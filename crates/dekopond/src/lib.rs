@@ -1,24 +1,6 @@
-//! The unprivileged Dekopon chat gateway and agent daemon.
-//!
-//! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
-//! message to a named agent from the catalog, runs one bounded model session with the sandboxed
-//! shell and safe on-demand meta tools, and replies with bounded text plus any images a provider
-//! result attached unless an optional owned-thread continuation deliberately declines.
-//!
-//! # Authority
-//!
-//! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
-//! question and to ask a model — and it never holds a provider credential, a policy, or an
-//! authorization. Producing an image is a provider effect like any other: image bytes reach a reply
-//! only through explicit asset.send authorization, carried on a typed result the broker already
-//! authorized and executed. Every provider effect a session drives is submitted to
-//! `dekopon-brokerd` as an *attested* proposal naming the sender's canonical subject, and the
-//! broker alone maps that subject to a principal, decides what it may do, and executes it. The
-//! daemon's dependency set excludes every privileged broker crate: orchestration holds no effect
-//! authority, and CI enforces it.
-//!
-//! Everything arriving from a chat service is untrusted, including the agent's own standing orders
-//! from the catalog: neither can assert identity, name a principal, or widen a grant.
+//! The daemon holds no provider authority; every effect is submitted to dekopon-brokerd as an
+//! attested proposal, and nothing from chat, including the agent's own instructions, can assert
+//! identity or widen a grant.
 
 #![forbid(unsafe_code)]
 #![cfg(unix)]
@@ -84,34 +66,14 @@ use crate::{
     },
 };
 
-/// Inbound messages buffered between the transport readers and the routing loop.
-///
-/// Bounded, so a chat service having a busy minute applies backpressure to the reader rather than
-/// growing a queue the daemon can never work through. Admission control refuses the overflow with
-/// a sentence, which is a better answer than an unbounded backlog.
 const INBOUND_BUFFER: usize = 64;
-/// Independent fallback timeout for attachment inventories after their last message.
-///
-/// Persistent access dies earlier whenever its conversation generation does. This remains longer
-/// than the default history timeout so a live reference normally stays resolvable; if this fallback
-/// removes one first, its generation-owned number sequence still prevents a later file alias.
 const ASSET_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// The effective UID this daemon runs as, used for every ownership check.
 #[must_use]
 pub fn current_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// Reads only the export settings, so the process can install its subscriber before serving.
-///
-/// [`run`] parses the same file and reports every configuration failure with full context, so a
-/// caller that prefers that reporting can discard this error. This call decides one thing: whether
-/// an OTLP layer is installed at all.
-///
-/// # Errors
-///
-/// Returns the same configuration errors [`run`] would.
 pub async fn telemetry_settings(
     config_path: impl AsRef<Path>,
     uid: u32,
@@ -119,7 +81,6 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
-/// Loads configuration, connects every transport, and serves routed sessions until shutdown.
 pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), DekopondError>
 where
     F: Future<Output = ()> + Send,
@@ -133,8 +94,6 @@ where
         transports: built_transports,
     } = prepare(&config, &routes)?;
 
-    // One probe before anything connects, so "the broker is not running" is a startup failure with
-    // a clear message rather than every session failing identically an hour later.
     let broker_client = BrokerClient::new(
         &config.broker.socket_path,
         config.broker.server_uid,
@@ -166,8 +125,6 @@ where
         }
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
-    // Retain this sender until supervision completes: a reader failure must reach the supervisor,
-    // rather than racing a closed inbound queue and losing its underlying cause.
 
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
@@ -175,8 +132,6 @@ where
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
-        // Independently bounded for one-shot state; persistent access additionally carries the
-        // conversation generation fence, so transcript invalidation retires its assets immediately.
         assets: Arc::new(AssetStore::with_retention(
             config.sessions.max_conversations,
             ASSET_IDLE_TIMEOUT,
@@ -197,7 +152,6 @@ where
     let mut terminal = Ok(());
     let stopped = async {
         terminal = supervise_transports(&mut readers, shutdown).await;
-        // Stop admission at every adapter before session draining, including sleepers/connectors.
         readers.abort_all();
     };
     let outcome = serve(
@@ -215,7 +169,6 @@ where
     readers.abort_all();
     while let Some(result) = readers.join_next().await {
         match result {
-            // A peer can fail before the supervisor abort reaches it. Preserve that reason too.
             Ok(Err(problem)) => tracing::warn!(
                 event = "gateway_transport_stopped",
                 transport = %problem.transport,
@@ -237,9 +190,9 @@ where
             tracing::info!(event = "gateway_stopped", reason = "shutdown");
             Ok(())
         }
-        // Nothing can wake the daemon again, and nobody asked it to stop. Exiting successfully
-        // here is what let a gateway that lost every workspace to a revoked token look like a
-        // clean run to whatever supervises it.
+        // Exiting successfully here would let a gateway that lost every workspace to a revoked
+        // token look like a clean run to whatever supervises it, so this is reported as a failure
+        // instead.
         ServeOutcome::TransportsLost => {
             tracing::error!(event = "gateway_stopped", reason = "transports-lost");
             Err(DekopondError::TransportsLost)
@@ -247,16 +200,12 @@ where
     }
 }
 
-/// Why the routing loop stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServeOutcome {
-    /// Somebody asked the daemon to stop.
     Shutdown,
-    /// Every transport reader ended, so no message can reach the daemon again.
     TransportsLost,
 }
 
-/// The routing loop: one message in, at most one session task out.
 #[allow(clippy::too_many_arguments)]
 async fn serve<F>(
     runner: Arc<SessionRunner>,
@@ -277,8 +226,6 @@ where
     let mut outcome = ServeOutcome::Shutdown;
 
     loop {
-        // Reaped opportunistically rather than awaited: a finished session's task must not hold a
-        // slot in the set while the loop is blocked waiting for the next message.
         while let Some(result) = sessions.try_join_next() {
             observe_session(result);
         }
@@ -306,9 +253,6 @@ where
                         Arc::make_mut(&mut identities).insert(name, identity);
                     }
                     TransportEvent::Message(message) => {
-                        // Routing runs inside the transport's receive span, so a message dropped as
-                        // unrouted or unaddressed says why inside its own trace instead of leaving
-                        // an orphan debug record an operator cannot tie to anything.
                         let received = message.receive_span.clone();
                         received.in_scope(|| {
                             dispatch(
@@ -336,8 +280,6 @@ where
 
     collector.shutdown();
 
-    // In-flight sessions are given the configured grace to finish: a model call is already paid
-    // for, and abandoning it means a person watching a chat window never hears back.
     if timeout(grace, async {
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
@@ -353,11 +295,6 @@ where
     outcome
 }
 
-/// Reports a session task that did not finish normally.
-///
-/// A session answers its own failures in chat and returns `()`, so reaching here means the task
-/// itself panicked or was cancelled — a bug rather than a refusal, and the one session outcome
-/// nobody in the conversation was told about.
 fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
         && !error.is_cancelled()
@@ -378,10 +315,6 @@ fn dispatch(
     mut message: InboundMessage,
 ) {
     let Some((route_id, route)) = routes.route_index(&message) else {
-        // Bots see ambient traffic. Silence is the correct answer, and debug level keeps a busy
-        // channel from becoming the daemon's log volume. The conversation rides along because
-        // "why did the bot not answer in here" is answered by which kind and which container the
-        // route table did not claim — service identifiers, never the message.
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -391,10 +324,9 @@ fn dispatch(
         );
         return;
     };
-    // Before the addressed check, because in a channel a stop word arrives as `<@U0123> stop` and
-    // every unaddressed channel message is dropped below — which is where the matcher could never
-    // see it. It fires only when this conversation has a session this sender started, so "stop"
-    // said to an idle agent is still a question the agent answers.
+    // Checked before the addressed filter, since a channel stop word like the bot mention plus stop
+    // would otherwise be dropped as unaddressed before the matcher ever saw it; it only fires for a
+    // session this sender started.
     if transport::is_stop_word(
         identities.get(&message.transport),
         &message.text,
@@ -409,8 +341,6 @@ fn dispatch(
         let pending_cancelled = collector.cancel(&request);
         let active_outcome = runner.active_sessions.cancel(&request);
         if pending_cancelled {
-            // A cancelled active run already has a progress/delivery owner for its stopped ending.
-            // Normal completion owns an answer, not a stopped ending for the removed batch.
             if matches!(
                 active_outcome,
                 CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
@@ -437,8 +367,6 @@ fn dispatch(
                 );
                 return;
             }
-            // The session existed and this sender owned it; it simply finished first. Routing the
-            // word as a question would answer a message that was never one.
             outcome @ (CancelOutcome::AlreadyCancelled | CancelOutcome::Completing) => {
                 tracing::debug!(
                     event = "gateway_session_stop_ignored",
@@ -450,10 +378,6 @@ fn dispatch(
             CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
         }
     }
-    // A channel route that fired on every message would be noise and cost. Shared conversations
-    // therefore require an explicit address, except for one Slack Agent continuation that the
-    // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
-    // A direct message is addressed by definition.
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
@@ -463,8 +387,6 @@ fn dispatch(
         .thread_continuation
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
-    // Every kind but a direct message is a shared conversation: a group DM, a channel, and a
-    // thread under either all carry ambient traffic the bot must be summoned into.
     if message.conversation.kind != ConversationKind::DirectMessage
         && !addressed
         && !inherited_thread
@@ -513,7 +435,6 @@ fn start_session(
     sessions: &mut JoinSet<()>,
     message: InboundMessage,
 ) {
-    // Routing is startup-fixed; a collected lead selects the exact same bound route at flush.
     let Some(route) = routes.route(&message) else {
         collection::disposition(&message.receive_span, "route-lost");
         return;
@@ -533,10 +454,6 @@ fn start_session(
     ));
 }
 
-/// Routes one authenticated cancel request to the session that owns the conversation.
-///
-/// Nothing is replied here. The session's own policy task owns the message on screen and writes
-/// the ending, which is what keeps `Stopped.` from arriving ahead of the partial answer it follows.
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
     match runner.active_sessions.cancel(request).ignored_reason() {
         None => tracing::info!(
@@ -544,8 +461,8 @@ fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
             transport = %request.transport,
             via = via_label(request.via)
         ),
-        // Acknowledged by the transport reader already; ignored here because only the subject that
-        // started a session may stop it, and because a session that already ended has no work left.
+        // Ignored here since only the subject that started a session may stop it, and a session
+        // that already ended has nothing left to stop.
         Some(reason) => tracing::debug!(
             event = "gateway_session_stop_ignored",
             transport = %request.transport,
@@ -554,7 +471,6 @@ fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
     }
 }
 
-/// Stable low-cardinality label for how a cancel reached the daemon.
 const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
     match via {
         dekopon_agent::CancelVia::NativeStop => "native-stop",
@@ -563,7 +479,6 @@ const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
     }
 }
 
-/// One reader per adapter, with identity delivered before any of its messages.
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
     sender: mpsc::Sender<TransportEvent>,
@@ -594,7 +509,6 @@ async fn read_transport(
     })
 }
 
-/// Any terminal reader failure stops the whole gateway, even while other readers are healthy.
 async fn supervise_transports<F>(
     readers: &mut JoinSet<Result<(), TransportConnectProblem>>,
     shutdown: F,
@@ -661,18 +575,6 @@ mod openrouter_startup_tests {
     }
 }
 
-/// Resolves every credential this daemon holds and builds every transport, before any of them
-/// authenticates.
-///
-/// Nothing here opens a socket or speaks to a chat service: it reads the owner-named environment
-/// variables and constructs the fixed-endpoint clients. That split is the whole point. Reading a
-/// token inside the connect loop meant a rollout missing two of them cost two crash loops, and the
-/// first of those had already authenticated to the service whose token was present. This process
-/// also cannot see a variable exported after it started, so an unset or blank one that used to
-/// surface as a 401 on the first user's message is a startup refusal naming the variable instead.
-///
-/// Every problem is collected, so an operator who forgot two secrets in a deployment manifest is
-/// told about both at once.
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, DekopondError> {
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
@@ -692,15 +594,10 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, D
     }
 }
 
-/// Everything `prepare` resolved, none of it having spoken to a chat service yet.
 struct Prepared {
-    /// One built transport per configured transport, in configuration order.
     transports: Vec<Box<dyn ChatTransport>>,
 }
 
-/// Reads one transport's owner-named credentials and builds its fixed-endpoint client.
-///
-/// Nothing here connects; `prepare` calls it for every transport before any of them does.
 fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, TransportError> {
     Ok(match spec {
         TransportConfig::SlackSocketMode {
@@ -789,68 +686,42 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
     })
 }
 
-/// Startup or lifecycle failure.
 #[derive(Debug, Error)]
 pub enum DekopondError {
-    /// Strict owner-controlled configuration failed.
     #[error("gateway configuration is invalid")]
     Config(#[from] ConfigError),
-    /// The agent catalog could not be loaded or validated.
     #[error("gateway agent catalog is unavailable or invalid")]
     Catalog(#[source] dekopon_config::ConfigError),
-    /// A route could not be bound to a catalog agent and a configured model.
     #[error("gateway route cannot be satisfied")]
     Route(#[from] RouteError),
-    /// Something the daemon must hold before it serves is unusable; every one of them is named.
     #[error("{}", render_problems(.problems))]
-    Startup {
-        /// Every credential or client that could not be resolved, in the order they were tried.
-        problems: Vec<StartupProblem>,
-    },
-    /// The configured broker did not answer a capability probe at startup.
+    Startup { problems: Vec<StartupProblem> },
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
-    /// A transport could not establish or recover its wakeup path.
     #[error("{}", render_problems(.problems))]
     TransportConnect {
-        /// Terminal transport failures, including the configured name and underlying cause.
         problems: Vec<TransportConnectProblem>,
     },
-    /// A transport reader panicked or was unexpectedly cancelled.
     #[error("chat transport task failed")]
     TransportTask(#[source] tokio::task::JoinError),
-    /// Every transport ended on its own, with no shutdown asked for.
-    ///
-    /// The daemon has no way left to hear a message, so it stops. Reporting it as a failure is the
-    /// difference between a supervisor restarting the gateway and a pod that stays green.
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
 }
 
-/// A configured transport and its connection failure.
 #[derive(Debug, Error)]
 #[error("chat transport {transport} failed")]
 pub struct TransportConnectProblem {
-    /// Configured transport name included in the diagnostic.
     pub transport: String,
-    /// The underlying transport failure.
     #[source]
     pub source: TransportError,
 }
 
-/// One thing the daemon must hold before any transport authenticates.
-///
-/// Resolved together by `prepare` and reported through [`DekopondError::Startup`], so a
-/// deployment missing several secrets is one refusal naming all of them.
 #[derive(Debug, Error)]
 pub enum StartupProblem {
-    /// A bound route's model names a credential variable nothing usable can be read from.
     #[error("configured model credential is unavailable")]
     ModelCredential(#[source] ModelCredentialError),
-    /// A chat transport's credential is unusable, or its fixed-endpoint client could not be built.
     #[error("chat transport {transport} could not be prepared")]
     Transport {
-        /// Configured transport name.
         transport: String,
         #[source]
         source: TransportError,

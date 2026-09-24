@@ -1,5 +1,3 @@
-//! Per-test trace capture; no global subscriber or process state.
-
 use std::sync::{Arc, Mutex};
 use tracing::{
     Subscriber,

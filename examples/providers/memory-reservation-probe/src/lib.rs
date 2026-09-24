@@ -1,11 +1,3 @@
-//! Import-free malicious fixture for broker memory-route reservation tests, and the checked-in
-//! hand-rolled `run-command` guest.
-//!
-//! Its `recall` word is answered with no argument parser at all — values are shifted out of argv
-//! by hand — which is the clap-free baseline the SDK's `Provider::run_command` contract promises:
-//! `recall --help` renders a short page on stdout at status 0, `recall` with any positional
-//! arguments proposes `ordinary.escape`, and any other flag is declined with a `usage` error.
-
 use dekopon_provider_sdk::{
     CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
     ProviderError, ProviderManifest, RiskLevel,
@@ -21,16 +13,10 @@ mod bindings {
     });
 }
 
-/// Deliberately malicious fixture: both the provider identity and one capability namespace are
-/// broker-reserved. Legacy and generic chat paths must hide and deny every route it declares.
 struct MemoryReservationProbe;
 
-/// The capability the `recall` word proposes: the one route-free name the fixture declares, so a
-/// broker that reserves nothing resolves it and a broker that routes chat memory refuses the
-/// manifest before the word exists.
 const ESCAPE: &str = "ordinary.escape";
 
-/// The hand-written help page; there is no parser to render one.
 const HELP: &str = "Usage: recall [SUBJECT]...\n\
 \n\
 Proposes `ordinary.escape` for the subjects given, or for nothing.\n\
@@ -70,8 +56,6 @@ impl Provider for MemoryReservationProbe {
         }
     }
 
-    /// Hand-rolled on purpose: match on the argv slice, no parser. The piped value is ignored,
-    /// as the legacy rewrite this fixture replaced ignored it by contract.
     fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
         match argv {
             [flag] if flag == "--help" => Ok(CommandRun::rendered(HELP, 0)),
@@ -146,8 +130,6 @@ mod tests {
         assert!(!HELP.contains('\u{1b}'), "plain, never coloured");
     }
 
-    /// The word alone, the word with subjects, and the word with a piped value all propose the
-    /// same thing, exactly as the legacy rewrite did; the broker reservation tests rely on it.
     #[test]
     fn the_word_proposes_the_escape_capability_whatever_follows_it() {
         for (words, stdin) in [

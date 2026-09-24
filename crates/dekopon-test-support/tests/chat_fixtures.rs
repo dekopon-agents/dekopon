@@ -1,11 +1,3 @@
-//! The shared chat-progress doubles, exercised against their own contracts.
-//!
-//! A fixture nobody checks is a fixture that quietly stops doing what its callers assume. Each of
-//! these pins the one property its users depend on and nothing else: that the runtime really does
-//! park, that the stream really does hand out one event per release and interrupts on `Break`, that
-//! a parked stream emits nothing at all, and that the driver's per-object switches and failure
-//! injection are independent of each other.
-
 #![allow(clippy::unwrap_used)]
 
 use std::{
@@ -146,18 +138,11 @@ async fn a_parked_stream_emits_nothing_at_all_until_it_is_released() {
     );
 }
 
-/// This deliberately parked double has only the synchronous callback, not a transport watch.
-/// It illustrates the limit of a callback-only embedder, not the live async adapters: production
-/// BlockingModel watches session cancellation even while HTTP produces no events.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_deadline() {
-    /// The double's own deadline: long enough to watch the press do nothing, short enough
-    /// to wait out.
     const DEADLINE: Duration = Duration::from_millis(600);
-    /// How long the stop is given to fail to interrupt anything.
     const WATCHED: Duration = Duration::from_millis(150);
 
-    /// One person's press, as the loop sees it.
     struct Pressed(AtomicBool);
 
     impl CancellationProbe for Pressed {
@@ -192,8 +177,6 @@ async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_dead
         })
     };
 
-    // The request is open and the socket is silent, which is the only moment this property is
-    // about; a sleep here would be asserting on the loop's start-up instead.
     tokio::time::timeout(Duration::from_secs(5), model.wait_until_asked())
         .await
         .expect("the turn reaches the model");
@@ -293,8 +276,6 @@ fn failure_injection_is_per_object_and_per_call() {
 
 #[test]
 fn every_recorded_transcript_parses_to_the_events_its_backend_sends() {
-    // Both routes and both turn shapes, because the four combinations are what the parser has to
-    // get right and a fixture that only covers one of them hides the other three.
     for (name, body, text) in [
         (
             "openai two deltas",

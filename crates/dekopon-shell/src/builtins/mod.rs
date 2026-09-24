@@ -1,15 +1,6 @@
-//! The fixed builtin table and the context builtins run against.
-//!
-//! Every name in this table is reserved: `dekopon_core::RESERVED_COMMAND_WORDS` mirrors it, a test
-//! beside [`crate::dispatch`] pins the two together, and a provider declaring one as a command word
-//! is refused at load rather than shadowed.
-//!
-//! Builtins are either **text-shaped** or **value-shaped**:
-//!
-//! - text-shaped (`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`) accept a raw string or a
-//!   JSON array of lines, newline-joining arrays on the way in and re-coercing line lists to arrays
-//!   on the way out, so `gh issue list | grep foo | wc -l` reads like bash;
-//! - value-shaped (`jq`, `cap`, `cat`) stay JSON-native end to end.
+//! Builtins are text-shaped (grep, sed, cut, sort, uniq, wc, base64: lines in and out) or
+//! value-shaped (jq, cap, cat: JSON-native); every name here is reserved, so a provider declaring
+//! one is refused at load rather than shadowed.
 
 use std::collections::BTreeMap;
 
@@ -28,14 +19,10 @@ pub(crate) mod misc;
 pub(crate) mod text;
 pub(crate) mod xargs;
 
-/// What one command produced.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CommandResult {
-    /// The structured value the command produced.
     pub value: Value,
-    /// The command's exit status.
     pub status: ExitCode,
-    /// Whether emitting this value should omit the usual trailing newline.
     pub suppress_newline: bool,
 }
 
@@ -62,22 +49,13 @@ impl CommandResult {
     }
 }
 
-/// Why a command did not produce a result.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CommandFailure {
-    /// Recoverable: the message is written to output, the status is recorded, the script continues.
-    Status {
-        /// Diagnostic written to the combined output.
-        message: String,
-        /// Exit status recorded in `$?`.
-        status: ExitCode,
-    },
-    /// Terminal: the script stops and the interpreter reports this exit code.
+    Status { message: String, status: ExitCode },
     Fatal(FatalError),
 }
 
 impl CommandFailure {
-    /// A usage or argument error. Exit code `2`, matching a shell syntax failure.
     pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self::Status {
             message: message.into(),
@@ -85,7 +63,6 @@ impl CommandFailure {
         }
     }
 
-    /// A runtime failure inside a builtin. Exit code `1`.
     pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self::Status {
             message: message.into(),
@@ -106,39 +83,28 @@ impl From<LimitExceeded> for FatalError {
     }
 }
 
-/// A failure that stops the whole script.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FatalError {
-    /// A sandbox bound was exhausted.
     Limit(LimitExceeded),
-    /// The script reached a construct this shell deliberately excludes.
     Unsupported(String),
-    /// A `${NAME:?message}` assertion found the parameter absent.
-    ///
-    /// Terminal rather than recoverable, because that is the whole point of the construct: a
-    /// script writes it to stop when a value it depends on is missing. Reporting a status and
-    /// carrying on with an empty string would be the silent wrongness this shell exists to refuse.
+    /// Terminal rather than recoverable, because that is the point of the construct: reporting a
+    /// status and continuing with an empty string would be exactly the silent wrongness this shell
+    /// exists to refuse.
     Assertion(String),
 }
 
-/// Everything a builtin may touch.
 pub(crate) struct BuiltinContext<'a> {
-    /// The capability seam.
     pub invoker: &'a dyn CapabilityInvoker,
-    /// Per-execution counters.
     pub budget: &'a mut Budget,
-    /// Named in-memory buffers written by `>` and `>>`; never real paths.
+    /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
+    /// a real filesystem path.
     pub buffers: &'a mut BTreeMap<String, Value>,
 }
 
 impl BuiltinContext<'_> {
-    /// Charges the capability-call budget and invokes one capability, carrying the proposal's
-    /// typed secret intent to the invoker unchanged.
-    ///
-    /// The deadline is re-read on both sides of the call. A capability invocation is the single
-    /// most expensive thing a script can do in wall-clock terms and the cheapest in steps — the
-    /// default budget lets thirty-two of them run in ninety-six steps — so leaving the clock to the
-    /// step counter alone let a script overrun its deadline by minutes and still report success.
+    /// Capability calls are wall-clock expensive but step-cheap (the default budget allows 32 in 96
+    /// steps), so the deadline is re-read on both sides; step-counting alone let a script overrun
+    /// its deadline by minutes.
     pub(crate) fn invoke_capability_with_secret_use(
         &mut self,
         capability: &str,
@@ -162,10 +128,6 @@ impl BuiltinContext<'_> {
                     status,
                 });
             }
-            // The classification first, because that is what the exit status means, then the
-            // provider's own sentence when it wrote one. A model that reads only
-            // `gpt-image.edit: failed: provider-failure` has no way to learn that the upstream
-            // refused the image for moderation, and guesses instead of relaying.
             CapabilityCallResult::Failed { error, detail } => {
                 let message = match detail {
                     Some(detail) => format!("{capability}: failed: {error}: {detail}"),
@@ -183,12 +145,9 @@ impl BuiltinContext<'_> {
     }
 }
 
-/// One builtin command.
 pub(crate) trait Builtin {
-    /// The name this builtin is dispatched by.
     fn name(&self) -> &'static str;
 
-    /// Runs the builtin with already-expanded argv and the piped input value, if any.
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -197,16 +156,12 @@ pub(crate) trait Builtin {
     ) -> Result<CommandResult, CommandFailure>;
 }
 
-/// How a builtin is executed.
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinKind {
-    /// Runs entirely inside the builtin.
     Simple(&'static dyn Builtin),
-    /// `xargs` maps a command over a list, so the interpreter runs it re-entrantly.
     Xargs,
 }
 
-/// The complete builtin registry, in dispatch order.
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &misc::Sleep,
@@ -227,7 +182,6 @@ const REGISTRY: &[&dyn Builtin] = &[
     &cap::Cap,
 ];
 
-/// Looks one command word up in the builtin table.
 pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
     if name == xargs::NAME {
         return Some(BuiltinKind::Xargs);
@@ -238,11 +192,8 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
         .map(|builtin| BuiltinKind::Simple(*builtin))
 }
 
-/// Returns every builtin name, in sorted order.
-///
-/// Derived from [`REGISTRY`] rather than hand-listed, which is what makes the drift test against
-/// `dekopon_core::RESERVED_COMMAND_WORDS` meaningful: a builtin added or removed here changes what
-/// this returns, and the test then demands the mirrored list agree.
+/// names() must stay derived from REGISTRY rather than hand-listed, or the drift test against
+/// RESERVED_COMMAND_WORDS could pass while stale.
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = REGISTRY
@@ -254,14 +205,12 @@ pub(crate) fn names() -> Vec<&'static str> {
     names
 }
 
-/// Rejects a flag this shell does not implement, rather than accepting it as a no-op.
 pub(crate) fn unsupported_flag(command: &str, flag: &str) -> CommandFailure {
     CommandFailure::usage(format!("{command}: option not yet supported: {flag}"))
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Helpers letting each builtin be unit-tested without standing up the whole interpreter.
 
     use std::collections::BTreeMap;
 
@@ -274,7 +223,6 @@ pub(crate) mod test_support {
 
     use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
 
-    /// An invoker that grants nothing, for builtins that never reach the capability seam.
     pub(crate) struct NoCapabilities;
 
     impl CapabilityInvoker for NoCapabilities {
@@ -292,7 +240,6 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Runs one builtin under default limits with no capabilities and no buffers.
     pub(crate) fn run_builtin(
         builtin: &dyn Builtin,
         arguments: &[&str],
@@ -302,7 +249,6 @@ pub(crate) mod test_support {
         run_builtin_with(builtin, arguments, input, Limits::default(), &mut buffers)
     }
 
-    /// Runs one builtin against a caller-supplied invoker.
     pub(crate) fn run_builtin_with_invoker(
         builtin: &dyn Builtin,
         arguments: &[&str],
@@ -322,7 +268,6 @@ pub(crate) mod test_support {
         builtin.run(&mut context, &arguments, None)
     }
 
-    /// Runs one builtin with explicit limits and buffer store.
     pub(crate) fn run_builtin_with(
         builtin: &dyn Builtin,
         arguments: &[&str],
@@ -385,7 +330,6 @@ mod tests {
         assert!(lookup("definitely-not-a-builtin").is_none());
     }
 
-    /// A session holding an HTTP capability and no provider word that would propose it.
     struct HttpGranted;
 
     impl CapabilityInvoker for HttpGranted {

@@ -21,8 +21,8 @@ use crate::{FrameLimits, MAX_DESCRIPTORS_PER_FRAME, ProtocolError, read_frame, w
 // rustix panics on truncated cmsg data on macOS, so this buffer exceeds either kernel's single-message limit rather than the five-descriptor wire cap.
 const MAX_KERNEL_DESCRIPTORS_PER_MESSAGE: usize = 512;
 
-/// Owned broker socket. Every read, including the frame prefix, receives ancillary data.
-/// Typed callers reject descriptors on operations other than Invoke/Invocation.
+/// Every read receives ancillary data even off the frame prefix; typed callers must reject
+/// descriptors on any operation besides Invoke or Invocation.
 pub struct DescriptorStream {
     stream: UnixStream,
     received: Vec<OwnedFd>,
@@ -33,7 +33,6 @@ pub struct DescriptorStream {
 }
 
 impl DescriptorStream {
-    /// Wraps either end of a broker connection.
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -45,7 +44,6 @@ impl DescriptorStream {
         }
     }
 
-    /// Reads a frame and transfers its descriptors to the typed caller for validation.
     pub async fn read_frame<T: DeserializeOwned>(
         &mut self,
         limits: FrameLimits,
@@ -64,7 +62,6 @@ impl DescriptorStream {
         }
     }
 
-    /// Attaches descriptors to the sendmsg carrying only the frame's first byte.
     pub async fn write_frame<T: Serialize>(
         &mut self,
         value: &T,
@@ -107,7 +104,8 @@ impl DescriptorStream {
                 descriptors.extend(rights);
             }
         }
-        // macOS lacks MSG_CMSG_CLOEXEC; secure every received descriptor before exposing it.
+        // macOS has no MSG_CMSG_CLOEXEC, so every received descriptor must be secured before it is
+        // exposed.
         #[cfg(not(target_os = "linux"))]
         for descriptor in &descriptors {
             if let Err(source) = rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::CLOEXEC) {

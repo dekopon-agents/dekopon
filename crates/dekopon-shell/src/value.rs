@@ -1,20 +1,5 @@
-//! The script value type and its coercion rules.
-//!
-//! Every shell variable, command result, and pipeline element is a [`serde_json::Value`]. Nothing
-//! in this interpreter is stringly typed, so capability inputs and outputs never need marshaling:
-//! the rest of the workspace already speaks `serde_json::Value` everywhere.
-
 use serde_json::Value;
 
-/// Coerces one value to its display form.
-///
-/// This is the form used by bare-word arguments, double-quoted interpolation, and emitted output:
-///
-/// - strings are reproduced verbatim, without quotes,
-/// - numbers use their JSON literal,
-/// - booleans become `true` or `false`,
-/// - null becomes the empty string,
-/// - arrays and objects become compact JSON text.
 #[must_use]
 pub fn display(value: &Value) -> String {
     match value {
@@ -26,10 +11,6 @@ pub fn display(value: &Value) -> String {
     }
 }
 
-/// Reports whether a value is "true" for `if`, `while`, and `test`.
-///
-/// This is a value-model predicate, not bash's exit-status rule: exit status drives control flow
-/// in the evaluator, while this helper is only used by builtins that inspect a value directly.
 #[must_use]
 #[cfg(test)]
 pub(crate) fn truthy(value: &Value) -> bool {
@@ -43,11 +24,6 @@ pub(crate) fn truthy(value: &Value) -> bool {
     }
 }
 
-/// Converts a value into the line list consumed by text-shaped builtins.
-///
-/// A JSON array is treated as an array of lines (each element display-coerced). Every other value
-/// is display-coerced and split on newlines. A trailing empty line is dropped so that
-/// `"a\nb\n"` and `"a\nb"` behave identically.
 #[must_use]
 pub fn to_lines(value: &Value) -> Vec<String> {
     match value {
@@ -67,12 +43,6 @@ pub fn to_lines(value: &Value) -> Vec<String> {
     }
 }
 
-/// Converts a line list back into a value.
-///
-/// No lines becomes `null`, which emits nothing: a `grep` that matched nothing must print nothing,
-/// where an empty string would print a phantom blank line and spend a line of the output ceiling.
-/// A single line becomes a string so that `echo hi | grep hi` stays scalar; anything else becomes a
-/// JSON array of lines so that later `jq` or index expressions see real structure.
 #[must_use]
 pub fn from_lines(lines: Vec<String>) -> Value {
     match lines.len() {
@@ -82,7 +52,6 @@ pub fn from_lines(lines: Vec<String>) -> Value {
     }
 }
 
-/// Converts a value into the text a text-shaped builtin operates on.
 #[must_use]
 pub fn to_text(value: &Value) -> String {
     match value {
@@ -91,10 +60,6 @@ pub fn to_text(value: &Value) -> String {
     }
 }
 
-/// Indexes a value with one display-coerced key.
-///
-/// Arrays accept non-negative decimal indices; objects accept field names. Anything else yields
-/// `null`, matching how a missing JSON field reads.
 #[must_use]
 pub fn index(value: &Value, key: &str) -> Value {
     match value {
@@ -109,11 +74,6 @@ pub fn index(value: &Value, key: &str) -> Value {
     }
 }
 
-/// Parses the value half of one `local NAME=value` token, keeping ambiguous text as a string.
-///
-/// Only JSON numbers, `true`, `false`, and `null` are promoted. Objects and arrays are deliberately
-/// left as strings so `local body='{"a":1}'` is not silently restructured; `jq 'fromjson'` is the
-/// explicit way across.
 #[must_use]
 pub fn scalar_from_token(token: &str) -> Value {
     match token {
@@ -167,7 +127,6 @@ mod tests {
             from_lines(vec!["a".to_owned(), "b".to_owned()]),
             json!(["a", "b"])
         );
-        // Nothing selected is nothing emitted, not an empty line.
         assert_eq!(from_lines(Vec::new()), Value::Null);
     }
 

@@ -19,58 +19,39 @@ use std::{
 use tokio::time::timeout;
 use tracing::Instrument as _;
 
-/// Maximum bytes in one native asset I/O chunk.
 pub const CHUNK_BYTES: usize = dekopon_core::asset::MAX_ASSET_CHUNK_BYTES;
 const RAW_ENCODE_CHUNK: usize = CHUNK_BYTES / 4 * 3;
 
-/// Storage or HTTP-wire representation, independent of content type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Representation {
     Identity,
     Base64,
 }
 
-/// One read-only asset in an exact-length streamed HTTP request.
 pub struct FilePart {
-    /// Read-only file; every reader uses positional I/O.
     pub file: AssetReader,
-    /// Stored representation.
     pub stored: Representation,
-    /// Representation the endpoint receives.
     pub wire: Representation,
-    /// Decoded length, checked against file metadata by the host.
     pub decoded_bytes: u64,
-    /// Conversation reference, absent for invocation-local outputs.
     pub id: Option<u64>,
-    /// Label supplied by the conversation table or provider.
     pub content_type: String,
 }
 
-/// A bounded literal or a file-backed asset; no whole asset is materialized.
 pub enum Part {
     Literal(Vec<u8>),
     Asset(FilePart),
 }
 
-/// Native exact-length HTTP request.
 pub struct StreamedRequest {
-    /// HTTP method validated beneath the invocation grant.
     pub method: String,
-    /// Absolute destination validated and pinned by the native host.
     pub uri: String,
-    /// Ordered guest-authored headers, excluding broker-owned headers.
     pub headers: Vec<Header>,
-    /// Ordered body segments.
     pub body: Vec<Part>,
 }
 
-/// Echo-scanned response backed by an unlinked read-only file.
 pub struct StreamedResponse {
-    /// Upstream status.
     pub status: u16,
-    /// Only permitted, echo-scanned headers.
     pub headers: Vec<Header>,
-    /// Identity-encoded body, charged to the broker in-flight budget.
     pub body: AssetFile,
 }
 
@@ -270,7 +251,6 @@ impl io::Read for PositionalReader<'_> {
     }
 }
 
-/// Reads an exact bounded decoded slice without observing or changing the descriptor's offset.
 pub fn read_decoded(
     file: &File,
     representation: Representation,
@@ -312,7 +292,8 @@ pub fn read_decoded(
 }
 
 impl BufferedHttpClient {
-    /// Executes a single exact-length body using the same grant and credential checks as send.
+    /// stream() must apply exactly the same grant and credential checks as send(), or the two
+    /// request paths could diverge in what they allow.
     pub async fn stream(
         &mut self,
         request: StreamedRequest,

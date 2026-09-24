@@ -34,21 +34,12 @@ use thiserror::Error;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Transport crates are silenced explicitly: a WebSocket library logs every frame, and an HTTP
-/// stack logs every connection. The OTLP exporter's own diagnostics are silenced by
-/// `dekopon_telemetry`, which appends that directive to every OTLP layer it installs.
 #[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
-/// How long exit may still wait on blocking session work after everything else has stopped.
-///
-/// The gateway's shutdown grace is the deadline for a session to *finish*; abandoning one only
-/// cancels the async owner's await on its blocking half. Model HTTP reads observe cancellation
-/// even on a silent socket, but non-preemptible blocking credential/file operations or other
-/// blocking work can outlive that signal. Dropping a Tokio runtime waits for those threads and
-/// could exceed the pod termination grace that the broker's own drain also has to fit inside.
-/// Here the wait is bounded and the remaining threads are left to die with the process; a request already
-/// in flight was never rollbackable, and waiting for it does not make it so.
+/// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
+/// non-preemptible blocking work already in flight; anything still running past this timeout is
+/// left to die with the process.
 #[cfg(unix)]
 const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -63,7 +54,6 @@ fn main() -> ExitCode {
         };
     }
     let Some(config) = cli.config else {
-        // Clap requires this for serving; keep constructed state fail-closed too.
         eprintln!("dekopond: --config is required for serving");
         return ExitCode::from(2);
     };
@@ -76,11 +66,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Runs `body` on an owned runtime whose teardown is bounded rather than unbounded.
-///
-/// `#[tokio::main]` drops its runtime, and that drop blocks until every blocking task returns.
-/// Owning the runtime is what makes [`tokio::runtime::Runtime::shutdown_timeout`] — the one exit
-/// bound Tokio offers — reachable at all.
 #[cfg(unix)]
 fn bounded_runtime<T>(
     exit_timeout: Duration,
@@ -96,23 +81,16 @@ fn bounded_runtime<T>(
 
 #[cfg(unix)]
 async fn serve(config: std::path::PathBuf) -> ExitCode {
-    // Read the export settings before serving. A failure here is discarded rather than reported:
-    // `run` parses the same file and surfaces every configuration error with full context, so
-    // reporting it twice would only make the first message the confusing one.
     let settings = dekopond::telemetry_settings(&config, dekopond::current_uid())
         .await
         .ok()
         .flatten();
 
-    // Telemetry must never keep the gateway from starting. Answering messages under bounded
-    // authority is the service's contract; observability is not.
     let tracer_provider = dekopon_telemetry::optional_tracer_provider(
         settings.as_ref().map(|telemetry| &telemetry.settings),
         "dekopond",
     );
 
-    // Structured JSON on stdout is the log contract, so a collector or shipper can pick it up
-    // without the daemon holding a second credential.
     let mut install = Install::new(Console {
         format: ConsoleFormat::Json,
         writer: ConsoleWriter::Stdout,
@@ -132,16 +110,11 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
     let code = match execute(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // The whole source chain, not just the top Display: "gateway service failed"
-            // without its cause sends an operator source-diving for what one log line
-            // could have said. The broker's exit record carries the same one field.
             tracing::error!(event = "gateway_exit", error = %error_chain(&error));
             ExitCode::FAILURE
         }
     };
 
-    // Flush failures are reported but do not change the exit code: serving has already ended, and a
-    // final batch the exporter could not deliver is not a reason to report the run as failed.
     if let Err(error) = telemetry.shutdown() {
         tracing::error!(event = "gateway_telemetry_shutdown_failed", error = %error);
     }
@@ -190,10 +163,6 @@ mod tests {
 
     #[test]
     fn exit_does_not_wait_for_blocking_work_that_outlived_its_session() {
-        // The shape of an abandoned session: the async owner is gone, its synchronous half is
-        // parked inside a model call, and nothing can interrupt it. Exit must not inherit that
-        // wait — the pod's termination grace is shared with the broker's own drain, and
-        // overshooting it turns a clean stop into SIGKILL mid-drain.
         let started = Instant::now();
         let (running, is_running) = tokio::sync::oneshot::channel();
         let value = super::bounded_runtime(Duration::from_millis(50), async move {

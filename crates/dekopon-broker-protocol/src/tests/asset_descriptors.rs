@@ -86,7 +86,6 @@ async fn invoke_round_trips_five_close_on_exec_descriptors() {
 
 #[test]
 fn sixteen_descriptors_are_refused_and_every_one_is_closed() {
-    // Linux counts run alone so unrelated tests cannot change the process-wide total.
     #[cfg(target_os = "linux")]
     {
         const CHILD: &str = "DEKOPON_SIXTEEN_DESCRIPTORS_CHILD";
@@ -130,7 +129,6 @@ fn sixteen_descriptors_are_refused_and_every_one_is_closed() {
             ));
             #[cfg(target_os = "linux")]
             assert_eq!(count(), before);
-            // Received raw descriptors are not exposed on refusal; macOS checks the error only.
         });
 }
 
@@ -285,7 +283,6 @@ fn typed_rows_and_response_indexes_are_exact() {
     ));
 }
 
-// The child runs alone: process-wide fd counts must not race unrelated parallel tests.
 #[cfg(target_os = "linux")]
 #[test]
 fn rejected_frames_close_every_received_descriptor() {

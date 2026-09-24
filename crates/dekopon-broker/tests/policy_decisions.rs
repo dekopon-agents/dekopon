@@ -1,14 +1,3 @@
-//! The workflow decision table, evaluated end to end through a real broker.
-//!
-//! Every expectation below was first verified against the exact-match policy engine this Cedar
-//! adapter replaced: on 2026-08-16 a temporary parity test built both engines from equivalent
-//! configurations, ran all eight capability rows through each, and asserted identical allow/deny
-//! outcomes. That test was deleted along with `ExactPolicy`; these hardcoded outcomes are what it
-//! proved.
-//!
-//! The `agent.prompt` rows have no exact-engine counterpart — the session gate is authority the
-//! Cedar migration adds — so they are asserted against their documented intent alone.
-
 #![allow(clippy::unwrap_used)]
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -28,16 +17,10 @@ use dekopon_core::{
 use dekopon_test_support::provider_fixture;
 use serde_json::json;
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
-/// `cli-probe.upper` is direct-only; `cli-probe.reverse` is attested-only; `agent.prompt` gates
-/// the session.
 const POLICIES: &str = r#"
 @id("direct-upper")
 permit(principal == Dekopon::Principal::"direct-caller",
@@ -80,7 +63,6 @@ fn subject() -> ExternalSubject {
     SLACK_SUBJECT.parse().expect("canonical subject fixture")
 }
 
-/// One row: who is asking, as which agent, through which gateway, for what.
 struct Row {
     label: &'static str,
     principal: &'static str,
@@ -227,11 +209,8 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
     }
 }
 
-/// The eight capability rows, evaluated through `invoke` attested and unattested rather than the policy
-/// engine directly, so the assertion covers the whole decision path.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_workflow_decision_table_holds_end_to_end() {
-    // Each boot compiles the provider; rows only differ in the mapped principal.
     let mut brokers = BTreeMap::new();
     for (index, row) in TABLE.iter().enumerate() {
         if !brokers.contains_key(row.principal) {
@@ -287,8 +266,6 @@ async fn the_workflow_decision_table_holds_end_to_end() {
     }
 }
 
-/// The session gate is its own statement: permitting `cpetersen` to talk to `some-agent` through
-/// the gateway grants nothing to a different agent, a different principal, or a direct arrival.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agent_prompt_gate_is_a_separate_grant() {
     let broker = broker("cpetersen").await;
@@ -380,8 +357,6 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         "an agent no policy names is refused exactly like an unhonored attestation"
     );
 
-    // The refusal is an audited denial rather than an error, and it names its own reason: the
-    // attestation was honored, so `attestation-denied` would misattribute what was refused.
     let proposal = request(99, "cli-probe.reverse");
     let refused = broker
         .invoke(

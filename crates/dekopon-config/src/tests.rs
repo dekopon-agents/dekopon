@@ -90,10 +90,6 @@ fn rejects_duplicate_resources() {
     assert!(error.to_string().contains("first declared"));
 }
 
-/// The refusal an operator upgrading past these kinds actually reads.
-///
-/// A generic unknown-kind message would send them looking for a typo in a document that was
-/// correct when it was written, so the cause is named once, per document.
 #[test]
 fn a_withdrawn_kind_names_the_upgrade_rather_than_reading_as_a_typo() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1
@@ -154,7 +150,6 @@ fn rejects_unknown_fields() {
     assert!(error.to_string().contains("unknown field"));
 }
 
-/// The requirement the whole report shape exists for: one catalog load, one fix pass.
 #[test]
 fn every_problem_in_a_catalog_is_reported_at_once() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1
@@ -210,7 +205,6 @@ spec:
     );
 }
 
-/// The friendly message exists for exactly this input, and only a pre-decode read reaches it.
 #[test]
 fn a_future_api_version_gets_the_dedicated_message() {
     let input = valid_documents("reviewer").replace("v1alpha1", "v1alpha2");
@@ -282,8 +276,6 @@ fn discovery_uses_documented_precedence() {
     );
 }
 
-/// A candidate that cannot be examined may be hiding the operator's real config, so it must not
-/// silently hand the catalog to a lower-precedence file.
 #[test]
 fn an_unreadable_candidate_fails_instead_of_falling_through() {
     let root = tempdir().expect("temporary directory");
@@ -291,8 +283,6 @@ fn an_unreadable_candidate_fails_instead_of_falling_through() {
     let home = root.path().join("home");
     let current = root.path().join("project");
 
-    // A regular file where a directory belongs makes the candidate below it ENOTDIR rather than
-    // absent, which is what the fall-through used to swallow.
     fs::write(&xdg, "not a directory").expect("fixture file");
     write_config(&home.join(".config/dekopon/config.yaml"));
     write_config(&current.join("dekopon.yaml"));
@@ -318,7 +308,6 @@ fn write_config(path: &Path) {
     fs::write(path, valid_documents("reviewer")).expect("fixture config");
 }
 
-/// One well-formed skill directory beside a catalog.
 fn write_skill(root: &Path, name: &str) {
     let directory = root.join("skills").join(name);
     fs::create_dir_all(directory.join("references")).expect("skill directory");
@@ -350,8 +339,6 @@ spec:
     )
 }
 
-/// Skills resolve against the catalog file's directory and are read whole at load, so a session
-/// never opens a file to show a model one.
 #[test]
 fn agent_skills_are_loaded_relative_to_the_catalog() {
     let root = tempdir().expect("temporary directory");
@@ -385,12 +372,10 @@ fn agent_skills_are_loaded_relative_to_the_catalog() {
     assert!(catalog.agent_skills(&absent).is_empty());
 }
 
-/// Every broken skill is reported, and one bad directory does not hide a second problem.
 #[test]
 fn every_unmountable_skill_is_reported_in_one_refusal() {
     let root = tempdir().expect("temporary directory");
     write_skill(root.path(), "pull-request-review");
-    // A second directory carrying the first skill's name.
     let copy = root.path().join("elsewhere").join("pull-request-review");
     fs::create_dir_all(&copy).expect("copy directory");
     fs::copy(

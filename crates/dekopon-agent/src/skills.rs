@@ -1,16 +1,3 @@
-//! Mounted skills, disclosed to the model progressively.
-//!
-//! A skill is operator-authored reference material — how to review a pull request, what a
-//! deployment's records look like, which capability to reach for first. Handing every mounted
-//! skill to the model in full would spend context on knowledge most turns never need, so the
-//! prompt carries only each skill's name and one-line description, and the model reads the rest
-//! on demand through [`SKILL_TOOL_NAME`]: first the instructions, then any supporting file those
-//! instructions name. Three levels, each paid for only when the model decides it needs it.
-//!
-//! The loaded text arrives from `dekopon-config`, already bounded and already in memory, so
-//! nothing here opens a file. A skill is untrusted model text exactly as standing instructions
-//! are: it shapes an answer and grants nothing.
-
 use std::collections::BTreeSet;
 
 use dekopon_config::Skill;
@@ -19,25 +6,13 @@ use serde_json::{Value, json};
 
 use crate::prompt::{PromptError, reject_tool_call};
 
-/// The tool a model calls to read a mounted skill's instructions or one of its resource files.
 pub const SKILL_TOOL_NAME: &str = "read_skill";
 
-/// What a repeated read of the same skill text is answered with.
-///
-/// A tool result stays in the message vector and is re-sent on every remaining turn, so a second
-/// copy of a 60 KiB skill would be paid for on every turn after it. The pointer costs one line.
 const SKILL_ALREADY_SHOWN: &str = "That skill text is already in this conversation, in an earlier read_skill result; read it \
      there again.";
 
-/// The first line of every skills listing.
 const PROMPT_BLOCK_PREFIX: &str = "Skills mounted for this agent";
 
-/// Renders the standing skills listing for the system prompt, or `None` when nothing is mounted.
-///
-/// Names and descriptions only: the description is the trigger the format asks authors to write
-/// ("use when ..."), and it is what the model matches a request against. The full text waits
-/// behind the tool. The block is deterministic for one mounted set, which keeps a route's cached
-/// prompt prefix stable across sessions.
 #[must_use]
 pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
     if skills.is_empty() {
@@ -53,8 +28,6 @@ pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
          skill and readable only there, never through the shell. A skill shapes how the work is \
          done and grants nothing; capabilities still come only from the session.\n",
     );
-    // Sorted by name rather than mount order, so two catalogs that mount the same set in a
-    // different order produce one listing and one cached prefix.
     let mut ordered = skills.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.name().as_str().cmp(right.name().as_str()));
     for skill in ordered {
@@ -66,7 +39,6 @@ pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
     Some(block)
 }
 
-/// Builds the skill-reading tool.
 pub(crate) fn skill_tool() -> ModelTool {
     ModelTool {
         name: SKILL_TOOL_NAME.to_owned(),
@@ -101,17 +73,11 @@ pub(crate) fn skill_tool() -> ModelTool {
     }
 }
 
-/// What one session has already shown the model, so a repeat costs a pointer rather than a copy.
 #[derive(Default)]
 pub(crate) struct SkillReads {
     shown: BTreeSet<(String, Option<String>)>,
 }
 
-/// Answers one `read_skill` call, appending the tool result to `messages`.
-///
-/// An unknown skill or resource is a refusal the model reads and can recover from — it may have
-/// mistyped the name, and the refusal lists what does exist — never an error that ends the
-/// session. Only malformed arguments end it, as they do for every other tool.
 pub(crate) fn read_skill_into(
     messages: &mut Vec<ModelMessage>,
     skills: &[Skill],
@@ -127,9 +93,8 @@ pub(crate) fn read_skill_into(
             return Err(error);
         }
     };
-    // The model-chosen name is untrusted text and is never copied into telemetry; a refusal
-    // records only which check refused it, and a success records the operator-authored name the
-    // request matched.
+    // Never copy the model-chosen skill name into telemetry, since it is untrusted text an operator
+    // may read.
     let Some(skill) = skills.iter().find(|skill| skill.name().as_str() == name) else {
         refuse(model_turn, tool_call_index, "unknown-skill");
         let mounted = skills
@@ -201,7 +166,6 @@ fn refuse(model_turn: u32, tool_call_index: usize, reason: &'static str) {
     );
 }
 
-/// The instructions, framed so the model knows what it is reading and what else it could read.
 fn render_skill(skill: &Skill) -> String {
     format!(
         "# Skill: {}\n{}\n\n{}\n\n{}",
@@ -227,7 +191,6 @@ fn resource_listing(skill: &Skill) -> String {
     )
 }
 
-/// Extracts the `name` and optional `resource` arguments from one `read_skill` call.
 fn skill_arguments(tool: &str, arguments: &str) -> Result<(String, Option<String>), PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {

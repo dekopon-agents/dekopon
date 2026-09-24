@@ -265,7 +265,6 @@ async fn late_photos_failure_notice_never_claims_a_generated_version() {
     for after_completion in [false, true] {
         let mut f = Fixture::new(listings(3, &["cli-probe.upper"]), vec![]).await;
         let pending = f.capture(photo(""));
-        // Admit one photo before failure so the temporary generation survives its unanswered turn.
         if after_completion {
             f.retain(f.capture(photo(""))).await;
         } else {
@@ -334,7 +333,6 @@ async fn late_photos_receipt_scope_excludes_other_actors_routes_audiences_and_tr
     );
     route = f.route.clone();
     route.agent = "other".parse().unwrap();
-    // Even an internal forged handle cannot register into another route's generation.
     let captured = f.capture(original);
     run_session(
         Arc::clone(&f.runner),
@@ -542,7 +540,6 @@ async fn late_photos_during_a_slow_provider_call_neither_restart_nor_add_provide
     );
     let broker_task = tokio::spawn(async move {
         let mut calls = tokio::task::JoinSet::new();
-        // Initial grant, command, parked invocation, late-input fresh grant: no other work.
         for _ in 0..4 {
             let (stream, _) = listener.accept().await.unwrap();
             let (entered, released, invoked) = (
@@ -960,7 +957,6 @@ async fn late_photos_stop_owns_parked_authorization_after_execution_ends_with_or
         });
         let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 1);
         let driver = Arc::new(RecordingDriver::default());
-        // The initial reference must survive a stop aimed only at outstanding late intake.
         let running = tokio::spawn(run_session(
             Arc::clone(&runner),
             route.clone(),

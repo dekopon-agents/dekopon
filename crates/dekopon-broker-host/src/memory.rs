@@ -1,14 +1,8 @@
-//! Conservative, per-memory observations at the synchronous Wasmtime limiter boundary.
-
 use dekopon_provider_sdk::host::StoreLimits;
 use wasmtime::ResourceLimiter;
 
-/// Delegates every enforcement decision to the existing limiter; no guest memory is read.
-///
-/// Wasmtime has no success callback. Permitted sizes are candidates until instantiation
-/// succeeds. A grow-failed callback can also occur *without* a preceding growing callback,
-/// so after any such callback only confirmed observations are reported, never candidates.
-/// Initial allocation failures have no failure callback, hence the instantiation gate.
+/// Wasmtime has no success callback and can report a grow failure with no prior growing callback,
+/// so only confirmed observations are reported after a failure, never candidates.
 pub(super) struct MemoryLimiter {
     limits: wasmtime::StoreLimits,
     per_memory_limit: usize,
@@ -98,8 +92,6 @@ impl ResourceLimiter for MemoryLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        // A positive current size proves that memory exists even if instantiation later fails.
-        // current=0 is also used for initial allocation, which has not yet succeeded.
         if current > 0 {
             self.confirmed_peak = self.confirmed_peak.max(Some(current));
         }
@@ -146,8 +138,8 @@ impl ResourceLimiter for MemoryLimiter {
 impl Drop for MemoryLimiter {
     fn drop(&mut self) {
         if let Some(report) = &self.report {
-            // Explicit parenting alone does not activate the native OTel context used by
-            // the log bridge. Re-enter synchronously, including on out-of-context drops.
+            // Explicit span parenting alone doesn't activate the OTel context the log bridge needs,
+            // so the span is re-entered synchronously, including on out-of-context drops.
             report.span.in_scope(|| tracing::info!(
                 parent: &report.span,
                 event = "provider.memory",
@@ -211,7 +203,6 @@ mod tests {
         assert_eq!(grow.call(&mut store, ()).unwrap(), 1);
         assert_eq!(store.data().observed_peak(), Some(3 * PAGE));
         assert!(store.data().complete());
-        // A second core instance does not reset the observation or turn it into a sum.
         instantiate(&mut store, "(module (memory 2))");
         assert_eq!(store.data().observed_peak(), Some(3 * PAGE));
     }
@@ -251,16 +242,14 @@ mod tests {
             .unwrap()
             .call(&mut store, ())
             .unwrap();
-        // Replay Wasmtime's unpaired type-limit failure path; ordinary wasm32
-        // oversized grows may instead be rejected before reaching the limiter.
+        // This replays Wasmtime's own unpaired type-limit failure path, not the ordinary
+        // oversized-grow rejection.
         store
             .data_mut()
             .memory_grow_failed(wasmtime::Error::msg("synthetic type-limit failure"))
             .unwrap();
         assert_eq!(store.data().failed, 1);
         assert!(!store.data().complete());
-        // Wasmtime can report a type-limit failure without a new growing callback.
-        // The preceding two-page candidate is not safe to promote from callbacks alone.
         assert_eq!(store.data().observed_peak(), Some(PAGE));
     }
 
@@ -270,7 +259,6 @@ mod tests {
         assert!(limiter.memory_growing(0, PAGE, None).unwrap());
         limiter.instantiated();
         assert!(limiter.memory_growing(PAGE, 2 * PAGE, None).unwrap());
-        // Deterministic OS-failure callback: exhausting the test machine is not a test.
         limiter
             .memory_grow_failed(wasmtime::Error::msg("synthetic allocation failure"))
             .unwrap();
@@ -282,8 +270,6 @@ mod tests {
     fn failed_initial_allocation_or_instantiation_is_not_confirmed() {
         let mut limiter = MemoryLimiter::new(StoreLimits::default());
         assert!(limiter.memory_growing(0, PAGE, None).unwrap());
-        // Initial OS allocation failure has no callback in Wasmtime. No completed
-        // instantiation means this candidate remains unknown, not zero or one page used.
         assert_eq!(limiter.observed_peak(), None);
         assert!(!limiter.complete());
 
@@ -321,12 +307,10 @@ mod tests {
                     limiter
                         .memory_grow_failed(wasmtime::Error::msg("private-error-sentinel"))
                         .unwrap();
-                    // A guest may swallow a growth failure and still succeed.
                     limiter.finish("succeeded");
                 } else {
                     limiter.finish("instantiation-error");
                 }
-                // No entered span: the stored explicit parent must still correlate the event.
                 drop(limiter);
             }
         });
@@ -353,7 +337,6 @@ mod tests {
         );
         assert!(events[1].0.contains("outcome=\"succeeded\""));
         assert!(events[1].0.contains("memory.growth_failed=1"));
-        // Fuel is independently observable even when memory is incomplete.
         assert!(!events[0].0.contains("fuel.initial="));
         assert!(!events[0].0.contains("fuel.consumed="));
         assert!(events[1].0.contains("fuel.initial=200"));

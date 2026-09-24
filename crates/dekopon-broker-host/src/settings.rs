@@ -1,5 +1,3 @@
-//! Broker-owned settings for the currently invoked provider, never for command resolution.
-
 use crate::StoreState;
 use crate::bindings::dekopon::settings::config;
 

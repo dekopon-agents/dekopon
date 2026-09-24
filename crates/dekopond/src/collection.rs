@@ -1,4 +1,3 @@
-//! Bounded input collection, not an execution queue. The routing loop is its sole owner.
 use std::{collections::BTreeMap, time::Duration};
 
 use dekopon_broker_protocol::ChatTransportKind;
@@ -68,7 +67,6 @@ impl Collector {
         self.pending.iter().map(|batch| batch.deadline).min()
     }
 
-    /// An authenticated native album can continue its addressed lead, never create a wakeup.
     pub(crate) fn is_native_continuation(&self, route: usize, message: &InboundMessage) -> bool {
         message.transport_kind == ChatTransportKind::Telegram
             && message.native_group.is_some()
@@ -266,7 +264,6 @@ impl Batch {
     }
 }
 
-/// Ensures aborts and panics also terminate each constituent's receipt trace.
 pub(crate) struct Dispositions(pub(crate) Vec<tracing::Span>);
 
 impl Dispositions {
@@ -405,7 +402,6 @@ mod tests {
                 collector.offer(0, message(1, "")),
                 Offered::Pending
             ));
-            // More receipts within each quiet interval cannot postpone the hard deadline.
             for _ in 0..3 {
                 tokio::time::advance(Duration::from_millis(quiet - 1)).await;
                 assert!(collector.take_due(Instant::now()).is_empty());

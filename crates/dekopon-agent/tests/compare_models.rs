@@ -1,4 +1,3 @@
-//! Public API proof: the unchanged synchronous loop drives either async native adapter.
 #![allow(clippy::unwrap_used)]
 
 use dekopon_agent::prompt::{

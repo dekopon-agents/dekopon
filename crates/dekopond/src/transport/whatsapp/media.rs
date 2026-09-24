@@ -1,4 +1,4 @@
-//! Bounded WhatsApp media courier. No webhook or model content chooses a credential sink.
+//! No webhook or model content ever chooses a credential sink.
 
 use std::{net::IpAddr, time::Instant};
 
@@ -10,7 +10,6 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use super::*;
 
-/// Conservative decimal interpretation of Meta's image-specific 5 MB ceiling.
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
@@ -34,7 +33,7 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     Some(PendingAsset {
         name: format!("photo.{extension}"),
         mime: mime.to_owned(),
-        size: None, // Webhooks do not promise a length; the lazy reader enforces it.
+        size: None,
         source: Some(AssetSourceRef::WhatsApp {
             media_id: id.to_owned(),
             mime: mime.to_owned(),
@@ -77,8 +76,6 @@ async fn read_body(
     {
         return Err(failure("response-too-large"));
     }
-    // The declared length was checked above and only sizes the buffer here; the cutoff in the loop
-    // is what refuses a response that grows past the ceiling.
     let mut bytes = asset_buffer(response.content_length(), limit);
     while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
@@ -112,7 +109,8 @@ impl WhatsappDriver {
         let trusted = url.scheme() == "https"
             && url.host_str() == Some(DOWNLOAD_HOST)
             && url.port_or_known_default() == Some(443);
-        // Only tests may replace the exact origin; runtime config pins Graph and cannot add a CDN.
+        // Only the test build may widen the trusted origin; production configuration can never add
+        // another host to it.
         #[cfg(test)]
         let trusted = trusted
             || reqwest::Url::parse(&self.endpoint).is_ok_and(|origin| {
@@ -300,7 +298,6 @@ impl AssetFetcher for WhatsappDriver {
             if bytes.len() as u64 != size {
                 return Err(failure("media-size-mismatch"));
             }
-            // Match the existing courier's signature-level validation, not full image decoding.
             let valid = match mime.as_str() {
                 "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
                 "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
@@ -314,8 +311,8 @@ impl AssetFetcher for WhatsappDriver {
     }
 }
 
-/// Resolver results are the addresses reqwest actually connects to, not a preflight lookup that
-/// it repeats later. Only the two fixed WhatsApp services may resolve; no ambient proxy is used.
+/// Resolved addresses are exactly what reqwest connects to, not a separate preflight lookup that
+/// could be redone later; only the two fixed WhatsApp hosts resolve at all.
 pub(super) struct WhatsappResolver;
 impl Resolve for WhatsappResolver {
     fn resolve(&self, name: Name) -> Resolving {
@@ -346,7 +343,6 @@ impl Resolve for WhatsappResolver {
     }
 }
 
-/// Conservative direct-public-address policy for this transport's two credential sinks.
 fn public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {

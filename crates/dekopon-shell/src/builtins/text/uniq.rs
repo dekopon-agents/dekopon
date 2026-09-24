@@ -1,5 +1,3 @@
-//! `uniq [-c] [-d] [-u]`.
-
 use serde_json::Value;
 
 use crate::{
@@ -7,7 +5,6 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
-/// Collapses runs of adjacent identical lines, like real `uniq`.
 pub(crate) struct Uniq;
 
 impl Builtin for Uniq {

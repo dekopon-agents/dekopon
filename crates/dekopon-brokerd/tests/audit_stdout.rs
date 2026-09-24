@@ -1,14 +1,3 @@
-//! A broker with no `telemetry` block records every decision on stdout, as JSON.
-//!
-//! This is the half of the constitution a library test cannot show: the real binary, its real
-//! console layer, and a configuration with no exporter at all. The decision and its outcome have to
-//! come out of the process as structured records, because stdout is the only place they go.
-//!
-//! It is also where offline correlation is pinned. With no exporter there is no OpenTelemetry
-//! context, so the formatter fabricates no native `trace_id` — and the record still names the
-//! caller's trace, because `broker.invocation` carries it as the ordinary `trace` span field and the
-//! JSON formatter renders every enclosing span.
-
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -31,7 +20,6 @@ use dekopon_capability::InvocationOutcome;
 use dekopon_test_support::provider_fixture;
 use serde_json::{Value, json};
 
-/// The trace the client declares it belongs to, and the hex the record has to name.
 const CLIENT_TRACE_ID: [u8; 16] = [
     0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36,
 ];
@@ -76,7 +64,6 @@ permit(principal == Dekopon::Principal::"caller",
     write_owner_only(
         &config,
         &serde_json::to_vec(&json!({
-            // No `telemetry` section: the console is the only sink.
             "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
             "socketPath": &socket,
             "brokerPrincipal": "broker-test",
@@ -190,13 +177,9 @@ permit(principal == Dekopon::Principal::"caller",
     assert_eq!(execution["provider"], "cli-probe");
     assert!(execution["output.digest"].is_string(), "{execution}");
 
-    // Documented, not accidental: without a tracer provider there is no native context to read, so
-    // the formatter fabricates neither identifier.
     assert!(decision.get("trace_id").is_none(), "{decision}");
     assert!(decision.get("span_id").is_none(), "{decision}");
 
-    // And the record is still in the caller's trace, because the invocation span carries the
-    // identifier the client sent rather than one derived from an exporter that is not running.
     for record in &records {
         let invocation = record["spans"]
             .as_array()

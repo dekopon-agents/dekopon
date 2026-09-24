@@ -1,8 +1,5 @@
-//! Meta WhatsApp Cloud API webhook and text/image reply transport.
-//!
-//! TLS terminates outside this daemon. The listener verifies Meta's signature over the exact raw
-//! body before parsing, claims message IDs in a bounded process-local set, enqueues a whole delivery
-//! atomically, and acknowledges before any session or model work begins.
+//! The webhook verifies Meta's signature over the raw body before parsing, claims message IDs
+//! atomically, and only acknowledges once a whole delivery is enqueued.
 
 mod media;
 pub(crate) use media::MAX_IMAGE_BYTES;
@@ -49,32 +46,22 @@ use crate::{
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
 const MAX_WEBHOOK_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-/// Hyper's parser buffer also includes the request line; keep it finite above the field ceilings.
 const MAX_CONNECTION_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_QUERY_BYTES: usize = 2 * 1024;
 const MAX_QUERY_VALUE_BYTES: usize = 512;
 const MAX_MESSAGES_PER_DELIVERY: usize = 128;
-/// Message identifiers one webhook remembers, four times the socket transports' ring.
-///
-/// Deliberately larger: Slack's and Discord's rings only have to bridge one reconnect, while this
-/// is the whole replay defense for a webhook Meta retries for far longer than a delivery burst,
-/// and each burst may itself carry [`MAX_MESSAGES_PER_DELIVERY`] identifiers.
+/// This ring is four times the socket transports' capacity because it is the whole replay defense
+/// against Meta's webhook retries, not just a bridge across one reconnect.
 const MAX_DEDUP_IDS: usize = 4096;
 const MAX_QUEUED_MESSAGES: usize = 512;
 const WEBHOOK_QUEUE: usize = 64;
 const MAX_WEBHOOK_CONCURRENCY: usize = 16;
 const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const GRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Deadline on one cosmetic Graph call. Liveness decorates an answer; it never delays one.
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// How often the typing indicator is re-posted while a session runs.
-///
-/// Meta dismisses it after 25 seconds; this sits under that with room for one slow call. Whether
-/// re-posting actually restarts that timer is the open question [`TypingLease::renew`] states.
 const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_GRAPH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_WHATSAPP_TEXT_CHARS: usize = 4096;
-/// One refusal reason is reported at most this often, with the count it stands for.
 const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
 
 pub(crate) struct WhatsappTransport {
@@ -85,7 +72,6 @@ pub(crate) struct WhatsappTransport {
     receiver: mpsc::Receiver<QueuedDelivery>,
     pending: VecDeque<QueuedDelivery>,
     driver: Arc<WhatsappDriver>,
-    /// The accept loop, at most one; dropping the transport aborts it.
     server: tokio::task::JoinSet<()>,
 }
 
@@ -96,13 +82,6 @@ struct WebhookState {
     verify_token: Arc<Redacted<String>>,
     waba_id: String,
     phone_number_id: String,
-    /// `liveness.mode: native` — an inbound message carries coordinates for the typing indicator.
-    ///
-    /// One decision, because the Cloud API has exactly one liveness surface: there is no message
-    /// edit, no stream, and no button inside the 24-hour service window. Configuration refuses
-    /// `liveness.stream` and `liveness.cancelButton` on this transport, so neither reaches here;
-    /// `liveness.progress: message` is accepted and does nothing at run time, because the driver
-    /// answers `None` for the progress surface rather than switching on a flag.
     native: bool,
     sender: mpsc::Sender<QueuedDelivery>,
     dedup: Arc<Mutex<ClaimedIds>>,
@@ -111,24 +90,15 @@ struct WebhookState {
     concurrency: Arc<Semaphore>,
 }
 
-/// Why one webhook request was refused, as a stable low-cardinality telemetry reason.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Refusal {
-    /// No usable `X-Hub-Signature-256`, so there was nothing to verify.
     Unsigned,
-    /// A signature that does not match the app secret over these exact bytes.
     Signature,
-    /// Headers or a body past the bounds this listener accepts.
     Oversize,
-    /// Signed, but not a delivery this transport can read.
     Malformed,
-    /// Concurrency or queue capacity is spent; Meta should redeliver.
     Saturated,
-    /// The request did not finish inside the handler deadline.
     Timeout,
-    /// A subscription-verification challenge that did not prove the verify token.
     Verification,
-    /// Internal state this handler needs is unusable.
     Unavailable,
 }
 
@@ -162,12 +132,8 @@ impl Refusal {
     }
 }
 
-/// Per-reason emission windows, so a refusal always leaves a trace and never a flood.
-///
-/// The callback is this daemon's only public surface, so an unauthenticated stranger decides how
-/// often refusals happen. Emitting one line each would let that stranger write unbounded volume
-/// into a shared log sink; emitting none is how a wrong app secret becomes invisible. One line per
-/// reason per window, carrying how many it stands for, is both.
+/// The webhook is public and unauthenticated, so logging every refusal risks a flood while logging
+/// none hides a broken secret; each reason logs once per window instead.
 struct RefusalLog {
     windows: [Option<Instant>; Refusal::COUNT],
     suppressed: [u64; Refusal::COUNT],
@@ -181,8 +147,6 @@ impl RefusalLog {
         }
     }
 
-    /// Reports how many earlier refusals of this reason an emission now stands for, or nothing when
-    /// this reason has already been reported inside the current window.
     fn admit(&mut self, refusal: Refusal, now: Instant) -> Option<u64> {
         let index = refusal.index();
         let due =
@@ -196,7 +160,6 @@ impl RefusalLog {
     }
 }
 
-/// Answers one refused request, naming its reason once per window and nothing about its content.
 fn refuse(state: &WebhookState, refusal: Refusal, status: StatusCode) -> Response {
     // A poisoned refusal log must not silence the refusal it exists to record.
     let admitted = match state.refusals.lock() {
@@ -220,10 +183,6 @@ struct QueuedDelivery {
     _capacity: OwnedSemaphorePermit,
 }
 
-/// The webhook's redelivery ring, with the claim/release the acknowledgment needs.
-///
-/// A webhook answers Meta before the work is queued, so an identifier is *claimed* on arrival and
-/// released again if the queue refuses it. The ring underneath is the one Slack and Discord use.
 struct ClaimedIds(SeenIds);
 
 impl ClaimedIds {
@@ -241,8 +200,6 @@ impl ClaimedIds {
         accepted
     }
 
-    /// Undoes a claim that never reached the queue, so Meta's redelivery is accepted rather than
-    /// silently acknowledged as a duplicate of work nothing is doing.
     fn release(&mut self, claimed: &[String]) {
         for id in claimed {
             self.0.remove(id);
@@ -251,8 +208,8 @@ impl ClaimedIds {
 }
 
 impl WhatsappTransport {
-    /// Every credential arrives non-empty: [`crate::transport::read_credential`] refuses an
-    /// exported-but-blank variable, because an empty app secret is an HMAC key anyone can guess.
+    /// An empty app secret would be an HMAC key anyone can guess, so every credential must arrive
+    /// non-empty.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: String,
@@ -335,8 +292,6 @@ impl ChatTransport for WhatsappTransport {
                         accepted = listener.accept() => {
                             let stream = match accepted {
                                 Ok((stream, _peer)) => stream,
-                                // Peer-local errors do not disturb the listener. Resource exhaustion
-                                // and listener failure go through bounded shared recovery.
                                 Err(error) => match classify_accept(&error) {
                                     AcceptFailure::Connection => {
                                         tracing::debug!(
@@ -367,7 +322,6 @@ impl ChatTransport for WhatsappTransport {
                                 },
                             };
                             let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
-                                // Drop immediately: even slow pre-header clients are concurrency-bound.
                                 continue;
                             };
                             let service = TowerToHyperService::new(router.clone());
@@ -378,8 +332,9 @@ impl ChatTransport for WhatsappTransport {
                                     .max_headers(MAX_WEBHOOK_HEADERS)
                                     .max_buf_size(MAX_CONNECTION_BUFFER_BYTES);
                                 let connection = builder.serve_connection(TokioIo::new(stream), service);
-                                // This includes header parsing, so a slowloris cannot hold a socket
-                                // beyond the same hard deadline as a buffered webhook request.
+                                // Header parsing is included in this deadline too, so a slow client
+                                // cannot hold a socket open longer than a fully buffered request
+                                // would allow.
                                 #[allow(
                                     clippy::let_underscore_must_use,
                                     reason = "the outcome is that one untrusted client's \
@@ -423,7 +378,6 @@ impl ChatTransport for WhatsappTransport {
                 };
                 match source {
                     Source::Delivery(delivery) => self.pending.push_back(delivery),
-                    // Empties the set either way, so a later `connect` may listen again.
                     Source::ListenerStopped => {
                         self.server.shutdown().await;
                         return Err(TransportError::Closed);
@@ -437,24 +391,15 @@ impl ChatTransport for WhatsappTransport {
         Some(Arc::clone(&self.driver) as Arc<dyn AssetFetcher>)
     }
 
-    /// One handle for replying and for the one liveness surface the Cloud API has.
-    ///
-    /// What the capability objects advertise is what WhatsApp implements, not what this deployment
-    /// asked for: `liveness.mode: off` withholds the target on the inbound message instead, so the
-    /// policy has nothing to render against and the transport is reply-only exactly as before.
     fn driver(&self) -> Arc<dyn ChatDriver> {
         Arc::clone(&self.driver) as Arc<dyn ChatDriver>
     }
 }
 
-/// What a failed `accept()` says about the listening socket itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcceptFailure {
-    /// One connection died before it was handed over; the listener is unaffected.
     Connection,
-    /// Descriptors or socket buffers are spent; the listener works again once one is freed.
     Exhausted,
-    /// The listening socket can no longer serve anything.
     Fatal,
 }
 
@@ -468,8 +413,6 @@ fn classify_accept(error: &io::Error) -> AcceptFailure {
         | io::ErrorKind::WouldBlock => AcceptFailure::Connection,
         io::ErrorKind::OutOfMemory => AcceptFailure::Exhausted,
         _ => match error.raw_os_error() {
-            // Process or system descriptor and buffer exhaustion. A pod under its memory limit with
-            // many half-open connections reaches these, and every one of them is temporary.
             Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
                 AcceptFailure::Exhausted
             }
@@ -507,9 +450,6 @@ async fn receive_webhook(State(state): State<WebhookState>, request: Request) ->
     let Ok(permit) = Arc::clone(&state.concurrency).try_acquire_owned() else {
         return refuse(&state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
-    // One span per delivery, opened before a byte of the body is read, so the signature check, the
-    // dedup claim, and the 200 that acknowledges the delivery are inside the trace of whatever the
-    // delivery turns out to carry — including a refusal, which is a receipt with no message.
     let received = receive_span(ChatTransportKind::Whatsapp);
     match tokio::time::timeout(
         WEBHOOK_REQUEST_TIMEOUT,
@@ -522,11 +462,6 @@ async fn receive_webhook(State(state): State<WebhookState>, request: Request) ->
     }
 }
 
-/// Verifies, parses, claims, and enqueues one signed delivery.
-///
-/// Everything from the dedup claim to the enqueue is synchronous on purpose: the caller's deadline
-/// can only cancel this at an `.await`, and a cancellation between claiming a message ID and
-/// queueing it would drop that message and swallow Meta's redelivery of it.
 async fn process_webhook(
     state: &WebhookState,
     request: Request,
@@ -578,8 +513,6 @@ async fn process_webhook(
         return content_free(StatusCode::OK);
     }
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
-    // Only the claimed IDs are needed to undo the claim, so the messages themselves move into the
-    // delivery rather than being held a second time for a path that usually does not run.
     let claimed: Vec<String> = accepted
         .iter()
         .map(|message| message.message_id.clone())
@@ -676,12 +609,6 @@ fn parse_delivery(
                     }
                     _ => continue,
                 };
-                // An individual message, positively: the delivery's `contacts` name the human the
-                // Cloud API would send a reply to, and on an individual message exactly one of
-                // them is `from`. A group payload names the group in `from` — with the human in
-                // `group_id`/`participant`, which are kept as the two checks that say so outright
-                // — and no contact matches it, so a shape Meta adds later that this gateway cannot
-                // answer is dropped rather than answered as if the group were a person.
                 let individual = contacts.is_some_and(|contacts| {
                     contacts
                         .iter()
@@ -691,9 +618,6 @@ fn parse_delivery(
                     || message.get("group_id").is_some()
                     || message.get("participant").is_some()
                 {
-                    // On an event rather than on `received`: one span covers the whole delivery,
-                    // so a `drop.reason` recorded there is overwritten by the next message's and
-                    // stains the trace of an accepted message beside it.
                     tracing::debug!(
                         event = "gateway_message_ignored",
                         transport = %state.name,
@@ -717,17 +641,12 @@ fn parse_delivery(
                 if accepted.len() == MAX_MESSAGES_PER_DELIVERY {
                     return Err(());
                 }
-                // The business account and phone number Meta signed this delivery under are the
-                // container; the sender is the conversation, because an individual message has
-                // nothing else it could be addressed to.
                 let conversation = Conversation {
                     kind: ConversationKind::DirectMessage,
                     container: Some(format!("{}:{}", state.waba_id, state.phone_number_id)),
                     id: sender.to_owned(),
                     thread: None,
                 };
-                // A delivery may carry several messages with different terminal dispositions.
-                // Keep their receipt identities distinct while retaining the signed delivery parent.
                 let receipt = received.in_scope(|| receive_span(ChatTransportKind::Whatsapp));
                 receipt.record("message.id", id);
                 record_conversation(&receipt, &conversation);
@@ -744,9 +663,6 @@ fn parse_delivery(
                     reply: ReplyTarget::WhatsApp {
                         recipient: sender.to_owned(),
                     },
-                    // The typing indicator is addressed to the message it answers rather than to
-                    // the conversation: the one Graph call that shows it also marks that message
-                    // read, and the read is what carries the identifier.
                     liveness: state.native.then(|| LivenessTarget::WhatsApp {
                         recipient: sender.to_owned(),
                         inbound_message_id: id.to_owned(),
@@ -844,12 +760,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-/// Decodes the verification query, refusing any field that could grow the echoed challenge.
-///
-/// `form_urlencoded` is lossy where the hand-written decoder was strict: a malformed escape or a
-/// non-UTF-8 byte survives as literal text or `U+FFFD` instead of failing the parse. Neither can
-/// reach the response — such a `hub.verify_token` fails the constant-time comparison and such a
-/// `hub.mode` is not `subscribe` — so the refusal happens one step later, still as 403.
 fn parse_query(query: &str) -> Result<Vec<(String, String)>, ()> {
     let mut fields = Vec::new();
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
@@ -883,7 +793,6 @@ fn text_response(status: StatusCode, body: String) -> Response {
     response
 }
 
-/// The answering half of the transport, plus the one liveness surface the Cloud API has.
 struct WhatsappDriver {
     transport: String,
     endpoint: String,
@@ -894,7 +803,6 @@ struct WhatsappDriver {
 }
 
 impl WhatsappDriver {
-    /// The one Graph endpoint this transport posts to, for answers and for liveness alike.
     fn messages_url(&self) -> String {
         format!(
             "{}/{}/{}/messages",
@@ -902,7 +810,6 @@ impl WhatsappDriver {
         )
     }
 
-    /// One text message, sent exactly once and never retried.
     async fn send_text(&self, recipient: &str, body: &str) -> Result<(), TransportError> {
         #[allow(
             clippy::map_err_ignore,
@@ -955,19 +862,6 @@ impl TypingLease for WhatsappDriver {
         TYPING_RENEW_INTERVAL
     }
 
-    /// Shows the typing indicator by marking the inbound message read, which is one call.
-    ///
-    /// The Cloud API has no separate typing endpoint: the indicator rides the `status: read`
-    /// message-status call as `typing_indicator`, so a run that shows it also delivers the blue
-    /// ticks, and a run with liveness off delivers neither. That fusion is Meta's, not a choice
-    /// made here.
-    ///
-    /// **The renewal is unverified against the Graph API.** Meta documents the indicator as
-    /// dismissed after 25 seconds or when the reply lands, and documents nothing about re-posting
-    /// it; re-posting every 20 seconds is this transport's bet that a second call restarts that
-    /// timer. Only a real WhatsApp Business number and a person watching the conversation can
-    /// settle it, so the loopback test below pins the *request* and not Meta's behavior. If the
-    /// bet is wrong the cost is dead air after 25 seconds, which the design already accepted.
     async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
         let LivenessTarget::WhatsApp {
             inbound_message_id, ..
@@ -1013,15 +907,6 @@ impl TypingLease for WhatsappDriver {
     }
 }
 
-/// Typing is the whole of WhatsApp's liveness.
-///
-/// The other accessors keep the trait's `None`, and that is the honest answer rather than a gap:
-/// the Cloud API has no message edit, so there is no progress message and no stream to grow, and
-/// an interactive button needs a template outside the 24-hour service window, so there is no
-/// cancel control either. Configuration refuses `liveness.stream` and `liveness.cancelButton` on
-/// this transport for those reasons, so neither reaches this driver. `liveness.progress: message`
-/// is not refused: it resolves like anywhere else and does nothing here, because the surface it
-/// asks for is one of the trait defaults this impl leaves alone.
 #[async_trait]
 impl ChatDriver for WhatsappDriver {
     async fn reply(
@@ -1035,9 +920,6 @@ impl ChatDriver for WhatsappDriver {
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
-        // Refuse every locally knowable failure before uploading or sending any part. A lease
-        // reports decoded length from at most two stored tail bytes on a blocking worker. Payloads
-        // are still read one at a time immediately before upload; retention counts stored bytes.
         if images
             .decoded_lengths()
             .await?
@@ -1126,7 +1008,6 @@ mod tests {
         )
     }
 
-    /// The receive span the listener would have opened for this delivery.
     fn received() -> Span {
         receive_span(ChatTransportKind::Whatsapp)
     }
@@ -1185,7 +1066,6 @@ mod tests {
             "hub.mode=subscribe&hub.challenge=x",
             "hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=x",
             "hub.mode=subscribe&hub.mode=subscribe&hub.verify_token=verify&hub.challenge=x",
-            // A malformed escape now survives the parse as literal text; `%zz` is not `subscribe`.
             "hub.mode=%zz&hub.verify_token=verify&hub.challenge=x",
         ] {
             let response =
@@ -1391,12 +1271,6 @@ mod tests {
         );
     }
 
-    /// Only a message whose sender is one of the delivery's own contacts is answered.
-    ///
-    /// Two shapes at once, because the rule is positive rather than a list of things to refuse: a
-    /// group payload, where `from` is the group and the contact is the human inside it, and a
-    /// delivery naming no contact for its sender at all — a shape this gateway cannot answer even
-    /// though it carries neither of the two group keys.
     #[test]
     fn a_message_whose_sender_is_not_a_contact_of_the_delivery_is_dropped() {
         let group = json!({
@@ -1435,7 +1309,6 @@ mod tests {
         );
     }
 
-    /// `liveness.mode: off` leaves the transport exactly as reply-only as it was.
     #[test]
     fn liveness_off_withholds_the_target_rather_than_the_capability() {
         let mut state = state();
@@ -1667,8 +1540,6 @@ mod tests {
         assert_eq!(body["text"]["preview_url"], false);
     }
 
-    /// A 200 that is not JSON is what an interposed proxy or a captive portal returns, and it is
-    /// indistinguishable from a missing field unless the parse error survives the call.
     #[tokio::test]
     async fn a_graph_response_that_is_not_json_keeps_the_parse_error() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1755,12 +1626,8 @@ mod tests {
                 .is_err()
         );
         server.await.expect("one server task");
-        // The mock accepted exactly one connection. `reply` has no retry loop, so an unknown
-        // post-transmission outcome cannot create a second visible message.
     }
 
-    /// The one WhatsApp counting unit, exercised through the shared splitter: Meta counts scalars,
-    /// so 4,096 crabs are one message here where the same text is two on a UTF-16 ceiling.
     fn split(text: &str) -> Vec<String> {
         split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
     }
@@ -1792,8 +1659,6 @@ mod tests {
         assert!(broken[0].ends_with('\n'), "a line boundary is preferred");
         assert_eq!(broken.concat(), lines);
 
-        // One rule for every transport: Meta refuses an empty message body exactly as Slack and
-        // Discord do, so an empty answer is a visible placeholder rather than a delivery failure.
         assert_eq!(split(""), vec!["[empty response]".to_owned()]);
     }
 
@@ -1852,8 +1717,6 @@ mod tests {
                 .build()
                 .expect("client"),
         };
-        // The session's own outbound bound is twice the WhatsApp ceiling, so this length is
-        // reachable from an ordinary answer rather than only from abuse.
         let answer = format!("BEGIN{}END", "x".repeat(MAX_WHATSAPP_TEXT_CHARS));
         driver
             .reply(
@@ -1876,7 +1739,6 @@ mod tests {
         assert_eq!(log.admit(Refusal::Signature, start), Some(0));
         assert_eq!(log.admit(Refusal::Signature, start), None);
         assert_eq!(log.admit(Refusal::Signature, start), None);
-        // A different reason is never hidden by a noisy one.
         assert_eq!(log.admit(Refusal::Saturated, start), Some(0));
         assert_eq!(
             log.admit(Refusal::Signature, start + REFUSAL_LOG_WINDOW),
@@ -1944,10 +1806,6 @@ mod tests {
         );
     }
 
-    /// A loopback Graph endpoint that answers `count` requests and hands back what it was sent.
-    ///
-    /// Hand-rolled like the reply mocks above: what is under test is the exact request Meta
-    /// receives, and a real socket carrying real bytes is the only thing that proves one.
     fn graph_mock(
         count: usize,
         status: u16,
@@ -2025,12 +1883,10 @@ mod tests {
         }
     }
 
-    /// The body of one request, as the Graph endpoint parsed it.
     fn body(request: &str) -> Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json body")
     }
 
-    /// Meta has no typing endpoint: the indicator rides the read receipt, so one call does both.
     #[tokio::test]
     async fn typing_is_the_read_receipt_and_the_indicator_in_one_call() {
         let (endpoint, server) = graph_mock(1, 200, r#"{"success":true}"#);
@@ -2057,9 +1913,6 @@ mod tests {
         assert_eq!(sent["typing_indicator"], json!({ "type": "text" }));
     }
 
-    /// Meta documents no renewal, so what this pins is the request rather than the outcome: every
-    /// 20 seconds the same call goes out again, and whether it restarts Meta's 25-second dismissal
-    /// is the one thing only a live WhatsApp Business number can answer.
     #[tokio::test]
     async fn a_running_session_re_posts_the_same_indicator_request() {
         let (endpoint, server) = graph_mock(2, 200, r#"{"success":true}"#);
@@ -2079,8 +1932,6 @@ mod tests {
         );
     }
 
-    /// A message identifier Meta will not accept is the likely live failure, and it arrives as a
-    /// 400 rather than as a body to interpret.
     #[tokio::test]
     async fn a_refused_indicator_surfaces_the_graph_status() {
         let (endpoint, server) = graph_mock(
@@ -2100,8 +1951,6 @@ mod tests {
         server.await.expect("server");
     }
 
-    /// A 200 whose body does not say `success` is the Graph API disagreeing with itself; the
-    /// indicator was not shown, so the call did not succeed.
     #[tokio::test]
     async fn an_indicator_is_not_shown_unless_graph_says_so() {
         let (endpoint, server) = graph_mock(1, 200, r#"{"messaging_product":"whatsapp"}"#);
@@ -2114,7 +1963,6 @@ mod tests {
         server.await.expect("server");
     }
 
-    /// `Some` means implemented, so the three surfaces WhatsApp lacks have to answer `None`.
     #[tokio::test]
     async fn whatsapp_offers_typing_and_nothing_else() {
         let driver = driver("http://127.0.0.1:1".to_owned());

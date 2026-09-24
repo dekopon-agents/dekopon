@@ -1,12 +1,3 @@
-//! Pins this crate's vendored HTTP contract to the canonical one, byte for byte.
-//!
-//! `wit/deps/http.wit` is a copy of `wit/http/http.wit`, which `wit-package.yml` builds into the
-//! `dekopon:http@1.1.0` package. A copy that has drifted generates bindings for
-//! an interface no broker implements, and a prefix check only proves the two agree on their first
-//! line. The comparison lives in `tests/` rather than in `src/` because the published package
-//! carries only `src/**`, `wit/**`, `README.md`, and `Cargo.toml` — the repository-relative path
-//! below does not exist for a crates.io consumer.
-
 #![allow(clippy::unwrap_used)]
 
 use dekopon_provider_http::HTTP_WIT;

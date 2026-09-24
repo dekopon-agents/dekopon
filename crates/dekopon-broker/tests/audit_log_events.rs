@@ -1,16 +1,3 @@
-//! Every broker decision is one structured log record inside the span that made it.
-//!
-//! The audit record used to exist only in the JSONL file: `policy_ids`, `policy_digest`,
-//! `policy_revision`, `secret_sink`, and the sanitized HTTP evidence reached no telemetry at all,
-//! so an operator holding a complete trace still could not say which policy authorized a write.
-//! These tests hold the emission and its containment together — the record carries the symbolic
-//! credential name and never the bytes behind it — and they run against a sink that writes
-//! nothing, because the log record is the audit record whether or not a file was configured.
-//!
-//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
-//! global dispatcher: a sibling test that reached these callsites with no subscriber installed
-//! would disable them for the whole process.
-
 #![allow(clippy::unwrap_used)]
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -28,7 +15,6 @@ use dekopon_core::{
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// The credential value the audit record must never carry, in any field, at any level.
 const SECRET: &str = "audit-log-record-must-never-see-this";
 
 const POLICY: &str = r#"
@@ -87,7 +73,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
-/// Every captured audit record: its fields and the span the subscriber attributed it to.
 fn audit_records(captured: &CaptureLayer) -> Vec<(String, Option<String>)> {
     captured
         .records()
@@ -104,7 +89,6 @@ fn audit_records(captured: &CaptureLayer) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// The one captured record whose fields contain every needle, with the span it was attributed to.
 fn only<'a>(
     records: &'a [(String, Option<String>)],
     needles: &[&str],
@@ -122,7 +106,6 @@ fn only<'a>(
     (fields.as_str(), parent.as_deref())
 }
 
-/// One allowed credentialed execution and one refusal, with no durable sink behind either.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let captured = CaptureLayer::workspace();
@@ -179,7 +162,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         )])
         .expect("credential store builds"),
         IdentityDirectory::empty(),
-        // No file: the record is the log event, and nothing else is configured to keep it.
         Arc::new(TraceOnlyAuditLog),
         BrokerLimits::default(),
     )
@@ -219,9 +201,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         "one decision each and one execution, no more and no fewer: {records:?}"
     );
 
-    // The allowed decision, inside the span that made it. An allow is appended after the
-    // authorization block has handed off, so it belongs to `broker.execute`; only a refusal is
-    // recorded from inside `broker.authorize`. Both descend from the caller's `broker.invocation`.
     let (decision, parent) = only(
         &records,
         &["broker.decision", "invocation.id=invoke-audited"],
@@ -235,7 +214,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         "actor.id=\"provider-test\"",
         "provider=\"http-probe\"",
         "policy.revision=\"policy-test\"",
-        // Every one of these reached the JSONL file and nothing else before this change.
         "policy.ids=\"http-fetch\"",
         "policy.digest=",
     ] {
@@ -245,7 +223,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         );
     }
 
-    // The terminal execution record, inside `broker.execute`.
     let (execution, parent) = only(&records, &["broker.execution"]);
     assert_eq!(parent, Some("broker.execute"), "{execution}");
     for expected in [
@@ -253,7 +230,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         "outcome=Succeeded",
         "effect=ReadOnly",
         "risk=Low",
-        // The symbolic name owner configuration holds, never the bytes behind it.
         "credential=\"fetch-token\"",
         "\\\"credentialInjected\\\":true",
         "output.digest=",
@@ -263,7 +239,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
             "{expected} missing: {execution}"
         );
     }
-    // The refusal, with no policy to name: deny-by-default is its own explanation.
     let (refusal, parent) = only(&records, &["invocation.id=invoke-refused"]);
     assert_eq!(parent, Some("broker.authorize"), "{refusal}");
     assert!(refusal.contains("decision.allowed=false"), "{refusal}");
@@ -273,7 +248,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     );
     assert!(!refusal.contains("policy.ids="), "{refusal}");
 
-    // Containment: no captured record — audit or otherwise — may carry the credential.
     let everything = captured.events_text() + &captured.spans_text();
     assert!(!everything.contains(SECRET), "a record leaked the secret");
     assert!(

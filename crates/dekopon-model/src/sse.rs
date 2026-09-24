@@ -1,43 +1,21 @@
-//! Shared chunk-safe Server-Sent Events framing for Codex and chat-completions consumers.
-//!
-//! All async adapters feed chunks through [`read_async_stream`]; offline transcript replay
-//! uses [`decode_transcript`] over the same [`SseFramer`]. All paths enforce [`MAX_STREAM_BYTES`],
-//! join multi-line `data:`, recognize `[DONE]` and deliver a final event without a blank line.
-//! Consumers interpret events and control early termination through callbacks. Cancellation drops
-//! the response body, including when a socket produces no events.
-
-/// Bound on how much of one streaming response is read.
-///
-/// The larger of the two bounds these transports used separately (the Codex path's 16 MiB `take`
-/// and the chat-completions path's 10 MiB `read_json` default), because a bound that is correct
-/// for one wire format and not the other would be a per-backend limit again. A response this size
-/// is already far past anything a chat surface can show; the point is that a socket that never
-/// stops talking cannot grow the process.
+/// Set to the larger of the two bounds these transports used separately, so there is one shared
+/// limit instead of a per-backend one, stopping an endless socket from growing the process.
 pub(crate) const MAX_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The sentinel both wire formats end a turn with.
 const DONE: &str = "[DONE]";
 
-/// One event read off the stream.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum SseEvent<'a> {
-    /// The event's `data` payload, with multi-line `data:` fields joined by newlines.
     Data(&'a str),
-    /// `data: [DONE]`: the server said the turn is over. Nothing after it is read.
     Done,
 }
 
-/// What one round of reading produced, without borrowing the buffer it produced it into.
 enum Filled {
-    /// `data` holds one event's payload.
     Payload,
-    /// The `[DONE]` sentinel arrived.
     Done,
-    /// The body ended.
     Eof,
 }
 
-/// Chunk framing shared by async HTTP and in-memory transcript replay.
 #[derive(Default)]
 pub(crate) struct SseFramer {
     buffer: Vec<u8>,
@@ -281,7 +259,6 @@ mod tests {
         assert_eq!(received, 1);
     }
 
-    /// Every payload the reader produced, and how the stream finished.
     fn read(body: &str) -> (Vec<String>, Option<SseEvent<'static>>) {
         let mut payloads = Vec::new();
         let mut finish = None;
@@ -298,9 +275,6 @@ mod tests {
 
     #[test]
     fn multi_line_data_fields_are_joined_with_newlines() {
-        // The SSE framing rule, and not a theoretical one: a chunk large enough to be split across
-        // two `data:` lines is still one JSON document, and joining the halves with anything but a
-        // newline — or not joining them at all — turns it into two malformed ones.
         let (payloads, finish) = read(concat!(
             "data: {\"first\": 1,\n",
             "data: \"second\": 2}\n",
@@ -329,8 +303,6 @@ mod tests {
 
     #[test]
     fn a_final_event_without_its_blank_line_still_arrives() {
-        // Half the recorded transcripts in this crate end this way, and so does a server that
-        // flushes its last chunk and closes.
         let (payloads, _) = read("data: {\"delta\":\"hi\"}\r\ndata: {\"delta\":\"!\"}");
 
         assert_eq!(payloads, vec!["{\"delta\":\"hi\"}\n{\"delta\":\"!\"}"]);
@@ -355,9 +327,6 @@ mod tests {
 
     #[test]
     fn a_stream_that_never_stops_is_refused_by_byte_count() {
-        // A peer-claimed length is a limit to enforce. The line is well formed and the payload is
-        // never returned, so the failure names the bound rather than surfacing as a parse error on
-        // a truncated document.
         let flood = format!(
             "data: {}\n\n",
             "x".repeat(usize::try_from(MAX_STREAM_BYTES).expect("bound fits this platform") + 1)

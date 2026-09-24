@@ -1,10 +1,6 @@
-//! Discord Gateway v10: an outbound event WebSocket paired with REST replies.
-//!
-//! The transport requests only `GUILD_MESSAGES` and `DIRECT_MESSAGES`. Discord exposes message
-//! content and attachments without the privileged Message Content intent in direct messages and in
-//! guild messages that mention the bot, which is exactly the surface this gateway routes. The
-//! structured `mentions` array decides whether a guild message is addressed; model-visible text is
-//! never trusted to make that decision.
+//! Requesting only the GUILD_MESSAGES and DIRECT_MESSAGES intents avoids needing Discord's
+//! privileged Message Content intent, since addressing is still decided by the authenticated
+//! mentions array, never message text.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -40,57 +36,27 @@ use crate::{
     },
 };
 
-/// Discord API version used by both REST and Gateway.
 const API_VERSION: u8 = 10;
-/// `GUILD_MESSAGES | DIRECT_MESSAGES`; Message Content is deliberately absent.
 const INTENTS: u64 = (1 << 9) | (1 << 12);
-/// Recent message identifiers retained across reconnect/resume redelivery.
 const DEDUP_CAPACITY: usize = 1024;
-/// Channel shapes this process remembers, which bounds one `GET /channels/{id}` per channel.
-///
-/// A channel's type and parent never change, so a hit is never stale; a restart pays one lookup
-/// per channel the bot is spoken to in, and a thread created mid-session is simply a new id.
 const CHANNEL_SHAPE_CAPACITY: usize = 512;
-/// Bound on the channel lookup, the same two seconds every cosmetic Discord call takes.
 const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-/// Discord permits at most ten attachments on one message.
 const MAX_ATTACHMENTS: usize = 10;
-/// Ceiling on one sender-controlled attachment filename.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
-/// Discord's Create Message content ceiling, enforced as UTF-16 code units.
 const MAX_MESSAGE_CHARS: usize = 2_000;
-/// The single-shard identify bucket permits one Identify every five seconds.
 const IDENTIFY_INTERVAL: Duration = Duration::from_secs(5);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Deadline on every cosmetic call: typing, a reaction, a progress edit, a press acknowledgment.
-///
-/// Shorter than Discord's three-second interaction deadline on purpose, so an acknowledgment that
-/// is going to fail fails while the press can still be answered another way.
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Renewal interval inside Discord's ten-second typing lease.
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
-/// Ceiling on a cosmetic 429 cooldown; past this the surface simply stays quiet.
 const MAX_LIVENESS_COOLDOWN: Duration = Duration::from_secs(300);
-/// Floor between two edits of one message, per the design's per-driver budget.
 const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(2);
-/// Ceiling on streamed text, leaving the 2,000-character message room for a trailer.
 const MAX_STREAM_CHARS: usize = 1_900;
-/// What a streamed message shows where the policy cut the model's text.
 const TRUNCATION_MARKER: char = '…';
-/// The gateway's own reaction, the same tangerine the Slack fallback uses.
 const LIVENESS_REACTION: &str = "🍊";
-/// What a pressed cancel button says while the policy is winning the cancellation race.
-///
-/// Fixed rather than an operator template: it is written by the transport reader, which has no
-/// session and no configuration, inside the three seconds Discord allows. The operator's own
-/// stopped line follows from the policy, which owns the templates and the terminal write.
 const STOPPING_ACK_TEXT: &str = "Stopping…";
-/// Prefix on the cancel button's `custom_id`, which carries the conversation it stops.
 const CANCEL_CUSTOM_ID_PREFIX: &str = "stop:";
-/// Discord's ceiling on an interaction token, which this transport puts in a URL path.
 const MAX_INTERACTION_TOKEN_BYTES: usize = 256;
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
-/// How many published rate-limit deadlines one Create Message waits out before sending anyway.
 const MAX_REST_COOLDOWN_WAITS: u8 = 2;
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
@@ -98,7 +64,6 @@ const FATAL_GATEWAY_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014]
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// One Discord bot connection.
 pub(crate) struct DiscordTransport {
     name: String,
     endpoint: String,
@@ -117,14 +82,8 @@ pub(crate) struct DiscordTransport {
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
     seen: SeenIds,
-    /// What each guild channel this bot has been spoken to in actually is.
     channels: ChannelShapes,
     pending: VecDeque<TransportEvent>,
-    /// `liveness.mode: native` — an inbound message carries coordinates for transient signals.
-    ///
-    /// One decision rather than the whole block: what Discord can render is fixed, and progress,
-    /// stream, cancel button, keep-alive, and templates are read by the policy that drives the
-    /// driver. Withholding the coordinates is how `off` keeps this transport reply-only.
     native: bool,
 }
 
@@ -142,7 +101,6 @@ enum PumpResult {
 }
 
 impl DiscordTransport {
-    /// Takes the bot-token value after the caller resolved its configured environment variable.
     pub(crate) fn new(
         name: String,
         endpoint: String,
@@ -183,7 +141,6 @@ impl DiscordTransport {
         })
     }
 
-    /// Discovers the current Gateway and the identify allowance for this bot.
     async fn discover(&mut self) -> Result<(), TransportError> {
         let response = self
             .http
@@ -194,7 +151,8 @@ impl DiscordTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         let body = decode(response).await?;
         let gateway = body["url"].as_str().ok_or(TransportError::Response)?;
-        // Validate before retaining a URL that will receive the bot token in Identify/Resume.
+        // Validate the gateway URL before retaining it, since the bot token is sent to it on
+        // Identify and Resume.
         let gateway = gateway_url(gateway, self.endpoint == DISCORD_ENDPOINT)?;
         let limit = &body["session_start_limit"];
         let remaining = limit["remaining"]
@@ -217,7 +175,6 @@ impl DiscordTransport {
         Ok(())
     }
 
-    /// Opens one Gateway socket and completes Identify or Resume through READY/RESUMED.
     async fn open(&mut self) -> Result<(), TransportError> {
         if self.gateway_url.is_none() || self.session_starts.is_none() {
             self.discover().await?;
@@ -225,9 +182,8 @@ impl DiscordTransport {
         let resuming = self.session_id.is_some() && self.sequence.is_some();
         if !resuming {
             self.clear_session();
-            // Wait/check before opening a socket so identify throttling cannot leave a live Gateway
-            // connection sitting without its heartbeat loop. The allowance itself is consumed only
-            // immediately before opcode 2 is sent, after TCP/TLS and Hello have succeeded.
+            // Identify throttling is checked before opening the socket so a throttled attempt never
+            // leaves a live connection without a heartbeat loop.
             self.prepare_identify().await?;
         }
         let raw_url = if resuming {
@@ -247,7 +203,6 @@ impl DiscordTransport {
         self.next_heartbeat = None;
         self.heartbeat_acked = true;
 
-        // Discord sends Hello first. No heartbeat deadline exists until it tells us the interval.
         loop {
             let frame = self.read_payload().await?;
             if frame["op"].as_u64() == Some(10) {
@@ -338,8 +293,6 @@ impl DiscordTransport {
             return Err(TransportError::Response);
         }
         let interval = Duration::from_millis(milliseconds);
-        // Discord requires a random first-heartbeat jitter in [0, interval), so a fleet that
-        // connected together does not heartbeat in lockstep.
         let jitter = Duration::from_millis(jitter_below(milliseconds));
         self.heartbeat_interval = Some(interval);
         self.next_heartbeat = Some(Instant::now() + jitter);
@@ -347,7 +300,6 @@ impl DiscordTransport {
         Ok(())
     }
 
-    /// Reads one JSON payload, sending scheduled heartbeats while the socket is otherwise idle.
     async fn read_payload(&mut self) -> Result<Value, TransportError> {
         loop {
             let frame = if let Some(deadline) = self.next_heartbeat {
@@ -436,23 +388,19 @@ impl DiscordTransport {
                         if !is_snowflake(user_id) {
                             return Err(TransportError::Response);
                         }
-                        // Validate before this URL can receive a future Resume token.
                         self.resume_gateway_url =
                             Some(gateway_url(resume, self.endpoint == DISCORD_ENDPOINT)?);
                         self.session_id = Some(session_id.to_owned());
                         self.identity = TransportIdentity {
                             user_id: Some(user_id.to_owned()),
                             // Discord mentions are identifier-based and the structured mentions
-                            // array is authoritative. A mutable display name is not a fallback.
+                            // array is authoritative; a mutable display name is never used as a
+                            // fallback.
                             handle: None,
                         };
                         Ok(PumpResult::Ready)
                     }
                     "RESUMED" => Ok(PumpResult::Ready),
-                    // One span per inbound message event, opened before the payload is read, so
-                    // the loop-prevention and addressing decisions that may drop it are inside the
-                    // event's own trace rather than nowhere. Heartbeats and session control open
-                    // none: they carry no message and route nothing.
                     "MESSAGE_CREATE" => {
                         let received = receive_span(ChatTransportKind::Discord);
                         let routed = self
@@ -467,10 +415,9 @@ impl DiscordTransport {
                             None => PumpResult::Idle,
                         })
                     }
-                    // A press of this gateway's own cancel button. The acknowledgment happens
-                    // here, in the reader, before the event is handed to the routing loop: that
-                    // hand-off waits on a 64-slot queue, and Discord gives an interaction three
-                    // seconds before it shows the presser "This interaction failed".
+                    // The cancel-button acknowledgment must happen before the event reaches the
+                    // routing loop, since that handoff blocks on a bounded queue and Discord fails
+                    // the interaction after three seconds.
                     "INTERACTION_CREATE" => {
                         let received = receive_span(ChatTransportKind::Discord);
                         let press =
@@ -480,8 +427,6 @@ impl DiscordTransport {
                         };
                         let driver = Arc::clone(&self.driver);
                         if let Err(error) = driver.ack(&press).instrument(received).await {
-                            // Still routed. A refused acknowledgment costs the presser the
-                            // immediate "Stopping…" on the button, not the cancellation itself.
                             tracing::debug!(
                                 event = "gateway_cancel_ack_failed",
                                 transport = %self.name,
@@ -493,7 +438,6 @@ impl DiscordTransport {
                     _ => Ok(PumpResult::Idle),
                 }
             }
-            // Discord may ask for an immediate heartbeat independently of the regular cadence.
             1 => {
                 self.send_heartbeat().await?;
                 if let Some(interval) = self.heartbeat_interval {
@@ -501,10 +445,7 @@ impl DiscordTransport {
                 }
                 Ok(PumpResult::Idle)
             }
-            // Reconnect and attempt Resume on the new connection.
             7 => Err(TransportError::Closed),
-            // Invalid Session says whether Resume is still meaningful. Either way Discord requires
-            // a randomized 1–5 second delay before the next handshake.
             9 => {
                 if frame["d"].as_bool() != Some(true) {
                     self.clear_session();
@@ -546,15 +487,6 @@ impl DiscordTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))
     }
 
-    /// Turns one Discord message event into a routable message, or `None` when it is not ours.
-    ///
-    /// Async for one reason: a guild message needs to know whether its channel is a channel, a
-    /// thread, or a forum post, and only `GET /channels/{id}` says so. That call is deliberately
-    /// the *last* thing this does — after the message-type, bot-authored, malformed, self-authored,
-    /// empty-content and redelivery drops — because `GUILD_MESSAGES` delivers every message in
-    /// every channel of every guild the bot is in. It still runs ahead of the addressing decision,
-    /// which the routing loop rather than this reader makes, so ambient traffic costs one
-    /// `GET /channels/{id}` per channel: [`ChannelShapes`] answers every message after the first.
     async fn routable(
         &mut self,
         message: &Value,
@@ -611,7 +543,6 @@ impl DiscordTransport {
                     .any(|mention| mention["id"].as_str() == self.identity.user_id.as_deref())
             });
         let conversation = match (direct, guild) {
-            // A Discord direct message has no guild above it, and the channel is the conversation.
             (true, _) => Conversation {
                 kind: ConversationKind::DirectMessage,
                 container: None,
@@ -620,8 +551,6 @@ impl DiscordTransport {
             },
             (false, Some(guild)) => {
                 let Some(shape) = self.channel_shape(channel_id).await else {
-                    // Never a guessed channel: a route or a grant pinned to a parent would be
-                    // decided against the wrong id, so the message is dropped with a reason.
                     received.record("drop.reason", "conversation-unresolved");
                     return Ok(None);
                 };
@@ -632,8 +561,6 @@ impl DiscordTransport {
                         id: channel_id.to_owned(),
                         thread: None,
                     },
-                    // A thread *is* a channel on Discord, so the thread coordinate is its own id
-                    // and the conversation id is the parent every route and grant names.
                     ChannelShape::Thread { parent } => Conversation {
                         kind: ConversationKind::Thread,
                         container: Some(guild.to_owned()),
@@ -642,17 +569,14 @@ impl DiscordTransport {
                     },
                 }
             }
-            // A guild message whose `guild_id` is not a snowflake is an envelope this gateway
-            // cannot place, and the container is required for every guild conversation.
             (false, None) => {
                 received.record("drop.reason", "conversation-unresolved");
                 return Ok(None);
             }
         };
         record_conversation(received, &conversation);
-        // Minted once here and carried onto the button, never re-derived: a thread is keyed on
-        // `parent:thread` while the channel a thread's message arrives in is the thread's own
-        // snowflake, so a `custom_id` built from that id alone names no session at all.
+        // The conversation id is minted once here and carried onto the button rather than
+        // re-derived, because a thread's channel id differs from its keyed parent-thread identity.
         let conversation_id = conversation.key();
 
         Ok(Some(InboundMessage {
@@ -669,9 +593,6 @@ impl DiscordTransport {
                 channel_id: channel_id.to_owned(),
                 reply_to: (!direct).then(|| message_id.to_owned()),
             },
-            // The message identifier rides along because the reaction goes on the message being
-            // answered rather than on the channel. Which surfaces are then used is the policy's
-            // decision from the rest of the block, not a second gate here.
             liveness: self.native.then(|| LivenessTarget::Discord {
                 channel_id: channel_id.to_owned(),
                 message_id: message_id.to_owned(),
@@ -688,15 +609,8 @@ impl DiscordTransport {
         }))
     }
 
-    /// What one guild channel is, from cache or from one bounded `GET /channels/{id}`.
-    ///
-    /// Never takes the driver's `rest_lock`: that lock serializes reply delivery, and a 429 on
-    /// Create Message must not stall the reader that also sends heartbeats. It honors the published
-    /// REST cooldown by staying quiet rather than waiting it out — a message the bot cannot place
-    /// is dropped with a reason, which is better than a reader parked behind a rate limit.
-    ///
-    /// `None` is "this gateway could not place the message": a transport failure, a non-2xx answer,
-    /// an unreadable body, or a channel type no route can name.
+    /// This never takes the driver's rest_lock, because that lock serializes replies and a 429 here
+    /// must not stall the reader that also sends heartbeats.
     async fn channel_shape(&mut self, channel_id: &str) -> Option<ChannelShape> {
         if let Some(shape) = self.channels.get(channel_id) {
             return Some(shape);
@@ -788,24 +702,13 @@ impl DiscordTransport {
         Some(shape)
     }
 
-    /// Reads one component interaction as a press of this gateway's own cancel button.
-    ///
-    /// Everything comes from the interaction envelope: the presser from `member.user` in a guild
-    /// or `user` in a direct message, the conversation from the `custom_id` this transport wrote
-    /// on the button itself, and the acknowledgment coordinates from the interaction. Whether the
-    /// presser is the person whose run this is remains the routing loop's comparison — only it
-    /// knows which subject registered the session on that conversation — and anyone else's press
-    /// is acknowledged and then ignored there.
-    ///
-    /// `Ok(None)` is a press this gateway did not put on screen, or an envelope missing a field
-    /// the acknowledgment needs; each records why on the receive span.
     fn cancel_press(
         &self,
         interaction: &Value,
         received: &Span,
     ) -> Result<Option<(CancelPress, CancelRequest)>, TransportError> {
-        // Interaction type 3 is a message component, and component type 2 is a button. Anything
-        // else is an application command or a modal this gateway never registered.
+        // Interaction type 3 is a message component and component type 2 is a button; anything else
+        // is an application command or modal this gateway never registered.
         if interaction["type"].as_u64() != Some(3)
             || interaction["data"]["component_type"].as_u64() != Some(2)
         {
@@ -822,8 +725,6 @@ impl DiscordTransport {
             received.record("drop.reason", "not-a-cancel-button");
             return Ok(None);
         };
-        // A guild interaction carries the presser under `member`; a direct message has no member
-        // object and carries the same user at the top level.
         let presser = if interaction["member"].is_null() {
             &interaction["user"]
         } else {
@@ -846,11 +747,6 @@ impl DiscordTransport {
             received.record("drop.reason", "malformed-envelope");
             return Ok(None);
         }
-        // The button lives on a message in the conversation it stops. A press arriving from
-        // anywhere else is a copy of the component, and stopping a run from another channel on
-        // the strength of it is not something this transport does. The channel it arrives in is
-        // the last segment of the key, because a Discord thread *is* a channel: a message inside
-        // one carries the thread's own snowflake while the conversation is `parent:thread`.
         let channel_id = key_channel(conversation_id);
         if interaction["channel_id"].as_str() != Some(channel_id) {
             received.record("drop.reason", "conversation-mismatch");
@@ -948,23 +844,13 @@ impl ChatTransport for DiscordTransport {
     }
 }
 
-/// What one guild channel turned out to be, which is all a conversation needs from Discord.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ChannelShape {
-    /// A guild text, voice, or announcement channel: the conversation is the channel itself.
     Channel,
-    /// A thread, a forum post, or an announcement thread; the parent is the routed conversation.
-    Thread {
-        /// The channel the thread hangs under.
-        parent: String,
-    },
+    Thread { parent: String },
 }
 
 impl ChannelShape {
-    /// Reads one `GET /channels/{id}` body, or `None` for a shape no route can name.
-    ///
-    /// A forum or media channel (15, 16) is never the channel a message is posted in — a post
-    /// inside one is its own thread, which arrives here as type 11 with the forum as its parent.
     fn of(channel: &Value) -> Option<Self> {
         match channel["type"].as_u64()? {
             0 | 2 | 5 => Some(Self::Channel),
@@ -979,10 +865,6 @@ impl ChannelShape {
     }
 }
 
-/// Bounded per-process memory of what each channel is.
-///
-/// Bounded rather than unbounded because a bot in a busy guild meets an unbounded number of
-/// transient threads; oldest-first eviction costs one repeat lookup and nothing else.
 struct ChannelShapes {
     order: VecDeque<String>,
     shapes: HashMap<String, ChannelShape>,
@@ -1014,30 +896,15 @@ impl ChannelShapes {
     }
 }
 
-/// REST and CDN half shared by all in-flight sessions on one Discord transport.
 pub(crate) struct DiscordDriver {
     endpoint: String,
     token: Redacted<String>,
     http: reqwest::Client,
     production: bool,
-    /// Serializes REST requests so reactive rate-limit waits cannot race each other.
-    ///
-    /// Held across one request and nothing else. Sleeping under it made one throttled or multi-chunk
-    /// reply block every other session's answer, and a model waiting on `fetch_chat_asset`, for as
-    /// long as [`MAX_RATE_LIMIT_WAIT`].
+    /// This lock is held across one request only, because sleeping under it for a whole reply
+    /// blocked every other session's answer and any in-flight attachment fetch.
     rest_lock: Mutex<()>,
-    /// When Discord's last 429 said Create Message may be tried again.
-    ///
-    /// Published rather than only slept on, so a second reply waits out the same deadline instead of
-    /// spending its own single retry rediscovering it.
     rest_cooldown_until: std::sync::Mutex<Option<Instant>>,
-    /// When Discord's last 429 on a cosmetic call said this transport may show something again.
-    ///
-    /// Shared by typing, the reaction, the progress message, and the streamed answer, because they
-    /// are one bot against one set of buckets: a 429 earned by an edit is a reason for the next
-    /// pulse to stay quiet too. None of them sleeps under the final-reply lock or delays an answer;
-    /// the cancel acknowledgment is the one call that ignores this, because a press has three
-    /// seconds and is not cosmetic.
     liveness_cooldown_until: std::sync::Mutex<Option<Instant>>,
 }
 
@@ -1062,11 +929,6 @@ impl ChatDriver for DiscordDriver {
             return Err(TransportError::Response);
         }
         let mut accepted = false;
-        // The REST lock is taken per request rather than per reply. One answer's chunks still
-        // arrive in order because this loop awaits each one, and no second answer can be posting
-        // into the same conversation at the same time — admission control serializes a
-        // conversation against itself. What the reply-wide lock did add was making every other
-        // session, and every attachment refresh, wait out this reply's rate limit.
         for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
             .into_iter()
             .enumerate()
@@ -1083,8 +945,6 @@ impl ChatDriver for DiscordDriver {
                     "fail_if_not_exists": false,
                 });
             }
-            // Every attachment rides the first post, which is where a person reads the answer
-            // and where Discord shows them together as one message.
             let result = if images.is_empty() {
                 self.create_message(channel_id, &body).await
             } else {
@@ -1103,9 +963,6 @@ impl ChatDriver for DiscordDriver {
     fn typing(&self) -> Option<&dyn TypingLease> {
         Some(self)
     }
-
-    // `status` keeps the default `None`: Discord has no durable working/idle state of its own.
-    // Typing is the lease, and the progress message is what says more than that.
 
     fn progress(&self) -> Option<&dyn ProgressMessage> {
         Some(self)
@@ -1133,8 +990,6 @@ impl TypingLease for DiscordDriver {
     async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
         let (channel_id, _, _) = discord_coordinates(target)?;
         if self.cooling_down() {
-            // A pulse suppressed by Discord's own retry deadline is the cooldown working, not a
-            // failure for the policy to count against the lease.
             return Ok(());
         }
         self.liveness_empty(self.http.post(format!(
@@ -1231,8 +1086,6 @@ impl TextStream for DiscordDriver {
     ) -> Result<MessageRef, TransportError> {
         let content = one_message(&shown_text(text)).ok_or(TransportError::Response)?;
         match message {
-            // Cumulative edits: the answer grows in the message the first delta posted, which is
-            // also the message `finalize` turns into the answer.
             Some(message) => {
                 self.edit_liveness_message(message, &content, cancel)
                     .await?;
@@ -1267,9 +1120,8 @@ impl CancelButton for DiscordDriver {
         if !is_snowflake(interaction_id) || !is_interaction_token(interaction_token) {
             return Err(TransportError::Response);
         }
-        // Type 7 is UPDATE_MESSAGE: one call that answers the interaction and rewrites the message
-        // it was on, so the button is gone with the acknowledgment. A deferred update would need a
-        // second call to remove it, and between the two a second press is possible.
+        // Type 7, UPDATE_MESSAGE, answers the interaction and rewrites the message in one call, so
+        // a deferred update cannot leave a window for a second press.
         let body = json!({
             "type": 7,
             "data": {
@@ -1278,10 +1130,6 @@ impl CancelButton for DiscordDriver {
                 "allowed_mentions": allowed_mentions_none(),
             }
         });
-        // Deliberately not a cosmetic call: it takes no cooldown, because a press has three
-        // seconds and a 429 earned by typing must not swallow the one thing the presser is
-        // waiting for. The interaction token authenticates this request, so the bot token stays
-        // off it.
         let response = self
             .http
             .post(format!(
@@ -1304,7 +1152,6 @@ impl CancelButton for DiscordDriver {
 }
 
 impl DiscordDriver {
-    /// Whether Discord's last cosmetic 429 is still asking this transport to stay quiet.
     fn cooling_down(&self) -> bool {
         self.liveness_cooldown_until
             .lock()
@@ -1312,12 +1159,6 @@ impl DiscordDriver {
             .is_some_and(|until| until > Instant::now())
     }
 
-    /// Sends one cosmetic request: this transport's own short deadline, no REST lock, and a 429
-    /// published as a cooldown every other cosmetic call waits out.
-    ///
-    /// Deliberately not `send_rest`: that lock exists to serialize Create Message against itself,
-    /// and a progress edit taking it would make every other session's answer wait behind a
-    /// cosmetic call — the exact thing the lock was narrowed to avoid.
     async fn liveness_send(
         &self,
         request: reqwest::RequestBuilder,
@@ -1359,7 +1200,6 @@ impl DiscordDriver {
         Ok(response)
     }
 
-    /// Sends one cosmetic request whose success carries no body worth reading.
     async fn liveness_empty(&self, request: reqwest::RequestBuilder) -> Result<(), TransportError> {
         let response = self.liveness_send(request).await?;
         if response.status().is_success() {
@@ -1370,7 +1210,6 @@ impl DiscordDriver {
         })
     }
 
-    /// Posts one message this driver will edit later, answering with the reference to edit it by.
     async fn post_liveness_message(
         &self,
         target: &LivenessTarget,
@@ -1379,8 +1218,6 @@ impl DiscordDriver {
     ) -> Result<MessageRef, TransportError> {
         let (channel_id, inbound_message_id, conversation_id) = discord_coordinates(target)?;
         let mut body = liveness_body(content, cancel, conversation_id);
-        // Tied to the question it answers, exactly as the reply is: in a busy channel a floating
-        // status line says nothing about which message it belongs to.
         body["message_reference"] = json!({
             "message_id": inbound_message_id,
             "fail_if_not_exists": false,
@@ -1411,7 +1248,6 @@ impl DiscordDriver {
         })
     }
 
-    /// Rewrites one message this driver posted, mentions suppressed on every edit.
     async fn edit_liveness_message(
         &self,
         message: &MessageRef,
@@ -1435,12 +1271,6 @@ impl DiscordDriver {
         .await
     }
 
-    /// Turns a progress or streamed message into the answer in place.
-    ///
-    /// `Err` is not a delivery failure: it tells the policy to delete this message and use
-    /// [`ChatDriver::reply`] instead. The two things this cannot do in place say so by code — an
-    /// answer past Discord's ceiling, which would have to become several messages, and one
-    /// carrying attachments, which only a fresh Create Message can upload.
     async fn finalize_in_place(
         &self,
         message: &MessageRef,
@@ -1451,15 +1281,12 @@ impl DiscordDriver {
                 code: "answer-has-attachments".to_owned(),
             });
         }
-        // Bound to a local first: a `let ... else` drops the temporaries in its own initializer,
-        // so the chunk this borrows has to outlive the statement that matched it.
         let chunks = split_message(&reply.text, MAX_MESSAGE_CHARS, TextUnit::Utf16);
         let [content] = chunks.as_slice() else {
             return Err(TransportError::Service {
                 code: "answer-too-long".to_owned(),
             });
         };
-        // The stop control goes with the answer: the run it would have cancelled is over.
         self.edit_liveness_message(message, content, false).await
     }
 
@@ -1486,7 +1313,6 @@ impl DiscordDriver {
                         code: "http-429".to_owned(),
                     });
                 }
-                // The wait itself happens in `post_message`, outside the REST lock.
                 self.publish_rest_cooldown(retry.wait);
                 retried = true;
                 continue;
@@ -1503,9 +1329,6 @@ impl DiscordDriver {
         }
     }
 
-    /// The bytes are moved into the multipart body rather than copied into it, and the one retry a
-    /// 429 allows reads them again from their disk leases instead of a second copy being held
-    /// through an upload that usually succeeds.
     async fn create_message_with_images(
         &self,
         channel_id: &str,
@@ -1553,9 +1376,6 @@ impl DiscordDriver {
                     .map_err(|_| TransportError::Response)?;
                 form = form.part(format!("files[{index}]"), part);
             }
-            // Attachments go out through the same lock discipline as a text chunk: one more Create
-            // Message against the same route, and a reply that posts files is exactly the reply most
-            // worth not holding a shared lock through.
             let response = self
                 .send_rest(
                     self.http
@@ -1578,7 +1398,6 @@ impl DiscordDriver {
                         code: "http-429".to_owned(),
                     });
                 }
-                // The wait itself happens in `send_rest`, outside the REST lock.
                 self.publish_rest_cooldown(retry.wait);
                 retried = true;
                 continue;
@@ -1602,7 +1421,6 @@ impl DiscordDriver {
         }
     }
 
-    /// Sends one JSON Create Message, serialized against this transport's other REST calls.
     async fn post_message(
         &self,
         url: &str,
@@ -1618,19 +1436,10 @@ impl DiscordDriver {
         .await
     }
 
-    /// Sends one prepared REST request, serialized against this transport's other REST calls.
-    ///
-    /// The lock covers the request and nothing else. Any rate-limit wait is served *before* it is
-    /// taken, so a throttled reply holds up neither another session's answer nor a mid-prompt
-    /// attachment refresh.
     async fn send_rest(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, TransportError> {
-        // Bounded rather than a wait loop: at most one deadline is outstanding when the call
-        // arrives, and at most one more can be published while it queues on the lock. Past that it
-        // sends and lets Discord answer, because a reply parked forever is not an improvement on a
-        // reply that is refused.
         for _ in 0..MAX_REST_COOLDOWN_WAITS {
             let Some(wait) = self.rest_cooldown() else {
                 break;
@@ -1644,7 +1453,6 @@ impl DiscordDriver {
             .map_err(|source| TransportError::Request(Box::new(source)))
     }
 
-    /// Publishes Discord's own retry deadline so every later request waits it out before the lock.
     fn publish_rest_cooldown(&self, wait: Duration) {
         *self
             .rest_cooldown_until
@@ -1652,7 +1460,6 @@ impl DiscordDriver {
             .expect("Discord REST cooldown") = Some(Instant::now() + wait);
     }
 
-    /// How long Discord's last 429 still asks Create Message to wait, if at all.
     fn rest_cooldown(&self) -> Option<Duration> {
         let until = (*self
             .rest_cooldown_until
@@ -1688,9 +1495,9 @@ impl AssetFetcher for DiscordDriver {
         Box::pin(async move {
             match self.download_asset(&url, max_bytes).await {
                 Ok(bytes) => Ok(bytes),
-                // Discord attachment URLs are signed and expire. Refresh the source message only
-                // on the statuses that can mean the signature is stale; the bot token goes to the
-                // pinned REST origin and never to the CDN.
+                // Discord attachment URLs are signed and expire, so the source message is refreshed
+                // only on statuses meaning the signature is stale; the bot token never reaches the
+                // CDN.
                 Err(TransportError::Service { code })
                     if matches!(code.as_str(), "http-401" | "http-403" | "http-404") =>
                 {
@@ -1721,8 +1528,6 @@ impl DiscordDriver {
                 code: format!("http-{}", response.status().as_u16()),
             });
         }
-        // The declared length only sizes the buffer, clamped to the ceiling; what refuses an
-        // oversized asset is the cutoff applied while reading.
         let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
         let mut body = asset_buffer(response.content_length(), limit);
         while let Some(chunk) = response
@@ -1750,8 +1555,6 @@ impl DiscordDriver {
         if !is_snowflake(channel_id) || !is_snowflake(message_id) || !is_snowflake(attachment_id) {
             return Err(TransportError::Response);
         }
-        // Serialized with the reply path, but only for the request: reading the body back is this
-        // session's own business and no other caller's rate limit.
         let response = {
             let _guard = self.rest_lock.lock().await;
             self.http
@@ -1823,13 +1626,6 @@ fn pending_assets(
         .collect()
 }
 
-/// The channel, the message, and the conversation one liveness target names, refusing another
-/// service's coordinates.
-///
-/// The message identifier is the inbound message on an inbound target and the gateway's own
-/// message on a press, which is why both are validated here and neither is assumed. The
-/// conversation is [`Conversation::key`] as the transport minted it, and it is what goes on the
-/// button rather than the channel beside it.
 fn discord_coordinates(target: &LivenessTarget) -> Result<(&str, &str, &str), TransportError> {
     let LivenessTarget::Discord {
         channel_id,
@@ -1848,7 +1644,6 @@ fn discord_coordinates(target: &LivenessTarget) -> Result<(&str, &str, &str), Tr
     Ok((channel_id, message_id, conversation_id))
 }
 
-/// Whether a value is a Discord [`Conversation::key`]: one channel snowflake, or `parent:thread`.
 fn is_conversation_key(value: &str) -> bool {
     value.split_once(':').map_or_else(
         || is_snowflake(value),
@@ -1856,29 +1651,24 @@ fn is_conversation_key(value: &str) -> bool {
     )
 }
 
-/// The channel a Discord conversation key is addressed at: its thread, or the channel itself.
-///
-/// A thread is a channel on Discord, so `parent:thread` is answered, edited, and pressed in
-/// `thread`; the parent is what a route or a grant names and never what REST is called with.
+/// A Discord thread is itself a channel for REST purposes; always address the thread, never its
+/// parent, or calls fail.
 fn key_channel(conversation_id: &str) -> &str {
     conversation_id
         .split_once(':')
         .map_or(conversation_id, |(_, thread)| thread)
 }
 
-/// The body of every message this gateway posts or edits for liveness.
 fn liveness_body(content: &str, cancel: bool, conversation_id: &str) -> Value {
     json!({
         "content": content,
-        // On every edit, not only the first post: Discord re-notifies a channel when an edit
-        // introduces a mention, and neither a progress line nor streamed model text is a reason
-        // to ping anyone.
+        // Discord re-notifies a channel when an edit introduces a mention, so mentions are
+        // suppressed on every edit, not only the first post.
         "allowed_mentions": allowed_mentions_none(),
         "components": cancel_components(cancel, conversation_id),
     })
 }
 
-/// Mentions nothing, whatever the text turns out to contain.
 fn allowed_mentions_none() -> Value {
     json!({
         "parse": [],
@@ -1888,16 +1678,6 @@ fn allowed_mentions_none() -> Value {
     })
 }
 
-/// The stop control, or the empty list that removes one a previous edit left behind.
-///
-/// Style 4 is Danger, which is what a destructive control looks like on Discord. The `custom_id`
-/// carries the conversation the run belongs to, because an interaction arrives with the message
-/// it was on and nothing else this gateway wrote: the reader reads the conversation back out of
-/// it, and the routing loop decides whether the presser is the person who may stop that run.
-///
-/// Nothing truncates the identifier and nothing needs to: [`discord_coordinates`] has already
-/// refused anything that is not a [`Conversation::key`] of snowflakes, and the prefix plus two of
-/// the widest `u64` with a separator is still under half of Discord's hundred-byte ceiling.
 fn cancel_components(cancel: bool, conversation_id: &str) -> Value {
     if !cancel {
         return json!([]);
@@ -1913,11 +1693,6 @@ fn cancel_components(cancel: bool, conversation_id: &str) -> Value {
     }])
 }
 
-/// The cumulative text as the message shows it: a cut the policy made says so with a marker.
-///
-/// Rendering the cut is the driver's because only the driver knows what its surface has room for.
-/// The marker goes on before [`one_message`] counts, so Discord's ceiling still decides what is
-/// sent and the extra character cannot push a full message over it.
 fn shown_text(text: &StreamedText) -> String {
     let mut shown = text.text.as_str().to_owned();
     if text.truncated {
@@ -1926,19 +1701,12 @@ fn shown_text(text: &StreamedText) -> String {
     shown
 }
 
-/// What Discord will take of one progress or streamed text, counted the way Discord counts.
-///
-/// The policy bounds this text in characters and Discord's ceiling is UTF-16 code units, so astral
-/// text can still arrive over it. The first chunk is the part that fits; the rest is dropped
-/// because a progress surface is a summary and the answer carries the whole text. `None` is
-/// unreachable for any input `split_message` accepts, and is refused rather than guessed at.
 fn one_message(text: &str) -> Option<String> {
     split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
         .into_iter()
         .next()
 }
 
-/// Serializes one request body.
 #[allow(
     clippy::map_err_ignore,
     reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys and \
@@ -1948,10 +1716,8 @@ fn encode(body: &Value) -> Result<Vec<u8>, TransportError> {
     serde_json::to_vec(body).map_err(|_| TransportError::Response)
 }
 
-/// Percent-encodes one URL path segment, which is how Discord takes a Unicode reaction.
-///
-/// Deliberately not `form_urlencoded`: that spelling encodes a space as `+`, which in a path
-/// segment is a literal plus rather than a space.
+/// This deliberately avoids form_urlencoded, which encodes a space as a plus sign, a literal plus
+/// rather than a space in a URL path segment.
 fn percent_encoded(value: &str) -> String {
     value
         .bytes()
@@ -1965,11 +1731,6 @@ fn percent_encoded(value: &str) -> String {
         .collect()
 }
 
-/// Whether a service-issued interaction token can be interpolated into a request path unchanged.
-///
-/// The token authenticates the acknowledgment rather than being this daemon's own credential, but
-/// it is still service-supplied text that goes into a URL: a value carrying a slash, a query, a
-/// fragment, or whitespace would address an endpoint other than the callback it names.
 fn is_interaction_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_INTERACTION_TOKEN_BYTES
@@ -1998,8 +1759,6 @@ fn is_fatal(error: &TransportError) -> bool {
     )
 }
 
-/// Adds the fixed v10 JSON query after proving the service-selected URL cannot receive the token
-/// outside Discord (or the explicit loopback test boundary).
 fn gateway_url(raw: &str, production: bool) -> Result<String, TransportError> {
     #[allow(
         clippy::map_err_ignore,
@@ -2068,7 +1827,6 @@ fn client() -> Result<reqwest::Client, TransportError> {
         .map_err(|source| TransportError::Request(Box::new(source)))
 }
 
-/// Decodes a Discord REST response while retaining only a numeric API or HTTP error code.
 async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
     let status = response.status();
     let bytes = response
@@ -2118,11 +1876,8 @@ mod unit_tests {
         },
     };
 
-    /// Discord's ceiling on a component `custom_id`, which the button's identifier fits by
-    /// construction rather than by a check.
     const MAX_CUSTOM_ID_BYTES: usize = 100;
 
-    /// What one request reached the loopback service as.
     #[derive(Debug)]
     struct Recorded {
         method: String,
@@ -2131,11 +1886,6 @@ mod unit_tests {
         body: Value,
     }
 
-    /// A loopback stand-in for Discord: answers each request with the next canned response, in
-    /// order, and hands back everything it was sent.
-    ///
-    /// Mocked on loopback rather than against the service, which is also the only endpoint
-    /// [`crate::config`] will accept outside production.
     fn loopback(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<Vec<Recorded>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in");
         let address = listener.local_addr().expect("the bound address");
@@ -2198,7 +1948,6 @@ mod unit_tests {
         (format!("http://{address}"), server)
     }
 
-    /// A transport that publishes liveness, which is what every test here is about.
     fn transport(name: &str) -> DiscordTransport {
         DiscordTransport::new(
             name.to_owned(),
@@ -2212,7 +1961,6 @@ mod unit_tests {
         .expect("transport builds")
     }
 
-    /// An endpoint nothing listens on: the tests that use it assert no request is ever made.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
 
     fn driver(endpoint: &str) -> DiscordDriver {
@@ -2242,13 +1990,10 @@ mod unit_tests {
         }
     }
 
-    /// Operator-authored progress text, which only the policy module otherwise renders.
     fn progress_text(text: &str) -> ProgressText {
         ProgressText::for_test(text)
     }
 
-    /// The cumulative text of a recorded stream, taken through the model crate's own parser
-    /// because that parser is the only thing that builds model text from bytes.
     fn streamed() -> StreamedText {
         let events = dekopon_model::events_from_transcript(
             dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
@@ -2333,9 +2078,6 @@ mod unit_tests {
         assert_eq!(chunks.concat(), answer);
     }
 
-    /// The reaction goes on the inbound message as a percent-encoded path segment, and the typing
-    /// pulse is a plain POST under the transport's own short deadline. Both carry the bot token
-    /// and neither takes the reply path's REST lock.
     #[tokio::test]
     async fn typing_and_the_reaction_are_the_calls_discord_documents() {
         let (endpoint, server) = loopback(vec![
@@ -2373,10 +2115,6 @@ mod unit_tests {
         assert_eq!(recorded[2].path, recorded[1].path);
     }
 
-    /// The progress message is one post that answers the question it belongs to, then edits of
-    /// that same message, then a deletion. Every one of them suppresses mentions, because Discord
-    /// re-notifies a channel when an edit introduces one, and carries the danger-style stop button
-    /// whose `custom_id` names the conversation the run belongs to.
     #[tokio::test]
     async fn a_progress_message_is_posted_edited_and_deleted() {
         let (endpoint, server) = loopback(vec![
@@ -2424,8 +2162,6 @@ mod unit_tests {
         assert_eq!(recorded[2].path, "/api/v10/channels/100/messages/555");
     }
 
-    /// A streamed answer is the same message growing: the first delta posts it and every later one
-    /// edits it, so the person reads one message rather than a wall of fragments.
     #[tokio::test]
     async fn a_streamed_answer_grows_in_one_message() {
         let (endpoint, server) = loopback(vec![
@@ -2462,8 +2198,6 @@ mod unit_tests {
         }
     }
 
-    /// A cut the policy made is rendered rather than hidden: the marker is the only thing on the
-    /// message that says the answer on screen is not all of it.
     #[tokio::test]
     async fn a_cut_stream_carries_the_truncation_marker() {
         let (endpoint, server) = loopback(vec![(
@@ -2491,9 +2225,6 @@ mod unit_tests {
         );
     }
 
-    /// A finished answer replaces the message in place and takes the stop button with it. The two
-    /// answers that cannot land in place name which way they did not fit, because that is what
-    /// tells the policy to delete and post instead of reporting a failed delivery.
     #[tokio::test]
     async fn an_answer_finalizes_in_place_or_says_why_it_cannot() {
         let (endpoint, server) = loopback(vec![(200, "{}".to_owned())]);
@@ -2545,9 +2276,6 @@ mod unit_tests {
         );
     }
 
-    /// The acknowledgment is one type 7 UPDATE_MESSAGE carrying the stopping line and no
-    /// components, so the button is gone with the answer to the interaction and a second press
-    /// cannot arrive. The interaction token authenticates it, so the bot token stays off it.
     #[tokio::test]
     async fn a_press_is_acknowledged_by_rewriting_the_message_it_was_on() {
         let (endpoint, server) = loopback(vec![(204, String::new())]);
@@ -2585,8 +2313,6 @@ mod unit_tests {
         );
     }
 
-    /// An acknowledgment token from another service, or one whose value would leave the callback
-    /// path, is refused before any request is built.
     #[tokio::test]
     async fn an_acknowledgment_token_that_is_not_discords_is_refused() {
         let driver = driver(UNREACHABLE);
@@ -2623,9 +2349,6 @@ mod unit_tests {
         assert!(!is_interaction_token("has/slash"));
     }
 
-    /// A press becomes a cancel request only when it is this gateway's own button, pressed on the
-    /// conversation its `custom_id` names. The presser's identity rides the request in canonical
-    /// form; whether that subject is the one whose run this is belongs to the routing loop.
     #[test]
     fn only_this_gateways_button_becomes_a_cancel_request() {
         let mut transport = transport("elote");
@@ -2676,7 +2399,6 @@ mod unit_tests {
             "the press names the message the button was on"
         );
 
-        // A direct message carries the presser at the top level instead of under a member.
         let direct = press(json!({ "member": null, "user": { "id": "42" } }));
         assert!(
             transport
@@ -2686,15 +2408,10 @@ mod unit_tests {
         );
 
         for ignored in [
-            // An application command, not a component.
             press(json!({ "type": 2 })),
-            // Some other component this gateway never wrote.
             press(json!({ "data": { "component_type": 2, "custom_id": "vote:100" } })),
-            // A copy of the component pressed somewhere other than the conversation it stops.
             press(json!({ "channel_id": "101" })),
-            // An envelope with nothing to acknowledge with.
             press(json!({ "token": null })),
-            // The bot's own identity, which is not a person pressing anything.
             press(json!({ "member": { "user": { "id": "999" } } })),
         ] {
             assert!(
@@ -2707,12 +2424,6 @@ mod unit_tests {
         }
     }
 
-    /// A thread's stop button names `parent:thread`, which is the key the registry holds.
-    ///
-    /// A Discord thread *is* a channel, so a message inside one arrives carrying the thread's own
-    /// snowflake while the conversation is the parent with the thread beside it. A `custom_id`
-    /// built from the channel alone named a session nobody had, and a reader that insisted on a
-    /// bare snowflake refused the corrected one.
     #[tokio::test]
     async fn a_stop_pressed_in_a_thread_names_the_conversation_routing_minted() {
         let mut transport = transport("elote");
@@ -2720,7 +2431,6 @@ mod unit_tests {
             user_id: Some("999".to_owned()),
             handle: None,
         };
-        // Seeded rather than fetched: what this pins is the key, not the lookup that finds it.
         transport.channels.insert(
             "100".to_owned(),
             ChannelShape::Thread {
@@ -2763,7 +2473,6 @@ mod unit_tests {
                     "id": "300",
                     "token": "interaction-token-1",
                     "type": 3,
-                    // The press arrives from the thread, which is the channel it is posted in.
                     "channel_id": "100",
                     "data": { "component_type": 2, "custom_id": custom_id },
                     "message": { "id": "555" },
@@ -2779,9 +2488,6 @@ mod unit_tests {
         assert_eq!(request.via, CancelVia::Button);
     }
 
-    /// The `custom_id` the button is built with stays inside Discord's ceiling for the widest
-    /// conversation key the service can mint — a thread, which is two snowflakes and a separator —
-    /// which is why nothing along the way truncates it.
     #[test]
     fn a_stop_buttons_custom_id_fits_discords_ceiling() {
         let components = cancel_components(true, &format!("{0}:{0}", u64::MAX));
@@ -2794,9 +2500,6 @@ mod unit_tests {
         assert_eq!(percent_encoded("a-b_c.d~e"), "a-b_c.d~e");
     }
 
-    /// Every message this transport drops says why on its own receive span, because a silent drop
-    /// is a triage with nothing to read: the answer to "why did the bot not reply" has to be in
-    /// the trace the receipt already opened.
     #[tokio::test]
     async fn every_dropped_message_records_why_on_its_receive_span() {
         let mut transport = transport("elote");
@@ -2833,7 +2536,6 @@ mod unit_tests {
             drop(span);
             assert_reason(&capture, reason);
         }
-        // A direct message needs no channel lookup, so this whole test stays off the network.
         let span = receive_span(ChatTransportKind::Discord);
         assert!(
             transport
@@ -2860,7 +2562,6 @@ mod unit_tests {
         assert_reason(&capture, "duplicate");
     }
 
-    /// A guild message is placed by one bounded lookup, and an unplaceable one is dropped by name.
     #[tokio::test]
     async fn a_guild_message_that_cannot_be_placed_is_dropped_as_conversation_unresolved() {
         let mut transport = transport("elote");
@@ -2873,7 +2574,6 @@ mod unit_tests {
             .with(capture.clone())
             .set_default();
 
-        // `UNREACHABLE` is a closed loopback port, so the lookup fails rather than guessing.
         let span = receive_span(ChatTransportKind::Discord);
         let routed = transport
             .routable(
@@ -2890,7 +2590,6 @@ mod unit_tests {
         drop(span);
         assert_reason(&capture, "conversation-unresolved");
 
-        // The cache is what bounds the lookup to one per channel, and a hit needs no request.
         transport.channels.insert(
             "100".to_owned(),
             ChannelShape::Thread {
@@ -2918,7 +2617,6 @@ mod unit_tests {
         assert_eq!(routed.conversation.key(), "50:100");
     }
 
-    /// One Discord message event, with the fields a test varies overridden.
     fn message(overrides: Value) -> Value {
         let mut message = json!({
             "type": 0,
@@ -2942,9 +2640,6 @@ mod unit_tests {
         );
     }
 
-    /// A routed message carries the coordinates every liveness surface needs: the channel to post
-    /// in and the message to react to. `liveness.mode: off` withholds them, which is how this
-    /// transport stays exactly as reply-only as it was.
     #[tokio::test]
     async fn a_routed_message_carries_its_liveness_coordinates() {
         let identity = TransportIdentity {

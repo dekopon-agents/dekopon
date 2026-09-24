@@ -150,8 +150,6 @@ where
         let mut fields = FieldCapture::default();
         values.record(&mut fields);
         let terminal = fields.rendered.contains("process.outcome=");
-        // A later record is prefixed with the span's fixed kind so a test can correlate a
-        // terminal `process.outcome` with the node it belongs to.
         let kind = self
             .0
             .kinds
@@ -277,8 +275,6 @@ async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
     let capture = CaptureLayer::global();
     let terminal = capture.terminal("cancel-test");
     let (started_sender, started_receiver) = oneshot::channel();
-    // The parked receiver's sender stays alive for the whole test, so the process can only leave
-    // its await through the abort.
     let (_park_sender, park_receiver) = oneshot::channel::<()>();
     let (handle, signal) = CancelSignal::pair();
     let process = process_fn(
@@ -345,7 +341,6 @@ async fn a_never_signal_leaves_a_cancellable_process_joined() {
     let process = process_fn(
         ProcessMetadata::cancellable("never-signal-test", CancelSignal::never()),
         || async {
-            // Yield so execute observes the closed signal while the node still runs.
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
@@ -406,14 +401,11 @@ async fn dropping_every_cancel_handle_does_not_cancel() {
 
 #[test]
 fn a_synchronous_boundary_reads_the_request_without_awaiting_it() {
-    // The read a caller makes when it has to decide *now* whether to start work at all: a
-    // cancelled signal must answer before there is a process to supervise, and stay answered.
     let (handle, signal) = CancelSignal::pair();
     assert!(!signal.is_cancelled());
     handle.cancel();
     assert!(signal.is_cancelled());
     assert!(signal.is_cancelled(), "a request never lapses");
-    // Dropping every handle is "run to completion", so the answer is still no.
     drop(handle);
     assert!(signal.is_cancelled());
     assert!(!CancelSignal::never().is_cancelled());

@@ -1,8 +1,5 @@
-//! Bounded local broker wire protocol and unprivileged Unix-socket client.
-//!
-//! Wire requests carry no trusted identity or authorization. A server derives
-//! `dekopon_broker::AuthenticatedContext` from operating-system peer credentials and trusted
-//! mapping before dispatching these untrusted requests.
+//! Wire requests carry no trusted identity; the server derives authenticated context from OS peer
+//! credentials before dispatching them.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -59,73 +56,40 @@ use tokio::{
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-/// Current local broker protocol identifier.
 pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha2";
-/// Default complete request/response frame bound (2 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
-/// Hard ceiling accepted for any configured frame bound (16 MiB).
 pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-/// Default connection/read/write deadline.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Stable failure code: the connected peer is not mapped by broker policy.
 pub const ERROR_UNAUTHENTICATED: &str = "unauthenticated";
-/// Stable failure code: the request frame could not be decoded.
 pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
-/// Stable failure code: the broker could not complete the request and **nothing executed**.
-///
-/// No provider work began, so the same work may be resubmitted under a fresh invocation
-/// identifier without risking a duplicate external effect.
+/// Nothing executed for this failure, so the same work may safely be resubmitted under a fresh
+/// invocation identifier.
 pub const ERROR_BROKER_UNAVAILABLE: &str = "broker-unavailable";
 
-/// A loaded provider failed to rewrite a command word.
-///
-/// Deliberately opaque: the guest's own failure text is provider-controlled and reaches no caller
-/// through this path. An operator correlates the code with the audit event that names the word.
+/// The provider's own failure text is deliberately opaque to the caller; an operator correlates the
+/// code with the audit event naming the word.
 pub const ERROR_PROVIDER: &str = "provider-error";
-/// Stable failure code: provider work may already have completed and its outcome was not audited.
-///
-/// The external effect may have taken place. The request must **not** be resubmitted under any
-/// identifier; the broker's audit log records are the only account of what happened.
+/// The external effect may already have happened, so the request must never be resubmitted; the
+/// audit log is the only record of it.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
-/// Stable pre-execution storage failure codes. No provider work began, so a corrected request may
-/// use a fresh invocation identifier.
 pub const ERROR_STORAGE_QUOTA: &str = "storage-quota";
 pub const ERROR_STORAGE_BUSY: &str = "storage-busy";
 pub const ERROR_STORAGE_TIMEOUT: &str = "storage-timeout";
 pub const ERROR_STORAGE_CORRUPT: &str = "storage-corrupt";
 pub const ERROR_STORAGE_IO: &str = "storage-io";
 
-/// Stable failure code: a bounded broker resource is exhausted and nothing executed.
-///
-/// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: an embedding's bounded in-memory audit log is full
-/// and does not evict. A new identifier cannot fix capacity within that lifetime. Nothing executed,
-/// but clients must not retry automatically.
+/// Nothing executed, but a full audit log cannot be fixed by a new identifier, so clients must not
+/// retry automatically.
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
-/// Exact protocol version carried by every envelope.
-///
-/// One variant, so there is no negotiation: every envelope is strict-decoded and any other string
-/// fails to deserialize. That is the seam. `v1alpha2` replaced `v1alpha1` when the per-attestation
-/// operations collapsed into one operation per verb carrying an optional [`Attestation`]; a mixed
-/// pair now refuses at the envelope in *both* directions instead of only when a client is older
-/// than the operation it names.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolVersion {
-    /// Strict JSON protocol with one operation per verb.
     #[serde(rename = "dekopon.dev/broker/v1alpha2")]
     V1Alpha2,
 }
 
-/// W3C `traceparent`: the run's [`TraceId`] plus the client span that should parent broker work.
-///
-/// The trace identifier inside it is the run's one correlation identifier — the value the broker
-/// writes into every audit record and every span it opens — and the parent span identifier is the
-/// telemetry half, which changes from call to call while the trace does not.
-///
-/// Like every other request field this is untrusted. It reaches telemetry correlation and audit
-/// correlation and nothing else: never an authorization or routing input. A caller that
-/// sends someone else's trace identifier joins their own records to that trace and gains no
-/// authority by it.
+/// This field is untrusted and reaches only telemetry and audit correlation; it is never an
+/// authorization or routing input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceParent {
     trace: TraceId,
@@ -134,12 +98,6 @@ pub struct TraceParent {
 }
 
 impl TraceParent {
-    /// Builds a `traceparent` from raw identifier bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TraceParentError::ZeroTraceId`] or [`TraceParentError::ZeroParentId`] when an
-    /// identifier is all zeroes, which W3C defines as invalid.
     pub const fn new(
         trace_id: [u8; 16],
         parent_id: [u8; 8],
@@ -158,25 +116,21 @@ impl TraceParent {
         })
     }
 
-    /// The run's trace identifier.
     #[must_use]
     pub const fn trace(&self) -> TraceId {
         self.trace
     }
 
-    /// 16-byte trace identifier.
     #[must_use]
     pub const fn trace_id(&self) -> [u8; 16] {
         self.trace.to_bytes()
     }
 
-    /// 8-byte identifier of the span that should parent the broker's work.
     #[must_use]
     pub const fn parent_id(&self) -> [u8; 8] {
         self.parent_id
     }
 
-    /// W3C trace flags; bit 0 is the sampled flag.
     #[must_use]
     pub const fn flags(&self) -> u8 {
         self.flags
@@ -197,8 +151,6 @@ impl std::str::FromStr for TraceParent {
     type Err = TraceParentError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Exactly four hyphen-separated fields. Longer forms belong to future `traceparent`
-        // versions this protocol does not accept.
         let mut fields = value.split('-');
         let (Some(version), Some(trace), Some(parent), Some(flags), None) = (
             fields.next(),
@@ -214,8 +166,6 @@ impl std::str::FromStr for TraceParent {
                 version: version.to_owned(),
             });
         }
-        // The trace half is the run's own identifier, so it is read by the one type that owns
-        // that grammar rather than by a second copy of it here.
         let trace = trace.parse::<TraceId>().map_err(|error| match error {
             TraceIdError::Zero => TraceParentError::ZeroTraceId,
             TraceIdError::Malformed => TraceParentError::Malformed,
@@ -228,7 +178,6 @@ impl std::str::FromStr for TraceParent {
     }
 }
 
-/// Decodes exact-width lowercase hex into `output`.
 #[allow(
     clippy::map_err_ignore,
     reason = "the guards below already proved exact width and all-lowercase ASCII hex, so the \
@@ -264,67 +213,35 @@ impl<'de> Deserialize<'de> for TraceParent {
     }
 }
 
-/// Failures raised while parsing a `traceparent`.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TraceParentError {
-    /// The value was not four hyphen-separated fields of the expected widths.
     #[error("traceparent must be `00-<32 hex>-<16 hex>-<2 hex>`")]
     Malformed,
-    /// The version field named a version this protocol does not implement.
     #[error("unsupported traceparent version {version:?}; only `00` is accepted")]
-    UnsupportedVersion {
-        /// Version field as received.
-        version: String,
-    },
-    /// The trace identifier was all zeroes.
+    UnsupportedVersion { version: String },
     #[error("traceparent trace identifier must not be all zeroes")]
     ZeroTraceId,
-    /// The parent span identifier was all zeroes.
     #[error("traceparent parent identifier must not be all zeroes")]
     ZeroParentId,
 }
 
-/// Unprivileged invocation fields accepted from a broker client.
-///
-/// Actor and principal are deliberately absent: the server derives them from transport identity.
+/// Actor and principal are deliberately absent here; the server derives them from transport
+/// identity, not client input.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationRequest {
-    /// Client-selected identifier that binds an attestation to this proposal and names it in audit.
     pub id: InvocationId,
-    /// Requested exact capability.
     pub capability: CapabilityId,
-    /// The run's trace, and the client span that should parent broker telemetry for this call.
-    ///
-    /// Mandatory, because the broker's audit record for this invocation is correlated by the trace
-    /// identifier inside it and a record with no correlation identifier is the inverse of what the
-    /// audit log is for. A client that exports no telemetry still sends one: `tracing-opentelemetry`
-    /// installs its layer only when an OTLP exporter is configured, so a non-exporting process has
-    /// no span context to read at all — valid or otherwise — and mints a session-local trace
-    /// instead of omitting the field. Nothing off-box ever receives that minted trace from the
-    /// client; it still ties one session's audit records to each other, which is the whole job of
-    /// the identifier on a host that exports nothing.
-    ///
-    /// A minted context arrives with `sampled` set even though its author exports nothing. The
-    /// broker adopts this as a remote parent, and under the OpenTelemetry SDK's default
-    /// `ParentBased(AlwaysOn)` sampler an unsampled parent makes every span beneath it
-    /// non-recording — which would silence an exporting broker behind a non-exporting client. The
-    /// flag says what the receiver should do, not what the sender did.
-    ///
-    /// Untrusted like every other request field: it reaches telemetry and audit correlation and
-    /// nothing else. A malformed value is a decode failure rather than a silent default, because
-    /// attaching broker spans to a trace that does not exist is worse than refusing the frame.
+    /// This field is untrusted and mandatory; a malformed value fails decoding rather than
+    /// defaulting, since an invalid trace is worse than refusing the frame.
     pub trace_parent: TraceParent,
-    /// Optional typed, untrusted intent to use a public DRN in a broker-native sink.
-    ///
-    /// The field is proposal data, not a credential or bearer grant. Providers never receive it.
+    /// This field is proposal data only, never a credential or bearer grant, and providers never
+    /// receive it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_use: Option<SecretUseProposal>,
-    /// Capability-specific untrusted input.
     pub input: Value,
 }
 
-/// Transport family that authenticated one chat scope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatTransportKind {
@@ -347,10 +264,6 @@ impl fmt::Display for ChatTransportKind {
     }
 }
 
-/// Bounded transport-derived conversation scope.
-///
-/// The conversation is minted canonical by the transport that authenticated the message, so this
-/// claim carries the exact values a grant and a Cedar policy compare against.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatScopeClaim {
@@ -366,7 +279,6 @@ impl fmt::Debug for ChatScopeClaim {
 }
 
 impl ChatScopeClaim {
-    /// Defensive wire bounds common to every service-specific canonical form.
     #[must_use]
     pub fn is_bounded(&self) -> bool {
         self.conversation.is_bounded()
@@ -429,37 +341,13 @@ where
     deserializer.deserialize_string(Visitor::<MAXIMUM>)
 }
 
-/// One on-behalf-of claim accompanying an operation, absent when a peer speaks as itself.
-///
-/// Attestation shape is one axis, not one operation per shape. A subject-only claim carries no
-/// `scope` and derives the legacy attested context; a chat claim adds the transport scope that
-/// invocation-bound chat authority is checked against. Both are the same claim about the same two
-/// things — which authenticated external identity the peer is relaying, and which agent is
-/// orchestrating for it — so both travel in this one structure and every operation takes it
-/// optionally.
-///
-/// It is a *claim*, never authority. It carries no principal, because the subject-to-principal
-/// mapping is owner-controlled broker state; the broker honors the claim only when the connected
-/// peer's configuration grants attestor authority over the subject's namespace, and the broker
-/// alone performs the mapping. It is a separate structure rather than fields on
-/// [`InvocationRequest`] so that an invocation payload stays identity-free whether or not one
-/// accompanies it.
-///
-/// `invocation` is present exactly for the operations that carry a proposal, where it must equal
-/// that proposal's identifier. The two already travel in one frame, so this is defense in depth
-/// against a future refactor separating them; a disagreement — or an identifier on an operation
-/// with no proposal to bind to — is a decode-level protocol error rather than a policy decision.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Attestation {
-    /// The transport-authenticated external subject the operation is made on behalf of.
     pub subject: ExternalSubject,
-    /// The named agent orchestrating on the subject's behalf.
     pub agent: AgentId,
-    /// The claimed chat transport scope; absent for a subject-only attestation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<ChatScopeClaim>,
-    /// The proposal identifier this claim is bound to; absent when no proposal accompanies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<InvocationId>,
 }
@@ -471,7 +359,6 @@ impl fmt::Debug for Attestation {
 }
 
 impl Attestation {
-    /// Builds a subject-only claim for an operation that carries no proposal.
     #[must_use]
     pub const fn for_subject(subject: ExternalSubject, agent: AgentId) -> Self {
         Self {
@@ -482,7 +369,6 @@ impl Attestation {
         }
     }
 
-    /// Builds a chat-scoped claim for an operation that carries no proposal.
     #[must_use]
     pub const fn for_chat(subject: ExternalSubject, agent: AgentId, scope: ChatScopeClaim) -> Self {
         Self {
@@ -493,7 +379,6 @@ impl Attestation {
         }
     }
 
-    /// The same claim bound to the proposal it accompanies.
     #[must_use]
     pub fn bound_to(&self, invocation: InvocationId) -> Self {
         Self {
@@ -502,26 +387,20 @@ impl Attestation {
         }
     }
 
-    /// Whether the claimed scope, if any, is inside the defensive wire bounds.
-    ///
-    /// Structural only: it consults no grant and decides nothing about authority.
+    /// This checks structure only; it consults no grant and decides nothing about authority.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         self.scope.as_ref().is_none_or(ChatScopeClaim::is_bounded)
     }
 
-    /// Whether this claim is bound to exactly the proposal it travelled with.
     #[must_use]
     pub fn binds(&self, invocation: &InvocationId) -> bool {
         self.invocation.as_ref() == Some(invocation)
     }
 }
 
-/// Service-specific identity of the inbound delivery whose answer was accepted.
-///
-/// The tagged shape prevents a Slack timestamp, Discord snowflake, Telegram message, WhatsApp
-/// message ID, or local nonce from being replayed under another transport kind. Scope fields are checked
-/// against the separately attested chat scope before any namespace is derived.
+/// The tagged shape stops one transport's identifier from being replayed as another's; scope is
+/// checked against the attested chat scope first.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -579,12 +458,6 @@ impl fmt::Debug for DeliveryIdentity {
 }
 
 impl DeliveryIdentity {
-    /// Whether this delivery belongs to the conversation the claim separately attested.
-    ///
-    /// Service coordinates only: a Slack timestamp cannot be replayed under a Discord snowflake,
-    /// and a message in one conversation cannot be answered as a message in another. The
-    /// conversation's own grammar is [`Conversation::is_canonical_for`]'s job and is not repeated
-    /// here; this decides the join between the two.
     #[must_use]
     pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
         let conversation = &scope.conversation;
@@ -593,8 +466,8 @@ impl DeliveryIdentity {
                 channel == &conversation.id && canonical_slack_timestamp(timestamp)
             }
             (Self::Discord { channel, message }, ChatTransportKind::Discord) => {
-                // A Discord thread *is* the channel its messages are posted in, so the delivery
-                // names the thread while the conversation's `id` names the parent.
+                // A Discord thread is itself the channel its messages post in, so delivery names
+                // the thread while the conversation's id names the parent.
                 channel == conversation.api_channel(ChatTransportKind::Discord)
                     && canonical_unsigned_decimal(channel)
                     && canonical_unsigned_decimal(message)
@@ -736,7 +609,6 @@ where
     deserializer.deserialize_option(OptionalServiceDecimal)
 }
 
-/// Exact turn accepted by a transport and proposed once for model-hidden recording.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DeliveredTurnRequest {
@@ -756,8 +628,6 @@ impl fmt::Debug for DeliveredTurnRequest {
 }
 
 impl DeliveredTurnRequest {
-    /// Validates the complete text bound. Delivery canonicalization additionally needs the
-    /// separately attested scope and is checked by the broker.
     #[must_use]
     pub fn is_bounded(&self) -> bool {
         self.user
@@ -774,7 +644,6 @@ where
     deserialize_bounded_string::<D, { 64 * 1024 }>(deserializer)
 }
 
-/// Broker-derived optional memory surface for one freshly authorized chat scope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatMemorySurface {
@@ -782,31 +651,21 @@ pub struct ChatMemorySurface {
     pub prompt_note: String,
 }
 
-/// One capability visible to an authenticated broker client.
-///
-/// Routing and effect metadata are overwritten from trusted exact policy. Description and input
-/// schema remain bounded provider-supplied model metadata and are not authorization inputs.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AvailableCapability {
-    /// Trusted selected provider.
     pub provider: ProviderId,
-    /// Client-visible capability metadata.
     pub capability: ProviderCapability,
 }
 
-/// One strict untrusted client request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RequestEnvelope {
-    /// Exact wire protocol version.
     pub api_version: ProtocolVersion,
-    /// Requested operation.
     pub request: BrokerRequest,
 }
 
 impl RequestEnvelope {
-    /// Creates a capability-inspection request for the peer, or for one attested context.
     #[must_use]
     pub const fn capabilities(attestation: Option<Attestation>) -> Self {
         Self {
@@ -815,8 +674,6 @@ impl RequestEnvelope {
         }
     }
 
-    /// Creates a command-word run request carrying the value piped into the word, if any, under the
-    /// run's trace.
     #[must_use]
     pub const fn run_command(
         attestation: Option<Attestation>,
@@ -837,7 +694,6 @@ impl RequestEnvelope {
         }
     }
 
-    /// Creates an invocation proposal request, optionally attested on behalf of a subject.
     #[must_use]
     pub const fn invoke(
         attestation: Option<Attestation>,
@@ -856,7 +712,6 @@ impl RequestEnvelope {
         }
     }
 
-    /// Creates the dedicated model-hidden post-acceptance record proposal.
     #[must_use]
     pub const fn record_delivered_turn(
         attestation: Attestation,
@@ -869,101 +724,39 @@ impl RequestEnvelope {
     }
 }
 
-/// Operations accepted by the local broker.
-///
-/// One operation per verb. Whether a caller speaks as its own authenticated peer, on behalf of an
-/// external subject, or inside a bounded chat scope is [`Attestation`] — a field on the operation,
-/// not a separate operation per shape. The `operation` tag stays strict-decoded, so an operation a
-/// broker does not know is a clean protocol error rather than a misread proposal.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerRequest {
-    /// Lists the capabilities and command words allowed for this context.
-    ///
-    /// Without an attestation this is the authenticated peer's own listing, which is never
-    /// refused. With one it is the attested context's, honored only for peers whose
-    /// owner-controlled configuration carries an attestor grant covering the subject's namespace
-    /// — and any other peer receives a stable refusal that discloses nothing, not even whether
-    /// the subject is mapped. A chat-scoped claim additionally answers with the durable-memory
-    /// surface when all three of its grants are effective.
     Capabilities {
-        /// The on-behalf-of claim, or `None` to speak as the connected peer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// Runs one command word as the command-line program its provider declared.
-    ///
-    /// Deliberately not gated on the caller's grants. The run is a pure function inside the
-    /// declaring component — no imports, bounded by fuel and timeout — and what it returns is a
-    /// *proposal*, authorized on exactly the path any other proposal takes, or text the guest
-    /// rendered itself, which authorizes nothing. Gating it would add a principal check to a
-    /// function that grants nothing; what stops an unauthorized caller is the authorization of the
-    /// invocation that follows, not the arithmetic that shaped it. An attestation, when one is
-    /// supplied, is still validated as a claim: a caller cannot run a word under a subject or
-    /// scope the broker refuses it.
     RunCommand {
-        /// The on-behalf-of claim, or `None` to speak as the connected peer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
-        /// The run's trace, and the client span that should parent the broker's `broker.command_run`
-        /// span.
-        ///
-        /// Mandatory and validated exactly as [`InvocationRequest::trace_parent`] is: the word, its
-        /// arguments, and what the guest answered belong to the same trace as the proposal that
-        /// follows, and a frame that omits the parent or sends a malformed one fails to decode
-        /// rather than landing the run in a trace of its own. Untrusted, and read only for
-        /// correlation.
-        ///
-        /// Renamed by hand because an enum's `rename_all` names its variants, not their fields, and
-        /// this key must read exactly as it does on an invocation.
         #[serde(rename = "traceParent")]
         trace_parent: TraceParent,
-        /// The command word, which must belong to a loaded provider.
         word: String,
-        /// Arguments as the script supplied them, **without** the word itself.
-        ///
-        /// The word travels in its own field because the broker selects the declaring provider by
-        /// it before the guest runs, so repeating it here would give the guest a second, editable
-        /// copy of a routing decision already made.
         argv: Vec<String>,
-        /// The value the script piped into the word, already rendered to text by the shell's
-        /// display rule; absent when nothing was piped.
-        ///
-        /// It rides this frame under [`FrameLimits::max_frame_bytes`], and the broker host counts
-        /// it with the argv against its own input bound before a store exists, so an oversized
-        /// value is refused twice and preallocated for nowhere.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin: Option<String>,
     },
-    /// Submits one untrusted invocation proposal.
     Invoke {
-        /// The on-behalf-of claim, bound to `invocation.id`, or `None` for a direct proposal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
-        /// Proposal fields without principal or actor claims.
         invocation: InvocationRequest,
-        /// Conversation asset metadata, never asset bytes.
         #[serde(default)]
         assets: Vec<AssetRow>,
-        /// Deliveries still permitted in this turn.
         #[serde(default, rename = "sendsRemaining")]
         sends_remaining: u8,
     },
-    /// Dedicated model-hidden recording operation after transport acceptance.
-    ///
-    /// Its own operation on purpose: the chat-memory record route is unreachable through
-    /// [`BrokerRequest::Invoke`] and [`BrokerRequest::RunCommand`] whatever attestation
-    /// accompanies them, so recording cannot be reached by a proposal a model shaped.
     RecordDeliveredTurn {
-        /// The chat-scoped claim, bound to `turn.id`. A subject-only claim cannot record.
         attestation: Attestation,
-        /// Typed post-acceptance fields the broker turns into the proposal itself.
         turn: DeliveredTurnRequest,
     },
 }
 
 impl BrokerRequest {
-    /// Checks the typed invocation's metadata bound after strict decoding.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if matches!(self, Self::Invoke { assets, .. } if assets.len() > MAX_ASSET_ROWS) {
             return Err(ProtocolError::TooManyAssetRows);
@@ -972,95 +765,63 @@ impl BrokerRequest {
     }
 }
 
-/// Maximum conversation metadata rows on an invocation.
 pub const MAX_ASSET_ROWS: usize = 32;
-/// Maximum input references or attached outputs on one frame.
 pub const MAX_DESCRIPTORS_PER_FRAME: usize = 5;
 
-/// One row of the conversation's asset table; never asset bytes.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AssetRow {
-    /// Conversation-local number.
     pub id: u64,
-    /// Declared media type.
     pub content_type: String,
-    /// Representation of the stored bytes.
     pub encoding: AssetEncoding,
-    /// Stored byte count, or unknown until the chat file is fetched.
     pub bytes: Option<u64>,
-    /// Source label, not authority.
     pub origin: String,
-    /// Whether delivery was already requested.
     pub sent: bool,
 }
 
-/// Representation of bytes in an asset descriptor.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AssetEncoding {
-    /// Unencoded bytes.
     Identity,
-    /// Canonical standard base64.
     Base64,
 }
 
-/// An attached output, indexed into the frame's passed descriptors.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NewAsset {
-    /// Zero-based descriptor index, equal to this output's position.
     pub descriptor: u32,
-    /// Declared media type.
     pub content_type: String,
-    /// Representation of the stored bytes.
     pub encoding: AssetEncoding,
-    /// Stored byte count.
     pub bytes: u64,
-    /// Lowercase hex SHA-256 digest.
     pub sha256: String,
 }
 
-/// Conversation metadata and referenced inputs for one invocation.
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub struct InvokeAssets {
-    /// The conversation's metadata table.
     pub rows: Vec<AssetRow>,
-    /// Deliveries still permitted in this turn.
     pub sends_remaining: u8,
-    /// Read-only inputs in distinct reference order.
     pub descriptors: Vec<OwnedFd>,
 }
 
-/// A completed invocation together with its asset changes.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct AssetInvocationOutcome {
-    /// Terminal invocation result.
     pub result: InvocationResult,
-    /// Attached output metadata in descriptor order.
     pub attached: Vec<NewAsset>,
-    /// Removed conversation numbers.
     pub removed: Vec<u64>,
-    /// Numbers marked for delivery.
     pub sent: Vec<u64>,
-    /// Read-only attached output descriptors.
     pub descriptors: Vec<OwnedFd>,
 }
 
-/// One strict public broker response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ResponseEnvelope {
-    /// Exact wire protocol version.
     pub api_version: ProtocolVersion,
-    /// Operation result.
     pub response: BrokerResponse,
 }
 
 impl ResponseEnvelope {
-    /// Creates a successful capability response.
     #[must_use]
     pub const fn capabilities(
         capabilities: Vec<AvailableCapability>,
@@ -1076,7 +837,6 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Creates a successful freshly authorized chat capability response.
     #[must_use]
     pub const fn chat_capabilities(
         capabilities: Vec<AvailableCapability>,
@@ -1093,7 +853,6 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Creates the response to a command-word run: a proposal, rendered text, or a decline.
     #[must_use]
     pub const fn command_run(result: CommandRunOutcome) -> Self {
         Self {
@@ -1102,7 +861,6 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Creates a completed invocation response, including denials and provider failures.
     #[must_use]
     pub const fn invocation(
         result: InvocationResult,
@@ -1121,7 +879,6 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Creates a stable protocol/server failure response without internal details.
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -1134,66 +891,37 @@ impl ResponseEnvelope {
     }
 }
 
-/// Public response variants.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerResponse {
-    /// Capabilities visible under exact policy for the authenticated peer.
     Capabilities {
-        /// Deterministically sorted capabilities.
         capabilities: Vec<AvailableCapability>,
-        /// Command words this context may use, sorted.
-        ///
-        /// Carried here rather than fetched separately so a session costs one round trip, and
-        /// filtered the same way the capabilities are: a word appears only when policy allows this
-        /// context at least one capability of the provider declaring it. A principal granted
-        /// nothing receives an empty vocabulary rather than a map of the deployment.
-        ///
-        /// Defaulted so a client of this version reads a broker that predates it.
         #[serde(default)]
         command_words: Vec<String>,
-        /// Present only for an effective all-three chat-memory surface.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_memory: Option<ChatMemorySurface>,
     },
-    /// Terminal invocation result.
     Invocation {
-        /// Denied, failed, or succeeded result with public evidence.
         result: InvocationResult,
-        /// Outputs in exactly the passed descriptor order.
         #[serde(default)]
         attached: Vec<NewAsset>,
-        /// Conversation assets removed by this invocation.
         #[serde(default)]
         removed: Vec<u64>,
-        /// Conversation assets marked for delivery.
         #[serde(default)]
         sent: Vec<u64>,
     },
-    /// One command word run to completion: the answer to [`BrokerRequest::RunCommand`].
-    ///
-    /// The guest's own outcome shape travels intact — a proposal to submit, text it rendered with
-    /// the exit status it chose, or a decline carrying its stable code and message — so the
-    /// script sees exactly what the upstream command-line tool would have printed.
     CommandRun {
-        /// What the provider answered.
         result: CommandRunOutcome,
     },
-    /// Protocol or broker infrastructure failure.
     Error {
-        /// Stable public machine code.
         code: String,
-        /// Bounded non-sensitive message.
         message: String,
     },
 }
 
-/// Independent bound and deadline for one complete frame operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
-    /// Maximum JSON payload bytes, excluding the four-byte prefix.
     pub max_frame_bytes: usize,
-    /// Deadline for a complete prefix+payload read or write.
     pub io_timeout: Duration,
 }
 
@@ -1207,7 +935,6 @@ impl Default for FrameLimits {
 }
 
 impl FrameLimits {
-    /// Validates a configured bound before any I/O or allocation.
     pub fn validate(self) -> Result<Self, ProtocolError> {
         if self.max_frame_bytes == 0 || self.max_frame_bytes > HARD_MAX_FRAME_BYTES {
             return Err(ProtocolError::InvalidFrameLimit {
@@ -1221,16 +948,11 @@ impl FrameLimits {
     }
 }
 
-/// Length prefix carried at the head of every frame.
 const FRAME_PREFIX_BYTES: usize = 4;
-/// Payload bytes allocated up front, however large the peer's prefix claims the frame is.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Reads and strictly decodes one complete length-delimited JSON frame.
-///
-/// Allocation follows the bytes that actually arrive rather than the length the peer claims: a
-/// connected peer that sends only a prefix and then stalls holds one chunk until the deadline, not
-/// a whole frame's worth of zeroed memory per connection.
+/// Allocation follows bytes that actually arrive rather than the peer's claimed length, so a
+/// stalling peer holds one chunk, not a whole frame's memory.
 pub async fn read_frame<R, T>(reader: &mut R, limits: FrameLimits) -> Result<T, ProtocolError>
 where
     R: AsyncRead + Unpin,
@@ -1267,13 +989,8 @@ where
     serde_json::from_slice(&bytes).map_err(|source| ProtocolError::Deserialize { source })
 }
 
-/// Reads exactly `length` payload bytes into a buffer that never holds more than them.
-///
-/// Each step reserves one more chunk and stops at `length`, which the caller has already validated
-/// against the frame maximum: allocation still follows the bytes that actually arrive, so a peer
-/// that sends a prefix and then stalls holds one chunk rather than a whole frame, and the buffer no
-/// longer overshoots on the way there. Doubling did: an 11 MiB frame — one chat attachment —
-/// arrived into a buffer holding 16 MiB.
+/// Growth reserves one chunk at a time and stops exactly at length, avoiding the overshoot a
+/// doubling strategy causes on large frames.
 async fn read_payload<R>(reader: &mut R, length: usize) -> Result<Vec<u8>, ReadFrameError>
 where
     R: AsyncRead + Unpin,
@@ -1287,8 +1004,6 @@ where
             bytes.resize(target, 0);
         }
         let read = reader.read(&mut bytes[filled..]).await?;
-        // End of stream: a peer that announces more than it sends must fail rather than decoding
-        // a short frame.
         if read == 0 {
             return Err(ReadFrameError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1314,10 +1029,6 @@ impl From<io::Error> for ReadFrameError {
     }
 }
 
-/// Strictly serializes and writes one complete length-delimited JSON frame.
-///
-/// The prefix is patched into space the serialization buffer already reserved, so one frame is one
-/// `write_all` rather than a prefix syscall followed by a payload syscall on an unbuffered socket.
 pub async fn write_frame<W, T>(
     writer: &mut W,
     value: &T,
@@ -1328,10 +1039,8 @@ where
     T: Serialize,
 {
     let limits = limits.validate()?;
-    // The payload is counted before it is written, so the frame is allocated once at exactly its
-    // final size. A buffer grown as the serialization arrived doubled instead: an 11,185,049-byte
-    // frame — one chat attachment — held 22,370,098 bytes, because its closing quote did not fit.
-    // Counting holds nothing, so a value past the maximum is now refused before any of it is held.
+    // Counting the payload before writing lets the frame allocate exactly once at final size and
+    // refuse an oversized value before holding any of it.
     let mut counter = BoundedJsonCounter::new(limits.max_frame_bytes);
     if let Err(source) = serde_json::to_writer(&mut counter, value) {
         return Err(frame_write_failure(
@@ -1373,7 +1082,6 @@ where
     .map_err(|source| ProtocolError::Io { source })
 }
 
-/// Classifies what one serialization pass over a bounded sink reported.
 fn frame_write_failure(source: serde_json::Error, exceeded: bool, maximum: usize) -> ProtocolError {
     if exceeded {
         return ProtocolError::FrameTooLarge {
@@ -1384,7 +1092,6 @@ fn frame_write_failure(source: serde_json::Error, exceeded: bool, maximum: usize
     ProtocolError::Serialize { source }
 }
 
-/// Measures a frame's payload against the maximum without keeping a byte of it.
 struct BoundedJsonCounter {
     length: usize,
     maximum: usize,
@@ -1420,7 +1127,6 @@ impl io::Write for BoundedJsonCounter {
     }
 }
 
-/// Serialization target holding the complete frame: a reserved length prefix, then the payload.
 struct BoundedJsonBuffer {
     frame: Vec<u8>,
     maximum: usize,
@@ -1428,10 +1134,6 @@ struct BoundedJsonBuffer {
 }
 
 impl BoundedJsonBuffer {
-    /// Allocates the whole frame for a payload [`BoundedJsonCounter`] has already measured.
-    ///
-    /// The bound is still enforced on every write: the count and the write are two passes over the
-    /// same value, and this sink is what keeps the second one honest about the first.
     fn new(maximum: usize, payload: usize) -> Self {
         let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + payload);
         frame.extend_from_slice(&[0_u8; FRAME_PREFIX_BYTES]);
@@ -1442,7 +1144,6 @@ impl BoundedJsonBuffer {
         }
     }
 
-    /// Serialized bytes so far, excluding the reserved prefix the bound does not count.
     fn payload_len(&self) -> usize {
         self.frame.len() - FRAME_PREFIX_BYTES
     }
@@ -1467,78 +1168,50 @@ impl io::Write for BoundedJsonBuffer {
     }
 }
 
-/// Bounded framing or strict JSON failure.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
-    /// Ancillary data did not fit the receive buffer.
     #[error("broker frame descriptors were truncated")]
     DescriptorsTruncated,
-    /// Received descriptor flags could not be secured.
     #[error("could not set broker descriptor close-on-exec flags")]
     DescriptorFlags {
-        /// Close-on-exec flag failure.
         #[source]
         source: io::Error,
     },
-    /// A frame carried more descriptors than permitted.
     #[error("broker frame has too many descriptors")]
     TooManyDescriptors,
-    /// Only invocation frames may carry descriptors.
     #[error("broker frame has unexpected descriptors")]
     UnexpectedDescriptors,
-    /// Attached output indexes must exactly cover the received descriptors in order.
     #[error("broker frame has invalid descriptor indexes")]
     DescriptorIndex,
-    /// The conversation metadata exceeds its row bound.
     #[error("broker frame has too many asset rows")]
     TooManyAssetRows,
-    /// Configured frame maximum was zero or exceeded the hard ceiling.
     #[error("frame maximum must be between 1 and {maximum} bytes")]
-    InvalidFrameLimit {
-        /// Hard maximum.
-        maximum: usize,
-    },
-    /// Configured I/O timeout was zero.
+    InvalidFrameLimit { maximum: usize },
     #[error("frame I/O timeout must be greater than zero")]
     ZeroTimeout,
-    /// Complete frame deadline expired.
     #[error("broker frame I/O timed out")]
     Timeout,
-    /// Prefix or payload I/O failed.
     #[error("broker frame I/O failed")]
     Io {
-        /// I/O failure.
         #[source]
         source: io::Error,
     },
-    /// Prefix declared an empty JSON payload.
     #[error("broker frame must not be empty")]
     EmptyFrame,
-    /// Prefix or serialization exceeded the configured frame bound.
     #[error("broker frame is {length} bytes; maximum is {maximum}")]
-    FrameTooLarge {
-        /// Actual or minimum known size.
-        length: usize,
-        /// Configured maximum.
-        maximum: usize,
-    },
-    /// Public response/request could not be serialized.
+    FrameTooLarge { length: usize, maximum: usize },
     #[error("could not serialize broker frame")]
     Serialize {
-        /// JSON failure.
         #[source]
         source: serde_json::Error,
     },
-    /// Frame was malformed, used an unknown version/variant, or had unknown fields.
     #[error("broker frame is not valid protocol JSON")]
     Deserialize {
-        /// JSON failure.
         #[source]
         source: serde_json::Error,
     },
 }
 
-/// Unprivileged one-request-per-connection Unix client.
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct BrokerClient {
@@ -1549,7 +1222,6 @@ pub struct BrokerClient {
 
 #[cfg(unix)]
 impl BrokerClient {
-    /// Creates a client that authenticates the server by socket metadata and peer UID.
     pub fn new(
         socket: impl Into<PathBuf>,
         expected_server_uid: u32,
@@ -1562,17 +1234,8 @@ impl BrokerClient {
         })
     }
 
-    /// Returns the capabilities, command words, and chat-memory surface visible to one context.
-    ///
-    /// Without an attestation this is the connected peer's own listing. With one it is the
-    /// attested context's, and `Err(ClientError::Remote { code: ERROR_UNAUTHENTICATED, .. })` is
-    /// the opaque refusal: this client's peer identity carries no matching attestor grant, the
-    /// subject is not mapped, or policy does not let that principal drive that agent. The three
-    /// are deliberately indistinguishable here — the broker names the class on its own side of
-    /// the socket — so a refused caller cannot learn whether the subject exists.
-    ///
-    /// The memory surface is present only for a chat-scoped attestation whose three durable-memory
-    /// grants are all effective.
+    /// The three refusal causes are deliberately indistinguishable, so a refused caller cannot
+    /// learn whether the subject exists.
     pub async fn session_surface(
         &self,
         attestation: Option<Attestation>,
@@ -1600,27 +1263,12 @@ impl BrokerClient {
         }
     }
 
-    /// Returns the capabilities exact policy makes visible to this authenticated peer.
-    ///
-    /// The same `capabilities` exchange as [`BrokerClient::session_surface`] with no attestation,
-    /// for a caller with no use for command words or a memory surface.
     pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
         Ok(self.session_surface(None).await?.0)
     }
 
-    /// Runs one command word through the broker, carrying the piped value in the request frame.
-    ///
-    /// The answer is the guest's own: a proposal to submit, text it rendered with an exit status,
-    /// or a decline the caller reports as a usage error. An attestation, when supplied, must be
-    /// honored before any word runs; a refused claim answers exactly as an unknown word does,
-    /// because naming the word would disclose the surface the refusal withheld.
-    ///
-    /// The piped value is bounded on this side by [`FrameLimits::max_frame_bytes`]: an oversized
-    /// one fails as [`ClientError::Protocol`] in the request phase before a byte reaches the
-    /// socket, and by the broker host's own input bound on the other side.
-    ///
-    /// `trace_parent` is the run's trace and the client span the broker's `broker.command_run`
-    /// span adopts as its parent, so the word lands in the same trace as the invocation it proposes.
+    /// A refused attestation must answer exactly as an unknown word would, since naming the word
+    /// would disclose the surface withheld.
     pub async fn run_command(
         &self,
         attestation: Option<Attestation>,
@@ -1647,10 +1295,6 @@ impl BrokerClient {
         }
     }
 
-    /// Submits one invocation proposal, optionally on behalf of an external subject.
-    ///
-    /// The attestation binds to the proposal's own identifier here, so a caller cannot construct a
-    /// frame whose claim and proposal disagree.
     pub async fn invoke(
         &self,
         attestation: Option<Attestation>,
@@ -1685,7 +1329,6 @@ impl BrokerClient {
         }
     }
 
-    /// Submits exactly one model-hidden post-acceptance record request.
     pub async fn record_delivered_turn(
         &self,
         attestation: Attestation,
@@ -1739,9 +1382,6 @@ impl BrokerClient {
                 actual: credentials.uid(),
             });
         }
-        // The phase is the whole point: everything up to and including this write leaves the
-        // broker with no request to act on, and everything after it leaves this client unable to
-        // say whether the request was acted on.
         let mut stream = DescriptorStream::new(stream);
         stream
             .write_frame(&request, descriptors, self.limits)
@@ -1789,16 +1429,13 @@ fn validate_response_descriptors(
     Ok(())
 }
 
-/// Applies the shared socket rules before every exchange, parent included.
-///
-/// The parent is inspected whatever the socket's mode, so this client trusts exactly the sockets
-/// `dekopon-brokerd` would bind and no others.
+/// The parent directory is inspected regardless of the socket's own mode, so this client trusts
+/// exactly the sockets the broker would bind.
 #[cfg(unix)]
 async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), ClientError> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .map_err(|source| ClientError::SocketMetadata { source })?;
-    // A bare relative name has an empty parent, which is the current directory.
     let parent = path.parent().ok_or(ClientError::UnsafeSocket)?;
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -1816,94 +1453,48 @@ async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), Clie
     Ok(())
 }
 
-/// Client-side authentication, framing, or remote failure.
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum ClientError {
-    /// Socket metadata could not be inspected.
     #[error("could not inspect broker socket")]
     SocketMetadata {
-        /// I/O failure.
         #[source]
         source: io::Error,
     },
-    /// Socket or parent violated the server-owned private/shared IPC boundary.
     #[error("broker socket or parent has unsafe permissions or ownership")]
     UnsafeSocket,
-    /// Connecting exceeded the configured deadline.
     #[error("broker connection timed out")]
     ConnectTimeout,
-    /// Unix connection failed.
     #[error("could not connect to broker socket")]
     Connect {
-        /// I/O failure.
         #[source]
         source: io::Error,
     },
-    /// Peer credentials could not be read.
     #[error("could not authenticate broker peer credentials")]
     PeerCredentials {
-        /// I/O failure.
         #[source]
         source: io::Error,
     },
-    /// Connected server UID disagreed with trusted configuration.
     #[error("broker peer UID {actual} does not match expected UID {expected}")]
-    ServerIdentity {
-        /// Expected UID.
-        expected: u32,
-        /// Actual peer UID.
-        actual: u32,
-    },
-    /// Configured frame bounds were rejected before any connection was attempted.
+    ServerIdentity { expected: u32, actual: u32 },
     #[error("broker client limits are invalid: {0}")]
     Limits(#[source] ProtocolError),
-    /// Bounded framing failed during one half of an exchange.
-    ///
-    /// `phase` carries the resubmission-safety distinction: see [`ExchangePhase`] and
-    /// [`ClientError::may_have_executed`] before retrying anything that writes.
     #[error("broker {phase} framing failed: {source}")]
     Protocol {
-        /// Which half of the exchange failed.
         phase: ExchangePhase,
-        /// Bounded framing failure. Its message names no path and carries no payload content.
         #[source]
         source: ProtocolError,
     },
-    /// Broker returned a stable public infrastructure failure.
     #[error("broker returned {code}: {message}")]
-    Remote {
-        /// Stable remote code.
-        code: String,
-        /// Bounded public message.
-        message: String,
-    },
-    /// Response operation did not match the request.
+    Remote { code: String, message: String },
     #[error("broker returned an unexpected response variant")]
     UnexpectedResponse,
 }
 
-/// Which half of one broker exchange a bounded framing failure belongs to.
-///
-/// This is the client-local twin of the wire's [`ERROR_BROKER_UNAVAILABLE`] /
-/// [`ERROR_OUTCOME_UNAUDITED`] split. Nothing ties a client's `io_timeout` to the broker's own
-/// execution deadlines, so a proposal that ran just under the client deadline is delivered,
-/// possibly complete, and unreadable — indistinguishable at the socket from one that never left.
-/// Collapsing both into one error is what lets a caller resubmit an external write it already made.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangePhase {
-    /// Serializing or writing the request failed, so no complete request frame was delivered.
-    ///
-    /// Nothing executed. The same work may be resubmitted under a fresh invocation identifier,
-    /// matching [`ERROR_BROKER_UNAVAILABLE`].
     Request,
-    /// The complete request frame was delivered and reading its response failed.
-    ///
-    /// The broker may have executed the request. Treat this exactly like
-    /// [`ERROR_OUTCOME_UNAUDITED`]: the work must **not** be resubmitted under any identifier,
-    /// because the broker suppresses no duplicate and a resubmission repeats a non-idempotent
-    /// external effect. The broker's audit log is the only record of what happened.
     Response,
 }
 
@@ -1919,20 +1510,11 @@ impl fmt::Display for ExchangePhase {
 
 #[cfg(unix)]
 impl ClientError {
-    /// Reports whether the broker may have executed the request this failure ended.
-    ///
-    /// `true` means the complete request frame was delivered and this client could not establish
-    /// the outcome. For an operation that writes — `invoke`, attested or not, and
-    /// `recordDeliveredTurn` — the external effect may already have taken place, so the
-    /// caller must surface a non-retryable failure rather than resubmit under a fresh identifier.
-    /// For a read-only operation it is informational and re-asking is harmless.
     #[must_use]
     pub fn may_have_executed(&self) -> bool {
         match self {
             Self::Protocol { phase, .. } => *phase == ExchangePhase::Response,
             Self::Remote { code, .. } => code == ERROR_OUTCOME_UNAUDITED,
-            // The request was delivered in full and the broker answered something this client
-            // cannot interpret, which is exactly "delivered, outcome unknown".
             Self::UnexpectedResponse => true,
             _ => false,
         }
@@ -1941,34 +1523,23 @@ impl ClientError {
 
 impl fmt::Display for ProtocolVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Matched rather than written from the constant so a second variant cannot silently
-        // inherit the first one's identifier while serializing correctly.
         formatter.write_str(match self {
             Self::V1Alpha2 => PROTOCOL_VERSION,
         })
     }
 }
 
-/// Tier of the broker socket discovery precedence that produced a path.
-///
-/// The tier is telemetry-safe where the path is not: a socket path is excluded from every signal,
-/// but "which tier answered" is exactly what a connection investigation needs.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrokerSocketTier {
-    /// A caller-supplied path, such as a command-line flag or a configuration field.
     Explicit,
-    /// `DEKOPON_BROKER_SOCKET`.
     Environment,
-    /// `$XDG_RUNTIME_DIR/dekopon/broker.sock`.
     XdgRuntimeDir,
-    /// `$HOME/.local/run/dekopon/broker.sock`.
     Home,
 }
 
 #[cfg(unix)]
 impl BrokerSocketTier {
-    /// Stable low-cardinality label for telemetry and diagnostics.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -1987,7 +1558,6 @@ impl fmt::Display for BrokerSocketTier {
     }
 }
 
-/// One resolved broker socket and the discovery tier that produced it.
 #[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedBrokerSocket {
@@ -1997,32 +1567,24 @@ pub struct ResolvedBrokerSocket {
 
 #[cfg(unix)]
 impl ResolvedBrokerSocket {
-    /// The resolved path. It is never probed for existence; see [`BrokerSocketDiscovery`].
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Consumes this resolution and returns the owned path.
     #[must_use]
     pub fn into_path(self) -> PathBuf {
         self.path
     }
 
-    /// Which precedence tier answered.
     #[must_use]
     pub const fn tier(&self) -> BrokerSocketTier {
         self.tier
     }
 }
 
-/// Whether a directory may hold a broker socket.
-///
-/// This and [`secure_socket`] are the one definition of that rule: `dekopon-brokerd` consults them
-/// before binding, and every client consults them before connecting, so the two sides cannot drift
-/// into a mirror that accepts what the authority refuses. The directory is the operator-owned IPC
-/// group setting: server-owned, never group-writable or reachable by others, and either private or
-/// group-traversable. No credential path uses this rule.
+/// The socket directory must be server-owned and never group-writable or reachable by others; no
+/// credential path uses this rule.
 #[cfg(unix)]
 #[must_use]
 pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bool {
@@ -2033,11 +1595,8 @@ pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bo
         && matches!(mode & 0o070, 0 | 0o010 | 0o050)
 }
 
-/// Whether a socket is one its server can own, inside a parent [`secure_socket_parent`] accepts.
-///
-/// A `0600` socket is owner-only. A `0660` socket is shared IPC, which is trustworthy only inside a
-/// group-traversable parent whose group it carries: a client in that group may connect, but cannot
-/// replace the listener.
+/// A 0600 socket is owner-only; a 0660 socket is trustworthy only inside a group-traversable parent
+/// whose group it carries.
 #[cfg(unix)]
 #[must_use]
 pub fn secure_socket(
@@ -2055,11 +1614,8 @@ pub fn secure_socket(
                 && socket.gid() == parent.gid()))
 }
 
-/// The mode a broker binds its socket with under this parent.
-///
-/// Group traversal is how an operator opts into shared IPC. A private parent keeps the socket
-/// owner-only, which is also why a broker under one refuses to configure any peer UID but its own:
-/// no other UID could open what it is about to bind.
+/// A private parent keeps the socket owner-only, which is why a broker under one refuses any peer
+/// UID but its own.
 #[cfg(unix)]
 #[must_use]
 pub fn ipc_socket_mode(parent: &std::fs::Metadata) -> u32 {
@@ -2070,19 +1626,6 @@ pub fn ipc_socket_mode(parent: &std::fs::Metadata) -> u32 {
     }
 }
 
-/// Inputs used to resolve the broker socket precedence.
-///
-/// This is the one definition of that precedence. `dekopond` and the operator
-/// console consult it, so a socket a client finds here is the socket the documentation
-/// describes, and a change lands in one place rather than multiple copies that must be kept in step.
-///
-/// Unlike configuration discovery, no candidate is probed for existence: a broker socket is absent
-/// whenever the daemon is not running, so the tightest resolved tier is always trusted and
-/// connection failures are reported against that exact path.
-///
-/// [`Self::resolve`] answers `None` rather than an error because "no tier applied" means something
-/// different to each caller — a usage failure to one, a configuration failure to another — and each
-/// owns the wording an operator acts on.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BrokerSocketDiscovery {
@@ -2094,11 +1637,6 @@ pub struct BrokerSocketDiscovery {
 
 #[cfg(unix)]
 impl BrokerSocketDiscovery {
-    /// Captures discovery inputs from the current process.
-    ///
-    /// An environment variable exported with an empty value is ignored rather than resolved to an
-    /// empty path, matching configuration discovery elsewhere: an empty export is an unset
-    /// variable that happens to exist.
     #[must_use]
     pub fn from_process(explicit: Option<PathBuf>) -> Self {
         Self {
@@ -2115,7 +1653,6 @@ impl BrokerSocketDiscovery {
         }
     }
 
-    /// Creates an injectable discovery context, for deterministic tests in any consuming crate.
     #[must_use]
     pub const fn new(
         explicit: Option<PathBuf>,
@@ -2131,7 +1668,6 @@ impl BrokerSocketDiscovery {
         }
     }
 
-    /// Resolves the highest-precedence broker socket, or `None` when no tier applies.
     #[must_use]
     pub fn resolve(&self) -> Option<ResolvedBrokerSocket> {
         if let Some(path) = &self.explicit {

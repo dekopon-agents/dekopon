@@ -106,17 +106,11 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-/// Cedar namespace every Dekopon entity type and action lives in.
 pub const NAMESPACE: &str = "Dekopon";
-/// The one action that is not a capability: permission for a principal to drive an agent session.
 pub const AGENT_PROMPT_ACTION: &str = "agent.prompt";
-/// Separate permission to consume one public DRN in a broker-native sink.
 pub const SECRET_USE_ACTION: &str = "secret.use";
-/// Maximum accepted policy-source bytes.
 pub const MAX_POLICY_BYTES: usize = 1024 * 1024;
-/// Maximum accepted static policies in one engine.
 pub const MAX_POLICIES: usize = 1_024;
-/// Maximum accepted bytes in an `@id` policy annotation.
 pub const MAX_POLICY_ID_BYTES: usize = 128;
 
 const PRINCIPAL_TYPE: &str = "Dekopon::Principal";
@@ -126,38 +120,17 @@ const SECRET_TYPE: &str = "Dekopon::Secret";
 const ACTION_TYPE: &str = "Dekopon::Action";
 const DIGEST_DOMAIN: &[u8] = b"dekopon-policy-v1\0";
 
-/// The declared world a policy set is validated against.
-///
-/// Everything a policy may name has to appear here, which is what turns a typo into a startup
-/// refusal instead of a permanently unsatisfiable rule. Principals come from the deployment's peer
-/// identities and owner-controlled subject mappings; providers and capabilities come from loaded
-/// provider manifests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
-    /// Public logical secret resources declared by the owner-only private map.
     secrets: BTreeSet<SecretDrn>,
-    /// Capability names a policy referenced that no loaded provider routes. See
-    /// [`PolicyWorld::with_phantoms`].
     phantom_capabilities: BTreeSet<CapabilityId>,
-    /// Provider names a policy referenced that no loaded manifest declares.
     phantom_providers: BTreeSet<ProviderId>,
 }
 
 impl PolicyWorld {
-    /// Declares the principals a policy may name and the capability-to-provider routes it may act
-    /// on.
-    ///
-    /// Providers are derived from the capability routes: a provider with no loaded capability is
-    /// not a resource any action applies to, so naming one is an error rather than a silent
-    /// never-match.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyBuildError::WorldConflicts`] naming every reserved-action collision and
-    /// duplicate capability identifier together, with each list in identifier order.
     pub fn new(
         principals: impl IntoIterator<Item = PrincipalId>,
         capabilities: impl IntoIterator<Item = (CapabilityId, ProviderId)>,
@@ -190,50 +163,31 @@ impl PolicyWorld {
         Ok(world)
     }
 
-    /// Iterates the declared principals in identifier order.
     pub fn principals(&self) -> impl Iterator<Item = &PrincipalId> {
         self.principals.iter()
     }
 
-    /// Iterates the declared providers in identifier order.
     pub fn providers(&self) -> impl Iterator<Item = &ProviderId> {
         self.providers.iter()
     }
 
-    /// Iterates the declared capability routes in identifier order.
     pub fn capabilities(&self) -> impl Iterator<Item = (&CapabilityId, &ProviderId)> {
         self.capabilities.iter()
     }
 
-    /// Adds the public DRNs policies may name as `Dekopon::Secret` resources.
     #[must_use]
     pub fn with_secrets(mut self, secrets: impl IntoIterator<Item = SecretDrn>) -> Self {
         self.secrets.extend(secrets);
         self
     }
 
-    /// Iterates declared secret resources in canonical DRN order.
     pub fn secrets(&self) -> impl Iterator<Item = &SecretDrn> {
         self.secrets.iter()
     }
 
-    /// Extends this world with names a policy referenced that no loaded provider declares.
-    ///
-    /// A deployment may ship policy that anticipates a provider it has not dropped in yet. Cedar's
-    /// strict validator rejects a policy naming an action outside the schema, so such a name is
-    /// registered here as a *phantom*: it exists in the generated schema and nowhere else.
-    ///
-    /// The alternative — dropping the offending policy — is wrong, and worth saying why. A policy
-    /// reading `action in [gh.pull-request.read, gh.issue.create]` with only the first loaded would
-    /// lose *both* grants, silently revoking authority the operator still has every reason to
-    /// expect. A phantom keeps the policy whole and takes away exactly the missing capability.
-    ///
-    /// A phantom can never authorize an execution. It routes to no provider, the broker refuses any
-    /// constraint set naming an unrouted capability, and an invocation naming one is denied
-    /// `unconstrained-capability` before Cedar is consulted at all.
-    ///
-    /// Every reported name parses: `classify_policies` refuses a literal outside the identifier
-    /// grammar in both modes, so nothing silently fails to register here.
+    /// An undeclared name is kept as a phantom rather than dropping its policy, since dropping it
+    /// would silently revoke the policy's other grants too; a phantom can never authorize
+    /// execution.
     #[must_use]
     fn with_phantoms(&self, unresolved: &[UnresolvedName]) -> Self {
         let mut world = self.clone();
@@ -254,12 +208,9 @@ impl PolicyWorld {
         world
     }
 
-    /// Renders the Cedar schema this world implies.
     fn schema_json(&self) -> serde_json::Value {
-        // Every action's context record starts from the same routing facts: who the request
-        // arrived as, and over what transport. All optional — a direct call has no conversation —
-        // but all declared, because Cedar's strict validator rejects a policy that reads an
-        // attribute the schema never mentions, and "only from Slack" has to be sayable.
+        // Every routing attribute must be declared optional in the schema, or Cedar's strict
+        // validator rejects any policy referencing an absent one.
         const ROUTING: [&str; 5] = ["via", "subject", "agent", "transportKind", "transport"];
         let mut routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
             (
@@ -267,12 +218,8 @@ impl PolicyWorld {
                 json!({ "type": "String", "required": false }),
             )
         }));
-        // The conversation is a record rather than two strings, because where a message was posted
-        // is four facts that only make sense together and a policy that wants "the Lange guild"
-        // must be able to say so without parsing one of them out of a joined value. `container`
-        // and `thread` are optional inside it, so strict validation refuses
-        // `context.conversation.container == x` without a `context.conversation has container`
-        // guard — the operator trap worth failing at load rather than at authorization time.
+        // Conversation is a nested record, not flat strings, so a policy reading container must
+        // guard with has first or Cedar's strict validator refuses it at load time.
         routing_attributes.insert(
             "conversation".to_owned(),
             json!({
@@ -286,8 +233,8 @@ impl PolicyWorld {
                 },
             }),
         );
-        // What an action adds on top is *required*: those are facts the broker stamps on the
-        // request itself, so a policy that reads one must never find it absent.
+        // Fields added here must be schema-required only if the broker always stamps them on the
+        // request, or Cedar evaluation can fail.
         let context = |required: &[&str]| {
             let mut attributes = routing_attributes.clone();
             attributes.extend(
@@ -301,15 +248,10 @@ impl PolicyWorld {
         let entity_shape = json!({ "shape": { "type": "Record", "attributes": {} } });
         let capability_context = context(&["effect", "risk"]);
         let prompt_context = context(&[]);
-        // Named rather than folded in with the rest because this trio is goal 1's exact-binding
-        // gate: a `secret.use` policy names the capability, provider and sink a credential may be
-        // released into, and requiring all three is what stops a request whose trusted binding
-        // differs from satisfying that policy.
+        // Capability, provider and sink are required together on secret.use so a request cannot
+        // satisfy policy via a binding different from the one it is actually trusted for.
         let secret_context = context(&["capability", "provider", "sink"]);
 
-        // Phantom capabilities are indistinguishable from routed ones *here*, and only here: the
-        // schema is what strict validation checks a policy against, so a phantom is what lets a
-        // policy naming an unloaded capability stay whole. Nothing downstream can execute one.
         let mut actions = serde_json::Map::new();
         for capability in self
             .capabilities
@@ -368,31 +310,17 @@ impl PolicyWorld {
     }
 }
 
-/// What one authorization request is about.
-///
-/// The action and its resource travel together because they are not independently valid: a
-/// capability always acts on its provider, and `agent.prompt` always acts on an agent. Splitting
-/// them would let a caller assemble a pair the schema rejects and turn a programming mistake into a
-/// runtime denial.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyTarget {
-    /// One provider capability, with the trusted classification the broker will execute it under.
     Capability {
-        /// Requested capability, which is also the Cedar action identifier.
         capability: CapabilityId,
-        /// Provider the capability routes to, which is the Cedar resource.
         provider: ProviderId,
-        /// Trusted effect classification, rendered into `context.effect`.
         effect: EffectKind,
-        /// Trusted risk classification, rendered into `context.risk`.
         risk: RiskLevel,
     },
-    /// Permission for the principal to drive one agent's session at all.
     AgentPrompt {
-        /// The agent being driven, which is the Cedar resource.
         agent: AgentId,
     },
-    /// Permission to consume one exact DRN in one broker-native sink for one capability.
     SecretUse {
         secret: SecretDrn,
         capability: CapabilityId,
@@ -402,7 +330,6 @@ pub enum PolicyTarget {
 }
 
 impl PolicyTarget {
-    /// The Cedar action identifier this target names.
     #[must_use]
     pub fn action(&self) -> &str {
         match self {
@@ -413,82 +340,42 @@ impl PolicyTarget {
     }
 }
 
-/// Trusted routing metadata a policy may condition on.
-///
-/// Every field is derived by the broker from authenticated transport state or owner-controlled
-/// configuration. None of it can be set by a request payload.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyContext {
-    /// The attestor peer an attested context was derived through; absent for direct peers.
     pub via: Option<String>,
-    /// The canonical external subject an attested context stands for.
     pub subject: Option<String>,
-    /// The agent identity of an agent actor.
     pub agent: Option<String>,
-    /// Chat transport family, absent for legacy operations.
     pub transport_kind: Option<String>,
-    /// Owner-configured transport identifier, absent for legacy operations.
     pub transport: Option<String>,
-    /// Where the message was posted, absent for a direct peer with no chat scope.
     pub conversation: Option<PolicyConversation>,
 }
 
-/// Where one authorized message was posted, as a policy reads it.
-///
-/// The same four values the transport minted and the broker checked against a grant. `kind` is the
-/// serde spelling of `ConversationKind` — `directMessage`, `groupDirectMessage`, `channel`,
-/// `thread` — so the word in a Cedar statement is the word in the route file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyConversation {
-    /// Where the message was posted.
     pub kind: String,
-    /// The workspace, guild, or WhatsApp business account above it, when the service has one.
     pub container: Option<String>,
-    /// The conversation the service names; the parent channel for a thread.
     pub id: String,
-    /// The thread the answer joins, when there is one.
     pub thread: Option<String>,
 }
 
-/// One authorization question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyRequest {
-    /// Principal the broker resolved for this request.
     pub principal: PrincipalId,
-    /// Action and resource.
     pub target: PolicyTarget,
-    /// Trusted routing metadata.
     pub context: PolicyContext,
 }
 
-/// One authorization answer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyDecision {
-    /// Whether the policy set permits the request. False whenever evaluation reported an error.
     pub allowed: bool,
-    /// Identifiers of the policies that determined the answer, in sorted order.
     pub determining_policy_ids: Vec<String>,
-    /// Whether Cedar reported any evaluation error while deciding.
-    ///
-    /// A stable flag rather than the error text: a denial explanation must not become a channel for
-    /// policy source or entity data on a per-request path.
+    /// A stable flag rather than the error text, since a denial explanation must not become a
+    /// channel for policy source or entity data on a per-request path.
     pub errors_present: bool,
-    /// Why the request could not be turned into a Cedar query at all, when that is what happened.
-    ///
-    /// `None` for every decision Cedar actually made, ordinary denials included. `Some` means the
-    /// broker asked a question the schema does not admit — in practice a capability the policy world
-    /// never declared — which would otherwise present as a blanket denial with nothing anywhere
-    /// saying why.
-    ///
-    /// This does not reopen what [`Self::errors_present`] deliberately closes. That flag is terse
-    /// because an *evaluation* error is reached through policy source and entity attributes. This
-    /// text describes only the request the broker itself assembled from trusted routing state, and
-    /// is reached before any policy is consulted.
     pub refusal: Option<String>,
 }
 
 impl PolicyDecision {
-    /// The answer given when a request could not even be constructed.
     fn refused(error: &RequestError) -> Self {
         Self {
             allowed: false,
@@ -499,17 +386,13 @@ impl PolicyDecision {
     }
 }
 
-/// Which kind of declared name a policy referenced but the world does not contain.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum UnresolvedKind {
-    /// A Cedar action, which is a capability identifier.
     Capability,
-    /// A provider resource.
     Provider,
 }
 
 impl UnresolvedKind {
-    /// Returns the stable label used in operator-facing diagnostics.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -519,32 +402,19 @@ impl UnresolvedKind {
     }
 }
 
-/// One provider-derived name a policy references that no loaded provider declares.
-///
-/// Reported by [`PolicyEngine::new_lenient`] so a deployment can warn about policy that anticipates
-/// a provider it has not dropped in yet, instead of refusing to start. Principals are deliberately
-/// absent from this type: they come from owner-authored identities rather than a loaded component,
-/// so an undeclared principal is a typo and stays fatal in both modes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnresolvedName {
-    /// Identifier of the policy that named it.
     pub policy: String,
-    /// The undeclared name, exactly as the policy spelled it.
     pub name: String,
-    /// Whether it was named as an action or as a resource.
     pub kind: UnresolvedKind,
 }
 
-/// How a policy naming a provider-derived entity the world does not declare is handled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Handling {
-    /// Refuse to build. Every undeclared name is a [`PolicyBuildError`].
     Refuse,
-    /// Register the name as a phantom and report it. See [`PolicyWorld::with_phantoms`].
     Tolerate,
 }
 
-/// A validated, startup-fixed Cedar policy set with its generated schema and entity store.
 pub struct PolicyEngine {
     policies: PolicySet,
     schema: Schema,
@@ -556,11 +426,6 @@ pub struct PolicyEngine {
     digest: String,
 }
 
-/// The constant Cedar entity type names, parsed once at construction.
-///
-/// Every request names a principal, an action, and a resource by type. `EntityTypeName::from_str`
-/// runs Cedar's full name parser, so parsing these per request would contradict this crate's
-/// startup-fixed contract for the sake of four values that never change.
 #[derive(Debug)]
 struct EntityTypes {
     principal: EntityTypeName,
@@ -582,9 +447,6 @@ impl EntityTypes {
     }
 }
 
-// Written by hand rather than derived: `PolicySet`'s own `Debug` renders policy source, and this
-// value is reachable from `Broker`'s derived `Debug`. A fingerprint and two counts are what an
-// operator needs from a log line; the policy text is not.
 impl fmt::Debug for PolicyEngine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -600,16 +462,6 @@ impl fmt::Debug for PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Parses, schema-validates, and freezes one policy set against a declared world.
-    ///
-    /// Empty (or whitespace-only) policy text is valid and permits nothing, which is the honest
-    /// deny-by-default starting point for a deployment that has not written policy yet.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`PolicyBuildError`] when the source exceeds its byte or policy-count bound, fails
-    /// to parse, contains a template, fails strict schema validation, or names an entity the world
-    /// does not declare.
     pub fn new(policy_text: &str, world: &PolicyWorld) -> Result<Self, PolicyBuildError> {
         let (engine, unresolved) = Self::build(policy_text, world, Handling::Refuse)?;
         debug_assert!(
@@ -619,27 +471,6 @@ impl PolicyEngine {
         Ok(engine)
     }
 
-    /// Parses and validates one policy set, tolerating names no loaded provider declares.
-    ///
-    /// Identical to [`PolicyEngine::new`] except that a policy naming an undeclared capability or
-    /// provider is kept and the name reported, rather than refusing to start. This lets a
-    /// deployment ship policy that anticipates a provider it has not dropped in yet; the caller is
-    /// expected to warn about every returned [`UnresolvedName`].
-    ///
-    /// Tolerating a name grants nothing. The name is registered as a phantom: it routes to no
-    /// provider, the broker refuses any constraint set naming an unrouted capability, and an
-    /// invocation naming one is denied `unconstrained-capability` before Cedar is consulted at
-    /// all. Dropping the offending policy instead would silently revoke the grants it makes
-    /// alongside the missing one.
-    ///
-    /// # Errors
-    ///
-    /// The same failures as [`PolicyEngine::new`], minus [`PolicyBuildError::UnknownAction`] and
-    /// [`PolicyBuildError::UnknownProvider`] for a name that is a well-formed identifier. An
-    /// undeclared *principal* remains an error here: principals come from owner-authored
-    /// configuration, not from a loaded component. So does a literal outside the identifier
-    /// grammar — `Dekopon::Action::"GH.Read"` can never become a loaded capability however many
-    /// providers arrive later, so it gets the same specific error strict mode gives it.
     pub fn new_lenient(
         policy_text: &str,
         world: &PolicyWorld,
@@ -676,9 +507,8 @@ impl PolicyEngine {
         }
         let policies = apply_annotated_ids(&policies)?;
 
-        // Classification runs *before* schema generation, which is the whole reordering. Cedar's
-        // strict validator rejects a policy naming an action outside the schema, so a tolerated
-        // name has to be in the schema by the time validation runs.
+        // Classification must run before schema generation; a tolerated name needs to already be in
+        // the schema before Cedar's strict validator runs.
         let (referenced_capabilities, unresolved) = classify_policies(&policies, world, handling)?;
         let effective = world.with_phantoms(&unresolved);
 
@@ -715,7 +545,6 @@ impl PolicyEngine {
         ))
     }
 
-    /// Decides one request; every failure path denies.
     #[must_use]
     pub fn authorize(&self, request: PolicyRequest) -> PolicyDecision {
         let cedar_request = match self.build_request(request) {
@@ -741,27 +570,15 @@ impl PolicyEngine {
         }
     }
 
-    /// The capabilities some policy in this set names.
-    ///
-    /// The broker requires an owner-authored constraint set for each of them at startup: a policy
-    /// that can permit a capability nothing knows how to execute is a configuration mistake worth
-    /// refusing to start over.
     pub fn referenced_capabilities(&self) -> impl Iterator<Item = &CapabilityId> {
         self.referenced_capabilities.iter()
     }
 
-    /// Number of static policies loaded.
     #[must_use]
     pub fn policy_count(&self) -> usize {
         self.policy_count
     }
 
-    /// A `sha256:<hex>` fingerprint of the loaded policy set and the world it was validated
-    /// against.
-    ///
-    /// Domain-separated over canonicalized policy source plus the sorted entity and action
-    /// identifiers, so two brokers reporting the same digest evaluated the same authorization
-    /// surface. It is a correlation aid for audit records, not a wire-format contract.
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
@@ -821,7 +638,6 @@ impl PolicyEngine {
                 ],
             ),
         };
-        // Moved, not cloned: `authorize` owns the request and nothing reads it afterwards.
         for (name, value) in [
             ("via", context.via),
             ("subject", context.subject),
@@ -833,9 +649,8 @@ impl PolicyEngine {
                 pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
             }
         }
-        // Only the fields the transport actually minted: an absent `container` must stay absent so
-        // that a policy reading it without a `has` guard fails validation rather than silently
-        // comparing against an invented empty string.
+        // Absent conversation fields like container must stay truly absent, not defaulted to an
+        // empty string, or has-guarded policies could match unintentionally.
         if let Some(conversation) = context.conversation {
             let fields = [
                 Some(("kind", conversation.kind)),
@@ -865,39 +680,16 @@ impl PolicyEngine {
     }
 }
 
-/// Why one [`PolicyRequest`] could not be expressed as a Cedar query.
-///
-/// Private, and surfaced only as the [`PolicyDecision::refusal`] text: the variants are a debugging
-/// aid for a misconfigured deployment, not an authorization outcome callers should branch on. Every
-/// one of them denies.
-///
-/// Carries rendered diagnostics rather than the Cedar errors themselves, for the same reason
-/// [`PolicyBuildError`] does: those types are neither `Clone` nor small, and this one is reachable
-/// from a value the broker clones per request.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 enum RequestError {
-    /// The trusted routing metadata could not be assembled into a Cedar record.
     #[error("trusted routing context could not be assembled: {message}")]
-    Context {
-        /// Context-construction diagnostics.
-        message: String,
-    },
-    /// The assembled request does not typecheck against the generated schema. In practice this is a
-    /// capability the policy world does not declare, which no policy could ever have permitted.
+    Context { message: String },
     #[error("request does not validate against the policy schema: {message}")]
-    Schema {
-        /// Request-validation diagnostics.
-        message: String,
-    },
+    Schema { message: String },
 }
 
-/// Renames each policy to its optional `@id("…")` annotation.
-///
-/// Cedar names text-parsed policies positionally (`policy0`, `policy1`, …), and those identifiers
-/// are what an audit record carries as the reason for a decision. A positional name answers
-/// "which line" but not "which rule", and it shifts when an unrelated policy is inserted above it,
-/// so an annotation is honored as the stable name instead. Duplicates refuse startup: two policies
-/// sharing one name would make an explanation ambiguous.
+/// Cedar names policies positionally, which shifts as policies are added and is not stable for
+/// audit, so the @id annotation is used as the stable name instead.
 fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildError> {
     let mut renamed = PolicySet::new();
     let mut seen = BTreeSet::new();
@@ -942,26 +734,8 @@ fn entity_uid(type_name: &EntityTypeName, id: &str) -> EntityUid {
     EntityUid::from_type_name_and_id(type_name.clone(), EntityId::new(id))
 }
 
-/// Classifies every policy's entity literals against the declared world.
-///
-/// Returns the capabilities the policy set references, plus every provider-derived name the world
-/// does not contain. Cedar's own validator checks entity *types*, not instances, which is why this
-/// exists at all.
-///
-/// Two classes of name are treated differently on purpose:
-///
-/// - **Principals** come from owner-authored identities and subject mappings, never from a loaded
-///   component. An undeclared one is a typo, and stays fatal in both modes.
-/// - **Actions and providers** are derived from loaded provider manifests. An undeclared one means
-///   that provider is not loaded, which is a legitimate state for a deployment whose policy
-///   anticipates it. Under [`Handling::Tolerate`] it is reported and registered as a phantom.
-///
-/// **Agents are checked by neither class.** The agent catalog belongs to the gateway, so the broker
-/// declares the type and matches instances by UID without enumerating them: `Dekopon::Agent::"typo"`
-/// validates, starts cleanly, and then matches nothing, denying every session `agent-denied`.
-///
-/// An entity type outside the Dekopon namespace is a grammar error, not an absence, and is fatal
-/// in both modes.
+/// Agent identifiers are not checked against a catalog; the broker matches by UID, so a typo'd
+/// agent name still validates and then simply matches nothing, denying every session.
 fn classify_policies(
     policies: &PolicySet,
     world: &PolicyWorld,
@@ -996,11 +770,9 @@ fn classify_policies(
                         .as_ref()
                         .is_some_and(|provider| world.providers.contains(provider));
                     if !declared {
-                        // A literal outside the identifier grammar can never become a loaded
-                        // provider, so it is a typo like a misspelled principal rather than an
-                        // anticipated one, and gets the specific error in both modes. Tolerating
-                        // it would drop it from the phantom set and surface later as a raw Cedar
-                        // validation failure with the `UnresolvedName` report lost.
+                        // A literal outside the identifier grammar is treated as a typo, not
+                        // tolerated, since tolerating it would drop it from the phantom set and
+                        // surface as an unexplained raw Cedar failure.
                         if parsed.is_none() || handling == Handling::Refuse {
                             return Err(PolicyBuildError::UnknownProvider {
                                 policy: id.clone(),
@@ -1041,9 +813,6 @@ fn classify_policies(
                         Some(capability) => {
                             referenced_capabilities.insert(capability);
                         }
-                        // Same rule as a provider literal: a name outside the identifier grammar
-                        // can never become a loaded capability, so it is a typo rather than an
-                        // anticipation and stays fatal even under `Tolerate`.
                         None => {
                             if parsed.is_none() || handling == Handling::Refuse {
                                 return Err(PolicyBuildError::UnknownAction {
@@ -1059,8 +828,6 @@ fn classify_policies(
                         }
                     }
                 }
-                // The schema already rejects an unknown entity type, and `Agent` instances are
-                // intentionally unenumerated.
                 AGENT_TYPE => {}
                 other => {
                     return Err(PolicyBuildError::UnknownEntityType {
@@ -1128,12 +895,6 @@ fn policy_digest(
     world: &PolicyWorld,
     unresolved: &[UnresolvedName],
 ) -> Result<String, PolicyBuildError> {
-    // Cedar's structural JSON rather than the source text: two spellings of one policy must
-    // fingerprint identically, so reformatting a policy file does not look like a policy change.
-    // `Display` and `to_cedar` both round-trip the original bytes and would not do that, so a
-    // fallback to either would quietly abandon the property — two brokers loading semantically
-    // identical files would report different digests in every audit record with nothing saying
-    // why. The digest is computed once at startup, so failing closed here is cheap.
     let canonical = policies
         .policies()
         .map(|policy| {
@@ -1186,10 +947,6 @@ fn policy_digest(
         hasher.update([0]);
     }
 
-    // Tolerated names, recorded explicitly. The `actions` section above already moves when a
-    // capability stops being loaded, so this is belt-and-braces rather than load-bearing today; it
-    // states "this deployment tolerated an absent name" directly instead of leaving it to be
-    // inferred from what the world section omits.
     hasher.update(b"phantoms\0");
     let mut phantoms = unresolved
         .iter()
@@ -1212,80 +969,31 @@ fn policy_digest(
     Ok(hex)
 }
 
-/// Failure to build a coherent, validated policy engine.
-///
-/// Every variant is a startup failure. Construction-time detail is deliberately verbose — an
-/// operator is holding the policy file — while runtime decisions carry only identifiers and a
-/// [`PolicyDecision::errors_present`] flag.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PolicyBuildError {
-    /// Policy source exceeded its byte ceiling.
     #[error("policy source is {length} bytes; maximum is {maximum}")]
-    PolicyTooLarge {
-        /// Actual byte length.
-        length: usize,
-        /// Configured maximum.
-        maximum: usize,
-    },
-    /// Policy set exceeded its count ceiling.
+    PolicyTooLarge { length: usize, maximum: usize },
     #[error("policy set contains {count} policies; maximum is {maximum}")]
-    TooManyPolicies {
-        /// Actual count.
-        count: usize,
-        /// Configured maximum.
-        maximum: usize,
-    },
-    /// Policy source did not parse.
+    TooManyPolicies { count: usize, maximum: usize },
     #[error("policy source could not be parsed: {message}")]
-    Parse {
-        /// Parser diagnostics.
-        message: String,
-    },
-    /// Policy source declared a template.
-    ///
-    /// Templates only authorize once linked, and linking is a runtime operation this engine
-    /// deliberately does not have. A template would be policy that silently never applies.
+    Parse { message: String },
     #[error("policy templates are not supported; write static policies instead")]
     TemplateUnsupported,
-    /// The world could not be expressed as a Cedar schema.
     #[error("policy schema could not be generated: {message}")]
-    Schema {
-        /// Schema diagnostics.
-        message: String,
-    },
-    /// The policy set failed strict schema validation.
+    Schema { message: String },
     #[error("policy set failed strict validation: {}", messages.join("; "))]
-    Validation {
-        /// Sorted validator diagnostics.
-        messages: Vec<String>,
-    },
-    /// A policy named a principal the world does not declare.
+    Validation { messages: Vec<String> },
     #[error("policy {policy} names undeclared principal {principal:?}")]
-    UnknownPrincipal {
-        /// Policy identifier.
-        policy: String,
-        /// Undeclared principal.
-        principal: String,
-    },
-    /// A policy named a principal that is not a well-formed identifier.
-    ///
-    /// Deliberately distinct from [`Self::UnknownPrincipal`]. That one says "add this to the
-    /// deployment's identities", which is advice an operator cannot take here: the name could never
-    /// be a principal at all, and the parse error names the rule it broke and where.
+    UnknownPrincipal { policy: String, principal: String },
     #[error("policy {policy} names malformed principal {principal:?}")]
     MalformedPrincipal {
-        /// Policy identifier.
         policy: String,
-        /// The malformed name, exactly as the policy spelled it.
         principal: String,
-        /// Why it is not a valid principal identifier.
         #[source]
         source: IdentifierError,
     },
-    /// A policy named a secret DRN the private map does not declare.
     #[error("policy {policy} names undeclared secret {secret:?}")]
     UnknownSecret { policy: String, secret: String },
-    /// A policy named a non-canonical secret DRN.
     #[error("policy {policy} names malformed secret DRN {secret:?}")]
     MalformedSecret {
         policy: String,
@@ -1293,70 +1001,29 @@ pub enum PolicyBuildError {
         #[source]
         source: dekopon_core::SecretDrnError,
     },
-    /// A policy named a provider the world does not declare.
     #[error("policy {policy} names undeclared provider {provider:?}")]
-    UnknownProvider {
-        /// Policy identifier.
-        policy: String,
-        /// Undeclared provider.
-        provider: String,
-    },
-    /// A policy named an action the world does not declare.
+    UnknownProvider { policy: String, provider: String },
     #[error("policy {policy} names undeclared action {action:?}")]
-    UnknownAction {
-        /// Policy identifier.
-        policy: String,
-        /// Undeclared action.
-        action: String,
-    },
-    /// A policy named an entity type outside the Dekopon namespace.
+    UnknownAction { policy: String, action: String },
     #[error("policy {policy} names unknown entity type {entity_type}")]
-    UnknownEntityType {
-        /// Policy identifier.
-        policy: String,
-        /// Unknown entity type.
-        entity_type: String,
-    },
-    /// An `@id` annotation was empty, overlong, or outside the portable identifier alphabet.
+    UnknownEntityType { policy: String, entity_type: String },
     #[error("policy {policy} has an @id annotation that is not a bounded portable identifier")]
-    InvalidPolicyId {
-        /// Positional identifier of the offending policy.
-        policy: String,
-    },
-    /// Two policies resolved to one identifier.
+    InvalidPolicyId { policy: String },
     #[error("policy identifier {policy:?} is used by more than one policy")]
-    DuplicatePolicyId {
-        /// Duplicated identifier.
-        policy: String,
-    },
-    /// Every reserved-action collision and duplicate capability in the declared world.
+    DuplicatePolicyId { policy: String },
     #[error(
         "policy world conflicts: reserved actions {reserved:?}; duplicate capabilities {duplicates:?}"
     )]
     WorldConflicts {
-        /// Reserved capability identifiers, sorted and unique.
         reserved: Vec<CapabilityId>,
-        /// Duplicate capability identifiers, sorted and unique; at least one list is nonempty.
         duplicates: Vec<CapabilityId>,
     },
-    /// The declared world could not be turned into a Cedar entity store.
     #[error("policy entity store could not be built: {message}")]
-    Entities {
-        /// Entity diagnostics.
-        message: String,
-    },
-    /// A policy could not be rendered as the structural JSON the digest fingerprints.
-    ///
-    /// The digest deliberately hashes Cedar's structural JSON so two spellings of one policy
-    /// fingerprint identically. Degrading to the source text would abandon that property silently,
-    /// so construction refuses instead; the digest is computed once at startup.
+    Entities { message: String },
+    /// The digest hashes Cedar's structural JSON, not source text, so two spellings of one policy
+    /// fingerprint identically; falling back to source text would abandon that property silently.
     #[error("policy {policy} could not be canonicalized for the policy digest: {message}")]
-    Digest {
-        /// Policy identifier.
-        policy: String,
-        /// Canonicalization diagnostics.
-        message: String,
-    },
+    Digest { policy: String, message: String },
 }
 
 #[cfg(test)]

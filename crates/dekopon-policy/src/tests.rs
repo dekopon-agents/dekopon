@@ -7,7 +7,6 @@ use super::{
     PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION, UnresolvedKind,
 };
 
-/// The workflow world: two principals, two cli-probe capabilities.
 fn world() -> PolicyWorld {
     PolicyWorld::new(
         [
@@ -81,8 +80,6 @@ fn via(name: &str) -> PolicyContext {
     }
 }
 
-/// An empty policy set is a valid deployment that permits nothing. This is the deny-by-default
-/// floor: a broker that has not been given policy yet must still start and still refuse.
 #[test]
 fn empty_policy_text_is_valid_and_permits_nothing() {
     for source in ["", "   \n\t  "] {
@@ -100,9 +97,6 @@ fn empty_policy_text_is_valid_and_permits_nothing() {
     }
 }
 
-/// The three ways a policy can name something that does not exist, each of which the exact engine
-/// used to catch structurally. A rule nothing can satisfy is a configuration mistake, and finding
-/// it at startup beats finding it in a denial log.
 #[test]
 fn undeclared_names_refuse_construction() {
     let unknown_principal = PolicyEngine::new(
@@ -124,8 +118,6 @@ fn undeclared_names_refuse_construction() {
         &world(),
     )
     .expect_err("an undeclared provider must refuse startup");
-    // Cedar's own validator reaches this one first: `cli-probe.upper` does not apply to a resource type
-    // it has never seen paired with that action.
     assert!(matches!(
         unknown_provider,
         PolicyBuildError::Validation { .. } | PolicyBuildError::UnknownProvider { .. }
@@ -150,17 +142,12 @@ fn undeclared_names_refuse_construction() {
         &world(),
     )
     .expect_err("an undeclared entity type must refuse startup");
-    // Classification now runs before schema generation, so our own check reaches this before
-    // Cedar's validator does and reports the more specific variant.
     assert!(matches!(
         unknown_type,
         PolicyBuildError::Validation { .. } | PolicyBuildError::UnknownEntityType { .. }
     ));
 }
 
-/// Strict validation is what keeps a policy from reading an attribute the request will never carry.
-/// `agent.prompt` has no capability classification, so a policy that inspects one is refused rather
-/// than silently erroring — and therefore denying — on every request.
 #[test]
 fn strict_validation_rejects_attributes_an_action_never_carries() {
     let error = PolicyEngine::new(
@@ -173,8 +160,6 @@ fn strict_validation_rejects_attributes_an_action_never_carries() {
     .expect_err("agent.prompt carries no effect attribute");
     assert!(matches!(error, PolicyBuildError::Validation { .. }));
 
-    // The mirror image: a required attribute may be read without a `has` guard, because every
-    // capability request carries it.
     PolicyEngine::new(
         r#"permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
@@ -185,8 +170,6 @@ fn strict_validation_rejects_attributes_an_action_never_carries() {
     .expect("a capability action always carries its classification");
 }
 
-/// `via` is the hinge that keeps attested and direct authority disjoint, and it has to hold in both
-/// directions: a policy written for a gateway must not authorize a direct peer, and vice versa.
 #[test]
 fn context_conditions_isolate_attested_and_direct_authority() {
     let engine = PolicyEngine::new(
@@ -215,7 +198,6 @@ fn context_conditions_isolate_attested_and_direct_authority() {
     assert!(attested.allowed);
     assert_eq!(attested.determining_policy_ids, ["attested-upper"]);
 
-    // The same principal, the same capability, arriving directly.
     let direct = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.upper",
@@ -224,7 +206,6 @@ fn context_conditions_isolate_attested_and_direct_authority() {
     assert!(!direct.allowed);
     assert!(direct.determining_policy_ids.is_empty());
 
-    // A different gateway is not this gateway.
     let other_gateway = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.upper",
@@ -240,7 +221,6 @@ fn context_conditions_isolate_attested_and_direct_authority() {
     assert!(direct_grant.allowed);
     assert_eq!(direct_grant.determining_policy_ids, ["direct-reverse"]);
 
-    // And the direct grant cannot be borrowed by an attested context.
     let borrowed = engine.authorize(capability_request(
         "direct-caller",
         "cli-probe.reverse",
@@ -249,8 +229,6 @@ fn context_conditions_isolate_attested_and_direct_authority() {
     assert!(!borrowed.allowed);
 }
 
-/// The session gate: permitting a principal to talk to an agent is its own explicit statement, and
-/// naming a different agent is not that statement.
 #[test]
 fn agent_prompt_matches_the_named_agent_only() {
     let engine = PolicyEngine::new(
@@ -299,7 +277,6 @@ fn agent_prompt_matches_the_named_agent_only() {
     );
 }
 
-/// `forbid` beats `permit`, and the forbid is what the explanation names.
 #[test]
 fn forbid_overrides_permit_and_is_reported_as_the_reason() {
     let engine = PolicyEngine::new(
@@ -335,8 +312,6 @@ fn forbid_overrides_permit_and_is_reported_as_the_reason() {
     assert_eq!(forbidden.determining_policy_ids, ["no-reverse"]);
 }
 
-/// Every capability an `action in [...]` list names is reported, because each one needs an
-/// owner-authored constraint set before the broker will start.
 #[test]
 fn referenced_capabilities_cover_every_action_a_policy_names() {
     let engine = PolicyEngine::new(
@@ -355,9 +330,6 @@ fn referenced_capabilities_cover_every_action_a_policy_names() {
     );
 }
 
-/// A policy that constrains no action names none, so nothing forces a constraint set into
-/// existence. The broker's decision-time `unconstrained-capability` refusal is what covers this,
-/// and this test pins the fact that the startup half cannot.
 #[test]
 fn an_unconstrained_action_scope_names_no_capability() {
     let engine = PolicyEngine::new(
@@ -377,7 +349,6 @@ fn an_unconstrained_action_scope_names_no_capability() {
     );
 }
 
-/// Bounds are startup-fixed, so a policy file cannot become an unbounded parse cost.
 #[test]
 fn source_and_count_bounds_fail_closed() {
     let oversized = "x".repeat(MAX_POLICY_BYTES + 1);
@@ -404,8 +375,6 @@ fn source_and_count_bounds_fail_closed() {
     ));
 }
 
-/// Policy identifiers are the explanation an audit record carries, so they must be unambiguous and
-/// bounded.
 #[test]
 fn policy_identifiers_are_bounded_and_unique() {
     let duplicate = PolicyEngine::new(
@@ -440,8 +409,6 @@ fn policy_identifiers_are_bounded_and_unique() {
     assert!(matches!(invalid, PolicyBuildError::InvalidPolicyId { .. }));
 }
 
-/// The digest fingerprints the authorization surface: the same policies over the same world hash
-/// identically regardless of formatting, and any change to either side moves it.
 #[test]
 fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     let compact = r#"permit(principal == Dekopon::Principal::"cpetersen",action == Dekopon::Action::"cli-probe.upper",resource == Dekopon::Provider::"cli-probe");"#;
@@ -467,8 +434,6 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     .expect("a different policy builds");
     assert_ne!(baseline.digest(), different_policy.digest());
 
-    // The world is part of the fingerprint: the same text over a larger surface is not the same
-    // authorization decision procedure.
     let wider = PolicyWorld::new(
         [
             "cpetersen".parse().expect("valid principal fixture"),
@@ -496,7 +461,6 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
             .digest()
     );
 
-    // Empty policy text still has a digest, and it is not the digest of a granted one.
     assert_ne!(
         baseline.digest(),
         PolicyEngine::new("", &world())
@@ -505,7 +469,6 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     );
 }
 
-/// The world declares what a policy may name, so its own construction has to fail closed too.
 #[test]
 fn world_construction_rejects_duplicates_and_reserved_names() {
     let duplicate = PolicyWorld::new(
@@ -546,11 +509,6 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
     }
 }
 
-/// A chat leg's conversation reaches every action; a direct peer carries none.
-///
-/// The record is the whole vocabulary a policy has about *where* a message was posted, and the two
-/// halves of S30 are here: a statement guarded with `has` decides, and a statement reading an
-/// optional attribute without one never loads at all.
 #[test]
 fn the_conversation_record_gates_every_action_and_is_absent_for_a_direct_peer() {
     fn chat(kind: &str, container: Option<&str>, id: &str, thread: Option<&str>) -> PolicyContext {
@@ -641,7 +599,6 @@ permit(
         }
     }
 
-    // The container is optional in the schema, so the `has` guard is what makes reading it legal.
     assert!(
         engine
             .authorize(prompt_request(
@@ -668,7 +625,6 @@ permit(
     );
 }
 
-/// The three ways an operator writes a conversation gate that can never load.
 #[test]
 fn a_retired_or_unguarded_context_attribute_fails_validation() {
     for (source, why) in [
@@ -700,13 +656,6 @@ fn a_retired_or_unguarded_context_attribute_fails_validation() {
     }
 }
 
-/// The retired attribute's quiet failure mode, which is the one worth knowing about.
-///
-/// Cedar types `context has channel` against a closed record with no `channel` as the singleton
-/// `False` and then short-circuits the `&&` *without* typechecking the right-hand side. So an 0.13
-/// statement that guarded its read — as every one in this repository's own fixtures did — keeps
-/// loading after the attribute is gone and simply never fires again. That is not something the
-/// validator will tell an operator, so `upgrading.md` tells them to grep instead.
 #[test]
 fn a_has_guarded_read_of_the_retired_channel_attribute_loads_and_then_never_fires() {
     let source = r#"
@@ -745,24 +694,12 @@ permit(
     );
 }
 
-/// The context record of every action, pinned.
-///
-/// Cedar's strict validator rejects a policy that reads an attribute the schema does not declare,
-/// so these records *are* the vocabulary a policy may use about a request — and the reason a
-/// `secret.use` policy can rely on `capability`, `provider` and `sink` being present rather than
-/// optional: goal 1's exact binding is only a gate if the schema requires all three.
-///
-/// Spelled out rather than generated from the renderer, deliberately. A golden that shares code
-/// with what it checks cannot notice the rendering moving; this one fails the moment an attribute
-/// is added, dropped, renamed, or made optional.
 #[test]
 fn every_action_declares_exactly_these_context_attributes() {
     fn pretty(value: &serde_json::Value) -> String {
         serde_json::to_string_pretty(value).expect("a context record serializes")
     }
 
-    // A capability invocation: the routing attributes, plus the classification the broker will
-    // execute it under.
     let capability_context = json!({
         "type": "Record",
         "attributes": {
@@ -785,7 +722,6 @@ fn every_action_declares_exactly_these_context_attributes() {
             "risk": { "type": "String" },
         }
     });
-    // Driving an agent at all: the routing attributes and nothing else.
     let prompt_context = json!({
         "type": "Record",
         "attributes": {
@@ -806,7 +742,6 @@ fn every_action_declares_exactly_these_context_attributes() {
             },
         }
     });
-    // Using a secret: the routing attributes, plus the binding the credential is released against.
     let secret_context = json!({
         "type": "Record",
         "attributes": {
@@ -862,8 +797,6 @@ fn every_action_declares_exactly_these_context_attributes() {
     }
 }
 
-/// Debug output is reachable from the broker's own `Debug`; it must fingerprint the policy set
-/// rather than reproduce it.
 #[test]
 fn debug_output_carries_no_policy_source() {
     let engine = PolicyEngine::new(
@@ -879,11 +812,6 @@ fn debug_output_carries_no_policy_source() {
     assert!(!rendered.contains("cpetersen"));
 }
 
-/// The reason a policy naming an unloaded capability is *kept* rather than dropped.
-///
-/// A grant reading `action in [a, b]` with only `a` loaded must keep granting `a`. Dropping the
-/// whole policy would silently revoke authority the operator has every reason to still expect,
-/// turning "one provider is missing" into "this agent can do nothing".
 #[test]
 fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
     let text = r#"@id("workflow")
@@ -900,7 +828,6 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
     assert_eq!(unresolved[0].kind, UnresolvedKind::Capability);
     assert_eq!(unresolved[0].policy, "workflow");
 
-    // The surviving half of the same policy still grants.
     assert!(
         engine
             .authorize(capability_request(
@@ -913,8 +840,6 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
     );
 }
 
-/// A tolerated name is not a referenced capability, so it never reaches the broker's requirement
-/// that every capability a policy could permit have an owner-authored constraint set.
 #[test]
 fn a_tolerated_capability_is_never_reported_as_referenced() {
     let (engine, unresolved) = PolicyEngine::new_lenient(
@@ -934,8 +859,6 @@ fn a_tolerated_capability_is_never_reported_as_referenced() {
     assert_eq!(referenced, ["cli-probe.upper"]);
 }
 
-/// Leniency is a startup posture, not a weakening of the grammar. Everything strict mode refuses
-/// for a *provider-derived* reason is exactly what lenient mode tolerates, and nothing else.
 #[test]
 fn strict_construction_refuses_precisely_what_lenient_tolerates() {
     let text = r#"permit(principal == Dekopon::Principal::"cpetersen",
@@ -965,14 +888,6 @@ fn strict_construction_refuses_precisely_what_lenient_tolerates() {
     );
 }
 
-/// A literal outside the identifier grammar is a typo, not an anticipation.
-///
-/// `Dekopon::Action::"GH.Read"` can never become a loaded capability however many providers arrive
-/// later, so tolerating it is meaningless. It used to be pushed to `unresolved`, skipped by
-/// `with_phantoms` because it does not parse, and then rejected by Cedar's strict validator — so
-/// the tolerant default produced a raw `Validation` error carrying Cedar text while strict mode
-/// gave the clearer `UnknownAction` for the same input, and the `UnresolvedName` report was lost
-/// with the `Err`.
 #[test]
 fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
     let action = PolicyEngine::new_lenient(
@@ -1002,7 +917,6 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
         "{provider:?}"
     );
 
-    // A well-formed name that is merely absent is still tolerated.
     let (_, unresolved) = PolicyEngine::new_lenient(
         r#"permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"gh.pull-request.approve",
@@ -1013,8 +927,6 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
     assert_eq!(unresolved.len(), 2, "{unresolved:?}");
 }
 
-/// Principals come from owner-authored identities, never from a loaded component, so an undeclared
-/// one is a typo in any mode. Leniency must not turn a misspelled principal into a silent no-match.
 #[test]
 fn an_undeclared_principal_stays_fatal_under_leniency() {
     let error = PolicyEngine::new_lenient(
@@ -1030,8 +942,6 @@ fn an_undeclared_principal_stays_fatal_under_leniency() {
     );
 }
 
-/// "Undeclared" and "could never be a principal" are different diagnoses with different fixes, and
-/// collapsing the second into the first sends an operator to add an identity they cannot spell.
 #[test]
 fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
     let error = PolicyEngine::new(
@@ -1056,9 +966,6 @@ fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
     );
 }
 
-/// A capability the world never declared cannot even be phrased as a Cedar question. The answer is
-/// still a denial — but a blanket denial that explains itself, rather than one indistinguishable
-/// from a deployment that simply granted nothing.
 #[test]
 fn a_request_the_schema_cannot_express_says_so() {
     let engine = PolicyEngine::new(
@@ -1084,7 +991,6 @@ fn a_request_the_schema_cannot_express_says_so() {
         "the refusal names the undeclared action: {refusal}"
     );
 
-    // Every decision Cedar actually reached leaves the field alone, denials included.
     assert!(
         engine
             .authorize(capability_request(
@@ -1097,10 +1003,6 @@ fn a_request_the_schema_cannot_express_says_so() {
     );
 }
 
-/// A `forbid` naming an unloaded capability must not fail open once that provider is loaded.
-///
-/// Keeping the policy whole is what makes this safe: the same text refuses the capability the
-/// moment the world declares it, with no restart-ordering subtlety.
 #[test]
 fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
     let text = r#"permit(principal == Dekopon::Principal::"cpetersen",

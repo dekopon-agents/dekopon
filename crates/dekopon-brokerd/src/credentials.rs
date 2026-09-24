@@ -1,22 +1,6 @@
-//! Owner-only provider credential storage, resolved at startup into a [`CredentialStore`].
-//!
-//! This file is the only place a provider secret exists at rest, and this module is the only code
-//! that reads it. Values deserialize directly into [`Redacted`] and travel to the native HTTP
-//! boundary as [`BoundCredential`]s — policy rules refer to entries by symbolic name, so the main
-//! broker configuration stays shareable and the secret never enters policy, audit, evidence,
-//! telemetry, or the wire protocol.
-//!
-//! Hygiene is stricter than the main configuration's: where `broker.yaml` rejects group/world
-//! *writability*, a credentials file rejects group/world *anything* (`mode & 0o077`), because
-//! readability is the whole threat. The same rule applies to an `authFile` the file points at, plus
-//! one more the others do not need: its parent directory must be owner-only *and writable*, because
-//! a rotated credential is persisted by creating a sibling temporary file and renaming it over the
-//! target.
-//!
-//! Two credential mechanisms live here. `bearerToken` is a fixed secret an operator rotates by
-//! hand. `chatgptSubscription` names a credential file instead of a value: the access token expires
-//! hourly and the refresh token rotates on every renewal, so the broker resolves it per invocation
-//! through the one implementation of that protocol, `dekopon_model::chatgpt::CredentialFile`.
+//! A credentials file rejects any group/world permission bit, not just writability, since
+//! readability alone is the threat; a failed rotation because of a read-only parent directory would
+//! leave the retired token on disk for reuse.
 
 use std::{
     path::{Path, PathBuf},
@@ -38,32 +22,18 @@ use thiserror::Error;
 
 use crate::socket;
 
-/// Strict `apiVersion` accepted by the credentials file.
 pub const CREDENTIALS_API_VERSION: &str = "dekopon.dev/broker-credentials/v1alpha1";
-/// Hard ceiling on the credentials file size.
 pub const HARD_MAX_CREDENTIALS_BYTES: usize = 1024 * 1024;
-/// Hard ceiling on distinct credential entries.
 pub const HARD_MAX_CREDENTIALS: usize = 64;
-/// Hard ceiling on one `chatgptSubscription` credential document.
-///
-/// The document is a fixed five-field JSON object holding two JWT-shaped tokens. 64 KiB is orders of
-/// magnitude more than that and still bounds what a wrong path can make the broker read at startup.
+/// 64 KiB is far larger than the five-field JWT document needs, but it still bounds what a
+/// misconfigured path could make the broker read at startup.
 pub const HARD_MAX_CHATGPT_AUTH_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 
-/// Deadline for one token-endpoint renewal.
-///
-/// Not configurable: it bounds one form POST to an OAuth endpoint, it is charged to the invocation
-/// that triggered it, and the capability's own `timeoutMs` is what an operator tunes. A knob here
-/// would be a second ceiling with no second question behind it.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// OAuth `error` codes that mean the refresh-token family is gone for good.
-///
-/// Each of these survives no retry: the authorization server has retired the family, and only a new
-/// device login — a human at a browser — restores it. Anything else the endpoint says, including a
-/// 5xx with no code at all, is transient by default, because classifying an outage as permanent
-/// would take a capability out of service until someone noticed.
+/// Anything not explicitly listed here is treated as transient by default, since classifying an
+/// outage as permanent would take a capability out of service until an operator noticed.
 const REAUTHORIZATION_CODES: [&str; 4] = [
     "invalid_grant",
     "refresh_token_reused",
@@ -88,29 +58,18 @@ struct CredentialsFile {
     credentials: Vec<CredentialEntry>,
 }
 
-/// One named credential and its explicit destination binding.
-///
-/// The per-kind fields are optional at the serde layer and required by [`resolve`], which reports
-/// every missing and every surplus field across every entry at once. Making them `deny_unknown_
-/// fields`-strict per kind instead would mean an untagged enum, and serde would answer a typo in
-/// one entry with "data did not match any variant" and no idea which entry or which field.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialEntry {
-    /// Symbolic name policy rules bind with `credential:`.
     name: String,
-    /// Credential mechanism; `bearerToken` renders `authorization: <scheme> <secret>`.
     kind: CredentialKind,
-    /// Header scheme, typically `Bearer` or `token`. `bearerToken` only.
     #[serde(default)]
     scheme: Option<String>,
-    /// Authorities this credential may be presented to, in `allowedHosts` grammar.
     destinations: Vec<String>,
-    /// The secret value, for `bearerToken` only. Deserializes straight into `Redacted`; no plain
-    /// `String` field ever holds it, so `Debug` on this entry renders a marker.
+    /// The secret value deserializes directly into Redacted, never through a plain String field, so
+    /// a derived Debug on this entry can't accidentally print it.
     #[serde(default)]
     secret: Option<Redacted<String>>,
-    /// Absolute path to a Dekopon ChatGPT credential file, for `chatgptSubscription` only.
     #[serde(default)]
     auth_file: Option<PathBuf>,
 }
@@ -131,13 +90,10 @@ impl CredentialKind {
     }
 }
 
-/// Loads and validates the credentials file into a resolved store.
 pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
 ) -> Result<CredentialStore, CredentialsError> {
-    // Private, not merely unwritable: this file holds provider secrets, so anyone who can read it
-    // has already taken them.
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
         read_trusted_file(
@@ -174,12 +130,6 @@ pub(crate) async fn load(
     Ok(resolved)
 }
 
-/// Turns the parsed file into a store, reporting every problem in it rather than the first.
-///
-/// Blocking: a `chatgptSubscription` entry is validated by actually reading and parsing its
-/// credential file. That is deliberate — an unreadable, group-readable, symlinked, relative, or
-/// unparseable auth file is a startup refusal naming its cause rather than a capability that denies
-/// every invocation once it is in service.
 fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, CredentialsError> {
     if file.credentials.len() > HARD_MAX_CREDENTIALS {
         return Err(CredentialsError::TooMany {
@@ -218,7 +168,6 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
     CredentialStore::new(entries).map_err(|source| CredentialsError::Store { source })
 }
 
-/// Validates one entry's per-kind fields, listing every one that is missing or surplus.
 fn resolve_entry(
     entry: CredentialEntry,
     expected_uid: u32,
@@ -237,8 +186,6 @@ fn resolve_entry(
     match kind {
         CredentialKind::BearerToken => {
             absent("authFile", entry.auth_file.is_some(), &mut problems);
-            // Both required fields are checked before returning: an entry missing scheme *and*
-            // secret must say so once, not across two starts.
             if entry.scheme.is_none() {
                 problems.push(format!(
                     "credential {name:?} is kind bearerToken and needs scheme"
@@ -278,9 +225,6 @@ fn resolve_entry(
                 ));
                 return Err(problems);
             }
-            // The destinations are validated by building the same credential shape the refresh will
-            // produce, from a placeholder token. A wrong `destinations` list must fail here, not on
-            // the first invocation, and this is the one definition of what that list may contain.
             if let Err(source) = BoundCredential::chatgpt_subscription(
                 Redacted::new("startup-destination-probe".to_owned()),
                 "startup-destination-probe",
@@ -306,25 +250,15 @@ fn resolve_entry(
     }
 }
 
-/// Renders a structural refusal without echoing anything derived from the value.
-///
-/// `ConfigurationError::InvalidCredential`'s reason names the offending *field*, which is exactly
-/// what belongs in a startup message; the secret itself never reaches it.
 fn describe_structural(name: &str, source: &ConfigurationError) -> String {
     format!("credential {name:?} is structurally invalid: {source}")
 }
 
-/// Proves one `authFile` is trusted input on a writable owner-only parent, and parses it.
 fn open_auth_file(
     name: &str,
     auth_file: &Path,
     expected_uid: u32,
 ) -> Result<CredentialFile, String> {
-    // The hygiene gate first, and on its own: `read_trusted_file` is the one definition of
-    // "regular, owner-owned, owner-only, single-link, O_NOFOLLOW, bounded", and it is what rejects
-    // a symlink, a 0644 file, or a group-readable one. The bytes it returns are a live access and
-    // refresh token, so they are dropped immediately and `CredentialFile` does its own read; one
-    // extra bounded read at startup is cheaper than a second parser for the same document.
     drop(
         read_trusted_file(
             auth_file,
@@ -341,10 +275,8 @@ fn open_auth_file(
             )
         })?,
     );
-    // Writability of the parent is load-bearing rather than hygiene: a rotated credential is
-    // persisted by creating a sibling temporary file and renaming it over the target, so a
-    // read-only directory turns every refresh into a rotated-but-unsaved one and leaves the retired
-    // token on disk for the next process to spend.
+    // The auth-file parent must be writable, since a read-only parent would leave a
+    // rotated-but-unsaved retired token on disk for reuse.
     socket::validate_private_parent(auth_file, expected_uid).map_err(|source| {
         format!(
             "credential {name:?} authFile {} needs an owner-only parent directory: {}",
@@ -379,8 +311,6 @@ fn open_auth_file(
             error_chain(&source)
         )
     })?;
-    // Stated once at startup because nothing else can: an operator who seeded a credential weeks
-    // ago wants to know it is still the live one before the first invocation discovers otherwise.
     tracing::info!(
         event = "broker_chatgpt_credential_loaded",
         credential = name,
@@ -400,11 +330,8 @@ fn parent_is_owner_writable(parent: &Path) -> bool {
         .is_ok_and(|metadata| metadata.permissions().mode() & 0o200 != 0)
 }
 
-/// A `chatgptSubscription` credential: `dekopon-model`'s refresh protocol, run per invocation.
-///
-/// One [`CredentialFile`] per entry, shared by every invocation, is what makes the in-process
-/// snapshot meaningful: two concurrent invocations of the same capability see one credential and
-/// spend one refresh token between them, not two.
+/// Sharing one CredentialFile per entry across invocations is what keeps two concurrent invocations
+/// of the same capability from spending the same single-use refresh token twice.
 struct ChatGptSubscriptionCredential {
     name: String,
     credential: Arc<CredentialFile>,
@@ -435,11 +362,8 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
         );
         let credential = Arc::clone(&self.credential);
         let blocking_span = span.clone();
-        // `dekopon-model` is a blocking `ureq` client taking a blocking advisory file lock, so this
-        // runs on the blocking pool rather than stalling the runtime worker the invocation is on.
-        // The span is entered *inside* the closure rather than around the join: `in_scope` on the
-        // blocking thread is what makes `dekopon-model`'s own `chatgpt.refresh` a child of this
-        // span, and there is no await inside it for a guard to be held across.
+        // This refresh runs on the blocking pool because dekopon-model's client blocks on a file
+        // lock and would stall the runtime worker inline.
         let joined =
             tokio::task::spawn_blocking(move || blocking_span.in_scope(|| credential.current()))
                 .await;
@@ -476,8 +400,6 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             self.destinations.clone(),
         )
         .map_err(|source| {
-            // The token endpoint answered with something that cannot be put in a header. Startup
-            // proved the destinations, so this is the renewed material itself.
             tracing::warn!(
                 event = "broker_chatgpt_credential_refresh_failed",
                 credential = %self.name,
@@ -493,7 +415,6 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
 }
 
 impl ChatGptSubscriptionCredential {
-    /// Splits a refresh failure on the axis the operator acts on.
     fn classify(&self, error: &ChatGptError) -> CredentialRefreshError {
         let (permanent, category) = match error {
             ChatGptError::TokenRefused { status, code, .. } => {
@@ -510,14 +431,9 @@ impl ChatGptSubscriptionCredential {
             }
             ChatGptError::Request(_) => (false, "transport"),
             ChatGptError::Protocol(_) => (false, "token-endpoint-protocol"),
-            // Everything else reachable from `current` is the local credential or the clock:
-            // neither retries into working, and both need a human.
             _ => (true, "credential-unusable"),
         };
         if permanent {
-            // The only broker failure an operator must act on rather than wait out. It names the
-            // symbolic credential and nothing else: the broker keeps serving every other
-            // capability, so this line is how anyone learns one of them is out of service.
             tracing::error!(
                 event = "broker_chatgpt_credential_reauth_required",
                 credential = %self.name,
@@ -541,7 +457,6 @@ impl ChatGptSubscriptionCredential {
     }
 }
 
-/// Credential storage that could not be trusted or decoded.
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     #[error("could not read broker credentials at {path}")]
@@ -556,9 +471,7 @@ pub enum CredentialsError {
         "broker credentials must be single-link, owned by the server UID, and unreadable by group and world: {path}"
     )]
     InsecureFile {
-        /// The refused path.
         path: PathBuf,
-        /// Which hygiene check refused it.
         #[source]
         source: FileHygieneError,
     },
@@ -571,17 +484,8 @@ pub enum CredentialsError {
     },
     #[error("broker credentials name too many entries; maximum is {maximum}")]
     TooMany { maximum: usize },
-    /// Every problem found across every entry, rather than only the first.
-    ///
-    /// Entry validation is cheap and a credentials file is short, so an operator fixing one wrong
-    /// field only to be told about the next is pure waste. No problem string carries a secret
-    /// value: the only value-derived refusals come from `ConfigurationError`, whose reason names the
-    /// offending field.
     #[error("broker credentials are invalid: {}", problems.join("; "))]
-    Invalid {
-        /// One rendered problem per refusal, in file order.
-        problems: Vec<String>,
-    },
+    Invalid { problems: Vec<String> },
     #[error("broker credential store could not be built")]
     Store {
         #[source]
@@ -605,8 +509,6 @@ credentials:
     secret: fixture-secret-value
 ";
 
-    /// The same five-field document `dekopond auth chatgpt login` writes, with a JWT-shaped access
-    /// token carrying the account claim the broker presents as a companion header.
     fn chatgpt_document(expires_at: u64) -> String {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -634,7 +536,6 @@ credentials:
             .expect("set mode");
     }
 
-    /// Writes an auth file under its own owner-only directory, which is what a refresh needs.
     async fn write_auth_file(
         root: &std::path::Path,
         subdir: &str,
@@ -671,7 +572,6 @@ credentials:
         rustix::process::geteuid().as_raw()
     }
 
-    /// Every problem string, joined, so a test can assert the refusal names the cause.
     fn problems(error: &CredentialsError) -> String {
         let CredentialsError::Invalid { problems } = error else {
             panic!("expected an aggregated entry refusal, got {error:?}");
@@ -691,7 +591,6 @@ credentials:
 
     #[tokio::test]
     async fn rejects_group_or_world_readable_files() {
-        // Stricter than broker.yaml on purpose: for a secret, readability is the threat.
         let directory = tempfile::tempdir().expect("temporary directory");
         write_credentials(directory.path(), VALID, 0o640).await;
 
@@ -781,27 +680,20 @@ credentials:
             .expect("a fixed secret and a refreshing credential coexist");
     }
 
-    /// Every shape of wrong `authFile` refuses startup naming which check refused it, because the
-    /// alternative is a capability that is in service and denies every invocation.
     #[tokio::test]
     async fn every_untrusted_auth_file_refuses_startup_with_its_cause() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let good = write_auth_file(directory.path(), "good", u64::MAX, 0o600).await;
 
-        // Missing.
         let missing = directory.path().join("good").join("absent.json");
-        // A symlink to a perfectly good credential: `read_trusted_file` opens `O_NOFOLLOW`.
         let symlinked = directory.path().join("good").join("linked.json");
         std::os::unix::fs::symlink(&good, &symlinked).expect("create symlink fixture");
-        // Group-readable and world-readable, which is the whole threat for a credential.
         let group_readable = write_auth_file(directory.path(), "group", u64::MAX, 0o640).await;
         let world_readable = write_auth_file(directory.path(), "world", u64::MAX, 0o644).await;
-        // Not a Dekopon credential document at all.
         let unparseable = write_auth_file(directory.path(), "unparseable", u64::MAX, 0o600).await;
         tokio::fs::write(&unparseable, "not a credential document")
             .await
             .expect("overwrite with a non-credential document");
-        // A parent the broker cannot write, so a rotation could never be persisted.
         let read_only = write_auth_file(directory.path(), "read-only", u64::MAX, 0o600).await;
         tokio::fs::set_permissions(
             read_only.parent().expect("auth parent"),
@@ -809,7 +701,6 @@ credentials:
         )
         .await
         .expect("make the parent read-only");
-        // A group-accessible parent: the file is private but the directory is not.
         let open_parent = write_auth_file(directory.path(), "open-parent", u64::MAX, 0o600).await;
         tokio::fs::set_permissions(
             open_parent.parent().expect("auth parent"),
@@ -844,7 +735,6 @@ credentials:
             );
         }
 
-        // Restore so the temporary directory can be removed.
         for subdir in ["read-only", "open-parent"] {
             tokio::fs::set_permissions(
                 directory.path().join(subdir),
@@ -855,8 +745,6 @@ credentials:
         }
     }
 
-    /// Two simultaneous problems are both reported: an operator who fixes one must not have to run
-    /// the broker again to discover the other.
     #[tokio::test]
     async fn every_field_problem_in_the_file_is_reported_at_once() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -912,7 +800,6 @@ credentials:
             ),
             "{rendered}"
         );
-        // Both required fields of one entry, not just the first.
         assert!(
             rendered.contains(
                 "\"bearer-with-no-scheme-or-secret\" is kind bearerToken and needs scheme"

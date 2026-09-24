@@ -1,10 +1,7 @@
-//! Curated JSONL operations over the invocation namespace.
-
 use dekopon_capability::StorageInterface;
 
 use crate::{StorageHandle, StorageHostError};
 
-/// One bounded JSONL read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsonlChunk {
     pub bytes: Vec<u8>,

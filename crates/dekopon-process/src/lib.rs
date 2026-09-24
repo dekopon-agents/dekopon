@@ -1,14 +1,5 @@
-//! Joined Tokio process lifecycle for unprivileged Dekopon frontends.
-//!
-//! This slice owns exactly one boundary: run one asynchronous operation in a traced Tokio task and
-//! join it before returning. A process is either non-interruptible or cancellable. Cancellation is
-//! cooperative and minimal: a [`CancelHandle`] asks, [`ProcessRun::execute`] aborts the node's Tokio
-//! task at its next `.await`, and still joins that task before it reports anything. It joins the
-//! node's own Tokio task and nothing else: work the node handed to
-//! [`tokio::task::spawn_blocking`] or spawned as another task is detached by the abort, is not
-//! joined, and can outlive a `cancelled` outcome. A node that must not leave such work behind
-//! must stay [`ProcessMetadata::non_interruptible`]. Structured process trees, ports, deadlines,
-//! and graph scheduling remain deferred until a production frontend consumes them.
+//! Cancellation aborts and joins only the node's own task; work it spawned separately is detached,
+//! not joined, and can outlive a cancelled outcome.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -54,24 +45,14 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Requests cooperative cancellation of the [`CancelSignal`] it was paired with.
-///
-/// Every clone addresses the same signal. Dropping every handle never cancels: a process whose
-/// handles are all gone simply runs to completion as if it were non-interruptible.
+/// Dropping every CancelHandle never cancels the process; only calling cancel() does, and the
+/// process just runs to completion.
 #[derive(Clone)]
 pub struct CancelHandle {
     sender: watch::Sender<bool>,
 }
 
 impl CancelHandle {
-    /// Requests cancellation. Repeated calls are idempotent.
-    ///
-    /// The request is cooperative: [`ProcessRun`] aborts the node's Tokio task at its next
-    /// `.await`, then joins it and reports [`ProcessOutcome::TaskFailed`] whose
-    /// [`JoinError::is_cancelled`](tokio::task::JoinError::is_cancelled) is `true`. A process that
-    /// already returned keeps its real result. Only the node's own task is joined: work it handed
-    /// to [`tokio::task::spawn_blocking`] or spawned as another task is detached by the abort, is
-    /// not joined, and can outlive the `cancelled` outcome.
     pub fn cancel(&self) {
         self.sender.send_replace(true);
     }
@@ -108,17 +89,14 @@ pub struct CancelSignal {
 }
 
 impl CancelSignal {
-    /// Creates a signal together with the handle that requests it.
     #[must_use]
     pub fn pair() -> (CancelHandle, Self) {
         let (sender, receiver) = watch::channel(false);
         (CancelHandle { sender }, Self { receiver })
     }
 
-    /// Creates a signal that nobody can ever request.
-    ///
-    /// Its sender is dropped immediately, which `execute` treats as "pend forever", never as
-    /// a cancellation.
+    /// A dropped sender leaves the channel closed, but execute treats that as pending forever,
+    /// never as a cancellation signal.
     #[must_use]
     pub fn never() -> Self {
         let (sender, receiver) = watch::channel(false);
@@ -126,26 +104,16 @@ impl CancelSignal {
         Self { receiver }
     }
 
-    /// Reports whether cancellation has already been requested.
-    ///
-    /// The point-in-time read for a caller that must decide now rather than await: a synchronous
-    /// boundary deciding whether to start work at all, where `execute`'s own await on this
-    /// signal has nothing yet to abort. Once requested it stays `true`, and a
-    /// [`CancelSignal::never`] signal is always `false`. A signal fired the instant after this
-    /// returns `false` is the ordinary race any cooperative check has: work started on that answer
-    /// is supervised, not lost.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         *self.receiver.borrow()
     }
 
-    /// Clones the cancellation watch for consumers outside the process.
     #[must_use]
     pub fn watch(&self) -> watch::Receiver<bool> {
         self.receiver.clone()
     }
 
-    /// Resolves only once cancellation has been requested.
     async fn cancelled(&mut self) {
         loop {
             if *self.receiver.borrow_and_update() {
@@ -180,10 +148,6 @@ impl Interruptibility {
     }
 }
 
-/// Fixed, payload-free metadata for one process operation.
-///
-/// Once an operation starts, [`ProcessRun`] always awaits its Tokio task. It never reports any
-/// outcome, cancellation included, while operation work could still be running.
 #[derive(Clone)]
 pub struct ProcessMetadata {
     kind: &'static str,
@@ -191,7 +155,6 @@ pub struct ProcessMetadata {
 }
 
 impl ProcessMetadata {
-    /// Describes an operation that must be joined after it starts and cannot be interrupted.
     #[must_use]
     pub const fn non_interruptible(kind: &'static str) -> Self {
         Self {
@@ -200,7 +163,6 @@ impl ProcessMetadata {
         }
     }
 
-    /// Describes an operation whose Tokio task is aborted, then joined, once `signal` is requested.
     #[must_use]
     pub fn cancellable(kind: &'static str, signal: CancelSignal) -> Self {
         Self {
@@ -210,31 +172,21 @@ impl ProcessMetadata {
     }
 }
 
-/// One asynchronous operation joined by [`ProcessRun`].
-///
-/// The operation's associated error is returned unchanged inside [`ProcessOutcome::Completed`].
-/// Only failure of the Tokio task itself is classified separately.
 #[async_trait]
 pub trait Process: Send + 'static {
-    /// The value returned by a completed operation.
     type Output: Send + 'static;
-    /// The operation's own typed error.
     type Error: Error + Send + Sync + 'static;
 
-    /// Returns fixed metadata used for payload-free tracing.
     fn metadata(&self) -> ProcessMetadata;
 
-    /// Runs the operation to its typed result.
     async fn run(self) -> Result<Self::Output, Self::Error>;
 }
 
-/// [`Process`] implementation backed by one `FnOnce` asynchronous closure.
 pub struct ProcessFn<F> {
     metadata: ProcessMetadata,
     function: F,
 }
 
-/// Adapts an asynchronous closure to [`Process`].
 #[must_use]
 pub fn process_fn<F, Fut, Output, OperationError>(
     metadata: ProcessMetadata,
@@ -267,16 +219,9 @@ where
     }
 }
 
-/// Terminal result of one joined process operation.
 #[must_use = "process outcomes must be handled"]
 pub enum ProcessOutcome<Output, OperationError> {
-    /// The process returned its typed operation result.
     Completed(Result<Output, OperationError>),
-    /// The Tokio task was cancelled or panicked before returning an operation result.
-    ///
-    /// A requested cancellation arrives here with
-    /// [`JoinError::is_cancelled`](tokio::task::JoinError::is_cancelled) set, and only after the
-    /// node has been joined the aborted task.
     TaskFailed(tokio::task::JoinError),
 }
 
@@ -315,12 +260,8 @@ pub struct ProcessRun {
 }
 
 impl ProcessRun {
-    /// Runs one process in a traced Tokio task and joins it before returning.
-    ///
-    /// A cancellable process is supervised against its [`CancelSignal`]: once requested, the
-    /// node's task is aborted and then still joined, so this never returns while the node could
-    /// be running. A node that finished before the abort landed keeps its real result.
-    ///
+    /// A cancellable process is aborted then still joined, so execute never returns while the node
+    /// could be running; a node that finished before the abort landed keeps its real result.
     pub async fn execute<P>(process: P) -> ProcessOutcome<P::Output, P::Error>
     where
         P: Process,
@@ -348,8 +289,8 @@ impl ProcessRun {
         let node_instrument = node_span.clone().or_current();
 
         async move {
-            // A task rather than an inline future so a panicking node reports a `JoinError`
-            // instead of unwinding through the caller.
+            // Spawned as a task rather than awaited inline, so a panicking node reports as a
+            // JoinError instead of unwinding through the caller.
             let mut node = JoinSet::new();
             node.spawn(process.run().instrument(node_instrument));
             let (joined, cancel_requested) = match metadata.interruptibility {
@@ -359,8 +300,6 @@ impl ProcessRun {
                         biased;
                         joined = join_one(&mut node) => (joined, false),
                         () = signal.cancelled() => {
-                            // Abort is cooperative: it lands at the node's next await. The join
-                            // below is what makes the outcome safe to report.
                             node.abort_all();
                             (join_one(&mut node).await, true)
                         }
@@ -385,7 +324,6 @@ impl ProcessRun {
     }
 }
 
-/// Joins the one node a [`ProcessRun`] spawned.
 async fn join_one<T: 'static>(node: &mut JoinSet<T>) -> Result<T, tokio::task::JoinError> {
     node.join_next()
         .await

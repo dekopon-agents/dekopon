@@ -1,9 +1,3 @@
-//! A scripted loopback HTTP endpoint for transport tests.
-//!
-//! The clients use real HTTP sockets, and the behavior worth pinning is what they put
-//! on the wire and what they do with what comes back — including a connection that dies mid-flight,
-//! which no in-process fake can produce.
-
 use std::{
     io::{BufRead as _, BufReader, Read as _, Write as _},
     net::{TcpListener, TcpStream},
@@ -14,13 +8,10 @@ use std::{
 
 use serde_json::Value;
 
-/// One scripted reply, consumed in order by [`MockServer`].
 pub(crate) struct MockResponse {
     status: u16,
     content_type: &'static str,
     body: String,
-    /// Closes the connection after reading the request instead of answering, which is what a
-    /// dropped packet or a reset TLS session looks like to the client.
     hang_up: bool,
     delivery: Delivery,
     headers: Vec<(&'static str, String)>,
@@ -119,7 +110,6 @@ impl MockResponse {
         }
     }
 
-    /// A failure status carrying a body, so a test can assert the body reaches the error.
     pub(crate) fn failure(status: u16, body: Value) -> Self {
         Self {
             status,
@@ -199,7 +189,6 @@ impl MockServer {
         format!("http://{}", self.address)
     }
 
-    /// Every request the endpoint received, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("request lock").clone()
     }
@@ -258,9 +247,6 @@ impl Drop for MockServer {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        // A test that fails early leaves part of the script unconsumed and the endpoint parked in
-        // `accept`. Joining then would hang the whole suite instead of reporting the failure, so
-        // the remaining slots are retired with throwaway connections the reader treats as EOF.
         while !handle.is_finished() {
             drop(TcpStream::connect(&self.address));
             thread::sleep(Duration::from_millis(10));
@@ -269,7 +255,6 @@ impl Drop for MockServer {
     }
 }
 
-/// Reads one whole request, or `None` when the peer closed without sending one.
 fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
     let mut request = String::new();

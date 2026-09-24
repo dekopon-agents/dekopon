@@ -1,9 +1,3 @@
-//! Binding configured routes to catalog agents and configured models, then matching messages.
-//!
-//! Every binding failure here is a *startup* failure. A route naming a disabled agent or an agent
-//! with no reachable model is a configuration mistake, and finding it when the daemon starts beats
-//! finding it in a chat reply an hour later.
-
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use dekopon_agent::prompt::PromptLimits;
@@ -19,85 +13,38 @@ use crate::{
     transport::InboundMessage,
 };
 
-/// One route after its agent and model were resolved.
 #[derive(Clone, Debug)]
 pub(crate) struct BoundRoute {
     pub transport: String,
-    /// Which conversations on that transport this route claims.
     pub conversation: ConversationMatch,
-    /// Canonical subjects this route answers; every subject when absent.
-    ///
-    /// Only a `kind: [directMessage]` route may carry one, which configuration enforces. It
-    /// restricts and never widens: a subject listed here still reaches the broker as an ordinary
-    /// attested claim, and an unmapped one is refused before any model call.
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
-    /// Operator-authored purpose safe to expose through credential-free introspection.
     pub description: String,
-    /// Catalog model class; never the selected model endpoint or credential configuration.
     pub model_class: Option<String>,
-    /// The agent's standing orders, which are untrusted model text and grant nothing.
     pub instructions: Option<String>,
-    /// The agent's mounted skills, read whole at catalog load and shared by every session.
-    ///
-    /// Shared rather than cloned because a bound route is cloned per message, and a skill set
-    /// can be a megabyte of text that never changes while the daemon runs.
     pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
-    /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
-    /// Whether this route's sessions are offered `inspect_agent_config`.
     pub inspect_agent_config: bool,
     pub limits: PromptLimits,
-    /// Wall-clock bound on one session, counted from the moment the agent starts working.
-    ///
-    /// Absent means no wall-clock bound: the step and capability-call budgets are what most
-    /// deployments need, and a bound that cancels a working session is worth choosing rather than
-    /// inheriting.
     pub max_duration: Option<Duration>,
-    /// Wall-clock deadline one script this route's sessions run under.
-    ///
-    /// Always present, unlike `max_duration`: a script has a deadline whether or not an operator
-    /// chose one, and the route is where that number now comes from rather than `dekopon-shell`'s
-    /// own default.
     pub script_timeout: Duration,
-    /// How much this route's progress surface says.
     pub progress_detail: ProgressDetail,
-    /// What this route remembers between messages.
     pub memory: MemoryPolicy,
-    /// The provider cache lane a message on this route uses when it has no conversation of its own.
-    ///
-    /// Minted once here, at bind time, and shared by every sender the route answers. That reads
-    /// alarming and is not, because of what a `oneShot` route's shared prefix actually is: the
-    /// agent's `instructions` and the tool definitions, and then this one message. Those are byte
-    /// for byte identical for everyone the route serves and contain nothing about any of them, so
-    /// pointing the route's traffic at one cache lane shares a prefix that was already common to
-    /// all of it. Nothing sender-specific can hit: a different sender's message diverges from the
-    /// first token that differs, and a cache key is a hint about a shared *prefix* rather than a
-    /// handle on somebody's answer. It is not an authorization boundary and confers nothing — every
-    /// message still opens its own attested broker leg.
-    ///
-    /// The alternative, a fresh key per message, names a lane holding exactly one request and gives
-    /// up the only caching a stateless route can have.
+    /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
+    /// across the route's traffic, and grants nothing: every message still opens its own attested
+    /// broker leg.
     pub cache_key: String,
 }
 
-/// Every bound route, consulted in declaration order.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RoutingTable {
     routes: Vec<BoundRoute>,
 }
 
 impl RoutingTable {
-    /// Resolves every configured route against the catalog and the configured models.
-    ///
-    /// Every route is examined before any of them is refused, for the reason `resolve` scans a
-    /// whole configuration file: a deployment whose catalog disabled two of its agents is one
-    /// refusal naming both, not two restarts.
-    ///
-    /// # Errors
-    ///
-    /// Returns one [`RouteError`] carrying every route that no configuration could satisfy.
+    /// Every route is checked before any is refused, so a config with several broken routes gets
+    /// one error naming all of them instead of one restart per fix.
     pub fn bind(config: &ResolvedConfig, catalog: &LocalCatalog) -> Result<Self, RouteError> {
         let models = config
             .models
@@ -108,9 +55,6 @@ impl RoutingTable {
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut problems = Vec::new();
         for route in &config.routes {
-            // An agent that is absent or disabled settles nothing about which model would serve
-            // it, so the class lookup below would report a second problem about the same route.
-            // The same skip `dekopon-config` makes when a referenced resource never parsed.
             let Some(agent) = catalog.agent(&route.agent) else {
                 problems.push(RouteProblem::UnknownAgent {
                     agent: route.agent.to_string(),
@@ -123,9 +67,6 @@ impl RoutingTable {
                 });
                 continue;
             }
-            // An explicit override wins; otherwise the agent's declared class picks the first
-            // endpoint that offers it. Declaration order is the tie-break, so an operator controls
-            // preference by ordering `models` rather than by a hidden score.
             let selected = match &route.model {
                 Some(name) => models
                     .iter()
@@ -183,10 +124,6 @@ impl RoutingTable {
         }
     }
 
-    /// The distinct models bound routes can actually reach, in declaration order.
-    ///
-    /// Startup resolves each one's credential before any transport accepts work. A configured
-    /// model no route reaches is not a reason to refuse to start.
     pub fn bound_models(&self) -> Vec<&ModelConfig> {
         let mut seen = BTreeSet::new();
         self.routes
@@ -196,21 +133,13 @@ impl RoutingTable {
             .collect()
     }
 
-    /// First route claiming this conversation, or `None` for ambient traffic.
-    ///
-    /// Declaration order decides, and that is the whole precedence rule: a route matching one named
-    /// channel, written above a route matching any channel, keeps that channel for itself while the
-    /// catch-all takes everything else. No specificity ranking sorts them, because a hidden score is
-    /// how an operator ends up unable to explain which route answered — the file is read top to
-    /// bottom exactly as it looks.
-    ///
-    /// A catch-all is not a wakeup on its own. `dispatch` still requires channel traffic to address
-    /// the bot before any of this becomes a session.
+    /// Declaration order is the only precedence rule, with no specificity ranking, so an operator
+    /// reads top to bottom to see which route wins; a catch-all still needs dispatch's own
+    /// addressing check.
     pub fn route(&self, message: &InboundMessage) -> Option<&BoundRoute> {
         self.route_index(message).map(|(_, route)| route)
     }
 
-    /// Declaration index is the exact startup-fixed route identity for collection isolation.
     pub(crate) fn route_index(&self, message: &InboundMessage) -> Option<(usize, &BoundRoute)> {
         self.routes.iter().enumerate().find(|(_, route)| {
             route.transport == message.transport
@@ -222,21 +151,17 @@ impl RoutingTable {
         })
     }
 
-    /// How many routes are bound, for the startup lifecycle event.
     pub fn len(&self) -> usize {
         self.routes.len()
     }
 }
 
-/// Every route that no configuration could satisfy, reported as one refusal.
 #[derive(Debug, Error)]
 #[error("{}", render_problems(.problems))]
 pub struct RouteError {
-    /// Every unsatisfiable route, in declaration order.
     pub problems: Vec<RouteProblem>,
 }
 
-/// One route that no configuration could ever satisfy.
 #[derive(Debug, Error)]
 pub enum RouteProblem {
     #[error("route names agent {agent:?}, which is not in the catalog")]

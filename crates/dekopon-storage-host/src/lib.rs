@@ -81,18 +81,14 @@ use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{Namespace, NamespacePlan, Reset, deadline_after};
 use quota::QuotaLedger;
 
-/// Durable chat-memory continuity behavior.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContinuityPolicy {
-    /// Reuse one logical namespace across semantic authority changes. Must be explicit.
     Stable,
-    /// Mint a non-reusing random generation whenever the effective authority commitment changes.
     #[default]
     AuthorityBound,
 }
 
-/// Opaque commitment identifying a storage scope without spelling it out.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StorageScopeCommitment(String);
@@ -110,7 +106,6 @@ impl fmt::Debug for StorageScopeCommitment {
     }
 }
 
-/// Content-free storage evidence for one invocation: operation counts and exact byte totals.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageEvidence {
@@ -120,17 +115,12 @@ pub struct StorageEvidence {
     /// Exact bytes charged against this invocation's read budget: each read counts the length it
     /// asked for, whatever it returned.
     pub read_bytes: u64,
-    /// Exact bytes charged against this invocation's write budget.
     pub write_bytes: u64,
     pub evidence_commitment: String,
-    /// Commitment to the exact successful provider output, when one was supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_commitment: Option<String>,
 }
 
-/// Trusted, non-authoritative material from which a host may mint one grant.
-///
-/// Every formatter is redacted because it contains the complete raw chat scope.
 pub struct StorageGrantRequest {
     invocation: InvocationId,
     capability: CapabilityId,
@@ -209,11 +199,6 @@ impl StorageGrantRequest {
     }
 }
 
-/// Non-mutating, single-use preparation for one invocation-bound storage grant.
-///
-/// Preparation derives only opaque values. It performs no filesystem operation and reserves no
-/// quota, so dropping it after an authorization-audit failure leaves the storage tree exactly
-/// unchanged. [`materialize`](Self::materialize) is the explicit mutation boundary.
 pub struct StorageGrantPreparation {
     host: StorageHost,
     request: StorageGrantRequest,
@@ -233,21 +218,16 @@ impl StorageGrantPreparation {
         self.scope_commitment.clone()
     }
 
-    /// The base directory token this grant will open under `namespaces/`.
-    ///
-    /// It is what joins a trace's chat scope to a directory an operator can inspect.
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.base_token
     }
 
-    /// Derives one stable per-namespace record identifier without touching the namespace tree.
     #[must_use]
     pub fn record_id(&self, delivery: &[u8]) -> String {
         record_id(&self.base_token, delivery)
     }
 
-    /// Derives decision evidence without materializing storage authority.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
         commitment(
@@ -256,19 +236,16 @@ impl StorageGrantPreparation {
         )
     }
 
-    /// Derives the provider's content/dedup commitment before filesystem mutation.
     #[must_use]
     pub fn content_commitment(&self, user: &str, assistant: &str) -> String {
         content_commitment(&self.base_token, user, assistant)
     }
 
-    /// Crosses the explicit filesystem mutation boundary after durable authorization audit.
     pub fn materialize(self) -> Result<StorageGrant, StorageHostError> {
         self.host.materialize_grant(self.request, self.base_token)
     }
 }
 
-/// Single-use invocation-bound storage authority.
 pub struct StorageGrant {
     host_id: [u8; 32],
     invocation: InvocationId,
@@ -316,12 +293,10 @@ impl StorageGrant {
     pub fn scope_commitment(&self) -> StorageScopeCommitment {
         StorageScopeCommitment(self.namespace.scope_commitment.clone())
     }
-    /// Derives one stable per-namespace record identifier from a bounded delivery identity.
     #[must_use]
     pub fn record_id(&self, delivery: &[u8]) -> String {
         record_id(&self.namespace.base_token, delivery)
     }
-    /// Derives evidence distinct from every path and content domain.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
         commitment(
@@ -334,7 +309,6 @@ impl StorageGrant {
         )
     }
 
-    /// Derives a content/dedup commitment distinct from paths, record IDs, audit, and evidence.
     #[must_use]
     pub fn content_commitment(&self, user: &str, assistant: &str) -> String {
         content_commitment(&self.namespace.base_token, user, assistant)
@@ -359,11 +333,9 @@ struct HostInner {
     ledger: Arc<QuotaLedger>,
     limits: StorageLimits,
     namespace_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    /// Serializes physical namespace-slot observations with base removal, but never lease waits.
     namespace_observation_lock: Mutex<()>,
 }
 
-/// Wasmtime-independent secure native storage engine.
 #[derive(Clone)]
 pub struct StorageHost {
     inner: Arc<HostInner>,
@@ -376,10 +348,6 @@ impl fmt::Debug for StorageHost {
 }
 
 impl StorageHost {
-    /// Opens, locks, and accounts one broker-owned root.
-    ///
-    /// Only the root itself is validated here. Namespaces are checked when a grant opens them, so
-    /// a corrupt conversation fails its own invocation rather than the broker's startup.
     pub fn open(root: impl AsRef<Path>, limits: StorageLimits) -> Result<Self, StorageHostError> {
         limits.validate()?;
         let root = resolve_storage_root_path(root.as_ref())?;
@@ -388,8 +356,6 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let layout = Layout::open(&root)?;
-        // The one startup walk. It charges the quota ledger and nothing else: a namespace that
-        // will not scan is logged and left uncharged, and its own next grant is where it fails.
         let usage = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
             return Err(StorageHostError::QuotaExceeded);
@@ -415,7 +381,6 @@ impl StorageHost {
         })
     }
 
-    /// Produces evidence for a denied storage proposal without deriving or creating a namespace.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
         commitment(
@@ -424,7 +389,6 @@ impl StorageHost {
         )
     }
 
-    /// Prepares one grant without reading or mutating the filesystem or reserving quota.
     pub fn prepare_grant(
         &self,
         request: StorageGrantRequest,
@@ -442,7 +406,6 @@ impl StorageHost {
         })
     }
 
-    /// Convenience path for trusted callers that have already durably audited authorization.
     pub fn grant(&self, request: StorageGrantRequest) -> Result<StorageGrant, StorageHostError> {
         self.prepare_grant(request)?.materialize()
     }
@@ -463,15 +426,14 @@ impl StorageHost {
                     .collect::<Vec<_>>()
             )
         );
-        // One deadline for every wait this grant makes: the in-process housekeeping lock, then the
-        // base lease in `prepare` or `apply`. Contenders queue behind the base lease held for a
-        // whole invocation, so per-wait timeouts would let the k-th one wait k times over.
+        // One deadline covers all of a grant's waits; per-wait timeouts would let the k-th
+        // contender behind the lease wait k times as long.
         let deadline = deadline_after(self.inner.limits.lock_timeout_ms)?;
         let namespace_lock = namespace_lock(&self.inner.namespace_locks, &base);
         let _namespace = lock_before(&namespace_lock, deadline)?;
         let mut namespace_reservation = Some({
-            // The observation lock is dropped before any base lease wait, preserving concurrency between
-            // distinct namespaces.
+            // The observation lock is dropped before any base lease wait, preserving concurrency
+            // between distinct namespaces.
             let _observation = self
                 .inner
                 .namespace_observation_lock
@@ -488,9 +450,8 @@ impl StorageHost {
                 .ledger
                 .reserve_namespace(base.clone(), observed_namespaces)?
         });
-        // The ledger is rebuilt once at startup and every host mutation reconciles or retains its
-        // reservation. Rescanning here would be unsafe: a scan can start before another namespace
-        // commits and publish its stale lower total after that commit releases its reservation.
+        // Rescanning here would race another namespace's commit, publishing a stale lower total
+        // after that commit releases its reservation.
         let mut plan = NamespacePlan::prepare(
             self.inner.layout.namespaces(),
             &request,
@@ -506,10 +467,8 @@ impl StorageHost {
             .inner
             .ledger
             .reserve_root(plan.reserved_bytes(), plan.reserved_entries())?;
-        // Reconcile physical existence and keep slot publication under the same observation lock
-        // as the first namespace mutation. `prepare` has already completed every lease wait, so
-        // this short critical section never serializes an unrelated namespace behind a blocked
-        // base lease.
+        // This critical section must stay free of lease waits, or it would serialize an unrelated
+        // namespace behind a blocked lease.
         let _observation = self
             .inner
             .namespace_observation_lock
@@ -524,8 +483,8 @@ impl StorageHost {
         let namespace = match plan.apply(self.inner.layout.namespaces(), deadline) {
             Ok(namespace) => namespace,
             Err(error) => {
-                // `apply` may have completed mkdir/rename before a later open or sync failed. A
-                // physically present base continues to own its slot.
+                // A namespace mutation may partially complete before failing, so a physically
+                // present base still owns its slot afterward.
                 if self.inner.layout.namespaces().exists(&base).unwrap_or(true) {
                     namespace_reservation
                         .take()
@@ -581,8 +540,6 @@ impl StorageHost {
             .expect("namespace reservation")
             .commit();
         if let Some(cause) = reset {
-            // The fresh generation is on disk and accounted. This invocation still fails, so the
-            // model is told once that what it stored is gone rather than finding it empty.
             return Err(report_namespace_reset(cause, &namespace));
         }
         Ok(StorageGrant {
@@ -598,7 +555,6 @@ impl StorageHost {
         })
     }
 
-    /// Consumes and validates one grant, acquiring its namespace lease for the invocation lifetime.
     pub fn begin(&self, grant: StorageGrant) -> Result<StorageHandle, StorageHostError> {
         if grant.host_id != self.inner.id {
             return Err(StorageHostError::GrantHostMismatch);
@@ -612,8 +568,6 @@ impl StorageHost {
     }
 }
 
-/// Takes a namespace's housekeeping lock, polling like [`namespace::lock_exclusive`] so the wait
-/// counts against the grant's deadline instead of parking a blocking thread without one.
 fn lock_before(
     lock: &Mutex<()>,
     deadline: Instant,
@@ -645,7 +599,6 @@ fn namespace_lock(
     )
 }
 
-/// Resolves a configured storage root without following any original ancestor symlink.
 pub fn resolve_storage_root_path(path: &Path) -> Result<PathBuf, StorageHostError> {
     let io_error = |path: &Path, source: std::io::Error| StorageHostError::RootIo {
         path: path.to_path_buf(),
@@ -666,8 +619,6 @@ pub fn resolve_storage_root_path(path: &Path) -> Result<PathBuf, StorageHostErro
         match component {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(component) => components.push(component.to_os_string()),
-            // Do not normalize a parent component away: every component in the configured spelling
-            // must be traversed under a retained no-follow directory descriptor.
             Component::ParentDir | Component::Prefix(_) => return Err(unsafe_path(&absolute)),
         }
     }
@@ -704,11 +655,6 @@ pub fn resolve_storage_root_path(path: &Path) -> Result<PathBuf, StorageHostErro
     Ok(traversed)
 }
 
-/// Logs one namespace reset and returns the failure that tells the caller it happened.
-///
-/// Emitted inside the caller's span, so the record carries the trace of the invocation that found
-/// the corruption. The previous generation stays on disk under its token, uncollected, exactly as
-/// an authority rotation leaves one.
 fn report_namespace_reset(reset: Reset, fresh: &Namespace) -> StorageHostError {
     tracing::error!(
         event = "storage_namespace_reset",
@@ -734,12 +680,6 @@ fn report_namespace_reset(reset: Reset, fresh: &Namespace) -> StorageHostError {
     }
 }
 
-/// Reports why one retained document did not decode without echoing the rejected bytes.
-///
-/// The corruption error names the check and the file; the discarded `serde_json` failure is the
-/// only description of what is actually wrong inside it. Class, line, and column are its complete
-/// content-free part: they separate a truncated write from an unknown or wrongly typed field
-/// without exporting any document content.
 pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::Error) {
     tracing::warn!(
         event = "storage_document_decode_failed",
@@ -752,26 +692,16 @@ pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::
     );
 }
 
-/// The coarse class a storage failure is reported under.
-///
-/// Content-free classification for guest-visible refusal reasons and operator diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum StorageFailureClass {
-    /// A quota or an accounting overflow refused the write.
     Quota,
-    /// The operation ran out of its budget.
     Timeout,
-    /// Retained data or layout disagreed with itself.
     Corrupt,
-    /// The grant or the filesystem refused the access.
     Denied,
-    /// Everything else, filesystem input/output included.
     Io,
 }
 
 impl StorageFailureClass {
-    /// The stable label. It is the vocabulary a guest-visible violation reason is drawn from, so
-    /// these strings are a contract rather than log text.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -790,11 +720,8 @@ impl std::fmt::Display for StorageFailureClass {
     }
 }
 
-/// Stable native storage failure classes.
-///
-/// No variant carries guest content. Paths and opaque tokens name on-disk entries for the operator
-/// reading a log line; a guest sees only the WIT error enum and a model only the broker's fixed
-/// public code, so nothing here renders to either.
+/// No variant carries guest content; paths and tokens here are for operator logs only. A guest sees
+/// just the WIT error enum, and a model only the broker's fixed public code.
 #[derive(Debug, Error)]
 pub enum StorageHostError {
     #[error(transparent)]
@@ -811,13 +738,9 @@ pub enum StorageHostError {
     SecondWriter,
     #[error("storage layout is corrupt: {}", path.display())]
     CorruptLayout { path: PathBuf },
-    /// Retained namespace state failed one check.
     #[error("storage corruption detected: {scope}{}", SiteSuffix(.site))]
     Corrupt {
-        /// Compile-time literal naming the check that failed, never retained content.
         scope: &'static str,
-        /// Where it was found, filled in where the detecting code knows. Boxed so the error every
-        /// storage call can return stays small.
         site: Option<Box<CorruptionSite>>,
     },
     #[error("storage quota exceeded")]
@@ -857,20 +780,14 @@ pub enum StorageHostError {
     GrantHostMismatch,
 }
 
-/// Where a [`StorageHostError::Corrupt`] was found. Every field is for the operator.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CorruptionSite {
-    /// Base token of the namespace directory the check was about.
     pub namespace: Option<String>,
-    /// Generation token the check was about.
     pub generation: Option<String>,
-    /// The entry that failed the check.
     pub path: Option<PathBuf>,
-    /// The fresh generation the namespace was rotated to before this failure was returned.
     pub reset: Option<String>,
 }
 
-/// The optional half of a [`StorageHostError::Corrupt`] message.
 struct SiteSuffix<'a>(&'a Option<Box<CorruptionSite>>);
 
 impl fmt::Display for SiteSuffix<'_> {
@@ -895,7 +812,6 @@ impl fmt::Display for SiteSuffix<'_> {
 }
 
 impl StorageHostError {
-    /// A corruption naming only the check that failed.
     #[must_use]
     pub const fn corrupt(scope: &'static str) -> Self {
         Self::Corrupt { scope, site: None }
@@ -908,7 +824,6 @@ impl StorageHostError {
         }
     }
 
-    /// Names the entry a corruption was found at, unless the detecting site already did.
     pub(crate) fn at(mut self, entry: PathBuf) -> Self {
         if let Some(site) = self.site_mut() {
             site.path.get_or_insert(entry);
@@ -916,7 +831,6 @@ impl StorageHostError {
         self
     }
 
-    /// Names the namespace, and the generation when known, that a corruption belongs to.
     pub(crate) fn in_namespace(mut self, base: &str, generation_token: Option<&str>) -> Self {
         if let Some(site) = self.site_mut() {
             site.namespace.get_or_insert_with(|| base.to_owned());
@@ -927,15 +841,11 @@ impl StorageHostError {
         self
     }
 
-    /// Whether this failure rotated its namespace to a fresh, empty generation before returning.
-    ///
-    /// When it did, the storage an immediate retry opens is already usable.
     #[must_use]
     pub fn namespace_reset(&self) -> bool {
         matches!(self, Self::Corrupt { site: Some(site), .. } if site.reset.is_some())
     }
 
-    /// The coarse, content-free class this failure is reported under.
     #[must_use]
     pub const fn class(&self) -> StorageFailureClass {
         match self {
@@ -943,8 +853,6 @@ impl StorageHostError {
             Self::Timeout => StorageFailureClass::Timeout,
             Self::Corrupt { .. } | Self::CorruptLayout { .. } => StorageFailureClass::Corrupt,
             Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,
-            // An unaudited outcome is unknown rather than any one class, so it reports the
-            // catch-all here and names what actually broke in its own `cause` instead.
             _ => StorageFailureClass::Io,
         }
     }

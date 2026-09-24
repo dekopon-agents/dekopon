@@ -1,4 +1,3 @@
-//! Loopback-only media wire fixtures and regressions.
 use super::*;
 use axum::body::Body;
 use dekopon_agent::attachment::GeneratedImage;
@@ -81,7 +80,6 @@ pub(crate) fn json_reply(value: Value) -> Response {
     (StatusCode::OK, value.to_string()).into_response()
 }
 pub(crate) fn bytes_reply(bytes: &[u8]) -> Response {
-    // Unknown Content-Length exercises the streamed ceiling, not only a header check.
     Response::new(Body::from_stream(futures_util::stream::iter(vec![Ok::<
         _,
         io::Error,
@@ -425,7 +423,7 @@ async fn upload_success_is_not_delivery_and_later_failures_are_partial() {
             }
         })
         .await;
-        let text = "x".repeat(1025); // text comes after both images
+        let text = "x".repeat(1025);
         let error = driver(&peer.origin)
             .reply(
                 &target(),
@@ -512,7 +510,6 @@ async fn identity_and_base64_outputs_one_decoded_byte_over_refuse_before_any_upl
             .reply(
                 &target(),
                 OutboundReply::with_images(
-                    // A valid first image and standalone text must not escape before the later refusal.
                     "x".repeat(media::MAX_CAPTION_CHARS + 1),
                     vec![png(), encoded_image(&bytes, encoding)],
                 ),
@@ -663,6 +660,5 @@ async fn a_stalled_download_times_out_without_exposing_the_signed_url() {
         "{debug}"
     );
     assert_eq!(peer.requests.lock().expect("requests").len(), 2);
-    // Aborting the mock also owns the deliberately never-finishing stream.
     drop(peer);
 }

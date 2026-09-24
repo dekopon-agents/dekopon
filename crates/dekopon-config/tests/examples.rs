@@ -1,10 +1,3 @@
-//! The checked-in example catalogs are load-bearing documentation, so they are held to the same
-//! parser the gateway uses.
-//!
-//! A catalog that stops parsing, or an agent whose capability list drifts from the workflow the
-//! example promises, breaks instructions a reader follows literally. Both review examples may
-//! propose a comment and neither may approve or merge.
-
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};

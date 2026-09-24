@@ -1,16 +1,6 @@
-//! The tree-walking evaluator.
-//!
-//! # Namespace isolation
-//!
-//! The variable namespace is seeded **only** from the script's own `NAME=value` assignments. This
-//! module never calls [`std::env`]. A script that reads `$PATH` or `$OPENAI_API_KEY` sees an unset
-//! variable, not the host process's value, and
-//! [`crate::interp::tests::the_process_environment_never_leaks_into_a_script`] proves it.
-//!
-//! # Scoping
-//!
-//! Variables are dynamically scoped exactly as bash scopes them: global by default, and `local`
-//! shadows a name for the current function frame *and* every frame it calls into.
+//! The evaluator never reads the host process environment, so a script variable comes only from the
+//! script's own assignments, and reading something like an API key by name sees it as unset, not
+//! the host's real value.
 
 use std::{
     cmp::Ordering,
@@ -44,7 +34,6 @@ use telemetry::CommandKind;
 
 pub(crate) mod telemetry;
 
-/// Control-flow signals that unwind through the evaluator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
     Normal,
@@ -54,62 +43,33 @@ enum Flow {
     Exit(ExitCode),
 }
 
-/// What executing one command produced.
 enum Executed {
     Result(CommandResult),
     Flow(Flow),
 }
 
-/// The shell options `set` toggles.
-///
-/// Each one is enforced, not accepted-and-ignored: the reason `set` was refused outright before was
-/// that an option which changed nothing while looking like it had is exactly the class of silent
-/// wrongness this shell exists to refuse. That reason stops applying once the option is real.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ShellOptions {
-    /// `set -e`: a command that fails outside a tested position ends the script.
     errexit: bool,
-    /// `set -u`: expanding a parameter nothing ever set ends the script.
     nounset: bool,
-    /// `set -o pipefail`: a pipeline reports its rightmost failure, not just its last stage.
     pipefail: bool,
 }
 
-/// Where one of a command's two streams ends up.
-///
-/// [`Sink::Value`] and [`Sink::Diagnostics`] are the two defaults, and they are also what a
-/// duplication copies: `2>&1` gives stderr the sink stdout holds, and `>&2` the reverse. They are
-/// destinations in their own right rather than "unredirected", which is what makes
-/// `x=$(cmd 2>&1)` capture the diagnostics the way a real shell does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Sink {
-    /// The value channel: what the command produces, and what `$( )` captures.
     Value,
-    /// The diagnostic channel: text lines that escape a capture, as a terminal's stderr does.
     Diagnostics,
-    /// `/dev/null`.
     Discard,
-    /// A named in-memory buffer.
-    Buffer {
-        /// Buffer name.
-        name: String,
-        /// `true` for the `>>` forms.
-        append: bool,
-    },
+    Buffer { name: String, append: bool },
 }
 
-/// One entry on the stdin stack: the piped value, and how far `read` has consumed it.
-///
-/// The cursor is what separates `read` from every other way of looking at input. `cat` is offered
-/// the whole value on each pipeline in the body — deliberately, so a condition that never reads it
-/// cannot swallow it — while `read` *consumes*, one line per call, which is the only way
-/// `while read line` can terminate rather than seeing line one forever.
 #[derive(Debug, Default)]
 struct StdinSource {
     value: Option<Rc<Value>>,
-    /// Lines split from `value`, materialized on the first `read` and never again.
+    /// The read command consumes piped input one line at a time through a cursor, while other
+    /// commands see the whole value unconsumed each time, which is what lets a while-read loop
+    /// terminate instead of repeating the first line forever.
     lines: Option<Vec<String>>,
-    /// How many of those lines `read` has taken.
     position: usize,
 }
 
@@ -122,7 +82,6 @@ impl StdinSource {
         }
     }
 
-    /// Takes the next unread line, or `None` at end of input.
     fn next_line(&mut self) -> Option<String> {
         let lines = self.lines.get_or_insert_with(|| {
             self.value
@@ -138,11 +97,8 @@ impl StdinSource {
     }
 }
 
-/// Diagnostics collected while one command's stderr is redirected.
-///
-/// Bounded by the same output ceilings the combined stream uses. A shell function called as
-/// `f 2> log` can run thousands of commands, so this must not be the one accumulator in the
-/// interpreter without a ceiling.
+/// A redirected stderr capture must stay bounded by the same output ceilings, since a function can
+/// run thousands of commands into it.
 #[derive(Debug)]
 struct StderrCapture {
     lines: Vec<String>,
@@ -172,7 +128,6 @@ impl StderrCapture {
         self.lines.push(line.to_owned());
     }
 
-    /// Returns the captured lines, with a marker line when any were dropped.
     fn finish(mut self) -> Vec<String> {
         if self.truncated {
             self.lines
@@ -182,14 +137,12 @@ impl StderrCapture {
     }
 }
 
-/// One shell-function activation.
 #[derive(Debug, Default)]
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
 }
 
-/// Parses and evaluates one script, returning its outcome.
 pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits) -> ScriptOutcome {
     let program = match parse(script) {
         Ok(program) => program,
@@ -224,8 +177,6 @@ pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits)
         last_substitution_status: ExitCode::SUCCESS,
     };
 
-    // One span for the whole run, so the totals have a home that costs the same whether a script
-    // ran three commands or thirty thousand. Every `shell.command` span nests inside it.
     let script = telemetry::script_span();
     let exit_code = {
         let _entered = script.enter();
@@ -248,16 +199,9 @@ pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits)
     }
 }
 
-/// The evaluator's mutable state for one script execution.
-///
-/// This is deliberately *not* named `Interpreter`: [`crate::Interpreter`] is the public,
-/// immutable configuration handle a caller builds, while this is the private machine that runs
-/// one script under it. Sharing a name would send a reader following `Interpreter::run` to the
-/// wrong type.
 struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
-    /// The configured bounds, kept for the ceilings a redirected stderr capture reuses.
     limits: Limits,
     output: OutputBuffer,
     globals: BTreeMap<String, Value>,
@@ -266,48 +210,19 @@ struct Evaluator<'a> {
     function_names: BTreeSet<String>,
     buffers: BTreeMap<String, Value>,
     captures: Vec<Vec<CommandResult>>,
-    /// The value piped into the enclosing call or compound stage, innermost last.
-    ///
-    /// Separate from [`Frame`] because the two nest differently: a shell function opens a variable
-    /// scope *and* receives input, while a compound pipeline stage receives input and deliberately
-    /// does not open a scope — `cmd | while read x; do total=$x; done` has to leave `total` set,
-    /// which is the opposite of bash's subshell and the whole reason the idiom is worth having.
-    ///
-    /// Shared rather than owned: every pipeline in the body is offered it, so an owned value would
-    /// be deep-copied once per statement — including for the statements that never read input —
-    /// and all but the last copy dropped. See [`own`].
+    /// Unlike a function call, a pipeline stage receiving piped input does not open a new variable
+    /// scope, so piping into a while-read loop can still leave a variable set afterward, unlike a
+    /// real shell subshell.
     stdin: Vec<StdinSource>,
-    /// The options `set` has turned on.
     options: ShellOptions,
-    /// How many enclosing positions are *testing* a status rather than depending on it.
-    ///
-    /// `errexit` must not fire for a command whose failure the script is already asking about: an
-    /// `if`/`while`/`until` condition, every operand of an `&&`/`||` chain but the last, and a
-    /// pipeline inverted by `!`. Bash draws exactly these three exemptions, and a counter rather
-    /// than a flag is what keeps them composing — `if a && b; then` nests two of them.
     testing_status: u32,
-    /// Diagnostic capture stack, one frame per command whose stderr is redirected.
-    ///
-    /// A stack rather than a field because a redirection nests: a shell function called as
-    /// `f 2> log` collects its whole body's diagnostics, while a command *inside* that body with
-    /// its own `2>` collects only its own and then restores the function's.
     stderr_capture: Vec<StderrCapture>,
-    /// Per-script command totals, recorded on the script span when it closes.
     counters: telemetry::ScriptCounters,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
 }
 
 impl Evaluator<'_> {
-    // -----------------------------------------------------------------------
-    // Diagnostics and output
-    // -----------------------------------------------------------------------
-
-    /// Reports a fatal error and returns the exit code the script ends with.
-    ///
-    /// The code half comes from [`telemetry::fatal_exit_code`] rather than from this match, so the
-    /// code a `shell.command` span records for an aborted command is by construction the same one
-    /// the script itself reports.
     fn report_fatal(&mut self, fatal: &FatalError) -> ExitCode {
         let message = match fatal {
             FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
@@ -329,20 +244,10 @@ impl Evaluator<'_> {
                 format!("dekopon-shell: {reason}")
             }
         };
-        // Straight to the combined output, never into a redirected stderr capture: the script is
-        // ending, the capture is about to be abandoned unrouted, and `cmd 2> log` must not be able
-        // to swallow the one line explaining why nothing else ran.
         self.output.push_block(&message);
         telemetry::fatal_exit_code(fatal)
     }
 
-    /// Writes one diagnostic to the diagnostic stream.
-    ///
-    /// Diagnostics escape a `$( )` capture on purpose. Only the *value* of a substitution is being
-    /// captured; suppressing its errors too would leave `v=$(nosuchcmd)` with an empty variable, no
-    /// explanation, and only a numeric `$?` the script may never inspect. Real shells send command
-    /// substitution stderr to the terminal for exactly this reason. A script that *wants* them
-    /// captured says so with `2>&1`, which is what the capture stack consulted here implements.
     fn write_line(&mut self, line: &str) {
         if let Some(capture) = self.stderr_capture.last_mut() {
             capture.push(line);
@@ -351,15 +256,6 @@ impl Evaluator<'_> {
         self.output.push_block(line);
     }
 
-    /// Writes what one pipeline produced, to the capture that is collecting it or to the output.
-    ///
-    /// A command that produced no value writes nothing, and that has to be decided *before* the
-    /// capture branch rather than after it. `$(true; echo a)` is `a` in bash; retaining `true`'s
-    /// null in the capture made it a second element, and [`reduce_captured`] joins elements with a
-    /// newline — so the substitution silently gained a leading blank line, or a trailing one for
-    /// `$(echo a; true)`, depending on where the command that produced nothing happened to sit.
-    /// The status such a command reported is unaffected: it travels through `last_status`, not
-    /// through the capture.
     fn emit(&mut self, result: CommandResult) {
         if result.value.is_null() {
             return;
@@ -376,7 +272,8 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Converts a recoverable failure into a status, or propagates a fatal one.
+    /// Whether a command produced no value has to be recognized before it reaches a capture, not
+    /// after, or it silently adds a blank element and an extra blank line to the captured result.
     fn absorb(&mut self, failure: CommandFailure) -> Result<ExitCode, FatalError> {
         match failure {
             CommandFailure::Status { message, status } => {
@@ -387,18 +284,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Routes text a provider command word rendered itself onto the shell's two streams.
-    ///
-    /// No capability call is charged: the provider printed help, a version, or a usage error and
-    /// invoked nothing. The bytes are charged against the value ceiling first, so a provider that
-    /// renders a page the size of the ceiling trips the same limit a script materializing it
-    /// would, and both streams then obey the output ceilings like any other write.
-    ///
-    /// Both texts arrive as the provider wrote them, which for `clap` means newline-terminated.
-    /// Values here are not newline-terminated — emitting one is what adds the line ending — so
-    /// one trailing newline is folded into the value model: `h=$(word --help)` holds the page the
-    /// way `h=$(cat <<EOF ...)` would, and printing it adds the newline back exactly once. Text
-    /// with no trailing newline is emitted as a fragment, the way `printf '%s'` is.
     fn emit_rendered(
         &mut self,
         stdout: String,
@@ -429,10 +314,6 @@ impl Evaluator<'_> {
         Ok(Executed::Result(result))
     }
 
-    // -----------------------------------------------------------------------
-    // Scope
-    // -----------------------------------------------------------------------
-
     fn lookup(&self, name: &str) -> Option<&Value> {
         for frame in self.frames.iter().rev() {
             if let Some(value) = frame.locals.get(name) {
@@ -442,11 +323,6 @@ impl Evaluator<'_> {
         self.globals.get(name)
     }
 
-    /// Binds a name, charging what the value costs against the value-byte ceiling.
-    ///
-    /// Every retention point funnels through here, [`Evaluator::declare_local`], and
-    /// [`Evaluator::write_buffer`]: `x="$x$x"` is one cheap step but doubles the bytes held, so
-    /// counting operations alone leaves memory unbounded.
     fn assign(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
         self.budget.charge_value_bytes(value_bytes(&value))?;
         for frame in self.frames.iter_mut().rev() {
@@ -459,7 +335,6 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Restores a binding captured before a transient prefix assignment.
     fn restore(&mut self, name: &str, previous: Option<Value>) {
         match previous {
             Some(value) => {
@@ -471,8 +346,6 @@ impl Evaluator<'_> {
                 }
                 self.globals.insert(name.to_owned(), value);
             }
-            // The prefix assignment created the binding, so removing it is what "restore" means.
-            // `assign` writes to `globals` exactly when no frame already held the name.
             None => {
                 self.globals.remove(name);
             }
@@ -494,10 +367,6 @@ impl Evaluator<'_> {
             .last()
             .map_or(&[][..], |frame| frame.positional.as_slice())
     }
-
-    // -----------------------------------------------------------------------
-    // Statements
-    // -----------------------------------------------------------------------
 
     fn execute_program(&mut self, program: &Program) -> Result<Flow, FatalError> {
         for statement in &program.statements {
@@ -521,8 +390,6 @@ impl Evaluator<'_> {
             Statement::For(statement) => self.execute_for(statement),
             Statement::While(statement) => self.execute_while(statement),
             Statement::Case(statement) => self.execute_case(statement),
-            // A group runs its statements in the current scope; it exists to make several of them
-            // one command, not to open a subshell this evaluator does not have.
             Statement::Group(body) => self.execute_program(body),
             Statement::Conditional(expression) => {
                 let status = match self.evaluate_conditional(expression) {
@@ -561,11 +428,6 @@ impl Evaluator<'_> {
         Ok(Flow::Normal)
     }
 
-    /// Runs the first `case` clause whose pattern matches, and no other.
-    ///
-    /// Every clause tested charges a step, the way a loop iteration does: a `case` with many
-    /// alternatives inside a loop is real work, and a statement-level charge alone would let it
-    /// run outside the step budget that bounds everything else.
     fn execute_case(&mut self, statement: &CaseStatement) -> Result<Flow, FatalError> {
         let subject = match self.expand_word(&statement.subject) {
             Ok(expanded) => expanded.join(" "),
@@ -589,9 +451,6 @@ impl Evaluator<'_> {
                             return Ok(Flow::Normal);
                         }
                     },
-                    // A pattern assembled at run time cannot be checked any earlier, so it is
-                    // checked here: `p='*.json'; case $f in $p)` must not quietly compare the
-                    // subject against the four literal characters `*`, `.`, `j`...
                     CasePattern::Expanded(word) => {
                         let expanded = match self.expand_word(word) {
                             Ok(expanded) => expanded.join(" "),
@@ -618,8 +477,6 @@ impl Evaluator<'_> {
             }
         }
 
-        // No clause matched. bash reports success for that, and so does this: `case` asked a
-        // question, and "none of the above" is an answer rather than a failure.
         self.last_status = ExitCode::SUCCESS;
         Ok(Flow::Normal)
     }
@@ -637,8 +494,6 @@ impl Evaluator<'_> {
             }
         }
 
-        // A loop reports the status of the last command its body ran, or success when the body
-        // never ran. The condition that ended the loop must not leak into `$?`, exactly as in bash.
         let mut body_status = ExitCode::SUCCESS;
         for item in items {
             self.budget.charge_step()?;
@@ -667,8 +522,6 @@ impl Evaluator<'_> {
     fn execute_while(&mut self, statement: &WhileLoop) -> Result<Flow, FatalError> {
         let mut body_status = ExitCode::SUCCESS;
         loop {
-            // Every iteration charges a step. This is the only thing standing between
-            // `while true; do :; done` and an unbounded loop.
             self.budget.charge_step()?;
             let (status, flow) = self.tested(true, |evaluator| {
                 evaluator.execute_list(&statement.condition)
@@ -707,8 +560,6 @@ impl Evaluator<'_> {
     }
 
     fn execute_list(&mut self, list: &AndOrList) -> Result<(ExitCode, Option<Flow>), FatalError> {
-        // Every operand of an `&&`/`||` chain but the last is a tested status: the chain is asking
-        // whether it succeeded, so `errexit` must not answer by ending the script.
         let (mut status, flow) = self.tested(!list.rest.is_empty(), |evaluator| {
             evaluator.execute_pipeline(&list.first)
         })?;
@@ -741,16 +592,6 @@ impl Evaluator<'_> {
         Ok((status, None))
     }
 
-    /// `read [-r] NAME...`: takes one line of input and binds it.
-    ///
-    /// This is what makes `cmd | while read line; do ...; done` terminate. Input is *consumed*
-    /// here, unlike every other way of looking at it: `cat` is offered the whole value on each
-    /// pipeline in the body so a condition cannot swallow it, while `read` advances a cursor and
-    /// reports failure at end of input, which is what ends the loop.
-    ///
-    /// A value that reached this command through a pipe is its own one-shot source; one inherited
-    /// from an enclosing call or compound stage is read through that stage's shared cursor, so
-    /// successive `read`s in a loop body see successive lines.
     fn run_read(
         &mut self,
         arguments: &[String],
@@ -758,9 +599,6 @@ impl Evaluator<'_> {
         from_pipe: bool,
     ) -> Result<CommandResult, CommandFailure> {
         let mut names = arguments;
-        // `-r` is the only flag, and it is what every correct script already passes. Backslashes
-        // are never line continuations here, so it is accepted and changes nothing — said out loud
-        // rather than left as a surprise.
         if names.first().is_some_and(|first| first == "-r") {
             names = &names[1..];
         }
@@ -788,14 +626,9 @@ impl Evaluator<'_> {
             self.stdin.last_mut().and_then(StdinSource::next_line)
         };
         let Some(line) = line else {
-            // End of input is a *status*, not a diagnostic: it is the ordinary way a
-            // `while read` loop ends, and a message per loop would be one per iteration.
             return Ok(CommandResult::status(ExitCode::FAILURE));
         };
 
-        // Several names split the line on whitespace runs, with the remainder landing in the last,
-        // exactly as bash does. This is a rule local to `read` rather than a return of IFS word
-        // splitting: there is no `IFS` here to configure, and nothing else splits.
         let fields = split_read_fields(&line, names.len());
         for (index, name) in names.iter().enumerate() {
             let field = fields.get(index).copied().unwrap_or_default();
@@ -804,13 +637,6 @@ impl Evaluator<'_> {
         Ok(CommandResult::status(ExitCode::SUCCESS))
     }
 
-    /// Applies one `set` invocation.
-    ///
-    /// Only the three options this shell actually enforces are accepted. Every other letter and
-    /// long name **ends the script** by name rather than being ignored: an accepted-and-ignored
-    /// option is the exact failure that kept `set` out of this shell in the first place, and a
-    /// refusal the script could carry on past would leave it running without the option it asked
-    /// for, which is the same failure wearing a status code.
     fn apply_set_options(&mut self, arguments: &[String]) -> Result<(), CommandFailure> {
         if arguments.is_empty() {
             return Err(unsupported_option(
@@ -868,7 +694,6 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Applies one `set -o NAME` / `set +o NAME`.
     fn set_long_option(&mut self, name: &str, enable: bool) -> Result<(), CommandFailure> {
         match name {
             "pipefail" => self.options.pipefail = enable,
@@ -883,14 +708,6 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Publishes one pipeline's per-stage statuses as `PIPESTATUS`.
-    ///
-    /// An ordinary global, so `${PIPESTATUS[@]}`, `${PIPESTATUS[0]}`, and `${#PIPESTATUS[@]}` all
-    /// work through the expansion machinery that already exists rather than through a special case.
-    /// Written straight into the map instead of through [`Evaluator::assign`] because it *replaces*
-    /// a bounded array of small integers on every pipeline rather than accumulating one; charging
-    /// it against the value-byte ceiling would let a long loop exhaust that ceiling with a value
-    /// the script never asked for.
     fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) {
         self.globals.insert(
             "PIPESTATUS".to_owned(),
@@ -903,7 +720,6 @@ impl Evaluator<'_> {
         );
     }
 
-    /// Runs `body` with `errexit` suspended when `suspended`, restoring the count afterwards.
     fn tested<T>(
         &mut self,
         suspended: bool,
@@ -919,7 +735,6 @@ impl Evaluator<'_> {
         outcome
     }
 
-    /// Reports the exit `errexit` demands for this status, if any.
     fn errexit_trip(&mut self, status: ExitCode) -> Option<Flow> {
         if !self.options.errexit || self.testing_status > 0 || status == ExitCode::SUCCESS {
             return None;
@@ -935,10 +750,6 @@ impl Evaluator<'_> {
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step()?;
-        // A function body inherits the value piped into the call, offered to the first command of
-        // each pipeline in the body. It is shared rather than consumed: consuming it would let a
-        // condition that never reads input (`if [ -n "$1" ]; then cat; fi`) swallow the value
-        // before `cat` could see it, which is the same class of silent data loss as dropping it.
         let mut input: Option<Rc<Value>> =
             self.stdin.last().and_then(|source| source.value.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
@@ -947,13 +758,7 @@ impl Evaluator<'_> {
 
         for (index, command) in pipeline.commands.iter().enumerate() {
             let piped = index + 1 < commands;
-            // Only a later stage's input actually came out of a pipe. The first stage's came from
-            // the enclosing call or compound stage, and `read` has to consume *that* through the
-            // shared cursor rather than through a private copy, or `while read line` would see the
-            // first line forever.
             let from_pipe = index > 0;
-            // A `!` makes the whole pipeline a tested status, and every stage but the last is one
-            // anyway: bash exempts both from `errexit`, and so does this.
             match self.tested(pipeline.negated || piped, |evaluator| {
                 evaluator.execute_command(command, input.take(), piped, from_pipe)
             })? {
@@ -961,11 +766,6 @@ impl Evaluator<'_> {
                 Executed::Result(result) => {
                     stages.push(result.status);
                     if piped {
-                        // Only the terminal command's result is ever read, and the terminal
-                        // command is by construction never piped — so an intermediate value moves
-                        // into the next stage instead of being copied into it and then dropped.
-                        // Without this `gh issue list | jq . | grep x` deep-copies the payload per
-                        // stage.
                         last = CommandResult::status(result.status);
                         input = Some(Rc::new(result.value));
                     } else {
@@ -975,8 +775,6 @@ impl Evaluator<'_> {
             }
         }
 
-        // `pipefail` reports the rightmost stage that failed, so `gh issue view 12 | jq .` stops
-        // hiding a capability that never ran behind a `jq` that was handed nothing and succeeded.
         let mut status = last.status;
         if self.options.pipefail
             && let Some(failed) = stages
@@ -994,11 +792,6 @@ impl Evaluator<'_> {
         Ok((status, None))
     }
 
-    // -----------------------------------------------------------------------
-    // Commands
-    // -----------------------------------------------------------------------
-
-    /// Runs one pipeline stage.
     fn execute_command(
         &mut self,
         command: &Command,
@@ -1017,11 +810,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Runs a compound statement as one pipeline stage.
-    ///
-    /// The stage's emissions are collected into one value whenever anything downstream will read
-    /// them — a later pipe, a redirection, an enclosing `$( )`. Each statement inside emits
-    /// separately, so without that `{ echo a; echo b; } | wc -l` would hand `wc` only the last one.
     fn execute_compound_command(
         &mut self,
         statement: &Statement,
@@ -1113,9 +901,6 @@ impl Evaluator<'_> {
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
-        // Command words are expanded *before* any prefix assignment is applied, so `x=new echo $x`
-        // prints the old value, and the binding is restored afterwards so it does not leak into the
-        // rest of the script. Both halves are what `DEBUG=1 some-command` means in bash.
         let mut argv = Vec::new();
         for word in &command.words {
             match self.expand_word(word) {
@@ -1153,8 +938,6 @@ impl Evaluator<'_> {
         }
 
         if argv.is_empty() {
-            // An assignment-only command reports the status of its last command substitution,
-            // so `x=$(false); echo $?` behaves the way bash trains a model to expect.
             let status = if command.assignments.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -1163,11 +946,6 @@ impl Evaluator<'_> {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
 
-        // A here-document supplies this command's input in place of anything piped into it: `<<EOF`
-        // redirects the same stdin a pipe would have filled, and the redirection is what bash
-        // applies last. The body arrives as one JSON string, because a block of literal text is
-        // exactly what a string is in this value model — no byte stream is involved anywhere here,
-        // so a command that wants structure still pipes the body through `jq`.
         let input = match &command.here_doc {
             None => input,
             Some(body) => match self.expand_quoted(&body.parts) {
@@ -1187,9 +965,6 @@ impl Evaluator<'_> {
             },
         };
 
-        // Redirections are resolved *before* the command runs, the way bash resolves them, because
-        // a redirected stderr has to be in place while the command is producing diagnostics rather
-        // than applied to a value afterwards.
         let (stdout, stderr) = match self.resolve_redirects(&command.redirects) {
             Ok(sinks) => sinks,
             Err(failure) => {
@@ -1204,8 +979,9 @@ impl Evaluator<'_> {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
         let executed = self.run_argv(&argv, input, capture_output, from_pipe);
-        // Popped before the `?` below: a fatal error must not leave a capture installed for the
-        // rest of the script, silently swallowing every later diagnostic.
+        // The stderr capture is removed before the fallible step that follows can return early, so
+        // a fatal error can never leave a capture installed that silently swallows the rest of the
+        // script's diagnostics.
         let mut diagnostics = capturing
             .then(|| self.stderr_capture.pop())
             .flatten()
@@ -1223,9 +999,9 @@ impl Evaluator<'_> {
             diagnostics = Vec::new();
         }
 
-        // Truncation belongs to the redirection, not to each write, exactly as a real shell
-        // truncates once when it opens the file. Without this, `cmd > out 2>&1` would write the
-        // diagnostics and then have the value overwrite them, or the reverse depending on order.
+        // A redirect truncates its target once, when it is set up, not on every write, so combining
+        // a value redirect with a merged stderr redirect cannot let one silently overwrite the
+        // other depending on order.
         self.open_buffers(&[&stdout, &stderr]);
         self.route_diagnostics(diagnostics, &stderr)?;
 
@@ -1246,11 +1022,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Truncates every buffer a non-appending redirection names, once, before anything is written.
-    ///
-    /// A truncated buffer is left holding `null` rather than removed, so `cmd > out` makes `out`
-    /// exist and readable even when the command produced nothing — the way redirecting into a file
-    /// creates an empty one.
     fn open_buffers(&mut self, sinks: &[&Sink]) {
         for sink in sinks {
             if let Sink::Buffer {
@@ -1263,11 +1034,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Resolves a command's redirections into one destination per stream.
-    ///
-    /// Walked left to right so a duplication copies the sink its target holds *at that point*,
-    /// which is how a real shell's `dup2` behaves. The parser refuses the one ordering where that
-    /// distinction is invisible and wrong — a duplication whose target is redirected afterwards.
     fn resolve_redirects(
         &mut self,
         redirects: &[Redirect],
@@ -1310,7 +1076,6 @@ impl Evaluator<'_> {
         Ok((stdout, stderr))
     }
 
-    /// Sends one command's collected diagnostics to their redirected destination.
     fn route_diagnostics(
         &mut self,
         diagnostics: Vec<String>,
@@ -1322,8 +1087,6 @@ impl Evaluator<'_> {
         match sink {
             Sink::Discard => {}
             Sink::Diagnostics | Sink::Value => {
-                // `Value` reaches here only for a command that produced no result to merge into,
-                // which is a flow word; its diagnostics still belong somewhere visible.
                 for line in diagnostics {
                     self.write_line(&line);
                 }
@@ -1336,25 +1099,18 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Restores every binding a transient prefix assignment shadowed, in reverse order.
     fn restore_all(&mut self, restore: Vec<(String, Option<Value>)>) {
         for (name, previous) in restore.into_iter().rev() {
             self.restore(&name, previous);
         }
     }
 
-    /// Adds one value to the named in-memory buffer store, folding repeats into an array.
     fn append_buffer(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
-        // A command that produced nothing writes nothing, matching `emit`. Otherwise
-        // `nosuchcmd > out 2>&1` would leave a stray `null` sitting in front of the one line that
-        // explains what happened.
         if value.is_null() {
             return Ok(());
         }
         self.budget.charge_value_bytes(value_bytes(&value))?;
         match self.buffers.remove(name) {
-            // `null` is what an opened-and-truncated buffer holds, so it reads as empty rather
-            // than as a first element.
             None | Some(Value::Null) => {
                 self.buffers.insert(name.to_owned(), value);
             }
@@ -1370,17 +1126,6 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Executes one command word, wrapped in the span every command in a script produces.
-    ///
-    /// This is the single place a command word actually runs, so it is the single place worth
-    /// instrumenting: one span here covers builtins, provider command words, shell functions,
-    /// refused words, and unknown words alike, and covers builtins added later without another
-    /// edit. The recursion `xargs` drives back into this function is deliberately *not*
-    /// special-cased — one script word that maps a command over ten items really did run ten
-    /// commands, and each of them gets its own span nested inside the `xargs` one, which is
-    /// exactly the syscall-by-syscall reading this instrumentation exists to give.
-    ///
-    /// See [`telemetry`] for what these spans carry.
     fn run_argv(
         &mut self,
         argv: &[String],
@@ -1391,9 +1136,6 @@ impl Evaluator<'_> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
 
-        // Classification happens before execution so that the span and its opening event both
-        // carry the resolution kind, and so a command that aborts the script is still described by
-        // more than "something failed".
         let (kind, resolution) = if telemetry::is_control_word(command) {
             (CommandKind::Control, None)
         } else {
@@ -1403,8 +1145,6 @@ impl Evaluator<'_> {
         self.counters.charge(kind);
         let span = telemetry::command_span(command, kind, arguments.len());
         let _entered = span.enter();
-        // The payload attributes cost a serialization each, so they are built only for a span
-        // something will record.
         let traced = !span.is_disabled();
         if traced {
             telemetry::record_arguments(&span, arguments);
@@ -1425,8 +1165,6 @@ impl Evaluator<'_> {
             Ok(Executed::Result(result)) => {
                 (result.status, telemetry::outcome_label(result.status))
             }
-            // `break`, `return 1`, and `exit 3` are commands that succeeded at doing what they
-            // were asked; the status they carry belongs to the script, and is reported as theirs.
             Ok(Executed::Flow(flow)) => {
                 let status = match flow {
                     Flow::Return(status) | Flow::Exit(status) => *status,
@@ -1448,7 +1186,6 @@ impl Evaluator<'_> {
         executed
     }
 
-    /// Runs one already-classified command word.
     fn dispatch_command(
         &mut self,
         command: &str,
@@ -1462,10 +1199,6 @@ impl Evaluator<'_> {
             if let Some(executed) = self.run_control_word(command, arguments, input, from_pipe)? {
                 return Ok(executed);
             }
-            // Unreachable while [`telemetry::CONTROL_WORDS`] and `run_control_word` agree, which
-            // `control_words_and_their_dispatcher_agree` pins. Reporting "command not found" is
-            // what a word added to only one of the two should do: fail closed and visibly, rather
-            // than silently succeed with no effect.
             self.write_line(&format!("dekopon-shell: {command}: command not found"));
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
         };
@@ -1480,10 +1213,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                     };
-                    // The one place a piped value has to become owned. A pipeline stage's own
-                    // output is held by nobody else and moves straight through; a function frame's
-                    // stdin is shared with the frame, so only that case copies — and only for the
-                    // commands that actually reach for input.
                     builtin.run(&mut context, arguments, own(input))
                 };
                 match outcome {
@@ -1495,17 +1224,8 @@ impl Evaluator<'_> {
                 }
             }
             Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
-            // The provider runs its own argv like a small command-line program. A proposal it
-            // makes is charged, authorized, and traced like every capability call, and any secret
-            // reference it names travels with it to the invoker. Running the word proposes; it
-            // does not grant.
             Resolution::ProviderCommand => {
-                // Encoded once, with the rule every emitted value follows — strings verbatim,
-                // everything else as compact JSON — so a provider reads `echo hello | word -` and
-                // `jq -n '{a:1}' | word -` exactly as the script would have printed them.
                 let stdin = input.as_deref().map(display);
-                // A guest run costs wall clock the same way a capability call does, and for the
-                // same reason `invoke_capability_with_secret_use` re-reads the clock around one.
                 self.budget.check_deadline()?;
                 let run = self
                     .invoker
@@ -1521,9 +1241,6 @@ impl Evaluator<'_> {
                         let status = self.absorb(CommandFailure::usage(message))?;
                         return Ok(Executed::Result(CommandResult::status(status)));
                     }
-                    // Neither a proposal nor the provider's own answer: the same two shapes a
-                    // capability call ends in when it errors or is refused, so the model reads
-                    // them the same way — retry later, or stop — rather than as a bad argv.
                     Some(CommandRun::Errored { message }) => {
                         let status = self.absorb(CommandFailure::failed(format!(
                             "{command}: failed: {message}"
@@ -1542,18 +1259,11 @@ impl Evaluator<'_> {
                         stderr,
                         status,
                     }) => return self.emit_rendered(stdout, stderr, status),
-                    // Resolution said a provider owned this word, so nothing owning it now means
-                    // the registry changed underneath the session. Fail closed and visibly.
                     None => {
                         self.write_line(&format!("dekopon-shell: {command}: command not found"));
                         return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
                     }
                 };
-                // The provider proposes a capability without knowing what this session was
-                // granted — it holds no session state and could not consult a grant if it wanted
-                // to. Naming the missing capability here is what keeps "not configured" from
-                // reading as "does not exist", which is the message the `gh` builtin used to give
-                // before this layer moved into the component.
                 if !self.invoker.is_granted(&capability) {
                     self.write_line(&format!(
                         "dekopon-shell: {command}: requires capability {capability}, which is not \
@@ -1584,7 +1294,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Handles the control words the evaluator owns rather than the builtin table.
     fn run_control_word(
         &mut self,
         command: &str,
@@ -1664,8 +1373,6 @@ impl Evaluator<'_> {
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
             }
-            // `shift` belongs beside `local`: this shell already models `$1`, `$@`, and `$#`, so
-            // its absence broke `while [ $# -gt 0 ]; do ...; shift; done` while looking fine.
             "shift" => {
                 let Some(frame) = self.frames.last_mut() else {
                     self.write_line("dekopon-shell: shift: only valid inside a function");
@@ -1681,7 +1388,6 @@ impl Evaluator<'_> {
                     }
                 };
                 if count > frame.positional.len() {
-                    // Shifting past the end is a failed `shift` in bash, not a truncation.
                     Executed::Result(CommandResult::status(ExitCode::FAILURE))
                 } else {
                     frame.positional.drain(..count);
@@ -1703,13 +1409,6 @@ impl Evaluator<'_> {
         Ok(Some(executed))
     }
 
-    /// Calls one shell function.
-    ///
-    /// `input` is the value piped into the call, and `capture_output` says whether the caller
-    /// consumes what the function produced. Both matter: without them a function is silently
-    /// broken in a pipeline, leaking its output past the pipe and handing the next command a null.
-    /// Output is captured only when it is consumed, so a function in terminal position keeps
-    /// streaming into the bounded output buffer rather than accumulating in memory.
     fn call_function(
         &mut self,
         name: &str,
@@ -1762,8 +1461,6 @@ impl Evaluator<'_> {
                 suppress_newline: false,
             }),
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
-            // `break`/`continue` that escape a function body do not unwind the caller's loop;
-            // bash treats them as spent, and so does this evaluator.
             Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
                 value,
                 status: self.last_status,
@@ -1802,7 +1499,6 @@ impl Evaluator<'_> {
             }
         }
 
-        // Nothing produced is nothing emitted; an empty `[]` would be a phantom line of output.
         let value = if outputs.is_empty() {
             Value::Null
         } else {
@@ -1815,16 +1511,9 @@ impl Evaluator<'_> {
         }))
     }
 
-    // -----------------------------------------------------------------------
-    // Expansion
-    // -----------------------------------------------------------------------
-
-    /// Evaluates an assignment right-hand side.
-    ///
-    /// A whole-RHS `$(cmd)` or `$NAME` keeps its structured value instead of collapsing to text.
-    /// This is the documented deviation from bash that makes `issue=$(gh issue view 12)` followed
-    /// by `${issue[title]}` work, and it has to cover both spellings or `copy=$issue` would
-    /// silently flatten what `issue` holds.
+    /// Assigning a variable from a whole command substitution or another whole variable keeps its
+    /// structured value instead of flattening it to text, a deliberate deviation from real shells
+    /// that lets a script later index into what it captured.
     fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if word.parts.is_empty() {
@@ -1837,9 +1526,6 @@ impl Evaluator<'_> {
                     self.last_substitution_status = status;
                     return Ok(value);
                 }
-                // A whole-RHS parameter expansion keeps its value for the same reason a whole-RHS
-                // substitution does: `b=$a` followed by `${b[key]}` is asking about the object `a`
-                // holds, and stringifying it here would answer about that object's JSON text.
                 WordPart::Parameter(parameter) => return self.parameter_value(parameter),
                 _ => {}
             }
@@ -1848,7 +1534,6 @@ impl Evaluator<'_> {
         Ok(Value::String(expanded.join(" ")))
     }
 
-    /// Expands one word into zero or more argv words.
     fn expand_word(&mut self, word: &Word) -> Result<Vec<String>, CommandFailure> {
         let mut fields = vec![String::new()];
         let mut produced = false;
@@ -1860,9 +1545,6 @@ impl Evaluator<'_> {
                     produced = true;
                 }
                 WordPart::DoubleQuoted(parts) => {
-                    // `"$@"` is the one place double quotes produce more than one word. It is the
-                    // most-trained idiom in shell (`for x in "$@"`), so it follows bash exactly
-                    // rather than collapsing to a space-joined string; `"$*"` is the joined form.
                     let expanded = self.expand_quoted_fields(parts)?;
                     let mut expanded = expanded.into_iter();
                     if let Some(first) = expanded.next() {
@@ -1889,24 +1571,16 @@ impl Evaluator<'_> {
             }
         }
 
-        // An unquoted expansion that produced nothing yields no argv word at all, so
-        // `echo $undefined` passes zero arguments rather than one empty one.
         if !produced && fields.len() == 1 && fields[0].is_empty() {
             return Ok(Vec::new());
         }
         Ok(fields)
     }
 
-    /// Expands the interior of a double-quoted string into exactly one field.
     fn expand_quoted(&mut self, parts: &[WordPart]) -> Result<String, CommandFailure> {
         Ok(self.expand_quoted_fields(parts)?.join(" "))
     }
 
-    /// Expands the interior of a double-quoted string, splitting only where `"$@"` demands it.
-    ///
-    /// Every part appends to the current field. `"$@"` is the sole exception: each parameter after
-    /// the first opens a new field, so `"$@"` yields one word per parameter, `"a$@b"` glues the
-    /// literals onto the outer two, and zero parameters yield zero words.
     fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
         let mut fields = vec![String::new()];
         for part in parts {
@@ -1931,9 +1605,6 @@ impl Evaluator<'_> {
                     };
                     let mut elements = elements.iter().map(display);
                     let Some(first) = elements.next() else {
-                        // A bare `"$@"` with no parameters is no word at all, so `f "$@"` with
-                        // nothing to forward calls `f` with zero arguments rather than one empty
-                        // one. Glued to other text it contributes nothing instead.
                         if parts.len() == 1 {
                             return Ok(Vec::new());
                         }
@@ -1964,9 +1635,6 @@ impl Evaluator<'_> {
                 length,
             } => {
                 let (value, bound) = self.select_parameter(name, indices)?;
-                // `set -u` only governs a plain reference. `${x:-d}` and its relatives exist
-                // precisely to handle an absent value, so tripping on them would make the option
-                // refuse the idiom written to satisfy it.
                 if self.options.nounset && !bound && *modifier == Modifier::None {
                     return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
                         "{name}: unbound variable, and `set -u` is on"
@@ -1986,7 +1654,6 @@ impl Evaluator<'_> {
                 .cloned()
                 .unwrap_or(Value::Null),
             Parameter::AllPositional => Value::Array(self.positional().to_vec()),
-            // `$*` is the always-joined counterpart of `$@`: one word, whatever the quoting.
             Parameter::AllPositionalJoined => Value::String(
                 self.positional()
                     .iter()
@@ -1999,10 +1666,6 @@ impl Evaluator<'_> {
         })
     }
 
-    /// Walks a parameter's indices, reporting the selection and whether it was bound at all.
-    ///
-    /// "Bound" is what separates `${NAME-word}` from `${NAME:-word}`: the first substitutes only
-    /// for a name nothing ever assigned, the second also for one holding an empty value.
     fn select_parameter(
         &mut self,
         name: &str,
@@ -2018,8 +1681,6 @@ impl Evaluator<'_> {
                     value = value::index(&value, &key);
                     bound = !value.is_null();
                 }
-                // `[@]` and `[*]` select the whole thing; what differs is how the *word* they sit
-                // in splits, which `expand_word` and `expand_quoted_fields` decide.
                 Index::All => {}
                 Index::AllJoined => {
                     value = Value::String(value::to_lines(&value).join(" "));
@@ -2029,7 +1690,6 @@ impl Evaluator<'_> {
         Ok((value, bound))
     }
 
-    /// Applies one `${NAME<op>word}` transformation.
     fn apply_modifier(
         &mut self,
         name: &str,
@@ -2038,8 +1698,6 @@ impl Evaluator<'_> {
         value: Value,
         bound: bool,
     ) -> Result<Value, CommandFailure> {
-        // `:` widens "absent" from "never assigned" to "assigned nothing useful", which is the
-        // distinction bash draws and the one a script almost always wants.
         let absent = |colon: bool| {
             if colon {
                 value.is_null() || display(&value).is_empty()
@@ -2126,10 +1784,6 @@ impl Evaluator<'_> {
         })
     }
 
-    /// Expands one `${NAME#pattern}`-family pattern and refuses the metacharacters it cannot honor.
-    ///
-    /// Same rule as a `grep`, `sed`, or `case` pattern. A constant pattern was already checked by
-    /// the parser, where quoting was still visible; only one assembled at run time is checked here.
     fn literal_pattern(&mut self, pattern: &Pattern) -> Result<String, CommandFailure> {
         match pattern {
             Pattern::Literal(word) => self.expand_quoted(&word.parts),
@@ -2145,10 +1799,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Evaluates one `[[ ... ]]` expression.
-    ///
-    /// `&&` and `||` short-circuit, exactly as they do between commands, so
-    /// `[[ -n $x && $x == ok ]]` never evaluates the comparison for an unset `x`.
     fn evaluate_conditional(
         &mut self,
         expression: &Conditional,
@@ -2174,12 +1824,6 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Evaluates one `[[ ]]` primary.
-    ///
-    /// Each operand expands to exactly one word — that is the promise `[[ ]]` makes over `[ ]`, and
-    /// it is why `[[ -n $x ]]` holds for a value with spaces where `[ -n $x ]` falls apart. The
-    /// test itself is [`builtins::misc::evaluate_test`], the same code `test` and `[` run, so the
-    /// two spellings can never disagree about what `-z` or `-lt` mean.
     fn evaluate_conditional_test(
         &mut self,
         test: &ConditionalTest,
@@ -2199,7 +1843,6 @@ impl Evaluator<'_> {
         Ok(builtins::misc::evaluate_test("[[", &operands)?.status)
     }
 
-    /// Runs a command substitution, capturing what its pipelines produced.
     fn run_substitution(&mut self, program: &Program) -> Result<(Value, ExitCode), CommandFailure> {
         self.captures.push(Vec::new());
         let flow = self.execute_program(program);
@@ -2207,7 +1850,8 @@ impl Evaluator<'_> {
         let flow = flow.map_err(CommandFailure::Fatal)?;
 
         if let Flow::Exit(status) = flow {
-            // There is no subshell to confine an `exit` to, so it ends the script.
+            // This shell has no subshells, so calling exit inside a captured command substitution
+            // ends the entire script rather than only the substitution, unlike a real shell.
             return Err(CommandFailure::Fatal(FatalError::Unsupported(format!(
                 "exit {status} inside $( ) ends the whole script; this shell has no subshells"
             ))));
@@ -2218,30 +1862,16 @@ impl Evaluator<'_> {
         self.budget
             .charge_value_bytes(value_bytes(&value))
             .map_err(CommandFailure::from)?;
-        // Every substitution records its status, not only a whole-RHS one: `x=a$(false)` must
-        // still leave `$?` at 1, exactly as `url="https://$(get_host)/x"` must report a failed
-        // lookup rather than reading as a success.
         self.last_substitution_status = status;
         Ok((value, status))
     }
 
-    // -----------------------------------------------------------------------
-    // Arithmetic
-    // -----------------------------------------------------------------------
-
-    /// Evaluates one arithmetic node.
-    ///
-    /// Every node charges a step. The parser caps how deep and how large an expression may be, so
-    /// this recursion is bounded before it starts; the step charge is what keeps a large-but-legal
-    /// expression inside the same budget the rest of the evaluator answers to.
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
         self.budget.charge_step()?;
         Ok(match expression {
             ArithExpr::Integer(value) => Number::Integer(*value),
             ArithExpr::Float(value) => Number::Float(*value),
             ArithExpr::Variable(name) => {
-                // `$(( $1 + 1 ))` reads a positional parameter; only `$N` can produce a
-                // digit-only name here, because a bare digit lexes as a literal.
                 let value = match name.parse::<usize>() {
                     Ok(position) => self.parameter_value(&Parameter::Positional(position))?,
                     Err(_) => self.lookup(name).cloned().unwrap_or(Value::Null),
@@ -2259,7 +1889,6 @@ impl Evaluator<'_> {
                 }
             }
             ArithExpr::Binary(operator, left, right) => {
-                // `&&` and `||` short-circuit, so `$(( x != 0 && 10 / x > 1 ))` is safe.
                 match operator {
                     ArithBinaryOp::And => {
                         let left = self.evaluate_arithmetic(left)?;
@@ -2288,11 +1917,6 @@ impl Evaluator<'_> {
     }
 }
 
-/// Reports whether a parameter keeps splitting into one word per element inside double quotes.
-///
-/// `"$@"` is the most-trained idiom in shell and `"${NAME[@]}"` is its named-variable counterpart:
-/// both exist precisely so a list survives quoting intact. Every other expansion inside quotes is
-/// one field.
 fn splits_inside_quotes(parameter: &Parameter) -> bool {
     match parameter {
         Parameter::AllPositional => true,
@@ -2303,11 +1927,6 @@ fn splits_inside_quotes(parameter: &Parameter) -> bool {
     }
 }
 
-/// Splits one `read` line into at most `count` fields on whitespace runs.
-///
-/// The remainder lands in the last field, as bash does, and leading whitespace is skipped. Local to
-/// `read` rather than a return of IFS word splitting: nothing else in this shell splits, and there
-/// is no `IFS` to configure.
 fn split_read_fields(line: &str, count: usize) -> Vec<&str> {
     let mut fields = Vec::with_capacity(count);
     let mut rest = line.trim_start();
@@ -2324,7 +1943,6 @@ fn split_read_fields(line: &str, count: usize) -> Vec<&str> {
     fields
 }
 
-/// Reports whether a word can name a shell variable.
 fn is_variable_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -2333,16 +1951,10 @@ fn is_variable_name(name: &str) -> bool {
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Composes the terminal failure for a `set` option this shell does not enforce.
 fn unsupported_option(message: impl Into<String>) -> CommandFailure {
     CommandFailure::Fatal(FatalError::Unsupported(message.into()))
 }
 
-/// Reports what `${#NAME}` counts, per value kind.
-///
-/// A string counts characters, the way bash does. An array counts elements and an object counts
-/// keys, which is what `${#NAME}` has to mean once values are real JSON rather than text; anything
-/// else counts the characters of its display form.
 fn parameter_length(value: &Value) -> Value {
     match value {
         Value::Null => Value::from(0),
@@ -2353,12 +1965,6 @@ fn parameter_length(value: &Value) -> Value {
     }
 }
 
-/// Folds a command's captured diagnostics into its value, for `2>&1`.
-///
-/// A command with nothing to say leaves its value untouched — including its type, so
-/// `gh issue view 12 2>&1` still yields an object rather than that object's JSON text. Only when
-/// there *are* diagnostics do the two channels have to become one, and they become one the way
-/// every text-shaped builtin already crosses between a value and its lines.
 fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     if diagnostics.is_empty() {
         return value;
@@ -2368,18 +1974,10 @@ fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     value::from_lines(lines)
 }
 
-/// Materializes a piped value for a command that consumes it by value.
-///
-/// Piped values travel as [`Rc`] so that offering one costs a refcount rather than a deep copy of
-/// whatever a capability returned. This is where that ends: a stage's own output is held by nobody
-/// else and moves through untouched, while a function frame's stdin is shared with the frame and
-/// every later pipeline in its body, so only that case copies — and only for a command that
-/// actually reaches for input.
 fn own(input: Option<Rc<Value>>) -> Option<Value> {
     input.map(Rc::unwrap_or_clone)
 }
 
-/// Inverts a pipeline status for a leading `!`, collapsing every failure to plain success.
 fn invert(status: ExitCode) -> ExitCode {
     if status == ExitCode::SUCCESS {
         ExitCode::FAILURE
@@ -2388,15 +1986,9 @@ fn invert(status: ExitCode) -> ExitCode {
     }
 }
 
-/// Reduces what a captured block emitted into one value.
-///
-/// One result keeps its structure so `x=$(cap ... )` stays JSON; several are joined as text
-/// because that is what a caller reading multiple lines expects.
-///
-/// The join honors [`CommandResult::suppress_newline`] the same way [`Evaluator::emit`] does. A
-/// capture is still a stream of writes: `v=$(printf '%s' a; printf '%s' b)` is `ab` in bash, and
-/// inserting the newline the script explicitly suppressed silently corrupted every value a model
-/// assembled piecewise — a URL, a JSON fragment — with no diagnostic anywhere.
+/// A capture is still a stream of individual writes, so joining them must respect a result that
+/// explicitly suppressed its own line ending, or a value a script assembled piece by piece would
+/// silently gain an unwanted newline.
 fn reduce_captured(captured: Vec<CommandResult>) -> Value {
     match captured.len() {
         0 => Value::String(String::new()),
@@ -2406,8 +1998,6 @@ fn reduce_captured(captured: Vec<CommandResult>) -> Value {
             .map_or(Value::Null, |result| result.value),
         _ => {
             let mut text = String::new();
-            // Seeded as if the (absent) result before the first one suppressed its terminator, so
-            // nothing is prefixed to the capture.
             let mut previous_suppressed = true;
             for result in &captured {
                 if !previous_suppressed {
@@ -2421,10 +2011,9 @@ fn reduce_captured(captured: Vec<CommandResult>) -> Value {
     }
 }
 
-/// Estimates the bytes one value occupies, for the value-byte ceiling.
-///
-/// This is an approximation of heap cost, not a measurement: it counts payload bytes plus a small
-/// fixed charge per node so that a deeply nested structure of empty pieces still costs something.
+/// The byte cost charged against the memory budget is an approximation, not a measurement, and
+/// includes a small fixed charge per node so a deeply nested structure built entirely of empty
+/// pieces still counts against the limit.
 fn value_bytes(value: &Value) -> u64 {
     const NODE_OVERHEAD: u64 = 16;
     NODE_OVERHEAD
@@ -2456,7 +2045,6 @@ fn parse_shift_count(arguments: &[String]) -> Result<usize, CommandFailure> {
     }
 }
 
-/// A `break N` that escapes the outermost loop it can reach becomes an ordinary exit from it.
 fn unwind_break(level: u32) -> Flow {
     if level > 1 {
         Flow::Break(level - 1)
@@ -2506,7 +2094,6 @@ fn parse_status(
     }
 }
 
-/// Appends text to the last field.
 fn append(fields: &mut Vec<String>, text: &str) {
     if let Some(last) = fields.last_mut() {
         last.push_str(text);
@@ -2515,10 +2102,6 @@ fn append(fields: &mut Vec<String>, text: &str) {
     }
 }
 
-/// Spreads one expanded value across argv fields.
-///
-/// POSIX IFS word splitting is dropped. In its place: an unquoted expansion holding a JSON array
-/// expands element by element into separate argv words, and any scalar expands to exactly one word.
 fn spread(fields: &mut Vec<String>, value: &Value) -> bool {
     match value {
         Value::Array(items) => {
@@ -2544,10 +2127,6 @@ fn spread(fields: &mut Vec<String>, value: &Value) -> bool {
     }
 }
 
-/// Renders a value inside double quotes, where arrays never split into separate words.
-///
-/// `"$@"` therefore joins with a space rather than producing one word per parameter. That is a
-/// documented deviation from bash, chosen so that double quotes always mean "exactly one word".
 fn quoted_text(value: &Value) -> String {
     match value {
         Value::Array(items) => items.iter().map(display).collect::<Vec<_>>().join(" "),
@@ -2555,7 +2134,6 @@ fn quoted_text(value: &Value) -> String {
     }
 }
 
-/// An arithmetic value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Number {
     Integer(i64),
@@ -2591,7 +2169,6 @@ fn render_number(number: Number) -> String {
     }
 }
 
-/// Coerces a value into an arithmetic operand, defaulting to zero like bash does.
 fn to_number(value: &Value) -> Number {
     match value {
         Value::Number(number) => number.as_i64().map_or_else(

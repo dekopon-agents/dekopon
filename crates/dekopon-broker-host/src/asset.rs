@@ -1,5 +1,3 @@
-//! Per-invocation asset resources. Descriptors carry bytes; table rows carry only metadata.
-
 use crate::{StoreState, bindings::dekopon::asset::asset as wit};
 use dekopon_broker_protocol::{
     AssetEncoding, AssetRow, MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
@@ -26,60 +24,42 @@ use wasmtime::component::Resource;
 const MAX_ASSET_BYTES: u64 = dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64;
 const MAX_INVOCATION_BYTES: u64 = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64;
 
-/// A frame's descriptors or table do not satisfy the asset admission contract.
 #[derive(Debug, thiserror::Error)]
 pub enum AssetAdmissionError {
-    /// Table row ceiling exceeded.
     #[error("too many asset rows")]
     TooManyRows,
-    /// Reference order must zip exactly with at most five descriptors.
     #[error("asset descriptor count does not match references")]
     DescriptorCount,
-    /// A conversation number must name exactly one table row.
     #[error("duplicate asset table row")]
     DuplicateRow,
-    /// A referenced number is absent from the conversation table.
     #[error("asset reference absent from table")]
     UnknownReference,
-    /// Only matching regular, read-only files are admitted.
     #[error("asset descriptor is not a matching read-only file")]
     InvalidDescriptor,
-    /// Input file lengths exceed the invocation ceiling.
     #[error("asset input exceeds invocation byte limit")]
     TooLarge,
-    /// Native descriptor inspection failed.
     #[error("asset descriptor inspection failed")]
     Io(#[from] AssetIoError),
 }
 
-/// Gateway metadata and the descriptors associated with proposal references in discovery order.
 #[derive(Debug, Default)]
 pub struct AssetInputs {
-    /// Complete conversation table, at most 32 rows.
     pub rows: Vec<AssetRow>,
-    /// One read-only descriptor per distinct referenced string leaf.
     pub descriptors: Vec<OwnedFd>,
-    /// Remaining external-delivery allowance for this turn.
     pub sends_remaining: u8,
 }
 
-/// Successful invocation's typed changes; keeping files alive retains in-flight accounting.
 #[derive(Debug, Default)]
 pub struct AssetOutputs {
-    /// Metadata in descriptor order.
     pub attached: Vec<NewAsset>,
-    /// Conversation references removed by this invocation.
     pub removed: Vec<u64>,
-    /// Conversation references marked for delivery.
     pub sent: Vec<u64>,
-    /// Read-only files corresponding exactly to attached rows.
     pub files: Vec<Arc<AssetFile>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AssetId(u64);
 
-/// File-backed host handle; never exposes its descriptor to a guest.
 pub struct HandleResource {
     digest_recorded: bool,
     source: Source,
@@ -94,7 +74,6 @@ enum Source {
     },
 }
 
-/// Sequential host writer under the invocation and process byte ceilings.
 pub struct WriterResource {
     spool: Option<WriterSink>,
     content_type: String,
@@ -159,7 +138,6 @@ pub(crate) struct AssetState {
     rows: Vec<AssetRow>,
     inputs: Vec<(AssetId, AssetReader)>,
     sends_remaining: u8,
-    /// Decoded writer bytes and every streamed asset occurrence share the invocation budget.
     written: u64,
     outputs: AssetOutputs,
 }
@@ -567,8 +545,8 @@ impl wit::HostHandle for StoreState {
     }
 }
 
-// bindgen eagerly lifts anonymous lists into Vec. Register this one import with WasmList so
-// the length is checked in guest memory before any payload allocation; the WIT remains async.
+// bindgen normally lifts anonymous lists into Vec eagerly; this import uses WasmList instead so the
+// length is checked in guest memory before any payload is allocated.
 pub(crate) fn link_bounded_writer(
     linker: &mut wasmtime::component::Linker<StoreState>,
 ) -> wasmtime::Result<()> {
@@ -1350,7 +1328,6 @@ mod tests {
                 &base64::STANDARD,
                 vec![0; MAX_ASSET_BYTES as usize + extra],
             );
-            // The one-decoded-byte overflow has the SAME stored length, but different padding.
             assert_eq!(encoded.len() as u64, stored_limit);
             let mut result = Ok(());
             for chunk in encoded.as_bytes().chunks(CHUNK_BYTES - 1) {

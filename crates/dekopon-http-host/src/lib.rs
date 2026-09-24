@@ -1,12 +1,5 @@
-//! Statically linked, buffered, deny-by-default HTTP primitive for Dekopon's broker host.
-//!
-//! This crate performs no authorization transition. It consumes a broker-produced
-//! [`HttpConstraints`] value beneath independent native ceilings and returns bounded buffers plus
-//! sanitized evidence metadata. Provider-facing WIT conversion remains in `dekopon-broker-host`.
-//!
-//! A credentialed context runs the credential echo check on every response it receives: a response
-//! whose body or any header value carries the raw or encoded secret is refused as
-//! [`ErrorCode::Denied`] rather than returned to the component.
+//! Every response from a credentialed context is checked for the raw or encoded secret and refused
+//! as Denied rather than returned to the component.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -49,114 +42,63 @@ use tokio::time::{Instant, timeout};
 use tracing::Instrument as _;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
-/// Companion header the `chatgptSubscription` credential kind injects beside `authorization`.
-///
-/// The ChatGPT account identifier is a claim inside the access token the guest never sees, and the
-/// Codex image and responses routes refuse a request that carries the bearer token without it.
 const CHATGPT_ACCOUNT_HEADER: &str = "chatgpt-account-id";
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const REQUEST_ENCODING_OVERHEAD_BYTES: u64 = 128;
 
-/// Default maximum calls accepted by one native HTTP execution context.
 pub const DEFAULT_MAX_REQUESTS: u32 = 32;
-/// Default maximum accounted request bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 1024 * 1024;
-/// Default maximum accounted response bytes (4 MiB).
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
-/// Default maximum header values in either direction.
 pub const DEFAULT_MAX_HEADERS: usize = 128;
-/// Default maximum aggregate header bytes in either direction (64 KiB).
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
-/// Maximum secret bytes accepted into one bound credential.
 pub const MAX_CREDENTIAL_BYTES: usize = 4096;
-/// Minimum secret bytes accepted into a legacy scheme-prefixed bound credential.
-///
-/// A credential's secret is also its echo value, and the credential echo check is a substring
-/// search over every response the credentialed context receives. A short or
-/// phrase-shaped secret would therefore refuse responses that never carried it: `token` as a
-/// credential would deny every JSON body that mentions the word. Sixteen bytes is shorter than any
-/// real bearer token — the shortest thing an issuer calls one is a 128-bit value, 22 characters in
-/// base64 and 32 in hex — and long enough that its appearance in a response body means the endpoint
-/// echoed the credential.
-///
-/// It applies to every constructor that turns a secret into an echo value: the legacy
-/// scheme-prefixed credential and both DRN-bound sinks.
+/// The minimum is 16 bytes because the echo check substring-searches every response, and a shorter
+/// secret like token would falsely match unrelated text.
 pub const MIN_CREDENTIAL_BYTES: usize = 16;
-// Each of those constructors names this bound in the refusal an operator reads, because the number
-// is what makes the message actionable. This is what keeps the messages and the constant together.
 const _: () = assert!(MIN_CREDENTIAL_BYTES == 16);
 
-/// One ordered byte-valued HTTP header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
-    /// Case-insensitive HTTP field name.
     pub name: String,
-    /// Field value bytes.
     pub value: Vec<u8>,
 }
 
-/// One complete buffered HTTP request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
-    /// Any syntactically valid standard or extension method token.
     pub method: String,
-    /// Absolute HTTP or HTTPS URI.
     pub uri: String,
-    /// Ordered headers with duplicate names preserved.
     pub headers: Vec<Header>,
-    /// Complete body bytes.
     pub body: Vec<u8>,
 }
 
-/// One complete buffered HTTP response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
-    /// HTTP status code.
     pub status: u16,
-    /// Ordered non-sensitive end-to-end headers.
     pub headers: Vec<Header>,
-    /// Complete body bytes.
     pub body: Vec<u8>,
 }
 
-/// Stable failure classes mapped to the component contract by the broker host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorCode {
-    /// Invalid method token.
     InvalidMethod,
-    /// Invalid or unsupported URI.
     InvalidUri,
-    /// Invalid or broker-owned header.
     InvalidHeader,
-    /// Request exceeded a byte or header bound.
     RequestTooLarge,
-    /// Destination, scheme, or method was denied.
     Denied,
-    /// Invocation exhausted its HTTP call count.
     HostCallLimit,
-    /// DNS resolution failed.
     Dns,
-    /// Connection failed.
     Connect,
-    /// TLS validation or negotiation failed.
     Tls,
-    /// Deadline expired.
     Timeout,
-    /// HTTP protocol failed.
     Protocol,
-    /// Response exceeded a byte or header bound.
     ResponseTooLarge,
-    /// Native client setup failed.
     Internal,
 }
 
-/// Bounded provider-safe HTTP failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpError {
-    /// Stable machine class.
     pub code: ErrorCode,
-    /// Sanitized detail of at most 256 UTF-8 bytes.
     pub message: String,
 }
 
@@ -168,30 +110,12 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
-/// Exact hostnames the broker owner has opted out of the plaintext-HTTP restriction.
-///
-/// Plaintext is refused to anything but loopback because a credential injected over `http://`
-/// travels in the clear, and that is goal 1's whole subject. The default set is empty, which is
-/// exactly that rule. An owner who runs a service that speaks only plaintext on a network they
-/// control — an OpenObserve ingest at `rpi.lan`, an in-cluster service address — names that host
-/// here, and only that host.
-///
-/// Entries are exact hostnames compared case-insensitively. No wildcards, so a listed host widens
-/// nothing beyond itself; no ports, because what this relaxes is the scheme rather than the
-/// socket; and no IPv6 literal, because a bare `:` reads as a port in this grammar — name the host.
-/// The list reaches nothing on its own: a constraint set's `allowedHosts` still has to name the
-/// destination and its `allowPlaintextLoopback` still has to be set, so this widens the *how*
-/// of a request the authorization already permits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlaintextHosts {
     hosts: Arc<BTreeSet<String>>,
 }
 
 impl PlaintextHosts {
-    /// Validates one owner-authored list and lowercases every entry.
-    ///
-    /// Every refusal names the offending entry, because this runs at broker startup and the
-    /// operator's next act is editing that line.
     pub fn new<I>(entries: I) -> Result<Self, PlaintextHostError>
     where
         I: IntoIterator,
@@ -226,63 +150,37 @@ impl PlaintextHosts {
         })
     }
 
-    /// Whether the owner listed this host, ignoring case.
     #[must_use]
     pub fn contains(&self, host: &str) -> bool {
         self.hosts.contains(host.to_ascii_lowercase().as_str())
     }
 
-    /// Whether the owner listed nothing, which is the loopback-only default.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()
     }
 
-    /// Listed hosts in deterministic order, for the one line startup logs.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
         self.hosts.iter().map(String::as_str)
     }
 }
 
-/// An owner-authored plaintext-host entry that is not a bare hostname.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PlaintextHostError {
-    /// An entry was empty or only whitespace.
     #[error("a plaintext host entry is empty")]
     Empty,
-    /// An entry carried a URL scheme.
     #[error("plaintext host `{entry}` must be a bare hostname, without a scheme")]
-    Scheme {
-        /// The refused entry.
-        entry: String,
-    },
-    /// An entry carried a path.
+    Scheme { entry: String },
     #[error("plaintext host `{entry}` must be a bare hostname, without a path")]
-    Path {
-        /// The refused entry.
-        entry: String,
-    },
-    /// An entry carried a port, or was an IPv6 literal.
+    Path { entry: String },
     #[error("plaintext host `{entry}` must carry no port: the port is irrelevant to this rule")]
-    Port {
-        /// The refused entry.
-        entry: String,
-    },
-    /// An entry used a wildcard.
+    Port { entry: String },
     #[error("plaintext host `{entry}` must be an exact hostname: wildcards are not accepted")]
-    Wildcard {
-        /// The refused entry.
-        entry: String,
-    },
-    /// An entry held characters a hostname may not.
+    Wildcard { entry: String },
     #[error("plaintext host `{entry}` is not a hostname")]
-    InvalidHost {
-        /// The refused entry.
-        entry: String,
-    },
+    InvalidHost { entry: String },
 }
 
-/// Whether this is a bare DNS name or IPv4 literal, in the shape `Url::host_str` would return.
 fn is_bare_hostname(entry: &str) -> bool {
     entry
         .bytes()
@@ -291,8 +189,6 @@ fn is_bare_hostname(entry: &str) -> bool {
         && !entry.ends_with(['-', '.'])
 }
 
-/// Broker-owned exact HTTPS authority permitted to resolve to private unicast addresses.
-/// Independent of certificate trust; the provider's grant must also allow this destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NonPublicHttpsAuthority {
     pub authority: String,
@@ -322,28 +218,15 @@ impl NonPublicHttpsAuthority {
     }
 }
 
-/// Independent native host settings that authorization cannot widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpHostCeilings {
-    /// Maximum calls in one execution context.
     pub max_requests: u32,
-    /// Maximum authorized accounted request bytes.
     pub max_request_bytes: u64,
-    /// Maximum authorized accounted response bytes.
     pub max_response_bytes: u64,
-    /// Maximum header values in a request or response.
     pub max_headers: usize,
-    /// Maximum aggregate header bytes in a request or response.
     pub max_header_bytes: usize,
-    /// Exact hostnames the broker owner permits plaintext HTTP to besides loopback.
-    ///
-    /// The one setting here that relaxes rather than bounds, and it sits beside the ceilings for
-    /// the same reason they do: it is the broker owner's file, and no authorization can add an
-    /// entry to it. Empty is the loopback-only rule.
     pub plaintext_hosts: PlaintextHosts,
-    /// Additional trusted root certificates for any HTTPS destination; not an egress grant.
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
-    /// Exact HTTPS authorities that may resolve to private unicast addresses; not CA trust.
     pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
 }
 
@@ -362,70 +245,38 @@ impl Default for HttpHostCeilings {
     }
 }
 
-/// Invalid native ceiling or broker grant.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ConfigurationError {
-    /// A native ceiling was zero.
     #[error("HTTP host ceiling {field} must be greater than zero")]
-    ZeroCeiling {
-        /// Invalid field.
-        field: &'static str,
-    },
-    /// Grant omitted required authority, an exact entry, or a positive bound.
+    ZeroCeiling { field: &'static str },
     #[error("HTTP authorization is not exact: {source}")]
     InvalidGrant {
-        /// Which entry-grammar or bound rule the grant violated.
         #[source]
         source: HttpConstraintsError,
     },
-    /// Grant attempted to exceed a native ceiling.
     #[error("HTTP authorization exceeds native host ceilings")]
     GrantExceedsCeiling,
-    /// Execution deadline was zero.
     #[error("HTTP execution deadline must be greater than zero")]
     ZeroTimeout,
-    /// Execution deadline could not be represented by the runtime clock.
     #[error("HTTP execution deadline is too large")]
     TimeoutOverflow,
-    /// A broker-produced secret-use grant failed its shared structural validation.
     #[error("secret-use grant is invalid")]
     InvalidSecretGrant {
         #[source]
         source: dekopon_capability::SecretUseGrantError,
     },
-    /// A bound credential failed structural validation.
-    ///
-    /// The reason names the invalid *field*, never any part of the secret value.
     #[error("bound credential is invalid: {reason}")]
-    InvalidCredential {
-        /// Which structural rule the credential violated.
-        reason: &'static str,
-    },
+    InvalidCredential { reason: &'static str },
 }
 
-/// A broker-resolved secret pre-rendered as one `authorization` header value and bound to
-/// explicit destination authorities.
-///
-/// This is the carrier for "an agent may *use* a credential but never see it": the broker
-/// constructs one from owner-only storage, hands it to the execution context alongside the
-/// authorization grant, and [`BufferedHttpClient`] injects it after guest headers have been
-/// validated — a guest-supplied `authorization` header is still rejected, never overwritten. The
-/// value lives in a [`Redacted`] wrapper end to end, so no `Debug`, `Display`, or `Serialize`
-/// path renders it.
-///
-/// Destinations use the same authority grammar as `HttpConstraints::allowed_hosts` (`host` for
-/// HTTPS on 443, `host:port` otherwise) and are matched with the same rules, so a policy layer
-/// that requires every allowed host to appear verbatim in the credential's destinations makes a
-/// runtime mismatch unreachable by construction. The request-time check here remains as defense
-/// in depth and fails closed: a credentialed context never sends an unauthenticated request to a
-/// destination outside the binding.
+/// This lets an agent use a credential without ever seeing it: the value stays in a Redacted
+/// wrapper end to end, and a guest-supplied authorization header is rejected, never overwritten.
 #[derive(Clone)]
 pub struct BoundCredential {
     header_value: Redacted<String>,
     companion_header: Option<(HeaderName, Redacted<String>)>,
     destinations: Vec<String>,
     secret_binding: Option<SecretBindingIdentity>,
-    /// What the credential echo check searches every response for.
     echo_values: Vec<SecretBytes>,
 }
 
@@ -454,20 +305,6 @@ impl fmt::Debug for BoundCredential {
 }
 
 impl BoundCredential {
-    /// Builds a scheme-prefixed credential such as `Bearer <secret>` or `token <secret>`.
-    ///
-    /// The secret is held to the same shape [`Self::secret_bearer`] holds a DRN-resolved one to —
-    /// printable ASCII with no whitespace or control bytes, between [`MIN_CREDENTIAL_BYTES`] and
-    /// [`MAX_CREDENTIAL_BYTES`] — because the secret becomes this credential's echo value. Those
-    /// two rules are what make it safe to substring-search for: a secret that could be a word or a
-    /// byte cannot reach the credential echo check and deny unrelated responses.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigurationError::InvalidCredential`] naming the offending *field* — never any
-    /// part of the value — when the scheme is not a printable ASCII token, the secret is short,
-    /// oversized or carries whitespace or control bytes, or the destinations are not bare
-    /// authorities.
     pub fn bearer(
         scheme: &str,
         secret: Redacted<String>,
@@ -485,9 +322,6 @@ impl BoundCredential {
             if value.len() > MAX_CREDENTIAL_BYTES {
                 return Err(invalid("secret exceeds the credential byte limit"));
             }
-            // ASCII graphic excludes space, every other whitespace byte, the controls, and
-            // everything non-ASCII: the header-value rule `render` relies on and the
-            // no-whitespace-or-controls rule the echo value relies on, in one test.
             if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
                 return Err(invalid(
                     "secret contains whitespace, control, or non-ASCII bytes",
@@ -505,10 +339,6 @@ impl BoundCredential {
                 "destinations must be host or host:port authorities",
             ));
         }
-        // The legacy path is echo-checked exactly as the DRN path is. The raw secret is the only
-        // echo value it needs: the rendered `<scheme> <secret>` header strictly contains it, and
-        // `echoes_credential` is a substring search, so a response carrying the rendered header
-        // already matches on the raw secret.
         let echo_value = SecretBytes::new(secret.expose().as_bytes().to_vec());
         let header_value = Redacted::new(format!("{scheme} {}", secret.expose()));
         Ok(Self {
@@ -520,18 +350,6 @@ impl BoundCredential {
         })
     }
 
-    /// Builds the two headers a ChatGPT subscription access token must be presented with.
-    ///
-    /// `authorization: Bearer <access>` plus the fixed companion `chatgpt-account-id: <account_id>`.
-    /// The account identifier is a claim inside the access token, so a provider component cannot
-    /// derive it and the broker has to send it; a guest that sets either name is refused rather than
-    /// overwritten, exactly as for every other credentialed context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigurationError::InvalidCredential`] naming the invalid field — never any part
-    /// of the token — when the access token or the account identifier is empty, oversized, or
-    /// carries bytes no header value admits, or when the destinations are not bare authorities.
     pub fn chatgpt_subscription(
         access: Redacted<String>,
         account_id: &str,
@@ -554,7 +372,6 @@ impl BoundCredential {
         Ok(credential)
     }
 
-    /// Builds a DRN-bound Bearer credential for one separately authorized use grant.
     pub fn secret_bearer(
         secret: SecretBytes,
         grant: &SecretUseGrant,
@@ -574,8 +391,6 @@ impl BoundCredential {
                 reason: "Bearer secret must be UTF-8",
             }
         })?;
-        // The resolved token becomes this credential's echo value, so it takes the same floor a
-        // legacy secret does: a one-byte echo value would deny responses that never carried it.
         if token.len() < MIN_CREDENTIAL_BYTES {
             return Err(ConfigurationError::InvalidCredential {
                 reason: "Bearer secret is shorter than the 16-byte minimum",
@@ -598,14 +413,10 @@ impl BoundCredential {
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
-            // `Bearer <token>` is not a second echo value: it strictly contains the token, the
-            // token is never empty, and `echoes_credential` is a substring search — every response
-            // the rendered header would catch the raw token already catches.
             echo_values: vec![secret],
         })
     }
 
-    /// Builds a DRN-bound HTTP Basic credential entirely inside the native broker boundary.
     pub fn secret_basic(
         password: SecretBytes,
         grant: &SecretUseGrant,
@@ -615,9 +426,6 @@ impl BoundCredential {
                 reason: "Basic secret use requires a fixed username",
             });
         };
-        // The resolved password is an echo value beside the encoded pair, and takes the same
-        // floor for the same reason. Its own refusal, because "structurally invalid" would leave an
-        // operator with a working password and no idea which rule it broke.
         if password.expose().len() < MIN_CREDENTIAL_BYTES {
             return Err(ConfigurationError::InvalidCredential {
                 reason: "Basic secret is shorter than the 16-byte minimum",
@@ -648,19 +456,15 @@ impl BoundCredential {
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
-            // The password and its base64 pair are independent echo values; `Basic <encoded>` is
-            // not, because it strictly contains the never-empty encoded pair.
             echo_values: vec![password, SecretBytes::new(encoded.into_bytes())],
         })
     }
 
-    /// The authorities this credential may be presented to, for policy-layer coverage checks.
     #[must_use]
     pub fn destinations(&self) -> &[String] {
         &self.destinations
     }
 
-    /// Whether one allowed-host scope is covered verbatim by this credential's destinations.
     #[must_use]
     pub fn covers(&self, allowed_host: &str) -> bool {
         destinations_cover(&self.destinations, allowed_host)
@@ -672,7 +476,6 @@ impl BoundCredential {
             .any(|destination| authority_matches(destination, host, port, scheme))
     }
 
-    /// Whether this resolved value belongs to the exact grant committed into authorization.
     #[must_use]
     pub fn matches_secret_grant(&self, grant: Option<&SecretUseGrant>) -> bool {
         match (&self.secret_binding, grant) {
@@ -710,7 +513,6 @@ impl BoundCredential {
         })
     }
 
-    /// Renders the header value, marked sensitive so the transport never debugs it.
     fn render(&self) -> Result<HeaderValue, HttpError> {
         #[allow(
             clippy::map_err_ignore,
@@ -718,20 +520,16 @@ impl BoundCredential {
                       restricted these bytes to ASCII graphic; nothing derived from a credential \
                       value may be reported anyway"
         )]
-        let mut value = HeaderValue::from_str(self.header_value.expose()).map_err(|_| {
-            // Unreachable when construction validated the bytes; message carries no value detail.
-            http_error(ErrorCode::Internal, "credential could not be rendered")
-        })?;
+        let mut value = HeaderValue::from_str(self.header_value.expose())
+            .map_err(|_| http_error(ErrorCode::Internal, "credential could not be rendered"))?;
         value.set_sensitive(true);
         Ok(value)
     }
 
-    /// The fixed companion header name a guest must not set, when this credential carries one.
     fn companion_name(&self) -> Option<&HeaderName> {
         self.companion_header.as_ref().map(|(name, _)| name)
     }
 
-    /// Renders the companion header, marked sensitive for the same reason `authorization` is.
     fn render_companion(&self) -> Option<Result<(HeaderName, HeaderValue), HttpError>> {
         let (name, value) = self.companion_header.as_ref()?;
         #[allow(
@@ -749,12 +547,8 @@ impl BoundCredential {
     }
 }
 
-/// Whether one allowed-host scope is covered verbatim by a credential's destination list.
-///
-/// The policy layer's coverage check is what makes a runtime destination mismatch unreachable, so it
-/// has to agree with [`BoundCredential::covers`] exactly. A broker entry whose value only exists at
-/// resolution time has no `BoundCredential` to ask at startup and calls this instead; a second
-/// implementation of the comparison could accept a host the injector then refuses.
+/// This must agree exactly with BoundCredential's own coverage check, since a divergence would let
+/// the policy layer accept a host the runtime injector then refuses.
 #[must_use]
 pub fn destinations_cover(destinations: &[String], allowed_host: &str) -> bool {
     let allowed = allowed_host.trim().to_ascii_lowercase();
@@ -763,8 +557,6 @@ pub fn destinations_cover(destinations: &[String], allowed_host: &str) -> bool {
         .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
 }
 
-/// The `allowed_hosts` grammar, applied to credential destinations: a bare authority with no
-/// path, query, fragment, userinfo, wildcard, or whitespace.
 fn is_destination_scope(value: &str) -> bool {
     !value.is_empty()
         && value.trim() == value
@@ -774,37 +566,17 @@ fn is_destination_scope(value: &str) -> bool {
         && !value.contains(['/', '?', '#', '@', '*'])
 }
 
-/// Sanitized metadata for one attempted native request.
-///
-/// An entry exists from the moment a request is dispatchable — method, destination authority, and
-/// accounted request bytes all known and authorized — so a call the credential binding then
-/// refuses still appears, status-less, rather than silently consuming a unit of the grant's request
-/// budget. A request rejected earlier than that (unauthorized method, denied destination, invalid
-/// header, failed resolution) has no sanitized authority to name and produces no entry, though it
-/// too consumes budget; its failure class reaches telemetry through the `http.request` span and the
-/// `accounting.http.request` record instead.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpCallEvidence {
-    /// HTTP method selected by the provider.
     pub method: String,
-    /// Authorized destination authority. Paths and queries are intentionally omitted.
     pub authority: String,
-    /// Response status when a response was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// Conservative request bytes accounted by the host.
-    ///
-    /// Counts guest-authored content only. A broker-injected credential header is deliberately
-    /// excluded: its length would leak into public evidence, and guest byte grants must not need
-    /// padding for a secret the guest cannot see.
+    /// request_bytes deliberately excludes any broker-injected credential header, since its length
+    /// must not leak into evidence or cost the guest's byte grant.
     pub request_bytes: u64,
-    /// Conservative response bytes accounted by the host.
     pub response_bytes: u64,
-    /// Whether the broker injected a destination-bound credential into this request.
-    ///
-    /// Presence is audit-relevant — the call transacted with broker-held authority — while the
-    /// value appears nowhere. Absent from records written before credentials existed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub credential_injected: bool,
 }
@@ -838,7 +610,6 @@ fn secret_raw_path_is_ambiguous(uri: &str) -> bool {
             .any(|segment| matches!(segment, "." | ".."))
 }
 
-/// Per-invocation buffered HTTP execution context.
 #[derive(Debug)]
 pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
@@ -856,10 +627,6 @@ pub struct BufferedHttpClient {
     pinned_client: Option<PinnedClient>,
 }
 
-/// One built client together with the exact pin set it was built for.
-///
-/// Reuse is keyed by that pin set rather than by host, so `resolve_to_addrs` stays authoritative:
-/// a client is never reused for addresses it was not built to reach.
 #[derive(Debug)]
 struct PinnedClient {
     host: String,
@@ -868,7 +635,6 @@ struct PinnedClient {
 }
 
 impl BufferedHttpClient {
-    /// Creates a disabled context used while describing providers or for invocations without HTTP.
     pub fn disabled(
         ceilings: HttpHostCeilings,
         timeout: Duration,
@@ -877,7 +643,6 @@ impl BufferedHttpClient {
         Self::new(None, None, None, ceilings, timeout)
     }
 
-    /// Creates a context constrained by one broker-produced HTTP grant.
     pub fn authorized(
         grant: HttpConstraints,
         ceilings: HttpHostCeilings,
@@ -887,11 +652,6 @@ impl BufferedHttpClient {
         Self::new(Some(grant), None, None, ceilings, timeout)
     }
 
-    /// Creates an authorized context that additionally presents one destination-bound credential.
-    ///
-    /// The credential is injected after every guest-facing check has run, only for requests whose
-    /// resolved authority falls inside the credential's destination binding; a request outside it
-    /// is refused rather than sent unauthenticated.
     pub fn authorized_with_credential(
         grant: HttpConstraints,
         credential: Option<BoundCredential>,
@@ -910,7 +670,6 @@ impl BufferedHttpClient {
         Self::new(Some(grant), None, credential, ceilings, timeout)
     }
 
-    /// Creates an authorized context for one exact separately authorized DRN use.
     pub fn authorized_with_secret_credential(
         grant: HttpConstraints,
         secret_grant: SecretUseGrant,
@@ -963,36 +722,23 @@ impl BufferedHttpClient {
         })
     }
 
-    /// Sticky native disk exhaustion; independent of the fixed HTTP WIT error vocabulary.
     pub fn asset_over_budget(&self) -> bool {
         self.asset_over_budget
     }
 
-    /// Whether provider code attempted any HTTP call.
     pub fn attempted(&self) -> bool {
         self.attempted
     }
 
-    /// Stable enforcement reason that provider code must not mask.
     pub fn policy_violation(&self) -> Option<&'static str> {
         self.policy_violation
     }
 
-    /// Consumes the context and returns sanitized call metadata.
     pub fn into_evidence(self) -> Vec<HttpCallEvidence> {
         self.evidence
     }
 
-    /// Executes one request beneath both the broker grant and native ceilings.
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
-        // Evidence's sanitized set, plus the full URL. Request and response headers and both
-        // bodies stay out: an injected credential rides a header, so a header field would hand the
-        // trace the one thing goal 1 keeps out of it. That exclusion is redaction and holds
-        // unconditionally; it is not a verbosity setting.
-        // The byte fields are deliberately not the OTel `http.*.body.size` names: what this host
-        // accounts is a conservative envelope estimate — encoding overhead, method, URL, headers,
-        // and body — not a payload length, and publishing it under the semconv name would make
-        // every dashboard reading transfer volume wrong by the size of the headers.
         let span = tracing::info_span!(
             "http.request",
             "http.request.method" = tracing::field::Empty,
@@ -1005,17 +751,12 @@ impl BufferedHttpClient {
             "url.full" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
-        // `url.full` carries the path and query. It is recorded unconditionally: an egress a trace
-        // cannot name is not a reconstructible run. Headers and bodies stay out — that is redaction,
-        // and it is independent of how much of the URL a span carries.
         span.record("url.full", request.uri.as_str());
 
         let evidence_index = self.evidence.len();
         self.attempted = true;
-        // `instrument`, never `enter`: this future awaits resolution, connection, and the whole
-        // response body. A guard held across those awaits would leave `http.request` current on
-        // the worker thread while it polls unrelated tasks, re-parenting their events onto this
-        // request and exiting the span on whichever thread happened to drop the guard.
+        // This must use instrument, not enter: holding an entered guard across these awaits would
+        // leave the span current on whatever thread happens to poll unrelated tasks.
         let result = self.send_checked(request).instrument(span.clone()).await;
 
         self.record_request(&span, evidence_index, &result);
@@ -1031,9 +772,6 @@ impl BufferedHttpClient {
         let outcome = outcome_label(result);
         let failure = result.as_ref().err();
         span.in_scope(|| {
-            // `prepare` is what learns the method and authority, so the evidence entry it pushed
-            // is the only sanitized source for them; a request rejected before that point has
-            // nothing safe to report beyond its outcome and failure class.
             let evidence = self.evidence.get(evidence_index);
             if let Some(evidence) = evidence {
                 span.record("http.request.method", evidence.method.as_str());
@@ -1051,24 +789,13 @@ impl BufferedHttpClient {
                 }
             }
             if let Some(error) = failure {
-                // Six failure classes otherwise collapse into `outcome = "failed"`, which cannot
-                // separate a webpki root problem from a DNS blip from a deadline. Recording the
-                // reason is safe by construction rather than by review: every message this crate
-                // produces is a static, pre-sanitized `&str`, and that is the property to keep.
+                // Recording the error reason is safe only because every message this crate produces
+                // is a static, pre-sanitized string; that property must be preserved.
                 span.record("error.code", tracing::field::debug(error.code));
                 span.record("error.message", error.message.as_str());
             }
             span.record("outcome", outcome);
 
-            // Accounting rather than lifecycle: the `http.request` span above already carries
-            // these fields and its own duration. This record exists to outlive trace retention and
-            // survive sampling, because an external request is a billed and rate-limited call, and
-            // "how many, to where, how big" is asked long after the trace has expired. Same
-            // sanitized set — no path, query, header, or body — for the same reason.
-            //
-            // It fires even when nothing reached `prepare`, because that attempt still consumed a
-            // unit of the grant's request budget; the fields such a record cannot know are absent
-            // rather than zero, so a query grouping by status never sees a phantom status 0.
             tracing::info!(
                 target: "dekopon_http_host::audit",
                 {
@@ -1119,12 +846,9 @@ impl BufferedHttpClient {
             ));
         }
         let mut prepared = self.prepare(request, &grant, streamed).await?;
-        // Injection happens strictly after `prepare`, so every guest-facing rule has already run:
-        // a guest-supplied `authorization` header was rejected (never overwritten), and the
-        // destination passed the grant. The credential's own binding is narrower than the grant's
-        // and fails closed — a credentialed context refuses to send an unauthenticated request to
-        // an allowed-but-unbound destination, because "quietly missing auth" reads as an outage
-        // at best and an unauthenticated write at worst.
+        // Credential injection happens strictly after every guest-facing check, and its binding is
+        // narrower than the grant and fails closed: an allowed-but-unbound destination is refused
+        // rather than sent unauthenticated.
         if let Some(secret) = &self.secret_grant {
             let path_allowed = secret
                 .allowed_paths
@@ -1174,9 +898,8 @@ impl BufferedHttpClient {
             }
         });
 
-        // Evidence is pushed before the credential decision, not after it: this call has already
-        // consumed a unit of the grant's exact request budget, so a binding refusal must leave a
-        // status-less record rather than a gap an auditor has to infer.
+        // Evidence is pushed before the credential decision so a binding refusal still leaves an
+        // accounted, status-less record rather than a silent gap.
         let evidence_index = self.evidence.len();
         self.evidence.push(HttpCallEvidence {
             method: prepared.method.as_str().to_owned(),
@@ -1188,11 +911,8 @@ impl BufferedHttpClient {
         });
         if let Some(header) = credential_header {
             prepared.headers.insert(AUTHORIZATION, header?);
-            // One credential, one decision: the companion is part of the same presented identity,
-            // so it is inserted under the binding check that admitted the bearer token and never
-            // on its own. Its bytes are outside `request_bytes` for the same reason the
-            // authorization header's are — both are inserted after accounting, and a guest's byte
-            // grant must not need padding for a header it cannot see.
+            // The companion header is inserted only after accounting, alongside the bearer token,
+            // so it never counts against the guest's byte grant.
             if let Some(companion) = self
                 .credential
                 .as_ref()
@@ -1271,10 +991,6 @@ impl BufferedHttpClient {
             ));
         }
 
-        // `url::ParseError` names which rule the URI broke — "relative URL without a base",
-        // "invalid port number", "invalid IPv6 address" — from a fixed set of strings that quote
-        // no part of the input. It is the guest's own URI, so returning the structural reason
-        // leaks nothing while turning an undifferentiated `InvalidUri` into an actionable one.
         let url = Url::parse(&request.uri).map_err(|error| {
             http_error(
                 ErrorCode::InvalidUri,
@@ -1287,9 +1003,8 @@ impl BufferedHttpClient {
                 "URI user information and fragments are prohibited",
             ));
         }
-        // `host_str` renders an IPv6 literal in URL form (`[::1]`). Everything downstream — the
-        // resolver, the pin set, the credential binding — wants the bare address; brackets are
-        // added back only where an authority is rendered.
+        // host_str() returns IPv6 addresses bracketed, but resolution, pinning, and credential
+        // matching all require the bare unbracketed form.
         let host = unbracketed_host(
             url.host_str()
                 .ok_or_else(|| http_error(ErrorCode::InvalidUri, "URI has no host"))?,
@@ -1336,9 +1051,6 @@ impl BufferedHttpClient {
                 "request has too many headers",
             ));
         }
-        // Cloned before the loop: a guest-set companion name must be *refused* rather than
-        // silently overwritten, exactly as `authorization` is, so the forbidden set depends on
-        // which credential this context carries.
         let companion = self
             .credential
             .as_ref()
@@ -1399,9 +1111,8 @@ impl BufferedHttpClient {
             ));
         }
 
-        // Resolution is cached for the lifetime of this execution context, which the invocation
-        // deadline already bounds; every retained address is still validated below on every call,
-        // so the cache shortens the path without widening what may be reached.
+        // DNS resolution is cached for this context's lifetime, but every cached address is still
+        // validated on each call, so caching narrows latency, not what may be reached.
         let addresses = if let Some(addresses) = self.resolved.get(&authority) {
             addresses.clone()
         } else {
@@ -1419,9 +1130,6 @@ impl BufferedHttpClient {
             self.resolved.insert(authority.clone(), addresses.clone());
             addresses
         };
-        // The list is named in the refusal because the destination is otherwise reachable — the
-        // grant already allowed it — and the only thing between the operator and a working
-        // request is one line in their own file.
         if !plaintext_permitted(
             url.scheme(),
             &host,
@@ -1564,12 +1272,6 @@ impl BufferedHttpClient {
         ))
     }
 
-    /// Returns a client pinned to exactly these addresses, rebuilding only when the pin set moved.
-    ///
-    /// A capability with a two-call budget otherwise pays two resolutions and two TCP+TLS
-    /// handshakes inside one deadline. Reuse keeps the connection pool warm without touching the
-    /// pinning contract: the cache key is the full `(host, addresses)` pair, so a client is never
-    /// reused for a destination whose resolved address set differs from the one it was built for.
     fn pinned_client(
         &mut self,
         host: &str,
@@ -1582,9 +1284,6 @@ impl BufferedHttpClient {
         {
             return Ok(pinned.client.clone());
         }
-        // The client-level deadlines are the remaining budget at build time rather than this
-        // call's share, because a reused client cannot re-arm them. Every await in `execute` is
-        // already wrapped in a `timeout` against the same deadline, which stays authoritative.
         let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .no_proxy()
@@ -1638,8 +1337,6 @@ fn validate_configuration(
         return Err(ConfigurationError::ZeroTimeout);
     }
     if let Some(grant) = grant {
-        // One shared definition of an exact grant, so this host cannot accept a scope the
-        // broker that issued it would have refused.
         grant
             .validate()
             .map_err(|source| ConfigurationError::InvalidGrant { source })?;
@@ -1669,25 +1366,14 @@ async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, H
     let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
-            // NXDOMAIN, a resolver that timed out, and an unreachable network all arrive here and
-            // all leave as `Dns`, so without this the operator side of a resolution failure is
-            // indistinguishable. The resolver's verdict is host infrastructure state rather than
-            // anything the guest asked about, which is why it goes to the trace and not into the
-            // returned message; it names no host, so it stays inside the sanitized set the
-            // enclosing `http.request` span already carries `server.address` for.
             tracing::debug!(error = %error, "destination resolution failed");
             http_error(ErrorCode::Dns, "destination could not be resolved")
         })?;
     bounded_addresses(addresses)
 }
 
-/// Collapses a resolver answer into a bounded pin set of distinct addresses.
-///
-/// The bound is a resource ceiling on the pin set, not an admission test on the answer: a
-/// dual-stack resolver returns A and AAAA records together, so refusing the whole request at the
-/// seventeenth raw record would make a large round-robin destination permanently unreachable and a
-/// growing one fail intermittently. Duplicates collapse first and the remainder is truncated; every
-/// retained address is still validated and pinned by the caller.
+/// The bound truncates rather than refuses because refusing at the limit would make a large
+/// round-robin or dual-stack destination permanently or intermittently unreachable.
 fn bounded_addresses(
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<Vec<SocketAddr>, HttpError> {
@@ -1707,14 +1393,12 @@ fn bounded_addresses(
     Ok(unique.into_iter().collect())
 }
 
-/// Strips the brackets `Url::host_str` puts around an IPv6 literal.
 fn unbracketed_host(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
         .unwrap_or(host)
 }
 
-/// Renders a bare host in URL authority form: an IPv6 literal is bracketed, anything else is not.
 fn canonical_host(host: &str) -> Cow<'_, str> {
     if host.contains(':') {
         Cow::Owned(format!("[{host}]"))
@@ -1727,13 +1411,8 @@ fn canonical_authority(host: &str, port: u16) -> String {
     format!("{}:{port}", canonical_host(host))
 }
 
-/// Whether this request may cross the network in the clear.
-///
-/// `https` is never this rule's business. `http` reaches a loopback destination — *every* resolved
-/// address, so a name that answers with one loopback address and one routable address is refused —
-/// or an exact hostname the broker owner listed. The listed host is matched by name and not by the
-/// addresses it resolved to, which is the whole point: `rpi.lan` answers with a LAN address that
-/// no address rule could distinguish from an address a DNS answer chose for itself.
+/// The loopback branch requires every resolved address to be loopback; the list matches by
+/// hostname, not address, since address alone can't distinguish a LAN answer from a chosen one.
 fn plaintext_permitted(
     scheme: &str,
     host: &str,
@@ -1753,11 +1432,6 @@ fn authority_matches(allowed: &str, host: &str, port: u16, scheme: &str) -> bool
             && port == DEFAULT_HTTPS_PORT)
 }
 
-/// Whether a guest may not set this request header.
-///
-/// `companion` is the fixed extra header the context's credential injects, when it has one. It
-/// belongs in the same set as `authorization` rather than in the fixed list below: a guest that
-/// names it must be refused, and a context with no such credential has no reason to refuse it.
 fn is_forbidden_request_header(name: &HeaderName, companion: Option<&HeaderName>) -> bool {
     if companion == Some(name) {
         return true;
@@ -1863,15 +1537,11 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
         || (segments[0] & 0xe000) != 0x2000
         || (segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        // Exclude transition/documentation ranges that are not direct public destinations.
         || segments[0] == 0x2002
         || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
 }
 
 fn map_reqwest_error(error: &reqwest::Error) -> HttpError {
-    // A builder failure means nothing was ever put on a wire, so classifying it as a protocol
-    // failure would name the wrong layer to a guest and to the broker host's WIT mapping. This is
-    // the native setup failure `Internal` is documented for.
     if error.is_builder() {
         return http_error(ErrorCode::Internal, "native HTTP client setup failed");
     }
@@ -1923,13 +1593,8 @@ fn bounded_message(message: &str) -> String {
     output
 }
 
-/// The single enforcement vocabulary, shared by the broker-facing `policy_violation`, the span,
-/// and the accounting record, so the three cannot disagree about the same call.
-///
-/// `None` means the failure was not an enforcement decision — a transport or setup failure, which
-/// the broker must not report as a policy violation. The match is exhaustive on purpose: a new
-/// [`ErrorCode`] has to be classified here rather than falling through a catch-all in one site and
-/// not the other.
+/// This match must stay exhaustive with no wildcard arm, or a new ErrorCode could silently disagree
+/// across policy_violation, the span, and accounting.
 fn violation_label(code: ErrorCode) -> Option<&'static str> {
     match code {
         ErrorCode::Denied => Some("denied"),
@@ -1947,7 +1612,6 @@ fn violation_label(code: ErrorCode) -> Option<&'static str> {
     }
 }
 
-/// One outcome vocabulary for the span and the accounting record, so they cannot disagree.
 fn outcome_label<T>(result: &Result<T, HttpError>) -> &'static str {
     match result {
         Ok(_) => "succeeded",
@@ -1995,7 +1659,6 @@ mod tests {
 
     #[test]
     fn plaintext_reaches_loopback_with_an_empty_allow_list() {
-        // The default set is empty, and an empty set must leave today's rule exactly as it was.
         let empty = PlaintextHosts::default();
         assert!(empty.is_empty());
         assert!(plaintext_permitted(
@@ -2033,8 +1696,6 @@ mod tests {
             &[address("10.43.7.9", 5080)],
             &allowed
         ));
-        // A neighbour of a listed host is not a listed host: the entries are exact, so nothing
-        // about `rpi.lan` says anything about `evil.rpi.lan` or about the bare suffix.
         for refused in ["evil.rpi.lan", "rpi.lan.evil.test", "lan", "rpi"] {
             assert!(
                 !plaintext_permitted("http", refused, &[address("192.168.1.20", 5080)], &allowed),
@@ -2045,8 +1706,6 @@ mod tests {
 
     #[test]
     fn listed_plaintext_hosts_match_case_insensitively() {
-        // DNS names are case-insensitive, and the host this rule compares was lowercased out of
-        // the guest's URL; an entry authored in mixed case must not become a silent deny.
         let allowed = plaintext_hosts(&["RPi.LAN"]);
         assert!(plaintext_permitted(
             "http",
@@ -2061,15 +1720,12 @@ mod tests {
     #[test]
     fn a_listed_host_does_not_relax_https_or_mixed_loopback_answers() {
         let allowed = plaintext_hosts(&["rpi.lan"]);
-        // HTTPS never consults this rule, listed or not.
         assert!(plaintext_permitted(
             "https",
             "api.example.test",
             &[address("93.184.216.34", 443)],
             &allowed
         ));
-        // An unlisted name that answers with a loopback address *and* a routable one stays
-        // refused: the loopback branch is all-or-nothing, and the list is the only other way in.
         assert!(!plaintext_permitted(
             "http",
             "split.example.test",
@@ -2080,8 +1736,6 @@ mod tests {
 
     #[test]
     fn plaintext_host_entries_must_be_bare_hostnames() {
-        // Each of these is a plausible thing to write in broker.yaml, and each would otherwise
-        // become a host the operator believes is allowed and that never matches anything.
         for (entry, expected) in [
             ("", PlaintextHostError::Empty),
             ("   ", PlaintextHostError::Empty),
@@ -2143,12 +1797,9 @@ mod tests {
             let error = PlaintextHosts::new([entry]).expect_err("{entry} must be refused");
             assert_eq!(error, expected, "{entry}");
         }
-        // One bad entry refuses the whole list rather than being dropped from it.
         PlaintextHosts::new(["rpi.lan", "http://other.lan"])
             .expect_err("a single invalid entry must refuse the list");
-        // Surrounding whitespace is authored noise, not a different hostname.
         assert!(plaintext_hosts(&["  rpi.lan  "]).contains("rpi.lan"));
-        // A bare IPv4 literal is a host the same way `allowedHosts` treats one.
         assert!(plaintext_hosts(&["192.168.1.20"]).contains("192.168.1.20"));
     }
 
@@ -2178,8 +1829,6 @@ mod tests {
 
     #[test]
     fn renders_ipv6_literal_authorities_with_exactly_one_pair_of_brackets() {
-        // The bare host is what resolution and credential binding see; brackets belong to the
-        // rendered authority only, and a doubled pair matches no grant that can be authored.
         assert!(authority_matches("[::1]:8080", "::1", 8080, "http"));
         assert!(authority_matches(
             "[2606:4700:4700::1111]",
@@ -2302,8 +1951,6 @@ mod tests {
         assert_eq!(error, ConfigurationError::TimeoutOverflow);
     }
 
-    /// An entry this host cannot match is a grant it must refuse, not one it accepts and then
-    /// denies on every call. The rule set is shared with the broker that issues the grant.
     #[test]
     fn rejects_grant_entries_no_authority_can_match() {
         for host in [" api.example.test", "*", "a/b", ""] {
@@ -2346,8 +1993,6 @@ mod tests {
             bounded_addresses(addresses).expect("a large fan-out is truncated, not refused");
         assert_eq!(bounded.len(), MAX_RESOLVED_ADDRESSES);
 
-        // A dual-stack answer repeats the same address across records; counting raw answers made
-        // a ten-A/ten-AAAA destination permanently unreachable.
         let duplicated = (1..=20).map(|_| SocketAddr::from(([192, 0, 2, 1], 443)));
         let bounded = bounded_addresses(duplicated).expect("duplicates collapse before the bound");
         assert_eq!(bounded.len(), 1);
@@ -2358,8 +2003,6 @@ mod tests {
 
     #[test]
     fn client_builder_failures_are_setup_failures_not_protocol_failures() {
-        // Nothing reached a wire, so `Protocol` would name the wrong layer — and `Internal`, the
-        // class documented for native setup failures, was otherwise unreachable.
         let error = reqwest::Client::new()
             .get("not an absolute url")
             .build()
@@ -2426,9 +2069,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_listed_plaintext_host_still_needs_the_authorization_to_allow_it() {
-        // The opt-out reaches nothing on its own. Both refusals below happen before the
-        // destination is even resolved, which is the order that makes the list a relaxation of one
-        // transport rule rather than a second way to authorize a host.
         let ceilings = HttpHostCeilings {
             plaintext_hosts: plaintext_hosts(&["api.example.test"]),
             ..HttpHostCeilings::default()
@@ -2520,9 +2160,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_uris_name_the_rule_they_broke() {
-        // `InvalidUri` on its own is not actionable: a provider author needs to know whether the
-        // URI was relative, carried a bad port, or had a malformed host. `url::ParseError` says
-        // exactly that, from a fixed set of strings none of which quote the URI back.
         let mut client = BufferedHttpClient::authorized(
             grant("api.example.test".to_owned(), "GET"),
             HttpHostCeilings::default(),
@@ -2556,7 +2193,6 @@ mod tests {
             .expect_err("a malformed port is not an absolute URL");
         assert_eq!(error.code, ErrorCode::InvalidUri);
         assert!(error.message.contains("invalid port number"), "{error}");
-        // The URI itself never appears in a message that crosses back to the guest unmodified.
         assert!(!error.message.contains("api.example.test"), "{error}");
     }
 
@@ -2595,15 +2231,12 @@ mod tests {
 
     #[test]
     fn bound_credentials_fail_closed_on_structural_problems() {
-        // Long enough to pass the length rule, so every case below fails on the field it names.
         let secret = || Redacted::new("fixture-secret-value".to_owned());
         let destinations = || vec!["api.example.test".to_owned()];
         for (scheme, secret, destinations) in [
             ("", secret(), destinations()),
             ("Bea rer", secret(), destinations()),
             ("Bearer", Redacted::new(String::new()), destinations()),
-            // The secret is this credential's echo value, so a short or phrase-shaped one
-            // is refused at construction rather than left to deny unrelated responses later.
             ("Bearer", Redacted::new("x".repeat(15)), destinations()),
             (
                 "Bearer",
@@ -2634,14 +2267,12 @@ mod tests {
                 Err(ConfigurationError::InvalidCredential { .. })
             ));
         }
-        // Exactly the minimum is accepted; the bound is a floor, not a gap.
         BoundCredential::bearer(
             "Bearer",
             Redacted::new("x".repeat(MIN_CREDENTIAL_BYTES)),
             destinations(),
         )
         .expect("a minimum-length secret is a valid credential");
-        // The one thing a credential error must never carry is the secret itself.
         let error = BoundCredential::bearer(
             "Bearer",
             Redacted::new("tell-nobody-not-even-once\n".to_owned()),
@@ -2694,9 +2325,6 @@ mod tests {
     async fn injects_a_destination_bound_credential_after_guest_checks() {
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-        // Twin requests, one credentialed and one not, so the accounting assertion below compares
-        // like with like: the injected header must change neither the guest-authored byte count
-        // nor anything else the evidence reports.
         let plain_server = LoopbackServer::once(response);
         let plain_authority = plain_server.authority().to_owned();
         let server = LoopbackServer::once(response);
@@ -2751,10 +2379,6 @@ mod tests {
         let evidence = credentialed.into_evidence();
         assert!(!plain_evidence[0].credential_injected);
         assert!(evidence[0].credential_injected);
-        // Guest-authored accounting is identical: the credential is invisible to byte grants,
-        // so its length can neither starve a request nor leak into public evidence. The twin
-        // requests differ only by their fixture authorities, so normalize for that before
-        // comparing.
         let authority_delta = authority.len() as i64 - plain_authority.len() as i64;
         assert_eq!(
             evidence[0].request_bytes as i64 - authority_delta,
@@ -2850,8 +2474,6 @@ mod tests {
 
     #[test]
     fn a_drn_bound_bearer_secret_below_the_floor_is_refused() {
-        // A resolved secret is an echo value exactly as a legacy one is, so it takes the same
-        // floor. Without it a one-byte DRN secret would deny every response containing that byte.
         let grant = secret_grant("api.example.test", SecretSinkKind::HttpBearer, None, "/v1");
         let error = BoundCredential::secret_bearer(
             SecretBytes::new(vec![b'x'; MIN_CREDENTIAL_BYTES - 1]),
@@ -2866,7 +2488,6 @@ mod tests {
 
     #[test]
     fn a_drn_bound_basic_secret_below_the_floor_is_refused() {
-        // The password is an echo value beside the encoded pair, so the floor applies to it too.
         let grant = secret_grant(
             "api.example.test",
             SecretSinkKind::HttpBasic,
@@ -2923,11 +2544,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn legacy_credential_echo_is_discarded() {
-        // The twin of `direct_credential_echo_is_discarded` on the credential path that is
-        // actually deployed. A `bearerToken` entry used to carry no echo values at all, so an
-        // endpoint that echoed the `authorization` header handed the token to the provider and then
-        // to the model. One echo value covers both shapes: the rendered `Bearer <secret>` header
-        // strictly contains the raw secret, and the check is a substring search.
         for body in ["fixture-secret-value", "Bearer fixture-secret-value"] {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2953,7 +2569,6 @@ mod tests {
                 .expect_err("an echoed legacy credential is never returned");
             assert_eq!(error.code, ErrorCode::Denied);
             assert!(!error.message.contains("fixture-secret-value"), "{error}");
-            // The call happened and is accounted for; only its answer is withheld.
             let evidence = client.into_evidence();
             assert_eq!(evidence[0].status, Some(200));
             assert!(evidence[0].credential_injected);
@@ -2963,8 +2578,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn refuses_destinations_outside_the_credential_binding() {
-        // The grant allows the destination; the credential does not. Sending without the
-        // credential would be the quiet failure mode, so the request must not happen at all.
         let mut client = BufferedHttpClient::authorized_with_credential(
             grant("127.0.0.1:9".to_owned(), "GET"),
             Some(credential_for("other.example.test")),
@@ -2983,8 +2596,6 @@ mod tests {
             .expect_err("unbound destinations are refused, not sent unauthenticated");
         assert_eq!(error.code, ErrorCode::Denied);
         assert_eq!(client.policy_violation(), Some("denied"));
-        // The refusal consumed a unit of the request budget, so evidence reconciles with it: one
-        // status-less entry naming the destination, and no credential recorded as injected.
         let evidence = client.into_evidence();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].authority, "127.0.0.1:9");
@@ -3001,9 +2612,6 @@ mod tests {
         .expect("valid fixture credential")
     }
 
-    /// The subscription route refuses a bearer token presented without the account identifier, so
-    /// the two headers are one credential: both go on, under the same destination-binding decision,
-    /// and neither is accounted against the guest's byte grant.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_chatgpt_subscription_credential_injects_both_headers_outside_accounted_bytes() {
         let response: &[u8] =
@@ -3058,9 +2666,6 @@ mod tests {
         let plain_evidence = plain.into_evidence();
         let evidence = client.into_evidence();
         assert!(evidence[0].credential_injected);
-        // `HttpCallEvidence` grew no field for the companion, and the companion's bytes are outside
-        // the guest's accounting exactly as `authorization`'s are. The twin requests differ only by
-        // their fixture authorities, so normalize for that before comparing.
         let authority_delta = authority.len() as i64 - plain_authority.len() as i64;
         assert_eq!(
             evidence[0].request_bytes as i64 - authority_delta,
@@ -3075,9 +2680,6 @@ mod tests {
         server.join();
     }
 
-    /// The companion name is forbidden for the same reason `authorization` is, and only while the
-    /// context carries a credential that injects it: silently replacing a guest-supplied value
-    /// would train providers to attempt one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_guest_set_companion_header_is_rejected_not_overwritten() {
         let forged = || Request {
@@ -3103,8 +2705,6 @@ mod tests {
             .expect_err("a guest-set companion header must be rejected");
         assert_eq!(error.code, ErrorCode::InvalidHeader);
 
-        // A plain bearer credential injects no companion, so the same name is an ordinary header
-        // and the request fails on the unreachable destination instead.
         let mut uncompanioned = BufferedHttpClient::authorized_with_credential(
             grant("127.0.0.1:9".to_owned(), "GET"),
             Some(credential_for("127.0.0.1:9")),
@@ -3156,8 +2756,6 @@ mod tests {
             assert!(rendered.contains("account identifier"), "{rendered}");
             assert!(!rendered.contains("fixture-access-token"), "{rendered}");
         }
-        // The access token itself is still validated by the bearer constructor underneath, whose
-        // length floor subsumes the empty case.
         let error = BoundCredential::chatgpt_subscription(
             Redacted::new(String::new()),
             "acct-fixture",
@@ -3169,7 +2767,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn guest_authorization_is_rejected_not_overwritten_when_a_credential_exists() {
-        // Silently replacing a guest-supplied credential would train providers to attempt one.
         let mut client = BufferedHttpClient::authorized_with_credential(
             grant("127.0.0.1:9".to_owned(), "GET"),
             Some(credential_for("127.0.0.1:9")),
@@ -3198,7 +2795,6 @@ mod tests {
         let evidence =
             serde_json::from_str::<HttpCallEvidence>(old_record).expect("old records still parse");
         assert!(!evidence.credential_injected);
-        // False stays absent so pre-credential chains and digests are byte-identical.
         let serialized = serde_json::to_string(&evidence).expect("serializes");
         assert!(!serialized.contains("credentialInjected"), "{serialized}");
 
@@ -3274,7 +2870,6 @@ mod tests {
             "[::1]:0",
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         ) else {
-            // A host without an IPv6 loopback cannot exercise this path.
             return;
         };
         let authority = server.authority().to_owned();
@@ -3306,10 +2901,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reuses_one_pinned_client_across_calls_to_the_same_authority() {
-        // `pinned_client` hands both calls the same `reqwest::Client`/pool deterministically;
-        // whether hyper's pool actually reuses one TCP connection for them is a background-task
-        // race this crate doesn't control, so the fixture tolerates (without requiring) a second
-        // connection — see `LoopbackServer::pooled`.
+        // Client-level pinning is deterministic, but whether hyper's connection pool reuses one TCP
+        // connection is a background-task race this crate doesn't control, so the fixture tolerates
+        // it without requiring it.
         let server = LoopbackServer::pooled(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 2);
         let authority = server.authority().to_owned();
         let mut client = BufferedHttpClient::authorized(
@@ -3336,8 +2930,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_changed_pin_set_builds_a_new_client() {
-        // Reuse is keyed by the resolved address set, not by host: two authorities inside one
-        // context must each be reached through a client pinned to their own addresses.
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         let first_server = LoopbackServer::once(response);

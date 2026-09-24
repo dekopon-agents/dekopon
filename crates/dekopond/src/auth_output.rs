@@ -1,4 +1,3 @@
-//! Synchronous auth diagnostics and stdout writer, never gateway telemetry.
 use crate::{
     auth::{self, AuthError},
     auth_render::{RenderError, render},
@@ -10,9 +9,6 @@ use std::{
 };
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
-/// Runs a parsed CLI invocation and returns a documented process exit code.
-///
-/// Clap handles syntax errors before this function and exits with code `2`.
 #[must_use]
 pub(crate) fn run(cli: &AuthOptions) -> i32 {
     initialize_tracing(cli.verbose, cli.no_color);
@@ -54,8 +50,8 @@ fn write_output(output: &str) -> io::Result<()> {
 }
 
 fn report_error(error: &AppError, verbosity: u8) {
-    // Serde's Display and derived Debug may reflect arbitrary credential values.
-    // Project this typed failure before formatting any part of its error tree.
+    // Serde's derived Display and Debug can reflect arbitrary credential values, so this typed
+    // failure is matched and projected out before any part of its error tree is formatted.
     if let AppError::Auth(AuthError::ChatGpt(dekopon_model::chatgpt::ChatGptError::ParseAuth {
         path,
         source,
@@ -107,9 +103,6 @@ fn initialize_tracing(verbosity: u8, no_color: bool) {
         .with_target(verbosity > 1)
         .without_time();
     if let Err(error) = builder.with_writer(io::stderr).try_init() {
-        // A second installation in one process is a real event rather than nothing: the
-        // subscriber that won owns the verbosity and the writer, so `--verbose` and `--no-color`
-        // on this call did not take effect. The winner receives this record.
         tracing::debug!(
             event = "cli_tracing_already_installed",
             error = %error,

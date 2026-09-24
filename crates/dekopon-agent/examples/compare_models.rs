@@ -1,6 +1,3 @@
-//! A runtime-owning embedder. Scripts are never executed; the runtime returns a fixed outcome.
-//! Compile this example for validation; real inference requires explicit operator authorization.
-
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use dekopon_agent::prompt::{
@@ -120,7 +117,6 @@ fn main() -> Result<(), ExampleError> {
     let endpoint = arguments
         .loopback
         .map(|address| format!("http://{address}/"));
-    // Credential-file IO happens before entering the async runtime.
     let client = match arguments.kind {
         Kind::Codex => {
             let client =

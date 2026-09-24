@@ -1,9 +1,5 @@
-//! One routed message, from admission through the answer that goes back to chat.
-//!
-//! A session holds no authority. It opens an *attested* broker leg naming the sender, and whatever
-//! that leg reports as granted is what the broker decided the sender may reach through this agent.
-//! An empty grant ends the session before a single model token is spent, which is deliberate: the
-//! cheapest possible refusal, and one that cannot be talked out of by the message text.
+//! A session holds no authority of its own; it opens an attested broker leg naming the sender, and
+//! an empty grant ends it before any model token is spent, whatever the message text says.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
@@ -56,45 +52,21 @@ use crate::{
     },
 };
 
-/// The refusal a subject with no granted capabilities receives.
 pub(crate) const UNAUTHORIZED_REPLY: &str = "You're not authorized to use this agent.";
-/// The refusal an over-subscribed daemon returns, when configured to answer at all.
 pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
-/// The one thing a failed session ever says.
-///
-/// Fixed and bounded on purpose. A `PromptError` can carry model-chosen text, a provider message,
-/// or a transport diagnostic, and chat is the last place any of those belong: the operator reads
-/// the category from telemetry, and the sender reads a sentence.
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
-/// Fixed warning when capability work may have happened but the model produced no report.
 pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
-/// Confirmation a cancelled session ends with, and the default of `liveness.templates.stopped`.
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
-/// One transport-independent normalization for a successful empty model answer.
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const SESSION_RUNNING: u8 = 0;
 const SESSION_CANCELLED: u8 = 1;
 const SESSION_COMPLETING: u8 = 2;
 
-/// One conversation, for in-flight serialization only.
-///
-/// Deliberately subject-free, and deliberately not the state key. Two people talking at once in one
-/// thread are one thing to serialize; `ConversationKey` in [`crate::conversation`] is the other
-/// question and either includes the subject (private scope) or deliberately omits it (shared).
-///
-/// `(transport, Conversation::key())` — the same pair the active-session registry uses, so the
-/// slot a message holds and the session a stop reaches are one key rather than two that used to
-/// split on a Slack thread-starting message.
 type AdmissionKey = (String, String);
 
-/// One model client, shared by every session that routes to the same configured model.
 pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
 
-/// Builds the model client one route selected.
-///
-/// A seam rather than a direct call because the alternative is a test suite that cannot exercise
-/// routing, admission, or authorization without a live model endpoint.
 pub(crate) trait ModelFactory: Send + Sync {
     fn build(
         &self,
@@ -104,24 +76,15 @@ pub(crate) trait ModelFactory: Send + Sync {
     ) -> Result<SharedModel, SessionError>;
 }
 
-/// The real factory: whatever `models:` configured, constructed by the shared model library.
 #[derive(Default)]
 pub(crate) struct ConfiguredModels {
     clients: Mutex<HashMap<String, Arc<ModelClient>>>,
-    /// One ChatGPT credential per auth file, however many models name it. A rotation that could
-    /// not be written back lives only in the instance that made it, so a second instance over the
-    /// same file would spend the refresh token the provider just retired.
+    /// One credential instance per auth file path, shared across every model naming it, so a second
+    /// instance cannot spend a refresh token the first already rotated and retired.
     chatgpt_credentials:
         Mutex<HashMap<std::path::PathBuf, Arc<dekopon_model::chatgpt::CredentialFile>>>,
 }
 
-/// The bearer token a configured model's `apiKeyEnv` names, when it names one.
-///
-/// Absent is not missing. A loopback llama.cpp needs no key and leaving the field out is how an
-/// operator says so, which is why this answers `None` rather than refusing. Exported-but-blank is
-/// missing: an empty bearer token is still sent as a header. Both used to read `env::var(..).ok()`
-/// and become "no bearer token", so the gateway started clean and 401'd on the first message with
-/// nothing anywhere naming the variable.
 pub(crate) fn model_bearer_token(
     model: &ModelConfig,
 ) -> Result<Option<String>, ModelCredentialError> {
@@ -143,8 +106,6 @@ pub(crate) fn model_bearer_token_with(
     }
 }
 
-/// Split from the environment read so the rule is reachable without a test mutating this process's
-/// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
 pub(crate) fn model_credential(
     model: &str,
     variable: &str,
@@ -158,7 +119,6 @@ pub(crate) fn model_credential(
 }
 
 impl ConfiguredModels {
-    /// The shared credential for one auth file, opened by the first model that names it.
     fn chatgpt_credential(
         &self,
         auth_file: Option<&std::path::Path>,
@@ -175,8 +135,8 @@ impl ConfiguredModels {
         if let Some(credential) = cached {
             return Ok(credential);
         }
-        // Opened outside the lock, like a client; two models racing to open one file keep the
-        // first instance, which is the one every later model is handed.
+        // Opened outside the lock; if two models race to open the same file, the first instance
+        // wins and is the one handed to every later model.
         let opened =
             Arc::new(chatgpt::CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?);
         let mut credentials = self
@@ -216,9 +176,6 @@ impl ConfiguredModels {
                         bearer_token,
                         std::time::Duration::from_millis(*timeout_ms),
                     )?
-                    // The configured answer to "does this endpoint stream", which is the only
-                    // place it is decided: the client defaults to streaming and this turns it off
-                    // for the one endpoint an operator found it broken on.
                     .with_streaming(*stream)
                     .with_name(name),
                 )))
@@ -284,8 +241,6 @@ impl ModelFactory for ConfiguredModels {
         let client = match cached {
             Some(client) => client,
             None => {
-                // Build outside the lock; failure leaves no entry. A racing successful builder
-                // keeps the first pool rather than replacing a client already in use.
                 let built = self.construct(model)?;
                 let mut clients = self.clients.lock().expect("gateway model clients");
                 Arc::clone(clients.entry(model.name().to_owned()).or_insert(built))
@@ -305,10 +260,6 @@ impl ModelFactory for ConfiguredModels {
     }
 }
 
-/// Session factory seam. Expensive clients are cached by the real factory, never session bridges.
-///
-/// Configured names are unique, pools are shared across sessions, and construction failures are
-/// not cached. A session always supplies its own runtime and cancellation receiver.
 pub(crate) struct ModelCache {
     factory: Arc<dyn ModelFactory>,
 }
@@ -326,17 +277,9 @@ impl ModelCache {
     }
 }
 
-/// Admission control: a process-wide ceiling plus per-conversation serialization.
-///
-/// Two bounds because they answer different questions. The semaphore bounds what this daemon costs
-/// at once; the in-flight set stops one conversation from queueing work on itself, which is what a
-/// person does when a bot seems slow and they send the same thing again.
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
     late_permits: Arc<Semaphore>,
-    /// Refusal, busy and stopped replies waiting on a chat service. They are not sessions, but on
-    /// Discord they queue on the same REST lock as real answers, so a flood of them would delay
-    /// the answers they are refusing on behalf of.
     refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
@@ -351,7 +294,6 @@ impl SessionGate {
         }
     }
 
-    /// Admits one session, or reports that this message must be refused.
     pub fn admit(&self, key: AdmissionKey) -> Option<SessionAdmission> {
         let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
         let mut in_flight = self.in_flight.lock().expect("session in-flight registry");
@@ -368,9 +310,6 @@ impl SessionGate {
 }
 
 impl SessionGate {
-    /// Reserves one pending refusal reply, or `None` when enough are already waiting on a chat
-    /// service. The message's trace already carries its disposition, so a skipped reply loses
-    /// only the courtesy text, never the record.
     pub fn refusal(&self) -> Option<OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.refusals).try_acquire_owned().ok();
         if permit.is_none() {
@@ -383,7 +322,6 @@ impl SessionGate {
     }
 }
 
-/// Holds one session's permit and conversation slot until it is dropped.
 pub(crate) struct SessionAdmission {
     _permit: OwnedSemaphorePermit,
     key: AdmissionKey,
@@ -402,14 +340,8 @@ impl Drop for SessionAdmission {
 #[derive(Clone)]
 pub(crate) struct SessionCancellation {
     state: Arc<AtomicU8>,
-    /// Why the session stopped, written by whichever caller won the race and read by the policy
-    /// task that renders the ending.
     source: Arc<Mutex<Option<CancelSource>>>,
-    /// Wakes the progress policy the instant the race is decided, so the screen changes while the
-    /// model request the session is parked on is still in flight.
     woken: Arc<Notify>,
-    /// Fired exactly once, by the caller that won the race to cancel, into the broker leg's
-    /// in-flight command-word run.
     handle: CancelHandle,
     signal: CancelSignal,
 }
@@ -426,17 +358,9 @@ impl SessionCancellation {
         }
     }
 
-    /// Claims this session as ended by its own work, so a stop that arrives afterwards loses.
-    ///
-    /// Claimed twice on the answering path, and idempotent for that reason. The progress sink
-    /// claims the instant the prompt loop reports `ProgressEvent::Finished`, on the loop's own
-    /// thread, because that is where the answer stops being stoppable; the session claims again
-    /// when it resumes to deliver it. Without the first claim the two are separated by a thread
-    /// hand-off, and a stop word landing inside it won a race whose subject had already ended —
-    /// the policy wrote `Stopped.` under the answer the person was already reading.
-    ///
-    /// `SESSION_COMPLETING` is only ever written here, so finding it already set means this
-    /// session won the race earlier rather than lost it.
+    /// Idempotent and claimed twice on the answering path, so a stop landing in the gap between the
+    /// loop finishing and the session resuming cannot write a stopped line under an answer already
+    /// being read.
     #[must_use]
     pub(crate) fn claim_completion(&self) -> bool {
         match self.state.compare_exchange(
@@ -450,11 +374,9 @@ impl SessionCancellation {
         }
     }
 
-    /// Wins the race to stop this session, recording who asked.
-    ///
-    /// The origin is written under the same lock that decides the race, so anything that observes
-    /// the cancelled state and then asks for the origin waits for the winner's write rather than
-    /// reading the absence that preceded it.
+    /// The cancel origin is written under the same lock that decides the race, so a caller that
+    /// observes the cancelled state and then reads the origin sees the winner's write, never the
+    /// prior absence.
     pub(crate) fn cancel(&self, source: CancelSource) -> bool {
         let cancelled = {
             let mut recorded = self.source.lock().expect("session cancellation source");
@@ -472,8 +394,6 @@ impl SessionCancellation {
             }
             won
         };
-        // Only the winner fires it, so a session that completed normally — whose drop guard
-        // still calls this — never aborts a broker round trip it already finished.
         if cancelled {
             self.handle.cancel();
             self.woken.notify_waiters();
@@ -481,16 +401,14 @@ impl SessionCancellation {
         cancelled
     }
 
-    /// Who stopped this session, once one caller has won the race.
     pub(crate) fn source(&self) -> Option<CancelSource> {
         *self.source.lock().expect("session cancellation source")
     }
 
-    /// Resolves as soon as this session is cancelled, including when it already was.
     pub(crate) async fn cancelled(&self) {
         loop {
-            // Registered before the state is read, which is what makes a cancel between the two
-            // a wakeup rather than a missed one.
+            // Register the notified future before checking cancellation state, or a cancel arriving
+            // between the two checks is silently missed.
             let woken = self.woken.notified();
             if self.state.load(Ordering::Acquire) == SESSION_CANCELLED {
                 return;
@@ -499,7 +417,6 @@ impl SessionCancellation {
         }
     }
 
-    /// The signal the broker leg supervises its command-word runs against.
     pub(crate) fn signal(&self) -> CancelSignal {
         self.signal.clone()
     }
@@ -510,18 +427,11 @@ impl CancellationProbe for SessionCancellation {
         self.state.load(Ordering::Acquire) == SESSION_CANCELLED
     }
 
-    /// Who won the race, rather than the trait's "somebody stopped it".
-    ///
-    /// The origin is already known at the cancel site — a Stop control, a button, a stop word, a
-    /// shutdown, or a budget — and the prompt loop reports whatever this answers as
-    /// [`dekopon_agent::ProgressEvent::Cancelled`]. Without it every ending on the trace reads
-    /// `Operator`, which is the one origin that tells an operator nothing.
     fn cancel_source(&self) -> Option<CancelSource> {
         self.source()
     }
 }
 
-/// Cancels synchronous work when its owning async session is aborted during shutdown.
 struct CancellationOnDrop(SessionCancellation);
 
 impl Drop for CancellationOnDrop {
@@ -548,30 +458,16 @@ struct ActiveSession {
     cancellation: SessionCancellation,
 }
 
-/// What a cancel request found.
-///
-/// A stop word with no session behind it is an ordinary message to answer. An already-cancelled
-/// session owns its stopped ending; a normally completing session cannot acknowledge a pending
-/// batch cancelled alongside it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancelOutcome {
-    /// This request won the race; the session's own policy task writes the ending.
     Cancelled,
-    /// No session is running in that conversation.
     NoSession,
-    /// A session is running, but somebody else started it.
     OtherSubject,
-    /// The session had already been stopped and owns its stopped ending.
     AlreadyCancelled,
-    /// The session claimed normal completion and will not deliver a stopped ending.
     Completing,
 }
 
 impl CancelOutcome {
-    /// Stable low-cardinality reason this request stopped nothing, or `None` when it did.
-    ///
-    /// One definition, because the routing loop reports the same set from two places: an inbound
-    /// stop word and an authenticated press on a control.
     pub(crate) const fn ignored_reason(self) -> Option<&'static str> {
         match self {
             Self::Cancelled => None,
@@ -582,11 +478,6 @@ impl CancelOutcome {
     }
 }
 
-/// Every running session, keyed only by authenticated transport-native conversation identity.
-///
-/// Every session registers, not only the ones on a transport with a native Stop control: the stop
-/// word and the wall-clock bound reach a session through this registry, and they exist on every
-/// transport.
 #[derive(Clone)]
 pub(crate) struct ActiveSessions {
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
@@ -628,8 +519,6 @@ impl ActiveSessions {
                 true
             }
             Entry::Occupied(_) => {
-                // Admission should make this unreachable. Refusing to replace the owner keeps a
-                // stale or malformed control event from cancelling a different generation.
                 tracing::error!(event = "gateway_session_registry_conflict");
                 false
             }
@@ -644,7 +533,6 @@ impl ActiveSessions {
         }
     }
 
-    /// Stops the session one authenticated request names, if that sender is the one running it.
     pub(crate) fn cancel(&self, request: &CancelRequest) -> CancelOutcome {
         let execution = self.cancel_execution(request);
         self.intakes.cancel(request, execution)
@@ -661,8 +549,6 @@ impl ActiveSessions {
         else {
             return CancelOutcome::NoSession;
         };
-        // The canonical rendering on both sides: every origin proves the same thing about the
-        // sender, and the registry holds the typed subject the transport envelope produced.
         if session.subject.canonical() != request.subject {
             return CancelOutcome::OtherSubject;
         }
@@ -706,27 +592,19 @@ impl Drop for ActiveRegistration {
     }
 }
 
-/// Everything shared by every session this daemon runs.
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
     pub models: Arc<ModelCache>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
-    /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
     pub conversations: ConversationStore,
-    /// Scope- and generation-bound attachments, numbered so a model can ask for one.
     pub assets: Arc<AssetStore>,
-    /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
-    /// What each transport shows while a session runs, by transport name.
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
-    /// Bounded transport-owned Slack Agent thread claims, by transport name.
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
-    /// Every running session, so any authenticated cancel can reach the one it names.
     pub active_sessions: ActiveSessions,
 }
 
-/// Selects the state audience solely from trusted bound-route configuration.
 fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
     let conversation = message.conversation.key();
     match route.memory {
@@ -747,13 +625,9 @@ fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> Conversatio
     }
 }
 
-/// Adds authoritative gateway provenance to one shared-scope user turn.
-///
-/// The canonical subject came from the transport envelope accepted for the fresh broker leg. For
-/// the local development transport, the owner UID is authenticated but its declared subject remains
-/// an owner-trusted claim; the uniform label does not upgrade that claim into service authentication.
-/// The remaining bytes are still untrusted user text and can contain lookalike labels or prompt
-/// injection; the first line is the only attribution the gateway vouches for.
+/// Only the canonical subject line is attribution the gateway vouches for; the rest is untrusted
+/// user text that can contain lookalike labels or prompt injection, even under the local-dev
+/// transport.
 fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> String {
     bound_inbound(&format!(
         "[gateway: authenticated participant: {}]\n{text}",
@@ -761,16 +635,13 @@ fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> Str
     ))
 }
 
-/// Runs one routed message end to end, answering unless an optional continuation declines.
 pub(crate) fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     mut message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
 ) -> impl std::future::Future<Output = ()> + Send {
-    // Construct before spawn so even a task aborted before its first poll disposes its receipts.
     let receipts = crate::collection::Dispositions(message.constituents.clone());
-    // Synchronous with dispatch, so Stop also owns a flushed task not yet polled by Tokio.
     let intake = message.late_photos.as_ref().and_then(|_| {
         runner
             .active_sessions
@@ -778,11 +649,6 @@ pub(crate) fn run_session(
             .register(&runner.gate, &message)
     });
     async move {
-        // The trace already exists: the transport opened `transport.receive` when the envelope arrived,
-        // which is what puts the acknowledgment and the routing decision in front of this span rather
-        // than outside the trace entirely. Taking the handle out of the message parents this span under
-        // it and closes it here, so `transport.receive` measures receipt and dispatch instead of the
-        // whole session it started.
         let span = {
             let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
             tracing::info_span!(
@@ -832,9 +698,8 @@ async fn execute(
             .await;
     }
 
-    // One admission slot per conversation, keyed on the same value everything else keys on: the
-    // registry, the cancel request, and the memory key are all `Conversation::key()`, so a stop
-    // and the session it names can never be filed apart.
+    // The admission slot, the active-session registry, the cancel request, and the memory key are
+    // all keyed on the same conversation key, so a stop can never be filed apart from its session.
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
@@ -854,10 +719,6 @@ async fn execute(
             .invalidate_late_input(&conversation_key(&route, &message));
     }
 
-    // Both conversation fields are zero on a `oneShot` route and on the first message of any
-    // conversation, which makes "was this session seeded" a filter rather than a guess. They stay a
-    // count and a byte total because a span attribute is the wrong container for unbounded text;
-    // the history itself rides `agent.model.prompt` on the log stream.
     let outcome = session(&runner, &route, &message, &driver)
         .instrument(tracing::info_span!(
             "gateway.session",
@@ -882,15 +743,6 @@ async fn session(
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
 ) -> &'static str {
-    // Registered before the broker is reached, and held for the whole function: a session parked
-    // on its capability listing is a session somebody is waiting on, and a stop aimed at it must
-    // find it rather than be told nothing is running. Registering publishes nothing — the leg
-    // takes the cancel signal once it exists, the policy task starts later still, and a session
-    // refused here deregisters on the way out.
-    //
-    // Every session registers, on every transport: a stop word, a button, a native Stop, and the
-    // wall-clock bound all reach a session through this one registry, and only the first of those
-    // is limited to the transports with a native control.
     let cancellation = SessionCancellation::new();
     let _active_registration =
         runner
@@ -898,9 +750,6 @@ async fn session(
             .register(message, route, cancellation.clone());
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
-        // A refused attestation never reaches a decision record, so it arrives as a transport-level
-        // code rather than an empty capability set. It is still the broker saying no, and telling
-        // the sender "something broke" would send them to an operator over a working refusal.
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
@@ -923,17 +772,14 @@ async fn session(
         }
     };
     // Never cached and never remembered as a permission: this is a fresh answer from the broker
-    // about what this subject may reach through this agent, on this message.
+    // about what this subject may reach through this agent, for this message alone.
     let granted = leg.granted();
-    // Only trusted route configuration chooses whether the accepted canonical subject participates
-    // in the state key. Message text, transport presentation, and model output never reach this
-    // decision. A one-shot route uses the conservative private key for its attachment state while
-    // retaining no transcript history.
+    // Only trusted route configuration decides whether the subject participates in the state key;
+    // message text, transport presentation, and model output never influence that choice.
     let key = conversation_key(route, message);
-    // The authorization gate, and it costs nothing: an empty answer is a complete answer, so there
-    // is no model call to make. Removing the entry rather than only refusing is the other half —
-    // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
-    // holding exactly the text the revocation was about.
+    // Removing the entry, not just refusing further calls, matters because a revoked subject's
+    // exchange left resident for its idle timeout would hold exactly the text the revocation was
+    // about.
     if granted.is_empty() {
         revoke_thread_ownership(runner, message);
         runner
@@ -943,9 +789,9 @@ async fn session(
         answer(driver, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
-    // An Agent thread becomes a continuation surface only after this exact sender's fresh broker
-    // grant succeeded. Merely mentioning the bot, or putting coordinates in model text, cannot
-    // claim one.
+    // A chat thread becomes a continuation surface only after this exact sender's fresh broker
+    // grant succeeds; merely mentioning the bot or putting coordinates in model text cannot claim
+    // one.
     claim_thread_ownership(runner, message);
     let agent_config = agent_config_view(
         route.agent.as_str(),
@@ -958,9 +804,6 @@ async fn session(
         &leg,
     );
 
-    // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
-    // grant to compare against. `Instant` is supplied by the caller rather than read inside the
-    // store so eviction has a clock a test can drive.
     let window = route.memory.window();
     let (seeded, cache_key, conversation_lease, asset_access, gateway_notice) = match window {
         Some(window) => {
@@ -979,10 +822,6 @@ async fn session(
                 .authorized(input, assets.clone(), cache_key.clone());
             (history, cache_key, Some(lease), assets, gateway_notice)
         }
-        // A route that remembers nothing has no history lane to name, so its messages route to the
-        // route's own lane: the instructions and tools ahead of every one of them are the only
-        // prefix they share, and they share all of it. `routes::BoundRoute::cache_key` has the
-        // argument for why that is not a sender leak.
         None => (
             History::default(),
             route.cache_key.clone(),
@@ -994,9 +833,6 @@ async fn session(
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
-    // On a line of its own rather than beside the subject: the key names nobody, and keeping it off
-    // `gateway.message.received` means a cache key and a canonical subject never meet in one record
-    // for a reader who only needs one of them.
     tracing::info!(
         target: "dekopond::audit",
         {
@@ -1029,8 +865,6 @@ async fn session(
         "{}\n\n[Gateway assets: this reply adapter accepts {accepted_types}. Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]",
         instructions.as_deref().unwrap_or_default()
     ));
-    // Numbered here rather than in the transport: the identifier belongs to the store, and two
-    // transports minting their own would collide inside one conversation.
     let images_supported = route.model.accepts_images();
     let registered = runner.assets.assets_for_access(
         &asset_access,
@@ -1038,15 +872,11 @@ async fn session(
         images_supported,
         Instant::now(),
     );
-    // Bounded again after the note is appended, because the invariant is on the whole prompt the
-    // model reads rather than on the half of it the sender wrote.
     let text = match asset::reference_note(&registered, images_supported) {
         Some(note) if message.text.trim().is_empty() => note,
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
     };
-    // Keep the bounded gateway notice ahead of user text so both this truncator and shared
-    // participant attribution below preserve it, even when the inbound text fills the budget.
     let text = match runner.assets.take_delivery_notice(&asset_access) {
         Some(note) => bound_inbound(&format!("{note}\n{text}")),
         None => text,
@@ -1057,15 +887,10 @@ async fn session(
         )),
         None => text,
     };
-    // Shared transcript turns carry gateway-authored provenance from the authenticated transport
-    // subject. The prefix is rendered only after the ordinary private prompt has been assembled,
-    // leaving one-shot and private persistent prompt bytes unchanged.
     let text = match window.map(|window| window.scope) {
         Some(MemoryScope::SharedConversation) => attributed_prompt(&message.subject, &text),
         Some(MemoryScope::PrivateConversation) | None => text,
     };
-    // Shared rather than owned by the prompt loop alone: model fetches and universal capability
-    // references share the store and generation fence, not readability or invocation budgets.
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access,
@@ -1074,33 +899,20 @@ async fn session(
         images_supported,
         registered.fetchable,
     ));
-    // The route owns the script deadline; every other shell bound is the crate's own default. A
-    // provider call still in flight when it fires is abandoned with the script, which is why the
-    // number is configurable at all: a slow capability needs more than the 30 seconds a script got
-    // before the route could say otherwise.
     let shell = ShellLimits {
         max_capability_calls: limits.max_capability_calls,
         timeout: route.script_timeout,
         ..ShellLimits::default()
     };
-    // Request-scoped and built here rather than handed to `ModelFactory::build`, which is what lets
-    // `ModelCache` share one client across sessions: a key captured in a constructor would describe
-    // the first conversation forever while quietly mislabeling every later one.
+    // Built here per request rather than passed to the shared factory, so a cached client's cache
+    // key never gets baked in from the first conversation and silently mislabels every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
 
-    // Liveness is armed only after the fresh authorization gate and immediately before the costly
-    // model/tool work, which is later than registration on purpose: a stop may reach a session
-    // from the moment it exists, but nothing is *shown* to anyone until the broker has said this
-    // sender may drive this agent. The registry and the probe share one generation, so one cancel
-    // can win exactly once against the terminal answer.
     let liveness = runner
         .liveness
         .get(&message.transport)
         .cloned()
         .unwrap_or_default();
-    // A Stop that wins the race also aborts whichever broker command-word run the script is
-    // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
-    // a broker that is still working.
     let leg = leg.with_cancel_signal(cancellation.signal());
     let attachments = Arc::new(ReplyAttachments::new(
         asset::MAX_SENDS_PER_TURN,
@@ -1112,12 +924,9 @@ async fn session(
         .with_chat_asset_inputs(ChatAssetInputs::new(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
-    // The kind decides the budget: what is worth streaming to one reader in a direct message is
-    // not what a channel with a hundred of them wants. The route keeps `progressDetail`, which is
-    // how much the surface says rather than whether there is one.
     let (settings, keep_alive) = liveness.for_kind(message.conversation.kind);
-    // Drop the policy's terminal sender before waking cancellation: an aborted owner must not
-    // race a `Stopped.` reply. The guard still cancels blocking work before registry release.
+    // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
+    // wake ahead of the terminal reply being sent.
     let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
     let (mut progress, sink) = ProgressPolicy::start(ProgressInputs {
         driver: Arc::clone(driver),
@@ -1131,45 +940,29 @@ async fn session(
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
     });
-    // The gateway emits `Started` because the gateway owns the grant: nothing is shown before the
-    // broker has said this sender may drive this agent, and the wall-clock budget is counted from
-    // here rather than from receipt, because waiting for an admission slot is not agent time.
     sink.emit(ProgressEvent::Started {
         agent: route.agent.to_string(),
         max_steps: limits.max_steps,
     });
-    // The prompt loop and the interpreter are both synchronous and both can block for a long time
-    // — a model round trip, a script that sleeps, a broker call per command. Running that on a
-    // runtime worker would stall every other session in the process.
+    // The prompt loop and interpreter are synchronous and can block for a long time; running that
+    // on a runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
     let prompt_cancellation = cancellation.clone();
     let reply_optional = message
         .thread_continuation
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
-    // Shared with the route rather than cloned: the skill text is read once at startup.
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
-    // The same sink on the broker leg, because the two halves of a run are reported by two
-    // different owners: the prompt loop knows a turn happened and a script ran, and only the leg
-    // knows which command word it invoked and how many of the session's calls that spent. Without
-    // this the surface can say it is working but never which capability is running. The ceiling
-    // travels with the sink because `ToolStarted` renders "3 of 16", and the route's budget is
-    // spent across every script of one session, so this caller is the only one that knows it.
     let leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
-    // Moved into the blocking task so the policy's event queue closes when the loop ends, which is
-    // how the policy learns there is nothing more coming without a second signal to keep in step.
     drop(sink);
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.signal().watch();
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
-        // Resolved before the accumulator exists, so a model client that cannot be constructed
-        // returns without a turn: nothing was asked, so there is no exchange to remember. Only the
-        // first message to reach a given endpoint actually builds one.
         let model = match models.client(&model_config, model_runtime, model_cancel) {
             Ok(model) => model,
             Err(error) => return (Err(error), None, Vec::new()),
@@ -1178,8 +971,6 @@ async fn session(
             invoker: leg,
             limits: shell,
         };
-        // `history` is the accumulator rather than a return value, so this session's exchange is
-        // recorded into it whichever way the loop ends.
         let mut history = seeded;
         let mut inputs = SessionInputs::new(&text, limits)
             .with_system(instructions.as_deref())
@@ -1189,10 +980,9 @@ async fn session(
             .with_reply_assets(&session_attachments)
             .with_cancellation(&prompt_cancellation)
             .with_progress(Arc::clone(&progress_sink));
-        // The one gate `inspectAgentConfig: false` is. The view is still built above — it reads
-        // the leg this session already holds and costs no I/O — and withholding it here removes
-        // the structured dump, including the agent's standing orders verbatim. The instructions
-        // are still the system prompt, so this is not secrecy from a determined user.
+        // Withholding the agent-config view here removes the structured dump but not the underlying
+        // instructions, which are still the system prompt, so this is not secrecy from a determined
+        // user.
         if inspect_agent_config {
             inputs = inputs.with_agent_config(&agent_config);
         }
@@ -1204,17 +994,10 @@ async fn session(
         }
         let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
             .map_err(SessionError::from);
-        // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
-        // in the one module that owns it. The single exception is the message the loop refuses
-        // outright: a zero step budget builds no request, records nothing, and would otherwise make
-        // the newest *seeded* turn look like this session's — which strict configuration already
-        // rejects at startup, and which must not silently duplicate an exchange if it ever did not.
         let turn = match &outcome {
             Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
             _ => history.turns().last().cloned(),
         };
-        // Taken only on success, for the reason the fixed failure line is never stored: a session
-        // that failed or was cancelled underneath its own work must not post what it produced.
         let images = if outcome.is_ok() {
             session_attachments.take()
         } else {
@@ -1230,7 +1013,6 @@ async fn session(
             if !cancellation.claim_completion() {
                 return stopped(&mut progress, &cancellation).await;
             }
-            // The task itself died, so there is no history to trust and nothing to record.
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
             let notice = _active_registration
@@ -1258,15 +1040,8 @@ async fn session(
         return stopped(&mut progress, &cancellation).await;
     }
 
-    // Seal rendering before terminal delivery or deliberate silence, but do no remote cleanup on
-    // this latency-sensitive path. The service's own indicators return to rest only after the
-    // completion decision is durable in gateway state.
     progress.seal();
 
-    // The exchange when the session answered, and the bare question when it did not. The fixed
-    // failure line is never stored: it is this daemon's sentence rather than the agent's, and
-    // replaying it would teach the model to keep producing it. Cancellation claimed the state
-    // above and therefore never reaches this commit.
     if let Some(window) = window
         && let Some(turn) = turn
         && let Some(lease) = conversation_lease
@@ -1278,10 +1053,6 @@ async fn session(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
-        // No reply call means no acceptance receipt and therefore no durable recording. The
-        // progress message is still removed: a surface left saying "Working on it…" is a claim
-        // about a session that ended. The unanswered in-process turn was committed above so a
-        // later continuation still sees what the person said.
         progress.terminal(Terminal::Silent).await;
         return "declined";
     }
@@ -1334,8 +1105,6 @@ async fn session(
             )
         }
     };
-    // The policy writes it, because the policy owns the one message on screen: an answer becomes
-    // that message in place where the transport can, and falls back to removing it and replying.
     let delivered = progress.terminal(terminal).await;
     attachments.finish(match (&outcome, delivered) {
         (Ok(_), true) => AssetDeliveryDisposition::Delivered,
@@ -1360,12 +1129,6 @@ async fn session(
     }
 }
 
-/// The one ending a cancelled session has, written by the task that owns its surface.
-///
-/// The policy has usually rendered it already, from the notification the cancel raised, which is
-/// what puts `Stopped.` on screen while the model request this session was parked on is still in
-/// flight. Handing it the terminal again is the ordered handoff for the case where it had not yet
-/// been scheduled, and a no-op when it had.
 async fn stopped(
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
@@ -1394,12 +1157,9 @@ fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     }
 }
 
-/// Builds the credential-free meta view from gateway-owned catalog fields and the broker's fresh
-/// subject-specific capability snapshot.
-///
-/// Deliberately takes no [`ModelConfig`], broker configuration, transport message, subject, or
-/// principal. Those are exactly the places credentials, endpoints, paths, and identity live, and a
-/// constructor that cannot receive them is stronger than one expected to remember to redact them.
+/// Deliberately takes no model config, broker config, message, subject, or principal: a constructor
+/// that cannot receive credentials or identity is stronger than one expected to remember to redact
+/// them.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is one catalog or route fact the view names; bundling them would hide which fact a caller forgot"
@@ -1454,11 +1214,6 @@ fn agent_config_view(
     )
 }
 
-/// Opens this session's attested broker leg.
-///
-/// A fresh client per session rather than a shared one, because the protocol client connects per
-/// call anyway: there is no connection to reuse, and a per-session client keeps one session's
-/// identifiers and attestation entirely its own.
 async fn connect(
     runner: &SessionRunner,
     route: &BoundRoute,
@@ -1474,11 +1229,9 @@ async fn connect(
         .map_err(SessionError::from)
 }
 
-/// The claim this session opens its broker leg with.
-///
-/// No normalization step: the transport minted the conversation in the canonical form the grant,
-/// the claim check and Cedar all compare against, so a second lowercasing here would be a second
-/// definition of the same fact.
+/// No normalization step here: the transport already minted the conversation in the canonical form
+/// the grant, claim check, and policy engine all compare against, so re-normalizing would create a
+/// second definition of the same fact.
 fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestation, SessionError> {
     let transport = message
         .transport
@@ -1509,8 +1262,6 @@ async fn record_delivered_turn(
         return;
     };
     let result: Result<(), MemoryRecordFailure> = async {
-        // The record rides the session's own trace: this runs inside `gateway.session`, so the
-        // turn the broker stores and the conversation that produced it are one trace to read.
         let identifiers = IdSequence::for_session();
         let client = BrokerClient::new(
             &runner.broker.socket_path,
@@ -1555,8 +1306,6 @@ pub(crate) fn delivery_identity(
             channel: conversation.id.clone(),
             timestamp: message.message_id.clone(),
         }),
-        // A Discord thread is itself the channel its messages live in, which is what
-        // `api_channel` answers; the conversation's `id` is the parent a route pinned.
         dekopon_broker_protocol::ChatTransportKind::Discord => Some(DeliveryIdentity::Discord {
             channel: conversation
                 .api_channel(dekopon_broker_protocol::ChatTransportKind::Discord)
@@ -1610,8 +1359,9 @@ pub(crate) fn memory_record_outcome_category(result: &InvocationResult) -> Optio
             Some("storage-timeout") => "storage-timeout",
             Some("storage-corrupt") => "storage-corrupt",
             Some("storage-io") => "storage-io",
-            // Never copy a future provider/public error into telemetry. The broker result is
-            // bounded, but an allowlist keeps this category stable and content-free by proof.
+            // Never copy a future provider or public error into telemetry; an explicit allowlist,
+            // not a passthrough, is what keeps this category stable and content-free by
+            // construction.
             _ => "failed",
         }),
     }
@@ -1653,11 +1403,6 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
     }
 }
 
-/// Sends one answer, reporting whether it arrived.
-///
-/// The outbound bound is applied here, once, rather than in each transport: a model writes this
-/// text, every chat service rejects or mangles an oversized post, and one bound at the session
-/// boundary is one place to read rather than three places to keep in agreement.
 pub(crate) async fn answer(
     driver: &Arc<dyn ChatDriver>,
     message: &InboundMessage,
@@ -1675,24 +1420,15 @@ pub(crate) async fn answer(
     }
 }
 
-/// The credential one configured model names could not be resolved.
-///
-/// Its own type rather than a [`SessionError`] variant alone, because startup resolves it before
-/// any transport accepts work and a session resolves it again when it builds the client. One
-/// definition, two readers: a pre-flight that could accept what the enforcing path rejects would be
-/// worse than no pre-flight.
 #[derive(Debug, Error)]
 #[error("model {model:?} credential environment variable {variable} is unusable")]
 pub struct ModelCredentialError {
-    /// Owner-authored model name.
     pub model: String,
-    /// Owner-authored variable name, never its value.
     pub variable: String,
     #[source]
     source: TransportError,
 }
 
-/// A session that could not run to completion.
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("broker client could not be created")]
@@ -1710,10 +1446,6 @@ pub enum SessionError {
 }
 
 impl SessionError {
-    /// Stable low-cardinality category, never the underlying message.
-    ///
-    /// Several variants wrap untrusted model, provider, or transport text, and `docs/observability.md`
-    /// keeps that out of exported telemetry. An operator correlates this with the daemon's own logs.
     pub fn category(&self) -> &'static str {
         match self {
             Self::BrokerClient(_) => "broker-client",

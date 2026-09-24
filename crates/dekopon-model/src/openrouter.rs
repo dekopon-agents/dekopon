@@ -1,6 +1,3 @@
-//! OpenRouter's streaming dialect, explicit cache anchors and private native replay.
-
-/// Strict authored settings shared with gateway configuration.
 pub mod settings;
 
 use crate::{
@@ -27,7 +24,6 @@ use std::{collections::HashMap, num::NonZeroU32, ops::ControlFlow, time::Duratio
 
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-/// A pooled OpenRouter client with immutable authored settings and a caller-supplied credential.
 pub struct OpenRouterClient {
     http: InferenceHttp,
     endpoint: String,
@@ -39,7 +35,6 @@ pub struct OpenRouterClient {
 }
 
 impl OpenRouterClient {
-    /// Validates local settings and wraps the credential before constructing the transport.
     pub fn new(
         model: impl Into<String>,
         token: String,
@@ -67,15 +62,12 @@ impl OpenRouterClient {
         })
     }
 
-    /// Records the configured name separately from the requested upstream model.
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
-    /// Overrides generation for an offline fixture at literal `127.0.0.1` or `::1` over HTTP.
-    /// Existing continuations are invalidated when changing the configured destination.
     pub fn with_loopback_endpoint(mut self, endpoint: &str) -> Result<Self, InferenceError> {
         self.endpoint = crate::loopback::endpoint(endpoint)?;
         self.identity = ClientIdentity::new();

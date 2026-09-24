@@ -1,5 +1,3 @@
-//! A streaming model whose every event is released by the test that is watching for it.
-
 use std::{
     ops::ControlFlow,
     sync::{
@@ -17,29 +15,8 @@ use dekopon_model::{
 };
 use tokio::sync::Notify;
 
-/// Longest a scripted stream waits for its next release before the fixture, not the subject, fails.
-///
-/// This deliberately callback-only double has no transport cancellation watch. A test of its
-/// parked wait supplies a short deadline through [`ScriptedStreamModel::parked`]; this ceiling
-/// bounds every other fixture release. Production adapters instead interrupt silent HTTP reads
-/// through `TurnControl`, so this wait does not model their cancellation latency.
 const PARK_CEILING: Duration = Duration::from_secs(30);
 
-/// A [`ChatModel`] that replays recorded stream events one at a time, on demand.
-///
-/// Streaming is where ordering assertions live: "the progress message was posted before the second
-/// delta", "a cancel between deltas stops the turn", "the partial text on screen is the text the
-/// loop had". None of those is assertable against a model that answers all at once, so this one
-/// hands out exactly one event per release and announces each hand-off.
-///
-/// The two directions use different primitives for the same reason `BlockedRuntime` does:
-/// the waiting side of `release` is the blocking prompt thread, which has no executor, while the
-/// waiting side of the announcement is an async test that may have time paused.
-///
-/// A model client cannot be asked to invent visible text: [`ModelText`] is constructed from bytes
-/// only inside `dekopon-model`, by its parser. So the scripted events come from a recorded
-/// transcript through that same parser, which also means a fixture cannot drift from what the
-/// backend really sends.
 pub struct ScriptedStreamModel {
     events: Mutex<Vec<TurnEvent>>,
     turn: AssistantTurn,
@@ -48,20 +25,10 @@ pub struct ScriptedStreamModel {
     asked: Notify,
     emitted: Notify,
     count: AtomicU32,
-    /// How long one release may be waited on, which a parked stream's own test chooses.
     deadline: Duration,
 }
 
 impl ScriptedStreamModel {
-    /// Replays a recorded SSE body's events, one per [`Self::release_next`].
-    ///
-    /// The turn is what the same response parses to when nothing interrupts it, so a test can
-    /// assert that the streamed and non-streamed reads of one transcript agree.
-    ///
-    /// # Errors
-    ///
-    /// When the transcript is not a body either backend's parser accepts, which is the fixture
-    /// being wrong rather than the subject.
     pub fn from_transcript(body: &str, turn: AssistantTurn) -> Result<Self, InferenceError> {
         Ok(Self::scripted(
             dekopon_model::events_from_transcript(body)?,
@@ -69,10 +36,6 @@ impl ScriptedStreamModel {
         ))
     }
 
-    /// Replays these events, one per [`Self::release_next`], then answers with `turn`.
-    ///
-    /// One more release than there are events is needed: the last one lets the turn return, which
-    /// is what puts "the stream has ended" under the test's control too.
     #[must_use]
     pub fn scripted(events: Vec<TurnEvent>, turn: AssistantTurn) -> Self {
         let (release, gate) = channel();
@@ -88,12 +51,6 @@ impl ScriptedStreamModel {
         }
     }
 
-    /// A stream that sends nothing at all until it is released or `deadline` elapses.
-    ///
-    /// This double only checks cancellation through event callbacks; its fixture wait has no
-    /// transport watch. The caller chooses a short deadline to test that deliberate limitation
-    /// without waiting for the fixture ceiling. Production adapters use `TurnControl` to cancel
-    /// silent HTTP reads without waiting for an event or the deadline.
     #[must_use]
     pub fn parked(turn: AssistantTurn, deadline: Duration) -> Self {
         Self {
@@ -102,7 +59,6 @@ impl ScriptedStreamModel {
         }
     }
 
-    /// Lets the stream emit its next event, or return its turn when none are left.
     pub fn release_next(&self) {
         #[allow(
             clippy::let_underscore_must_use,
@@ -112,27 +68,19 @@ impl ScriptedStreamModel {
         let _ = self.release.send(());
     }
 
-    /// Resolves once one more event has been handed to the prompt loop.
     pub async fn wait_for_event(&self) {
         self.emitted.notified().await;
     }
 
-    /// Resolves once a turn has reached the model, which is when the request is open.
-    ///
-    /// The rendezvous a silent phase needs: a parked stream announces nothing else, so a test that
-    /// slept instead would be asserting on whether its own sleep outran the loop's start-up rather
-    /// than on what a stop does to an open request.
     pub async fn wait_until_asked(&self) {
         self.asked.notified().await;
     }
 
-    /// How many events the loop has taken, which is what `stream.deltas` must equal.
     #[must_use]
     pub fn emitted(&self) -> u32 {
         self.count.load(Ordering::SeqCst)
     }
 
-    /// Blocks until the test releases the next step, or the deadline stands in for the client's.
     fn wait_for_release(&self) {
         #[allow(
             clippy::let_underscore_must_use,
@@ -163,8 +111,6 @@ impl ChatModel for ScriptedStreamModel {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.emitted.notify_one();
             if flow.is_break() {
-                // Production clients cancel the local exchange and drop its response, without
-                // guaranteeing closure of the pooled connection; no turn exists to report.
                 return Err(InferenceError::Cancelled);
             }
         }
@@ -173,11 +119,6 @@ impl ChatModel for ScriptedStreamModel {
     }
 }
 
-/// Every scripted text delta's text, concatenated, which is what a finished stream should show.
-///
-/// Written here rather than in each suite because "what the person would have read" is the same
-/// question everywhere, and two suites computing it differently is how a rendering assertion stops
-/// meaning anything.
 #[must_use]
 pub fn scripted_text(events: &[TurnEvent]) -> ModelText {
     let mut text = ModelText::default();

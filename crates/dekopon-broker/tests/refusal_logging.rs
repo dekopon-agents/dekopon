@@ -1,15 +1,5 @@
-//! What the broker says about a session it refuses before anything is ever invoked.
-//!
-//! An attested `capabilities` answers a refused caller with the same opaque nothing whatever went
-//! wrong — that is deliberate, because a distinguishable answer would tell an unauthorized gateway
-//! whether a subject is mapped. The cost was that the broker's own side of the socket recorded
-//! nothing either, so bootstrapping an `identityMapping` for a new Slack sender meant reading the
-//! sender's subject out of a payload-carrying gateway span. These tests hold the opaque wire answer
-//! and the named broker-side event together.
-//!
-//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
-//! global dispatcher, so a sibling test hitting these callsites with no subscriber installed can
-//! disable them for the whole process.
+//! Refused capability and command lookups return the same opaque error regardless of cause, so an
+//! unauthorized gateway can't learn whether a subject is mapped.
 
 #![allow(clippy::unwrap_used)]
 
@@ -29,16 +19,11 @@ use dekopon_core::{
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
 const UNMAPPED_SUBJECT: &str = "slack.t0123abc.unobody";
 
-/// `cpetersen` may drive `some-agent` through the gateway and nothing else may drive anything.
 const POLICIES: &str = r#"
 @id("attested-reverse")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -178,14 +163,12 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
     )
 }
 
-/// Four refusals that answer identically on the wire must not be one refusal in the logs.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_inspection_refusal_names_its_class_and_its_subject() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker().await;
 
-    // No attestor authority at all.
     assert!(
         broker
             .capability_surface(
@@ -207,7 +190,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(ungranted.contains(MAPPED_SUBJECT), "{ungranted}");
     assert!(ungranted.contains("gateway"), "{ungranted}");
 
-    // A grant that does not reach this namespace is the same wire answer, a different class.
     let narrow = AttestorGrant {
         namespaces: vec!["slack.tother".to_owned()],
         chat_scopes: Vec::new(),
@@ -226,8 +208,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     );
     assert!(captured.take_events().contains("attestation-denied"));
 
-    // The bootstrap case: a sender no `identityMapping` names yet. The canonical subject in this
-    // event is the whole point — it is the value an operator has to copy into configuration.
     assert!(
         broker
             .capability_surface(
@@ -244,7 +224,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(unmapped.contains("unmapped-subject"), "{unmapped}");
     assert!(unmapped.contains(UNMAPPED_SUBJECT), "{unmapped}");
 
-    // Mapped, attested, and still refused: policy does not let this principal drive that agent.
     assert!(
         broker
             .capability_surface(
@@ -261,9 +240,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(denied.contains("agent-denied"), "{denied}");
     assert!(denied.contains("other-agent"), "{denied}");
 
-    // A policy that cannot be evaluated denies exactly like one that does not match. Cedar's
-    // strict validator cannot rule this out — the overflow above is well typed — so the refusal
-    // class is the only thing that separates a broken rule from a deliberate one.
     assert!(
         broker
             .capability_surface(
@@ -280,8 +256,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(erroring.contains("policy-error"), "{erroring}");
     assert!(!erroring.contains("agent-denied"), "{erroring}");
 
-    // A refusal a `forbid` rule determined is the case where the identifiers are not empty, and
-    // they are the only route from the class back to the rule that reached it.
     assert!(
         broker
             .capability_surface(
@@ -298,8 +272,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(forbidden.contains("agent-denied"), "{forbidden}");
     assert!(forbidden.contains("forbidden-gate"), "{forbidden}");
 
-    // The same distinction reaches the durable decision record, where a denial that was really a
-    // broken policy used to be filed as an ordinary refusal.
     let denied = proposal("invoke-policy-error");
     let refused = broker
         .invoke(
@@ -318,7 +290,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert_eq!(refused.result.error.as_deref(), Some("policy-error"));
     captured.clear();
 
-    // The chat surface the gateway actually opens takes the same path and reports the same way.
     assert!(
         broker
             .capability_surface(
@@ -333,9 +304,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(chat.contains("unmapped-subject"), "{chat}");
     assert!(chat.contains(UNMAPPED_SUBJECT), "{chat}");
 
-    // A command word a refused session may not reach answers `UnknownCommandWord` whatever went
-    // wrong — naming the word would disclose the surface the refusal withheld — so this event is
-    // the only place the class exists at all.
     assert!(
         broker
             .run_command(
@@ -354,11 +322,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(command.contains("unmapped-subject"), "{command}");
     assert!(command.contains(UNMAPPED_SUBJECT), "{command}");
 
-    // The chat invocation path carries all four live transports. Every one of these classes used
-    // to be filed as a single `chat-attestation-denied` with no policy identifiers at all, and the
-    // wire answer must stay exactly that literal: the class and its policies belong to the audit
-    // record, and a peer that could read them off its own denial would learn from a refusal which
-    // subjects the directory maps and which agents a principal may drive.
     for (index, (attestor, canonical, agent_id, reason, policies)) in [
         (
             None,
@@ -436,7 +399,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     }
     captured.clear();
 
-    // An honored session stays silent: this event marks refusals, not traffic.
     assert!(
         broker
             .capability_surface(

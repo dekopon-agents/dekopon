@@ -61,8 +61,6 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
 
 #[test]
 fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
-    // An operator-chosen `memory.chat.export` on a provider named `memory-chat`, with no route:
-    // reserved-looking in every spelling and generic in the only place that decides.
     let authored = serde_json::json!({
         "provider": "memory-chat",
         "effect": "read-only",
@@ -143,7 +141,6 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
         "two final partial chunks are charged at their requested 256 KiB bounds"
     );
 
-    // The direct live peak includes the post-append turn file, permanent dedup, and metadata.
     let too_small_namespace = dekopon_storage_host::StorageLimits {
         max_namespace_bytes: 16 * 1024 * 1024,
         ..dekopon_storage_host::StorageLimits::default()
@@ -193,8 +190,6 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     };
     assert!(memory.validate(&one_below_namespace_limit).is_err());
 
-    // The minimum fixture reads one chunk from each file, makes both size calls, appends both
-    // records, and may replace turns: seven host calls exactly.
     let exact_host_calls = dekopon_storage_host::StorageLimits {
         max_host_calls_per_invocation: 7,
         ..dekopon_storage_host::StorageLimits::default()
@@ -440,12 +435,6 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
     assert_eq!(encoded_memory(&memory), encoded_memory(&unrelated_agent));
 }
 
-/// The exact list of inputs one capability commits to its storage namespace generation.
-///
-/// A storage namespace is keyed by this surface: adding or removing a field here mints a fresh
-/// random generation for every retained namespace on upgrade, and nothing recovers the old one by
-/// accident. Pinning the labels is what makes that cost deliberate — a field cannot enter or leave
-/// the digest without this list, and a reviewer, changing with it.
 #[test]
 fn capability_authority_commits_exactly_these_fields() {
     fn labels(bytes: &[u8]) -> Vec<String> {
@@ -604,7 +593,6 @@ fn pre_execution_storage_failures_keep_their_public_category() {
         assert!(!error.storage_namespace_reset(), "{expected}");
     }
 
-    // A reset keeps the corrupt code; only whether the store is already usable again differs.
     let reset = super::BrokerError::Storage {
         source: dekopon_storage_host::StorageHostError::Corrupt {
             scope: "authority-pointer",
@@ -618,9 +606,6 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     assert!(reset.storage_namespace_reset());
 }
 
-/// A permanent exhaustion is not a momentary outage. The bounded in-memory audit does not evict,
-/// so a client told to resubmit under a fresh identifier would loop against a broker that is
-/// capped forever.
 #[test]
 fn exhausted_bounds_are_terminal_rather_than_retriable() {
     for error in [
@@ -640,8 +625,6 @@ fn exhausted_bounds_are_terminal_rather_than_retriable() {
         assert_eq!(error.storage_failure_code(), None);
     }
 
-    // The same exhaustion *after* execution stays an unaudited outcome: the effect may already
-    // have happened, and that classification outranks how the append failed.
     let invocation = "invoke-terminal"
         .parse::<InvocationId>()
         .expect("valid invocation fixture");
@@ -653,10 +636,6 @@ fn exhausted_bounds_are_terminal_rather_than_retriable() {
     assert_eq!(terminal.unaudited_outcome(), Some(&invocation));
 }
 
-/// A materialization task that panicked reported itself as `StorageHostError::Io`, which sent an
-/// operator to the filesystem for a bug that is in the code. The wire category stays `storage-io`
-/// — the same step failed before any provider ran — but the panic's own account now survives in
-/// the error chain instead of being replaced by a fabricated I/O failure.
 #[tokio::test]
 async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_category() {
     let source = tokio::task::spawn_blocking(|| panic!("namespace generation pointer is missing"))
@@ -675,10 +654,6 @@ async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_cate
     );
 }
 
-/// `localSubjectService` is the one chat-scope field that is free-form operator text rather than
-/// a structural rule, and a typo in it used to produce "attestor chat scope is invalid" — the
-/// same sentence four other rejections produce. The refusal now carries the parse failure, which
-/// quotes the word to change.
 #[test]
 fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
     let grant = |service: &str| AttestorGrant {
@@ -710,7 +685,6 @@ fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
         .expect("a canonical local subject service is accepted");
 }
 
-/// Every selector fixture in this module names every conversation on its transport.
 fn any_conversation() -> ConversationMatch {
     ConversationMatch {
         kind: ConversationKindMatch::Any,
@@ -789,7 +763,6 @@ fn chat_scope_configuration_requires_service_canonical_forms_and_refuses_the_ret
             "Telegram has no container",
         ),
         (
-            // S31: a grant names a parent, never one thread.
             grant(
                 ChatTransportKind::Discord,
                 "discord",
@@ -848,7 +821,6 @@ fn chat_scope_configuration_requires_service_canonical_forms_and_refuses_the_ret
     );
 }
 
-/// The two single-sender transports correlate the conversation with the attested subject.
 #[test]
 fn a_whatsapp_or_telegram_direct_message_must_be_the_attested_senders_own() {
     let attestor = AttestorGrant {
@@ -905,7 +877,6 @@ fn a_whatsapp_or_telegram_direct_message_must_be_the_attested_senders_own() {
     );
 }
 
-/// A grant on a parent channel authorizes the threads under it exactly when it lists `thread`.
 #[test]
 fn a_thread_claim_is_authorized_by_its_parents_grant_and_only_with_thread_in_the_list() {
     let discord_claim = |kind, id: &str, thread: Option<&str>| ChatScopeClaim {
@@ -968,7 +939,6 @@ fn a_thread_claim_is_authorized_by_its_parents_grant_and_only_with_thread_in_the
         "`[channel]` excludes the threads under it"
     );
 
-    // A non-canonical conversation is refused before any grant is consulted.
     assert!(!both.permits_chat(
         &subject,
         &discord_claim(
@@ -1013,11 +983,6 @@ async fn in_memory_audit_fails_closed_at_its_bound() {
     assert!(matches!(error, AuditError::Full { maximum: 1 }));
 }
 
-/// Pins exactly which HTTP scopes this broker starts with, now that the grammar is shared.
-///
-/// The rules moved into `HttpConstraints::validate` so the capability gate and the HTTP host stop
-/// carrying weaker copies. Nothing here may become acceptable, and nothing already acceptable may
-/// start failing: this is the same broker startup decision, made in one place.
 #[test]
 fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
@@ -1125,11 +1090,6 @@ fn policy_http_scope_values_are_bounded() {
     }
 }
 
-/// The authored spelling of a per-agent credential, and what selection does with it.
-///
-/// The map key is an `AgentId`, so a name no agent could carry is a decode failure rather than an
-/// override that silently never matches. An absent map stays off the wire, which keeps a
-/// constraint set written before this existed serializing exactly as it did.
 #[test]
 fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
     let document = r#"{
@@ -1158,7 +1118,6 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
         set.credential_for(&agent("dekoponville-github")),
         Some("github-pat")
     );
-    // No agent, no override: the shape a direct service peer arrives in.
     assert_eq!(
         set.credential_for(&Actor::Service {
             principal: "local-user"
@@ -1190,9 +1149,6 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
     );
 }
 
-/// The provider's own answer travels with the class, never instead of it. A model and an operator
-/// both need the class to decide what to do; only the provider's sentence says what actually
-/// happened, and `provider-failure` on its own has never been able to say.
 #[test]
 fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_own_code() {
     let failure = BrokerHostError::ProviderFailure {
@@ -1220,8 +1176,6 @@ fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_o
     );
 }
 
-/// The pair crosses a trust boundary: the message is provider-authored text, so it is cut here
-/// rather than wherever it is later rendered.
 #[test]
 fn a_provider_message_past_its_bound_is_cut_before_it_leaves_the_broker() {
     let failure = BrokerHostError::ProviderFailure {
@@ -1244,8 +1198,6 @@ fn a_provider_message_past_its_bound_is_cut_before_it_leaves_the_broker() {
     );
 }
 
-/// Only a failure the provider itself reported has a provider sentence. Every other host failure
-/// is the host's or the broker's account, and inventing one for it would make the field a lie.
 #[test]
 fn a_host_failure_no_provider_reported_carries_no_detail() {
     for failure in [

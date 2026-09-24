@@ -23,16 +23,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
 
-/// One mapped peer: its trusted transport context and optional attestor authority.
-///
-/// The grant lives beside the context rather than inside it because it is authority *about
-/// identity derivation*, not identity: a peer with a grant still acts as itself on direct
-/// operations, and only an attested operation consults the grant at all.
 #[derive(Clone, Debug)]
 pub struct MappedPeer {
-    /// The peer's own authenticated context.
     pub context: AuthenticatedContext,
-    /// The peer's owner-configured attestor authority, when it has any.
     pub attestor: Option<AttestorGrant>,
 }
 
@@ -90,9 +83,8 @@ where
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
-                // Without this branch a finished connection is only observed when the *next* one
-                // arrives, so `broker_outcome_unaudited` — the one failure an operator must act
-                // on — waits on unrelated traffic to be logged at all.
+                // Without this branch, a finished connection's outcome is only logged once the next
+                // connection arrives, delaying the failure an operator must act on.
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => observe_task(result)?,
                 accepted = listener.accept() => {
                     let stream = match accepted {
@@ -163,11 +155,7 @@ fn observe_task(
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            // The category answers "which failure class"; the chain answers "why", which is the
-            // half that used to be dropped.
             let cause = dekopon_core::error_chain(&error);
-            // An unaudited outcome is the only connection failure an operator must act on: it
-            // names the one invocation whose effect may have happened with nothing recording it.
             match error.unaudited_outcome() {
                 Some(invocation) => tracing::error!(
                     event = "broker_outcome_unaudited",
@@ -175,9 +163,6 @@ fn observe_task(
                     invocation.id = %invocation,
                     error = %cause,
                 ),
-                // Exhaustion is the second one an operator must act on, and the only signal it
-                // produces: every client sees a refusal it cannot retry out of, and nothing else
-                // in the process reports that the bound was reached.
                 None if error.is_capacity_exhausted() => tracing::error!(
                     event = "broker_capacity_exhausted",
                     category = error.category(),
@@ -201,10 +186,8 @@ fn observe_task(
     }
 }
 
-/// Stable, low-cardinality name for a framing failure.
-///
-/// The wire answer for every one of these is the same generic code, so this label is the only
-/// thing that tells a slow client from an oversized frame from unreadable JSON.
+/// Every framing failure gets the same generic wire code; this label is the only way to tell a slow
+/// client from an oversized frame from bad JSON.
 const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
     match error {
         ProtocolError::InvalidFrameLimit { .. } => "invalid-frame-limit",
@@ -224,13 +207,6 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
     }
 }
 
-/// Records why a provider could not run a command word.
-///
-/// The model is told only that the word could not be run, which is right — a guest trap or an
-/// input past the host bound is not something it can act on from the message — so the host error
-/// has to land here or nowhere. The event keeps its `command.resolve.failed` name: it is the
-/// operator-facing identifier for this class, and renaming it would break every filter built on
-/// it for nothing.
 fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHostError) {
     tracing::warn!(
         target: "dekopon_brokerd::audit",
@@ -244,14 +220,8 @@ fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHos
     );
 }
 
-/// Whether a claim is structurally usable, before any grant is consulted.
-///
-/// Attestation shape is one axis, so this is one check for every operation that can carry one.
-/// `proposal` is the identifier the claim must bind to; `None` names an operation with no proposal,
-/// where a bound claim is itself malformed because there is nothing for it to bind to. Neither
-/// half is an authorization decision — the broker still refuses a well-formed claim it does not
-/// honor — and a request that fails here is answered `invalid-request` with nothing authorized,
-/// accounted, or audited.
+/// This checks only structural validity, not authorization: a well-formed claim can still be
+/// refused later, and failing here authorizes, accounts, or audits nothing.
 fn claim_is_valid(attestation: Option<&Attestation>, proposal: Option<&InvocationId>) -> bool {
     attestation.is_none_or(|claim| {
         claim.is_well_formed()
@@ -259,10 +229,6 @@ fn claim_is_valid(attestation: Option<&Attestation>, proposal: Option<&Invocatio
     })
 }
 
-/// Answers a malformed claim with the stable protocol code and ends the connection.
-///
-/// The message stays generic on purpose: which half of the claim was malformed is a property of a
-/// frame the peer built, and a client that cannot bind its own attestation cannot act on detail.
 async fn refuse_invalid_claim(
     stream: &mut DescriptorStream,
     limits: FrameLimits,
@@ -278,10 +244,6 @@ async fn refuse_invalid_claim(
     Err(ConnectionError::InvalidRequest)
 }
 
-/// The invocation span, carrying the attested subject and agent only when a claim named them.
-///
-/// A storage-backed proposal opens the same span as any other: nothing a non-storage span records
-/// is withheld because the capability happens to keep durable state.
 fn invocation_span(
     request: &InvocationRequest,
     attestation: Option<&Attestation>,
@@ -304,9 +266,6 @@ fn invocation_span(
     }
 }
 
-/// The stable `outcome` a `broker.command_run` span records for what the guest answered.
-///
-/// `error` — the fourth value — is recorded where the run produced no answer at all.
 const fn command_run_outcome(outcome: &CommandRunOutcome) -> &'static str {
     match outcome {
         CommandRunOutcome::Proposed { .. } => "proposed",
@@ -315,12 +274,8 @@ const fn command_run_outcome(outcome: &CommandRunOutcome) -> &'static str {
     }
 }
 
-/// Joins the span to the trace the client sent.
-///
-/// An untrusted client chooses this parent. It reaches correlation and nothing else: policy never
-/// reads it, and the audit record it lands on is correlated by the same
-/// trace whether or not this call succeeds — the span still records, just as its own root — so a
-/// parent the local SDK rejects is a debug event rather than a failure.
+/// The client picks this trace parent, so it's used only for correlation, never policy; a parent
+/// the SDK rejects just becomes its own root span.
 fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
     if let Err(error) = span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
         trace_id: parent.trace_id(),
@@ -346,10 +301,8 @@ where
     let uid = credentials.uid();
     let mut stream = DescriptorStream::new(stream);
     let Some(peer) = identities.get(&uid) else {
-        // The wire answer is deliberately opaque, so this is the only place the reason exists. It
-        // is also the usual reason a deployed broker never becomes ready: its own readiness probe
-        // connects as the broker's UID, and a configuration that does not map that UID refuses it
-        // exactly like any other stranger.
+        // The wire refusal is deliberately opaque; an unmapped UID is also the usual reason a
+        // broker's readiness probe fails, since it connects as the broker's own UID.
         tracing::warn!(event = "broker_peer_unmapped", peer.uid = uid);
         stream
             .write_frame(
@@ -380,9 +333,8 @@ where
     let (request, descriptors) = match received {
         Ok(request) => request,
         Err(error) => {
-            // A timeout, an oversized frame, and unreadable JSON are one wire code and three
-            // different operator problems. The kind and the bounded message stay here; the frame's
-            // own contents never do, so a decode failure cannot become a payload channel.
+            // Timeout, oversized frame, and bad JSON share one wire code; only the bounded message
+            // is logged, never the frame's bytes, so decoding can't leak data.
             tracing::warn!(
                 event = "broker_request_frame_invalid",
                 error.kind = protocol_error_kind(&error),
@@ -410,8 +362,8 @@ where
                 Some((capabilities, command_words, chat_memory)) => {
                     ResponseEnvelope::chat_capabilities(capabilities, command_words, chat_memory)
                 }
-                // A refused attestation discloses nothing about what the attested context could
-                // have seen — not even whether the subject is mapped.
+                // A refused attestation reveals nothing about the attested context, not even
+                // whether the subject is mapped.
                 None => ResponseEnvelope::error(
                     ERROR_UNAUTHENTICATED,
                     "attestation refused: no attestor authority for this subject",
@@ -428,8 +380,6 @@ where
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            // Joined to the client's trace so the word, and the proposal the caller submits next,
-            // are one run in the operator's trace rather than two unrelated roots.
             let span = tracing::info_span!(
                 "broker.command_run",
                 word = %word,
@@ -448,15 +398,10 @@ where
                 .instrument(span.clone())
                 .await
             {
-                // Whatever the guest answered travels intact: a proposal the caller submits next,
-                // text the guest rendered with the status it chose, or its own decline.
                 Ok(result) => {
                     span.record("outcome", command_run_outcome(&result));
                     ResponseEnvelope::command_run(result)
                 }
-                // Everything else — no such word, a trap, an input past the host bound, a host
-                // import — is the one opaque answer, with the cause recorded on this side, inside
-                // the run's own span so the trace names why the word stopped.
                 Err(error) => {
                     span.record("outcome", "error");
                     span.in_scope(|| report_command_run_failure(&word, &error));
@@ -470,13 +415,9 @@ where
             assets,
             sends_remaining,
         } => {
-            // Structural binding is already one frame; this check is defense in depth and makes a
-            // mismatched or malformed claim a protocol error rather than a policy decision.
             if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            // Correlation identifiers only: the proposal's input is recorded once, on the
-            // `broker.authorize` span beneath this one.
             let span = invocation_span(&invocation, attestation.as_ref());
             adopt_trace_parent(&span, invocation.trace_parent);
             match broker
@@ -516,8 +457,6 @@ where
             {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            // The same span an attested invocation opens. The broker names the record capability
-            // from its own route, so `broker.authorize` beneath this span carries it and the turn.
             let span = tracing::info_span!(
                 "broker.invocation",
                 invocation = %turn.id,
@@ -548,11 +487,8 @@ where
         .map_err(ConnectionError::Write)
 }
 
-/// Reports a broker failure while preserving whether provider work may already have completed.
-///
-/// Collapsing the two cases into one code would invite a resubmission that duplicates a
-/// non-idempotent external effect, so the distinction the broker library draws survives the
-/// wire boundary.
+/// Collapsing this into one wire code would invite retries that duplicate a non-idempotent external
+/// effect, so the completed-or-not distinction crosses the wire intact.
 async fn write_broker_failure(
     stream: &mut DescriptorStream,
     limits: FrameLimits,
@@ -609,21 +545,17 @@ enum ConnectionError {
     InvalidRequest,
     #[error("a bounded broker resource is exhausted")]
     CapacityExhausted {
-        /// The exhaustion the wire code names.
         #[source]
         source: BrokerError,
     },
     #[error("broker could not audit the outcome of {invocation}")]
     OutcomeUnaudited {
-        /// Invocation whose external effect may already have completed.
         invocation: InvocationId,
-        /// The broker failure that ended the request, kept so the log can name its cause.
         #[source]
         source: BrokerError,
     },
     #[error("broker failed")]
     Broker {
-        /// The broker failure the wire code deliberately generalizes.
         #[source]
         source: BrokerError,
     },
@@ -632,7 +564,6 @@ enum ConnectionError {
 }
 
 impl ConnectionError {
-    /// Invocation whose provider work may already have completed with no terminal audit record.
     const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {
             Self::OutcomeUnaudited { invocation, .. } => Some(invocation),
@@ -644,7 +575,6 @@ impl ConnectionError {
         }
     }
 
-    /// Whether the failure ends every subsequent request the same way until an operator acts.
     const fn is_capacity_exhausted(&self) -> bool {
         matches!(self, Self::CapacityExhausted { .. })
     }
@@ -667,7 +597,6 @@ pub enum ServerError {
     InvalidLimits,
     #[error("broker frame limits are invalid")]
     InvalidFrameLimits {
-        /// Which frame bound was rejected: a zero or over-ceiling maximum, or a zero I/O timeout.
         #[source]
         source: ProtocolError,
     },

@@ -1,5 +1,3 @@
-//! Checked logical quota reservations shared across grants and invocation handles.
-
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -88,9 +86,8 @@ impl QuotaLedger {
         observed: std::collections::BTreeSet<String>,
     ) -> Result<NamespaceReservation, StorageHostError> {
         let mut state = self.state.lock().expect("storage quota ledger");
-        // Observations can race a different namespace's in-flight creation. Unioning can only be
-        // conservative; replacing the set with one stale snapshot could forget a just-committed
-        // slot and admit the root above maxNamespaces.
+        // Observations can race another namespace's creation; unioning stays conservative, while
+        // replacing the set with a stale snapshot could admit the root above maxNamespaces.
         state.namespace_slots.extend(observed);
         if state.namespace_slots.contains(&namespace)
             || state.pending_namespace_slots.contains(&namespace)
@@ -208,9 +205,6 @@ impl RootReservation {
         let byte_growth = after.bytes.saturating_sub(before.bytes);
         let entry_growth = after.entries.saturating_sub(before.entries);
         if byte_growth > self.bytes || entry_growth > self.entries {
-            // Physical housekeeping already happened. Retaining the complete reservation is safer
-            // than releasing headroom that an unaccounted entry may now occupy; restart rebuilds
-            // the exact ledger from descriptor-relative scans.
             self.finalized = true;
             return Err(StorageHostError::Arithmetic);
         }
@@ -246,7 +240,6 @@ impl RootReservation {
         Ok(())
     }
 
-    /// Conservatively keeps housekeeping headroom after physical mutation may have started.
     pub(crate) fn retain(mut self) {
         self.finalized = true;
     }
@@ -273,8 +266,6 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
-    /// Raises the handle's exact temporary headroom reservation atomically.
-    /// A denial changes no state.
     pub(crate) fn reserve_to(
         &mut self,
         desired: u64,
@@ -375,8 +366,8 @@ impl Reservation {
         self.finalized = true;
     }
 
-    /// Keeps conservative headroom when actual usage cannot be read after a syscall failure.
-    /// Releasing it could let another namespace spend bytes still occupied on disk.
+    /// Releasing this headroom after an unreadable syscall failure could let another namespace
+    /// spend bytes still occupied on disk.
     pub(crate) fn retain_after_unknown(mut self) {
         self.finalized = true;
     }

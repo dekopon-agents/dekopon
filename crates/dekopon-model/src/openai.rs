@@ -1,5 +1,3 @@
-//! Async OpenAI-compatible chat completions and its portable wire codec.
-
 use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
@@ -21,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, ops::ControlFlow, time::Duration};
 
-/// A pooled, asynchronous client for a caller-supplied chat-completions endpoint.
 pub struct OpenAiClient {
     http: InferenceHttp,
     endpoint: String,
@@ -32,7 +29,6 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// Creates a client with bounded connection establishment; each call owns its total deadline.
     pub fn new(
         endpoint: impl Into<String>,
         model: impl Into<String>,
@@ -67,14 +63,12 @@ impl OpenAiClient {
         })
     }
 
-    /// Records the configured name separately from the provider's model identifier.
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
-    /// Uses a buffered response when false, omitting `stream` rather than sending `false`.
     #[must_use]
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
@@ -283,12 +277,6 @@ fn record_model(model: Option<&str>, secrets: DiagnosticSecrets<'_>) {
     }
 }
 
-/// The one place a finished chat-completions response becomes a turn.
-///
-/// Shared with the streaming accumulator's own conversion by the table test that asserts the two
-/// agree: a streamed turn and the non-streaming parse of the same completion are the same value,
-/// and the only way to keep that true is for the rules about what `content` and `tool_calls` mean
-/// to have one home each.
 fn turn_from_response(
     secrets: crate::diagnostic::DiagnosticSecrets<'_>,
     response: ChatResponse,
@@ -325,12 +313,10 @@ struct ChatRequest<'a> {
     messages: &'a [WireMessage<'a>],
     tools: &'a [OpenAiTool<'a>],
     tool_choice: &'static str,
-    /// Skipped when absent so a request without a cache key serializes to the same bytes it did
-    /// before the field existed. Compatible endpoints that have never heard of it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
-    /// `Some(true)` or absent, never `Some(false)`: an endpoint that does not stream is asked the
-    /// question it was asked before the field existed.
+    /// Never set stream to Some(false); only Some(true) or None keep wire compatibility for
+    /// endpoints unaware of this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,15 +328,9 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// One message as the chat-completions wire wants it.
-///
-/// A separate type from [`ModelMessage`] because the two answer different questions. This is what
-/// an endpoint parses; `ModelMessage`'s own `Serialize` is the redacted rendering that reaches the
-/// audit transcript. While they were one type, the wire format *was* the log format, which put a
-/// base64 attachment one careless `to_string` away from being written to disk forever.
-///
-/// Field order and skip rules match what the derived implementation emitted before this type
-/// existed, so a text-only request serializes to the same bytes it always did.
+/// Kept separate from ModelMessage, whose Serialize is the redacted audit rendering, because when
+/// they were one type a base64 attachment was one careless to_string away from being logged
+/// forever.
 #[derive(Debug, Serialize)]
 pub(crate) struct WireMessage<'a> {
     role: &'a str,
@@ -362,12 +342,10 @@ pub(crate) struct WireMessage<'a> {
     tool_call_id: Option<&'a str>,
 }
 
-/// Serde needs a named predicate to skip an empty borrowed slice.
 fn is_empty(calls: &&[ModelToolCall]) -> bool {
     calls.is_empty()
 }
 
-/// Untagged, so text stays a bare string and only an attachment forces the array form.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum WireContent<'a> {
@@ -507,9 +485,6 @@ struct ChatResponse {
     usage: Option<WireChatUsage>,
 }
 
-/// Chat-completions `usage` object, including the detail blocks that carry cache and reasoning
-/// counts. Every field defaults: a compatible endpoint that omits any of them still bills for the
-/// rest, so a partial report is worth keeping.
 #[derive(Debug, Deserialize)]
 pub(crate) struct WireChatUsage<CacheWrite = serde::de::IgnoredAny> {
     #[serde(default)]
@@ -639,7 +614,6 @@ impl WireToolCall {
     }
 }
 
-/// Replays an offline chat-completions transcript through the live reducer and framer.
 pub(crate) fn replay_transcript(
     secrets: DiagnosticSecrets<'_>,
     body: &str,
@@ -666,24 +640,16 @@ pub(crate) fn replay_transcript(
     state.into_turn(secrets)
 }
 
-/// One `data:` chunk of a chat-completions stream.
-///
-/// Every field is optional and every absence is tolerated, because "OpenAI-compatible" is a claim
-/// rather than a specification: llama.cpp, Ollama, vLLM, and a dozen proxies each omit or null a
-/// different one, and a turn that arrived intact must not fail on the shape of a field nobody
-/// reads.
+/// Every field is optional and every absence tolerated, since being OpenAI-compatible is a claim,
+/// not a spec: llama.cpp, Ollama, vLLM, and other proxies each omit or null a different one.
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     choices: Vec<ChunkChoice>,
-    /// Present on the final chunk when `stream_options.include_usage` was sent, `null` on every
-    /// earlier chunk from endpoints that send the field unconditionally.
     #[serde(default)]
     usage: Option<WireChatUsage>,
-    /// Some endpoints report a mid-stream failure as an event instead of a status, the response
-    /// having already been committed with a 200.
     #[serde(default)]
     error: Option<ChunkError>,
 }
@@ -700,7 +666,6 @@ pub(crate) struct ChunkError {
 struct ChunkChoice {
     #[serde(default)]
     delta: Option<ChunkDelta>,
-    /// `stop`, `tool_calls`, `length`; the one signal that this choice is complete.
     #[serde(default)]
     finish_reason: Option<FinishReason>,
 }
@@ -715,8 +680,6 @@ struct ChunkDelta {
 
 #[derive(Debug, Deserialize)]
 struct ChunkToolCall {
-    /// Which call this fragment belongs to. Absent means the first: an endpoint that reports one
-    /// call at a time has nothing to number.
     #[serde(default)]
     index: Option<u64>,
     #[serde(default)]
@@ -735,7 +698,6 @@ struct ChunkFunction {
     arguments: Option<String>,
 }
 
-/// A tool call being assembled from fragments.
 #[derive(Debug)]
 struct StreamedCall {
     id: String,
@@ -744,7 +706,6 @@ struct StreamedCall {
     arguments: String,
 }
 
-/// The turn a chat-completions stream is building.
 #[derive(Debug, Default)]
 struct ChatStream {
     content: String,
@@ -757,7 +718,6 @@ struct ChatStream {
 }
 
 impl ChatStream {
-    /// Folds one chunk in, reporting what it contained.
     fn apply(
         &mut self,
         chunk: ChatChunk,
@@ -768,8 +728,8 @@ impl ChatStream {
         if let Some(error) = chunk.error {
             return Err(stream_failure(error, secrets));
         }
-        // Last report wins, which is the final usage-only chunk on an endpoint that sends one and
-        // the last running total on an endpoint that repeats it.
+        // Overwrite, not accumulate: some endpoints send one final usage chunk, others repeat a
+        // running total each chunk.
         if let Some(usage) = chunk.usage {
             self.usage = Some(ModelUsage::from(usage));
         }
@@ -798,7 +758,6 @@ impl ChatStream {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Merges one tool-call fragment, answering the turn position of a call it started.
     fn merge_call(&mut self, fragment: ChunkToolCall) -> Option<u32> {
         let index = fragment.index.unwrap_or(0);
         let function = fragment.function.unwrap_or_default();
@@ -806,9 +765,8 @@ impl ChatStream {
         let arguments = function.arguments.unwrap_or_default();
 
         let slot = match self.latest.get(&index).copied() {
-            // Ollama reports every call of a parallel batch at index 0. A fragment that names a
-            // function when the call already at that index has one is a second call, not more of
-            // the first; anything else is a continuation, which is what OpenAI sends.
+            // Ollama reports every parallel call at index 0, so a fragment naming a function when
+            // that index already has one starts a new call rather than continuing it.
             Some(position) if name.is_some() && !self.calls[position].name.is_empty() => None,
             other => other,
         };
@@ -873,12 +831,8 @@ impl ChatStream {
     }
 }
 
-/// Whether a bearer token may accompany requests to this endpoint.
-///
-/// The connection host must be derived exactly as the transport derives it. `Uri::host` excludes
-/// userinfo, so an authority such as `127.0.0.1:80@models.example.test` resolves to the remote
-/// host it actually connects to rather than the loopback literal it imitates. `Uri::host` returns
-/// IPv6 literals bracketed and does not normalize case, so both are handled here.
+/// Must derive the host exactly as the transport does: Uri::host ignores userinfo, so an authority
+/// like 127.0.0.1:80@evil.test actually connects to evil.test despite looking like loopback.
 fn allows_bearer_token(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<http::Uri>() else {
         return false;
@@ -1556,12 +1510,10 @@ mod tests {
         assert!(!fields.contains(token));
     }
 
-    /// The callback for a turn whose deltas are not what the test is about.
     fn ignored(_event: TurnEvent) -> ControlFlow<()> {
         ControlFlow::Continue(())
     }
 
-    /// Every event a turn reported, in order, rendered so a test can assert on them.
     fn recorded(events: &[TurnEvent]) -> Vec<String> {
         events
             .iter()
@@ -1572,9 +1524,6 @@ mod tests {
             .collect()
     }
 
-    /// `ureq`'s own status error renders as `http status: 429` and discards the body, which is the
-    /// only part of a failure that says whether the model name is wrong, the context is too long,
-    /// or which rate limit was hit.
     #[tokio::test]
     async fn a_failed_completion_reports_the_endpoints_own_error_body() {
         let server = MockServer::start(vec![MockResponse::failure(
@@ -1603,9 +1552,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_that_ignores_stream_true_is_refused_naming_the_key_to_write() {
-        // A whole JSON completion where an event stream was asked for: what a stub or a buffering
-        // proxy answers. The turn fails at once, and the error names `stream: false` rather than
-        // the end of a stream that never was one.
         let server = MockServer::start(vec![MockResponse::json(
             json!({"choices": [{"message": {"role": "assistant", "content": "hello"}}]}),
         )]);
@@ -1696,7 +1642,6 @@ mod tests {
 
         assert!(matches!(error, InferenceError::InvalidRequest(_)));
 
-        // Userinfo makes the authority read as loopback while the socket connects elsewhere.
         for disguised in [
             "http://127.0.0.1:80@models.example.test/v1",
             "http://localhost@models.example.test/v1",
@@ -1769,7 +1714,6 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_bare_usage_counts_from_minimal_endpoints() {
-        // llama.cpp and friends report the three counts with no detail blocks.
         let response: ChatResponse = serde_json::from_value(json!({
             "choices": [{"message": {"content": "hi"}}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
@@ -1805,21 +1749,12 @@ mod tests {
         assert_eq!(call.function.arguments, r#"{"message":"hi"}"#);
     }
 
-    /// Serializes one request fragment so the comparison is over the bytes a provider's prefix
-    /// cache would hash. Both sides come from this same binary, so key ordering — which
-    /// `serde_json`'s `preserve_order` feature makes a per-binary property — cannot make the
-    /// assertion fail for a reason unrelated to the property under test.
     fn request_text(fragment: &Value) -> String {
         serde_json::to_string(fragment).expect("serialize request fragment")
     }
 
     #[tokio::test]
     async fn an_appended_turn_extends_the_chat_request_without_disturbing_its_prefix() {
-        // The chat-completions transport serializes `messages` verbatim and in order, hoisting
-        // nothing, so an append-only history is an append-only request. Nothing enforces that but
-        // this test. A conversation feature has to be correct on both backends, and this is the
-        // half where a regression is hardest to notice: the request stays valid, the answers stay
-        // right, and the only symptom is that the provider's prompt cache stops hitting.
         let tool = ModelTool {
             name: "bash".to_owned(),
             description: "Run a sandboxed script".to_owned(),
@@ -1869,8 +1804,6 @@ mod tests {
             messages.push(ModelMessage::tool(call_id, "12\n"));
         }
 
-        // Unlike the Codex transport, the system message keeps its authored position instead of
-        // being lifted into a separate top-level field, so growth here really is only growth.
         assert_eq!(bodies[0]["messages"][0]["role"], "system");
         for pair in bodies.windows(2) {
             let (previous, next) = (&pair[0], &pair[1]);
@@ -1897,9 +1830,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_chat_request_carries_a_cache_key_only_when_one_is_set() {
-        // Same contract as the Codex transport: absent means the field is gone, not null, so an
-        // OpenAI-compatible endpoint that has never heard of `prompt_cache_key` keeps receiving
-        // the request it always received.
         let tool = ModelTool {
             name: "bash".to_owned(),
             description: "Run a sandboxed script".to_owned(),
@@ -1974,10 +1904,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_implementation_that_cannot_stream_answers_without_reporting_an_event() {
-        // Streaming is not optional at the trait, so this is the contract every non-streaming
-        // implementation honors — the test doubles elsewhere in the workspace, and this crate's
-        // own client with `stream: false`. It calls `on_event` zero times and returns the whole
-        // turn, so a caller never needs a second code path for "this one does not stream".
         struct WholeTurnModel;
 
         impl ChatModel for WholeTurnModel {
@@ -2035,7 +1961,6 @@ mod tests {
         );
     }
 
-    /// One message through the chat-completions wire mapping.
     async fn wire(message: &ModelMessage) -> Value {
         serde_json::to_value(WireMessage::prepare(message).await.expect("wire"))
             .expect("serialize wire message")
@@ -2159,9 +2084,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_text_only_message_still_serializes_to_a_bare_string() {
-        // The compatibility promise of the whole change. `content` became an enum, and an untagged
-        // enum that guessed wrong here would silently reshape every request the daemon has ever
-        // sent to an endpoint that has never heard of content parts.
         assert_eq!(
             wire(&ModelMessage::user("how many files?")).await,
             json!({"role": "user", "content": "how many files?"})
@@ -2211,8 +2133,6 @@ mod tests {
         }
     }
 
-    /// `ureq`'s own JSON body renders with `to_vec_pretty` into a `Vec` that doubles past the
-    /// payload; the request buffer this crate sends is exactly the document it carries.
     #[tokio::test]
     async fn a_request_body_buffer_is_exactly_the_bytes_it_carries() {
         let body = json!({"data": "x".repeat(1_000_000)});
@@ -2230,8 +2150,6 @@ mod tests {
         );
     }
 
-    /// The `data:` URL is written as it is encoded rather than built first, and the two renderings
-    /// must stay the same string: it is the only thing the model ever sees of an attachment.
     #[tokio::test]
     async fn an_attachment_serializes_as_the_data_url_it_has_always_been() {
         use base64::Engine as _;
@@ -2255,10 +2173,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_attachment_never_reaches_the_audit_transcript_as_bytes() {
-        // `dekopon-agent` logs every prompt by serializing the message slice, so `ModelMessage`'s
-        // own `Serialize` is the audit rendering rather than the wire one. A base64 screenshot in
-        // that record would be enormous, sender-supplied, and permanent. The wire mapping above is
-        // the only thing that ever encodes.
         let message = ModelMessage::user_with_parts(vec![
             ContentPart::Text("look".to_owned()),
             ContentPart::Image {
@@ -2279,7 +2193,6 @@ mod tests {
             !logged.contains("UE5H"),
             "encoded bytes must never reach the log: {logged}"
         );
-        // `Debug` is the other way a message reaches a log, and it has the same duty.
         let debugged = format!("{message:?}");
         assert!(debugged.contains("bytes: 3"), "{debugged}");
         assert!(!debugged.contains("UE5H"), "{debugged}");
@@ -2289,7 +2202,6 @@ mod tests {
         );
     }
 
-    /// Frames chunk bodies the way an endpoint puts them on the wire.
     fn frames(chunks: &[&str]) -> String {
         chunks
             .iter()
@@ -2297,7 +2209,6 @@ mod tests {
             .collect()
     }
 
-    /// One recorded turn from a chat-completions endpoint.
     struct Recorded {
         name: &'static str,
         stream: String,
@@ -2305,20 +2216,11 @@ mod tests {
     }
 
     enum Expected {
-        /// The body the same endpoint answers with when it is not asked to stream. The streamed
-        /// turn must equal the parse of this, value for value.
         Completion(&'static str),
-        /// The stream failed, and the surfaced cause must contain this.
         MissingTerminal,
         ProviderFailure,
     }
 
-    /// Transcripts recorded from the endpoints this client actually meets.
-    ///
-    /// "OpenAI-compatible" is a claim, not a specification, so the awkward ones are here on
-    /// purpose: llama.cpp answering with a whole tool call in one fragment, Ollama numbering every
-    /// call of a batch `0`, a proxy splitting one chunk across two `data:` lines, an endpoint
-    /// nulling `usage` on every chunk but the last.
     fn recorded_turns() -> Vec<Recorded> {
         vec![
             Recorded {
@@ -2422,11 +2324,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_streamed_turn_equals_the_non_streaming_parse_of_the_same_completion() {
-        // The property the whole feature rests on: whether or not a caller watched the deltas, the
-        // turn handed back is the same value, so tool-call execution, history, and accounting
-        // never learn that streaming exists. The two cut-off transcripts are here for the other
-        // half of it — a turn that did not finish is a failure that names its cause, never a
-        // shorter answer that looks complete.
         for case in recorded_turns() {
             match case.expected {
                 Expected::Completion(completion) => {
@@ -2537,9 +2434,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_callback_that_breaks_abandons_the_streamed_turn_rather_than_shortening_it() {
-        // Failure path: the caller stopped the turn between events. Half a turn is not a turn, so
-        // the answer is an interruption the caller can act on and not a truncated `AssistantTurn`
-        // that would reach a conversation history looking complete.
         let stream = frames(&[
             r#"{"choices":[{"index":0,"delta":{"content":"half an"}}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":" answer"},"finish_reason":"stop"}]}"#,
@@ -2566,11 +2460,6 @@ mod tests {
         );
     }
 
-    /// The JSON body of a recorded request.
-    ///
-    /// Parsed rather than string-matched: the claim is about the field, not about its spelling,
-    /// and a body that once carried `to_vec_pretty` whitespace around `"stream": true` would have
-    /// slipped past a substring assertion.
     fn request_body(request: &str) -> Value {
         let (_, body) = request
             .split_once("\r\n\r\n")
@@ -2626,8 +2515,6 @@ mod tests {
     #[tokio::test]
     async fn an_endpoint_with_streaming_off_gets_the_request_it_received_before_streaming_existed()
     {
-        // The escape hatch has to be a true no-op on the wire: `stream: false` is not sent, the
-        // field is absent, and a proxy that has never heard of it sees the request it always saw.
         let server = MockServer::start(vec![MockResponse::json(json!({
             "choices": [{"message": {"content": "Merged already."}}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
@@ -2668,8 +2555,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_multimodal_message_reports_parts_rather_than_partial_text() {
-        // `content()` answering `Some("look")` would hand a caller the text and drop the image
-        // without saying so, which is the failure this accessor split exists to prevent.
         let message = ModelMessage::user_with_parts(vec![ContentPart::Text("look".to_owned())]);
         assert_eq!(message.content(), None);
         assert_eq!(message.parts().map(<[_]>::len), Some(1));

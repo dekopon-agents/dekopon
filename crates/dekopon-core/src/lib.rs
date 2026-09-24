@@ -1,15 +1,3 @@
-//! Dependency-light domain types for Dekopon.
-//!
-//! Identifiers are validated at construction and during deserialization. This prevents
-//! malformed resource references from leaking into the rest of the workspace while
-//! keeping transport, command-line, async-runtime, and policy concerns out of this crate.
-//!
-//! It also holds the helpers that separate processes must not disagree about — the `accept()` retry
-//! classification, `error_chain`, the span-attribute bound [`bounded_attribute`], the bounded
-//! provider failure pair [`ProviderFailureDetail`], and the trusted-file predicate behind
-//! [`read_trusted_file`] — because a fact split across five crates drifts, and the
-//! file-permission mask already had.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -22,7 +10,6 @@
 )]
 pub mod asset;
 
-/// Shared bounded native base64 plumbing; absent from guest builds.
 #[cfg(feature = "native")]
 pub mod base64;
 
@@ -57,28 +44,13 @@ pub use trusted_file::{
 };
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
-/// Maximum canonical bytes in one public Dekopon resource name for secret material.
 pub const MAX_SECRET_DRN_LENGTH: usize = 512;
-/// Maximum bytes in an HTTP Basic username proposed alongside a secret reference.
 pub const MAX_SECRET_USERNAME_LENGTH: usize = 256;
 
-/// File extension a Dekopon provider component is recognized by.
-///
-/// The privileged broker uses this to select components when reading a provider directory
-/// under its owner-only file rules.
 pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 
-/// Words a provider may not claim as a command word.
-///
-/// The sandboxed shell owns this namespace: builtins, the words the evaluator executes itself, and
-/// the words it refuses by name. A provider command word is dispatched only after all three, so a
-/// claim on one of these could never fire — reporting it at load is the difference between a
-/// manifest that lies and one that fails.
-///
-/// It lives here rather than in `dekopon-shell` so the broker can produce one conflict report at
-/// its own startup without linking an interpreter it never runs. `dekopon-shell` owns the tables
-/// this mirrors and pins the two together with a bidirectional test, so a builtin added or removed
-/// there fails the build until this list agrees.
+/// Must mirror dekopon-shell's own builtin and reserved-word tables exactly; a bidirectional test
+/// fails the build if the two disagree.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
     ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "cut",
     "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit", "export",
@@ -87,65 +59,34 @@ pub const RESERVED_COMMAND_WORDS: &[&str] = &[
     "then", "trap", "true", "uniq", "unset", "until", "wait", "wc", "while", "xargs",
 ];
 
-/// The reason a Dekopon identifier could not be parsed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum IdentifierError {
-    /// The identifier was empty.
     #[error("{kind} identifier must not be empty")]
-    Empty {
-        /// Human-readable identifier kind.
-        kind: &'static str,
-    },
-    /// The identifier exceeded the supported wire limit.
+    Empty { kind: &'static str },
     #[error("{kind} identifier is {length} bytes; the maximum is {maximum}")]
     TooLong {
-        /// Human-readable identifier kind.
         kind: &'static str,
-        /// Actual byte length.
         length: usize,
-        /// Maximum byte length.
         maximum: usize,
     },
-    /// The first character was not an ASCII lowercase letter or digit.
     #[error(
         "{kind} identifier must start with a lowercase ASCII letter or digit, found {character:?}"
     )]
-    InvalidStart {
-        /// Human-readable identifier kind.
-        kind: &'static str,
-        /// Invalid character.
-        character: char,
-    },
-    /// The last character was a separator.
+    InvalidStart { kind: &'static str, character: char },
     #[error(
         "{kind} identifier must end with a lowercase ASCII letter or digit, found {character:?}"
     )]
-    InvalidEnd {
-        /// Human-readable identifier kind.
-        kind: &'static str,
-        /// Invalid character.
-        character: char,
-    },
-    /// A character outside the portable identifier alphabet was present.
+    InvalidEnd { kind: &'static str, character: char },
     #[error(
         "{kind} identifier contains invalid character {character:?} at byte {index}; use lowercase ASCII letters, digits, '.', '-', or '_'"
     )]
     InvalidCharacter {
-        /// Human-readable identifier kind.
         kind: &'static str,
-        /// Byte offset in the submitted value.
         index: usize,
-        /// Invalid character.
         character: char,
     },
-    /// Two separator characters appeared next to one another.
     #[error("{kind} identifier contains adjacent separators at byte {index}")]
-    AdjacentSeparators {
-        /// Human-readable identifier kind.
-        kind: &'static str,
-        /// Byte offset of the second separator.
-        index: usize,
-    },
+    AdjacentSeparators { kind: &'static str, index: usize },
 }
 
 fn is_edge_character(character: char) -> bool {
@@ -214,7 +155,6 @@ macro_rules! identifier {
         pub struct $name(String);
 
         impl $name {
-            /// Returns the validated identifier as a string slice.
             #[must_use]
             pub fn as_str(&self) -> &str {
                 &self.0
@@ -264,8 +204,6 @@ macro_rules! identifier {
             where
                 D: Deserializer<'de>,
             {
-                // `TryFrom<String>` validates the deserialized buffer in place; `parse` would
-                // validate a borrow of it and then allocate a second copy of the same bytes.
                 Self::try_from(String::deserialize(deserializer)?).map_err(D::Error::custom)
             }
         }
@@ -300,17 +238,13 @@ identifier!(
     "A validated authenticated principal identifier."
 );
 
-/// A canonical, public name for broker-held secret material.
-///
-/// A DRN is deliberately inert: knowing or copying one grants no authority. It contains only a
-/// logical naming authority, realm, and path; backend names, physical locators, fields, selectors,
-/// and versions remain in the broker's owner-only secret map.
+/// A DRN is deliberately inert: knowing or copying one grants no authority; the actual backend
+/// location stays in the broker's private secret map.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SecretDrn(String);
 
 impl SecretDrn {
-    /// Returns the canonical DRN.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -406,21 +340,16 @@ fn valid_drn_component(value: &str) -> bool {
         })
 }
 
-/// Why a public secret DRN is not canonical.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SecretDrnError {
-    /// The value does not match `drn:<authority>:secret:<realm>:<logical-path>`.
     #[error("secret DRN must be canonical `drn:<authority>:secret:<realm>:<logical-path>`")]
     Malformed,
-    /// The complete DRN exceeded its wire bound.
     #[error("secret DRN is {length} bytes; maximum is {maximum}")]
     TooLong { length: usize, maximum: usize },
 }
 
-/// Opaque secret bytes whose ordinary rendering never reveals content or length.
-///
-/// Broker-private crates use this carrier across trusted layers. It deliberately implements no
-/// serialization and has no public conversion back into an owned byte vector.
+/// Deliberately has no serialization and no public way back to an owned byte vector; ordinary
+/// rendering reveals neither content nor length.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SecretBytes(Vec<u8>);
 
@@ -442,13 +371,10 @@ impl fmt::Debug for SecretBytes {
     }
 }
 
-/// The native sink in which the broker may consume a proposed secret reference.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SecretSinkKind {
-    /// `Authorization: Bearer <token>` rendered inside the native HTTP host.
     HttpBearer,
-    /// `Authorization: Basic base64(username:password)` rendered inside the native HTTP host.
     HttpBasic,
 }
 
@@ -461,10 +387,8 @@ impl fmt::Display for SecretSinkKind {
     }
 }
 
-/// Untrusted, typed intent to use one public secret reference in one native sink.
-///
-/// This value may travel in a proposal. It is never authority and is never passed to a provider;
-/// the broker must separately authorize `secret.use` and match an owner-authored use binding.
+/// Untrusted intent only; never authority and never passed to a provider, since the broker must
+/// separately authorize secret.use against an owner-authored binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum SecretUseProposal {
@@ -479,7 +403,6 @@ pub enum SecretUseProposal {
 }
 
 impl SecretUseProposal {
-    /// Returns the exact proposed DRN.
     #[must_use]
     pub const fn secret(&self) -> &SecretDrn {
         match self {
@@ -487,7 +410,6 @@ impl SecretUseProposal {
         }
     }
 
-    /// Returns the proposed native sink kind.
     #[must_use]
     pub const fn sink(&self) -> SecretSinkKind {
         match self {
@@ -496,7 +418,6 @@ impl SecretUseProposal {
         }
     }
 
-    /// Returns the public Basic username when that sink was proposed.
     #[must_use]
     pub fn username(&self) -> Option<&str> {
         match self {
@@ -525,38 +446,20 @@ where
     Ok(username)
 }
 
-/// The authenticated actor responsible for an operation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Actor {
-    /// A human operator.
-    Human {
-        /// The operator's trusted principal identity.
-        principal: PrincipalId,
-    },
-    /// A Dekopon agent. The envelope carrying this value must authenticate it.
-    Agent {
-        /// The agent identity.
-        agent: AgentId,
-    },
-    /// A non-human service principal.
-    Service {
-        /// The service's trusted principal identity.
-        principal: PrincipalId,
-    },
+    Human { principal: PrincipalId },
+    Agent { agent: AgentId },
+    Service { principal: PrincipalId },
 }
 
-/// Coarse risk classification used as policy input.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RiskLevel {
-    /// No expected external side effect and limited data exposure.
     Low,
-    /// Meaningful data access or a reversible/local effect.
     Medium,
-    /// An external write, sensitive data access, or difficult rollback.
     High,
-    /// A potentially destructive or high-impact operation.
     Critical,
 }
 
@@ -566,17 +469,12 @@ impl fmt::Display for RiskLevel {
     }
 }
 
-/// Operational phase reported for an agent.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum AgentStatus {
-    /// Configuration intentionally prevents the agent from running.
     Disabled,
-    /// The agent is valid but not yet ready.
     Pending,
-    /// The agent is ready for orchestration.
     Ready,
-    /// The agent cannot operate because of an error.
     Error,
 }
 
@@ -683,19 +581,14 @@ mod tests {
     }
 }
 
-/// Why a provider may not claim a command word.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CommandWordConflictKind {
-    /// The sandboxed shell owns the word: a builtin, a control word, or one it refuses by name.
     Reserved,
-    /// More than one provider claimed it.
     Duplicate,
-    /// One provider declared it more than once.
     Repeated,
 }
 
 impl CommandWordConflictKind {
-    /// Returns the operator-facing explanation of why the claim cannot stand.
     #[must_use]
     pub const fn explanation(self) -> &'static str {
         match self {
@@ -705,7 +598,6 @@ impl CommandWordConflictKind {
         }
     }
 
-    /// Returns the fix an operator should apply.
     #[must_use]
     pub const fn remedy(self) -> &'static str {
         match self {
@@ -716,24 +608,15 @@ impl CommandWordConflictKind {
     }
 }
 
-/// One command word that cannot be granted to the provider(s) claiming it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandWordConflict {
-    /// The contested word.
     pub word: String,
-    /// Every distinct provider claiming it, in the order they were loaded.
     pub claimants: Vec<String>,
-    /// Why the claim cannot stand.
     pub kind: CommandWordConflictKind,
 }
 
-/// Finds every reason the given provider-declared command words cannot all be granted.
-///
-/// Ambiguity is fatal in a way absence is not. A word two providers both claim has no meaning the
-/// shell can pick without silently choosing for the operator, so this reports rather than resolves,
-/// and it reports *everything* — fixing a provider directory should take one restart, not six.
-///
-/// `declared` is `(provider id, command words)` in load order.
+/// Reports every conflict rather than silently picking a winner for the operator, and reports all
+/// of them at once so one fix pass suffices.
 #[must_use]
 pub fn command_word_conflicts(declared: &[(String, Vec<String>)]) -> Vec<CommandWordConflict> {
     use std::collections::BTreeMap;
@@ -750,8 +633,6 @@ pub fn command_word_conflicts(declared: &[(String, Vec<String>)]) -> Vec<Command
 
     let mut conflicts = Vec::new();
     for (word, providers) in claimants {
-        // A manifest listing one word twice is one provider's mistake, not a collision between
-        // two, so the count that decides Duplicate is of distinct providers.
         let mut distinct = Vec::with_capacity(providers.len());
         for provider in &providers {
             if !distinct.contains(provider) {
@@ -800,11 +681,6 @@ mod command_word_tests {
         );
     }
 
-    /// A provider may claim `gh`, which is the point of having deleted the builtin.
-    ///
-    /// This test replaces `gh_is_reserved_until_its_builtin_is_deleted`, which existed to fail at
-    /// exactly this moment. Keeping its successor pointed at the same word is what stops `gh`
-    /// quietly returning to the reserved list and stranding the out-of-tree provider.
     #[test]
     fn a_provider_may_claim_gh_now_that_no_builtin_owns_it() {
         assert!(command_word_conflicts(&declared(&[("gh", &["gh"])])).is_empty());
@@ -824,9 +700,6 @@ mod command_word_tests {
         }
     }
 
-    /// A repeated word is still refused, but the operator is told what actually happened: one
-    /// manifest lists it twice. "More than one provider" would send them looking for a provider
-    /// that does not exist.
     #[test]
     fn one_provider_repeating_a_word_is_not_reported_as_two_providers() {
         let conflicts = command_word_conflicts(&declared(&[("fly", &["deploy", "deploy"])]));
@@ -843,7 +716,6 @@ mod command_word_tests {
             conflicts[0].kind.explanation()
         );
 
-        // A real two-provider collision still reads as one, even when one of them repeats.
         let conflicts = command_word_conflicts(&declared(&[
             ("fly", &["deploy", "deploy"]),
             ("k8s", &["deploy"]),
@@ -853,8 +725,6 @@ mod command_word_tests {
         assert_eq!(conflicts[0].claimants, ["fly", "k8s"]);
     }
 
-    /// A separator in a command word shadows nothing, because a capability identifier is not a
-    /// command: a word shaped like one is claimed and contested by the same rules as any other.
     #[test]
     fn a_word_containing_a_separator_follows_the_ordinary_rules() {
         assert!(
@@ -881,15 +751,10 @@ mod command_word_tests {
         assert_eq!(conflicts[0].claimants, ["fly", "k8s"]);
     }
 
-    /// The requirement this whole shape exists for: fixing a provider directory takes one restart.
-    ///
-    /// A check that returned on the first problem would make an operator rediscover the next one
-    /// after every rebuild.
     #[test]
     fn conflicts_of_several_classes_are_all_reported_at_once() {
         let conflicts = command_word_conflicts(&declared(&[
             ("fly", &["deploy", "jq"]),
-            // Claimed once, `gh.pr` shadows nothing and stays out of the report.
             ("k8s", &["deploy", "gh.pr"]),
             ("danger", &["eval"]),
         ]));
@@ -909,8 +774,6 @@ mod command_word_tests {
         );
     }
 
-    /// Reserved beats duplicate: two providers claiming `jq` have a naming problem, but the one
-    /// worth telling them about is that `jq` could never have dispatched either way.
     #[test]
     fn a_reserved_word_is_reported_as_reserved_even_when_contested() {
         let conflicts = command_word_conflicts(&declared(&[("one", &["jq"]), ("two", &["jq"])]));
@@ -931,7 +794,6 @@ mod command_word_tests {
     }
 }
 
-/// Parses an exact conversation asset marker; ordinary text is never rewritten.
 #[must_use]
 pub fn chat_asset_marker(text: &str) -> Option<u64> {
     let digits = text.strip_prefix("chat-asset:")?;

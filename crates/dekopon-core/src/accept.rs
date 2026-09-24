@@ -1,38 +1,16 @@
-//! What a failed `accept()` says about the listening socket, and how long to wait.
-//!
-//! The broker's Unix control socket uses this classification to distinguish transient pressure
-//! from a broken listener. Retryable errors wait with bounded backoff; permanent failures stop
-//! the listener. The stable failure names let the caller report the cause of each retry rather
-//! than hiding an errno behind a fixed-delay retry loop.
-
 use std::io;
 
-/// First wait after a retryable `accept()` failure.
-///
-/// Short enough that a descriptor freed by a closing connection is picked up almost immediately.
 pub const ACCEPT_BACKOFF_MS: u64 = 100;
 
-/// Ceiling the wait doubles up to while the condition persists.
 pub const MAX_ACCEPT_BACKOFF_MS: u64 = 1_000;
 
-/// Stable, low-cardinality name for an `accept` failure the loop can survive, or `None` if fatal.
-///
-/// Exiting is the expensive answer for the caller that can: that is the privileged daemon, so the
-/// process ends, the container restarts, and every provider recompiles under Cranelift before the
-/// socket rebinds — minutes, against a five-minute startup probe. Process or system descriptor exhaustion, kernel buffer exhaustion,
-/// a client that vanished between its connect and this accept, and a signal interruption are all
-/// conditions the next accept can succeed through. None of them say the listener is broken,
-/// and none are worth a cold start.
-///
-/// The name is a telemetry value rather than a message: a loop that keeps retrying has to say
-/// *which* exhaustion it is waiting on before an operator can act on it.
+/// Restarting is expensive here: every provider recompiles under Cranelift before the socket
+/// rebinds, taking minutes, so only truly fatal errors should stop the daemon.
 #[cfg(unix)]
 pub fn retryable_accept_error(error: &io::Error) -> Option<&'static str> {
     match error.raw_os_error()? {
         libc::EMFILE => Some("process-descriptor-limit"),
         libc::ENFILE => Some("system-descriptor-limit"),
-        // `accept` reports the same kernel-memory pressure under either name depending on the
-        // platform and the allocation that failed.
         libc::ENOBUFS | libc::ENOMEM => Some("kernel-memory"),
         libc::ECONNABORTED => Some("connection-aborted"),
         libc::ECONNRESET => Some("connection-reset"),
@@ -41,10 +19,6 @@ pub fn retryable_accept_error(error: &io::Error) -> Option<&'static str> {
     }
 }
 
-/// Unix `errno` values are the whole table, so nothing is classified as retryable elsewhere.
-///
-/// A caller that cannot abort keeps waiting at its ceiling, which is what it did before this
-/// classification existed.
 #[cfg(not(unix))]
 pub fn retryable_accept_error(_error: &io::Error) -> Option<&'static str> {
     None
@@ -56,11 +30,6 @@ mod tests {
 
     use super::retryable_accept_error;
 
-    /// One transient `accept` failure used to end the privileged daemon, and ending it is the most
-    /// expensive answer available: the container restarts, and every provider recompiles under
-    /// Cranelift before the socket rebinds.
-    /// Process or system descriptor exhaustion is not a broken listener and must remain retryable.
-    /// Keep permanent listener faults on the fatal path.
     #[test]
     fn transient_accept_failures_are_survivable_and_the_rest_are_not() {
         for (errno, kind) in [
@@ -79,8 +48,6 @@ mod tests {
             );
         }
 
-        // A listener that is gone, unbound, or not a socket is a real fault: retrying it forever
-        // would turn a startup mistake into a silent hang.
         for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
             assert_eq!(
                 retryable_accept_error(&io::Error::from_raw_os_error(errno)),
@@ -88,7 +55,6 @@ mod tests {
                 "errno {errno} must stay fatal"
             );
         }
-        // Not every `io::Error` carries an errno.
         assert_eq!(retryable_accept_error(&io::Error::other("no errno")), None);
     }
 }

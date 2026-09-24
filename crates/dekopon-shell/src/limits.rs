@@ -1,45 +1,27 @@
-//! Hand-built sandbox bounds for the tree-walking evaluator.
-//!
-//! This interpreter is native Rust, not Wasm: there is no fuel meter, no linear-memory ceiling, and
-//! no engine-level deadline to fall back on. Every bound a script can exhaust is owned here and
-//! enforced from the evaluator.
+//! This interpreter is native Rust, not Wasm, so there is no fuel meter, memory ceiling, or engine
+//! deadline to fall back on; every bound a script can exhaust must be owned and enforced here.
 
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
 
-/// Default statement/loop/call budget for one script.
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
-/// Default shell-function call-stack depth.
 pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
-/// Default accumulated output ceiling in bytes.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
-/// Default accumulated output ceiling in lines.
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
-/// Default wall-clock deadline for one script.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default number of capability invocations one script may drive.
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 32;
-/// Default ceiling on the value bytes one script may materialize.
 pub const DEFAULT_MAX_VALUE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Configurable execution bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
-    /// Statements, loop iterations, and function calls one script may execute.
     pub max_steps: u64,
-    /// Maximum nested shell-function calls.
     pub max_recursion_depth: u32,
-    /// Maximum accumulated output bytes.
     pub max_output_bytes: usize,
-    /// Maximum accumulated output lines.
     pub max_output_lines: usize,
-    /// Wall-clock deadline for the whole script.
     pub timeout: Duration,
-    /// Maximum capability invocations one script may drive.
     pub max_capability_calls: u32,
-    /// Maximum value bytes one script may materialize; see [`Budget::charge_value_bytes`].
     pub max_value_bytes: u64,
 }
 
@@ -57,37 +39,15 @@ impl Default for Limits {
     }
 }
 
-/// A limit a running script exhausted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LimitExceeded {
-    /// The statement/loop/call budget ran out.
-    Steps {
-        /// Configured budget.
-        maximum: u64,
-    },
-    /// Shell functions nested too deeply.
-    RecursionDepth {
-        /// Configured depth cap.
-        maximum: u32,
-    },
-    /// The script exceeded its wall-clock deadline.
-    Deadline {
-        /// Configured deadline in milliseconds.
-        timeout_ms: u128,
-    },
-    /// The script drove too many capability invocations.
-    CapabilityCalls {
-        /// Configured call cap.
-        maximum: u32,
-    },
-    /// The script materialized more value bytes than it is allowed to.
-    ValueBytes {
-        /// Configured value-byte ceiling.
-        maximum: u64,
-    },
+    Steps { maximum: u64 },
+    RecursionDepth { maximum: u32 },
+    Deadline { timeout_ms: u128 },
+    CapabilityCalls { maximum: u32 },
+    ValueBytes { maximum: u64 },
 }
 
-/// Mutable per-execution counters for one script run.
 #[derive(Debug)]
 pub struct Budget {
     limits: Limits,
@@ -99,7 +59,6 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Starts a fresh budget and its wall clock.
     #[must_use]
     pub fn start(limits: Limits) -> Self {
         Self {
@@ -112,13 +71,9 @@ impl Budget {
         }
     }
 
-    /// Charges one evaluation step and re-checks the deadline.
-    ///
-    /// This is the only backstop against `while true; do :; done`. The deadline is re-read on
-    /// *every* step rather than every Nth: a script can spend minutes in very few steps (a handful
-    /// of slow capability calls, one enormous string concatenation), so a sampled clock leaves the
-    /// exact workloads that most need bounding unbounded. Reading a monotonic clock costs tens of
-    /// nanoseconds against a tree-walking step that costs far more.
+    /// This is the only backstop against an infinite loop; the deadline is re-read every step
+    /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
+    /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_steps {
@@ -129,14 +84,8 @@ impl Budget {
         self.check_deadline()
     }
 
-    /// Charges value bytes a script materialized into a variable, buffer, or capture.
-    ///
-    /// This counter is deliberately **cumulative rather than retained**: it bounds how many bytes a
-    /// script may bring into existence over its whole run, not how many it holds at one instant.
-    /// Retained memory is always at most the cumulative total, so a cheap bound on the total is a
-    /// sound bound on the peak, and it needs no release path that a missed call could silently
-    /// corrupt. Without it, `x="$x$x"` repeated twenty-six times reaches gigabytes in a few hundred
-    /// steps — every other ceiling here counts operations, and none of them counts bytes.
+    /// This counter is cumulative, not retained: it bounds total bytes materialized over the run,
+    /// not bytes held at one instant, so it needs no release path a missed call could corrupt.
     pub fn charge_value_bytes(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
         self.value_bytes = self.value_bytes.saturating_add(bytes);
         if self.value_bytes > self.limits.max_value_bytes {
@@ -147,7 +96,6 @@ impl Budget {
         Ok(())
     }
 
-    /// Re-reads the wall clock immediately.
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if self.started.elapsed() > self.limits.timeout {
             return Err(LimitExceeded::Deadline {
@@ -157,13 +105,11 @@ impl Budget {
         Ok(())
     }
 
-    /// Returns the time left before the deadline trips.
     #[must_use]
     pub fn remaining(&self) -> Duration {
         self.limits.timeout.saturating_sub(self.started.elapsed())
     }
 
-    /// Enters one shell-function frame.
     pub fn enter_call(&mut self) -> Result<(), LimitExceeded> {
         if self.depth >= self.limits.max_recursion_depth {
             return Err(LimitExceeded::RecursionDepth {
@@ -174,16 +120,13 @@ impl Budget {
         Ok(())
     }
 
-    /// Leaves one shell-function frame.
     pub fn leave_call(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// Charges one capability invocation.
-    ///
-    /// This counter is deliberately independent of the step budget: a single script can loop and
-    /// drive many capability calls where one model tool call drives exactly one today, so the
-    /// amplification vector needs its own ceiling.
+    /// Capability calls are budgeted independently of steps, since one script can loop to drive
+    /// many calls where a single model tool call drives exactly one today, and that amplification
+    /// needs its own ceiling.
     pub fn charge_capability_call(&mut self) -> Result<(), LimitExceeded> {
         if self.capability_calls >= self.limits.max_capability_calls {
             return Err(LimitExceeded::CapabilityCalls {
@@ -194,31 +137,25 @@ impl Budget {
         Ok(())
     }
 
-    /// Returns the number of capability invocations charged so far.
     #[must_use]
     pub fn capability_calls(&self) -> u32 {
         self.capability_calls
     }
 
-    /// Returns the number of steps charged so far.
     #[must_use]
     pub fn steps(&self) -> u64 {
         self.steps
     }
 
-    /// Returns the value bytes charged so far.
     #[must_use]
     pub fn value_bytes(&self) -> u64 {
         self.value_bytes
     }
 }
 
-/// Bounded combined stdout/stderr accumulator.
-///
-/// The byte and line ceilings are independent so a single oversized line cannot slip past a
-/// line-count-only limit. When either trips, the head and the tail are both retained with a marker
-/// in between; head-only truncation would hide a script's final result, which is usually the part
-/// worth reading.
+/// Byte and line ceilings are independent so one oversized line cannot slip past a line-count-only
+/// limit; when either trips, both head and tail are kept, since head-only truncation would hide the
+/// final result.
 #[derive(Debug)]
 pub struct OutputBuffer {
     max_bytes: usize,
@@ -233,7 +170,6 @@ pub struct OutputBuffer {
 }
 
 impl OutputBuffer {
-    /// Creates an empty buffer under the configured ceilings.
     #[must_use]
     pub fn new(limits: &Limits) -> Self {
         Self {
@@ -257,7 +193,6 @@ impl OutputBuffer {
         (self.max_bytes / 2).max(1)
     }
 
-    /// Appends one already-rendered line.
     pub fn push_line(&mut self, line: &str) {
         self.total_lines = self.total_lines.saturating_add(1);
 
@@ -274,10 +209,6 @@ impl OutputBuffer {
             self.begin_truncation();
         }
 
-        // The tail owns only its own share of the byte ceiling, so a line entering it is clamped to
-        // *that* share rather than to the whole one. Clamping to `max_bytes` produced a line
-        // `evict_tail` then dropped whole, so a script that printed diagnostics and one large final
-        // JSON result ended with the truncation marker and no result at all.
         let clamped = clamp_line(line, self.tail_byte_budget().saturating_sub(1));
         self.tail_bytes = self
             .tail_bytes
@@ -286,16 +217,11 @@ impl OutputBuffer {
         self.evict_tail();
     }
 
-    /// Appends text without terminating the current line.
-    ///
-    /// This is what `echo -n` and `printf` produce; the fragment joins whatever the next write
-    /// appends, exactly as it would on a real terminal.
     pub fn push_fragment(&mut self, fragment: &str) {
         self.pending.push_str(fragment);
         self.drain_complete_lines();
     }
 
-    /// Appends a possibly multi-line block and terminates the line.
     pub fn push_block(&mut self, block: &str) {
         self.pending.push_str(block);
         self.pending.push('\n');
@@ -310,7 +236,6 @@ impl OutputBuffer {
         }
     }
 
-    /// Flushes any unterminated trailing fragment. Call once before rendering.
     pub fn finish(&mut self) {
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
@@ -332,11 +257,6 @@ impl OutputBuffer {
         }
     }
 
-    /// Drops the oldest tail lines until the tail is back inside its share of both ceilings.
-    ///
-    /// The most recent line is never evicted, however oversized it is: it has already been clamped
-    /// to the tail's byte budget on the way in, so keeping it is bounded, and it is the line a
-    /// reader most wants — a script's last output is usually its result.
     fn evict_tail(&mut self) {
         while self.tail.len() > 1
             && (self.tail.len() > self.tail_line_budget()
@@ -351,13 +271,11 @@ impl OutputBuffer {
         }
     }
 
-    /// Reports whether any line was dropped or clamped.
     #[must_use]
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
 
-    /// Renders the retained output, including the truncation marker when one applies.
     #[must_use]
     pub fn render(&self) -> String {
         let mut lines = Vec::with_capacity(self.head.len() + self.tail.len() + 1);
@@ -373,11 +291,8 @@ impl OutputBuffer {
     }
 }
 
-/// Clamps one line so a single enormous line cannot defeat the byte ceiling.
-///
-/// The marker counts against `maximum`, so the result is never longer than the budget the caller
-/// checked it against. Clamping to `maximum` and then appending three more bytes produced a line
-/// that overshot every budget it was measured for and was dropped instead of kept.
+/// The truncation marker counts against the budget itself, so appending it after clamping cannot
+/// push a line back over the ceiling and get it dropped entirely.
 fn clamp_line(line: &str, maximum: usize) -> String {
     if line.len() <= maximum {
         return line.to_owned();
@@ -449,7 +364,6 @@ mod tests {
             ..Limits::default()
         });
         assert!(budget.charge_value_bytes(6).is_ok());
-        // Cumulative, not retained: two values that each fit still trip the ceiling together.
         assert_eq!(
             budget.charge_value_bytes(6),
             Err(LimitExceeded::ValueBytes { maximum: 10 })
@@ -473,8 +387,6 @@ mod tests {
 
     #[test]
     fn charging_a_step_re_reads_the_deadline() {
-        // The step counter is not the backstop here: a script that is slow rather than long must
-        // still be stopped, so every step re-reads the clock.
         let mut budget = Budget::start(Limits {
             max_steps: u64::MAX,
             timeout: Duration::from_millis(5),
@@ -533,10 +445,6 @@ mod tests {
 
     #[test]
     fn a_large_final_line_survives_as_a_clamped_prefix() {
-        // A script that prints diagnostics and then one large JSON result used to end with the
-        // truncation marker and nothing after it: the final line was clamped to the whole byte
-        // ceiling, pushed into a tail that owns half of it, and evicted by the tail's own loop. The
-        // result is the part worth reading, so a prefix of it has to survive.
         let mut buffer = OutputBuffer::new(&Limits {
             max_output_bytes: 64,
             max_output_lines: 100,
@@ -551,7 +459,6 @@ mod tests {
         assert!(buffer.is_truncated());
         assert!(rendered.contains("{\"result\":\"yy"), "{rendered}");
         assert!(rendered.ends_with("..."), "{rendered}");
-        // Still bounded: the survivor is a clamped prefix, not the whole 4 KiB line.
         assert!(rendered.len() < 4 * 64, "{rendered}");
     }
 

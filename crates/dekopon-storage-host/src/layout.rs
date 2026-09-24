@@ -1,5 +1,3 @@
-//! Opaque physical layout, retained directory descriptors, root locking, and accounting.
-
 use std::{
     fs::{self, File, TryLockError},
     io::{Read as _, Seek as _, SeekFrom, Write as _},
@@ -18,10 +16,6 @@ pub(crate) const ENTRY_CHARGE: u64 = 4_096;
 const LAYOUT_VERSION: &str = "dekopon.dev/provider-storage-layout/v1alpha1";
 const HARD_MAX_DIRECTORY_ENTRIES: u64 = 1_000_000;
 
-/// A directory capability retained for the lifetime of every operation below it.
-///
-/// Paths are retained only for bounded diagnostics. Tree traversal, opens, creation, rename,
-/// unlink, scans, and synchronization are all relative to this descriptor.
 #[derive(Clone)]
 pub(crate) struct Directory {
     file: Arc<File>,
@@ -56,10 +50,6 @@ pub(crate) struct Layout {
     _writer_lock: File,
 }
 
-/// The root's initialization commit point.
-///
-/// Strict, so a root initialized under the namespace key, whose document still carries its
-/// `keyCommitment`, is refused as a corrupt layout rather than opened with every name changed.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct LayoutDocument {
@@ -73,7 +63,6 @@ pub(crate) struct Usage {
     pub(crate) files: u64,
 }
 
-/// Charges the scanned directory's own entry in its parent, which a scan of it never sees.
 pub(crate) fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, StorageHostError> {
     usage.entries = usage
         .entries
@@ -128,10 +117,8 @@ impl Layout {
         let has_layout = initial_entries.iter().any(|name| name == "layout");
         let has_writer = initial_entries.iter().any(|name| name == "writer.lock");
 
-        // `layout` is the initialization commit point. Once it exists, every required root entry
-        // must already exist and no unknown entry is accepted. Recreating a missing directory here
-        // would turn retained-data loss into an apparently healthy empty store before key/layout
-        // verification had a chance to fail closed.
+        // Once `layout` exists, every required root entry must already exist; recreating a missing
+        // one here would silently turn data loss into an apparently healthy empty store.
         if has_layout && !has_writer {
             return Err(corrupt_layout(root.path().to_path_buf()));
         }
@@ -237,7 +224,6 @@ impl Directory {
         }
     }
 
-    /// A corruption found at one entry of this directory, naming its path.
     pub(crate) fn corrupt(&self, name: &str, scope: &'static str) -> StorageHostError {
         StorageHostError::corrupt(scope).at(self.diagnostic_child(name))
     }
@@ -301,10 +287,6 @@ impl Directory {
         Ok(child)
     }
 
-    /// Revalidates that a retained child descriptor is still the entry named by this parent.
-    ///
-    /// After an advisory-lease wait, refuse a base whose name no longer identifies the
-    /// descriptor on which the waiter acquired its lock.
     pub(crate) fn retains_child(&self, name: &str, child: &Self) -> Result<bool, StorageHostError> {
         validate_component(name)?;
         let stat = match rustix::fs::statat(self.file.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -346,12 +328,10 @@ impl Directory {
         Ok(self.metadata(name)?.is_some())
     }
 
-    /// Reads at most one bounded prefix without first materializing the complete directory.
     pub(crate) fn entries_prefix(&self, maximum: u64) -> Result<Vec<String>, StorageHostError> {
         self.read_entries(maximum.min(HARD_MAX_DIRECTORY_ENTRIES), false)
     }
 
-    /// Reads a configured bounded directory and fails on the first excess entry.
     pub(crate) fn entries_bounded(&self, maximum: u64) -> Result<Vec<String>, StorageHostError> {
         self.read_entries(maximum.min(HARD_MAX_DIRECTORY_ENTRIES), true)
     }
@@ -429,9 +409,9 @@ impl Directory {
         file: &File,
     ) -> Result<(), StorageHostError> {
         let metadata = file.metadata().map_err(|source| self.io_error(source))?;
-        // Private: every retained file is broker-owned state, so group- or world-readability is
-        // already the loss. `Corrupt` stays opaque to the guest, so which check refused it is
-        // logged here rather than returned.
+        // Every retained file is broker-owned, so group- or world-readable permissions are already
+        // a security loss; which check failed is logged, not returned, since `Corrupt` stays opaque
+        // to the guest.
         if let Err(error) = dekopon_core::check_trusted_metadata(
             &self.diagnostic_child(name),
             &metadata,
@@ -582,11 +562,8 @@ impl Directory {
     }
 }
 
-/// Classifies one `writer.lock` acquisition failure.
-///
-/// Only a would-block refusal proves another conforming writer holds the root. Every other error
-/// is the filesystem itself failing or refusing advisory locks, which must surface as root I/O
-/// carrying its cause rather than as a second writer an operator would then go looking for.
+/// Only a WouldBlock error proves another writer holds the root; every other lock failure is
+/// filesystem trouble and must surface as I/O, not be misreported as a second writer.
 fn writer_lock_failure(root: &Directory, source: TryLockError) -> StorageHostError {
     match source {
         TryLockError::WouldBlock => StorageHostError::SecondWriter,
@@ -633,8 +610,6 @@ fn validate_component(name: &str) -> Result<(), StorageHostError> {
     Ok(())
 }
 
-/// Walks as written, parent and above, because the root may not exist yet and
-/// `a_configured_root_ancestor_symlink_is_rejected_before_canonicalization` pins it.
 fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
     let policy = AncestorPolicy {
         canonicalize: false,
@@ -650,12 +625,6 @@ fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
 
 #[cfg(test)]
 thread_local! {
-    /// Directory reads performed on this thread.
-    ///
-    /// Test-only instrumentation. Accounting a mutation from the tree it just changed is a cost
-    /// this crate has to hold to — a write reads no directory — so directory reads are counted
-    /// rather than assumed. A tree walk bumps this once for the walk and once per directory it
-    /// reads, so a scan on a path that must not scan cannot register as one read.
     static DIRECTORY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -664,7 +633,6 @@ fn note_directory_scan() {
     DIRECTORY_SCANS.with(|cell| cell.set(cell.get().saturating_add(1)));
 }
 
-/// Directory reads performed on this thread so far.
 #[cfg(test)]
 pub(crate) fn directory_scans() -> u64 {
     DIRECTORY_SCANS.with(std::cell::Cell::get)
@@ -700,7 +668,6 @@ fn scan(
     Ok(())
 }
 
-/// Charges one entry and, for a directory, everything under it.
 fn scan_entry(
     directory: &Directory,
     name: &str,
@@ -746,11 +713,6 @@ fn scan_entry(
     Ok(())
 }
 
-/// The startup quota walk.
-///
-/// Root-level entries are the store's own shape and a fault in one refuses startup. Everything
-/// under `namespaces/` belongs to one conversation: a base that will not scan is logged as
-/// `storage_root_entry_ignored` and left uncharged, and its next grant is where it fails.
 pub(crate) fn scan_root_usage(
     layout: &Layout,
     maximum_entries: u64,
@@ -761,7 +723,6 @@ pub(crate) fn scan_root_usage(
             scan_entry(&layout.root, &name, maximum_entries, &mut usage)?;
             continue;
         }
-        // The `namespaces` entry itself, then each base on its own.
         usage = usage_with_directory_entry(usage)?;
         let namespaces = layout.namespaces();
         for base in namespaces.entries_bounded(maximum_entries)? {
@@ -807,7 +768,6 @@ mod tests {
             writer_lock_failure(&root, TryLockError::WouldBlock),
             StorageHostError::SecondWriter
         ));
-        // A filesystem that fails or refuses advisory locks is not another conforming writer.
         assert!(matches!(
             writer_lock_failure(&root, TryLockError::Error(Error::from(ErrorKind::Unsupported))),
             StorageHostError::RootIo { source, .. } if source.kind() == ErrorKind::Unsupported

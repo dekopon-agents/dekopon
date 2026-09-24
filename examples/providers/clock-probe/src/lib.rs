@@ -1,13 +1,3 @@
-//! Clock conformance fixture: its `date` word proposes `clock.now`, and `invoke` reads the broker
-//! host's wall clock through `dekopon:clock/wall@1.0.0`.
-//!
-//! `run-command` is pure, as the provider contract requires: `date` proposes `clock.now` with an
-//! empty input, `date --help` renders a hand-written page on stdout at status 0, and anything else
-//! is a usage error on stderr at status 2. The clock is read only inside `invoke`, which answers
-//! `{"unixMillis": n, "rfc3339": "YYYY-MM-DDTHH:MM:SSZ"}` in UTC. The test-only
-//! `date --clock-in-run-command` reads the clock from `run-command` instead, which is the call the
-//! broker host must trap.
-
 use dekopon_provider_sdk::{
     CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
     ProviderError, ProviderManifest, RiskLevel,
@@ -25,13 +15,10 @@ mod bindings {
 
 struct ClockProbe;
 
-/// The one capability: read the host's wall clock.
 const NOW: &str = "clock.now";
 
-/// Test-only argument that reads the clock from `run-command`, where the host must refuse it.
 const CLOCK_IN_RUN_COMMAND: &str = "--clock-in-run-command";
 
-/// The hand-written help page; there is no parser to render one.
 const HELP: &str = "Usage: date\n\
 \n\
 Prints the broker host's current time in UTC by proposing `clock.now`.\n\
@@ -39,7 +26,6 @@ Prints the broker host's current time in UTC by proposing `clock.now`.\n\
 Options:\n\
 \x20     --help  Print help\n";
 
-/// 9999-12-31T23:59:59.999Z, the last instant a four-digit RFC 3339 year can name.
 const MAX_RFC3339_UNIX_MILLIS: u64 = 253_402_300_799_999;
 
 impl Provider for ClockProbe {
@@ -97,7 +83,6 @@ impl Provider for ClockProbe {
                 0,
             )),
             [first, rest @ ..] => {
-                // `--help` alone renders; followed by anything, the follower is what was unexpected.
                 let unexpected = rest.first().filter(|_| first == "--help").unwrap_or(first);
                 Ok(CommandRun::rendered_error(
                     format!("date: unexpected argument '{unexpected}'\n\n{HELP}"),
@@ -108,13 +93,10 @@ impl Provider for ClockProbe {
     }
 }
 
-/// The invocation's answer for one clock reading.
 fn reading(unix_millis: u64) -> Result<Value, ProviderError> {
     Ok(json!({"unixMillis": unix_millis, "rfc3339": rfc3339(unix_millis)?}))
 }
 
-/// Renders `unix_millis` as the RFC 3339 UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, truncated to the
-/// second. A reading past year 9999 has no four-digit year, so it is refused naming the reading.
 fn rfc3339(unix_millis: u64) -> Result<String, ProviderError> {
     if unix_millis > MAX_RFC3339_UNIX_MILLIS {
         return Err(ProviderError::new(
@@ -133,11 +115,6 @@ fn rfc3339(unix_millis: u64) -> Result<String, ProviderError> {
     ))
 }
 
-/// The proleptic Gregorian `(year, month, day)` of a day count since 1970-01-01.
-///
-/// Howard Hinnant's `civil_from_days`, restricted to non-negative day counts: shift the epoch to
-/// 0000-03-01 so the leap day ends each 400-year era, then read the year, the day of the
-/// March-based year, and the month from it.
 const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let shifted = days + 719_468;
     let era = shifted / 146_097;

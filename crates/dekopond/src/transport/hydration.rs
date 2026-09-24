@@ -1,5 +1,3 @@
-//! The owned disk-to-upload boundary shared by outbound transports.
-
 use std::collections::VecDeque;
 
 use dekopon_agent::attachment::GeneratedImage;
@@ -13,28 +11,16 @@ pub(super) struct HydratedImage {
     pub bytes: Vec<u8>,
 }
 
-/// Transfer every lease before yielding, including those not read after an error. Only transient
-/// buffers return to the async worker. Dropping the returned future does not abort the blocking
-/// task: it still owns and disposes the leases when IO finishes. An unpolled transport future or
-/// runtime shutdown before a queued task starts is not covered by this normal-disposal boundary.
+/// Dropping the returned future does not abort the blocking task, which still disposes its leases
+/// when IO finishes; an unpolled future is not covered by this guarantee.
 pub(super) fn hydrate_images(
     images: Vec<GeneratedImage>,
 ) -> impl Future<Output = Result<Vec<HydratedImage>, TransportError>> + Send {
     hydrate_images_with(0, images, GeneratedImage::into_bytes)
 }
 
-/// One reply's attachments, still on disk, taken one at a time or read all at once.
-///
-/// Reading them all before the first upload held every attachment resident until the last one
-/// finished: a reply carrying four 8 MiB images held 32 MiB while the first was still going over
-/// the wire. A transport that posts one attachment per message takes them from [`Self::next`]
-/// instead, so only the attachment on the wire is in memory; Discord, which posts them together in
-/// one multipart body, uses [`Self::read_all`] and gets the leases back rather than keeping a
-/// second copy against a retry that usually never happens.
-///
-/// Each read is its own blocking task. Whatever is left when this is dropped — a refused upload, an
-/// early return, a retry that never came — is disposed inline: closing a scratch file and removing
-/// its directory is two syscalls, not work worth a thread hop.
+/// Reading everything up front would hold all attachments resident at once, so single-attachment
+/// transports read one at a time; only Discord's multipart post reads all at once.
 #[derive(Default)]
 pub(super) struct ImageQueue {
     images: VecDeque<GeneratedImage>,
@@ -49,8 +35,6 @@ impl ImageQueue {
         }
     }
 
-    /// Preflights every upload length off the async worker without materializing payloads.
-    /// As with `read_all`, the blocking task owns all leases until IO completes.
     pub(super) async fn decoded_lengths(&mut self) -> Result<Vec<usize>, TransportError> {
         let taken = std::mem::take(&mut self.images);
         let span = tracing::Span::current();
@@ -71,7 +55,6 @@ impl ImageQueue {
         lengths.map_err(TransportError::from)
     }
 
-    /// The gateway-owned name each remaining attachment will be posted under, in order.
     pub(super) fn filenames(&self) -> Vec<String> {
         self.images
             .iter()
@@ -84,7 +67,6 @@ impl ImageQueue {
         self.images.is_empty()
     }
 
-    /// Reads the next image off the async worker, with its position in the reply.
     pub(super) async fn next(&mut self) -> Option<Result<(usize, HydratedImage), TransportError>> {
         let image = self.images.pop_front()?;
         let index = self.next;
@@ -96,10 +78,6 @@ impl ImageQueue {
         )
     }
 
-    /// Reads every remaining image off the async worker without consuming its lease.
-    ///
-    /// The leases go to the blocking thread and come back, so a second call reads them again
-    /// instead of a caller holding a copy between attempts.
     pub(super) async fn read_all(&mut self) -> Result<Vec<HydratedImage>, TransportError> {
         let taken = std::mem::take(&mut self.images);
         let first = self.next;
@@ -129,10 +107,10 @@ impl ImageQueue {
     }
 }
 
-/// Reports a blocking read that never produced a result, without rendering a panic payload.
 fn join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, TransportError> {
     joined.map_err(|error| {
-        // Panic payloads may contain arbitrary text; retain the actionable join cause only.
+        // Panic payloads may contain arbitrary text, so only the fixed reason string is kept, never
+        // the payload itself.
         let reason = if error.is_panic() {
             "panic"
         } else {
@@ -183,7 +161,6 @@ fn hydrate_images_with(
     }
 }
 
-/// Adapter-supported formats; encoding conversion is independent of content format.
 pub(super) enum AcceptedTypes {
     Files,
     Photos,
@@ -340,7 +317,6 @@ mod tests {
         assert!(!capture.text().contains("dekopon-assets-"));
     }
 
-    /// How many leases have been read so far, as the spool's own spans report it.
     fn reads(capture: &CaptureLayer) -> usize {
         capture
             .records()
@@ -352,8 +328,6 @@ mod tests {
             .count()
     }
 
-    /// A transport that posts one attachment per message takes them one at a time, so the second
-    /// image is still only a lease while the first one is going over the wire.
     #[tokio::test]
     async fn a_queue_reads_one_image_at_a_time() {
         let capture = CaptureLayer::workspace();
@@ -384,7 +358,6 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    /// A refused upload abandons the rest of the reply, and those leases are disposed with it.
     #[tokio::test]
     async fn a_queue_dropped_part_way_disposes_what_is_left() {
         let threads = SpoolThreads::default();
@@ -415,8 +388,6 @@ mod tests {
         );
     }
 
-    /// Discord needs every attachment at once and gets the leases back, so its one retry reads
-    /// them again instead of a second copy being held through an upload that usually succeeds.
     #[tokio::test]
     async fn reading_images_hands_the_leases_back_for_a_second_read() {
         let capture = CaptureLayer::workspace();
@@ -448,7 +419,6 @@ mod tests {
             assert_ne!(std::thread::current().id(), async_thread);
             if let Some(started) = started.take() {
                 started.send(()).unwrap();
-                // A bounded watchdog makes a broken boundary fail instead of hanging the suite.
                 wait.recv_timeout(Duration::from_secs(2))
                     .expect("async timer must release the slow read");
             }
@@ -522,12 +492,12 @@ mod tests {
             assert_ne!(std::thread::current().id(), async_thread);
             started.take().unwrap().send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(2)).unwrap();
-            let result = image.into_bytes(); // final owner is disposed before notifying the waiter
+            let result = image.into_bytes();
             finished.take().unwrap().send(()).unwrap();
             result
         });
         ready.await.unwrap();
-        drop(hydration); // an unpolled wait can be cancelled even while its blocking read runs
+        drop(hydration);
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), done)
             .await

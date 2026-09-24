@@ -1,17 +1,13 @@
-//! Per-generation cancellation and a single total deadline.
-
 use crate::error::{InferenceError, RequestError};
 use std::{future::Future, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
-/// One call's session cancellation signal and total deadline.
 pub struct TurnControl {
     cancel: watch::Receiver<bool>,
     deadline: Instant,
 }
 
 impl TurnControl {
-    /// Starts a fresh call deadline without changing the session's cancellation signal.
     pub fn new(cancel: watch::Receiver<bool>, timeout: Duration) -> Result<Self, InferenceError> {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
@@ -22,7 +18,8 @@ impl TurnControl {
         Ok(Self { cancel, deadline })
     }
 
-    /// Reject work before scheduling a blocking credential or attachment operation.
+    /// Call check() before scheduling any blocking credential or attachment operation, not after;
+    /// nothing else enforces this ordering.
     pub(crate) fn check(&self) -> Result<(), InferenceError> {
         if *self.cancel.borrow() {
             return Err(InferenceError::Cancelled);

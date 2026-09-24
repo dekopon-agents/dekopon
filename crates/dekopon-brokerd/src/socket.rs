@@ -42,8 +42,6 @@ pub fn validate_private_parent(path: &Path, expected_uid: u32) -> Result<(), Soc
     Ok(())
 }
 
-// The rule itself lives in `dekopon-broker-protocol`, where the clients that must agree with this
-// server read it. What stays here is the path handling and the error an operator acts on.
 pub fn validate_socket_parent(path: &Path, expected_uid: u32) -> Result<fs::Metadata, SocketError> {
     let parent = path.parent().ok_or_else(|| SocketError::MissingParent {
         path: path.to_path_buf(),
@@ -101,8 +99,8 @@ pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketE
     Ok(())
 }
 
-/// Walks as written from `path` inclusive; every caller canonicalized already, because it needs
-/// the resolved parent for its own check and its own error — one `canonicalize`, not two.
+/// Callers must canonicalize the path themselves before calling this; it walks the path as given
+/// rather than canonicalizing again.
 fn validate_ancestors(path: &Path) -> Result<(), SocketError> {
     let policy = AncestorPolicy {
         canonicalize: false,
@@ -130,8 +128,8 @@ pub async fn bind(
         path: path.to_path_buf(),
         source,
     })?;
-    // Group traversal opts into shared IPC. Set its exact group before granting access;
-    // an unprivileged broker must itself belong to this group. Private parents stay 0600.
+    // Set the exact group before granting group access to shared IPC socket parents; an
+    // unprivileged broker must already belong to that group.
     let mode = ipc_socket_mode(&parent);
     if mode == 0o660
         && let Err(source) = std::os::unix::fs::chown(path, None, Some(parent.gid()))

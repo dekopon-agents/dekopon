@@ -1,5 +1,3 @@
-//! Async Codex Responses generation; account login and refresh stay in `chatgpt`.
-
 use crate::{
     chatgpt::{ChatGptError, CredentialFile, ResolvedCredential, resolve_auth_path},
     control::TurnControl,
@@ -31,7 +29,6 @@ use std::{
 
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
-/// One pooled Codex client with its own credential snapshot and continuation identity.
 pub struct CodexClient {
     name: String,
     model: String,
@@ -43,7 +40,6 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
-    /// Loads the credential on the calling blocking thread; generation is asynchronous.
     pub fn new(
         model: impl Into<String>,
         auth_path: Option<&Path>,
@@ -61,11 +57,8 @@ impl CodexClient {
         )
     }
 
-    /// A client over a credential another client already holds.
-    ///
-    /// Clients on one credential file must share one [`CredentialFile`]: a rotation that could not
-    /// be written back lives only in the instance that performed it, and a sibling instance would
-    /// then spend the refresh token the provider just retired.
+    /// Clients on one credential file must share a single CredentialFile instance, or a sibling
+    /// could spend a refresh token that an unwritten rotation already retired.
     pub fn with_credential(
         model: impl Into<String>,
         credential: Arc<CredentialFile>,
@@ -103,17 +96,12 @@ impl CodexClient {
         })
     }
 
-    /// Sets the operator's configured name for local telemetry, never an upstream header.
     #[must_use]
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = name.to_owned();
         self
     }
 
-    /// Overrides generation for an offline fixture at literal `127.0.0.1` or `::1` over HTTP.
-    ///
-    /// Credentials are never refreshed: a `401` or a token inside its refresh margin fails with
-    /// [`InferenceError::Authentication`]. Existing continuations are invalidated.
     pub fn with_loopback_endpoint(mut self, endpoint: &str) -> Result<Self, InferenceError> {
         self.endpoint = crate::loopback::endpoint(endpoint)?;
         self.loopback = true;
@@ -219,7 +207,6 @@ impl CodexClient {
             )
             .await?;
         if response.status() == 401 && !self.loopback {
-            // No body byte is consumed on this one permitted resend; the deadline is unchanged.
             drop(response);
             refreshed = self
                 .credential(RefreshMode::Forced(credentials.access.clone()), control)
@@ -429,7 +416,6 @@ enum TextSource {
     Deltas,
 }
 
-/// A socket-independent reducer: offline fixtures and the async body use exactly this code.
 #[derive(Default)]
 pub(crate) struct CodexReducer<'a> {
     secrets: DiagnosticSecrets<'a>,
@@ -634,7 +620,6 @@ impl CodexReducer<'_> {
         Ok(())
     }
 
-    /// Items of unknown or missing type are ignored before their shared fields are parsed.
     fn parse_item<'v>(&self, value: &'v Value) -> Result<Option<WireItem<'v>>, InferenceError> {
         if value
             .get("type")
@@ -787,9 +772,6 @@ struct ResponsesRequest<'a> {
     parallel_tool_calls: bool,
     include: [&'static str; 1],
     text: ResponsesText,
-    /// Serialized only when a key exists, so a keyless request carries no such field at all.
-    /// `prompt_cache_key` routes toward a warm prefix and authorizes nothing; the conversation
-    /// itself is already in `input` either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
 }
@@ -808,10 +790,6 @@ struct ResponsesTool<'a> {
     parameters: &'a Value,
 }
 
-/// One entry of the `input` array.
-///
-/// Untagged because a replayed item is whatever the API sent last turn and already carries its own
-/// `type`; the rest name theirs.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ResponsesItem<'a> {
@@ -846,7 +824,6 @@ struct ResponsesFunctionCallOutput<'a> {
     output: &'a str,
 }
 
-/// One part of a message's `content` array.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum ResponsesContent<'a> {
@@ -862,15 +839,10 @@ enum ResponsesContent<'a> {
     #[serde(rename = "output_text")]
     OutputText {
         text: &'a str,
-        /// Always empty, and always present: the API requires the key on an assistant message.
         annotations: [Value; 0],
     },
 }
 
-/// The `content` array for one user message, text-only or multimodal.
-///
-/// The Responses API has taken an array here since before attachments existed, which is why this
-/// transport needs one function rather than the wire-message type the chat-completions path grew.
 async fn responses_content(
     message: &ModelMessage,
 ) -> Result<Vec<ResponsesContent<'_>>, InferenceError> {
@@ -1002,8 +974,6 @@ async fn build_request_body<'a>(
     })
 }
 
-/// Responses-API `usage` object from the `response.completed` event. Every field defaults for the
-/// same reason as the chat-completions shape: a partial report still prices the call.
 #[derive(Debug, Deserialize)]
 struct WireResponsesUsage {
     #[serde(default)]
@@ -1571,10 +1541,8 @@ mod tests {
                 first_seen.await.unwrap();
                 second_seen.await.unwrap();
                 release_first.send(()).unwrap();
-                // The second 401 arrives only after the first turn installed and used B.
                 completion.recv().await.unwrap();
                 if stale_disk {
-                    // An installed rotation is authoritative even if disk still holds A.
                     write_credential(&directory, "initial", u64::MAX - 1);
                 }
                 release_second.send(()).unwrap();
@@ -1600,7 +1568,6 @@ mod tests {
             MockResponse::failure(401, serde_json::json!({"error":"first"})),
             MockResponse::failure(401, serde_json::json!({"error":"second"})),
         ]);
-        // Simulate another process rotating the credential after this client's snapshot.
         write_credential(&directory, "rotated", u64::MAX);
         let result = generate(&client, &control()).await;
         assert!(matches!(result, Err(InferenceError::Authentication(_))));

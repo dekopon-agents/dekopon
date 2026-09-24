@@ -1,11 +1,3 @@
-//! The gateway half of `examples/conditional-write/`, held to the daemon's strict decoder.
-//!
-//! `dekopond.yaml` and `broker.yaml` are two files a reader edits separately, and the one thing
-//! that must agree between them is the socket: a gateway pointed at a path no broker binds fails
-//! its startup probe with nothing to explain why. Everything else asserted here is a startup
-//! failure the daemon would raise anyway — a route naming an absent agent, an agent whose
-//! `modelClass` no configured model offers — caught at test time instead of in someone's terminal.
-
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
@@ -34,7 +26,6 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     let config = serde_yaml::from_str::<DekopondConfig>(&read("dekopond.yaml"))
         .expect("the example gateway configuration decodes under the daemon's strict decoder");
 
-    // Relative to the configuration's own directory, like every other path in the example.
     assert_eq!(config.catalog_path, PathBuf::from("dekopon.yaml"));
 
     let broker = serde_yaml::from_str::<dekopon_brokerd::BrokerdConfig>(&read("broker.yaml"))
@@ -68,8 +59,6 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(route.transport, transport.name());
     assert_eq!(route.limits.max_steps, 8);
     assert_eq!(route.limits.max_capability_calls, 16);
-    // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to
-    // opt into: writing a window bound next to `mode: oneShot` would not decode at all.
     assert_eq!(
         route.memory,
         dekopond::MemoryConfig::Persistent {
@@ -81,8 +70,6 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     );
     assert_eq!(config.sessions.max_conversations, 1024);
 
-    // A route naming an agent the catalog does not contain, or one it disables, is a startup
-    // failure. So is an agent with no resolvable model.
     let catalog = LocalCatalog::load(example("dekopon.yaml")).expect("the example catalog loads");
     let agent = catalog
         .agent(&route.agent)

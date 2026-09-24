@@ -1,5 +1,3 @@
-//! Explicit offline generation destinations, never DNS names or production overrides.
-
 use crate::error::RequestError;
 
 pub(crate) fn endpoint(value: &str) -> Result<String, RequestError> {

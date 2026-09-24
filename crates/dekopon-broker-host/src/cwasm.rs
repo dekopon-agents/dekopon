@@ -1,7 +1,5 @@
-//! Trusted, immutable, file-backed compiled components. No retry, repair, or fallback.
-//!
-//! Only a missing index is a cache miss. Every other failure stops startup. The operator
-//! owns this directory and must never modify/truncate a mapped artifact in place.
+//! Only a missing index counts as a cache miss; every other failure stops startup, and the operator
+//! must never modify or truncate a mapped artifact in place.
 
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -20,8 +18,8 @@ use wasmtime::{Engine, component::Component};
 use crate::metadata::{hex_digest, identify_bytes};
 
 const MAX_INDEX_BYTES: u64 = 4096;
-// Compiled code can be larger than the 64 MiB source ceiling. Refuse, never allocate from
-// an unchecked on-disk length. This is an artifact limit, not a resident-memory promise.
+// Compiled artifacts can exceed the 64 MiB source ceiling; this bounds refusal only, never
+// allocation from an unchecked on-disk length, and promises nothing about resident memory.
 const MAX_CWASM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CACHE_OBJECTS: usize = 1024;
@@ -36,8 +34,6 @@ struct Entry {
 pub(crate) struct Cache {
     root: PathBuf,
     engine_key: String,
-    // Serializes cold compilation/publication and deduplicates verification within one registry
-    // boot. Component clones retain the same mapping, not another copy of the native code.
     loaded: Mutex<BTreeMap<String, Component>>,
 }
 
@@ -133,8 +129,8 @@ impl Cache {
                     publish(&index, &serde_json::to_vec(&entry)?)
                 })?;
                 drop(compiled);
-                // These exact bytes were just hashed and published by us. There is no second
-                // verification pass on a cold miss. Warm boots stream-verify below.
+                // No second verification pass runs on a cold miss, since these exact bytes were
+                // just hashed and published locally; warm boots stream-verify instead.
                 return self.map(engine, entry, &mut loaded);
             }
             Err(error) => {
@@ -233,8 +229,8 @@ fn publish(path: &Path, bytes: &[u8]) -> wasmtime::Result<()> {
         .ok_or_else(|| wasmtime::Error::msg("compiled artifact has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
-    // Never overwrite an inode another broker may have mapped. Concurrent publishers fail
-    // visibly; there is no lock protocol, retry loop, or recovery transaction.
+    // Never overwrites an inode another broker may already have mapped; concurrent publishers fail
+    // visibly, with no locking, retry, or recovery transaction.
     temporary.persist_noclobber(path).map_err(|error| {
         wasmtime::Error::msg(format!(
             "publish compiled artifact {}: {error}",
@@ -268,9 +264,6 @@ pub(crate) fn micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Each stage keeps its own span and a completion event: both OTLP traces and JSON logs can
-/// answer which part was expensive, including a failed attempt. No per-function compiler hook
-/// is available here; the compilation unit is one provider component.
 pub(crate) fn stage<T>(
     stage: &'static str,
     bytes: u64,
@@ -298,7 +291,6 @@ pub(crate) fn stage<T>(
                 outcome,
                 "provider load stage finished"
             ),
-            // The caller reports the cause on the component load, not at every stage boundary.
             Err(_) => tracing::error!(
                 stage,
                 bytes,
@@ -330,7 +322,8 @@ mod tests {
         let entry: Entry =
             serde_json::from_slice(&fs::read(&index).expect("index")).expect("entry");
         (index, cache.object(&entry))
-        // Cache and all mappings drop before a test mutates any artifact.
+        // Drop the cache and its mmap'd handles before a test mutates the artifact file, avoiding a
+        // mapping race.
     }
 
     #[test]
@@ -345,8 +338,6 @@ mod tests {
         );
         let cache = Cache::new(directory.path().to_owned(), &engine);
         let source = identify_bytes(EMPTY_COMPONENT);
-        // The caller normally supplies verified Wasm. An invalid buffer here proves the hit
-        // does not call the compiler, independently of wall-clock timing.
         cache
             .load(&engine, b"not wasm", &source.sha256)
             .expect("warm mapped load");

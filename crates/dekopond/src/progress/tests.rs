@@ -1,9 +1,3 @@
-//! What the policy puts on screen, on a clock the test drives.
-//!
-//! Every timing rule here is minutes long in production — a keep-alive at 45 seconds, a coalescing
-//! window, a wall-clock budget — so the clock is paused and advanced deliberately. A test that
-//! slept would be a test nobody runs.
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -37,7 +31,6 @@ use crate::{
     },
 };
 
-/// What a driver was asked to do, in order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Reaction(bool),
@@ -52,30 +45,15 @@ enum Call {
     Reply(String),
 }
 
-/// How long a stalled call holds the policy, which has to be well past the policy's own deadline.
-///
-/// The point of a stall is that the transport still has the call when this task stops waiting for
-/// it, so a test advances past [`CALL_DEADLINE`] and nowhere near this: the call is in flight, its
-/// effect may land, and the surface it would have created is one the session cannot name.
 const STALL: Duration = Duration::from_secs(60);
 
-/// Everything the fake transport recorded, plus the failures a test injects.
 #[derive(Debug, Default)]
 struct Recorder {
     calls: Mutex<Vec<Call>>,
-    /// Progress posts and edits to refuse, counted down.
     refuse_progress: AtomicU32,
-    /// Finalize calls to refuse, counted down.
     refuse_finalize: AtomicU32,
-    /// Progress posts and edits to hold past the policy's call deadline, counted down.
     stall_progress: AtomicU32,
-    /// Finalize calls to hold past it, counted down.
     stall_finalize: AtomicU32,
-    /// Progress posts the policy attempted, including the ones that never answered.
-    ///
-    /// Separate from `posts`, which counts the ones that produced a `MessageRef`: "did the policy
-    /// try to post a second message" is the whole question a stalled post asks, and a call that
-    /// never answered leaves no other trace.
     post_attempts: AtomicU32,
     posts: AtomicU32,
 }
@@ -99,11 +77,6 @@ impl Recorder {
             .collect()
     }
 
-    /// Spends one injected failure, reporting whether there was one to spend.
-    ///
-    /// `checked_sub` rather than a guard around a subtraction: `then_some` evaluates its argument,
-    /// so the guarded form still subtracts from zero on the common path where a test injected no
-    /// failure at all.
     fn counted(&self, counter: &AtomicU32) -> bool {
         counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -112,20 +85,12 @@ impl Recorder {
             .is_ok()
     }
 
-    /// Spends one injected stall, holding the caller past the policy's deadline when there is one.
     async fn stalled(&self, counter: &AtomicU32) {
         if self.counted(counter) {
             tokio::time::sleep(STALL).await;
         }
     }
 
-    /// Everything the driver wrote into the conversation, in order.
-    ///
-    /// The service's own indicators are left out because they bracket a session on both sides: the
-    /// ladder runs before the first write, and `cleanup` returns status and reaction to rest
-    /// *after* the ending is delivered, which is what lets an answered session release its
-    /// admission permit while that last cosmetic call is still in flight. An assertion about which
-    /// message the answer landed in is about this list.
     fn writes(&self) -> Vec<Call> {
         self.calls()
             .into_iter()
@@ -134,7 +99,6 @@ impl Recorder {
     }
 }
 
-/// Which capability objects this driver offers.
 #[derive(Clone, Copy, Debug)]
 struct Offers {
     typing: bool,
@@ -158,7 +122,6 @@ impl Default for Offers {
     }
 }
 
-/// One object implementing every capability, the way the local reference driver does.
 struct Surfaces {
     recorder: Arc<Recorder>,
     min_edit_interval: Duration,
@@ -261,12 +224,8 @@ impl ProgressMessage for Surfaces {
     }
 }
 
-/// What this fake's streamed surface holds, small enough that one recorded turn overflows it.
 const STREAM_CEILING: usize = 16;
 
-/// The marker a driver appends when [`StreamedText::truncated`] is set, the same `…` a real
-/// transport uses. It belongs to the driver and not to the policy, so the text the policy hands
-/// over is model-authored throughout and the marker can never be mistaken for the model's own.
 const TRUNCATION_MARKER: &str = "…";
 
 #[async_trait]
@@ -285,9 +244,6 @@ impl TextStream for Surfaces {
         text: &StreamedText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
-        // Rendered the way every driver renders it: the bounded text, plus the marker when the
-        // policy says it cut the text. Recording the text alone would let a policy that bounded
-        // silently pass, and a person would read an answer that stops mid-word.
         let mut rendered = text.text.as_str().to_owned();
         if text.truncated {
             rendered.push_str(TRUNCATION_MARKER);
@@ -373,7 +329,6 @@ fn templates() -> Templates {
     Templates::resolve(&TemplateOverrides::default(), STOPPED_REPLY, FAILURE_REPLY).0
 }
 
-/// Liveness whose keep-alive is an hour out, so a test about something else never races a tick.
 fn liveness(stream: bool) -> Arc<ResolvedLiveness> {
     liveness_with(
         stream,
@@ -385,7 +340,6 @@ fn liveness(stream: bool) -> Arc<ResolvedLiveness> {
     )
 }
 
-/// Liveness on the shipped schedule: 15 s, 45 s, then every 60 s, ten times.
 fn ticking() -> Arc<ResolvedLiveness> {
     liveness_with(false, KeepAlive::default())
 }
@@ -405,7 +359,6 @@ fn liveness_with(stream: bool, keep_alive: KeepAlive) -> Arc<ResolvedLiveness> {
     })
 }
 
-/// A started policy, its recorder, its sink, and the cancellation the session shares with it.
 struct Harness {
     policy: ProgressPolicy,
     sink: Arc<ProgressAdapter>,
@@ -455,11 +408,6 @@ fn start_with(
     }
 }
 
-/// Keeps this thread's workspace records, which is where the policy's own reasons are written.
-///
-/// Thread-local rather than global: the policy task runs on the `current_thread` runtime these
-/// tests drive, so it is polled on this thread, and a global subscriber would capture every other
-/// test in the binary alongside it.
 fn capture() -> (
     dekopon_test_support::CaptureLayer,
     tracing::subscriber::DefaultGuard,
@@ -473,7 +421,6 @@ fn capture() -> (
     (capture, guard)
 }
 
-/// Every record this thread wrote naming `event`, as its fields rendered.
 fn events_named(capture: &dekopon_test_support::CaptureLayer, event: &str) -> Vec<String> {
     let rendered = format!("event=\"{event}\"");
     capture
@@ -484,7 +431,6 @@ fn events_named(capture: &dekopon_test_support::CaptureLayer, event: &str) -> Ve
         .collect()
 }
 
-/// Lets the policy task run every step it can take without moving the clock.
 async fn settle() {
     for _ in 0..16 {
         tokio::task::yield_now().await;
@@ -496,10 +442,6 @@ async fn advance(duration: Duration) {
     settle().await;
 }
 
-/// One turn's model text, replayed from a recorded transcript.
-///
-/// The only route to real [`ModelText`] outside the model client, which is what keeps a test from
-/// inventing text a backend never sent.
 fn recorded_delta() -> ModelText {
     let events = dekopon_model::events_from_transcript(
         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
@@ -515,9 +457,6 @@ fn started() -> ProgressEvent {
     }
 }
 
-/// A turn that drove a capability call, which is one of the four things that may post the
-/// surface. `ToolStarted` carries a `CommandWord`, which only the broker leg may construct, so the
-/// tool-word rendering is pinned directly on the templates instead.
 fn answered_with_tool(turn: u32) -> ProgressEvent {
     ProgressEvent::Answered {
         turn,
@@ -527,7 +466,6 @@ fn answered_with_tool(turn: u32) -> ProgressEvent {
     }
 }
 
-/// The loop's own report that it produced an answer, which is the instant a stop is too late.
 fn finished() -> ProgressEvent {
     ProgressEvent::Finished {
         outcome: SessionOutcome::Answered,
@@ -537,8 +475,6 @@ fn finished() -> ProgressEvent {
     }
 }
 
-/// The one message a fast answer must not leave behind: a single turn with no tool call posts
-/// nothing, and the answer is an ordinary reply.
 #[tokio::test(start_paused = true)]
 async fn a_one_turn_answer_posts_no_progress_message() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -580,7 +516,6 @@ async fn a_one_turn_answer_posts_no_progress_message() {
     );
 }
 
-/// The t=0 ladder, and the first post trigger: a capability call is news worth a message.
 #[tokio::test(start_paused = true)]
 async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -623,12 +558,6 @@ async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
     );
 }
 
-/// The other post trigger, on the common route: a long turn that writes text and calls nothing.
-///
-/// Streaming is off by default, so the text never reaches the surface — but a model that has
-/// started writing is news, and without this the person watches an unchanged conversation until
-/// the first keep-alive tick fifteen seconds later. The keep-alive here is an hour out, so the
-/// post can only have come from the delta.
 #[tokio::test(start_paused = true)]
 async fn the_first_delta_posts_the_surface_with_the_stream_off() {
     let harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -670,10 +599,8 @@ async fn the_first_delta_posts_the_surface_with_the_stream_off() {
     );
 }
 
-/// Two events inside one edit window are one edit carrying the later state, not two edits.
 #[tokio::test(start_paused = true)]
 async fn edits_inside_the_interval_coalesce_to_the_latest_state() {
-    // `detailed`, because the coalescing question is which *state* the one edit carries.
     let harness = start(Offers::default(), ProgressDetail::Detailed, liveness(false));
     harness.sink.emit(started());
     harness.sink.emit(answered_with_tool(1));
@@ -701,7 +628,6 @@ async fn edits_inside_the_interval_coalesce_to_the_latest_state() {
     );
 }
 
-/// The tick schedule, read off the line the person sees: the number is fresh by construction.
 #[tokio::test(start_paused = true)]
 async fn keep_alive_ticks_at_fifteen_forty_five_then_every_sixty_seconds() {
     let harness = start(Offers::default(), ProgressDetail::Plain, ticking());
@@ -730,7 +656,6 @@ async fn keep_alive_ticks_at_fifteen_forty_five_then_every_sixty_seconds() {
     );
 }
 
-/// The keep-alive budget: ten ticks, then the surface goes quiet rather than writing forever.
 #[tokio::test(start_paused = true)]
 async fn the_keep_alive_budget_stops_at_ten_ticks() {
     let harness = start(Offers::default(), ProgressDetail::Plain, ticking());
@@ -749,8 +674,6 @@ async fn the_keep_alive_budget_stops_at_ten_ticks() {
     );
 }
 
-/// The edit budget, which is the guard against a pathological event stream rather than against a
-/// rate limit — the interval and the transport's own cooldown are that.
 #[tokio::test(start_paused = true)]
 async fn the_edit_budget_stops_at_sixty_edits() {
     let harness = start_with(
@@ -776,8 +699,6 @@ async fn the_edit_budget_stops_at_sixty_edits() {
     );
 }
 
-/// With a stream available the stream is the surface: no progress message is posted, and the one
-/// message it does create is the one that gets finalized.
 #[tokio::test(start_paused = true)]
 async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
     let offers = Offers {
@@ -794,8 +715,6 @@ async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
         harness.recorder.calls()
     );
 
-    // Only `dekopon-model` can build model text from bytes, which is what keeps anything else out
-    // of a streamed surface; the empty value is enough to pin which surface renders it.
     harness.sink.emit(ProgressEvent::TextDelta {
         turn: 1,
         text: ModelText::default(),
@@ -825,8 +744,6 @@ async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
 
 #[tokio::test(start_paused = true)]
 async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messages() {
-    // Capability shapes, not transport-name branching: Slack Agent/classic, Telegram/Discord,
-    // WhatsApp, an editable-only transport, and a reply-only transport.
     for (name, status, typing, reaction, progress, expected) in [
         (
             "slack-agent",
@@ -994,11 +911,6 @@ async fn auto_preserves_explicit_buttons_and_disabled_liveness() {
     }
 }
 
-/// Past the surface's ceiling the stream shows a bounded prefix and says it was cut.
-///
-/// The policy owns the cut and the flag; the driver owns the marker. Both halves are asserted here
-/// because a cut without the flag reads as a finished answer that happens to stop mid-word, and
-/// there is no other signal a person could use to tell the two apart.
 #[tokio::test(start_paused = true)]
 async fn a_stream_past_the_surface_ceiling_is_cut_and_marked() {
     let offers = Offers {
@@ -1008,7 +920,6 @@ async fn a_stream_past_the_surface_ceiling_is_cut_and_marked() {
     let harness = start(offers, ProgressDetail::Plain, liveness(true));
     harness.sink.emit(started());
 
-    // Two fragments of one recorded turn, which together run past the ceiling above.
     let delta = recorded_delta();
     let mut whole = ModelText::default();
     for _ in 0..2 {
@@ -1036,8 +947,6 @@ async fn a_stream_past_the_surface_ceiling_is_cut_and_marked() {
     );
 }
 
-/// `finalize` failing is not a delivery failure to report: the message is removed and the answer
-/// is posted the ordinary way.
 #[tokio::test(start_paused = true)]
 async fn a_refused_finalize_deletes_the_surface_and_replies() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -1060,13 +969,6 @@ async fn a_refused_finalize_deletes_the_surface_and_replies() {
     );
 }
 
-/// Two consecutive refusals stop that surface for the session, so a message that cannot be edited
-/// does not become one failed call per event for the rest of the run.
-///
-/// The record is the assertion, not the call count. A rung that stopped for the wrong reason — a
-/// budget, a seal, a tripped sibling — makes exactly as few calls as one the service refused, and
-/// an operator reading the trace has only `gateway_progress_degraded` and the category on it to
-/// tell those apart.
 #[tokio::test(start_paused = true)]
 async fn two_consecutive_failures_stop_the_surface_for_the_session() {
     let (capture, _guard) = capture();
@@ -1107,13 +1009,6 @@ async fn two_consecutive_failures_stop_the_surface_for_the_session() {
     );
 }
 
-/// A post that ran out its deadline may still land, so the surface stops rather than posting
-/// a second message the session would then finalize instead of the first.
-///
-/// A refusal says the service did nothing; a deadline says only that this task stopped waiting. A
-/// `post` held past it can leave a message on screen with no `MessageRef` here, and a rung that
-/// merely counted one failure would post again at the next trigger — leaving the first message
-/// saying "Working on it…" forever under an answer that landed in the second.
 #[tokio::test(start_paused = true)]
 async fn a_creating_post_that_misses_its_deadline_stops_the_surface_at_the_first_failure() {
     let (capture, _guard) = capture();
@@ -1128,7 +1023,6 @@ async fn a_creating_post_that_misses_its_deadline_stops_the_surface_at_the_first
     harness.sink.emit(started());
     harness.sink.emit(answered_with_tool(1));
     settle().await;
-    // The transport still has the post; the policy gives up on it at its own deadline.
     advance(CALL_DEADLINE + Duration::from_secs(1)).await;
 
     harness.sink.emit(answered_with_tool(2));
@@ -1152,13 +1046,6 @@ async fn a_creating_post_that_misses_its_deadline_stops_the_surface_at_the_first
     );
 }
 
-/// A finalize that ran out its deadline may still land, so the answer is posted beside the surface
-/// rather than after deleting it.
-///
-/// The delete is what makes this worth a branch of its own: an edit that landed a moment after
-/// this task gave up has already turned the message into the answer, and removing it takes the
-/// answer away. A duplicate answer is one a person can read twice; a deleted one is one they never
-/// read at all.
 #[tokio::test(start_paused = true)]
 async fn a_finalize_that_misses_its_deadline_replies_rather_than_deleting_the_surface() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -1167,8 +1054,6 @@ async fn a_finalize_that_misses_its_deadline_replies_rather_than_deleting_the_su
     settle().await;
     harness.recorder.stall_finalize.store(1, Ordering::Relaxed);
 
-    // Nothing else is runnable while the finalize is held, so the paused clock advances itself to
-    // the policy's deadline — which is the only timer short enough to fire before the stall.
     let delivered = harness
         .policy
         .terminal(Terminal::Answered(OutboundReply::text("the answer")))
@@ -1187,12 +1072,6 @@ async fn a_finalize_that_misses_its_deadline_replies_rather_than_deleting_the_su
     );
 }
 
-/// A failed session whose surface is a stream closes the stream instead of leaving it open.
-///
-/// An append-only stream has no delete, so the removal a failed progress message gets is not
-/// available: without this the stream stays live on the service, its registry entry is never
-/// taken, and the fixed failure sentence arrives as a second message under a partial answer that
-/// never ended. The close is the same shape a cancel takes, and for the same reason.
 #[tokio::test(start_paused = true)]
 async fn a_failed_streamed_session_closes_the_stream_under_the_partial_answer() {
     let offers = Offers {
@@ -1235,12 +1114,6 @@ async fn a_failed_streamed_session_closes_the_stream_under_the_partial_answer() 
     );
 }
 
-/// A stop reports who won the CAS, not "somebody".
-///
-/// The loop cannot tell a person's Stop from a shutdown from a wall-clock budget: all three reach
-/// it as the same `true`. The gateway knows, because it wrote the origin under the lock that
-/// decided the race, so `cancel_source` is what puts `user:stop-reply` on the trace instead of the
-/// trait default's `Operator`.
 #[test]
 fn a_stop_word_cancel_reports_the_affordance_that_won_the_race() {
     let cancellation = SessionCancellation::new();
@@ -1265,7 +1138,6 @@ fn a_stop_word_cancel_reports_the_affordance_that_won_the_race() {
         "user:stop-reply"
     );
 
-    // The loser of the race does not rewrite the origin.
     let shutdown = SessionCancellation::new();
     assert!(shutdown.cancel(CancelSource::Budget {
         limit: BudgetLimit::WallClock
@@ -1279,8 +1151,6 @@ fn a_stop_word_cancel_reports_the_affordance_that_won_the_race() {
     );
 }
 
-/// A stop changes the screen while the session is still parked in a model request; the ending is
-/// written once, by the task that owns the message.
 #[tokio::test(start_paused = true)]
 async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -1304,8 +1174,6 @@ async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
         harness.recorder.calls()
     );
 
-    // The session reaches its own cancelled branch later and hands the terminal over; the ending
-    // is already written, so nothing is said twice.
     let delivered = harness
         .policy
         .terminal(Terminal::Cancelled {
@@ -1328,13 +1196,6 @@ async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
     );
 }
 
-/// A stop that arrives after the loop answered loses the race it is too late for.
-///
-/// The window is between the prompt loop reporting `Finished` and the session resuming, on another
-/// thread, to deliver what it produced. A stop word landing inside it used to win: the policy wrote
-/// the stopped line onto the surface the answer was already streamed on, and the person read their
-/// answer with `Stopped.` under it. The claim the sink makes on `Finished` closes it, so the ending
-/// is the answer and there is still exactly one of them.
 #[tokio::test(start_paused = true)]
 async fn a_stop_after_the_loop_finished_leaves_the_answer_as_the_only_terminal_write() {
     const ANSWER: &str = "The capability echoed hi.";
@@ -1380,7 +1241,6 @@ async fn a_stop_after_the_loop_finished_leaves_the_answer_as_the_only_terminal_w
     );
 }
 
-/// The wall-clock budget cancels the session it belongs to, counted from `Started`.
 #[tokio::test(start_paused = true)]
 async fn the_wall_clock_budget_cancels_the_session_from_started() {
     let harness = start_with(
@@ -1409,8 +1269,6 @@ async fn the_wall_clock_budget_cancels_the_session_from_started() {
     );
 }
 
-/// A failed session's surface says something that is no longer true; it is removed and the fixed
-/// sentence is the whole reply.
 #[tokio::test(start_paused = true)]
 async fn a_failed_session_removes_the_surface_and_replies_the_fixed_line() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
@@ -1432,7 +1290,6 @@ async fn a_failed_session_removes_the_surface_and_replies_the_fixed_line() {
     );
 }
 
-/// `off` keeps the service's own indicators and writes nothing.
 #[tokio::test(start_paused = true)]
 async fn detail_off_renders_typing_status_and_reaction_and_nothing_else() {
     let harness = start(Offers::default(), ProgressDetail::Off, ticking());
@@ -1458,7 +1315,6 @@ async fn detail_off_renders_typing_status_and_reaction_and_nothing_else() {
     );
 }
 
-/// `detailed` adds the counters the operator asked for; `plain` never shows them.
 #[test]
 fn detail_levels_differ_only_by_the_counters_they_append() {
     let templates = templates();
@@ -1482,7 +1338,6 @@ fn detail_levels_differ_only_by_the_counters_they_append() {
     );
 }
 
-/// A provider-authored command word is bounded before it reaches a chat line.
 #[test]
 fn a_long_command_word_is_shortened_before_it_is_rendered() {
     let mut state = RenderState::default();
@@ -1495,7 +1350,6 @@ fn a_long_command_word_is_shortened_before_it_is_rendered() {
     );
 }
 
-/// Every unrenderable placeholder in the block is reported, not the first one.
 #[test]
 fn every_unrenderable_template_placeholder_is_reported_together() {
     let overrides = TemplateOverrides {
@@ -1521,7 +1375,6 @@ fn every_unrenderable_template_placeholder_is_reported_together() {
     );
 }
 
-/// Exercise the real local driver through the terminal policy, not a fake finalize refusal.
 #[tokio::test]
 async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
     use crate::transport::{ChatTransport, TransportEvent, local::LocalTransport};
@@ -1610,8 +1463,6 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                 OutboundReply::text("done")
             };
             assert!(policy.terminal(Terminal::Answered(reply)).await);
-            // A marker queued after terminal completion bounds the collected output and catches
-            // duplicate final writes without relying on an arbitrary no-more-lines sleep.
             transport
                 .driver()
                 .reply(&inbound.reply, OutboundReply::text("end marker"))

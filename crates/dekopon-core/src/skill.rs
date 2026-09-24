@@ -1,62 +1,34 @@
-//! The identifier grammar of an agent skill.
-//!
-//! A skill is a directory carrying a `SKILL.md` whose front matter names it. The name grammar is
-//! the one the open Agent Skills format fixes rather than Dekopon's own resource grammar: lowercase
-//! ASCII letters, digits, and single hyphens, at most 64 bytes, and equal to the directory's own
-//! name. It is narrower than [`crate::AgentId`] on purpose — a skill authored for another client
-//! has to load here unchanged, and one authored here has to load there — so the two grammars are
-//! two types rather than one type with a mode.
+//! Narrower than AgentId on purpose, matching the external Agent Skills format exactly, so this is
+//! a separate type rather than one grammar with a mode.
 
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
-/// Maximum bytes in a skill name, fixed by the Agent Skills format.
 pub const MAX_SKILL_NAME_LENGTH: usize = 64;
 
-/// The reason a skill name could not be parsed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SkillIdError {
-    /// The name was empty.
     #[error("skill name must not be empty")]
     Empty,
-    /// The name exceeded the format's limit.
     #[error("skill name is {length} bytes; the maximum is {maximum}")]
-    TooLong {
-        /// Actual byte length.
-        length: usize,
-        /// Maximum byte length.
-        maximum: usize,
-    },
-    /// A character outside `[a-z0-9-]` was present.
+    TooLong { length: usize, maximum: usize },
     #[error(
         "skill name contains invalid character {character:?} at byte {index}; use lowercase ASCII letters, digits, or '-'"
     )]
-    InvalidCharacter {
-        /// Byte offset in the submitted value.
-        index: usize,
-        /// Invalid character.
-        character: char,
-    },
-    /// The name started or ended with a hyphen.
+    InvalidCharacter { index: usize, character: char },
     #[error("skill name must start and end with a lowercase ASCII letter or digit")]
     InvalidEdge,
-    /// Two hyphens appeared next to one another.
     #[error("skill name contains consecutive hyphens at byte {index}")]
-    ConsecutiveHyphens {
-        /// Byte offset of the second hyphen.
-        index: usize,
-    },
+    ConsecutiveHyphens { index: usize },
 }
 
-/// A validated skill name, equal to the name of the directory the skill lives in.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SkillId(String);
 
 impl SkillId {
-    /// Returns the validated name as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -148,7 +120,6 @@ mod tests {
         );
     }
 
-    /// Every refusal names what was wrong, because a skill author reads it off a load failure.
     #[test]
     fn rejects_names_outside_the_grammar_by_reason() {
         assert_eq!("".parse::<SkillId>(), Err(SkillIdError::Empty));

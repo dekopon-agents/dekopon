@@ -1,4 +1,3 @@
-//! Direct per-invocation namespace storage and bounded native resources.
 use crate::{
     StorageEvidence, StorageGrant, StorageHostError,
     key::{
@@ -17,12 +16,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-/// One logical file's live presence and length for this invocation.
-///
-/// Presence and length are stat-derived when the file is first named and moved by each mutation
-/// this invocation applies; no path reads a file to learn how long it is. `data` is the JSONL
-/// append/replace working copy — that path builds the next contents from the previous ones — and
-/// is the only thing charged against the invocation load ceiling.
 #[derive(Clone, Debug)]
 pub(crate) struct FileEntry {
     /// Bounded working bytes, authoritative only while `loaded` is true.
@@ -42,7 +35,6 @@ impl FileEntry {
         self.exists.then_some(self.size)
     }
 
-    /// Records the length a completed mutation left, which the working copy no longer mirrors.
     pub(crate) fn present(&mut self, size: u64) {
         self.exists = true;
         self.size = size;
@@ -50,7 +42,6 @@ impl FileEntry {
         self.loaded = false;
     }
 
-    /// Records the contents a completed JSONL mutation wrote, retained as the working copy.
     pub(crate) fn mirrored(&mut self, bytes: Vec<u8>) {
         self.exists = true;
         self.size = bytes.len() as u64;
@@ -58,7 +49,6 @@ impl FileEntry {
         self.loaded = true;
     }
 
-    /// Records that a completed mutation removed the file, ending its identity.
     pub(crate) fn absent(&mut self) {
         self.exists = false;
         self.size = 0;
@@ -77,7 +67,6 @@ pub(crate) struct HandleState {
     pub(crate) lock: LockLevel,
 }
 
-/// One logical file's length before a reserved mutation and the length that mutation writes.
 #[derive(Debug)]
 struct PlannedChange {
     token: String,
@@ -85,11 +74,6 @@ struct PlannedChange {
     after: Option<u64>,
 }
 
-/// Every logical file one mutation rewrites, measured while its growth was reserved.
-///
-/// Reserving already stats each file it is about to change, so the resulting sizes are the
-/// mutation's exact accounting delta. Carrying them to the accounting call is what keeps
-/// `scan_usage` an open-time function instead of a per-write tree walk.
 #[derive(Debug)]
 pub(crate) struct PlannedMutation {
     changes: Vec<PlannedChange>,
@@ -104,7 +88,6 @@ pub(crate) struct OperationEvidence {
     pub(crate) write_bytes: u64,
 }
 
-/// One invocation holding the namespace lease; mutations apply during each call.
 pub struct StorageHandle {
     pub(crate) interface: StorageInterface,
     pub(crate) access: StorageAccess,
@@ -112,7 +95,6 @@ pub struct StorageHandle {
     pub(crate) limits: crate::StorageLimits,
     pub(crate) ledger: Arc<QuotaLedger>,
     pub(crate) entries: BTreeMap<String, FileEntry>,
-    /// What the namespace tree holds, carried forward by every mutation this invocation applies.
     usage: Usage,
     pub(crate) baseline_files: BTreeSet<String>,
     pub(crate) handles: BTreeMap<u64, HandleState>,
@@ -121,7 +103,6 @@ pub struct StorageHandle {
     pub(crate) next_file_identity: u64,
     pub(crate) host_calls: u64,
     pub(crate) read_bytes: u64,
-    // Successful JSONL working-copy loads only; writes have their own budget. Never refunded.
     native_loaded_bytes: u64,
     pub(crate) write_bytes: u64,
     pub(crate) entropy_bytes: u64,
@@ -188,23 +169,19 @@ impl StorageHandle {
         })
     }
 
-    /// Takes the generation lease, walks the generation once, and lists its logical files.
-    ///
-    /// The grant already checked this generation's shape and rotated past a corrupt one while it
-    /// held the base lease, which it still holds; a corruption here is a race with a writer that
-    /// does not take the leases.
+    /// Corruption found here signals a race with a writer that skipped the leases this generation
+    /// was already validated under.
     fn open_generation(
         grant: &StorageGrant,
     ) -> Result<(File, Usage, BTreeSet<String>), StorageHostError> {
-        // `Namespace::resolve` already holds the base lease. This is the one defined lock order.
+        // This is the one defined lock order: `Namespace::resolve` already holds the base lease
+        // before the generation lease is taken here.
         let lease = grant
             .namespace
             .directory
             .open_private("lease.lock", false)?;
         lock_exclusive(&lease, deadline_after(grant.limits.lock_timeout_ms)?)?;
 
-        // The one tree walk of this invocation. Every mutation below carries its own delta
-        // forward instead of asking the tree again.
         let usage = usage_with_directory_entry(scan_usage(
             &grant.namespace.directory,
             grant.limits.startup_max_entries,
@@ -335,8 +312,6 @@ impl StorageHandle {
         ))
     }
 
-    /// Loads only trusted metadata. Size, stat, and every durable-file mutation therefore cannot
-    /// allocate the complete file.
     pub(crate) fn ensure_entry(&mut self, name: &str) -> Result<String, StorageHostError> {
         let token = self.logical_token(name)?;
         if !self.entries.contains_key(&token) {
@@ -425,9 +400,8 @@ impl StorageHandle {
         Ok(identity)
     }
 
-    // Reserve growth before touching private data, including concurrent root users. Each change
-    // names the length its file ends at, never its contents: a positional write knows that length
-    // from the file's stat-derived size and never assembles the whole file to measure it.
+    // Growth must be reserved before private data is touched, or concurrent root users could
+    // overrun the accounted quota.
     pub(crate) fn reserve_candidate(
         &mut self,
         changes: &[(&str, Option<u64>)],
@@ -544,7 +518,6 @@ impl StorageHandle {
         result: Result<(), StorageHostError>,
         planned: PlannedMutation,
     ) -> Result<(), StorageHostError> {
-        // Account actual usage even after a partial syscall; no rollback or deferred write.
         let accounting = if result.is_ok() {
             self.account_planned(&planned)
         } else {
@@ -562,7 +535,6 @@ impl StorageHandle {
         result
     }
 
-    /// Charges the sizes the reservation planned, which every syscall of the mutation produced.
     fn account_planned(&mut self, planned: &PlannedMutation) -> Result<(), StorageHostError> {
         let final_sizes = planned
             .changes
@@ -572,12 +544,6 @@ impl StorageHandle {
         self.account_final_sizes(planned, &final_sizes)
     }
 
-    /// Charges what a failed mutation actually left behind, at one `statat` per file it touched.
-    ///
-    /// A short `write_all_at` or a refused `set_len` leaves a length neither the plan nor the
-    /// previous state predicts. Re-stating those files is the complete correction; the namespace
-    /// tree is never walked here. A stat that fails leaves the length unknown, and the caller
-    /// then retains the reservation rather than releasing bytes that may still be occupied.
     fn account_observed(&mut self, planned: &PlannedMutation) -> Result<(), StorageHostError> {
         let mut final_sizes = Vec::with_capacity(planned.changes.len());
         for change in &planned.changes {
@@ -591,7 +557,6 @@ impl StorageHandle {
         self.account_final_sizes(planned, &final_sizes)
     }
 
-    /// Moves the cached usage by each file's own delta and reports the new total to the ledger.
     fn account_final_sizes(
         &mut self,
         planned: &PlannedMutation,
@@ -654,7 +619,6 @@ impl StorageHandle {
             .observe_direct(usage)
     }
 
-    /// Releases resources, retaining every write already applied by this invocation.
     pub fn abort(mut self) -> StorageEvidence {
         self.close_all_handles();
         if let Some(reservation) = self.reservation.take() {
@@ -664,7 +628,6 @@ impl StorageHandle {
         self.lease.take();
         self.make_evidence()
     }
-    /// Closes an invocation after proving guest handles were released.
     pub fn finish_read(self) -> Result<StorageEvidence, StorageHostError> {
         if self.failed {
             return Err(StorageHostError::Io);
@@ -678,11 +641,9 @@ impl StorageHandle {
     pub fn finalization_budget(&self) -> Duration {
         Duration::from_millis(self.limits.finalization_budget_ms)
     }
-    /// Closes an invocation; writes have already taken effect.
     pub fn commit(self) -> Result<StorageEvidence, StorageHostError> {
         self.finish_read()
     }
-    /// Closes against the adapter's resource-drain deadline, without applying any writes.
     pub fn commit_before(self, deadline: Instant) -> Result<StorageEvidence, StorageHostError> {
         if Instant::now() >= deadline {
             return Err(StorageHostError::Timeout);
@@ -697,7 +658,6 @@ impl StorageHandle {
         }
     }
 
-    /// Commits the exact successful provider output under its dedicated per-namespace domain.
     #[must_use]
     pub fn output_commitment(&self, bytes: &[u8]) -> String {
         commitment(
@@ -848,9 +808,6 @@ mod tests {
 
     #[test]
     fn a_mutation_reads_no_directory_and_leaves_the_cached_usage_exact() {
-        /// Directory reads a mutation may perform, whatever the namespace holds and however many
-        /// mutations came before it: none. Accounting carries each change's own delta forward, so
-        /// the tree walk `begin` performs is the only one an invocation makes.
         const SCANS_ALLOWED: u64 = 0;
         const FILES: u64 = 8;
         const FRAMES: u64 = 64;
@@ -959,8 +916,6 @@ mod tests {
         let elapsed = started.elapsed();
         let written = FRAMES * FRAME;
         println!("{FRAMES} appends of {FRAME} B hashed {hashed} bytes in {elapsed:?}");
-        // Recommitting to the whole candidate file on every write hashes `written * FRAMES / 2`,
-        // roughly 2 GiB here. Reserving direct growth must not hash the file again.
         assert!(
             hashed <= written,
             "{FRAMES} appends totalling {written} bytes hashed {hashed} bytes: \

@@ -1,29 +1,5 @@
-//! What a `persistent` route remembers between one message and the next.
-//!
-//! The whole store is a bounded map in the daemon's memory. It is never written to disk, never sent
-//! to the broker, and lost on restart — a person who asks a follow-up across a restart gets a
-//! first-message answer. That placement is the point rather than a shortcut: the broker holds
-//! provider credentials and a deliberately metadata-only audit log, and conversation text there
-//! would put the most sensitive content in the system inside the most privileged process. The
-//! gateway already read the message and wrote the answer, so keeping the history here adds no new
-//! reader.
-//!
-//! Five properties are load-bearing and each has a test:
-//!
-//! - **Trusted route configuration selects the audience.** Private history includes the canonical
-//!   authenticated subject in its key. Explicit shared history omits only that subject and still
-//!   includes the agent, configured transport, and transport-derived conversation identity.
-//! - **The granted capability set travels with the conversation.** A grant that differs from the one
-//!   this message's fresh broker leg reported drops the whole selected history, so output fetched
-//!   under a wider grant stops being replayed once the grant narrows.
-//! - **Nothing here caches authorization.** The stored grant is an invalidation input and never a
-//!   permission: every message still opens its own attested leg and asks the broker again.
-//! - **A generation fences every commit and asset operation.** Removing, replacing, or evicting a
-//!   slot makes every older in-flight session's lease inert and closes its attachment-access fence,
-//!   so stale work can recreate neither forgotten text nor asset metadata.
-//! - **The prompt cache key is minted, not derived.** It is stored beside the history so it lives
-//!   and dies with the prefix it names, and it carries nothing about the audience whose key it sits
-//!   under; [`crate::cache_key`] states why a hashed identifier was refused.
+//! This history lives only in the gateway's memory, never persisted or forwarded to the broker, so
+//! the most sensitive conversation text never reaches the broker's more privileged process.
 
 use std::{
     collections::HashMap,
@@ -41,25 +17,14 @@ use crate::{
     config::MemoryWindow,
 };
 
-/// The audience discriminant on a remembered transcript.
-///
-/// Deliberately has no `Debug`: the private half contains a canonical authenticated subject.
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum ConversationAudience {
     Private(ExternalSubject),
     Shared,
 }
 
-/// One remembered transcript's complete isolation key.
-///
-/// The configured transport name and transport-derived conversation identity prevent aliases
-/// across chat installations and conversations. The agent prevents two routed agents from sharing
-/// transcript or attachment state even if every transport coordinate is otherwise equal. The
-/// audience then either adds the canonical authenticated subject or marks an explicit shared route.
-///
-/// It carries no `Debug`, on purpose. Both a canonical subject and a service-native conversation
-/// identifier are payload telemetry rather than metadata, so making a key unprintable is what stops
-/// one `?key` in a log line from putting either into a span at the metadata level.
+/// The transport, agent, and audience together stop two agents or installations from sharing
+/// history; the key has no Debug so a subject or native conversation id can't leak into a log span.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct ConversationKey {
     agent: AgentId,
@@ -69,7 +34,6 @@ pub(crate) struct ConversationKey {
 }
 
 impl ConversationKey {
-    /// Keys one authenticated subject's state within an exact routed conversation.
     pub fn private(
         agent: &AgentId,
         transport: &str,
@@ -84,7 +48,6 @@ impl ConversationKey {
         }
     }
 
-    /// Keys intentionally shared state within an exact routed conversation.
     pub fn shared(agent: &AgentId, transport: &str, conversation: &str) -> Self {
         Self {
             agent: agent.clone(),
@@ -95,35 +58,22 @@ impl ConversationKey {
     }
 }
 
-/// One live conversation.
 struct Conversation {
     history: History,
-    /// The provider cache lane every message of this conversation routes to.
-    ///
-    /// Minted with the entry and stored beside the history rather than derived from the key,
-    /// because the key may contain a canonical subject and a cache key must contain nothing about
-    /// its audience; [`crate::cache_key`] has the whole argument. Held here so it shares the
-    /// history's lifetime exactly: the window of messages that genuinely share a prompt prefix is
-    /// the window worth routing together, and an entry that goes away takes its lane with it.
+    /// The cache lane must be minted separately and never derived from the conversation key, since
+    /// that key may reveal who is asking.
     cache_key: String,
-    /// Last time a finished message touched this conversation, for idle timeout and LRU eviction.
     touched: Instant,
 }
 
-/// One current key generation, including sessions that have begun but not committed.
 struct Slot {
-    /// Globally non-reused token fencing leases and attachment state issued by this generation.
     generation: u64,
     input_revision: u64,
     seed_revision: u64,
     gateway_notice: Option<&'static str>,
-    /// Closed on every replacement/removal so stale sessions cannot publish or fetch assets.
     asset_fence: Arc<AssetFence>,
-    /// Exact sorted capability identifiers reported by the fresh legs in this generation.
     granted: Vec<String>,
-    /// Sessions holding a lease for this generation.
     pending: usize,
-    /// Absent until one of those sessions records a turn.
     live: Option<Conversation>,
 }
 
@@ -132,29 +82,20 @@ struct StoreState {
     slots: HashMap<ConversationKey, Slot>,
 }
 
-/// What one persistent session needs to continue a conversation.
-///
-/// The lease is the authority to append only to the exact generation this seed observed, and the
-/// asset token reaches only that generation's inventory. Neither is authorization to run a
-/// capability; together they prevent older in-flight work from restoring text or reaching assets
-/// after a later fresh grant, empty grant, idle check, or capacity eviction removed the generation.
+/// The lease and asset token only bound this generation's history and assets; neither authorizes
+/// running a capability, and both go stale once a fresh grant, idle check, or eviction replaces the
+/// generation.
 pub(crate) struct ConversationSeed<'a> {
-    /// The remembered exchanges to replay, empty on the first message of a conversation.
     pub history: History,
-    /// The cache lane this session's model calls declare.
-    ///
-    /// For a live conversation this is its retained key. Concurrent sessions opening a new
-    /// conversation each mint a candidate; the first matching commit chooses the retained lane.
     pub cache_key: String,
-    /// Generation-fenced access to this conversation's attachment inventory.
     pub assets: AssetAccess,
-    /// Generation-fenced append lease. Dropping it without committing stores no turn.
     pub lease: ConversationLease<'a>,
     pub input: ConversationInput,
     pub gateway_notice: Option<&'static str>,
 }
 
-/// Receipt association, invalid after any later normal request even in the same generation.
+/// This input becomes invalid after any later normal request, even within the same generation, so
+/// don't reuse a stale one.
 #[derive(Clone)]
 pub(crate) struct ConversationInput {
     key: ConversationKey,
@@ -184,9 +125,6 @@ impl LateAssetRefusal {
     }
 }
 
-/// One generation-fenced right to append a completed prompt turn.
-///
-/// This type deliberately has no `Debug`: it contains the non-debug conversation key.
 pub(crate) struct ConversationLease<'a> {
     store: &'a ConversationStore,
     key: ConversationKey,
@@ -196,10 +134,6 @@ pub(crate) struct ConversationLease<'a> {
 }
 
 impl ConversationLease<'_> {
-    /// Appends one turn if this lease still names the current key generation.
-    ///
-    /// Equal-generation sessions append in completion order. A stale lease is a no-op: it never
-    /// recreates an absent slot and never overwrites a replacement generation.
     pub fn commit(
         mut self,
         window: MemoryWindow,
@@ -269,19 +203,14 @@ fn decrement_pending(slot: &mut Slot) {
     }
 }
 
-/// Why a conversation stopped being remembered, as the lifecycle event records it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EvictionReason {
-    /// Untouched for longer than the route's idle timeout.
     Idle,
-    /// The least recently used conversation, displaced by a newer one at the ceiling.
     Capacity,
-    /// Built under a granted capability set that this message's fresh leg no longer reports.
     GrantChanged,
 }
 
 impl EvictionReason {
-    /// Stable low-cardinality label for `gateway_conversation_evicted`.
     const fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -291,20 +220,12 @@ impl EvictionReason {
     }
 }
 
-/// Every conversation this process remembers, bounded and evicted without a timer.
-///
-/// There is no sweeper task and no shutdown hook, which is deliberate rather than missing. A stale
-/// entry is dropped by the lookup that would have used it, and the ceiling is enforced by the insert
-/// that would have exceeded it. History is process memory and dies with the process, so there is
-/// nothing to flush. Pending-only slots do not count against the conversation ceiling; their number
-/// is bounded by the process-wide session admission ceiling.
 pub(crate) struct ConversationStore {
     capacity: usize,
     state: Mutex<StoreState>,
 }
 
 impl ConversationStore {
-    /// Creates a store tracking at most `capacity` committed conversations at once.
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -315,11 +236,6 @@ impl ConversationStore {
         }
     }
 
-    /// Seeds one session, replacing whatever this message invalidated.
-    ///
-    /// An entry idle past the route's timeout, or built under a different granted capability set, is
-    /// dropped rather than used. Every returned seed carries a lease for the selected generation.
-    /// Replacing a generation invalidates all older leases and asset access before inference begins.
     pub fn begin(
         &self,
         key: &ConversationKey,
@@ -434,8 +350,6 @@ impl ConversationStore {
         }
     }
 
-    /// Admission closes old WhatsApp intake before the new request awaits authorization.
-    /// Existing content survives, and an absent generation is never created here.
     pub fn invalidate_late_input(&self, key: &ConversationKey) {
         let mut state = self.state.lock().expect("conversation store");
         if let Some(slot) = state.slots.get_mut(key) {
@@ -446,8 +360,6 @@ impl ConversationStore {
         }
     }
 
-    /// Delivery may finish during the next request's authorization, but not after it seeds.
-    /// Admission closes asset intake; prompt seeding separately consumes delivered context.
     pub fn remember_gateway_notice(&self, input: &ConversationInput, notice: &'static str) {
         let mut state = self.state.lock().expect("conversation store");
         if let Some(slot) = state.slots.get_mut(&input.key)
@@ -458,8 +370,6 @@ impl ConversationStore {
         }
     }
 
-    /// Checks the fresh grant and receipt revision under the store lock; never creates a slot.
-    /// Successful metadata registration keeps an empty conversation alive even if its run stops.
     pub fn retain_late_assets<T>(
         &self,
         input: &ConversationInput,
@@ -517,11 +427,6 @@ impl ConversationStore {
         Ok(result)
     }
 
-    /// Forgets one selected conversation generation outright.
-    ///
-    /// This is what an empty grant gets. Removing any slot closes its attachment fence and
-    /// invalidates pending leases, but only removal of remembered history emits an eviction and
-    /// returns `true`.
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {
         let mut state = self.state.lock().expect("conversation store");
         let removed = state.slots.remove(key);
@@ -536,10 +441,8 @@ impl ConversationStore {
         had_history
     }
 
-    /// How many committed conversations are resident, against `sessions.maxConversations`.
-    ///
-    /// Test-only: nothing in the daemon reads this count, because a store that reported its own
-    /// size into telemetry would be one more place a conversation could be described.
+    /// Keep this test-only: exposing the count in production telemetry would give the conversation
+    /// store one more way to be observed.
     #[cfg(test)]
     pub fn tracked(&self) -> usize {
         self.state
@@ -551,7 +454,6 @@ impl ConversationStore {
             .count()
     }
 
-    /// Drops least-recently-used committed conversations until the ceiling holds.
     fn enforce_ceiling(&self, state: &mut StoreState) {
         while state
             .slots
@@ -590,9 +492,8 @@ fn allocate_generation(state: &mut StoreState) -> u64 {
     generation
 }
 
-/// Counts and byte totals, never text or pending keys.
-///
-/// Written by hand because the derived form would print every remembered exchange and identifier.
+/// Debug is hand-written so it prints only counts and byte totals, never the conversation text,
+/// pending keys, or identifiers a derived implementation would print.
 impl fmt::Debug for ConversationStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.lock().expect("conversation store");
@@ -619,12 +520,10 @@ impl fmt::Debug for ConversationStore {
     }
 }
 
-/// Whether an entry has gone untouched for at least as long as its route allows.
 fn expired(entry: &Conversation, idle_timeout: Duration, now: Instant) -> bool {
     now.saturating_duration_since(entry.touched) >= idle_timeout
 }
 
-/// One lifecycle event per forgotten committed conversation, carrying a reason and nothing else.
 fn evicted(reason: EvictionReason) {
     tracing::info!(
         event = "gateway_conversation_evicted",

@@ -1,28 +1,19 @@
-//! `xargs [-I PLACEHOLDER] COMMAND [ARGS...]`.
-//!
-//! `xargs` maps a command over the elements of its piped input, one element per invocation, and
-//! collects the results into a JSON array. It re-enters the evaluator to run each invocation, so
-//! [`crate::interp`] executes the plan this module builds rather than running it here.
-//!
-//! Element handling is deliberately not POSIX word splitting: a JSON array yields one invocation
-//! per element, and a scalar or line-oriented string yields one invocation per line.
+//! This module only builds the invocation plan; the interpreter re-enters itself to actually run
+//! each one, and elements come from JSON array items or text lines rather than POSIX word
+//! splitting.
 
 use serde_json::Value;
 
 use super::CommandFailure;
 use crate::value::{display, to_lines};
 
-/// The dispatch name for this builtin.
 pub(crate) const NAME: &str = "xargs";
 
-/// One planned invocation: the exact argv the interpreter should run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Plan {
-    /// Argv per input element, in order.
     pub invocations: Vec<Vec<String>>,
 }
 
-/// Builds the invocation plan from `xargs` arguments and the piped input value.
 pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, CommandFailure> {
     let mut placeholder: Option<String> = None;
     let mut index = 0;
@@ -43,7 +34,6 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
                 placeholder = Some(value.clone());
                 index += 2;
             }
-            // `-n 1` is already the only mode: one element per invocation.
             "-n" => {
                 let Some(value) = arguments.get(index + 1) else {
                     return Err(CommandFailure::usage("xargs: -n requires a count"));

@@ -37,10 +37,6 @@ use tokio::{
     sync::oneshot,
 };
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 fn context(principal: &str) -> AuthenticatedContext {
@@ -55,7 +51,6 @@ fn context(principal: &str) -> AuthenticatedContext {
     .expect("trusted context binds")
 }
 
-/// The direct grant: `caller`, as the agent its peer identity carries, may `cli-probe.upper`.
 const DIRECT_POLICY: &str = r#"
 @id("caller-upper")
 permit(principal == Dekopon::Principal::"caller",
@@ -65,10 +60,6 @@ when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
 
-/// The attested twin, plus the session gate it now needs.
-///
-/// `via` names the *peer* principal `context("caller")` builds, because that is the identity the
-/// socket authenticates; the policy's own principal is the one the subject maps to.
 const ATTESTED_POLICY: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -146,12 +137,6 @@ fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
 
-/// A fixture directory the broker binds under and its clients connect through.
-///
-/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
-/// world-traversable. That is a parent `socket::bind` refuses, and — now that both sides read one
-/// socket rule — a parent `BrokerClient` refuses too: whoever can write the directory can replace
-/// the listener under a socket whose own mode still looks private.
 fn private_directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("create fixture directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -198,7 +183,6 @@ async fn broker_with_audit_bound(
     (broker, audit)
 }
 
-/// The canonical subject the attested fixtures speak for.
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
 fn subject() -> ExternalSubject {
@@ -218,8 +202,6 @@ fn attestor_grant() -> AttestorGrant {
     }
 }
 
-/// A broker carrying both the direct grant and its attested twin, plus the one owner-controlled
-/// mapping that turns the subject into a principal.
 async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
@@ -268,9 +250,6 @@ fn server_limits() -> ServerLimits {
     }
 }
 
-/// A command word answers over the socket as the tool it fronts: the help page at status 0
-/// decides nothing, and the proposal built from the piped value is what the next frame submits,
-/// so `echo hello | probe upper -` is one run and one authorized invocation.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_command_over_the_socket_renders_help_then_proposes() {
     let uid = current_uid();
@@ -333,7 +312,6 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         .await
         .expect("the piped value proposes")
     {
-        // cli-probe names no secret, so the proposal carries no secret use to forward.
         CommandRunOutcome::Proposed {
             capability,
             input,
@@ -415,17 +393,6 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
         .expect("server shuts down");
 }
 
-/// The refusal an operator most often meets: the broker's own readiness probe connects as the
-/// broker's UID, so a configuration whose `identities` omit it is answered with the same opaque
-/// nothing a stranger gets. What the answer withholds is pinned here; the `broker_peer_unmapped`
-/// line that carries the peer UID is pinned in `failure_logging.rs`, whose global subscriber is
-/// the only one a spawned connection task reports to.
-///
-/// The frame is read straight off the socket because this is the one refusal the broker writes
-/// before reading a request and closes the socket with: macOS refuses to report a peer's
-/// credentials once that close has landed, so a `BrokerClient` here would report losing the
-/// server rather than the answer this test is about. The refusal itself survives the close —
-/// it is already in this peer's receive buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn unmapped_peer_receives_no_capability_information() {
     let directory = private_directory();
@@ -446,7 +413,6 @@ async fn unmapped_peer_receives_no_capability_information() {
         panic!("an unmapped peer must be refused rather than served");
     };
     assert_eq!(code, ERROR_UNAUTHENTICATED);
-    // Not even the provider it would have been allowed to call, had it been mapped.
     assert!(!message.contains("cli-probe"), "{message}");
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -601,8 +567,6 @@ when { context.capability == "http-probe.fetch"
     );
     upstream.await.expect("HTTP fixture exits");
 
-    // Wrong path is inside capability authority but outside the secret binding. It may not make a
-    // second network request, and the host rejection is terminal even if the guest catches it.
     invocation.id = "invoke-secret-wrong-path".parse().expect("invocation");
     invocation.input = json!({
         "uri": format!("http://{authority}/api/v1/other"),
@@ -621,14 +585,6 @@ when { context.capability == "http-probe.fetch"
         .expect("service stops");
 }
 
-/// Waits until the fixture's socket exists *and* is owner-only.
-///
-/// Existence alone is not readiness. `socket::bind` binds the listener and then narrows the mode to
-/// `0600`, so between those two steps the path exists with the umask's permissions and a client
-/// that connects inside that window fails its own `UnsafeSocket` check. That is a test-timing
-/// problem rather than an exposure — `validate_private_parent` has already proved the containing
-/// directory is owner-only, so no other user can traverse it to reach the socket meanwhile — but
-/// polling on `exists()` alone makes the suite flaky under parallel load.
 async fn wait_for_socket(
     path: &Path,
     task: &mut tokio::task::JoinHandle<Result<(), BrokerdError>>,
@@ -654,8 +610,6 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    // One audit slot: the first allowed invocation spends it on its Decision, so its terminal
-    // Execution append is already doomed when the provider runs.
     let (broker, audit) = broker_with_audit_bound(1).await;
     let mut identities = BTreeMap::new();
     identities.insert(
@@ -687,7 +641,6 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         message.contains("may already have completed"),
         "the client must be told the effect may have happened: {message}"
     );
-    // The Decision landed; the provider ran; nothing recorded the outcome.
     assert_eq!(audit.records().len(), 1);
 
     let never_ran = client
@@ -701,8 +654,6 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     else {
         panic!("expected a remote broker failure, got {never_ran}");
     };
-    // Nothing executed, so this is safe to resubmit — and futile in this bounded in-memory log.
-    // Every fresh identifier fails on the same append until the embedding addresses capacity.
     assert_eq!(unran_code, ERROR_CAPACITY_EXHAUSTED);
     assert_ne!(
         unran_code, ERROR_BROKER_UNAVAILABLE,
@@ -723,9 +674,6 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         .expect("server shuts down");
 }
 
-/// The whole attested path over a real socket: the peer names a canonical subject, the broker
-/// maps it, and the invocation runs under the attested context. The peer never names a principal
-/// at any point — that mapping is not something the wire can express.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let uid = current_uid();
@@ -774,9 +722,6 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
         .expect("server shuts down");
 }
 
-/// A peer with no attestor grant gets a completed invocation response carrying a denial, not a
-/// transport failure. The difference is the audit record: a denial is a decision the broker made
-/// and retained, and an error would leave the attempt with nothing accounting for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let uid = current_uid();
@@ -824,10 +769,6 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
         .expect("server shuts down");
 }
 
-/// `BrokerClient` binds the attestation to its proposal by construction, so reaching the
-/// server-side check needs a hand-rolled frame. A claim that names a different invocation is a
-/// decode-level protocol error rather than a policy decision — nothing is authorized, and nothing
-/// consumes an identifier.
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_attestation_binding_is_a_protocol_error() {
     let uid = current_uid();
@@ -887,9 +828,6 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
         .expect("server shuts down");
 }
 
-/// Inspection follows the same rule as invocation: an attestor peer sees the attested context's
-/// capabilities, and a peer without a grant is refused without learning whether the subject is
-/// mapped at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_over_the_socket() {
     let uid = current_uid();
@@ -921,8 +859,6 @@ async fn attested_capabilities_over_the_socket() {
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
-    // The peer's own listing is a different answer produced by a different rule, which is what
-    // makes the two populations disjoint rather than merely ordered.
     let own = client
         .capabilities()
         .await
@@ -971,9 +907,6 @@ async fn attested_capabilities_over_the_socket() {
         .expect("server shuts down");
 }
 
-/// Cedar validates types, not instances, so a policy naming a principal nobody configured is
-/// perfectly well typed and would simply never match. The declared world is what turns that into a
-/// startup refusal — the same protection the exact engine's reachability check used to provide.
 #[tokio::test(flavor = "multi_thread")]
 async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let uid = current_uid();
@@ -1040,12 +973,6 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     assert!(!directory.path().join("broker.sock").exists());
 }
 
-/// The default posture is the mirror of `strict_startup_refuses_every_policy_that_names_something_absent`.
-///
-/// Everything that test proves refuses under `strict: true` must *start* without it, so an operator
-/// can ship policy and constraint sets that anticipate a provider they have not dropped in yet. The
-/// undeclared principal is the exception and stays fatal: principals come from this very file, not
-/// from a loaded component, so naming one that does not exist is always a typo.
 #[tokio::test(flavor = "multi_thread")]
 async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     let uid = current_uid();
@@ -1101,7 +1028,6 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
             .unwrap_or_else(|error| panic!("{label} must start when tolerating: {error:?}"));
     }
 
-    // Still fatal, in every mode: a principal comes from this configuration, not a component.
     write_owner_only(
         &policies_path,
         r#"permit(principal == Dekopon::Principal::"nobody",
@@ -1297,8 +1223,6 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
             && refused.descriptors.is_empty()
     );
 
-    // Close the receive direction before sending the request: the successful effect's response
-    // must fail to write, not race a cooperative reader. Server shutdown drains the connection.
     let stream = UnixStream::connect(&socket_path)
         .await
         .unwrap()
@@ -1325,13 +1249,10 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     })
     .await
     .unwrap();
-    // On macOS the half-closed peer can leave the descriptor write waiting for its I/O
-    // deadline. Close it before shutdown so that deadline does not race the equal grace period.
     drop(stream);
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert_eq!(fs::read_dir(&assets_root).unwrap().count(), 0);
-    // The failed frame must close its output descriptor and release the full shared reservation.
     asset_directory
         .allocate()
         .await

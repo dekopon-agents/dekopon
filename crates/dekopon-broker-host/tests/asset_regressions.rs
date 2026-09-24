@@ -1,4 +1,3 @@
-// Match the workspace's test-only unwrap policy; production code keeps the deny lint.
 #![allow(clippy::unwrap_used)]
 
 use dekopon_broker_host::asset::AssetInputs;
@@ -84,7 +83,6 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     }
 }
 
-// One test owns the process-wide capture; real component imports, never direct StoreState calls.
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_record_decoded_hashes()
 {
@@ -204,7 +202,6 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
     );
     assert!(!capture.events_text().contains(&STANDARD.encode(payload)));
 
-    // Both caught native writer exhaustion and caught HTTP spool exhaustion are terminal.
     let tight_directory = AssetDirectory::new(root.path().to_owned(), 1);
     registry.set_assets(tight_directory.clone());
     for after in ["return", "spin", "http-denied"] {

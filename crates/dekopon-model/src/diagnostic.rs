@@ -1,5 +1,3 @@
-//! Request-scoped credential exclusion for untrusted diagnostic text.
-
 use dekopon_core::Redacted;
 
 use crate::{
@@ -74,8 +72,8 @@ impl<'a> DiagnosticSecrets<'a> {
         if sanitized == shown {
             return source;
         }
-        // Serde data errors may quote upstream values. Keeping that source would re-expose
-        // the token through Debug/source(), even if the outer diagnostic were redacted.
+        // Serde error sources may quote upstream values; keeping the source would re-expose the
+        // token through Debug or source() even if the outer message is redacted.
         <serde_json::Error as serde::de::Error>::custom(sanitized)
     }
 }

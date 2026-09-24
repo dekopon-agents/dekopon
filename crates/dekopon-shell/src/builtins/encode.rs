@@ -1,15 +1,9 @@
-//! `base64 [-d|--decode]`.
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::value::to_text;
 
-/// Encodes or decodes standard base64.
-///
-/// Text-shaped: a JSON array of lines is newline-joined before encoding, so
-/// `gh issue list | base64` behaves the way a script expects.
 pub(crate) struct Base64;
 
 impl Builtin for Base64 {

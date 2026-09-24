@@ -1,8 +1,5 @@
-//! Domain-separated SHA-256 derivations for every opaque name and commitment the host writes.
-//!
-//! Nothing here is secret and nothing here authenticates. Isolation is the broker granting only the
-//! caller's own scope and the host binding each handle to that scope's directory; a name anyone
-//! who can already list the storage root could recompute changes neither.
+//! These hashes aren't secret and don't authenticate; isolation comes from the broker granting only
+//! the caller's own scope and the host binding each handle to that directory.
 
 use sha2::{Digest as _, Sha256};
 
@@ -19,10 +16,6 @@ pub(crate) const DOMAIN_DECISION_EVIDENCE: &str = "storage-decision-evidence-v1"
 pub(crate) const DOMAIN_OUTPUT_EVIDENCE: &str = "storage-output-evidence-v1";
 pub(crate) const DOMAIN_OPERATION_EVIDENCE: &str = "storage-operation-evidence-v1";
 
-/// SHA-256 over the domain and every field, each length-prefixed.
-///
-/// The prefixes make the input injective: no two domains, and no two ways of splitting the same
-/// bytes into fields, hash the same message.
 pub(crate) fn digest(domain: &str, fields: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in [b"dekopon-storage-domain-v1".as_slice(), domain.as_bytes()]
@@ -50,10 +43,6 @@ pub(crate) fn commitment(domain: &str, fields: &[&[u8]]) -> String {
 
 #[cfg(test)]
 thread_local! {
-    /// Field bytes hashed on this thread.
-    ///
-    /// Test-only instrumentation. Hashing cost is a behavior this crate has to hold to—reserving a
-    /// positional write must not depend on file size—so it is measured rather than assumed.
     static HASHED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -62,7 +51,6 @@ fn note_hashed(bytes: u64) {
     HASHED_BYTES.with(|cell| cell.set(cell.get().saturating_add(bytes)));
 }
 
-/// Field bytes hashed on this thread so far.
 #[cfg(test)]
 pub(crate) fn hashed_bytes() -> u64 {
     HASHED_BYTES.with(std::cell::Cell::get)
@@ -115,7 +103,6 @@ mod tests {
         assert_eq!(tokens.iter().collect::<BTreeSet<_>>().len(), tokens.len());
     }
 
-    /// The length prefixes are what keep two field lists that concatenate to the same bytes apart.
     #[test]
     fn moving_a_field_boundary_changes_the_token() {
         assert_ne!(

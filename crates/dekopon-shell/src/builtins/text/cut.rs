@@ -1,5 +1,3 @@
-//! `cut -d DELIM -f LIST` and `cut -c LIST`.
-
 use serde_json::Value;
 
 use crate::{
@@ -7,7 +5,6 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
-/// Selects delimited fields or character ranges from each line.
 pub(crate) struct Cut;
 
 impl Builtin for Cut {
@@ -79,7 +76,6 @@ impl Builtin for Cut {
             .map(|line| match &selection {
                 Mode::Fields(selection) => {
                     let parts = line.split(delimiter).collect::<Vec<_>>();
-                    // Real cut passes lines without the delimiter through unchanged.
                     if parts.len() == 1 {
                         return line;
                     }
@@ -106,14 +102,12 @@ enum Mode {
     Characters(Selection),
 }
 
-/// A one-based `N`, `N-M`, `-M`, `N-`, comma-separated selection list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Selection {
     ranges: Vec<(usize, Option<usize>)>,
 }
 
 impl Selection {
-    /// Parses a selection list.
     pub(crate) fn parse(command: &str, list: &str) -> Result<Self, CommandFailure> {
         let mut ranges = Vec::new();
         for entry in list.split(',') {
@@ -147,7 +141,6 @@ impl Selection {
         Ok(Self { ranges })
     }
 
-    /// Returns the selected parts in ascending order, without duplicates.
     pub(crate) fn select<'a>(&self, parts: &[&'a str]) -> Vec<&'a str> {
         let mut selected = Vec::new();
         for (position, part) in parts.iter().enumerate() {
