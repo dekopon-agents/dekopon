@@ -7,13 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-24
+
 ### Added
 
 - `dekopond` and `dekopon-brokerd` OTLP exporters trust the extra PEM roots named by the standard
   `OTEL_EXPORTER_OTLP_CERTIFICATE`, beside WebPKI, on both transports; an unreadable or
   certificate-less file refuses startup.
-- Chart: `otlp.caBundle` (`configMap`, `key`) mounts that bundle into both daemons and sets
-  `OTEL_EXPORTER_OTLP_CERTIFICATE`.
 
 ### Changed
 
@@ -40,6 +40,17 @@ All notable changes to Dekopon are documented here. The format is based on
 - `jq halt`, `halt(n)` and `halt_error` exited `dekopond`; they now fail the command.
 - The jq abandoned-worker count could wrap below zero when a worker finished between its
   abandonment being published and charged.
+
+## [dekopon-chart-0.11.0] - 2026-09-24
+
+### Added
+
+- `otlp.caBundle` (`configMap`, `key`) mounts that bundle into both daemons and sets
+  `OTEL_EXPORTER_OTLP_CERTIFICATE`; it needs application 0.21.0.
+
+### Changed
+
+- Default application version is now 0.21.0.
 
 ## [0.20.0] - 2026-09-23
 

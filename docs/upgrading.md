@@ -13,6 +13,15 @@ do not understand rather than guessing.
 Rust embedders match `dekopon_model::error::InferenceError` instead of `ModelError`;
 `Interrupted` is now `Cancelled`.
 
+## OTLP private CA (0.21.0)
+
+Nothing changes unless `OTEL_EXPORTER_OTLP_CERTIFICATE` is set. When it is, both daemons read that
+PEM file at startup and trust its roots beside WebPKI for OTLP export over gRPC and HTTP; a path
+that cannot be read or holds no certificate refuses startup, so mount the file before rolling. On
+Kubernetes, chart 0.11.0's `otlp.caBundle: {configMap, key}` mounts it into both containers and
+sets the variable. This is separate from the broker's `http.extraCABundles`, which still covers
+provider HTTPS only.
+
 ## Provider HTTPS and owner settings (0.20.0)
 
 Broker `http.extraCABundles` adds absolute PEM CA files for **all** provider HTTPS requests;
