@@ -266,14 +266,7 @@ impl PolicyWorld {
     fn schema_json(&self) -> serde_json::Value {
         // Every routing attribute must be declared optional in the schema, or Cedar's strict
         // validator rejects any policy referencing an absent one.
-        const ROUTING: [&str; 6] = [
-            "via",
-            "subject",
-            "agent",
-            "transportKind",
-            "transport",
-            "trigger",
-        ];
+        const ROUTING: [&str; 4] = ["subject", "transportKind", "transport", "trigger"];
         let mut routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
             (
                 name.to_owned(),
@@ -299,6 +292,9 @@ impl PolicyWorld {
         // request, or Cedar evaluation can fail.
         let context = |required: &[&str]| {
             let mut attributes = routing_attributes.clone();
+            attributes.extend(
+                ["via", "agent"].map(|name| (name.to_owned(), json!({ "type": "String" }))),
+            );
             attributes.extend(
                 required
                     .iter()
