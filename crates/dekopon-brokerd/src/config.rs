@@ -318,9 +318,15 @@ pub async fn load(
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let path = absolute(path.as_ref())?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return load_directory(path, expected_uid).await;
+    }
     let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
+    if !config.constraint_sets.is_empty() && config.policies_path.is_none() {
+        return Err(ConfigError::MissingPoliciesPath);
+    }
     let mut resolved = resolve(config, path, expected_uid).await?;
     if let Some(policies_path) = resolved.policies_path.clone() {
         let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
@@ -329,6 +335,191 @@ pub async fn load(
         })?;
     }
     Ok(resolved)
+}
+
+/// Keys whose values are named collections: fragments union them by entry name. Every other key is
+/// set by exactly one fragment, so no fragment can override another and file order never matters.
+const MERGED_BY_NAME: [&str; 3] = ["principals", "constraintSets", "providerSettings"];
+const CONCATENATED: [&str; 2] = ["identities", "providers"];
+const FRAGMENT_EXTENSION: &str = "yaml";
+const POLICY_EXTENSION: &str = "cedar";
+
+async fn load_directory(
+    directory: PathBuf,
+    expected_uid: u32,
+) -> Result<ResolvedConfig, ConfigError> {
+    let fragments = scan_directory(&directory, expected_uid, FRAGMENT_EXTENSION)?;
+    let policy_files = scan_directory(&directory, expected_uid, POLICY_EXTENSION)?;
+    let first = fragments
+        .first()
+        .cloned()
+        .ok_or_else(|| ConfigError::EmptyConfigDirectory {
+            path: directory.clone(),
+        })?;
+    let mut parsed = Vec::with_capacity(fragments.len());
+    for path in fragments {
+        let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
+        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
+            ConfigError::DecodeFragment {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        parsed.push((path, mapping));
+    }
+    let merged = merge_fragments(parsed)?;
+    let config = serde_yaml::from_value::<BrokerdConfig>(serde_yaml::Value::Mapping(merged))
+        .map_err(|source| ConfigError::Decode { source })?;
+    if config.policies_path.is_some() {
+        return Err(ConfigError::PoliciesPathInDirectory);
+    }
+    if !config.constraint_sets.is_empty() && policy_files.is_empty() {
+        return Err(ConfigError::MissingPoliciesPath);
+    }
+    let mut resolved = resolve(config, first, expected_uid).await?;
+    let mut policies = String::new();
+    for path in policy_files {
+        let bytes = read_owner_only(&path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
+        let text = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 { path })?;
+        policies.push_str(&text);
+        policies.push('\n');
+        if policies.len() > HARD_MAX_POLICY_BYTES {
+            return Err(ConfigError::TooLarge {
+                length: policies.len() as u64,
+                maximum: HARD_MAX_POLICY_BYTES,
+            });
+        }
+    }
+    resolved.policies = policies;
+    Ok(resolved)
+}
+
+fn scan_directory(
+    directory: &Path,
+    expected_uid: u32,
+    extension: &str,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata =
+        std::fs::symlink_metadata(directory).map_err(|source| ConfigError::ResolvePath {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(ConfigError::InsecureConfigDirectory {
+            path: directory.to_path_buf(),
+        });
+    }
+    let entries = std::fs::read_dir(directory).map_err(|source| ConfigError::ResolvePath {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ConfigError::ResolvePath {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|candidate| candidate == extension)
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn merge_fragments(
+    fragments: Vec<(PathBuf, serde_yaml::Mapping)>,
+) -> Result<serde_yaml::Mapping, ConfigError> {
+    use serde_yaml::Value;
+
+    let mut merged = serde_yaml::Mapping::new();
+    let mut owners = BTreeMap::<String, Vec<PathBuf>>::new();
+    let mut versions = BTreeSet::new();
+    for (path, fragment) in fragments {
+        for (key, value) in fragment {
+            let name = key.as_str().unwrap_or_default().to_owned();
+            if name == "apiVersion" {
+                versions.insert(serde_yaml::to_string(&value).unwrap_or_default());
+                merged.insert(key, value);
+                continue;
+            }
+            let collection =
+                CONCATENATED.contains(&name.as_str()) || MERGED_BY_NAME.contains(&name.as_str());
+            match (merged.get_mut(&key), value) {
+                (Some(Value::Sequence(into)), Value::Sequence(from)) if collection => {
+                    into.extend(from);
+                }
+                (Some(Value::Mapping(into)), Value::Mapping(from))
+                    if MERGED_BY_NAME.contains(&name.as_str()) =>
+                {
+                    for (entry, entry_value) in from {
+                        let owner = format!("{name}.{}", entry.as_str().unwrap_or_default());
+                        owners.entry(owner).or_default().push(path.clone());
+                        into.insert(entry, entry_value);
+                    }
+                }
+                (None, value) => {
+                    if let (true, Value::Mapping(entries)) =
+                        (MERGED_BY_NAME.contains(&name.as_str()), &value)
+                    {
+                        for entry in entries.keys() {
+                            let owner = format!("{name}.{}", entry.as_str().unwrap_or_default());
+                            owners.entry(owner).or_default().push(path.clone());
+                        }
+                    }
+                    owners.entry(name).or_default().push(path.clone());
+                    merged.insert(key, value);
+                }
+                (Some(_), _) => {
+                    owners.entry(name).or_default().push(path.clone());
+                }
+            }
+        }
+    }
+    let conflicts = owners
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(key, files)| FragmentConflict { key, files })
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        return Err(ConfigError::FragmentConflicts { conflicts });
+    }
+    if versions.len() > 1 {
+        return Err(ConfigError::MixedApiVersions);
+    }
+    Ok(merged)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FragmentConflict {
+    pub key: String,
+    pub files: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for FragmentConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let files = self
+            .files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(formatter, "{} is set in {files}", self.key)
+    }
+}
+
+fn render_conflicts(conflicts: &[FragmentConflict]) -> String {
+    conflicts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 async fn read_owner_only(
@@ -671,9 +862,6 @@ async fn resolve(
             subjects: duplicate_subjects.into_iter().collect(),
         });
     }
-    if !config.constraint_sets.is_empty() && policies_path.is_none() {
-        return Err(ConfigError::MissingPoliciesPath);
-    }
     if config.server_limits.max_connections == 0
         || config.server_limits.max_connections > HARD_MAX_CONNECTIONS
         || config.server_limits.shutdown_grace_ms == 0
@@ -918,6 +1106,26 @@ pub enum ConfigError {
              would refuse every request"
     )]
     MissingPoliciesPath,
+    #[error(
+        "a configuration directory holds its policies as *.cedar files; policiesPath is not allowed there"
+    )]
+    PoliciesPathInDirectory,
+    #[error("configuration directory {path} holds no *.yaml fragment")]
+    EmptyConfigDirectory { path: PathBuf },
+    #[error(
+        "configuration directory {path} must be owned by the broker and not group or world writable"
+    )]
+    InsecureConfigDirectory { path: PathBuf },
+    #[error("configuration fragment {path} is not strict valid YAML")]
+    DecodeFragment {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("configuration fragments conflict: {}", render_conflicts(.conflicts))]
+    FragmentConflicts { conflicts: Vec<FragmentConflict> },
+    #[error("configuration fragments disagree on apiVersion")]
+    MixedApiVersions,
     #[error("broker policy file is not valid UTF-8: {path}")]
     PolicyNotUtf8 { path: PathBuf },
     #[error("peer attestor grant is invalid")]
