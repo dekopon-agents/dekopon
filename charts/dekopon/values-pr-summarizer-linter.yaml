@@ -16,8 +16,6 @@ broker:
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
-      brokerPrincipal: local-broker
-      policyRevision: pr-summarizer-linter-2026-01
       credentialsPath: /etc/dekopon/broker-credentials.yaml
       policiesPath: /etc/dekopon/policies.cedar
       strict: true

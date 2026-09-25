@@ -218,9 +218,11 @@ The files the init container turns into real owner-only regular files, as a YAML
 cannot drift apart.
 */}}
 {{- define "dekopon.managedFiles" -}}
+{{- if not .Values.broker.configDirectory.configMap }}
 - file: broker.yaml
   secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.config.existingSecret }}
   key: {{ if .Values.broker.config.existingSecret }}{{ .Values.broker.config.existingSecretKey }}{{ else }}broker.yaml{{ end }}
+{{- end }}
 {{- if include "dekopon.hasPolicies" . }}
 - file: policies.cedar
   secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.policies.existingSecret }}
@@ -241,10 +243,38 @@ cannot drift apart.
   secret: {{ .existingSecret }}
   key: {{ .existingSecretKey }}
 {{- end }}
-{{- if .Values.gateway.enabled }}
+{{- if and .Values.gateway.enabled (not .Values.gateway.configDirectory.configMap) }}
 - file: dekopond.yaml
   secret: {{ default (include "dekopon.configSecretName" .) .Values.gateway.config.existingSecret }}
   key: {{ if .Values.gateway.config.existingSecret }}{{ .Values.gateway.config.existingSecretKey }}{{ else }}dekopond.yaml{{ end }}
+{{- end }}
+{{- end -}}
+
+{{- define "dekopon.peersFragment" -}}
+{{- $uid := .Values.podSecurityContext.runAsUser | int -}}
+apiVersion: dekopon.dev/brokerd/v1alpha1
+identities:
+  - uid: {{ $uid }}
+    principal: dekopon-probe
+    actor:
+      type: service
+      principal: dekopon-probe
+{{- if .Values.gateway.enabled }}
+  - uid: 65533
+    principal: dekopond-gateway
+    actor:
+      type: service
+      principal: dekopond-gateway
+    attestor: {}
+{{- end }}
+{{- if and .Values.console.enabled .Values.console.subject }}
+  - uid: 65535
+    principal: dekopon-console
+    actor:
+      type: service
+      principal: dekopon-console
+    attestor:
+      namespaces: [{{ .Values.console.subject | toJson }}]
 {{- end }}
 {{- end -}}
 
@@ -305,18 +335,27 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if ne (toJson .Values.podSecurityContext.supplementalGroups) "[65534]" -}}
 {{- fail "podSecurityContext.supplementalGroups must be [65534] for IPC only" -}}
 {{- end -}}
-{{- if and .Values.gateway.enabled .Values.gateway.config.inline -}}
+{{- if and .Values.gateway.enabled .Values.gateway.config.inline (not .Values.gateway.configDirectory.configMap) -}}
 {{- $gateway := .Values.gateway.config.inline | fromYaml -}}
 {{- if ne (dig "broker" "serverUid" -1 $gateway | int) 65532 -}}
 {{- fail "gateway config must explicitly pin broker.serverUid: 65532" -}}
 {{- end -}}
 {{- end -}}
 
+{{- if .Values.broker.configDirectory.configMap -}}
+{{- if or .Values.broker.config.inline .Values.broker.config.existingSecret .Values.broker.policies.inline .Values.broker.policies.existingSecret -}}
+{{- fail "broker.configDirectory.configMap replaces broker.config and broker.policies: set broker.config.inline, broker.config.existingSecret, broker.policies.inline and broker.policies.existingSecret to empty" -}}
+{{- end -}}
+{{- else -}}
 {{- if and .Values.broker.config.inline .Values.broker.config.existingSecret -}}
 {{- fail "broker.config.inline and broker.config.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.broker.config.inline) (not .Values.broker.config.existingSecret) -}}
-{{- fail "a broker.yaml is required: set broker.config.inline or broker.config.existingSecret" -}}
+{{- fail "a broker.yaml is required: set broker.config.inline, broker.config.existingSecret or broker.configDirectory.configMap" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.gateway.configDirectory.configMap (not .Values.gateway.enabled) -}}
+{{- fail "gateway.configDirectory.configMap has no effect without gateway.enabled" -}}
 {{- end -}}
 
 {{- if and .Values.broker.policies.inline .Values.broker.policies.existingSecret -}}
@@ -358,11 +397,17 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- end -}}
 
 {{- if .Values.gateway.enabled -}}
+{{- if .Values.gateway.configDirectory.configMap -}}
+{{- if or .Values.gateway.config.inline .Values.gateway.config.existingSecret -}}
+{{- fail "gateway.configDirectory.configMap replaces gateway.config: set gateway.config.inline and gateway.config.existingSecret to empty" -}}
+{{- end -}}
+{{- else -}}
 {{- if and .Values.gateway.config.inline .Values.gateway.config.existingSecret -}}
 {{- fail "gateway.config.inline and gateway.config.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.gateway.config.inline) (not .Values.gateway.config.existingSecret) -}}
-{{- fail "gateway.enabled is true, so a dekopond.yaml is required: set gateway.config.inline or gateway.config.existingSecret" -}}
+{{- fail "gateway.enabled is true, so a dekopond.yaml is required: set gateway.config.inline, gateway.config.existingSecret or gateway.configDirectory.configMap" -}}
+{{- end -}}
 {{- end -}}
 {{- if and .Values.gateway.catalog.inline .Values.gateway.catalog.existingConfigMap -}}
 {{- fail "gateway.catalog.inline and gateway.catalog.existingConfigMap are mutually exclusive" -}}
@@ -542,7 +587,7 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 {{- end -}}
 
-{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "dekopond.yaml" true -}}
+{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "dekopond.yaml" true "broker.d" true -}}
 {{- range (include "dekopon.seedFiles" . | fromYamlArray) -}}
 {{- $_ := set $bootstrapNames .source true -}}
 {{- end -}}
@@ -559,7 +604,7 @@ broker that lands mid-invocation. */}}
 {{- $_ := set $bootstrapNames .file true -}}
 {{- end -}}
 
-{{- $secretSourceNames := dict "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true -}}
+{{- $secretSourceNames := dict "broker-config-directory" true "gateway-config-directory" true "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true -}}
 {{- range .Values.broker.secretSourceVolumes -}}
 {{- $source := . -}}
 {{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
@@ -613,7 +658,7 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "providerStorage.rootPath must not contain . or .. segments, got %q" $storagePath) -}}
 {{- end -}}
 {{- end -}}
-{{- $ownedMounts := dict "brokerAssets.rootPath" (clean .Values.brokerAssets.rootPath) "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- $ownedMounts := dict "brokerAssets.rootPath" (clean .Values.brokerAssets.rootPath) "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "broker configuration directory source" "/dekopon-broker-d-source" "gateway configuration directory source" "/dekopon-gateway-d-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- range $ownedName, $ownedPath := $ownedMounts -}}
 {{- if or (eq (clean $storagePath) $ownedPath) (hasPrefix (printf "%s/" (clean $storagePath)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $storagePath)) -}}
 {{- fail (printf "providerStorage.rootPath (%s) must not equal, contain, or be contained by chart-owned %s (%s); overlapping volume mounts shadow files" $storagePath $ownedName $ownedPath) -}}
@@ -622,7 +667,7 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 
 {{- range $pathName, $path := $chartPaths -}}
-{{- range $ownedName, $ownedPath := dict "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- range $ownedName, $ownedPath := dict "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "broker configuration directory source" "/dekopon-broker-d-source" "gateway configuration directory source" "/dekopon-gateway-d-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- if or (eq (clean $path) $ownedPath) (hasPrefix (printf "%s/" (clean $path)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $path)) -}}
 {{- fail (printf "%s (%s) must not overlap chart/image-owned %s (%s)" $pathName $path $ownedName $ownedPath) -}}
 {{- end -}}
@@ -650,7 +695,7 @@ Arguments: dict "ctx" $ "sidecar" bool
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
-  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"]
+  args: ["--config", "{{ $.Values.paths.configDir }}/{{ if $.Values.broker.configDirectory.configMap }}broker.d{{ else }}broker.yaml{{ end }}"]
   securityContext:
     {{- toYaml (mergeOverwrite (deepCopy $.Values.securityContext) (dict "runAsUser" ($.Values.podSecurityContext.runAsUser | int) "runAsGroup" ($.Values.podSecurityContext.runAsGroup | int))) | nindent 4 }}
   env:
