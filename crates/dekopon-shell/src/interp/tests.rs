@@ -210,6 +210,29 @@ fn last_status_is_observable() {
 }
 
 #[test]
+fn a_previous_output_is_visible_as_prev_and_absent_otherwise() {
+    let script = r#"if [ -z "$PREV" ]; then echo none; exit 1; fi; [ "$PREV" != "green" ]"#;
+    let interpreter = Interpreter::new(Limits::default());
+    let fixture = Fixture::default();
+
+    let baseline = interpreter.run(script, &fixture);
+    assert_eq!(
+        (baseline.output.as_str(), baseline.exit_code),
+        ("none", ExitCode::FAILURE)
+    );
+    assert_eq!(
+        interpreter
+            .run_with_prev(script, "green", &fixture)
+            .exit_code,
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        interpreter.run_with_prev(script, "red", &fixture).exit_code,
+        ExitCode::SUCCESS
+    );
+}
+
+#[test]
 fn comments_are_ignored() {
     assert_eq!(
         output("# leading\necho hi # trailing\n# trailing only"),
