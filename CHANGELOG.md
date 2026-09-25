@@ -17,6 +17,13 @@ All notable changes to Dekopon are documented here. The format is based on
   `capabilities.<provider>` carries a `credential` and `constraints` that each capability listed
   under its `capabilities` inherits, and an entry overrides a field whole (lists replace, never
   append). `effect` and `risk` are read from the provider manifest. Only listed capabilities run.
+- **Breaking:** agent specs lose `capabilities`, `providers` and `policyProfile`, which granted and
+  checked nothing; they are now unknown fields. `instructionsFile` reads an agent's instructions
+  from a file, and a catalog path may name a directory of `*.yaml` files.
+- A directory given as dekopond's config path is read as `*.yaml` fragments: `transports`, `models`
+  and `routes` concatenate, every other key is set once, and a route must sit in the fragment that
+  defines its transport.
+- **Breaking:** every Cedar statement needs an `@id`.
 - A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
   policy files. `principals`, `agents`, `constraintSets` and `providerSettings` union by name,
   `identities` and `providers` concatenate, every other key is set by one fragment, and every

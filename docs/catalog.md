@@ -19,8 +19,7 @@ shipped component reads. Authoring one correctly means knowing which is which.
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
 broker's `capabilities` and Cedar policy decide that, and neither reads the catalog. The
 capabilities a session may reach come from the broker, which builds them from the provider
-manifests it loaded; an agent's `capabilities` list here is a declaration of intent that grants
-nothing and is compared against nothing, and a name misspelled in a
+manifests it loaded, and a name misspelled in a
 policy's `Dekopon::Agent::"…"` literal cannot be caught by validating this file — see
 [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup).
 
@@ -81,11 +80,6 @@ spec:
     You review pull requests. Comment once, do not approve.
   skills:
     - skills/pull-request-review   # a directory beside this file, holding SKILL.md
-  capabilities:
-    - gh.pull-request.read
-    - gh.pull-request.comment
-  providers:
-    - gh
 status: Ready
 ```
 
@@ -94,11 +88,9 @@ status: Ready
 | `description` | string | yes | Bound into the gateway route and returned by `inspect_agent_config`. |
 | `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Authored status does not override it. |
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
+| `instructionsFile` | path | no | Read at load, relative to the catalog file (or directory), into `instructions`. An agent names one or the other. |
 | `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
-| `capabilities` | list of capability IDs | no | **Reserved.** Stored typed catalog metadata read by nothing; the capabilities a session reaches come from the broker. See [Reserved and inert fields](#reserved-and-inert-fields). |
-| `providers` | list of provider IDs | no | **Reserved.** Stored typed catalog metadata read by nothing. See [Reserved and inert fields](#reserved-and-inert-fields). |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
-| `policyProfile` | string | no | **Reserved.** Nothing reads it. See [Reserved and inert fields](#reserved-and-inert-fields). |
 | `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | **Reserved.** Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 ### `instructions` is untrusted model text, and it is readable
@@ -183,18 +175,15 @@ an agent that appears configured and answers nobody. See
 
 ## Reserved and inert fields
 
-Five fields are decoded and retained as typed metadata with no shipped behavioral reader. Each one
+Two fields are decoded and retained as typed metadata with no shipped behavioral reader. Each one
 reads like it selects a behavior, so each is listed here rather than left to be discovered.
 
 | Field | Looks like | Actually |
 |---|---|---|
-| `spec.capabilities` | The operations the agent may propose | Authored intent, compared against nothing. What a session may reach is the broker's answer to `capabilities` under that agent's attestation, built from the loaded provider manifests and the provider `capabilities` blocks policy allows. Adding a name here reaches nothing new; removing one narrows nothing. |
-| `spec.providers` | The integrations the agent uses | Authored intent, compared against nothing. A capability's provider is fixed by the manifest that declares it, and the broker selects it. |
-| `spec.policyProfile` | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the `capabilities` blocks in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
 | `status` | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 
-All five are optional and may simply be omitted. They are worth authoring only as documentation a
+Both are optional and may simply be omitted. They are worth authoring only as documentation a
 reviewer reads to understand what the deployment intends, and a reviewer should know that the
 broker's configuration can disagree with every one of them without either process noticing.
 
@@ -202,7 +191,7 @@ broker's configuration can disagree with every one of them without either proces
 
 - [`dekopon-protocol/src/lib.rs`](../crates/dekopon-protocol/src/lib.rs):
   `ObjectMeta`, `AgentSpec` and `AgentStatus` own the typed serde storage of labels,
-  policyProfile, capability and provider names, descriptions and the optional authored status.
+  descriptions and the optional authored status.
   Storage and serialization are not a catalog display command.
 - [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
