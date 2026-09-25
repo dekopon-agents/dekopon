@@ -67,9 +67,8 @@ reported through `BrokerError::unaudited_outcome`, because the effect may alread
 ## Optional durable chat memory
 
 Chat operations add a canonical transport and conversation to the subject mapping and the
-`agent.prompt` gate. Owner configuration must grant both the subject namespace and an explicit
-`chatScopes` entry whose `conversation:` selector names the kinds, container, and ids it covers,
-and Cedar receives that conversation as a record. Reservation follows what the owner
+`agent.prompt` gate, and Cedar receives that conversation as a record; policy names the kinds,
+containers and ids it covers. Reservation follows what the owner
 declared: each of the three capabilities carries a `route` of `chatMemoryRecord`,
 `chatMemoryRecent`, or `chatMemorySearch`, and the list, run, resolve, and invoke paths refuse
 exactly those and every command word of the provider they name. No capability or provider spelling

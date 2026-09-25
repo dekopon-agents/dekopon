@@ -31,10 +31,6 @@ broker:
             principal: dekopond-gateway
           attestor:
             namespaces: [slack.t0123abcd]
-            chatScopes:
-              - kind: slack
-                transport: workspace-slack
-                conversation: { kind: any }
         - uid: 65532
           principal: dekopond-gateway
           actor:

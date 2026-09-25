@@ -494,27 +494,9 @@ pub struct ConversationMatchConfig {
     pub container: Option<String>,
     #[serde(default)]
     pub ids: Option<Vec<String>>,
-    #[serde(default)]
-    mode: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
-    scope: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
-    idle_timeout_ms: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
-    max_turns: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
-    max_bytes: Option<serde::de::IgnoredAny>,
 }
 
 impl ConversationMatchConfig {
-    const fn is_retired_memory_block(&self) -> bool {
-        self.mode.is_some()
-            || self.scope.is_some()
-            || self.idle_timeout_ms.is_some()
-            || self.max_turns.is_some()
-            || self.max_bytes.is_some()
-    }
-
     fn selector(&self) -> ConversationMatch {
         ConversationMatch {
             kind: self.kind.clone(),
@@ -611,7 +593,14 @@ pub enum RecallSource {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self::OneShot {}
+        Self::Persistent {
+            scope: MemoryScope::default(),
+            idle_timeout_ms: default_idle_timeout_ms(),
+            max_turns: default_conversation_max_turns(),
+            max_bytes: default_conversation_max_bytes(),
+            recall: None,
+            forget_after_ms: None,
+        }
     }
 }
 
@@ -670,8 +659,6 @@ pub struct RouteConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub wakes: bool,
-    #[serde(default, rename = "match", skip_serializing)]
-    pub retired_match: Option<serde::de::IgnoredAny>,
 }
 
 const fn default_true() -> bool {
@@ -1143,12 +1130,6 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::UnknownRouteTransport {
                 transport: route.transport.clone(),
             });
-        }
-        if route.retired_match.is_some() {
-            problems.push(ConfigProblem::RetiredRouteMatch { route: index });
-        }
-        if route.conversation.is_retired_memory_block() {
-            problems.push(ConfigProblem::RetiredMemoryBlock { route: index });
         }
         let conversation = route.conversation.selector();
         if let Some(chat_kind) = transport_kinds.get(&route.transport) {
@@ -1891,14 +1872,6 @@ pub enum ConfigProblem {
         "route for agent {agent:?} declares a persistent memory window with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
     )]
     InvalidMemoryBounds { agent: String },
-    #[error(
-        "routes[{route}]: `match` is no longer a route field; write `conversation: {{ kind: [channel, thread], ids: [...] }}`"
-    )]
-    RetiredRouteMatch { route: usize },
-    #[error(
-        "routes[{route}]: `conversation:` is the match now; the memory window is `memory:` with the same fields"
-    )]
-    RetiredMemoryBlock { route: usize },
     #[error("routes[{route}]: conversation selector is invalid: {problem}")]
     InvalidRouteConversation {
         route: usize,

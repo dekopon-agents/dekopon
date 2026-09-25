@@ -376,11 +376,7 @@ identities:
       type: service
       principal: dekopond-gateway
     attestor:
-      namespaces: [slack.t0123abc]     # segment-boundary prefixes, service name first
-      chatScopes:                      # required by chat-scoped gateway operations
-        - kind: slack
-          transport: scientist-slack
-          conversation: { kind: any }   # or a kind list with `container`/`ids`
+      namespaces: [slack.t0123abc]     # optional segment-boundary prefixes; omitted = every mapped subject
 principals:
   maintainer:                          # the only place a subject becomes a principal
     subjects: [slack.t0123abc.u9xyz]   # canonical: lowercase dotted segments
@@ -854,24 +850,17 @@ Startup accounts the worst-case JSON escaping of a bounded search query and prov
 decoded files plus canonical-ABI compaction copies and fixed allocator headroom fit the independent
 Wasm linear-memory ceiling.
 
-The gateway peer's attestor additionally needs `chatScopes`. Each entry names the transport kind and
-the configured transport ID, plus a `conversation:` selector — the word `any` or a list of kinds,
-with an optional `container` and an optional `ids` list — written exactly as a gateway route writes
-it. A local transport must also name `localSubjectService`. Subject namespace authority remains
-independently required. Scope fields enter Cedar as the optional `transportKind` and `transport`
-strings and the optional `conversation` record `{kind, container, id, thread}`.
+A chat claim that is canonical for the sender's service enters Cedar as the optional
+`transportKind` and `transport` strings and the optional `conversation` record
+`{kind, container, id, thread}`; the policy that grants the memory capabilities names the
+conversations it covers.
 
-```yaml
-identities:
-  - uid: 65532
-    principal: dekopond-gateway
-    actor: { type: service, principal: dekopond-gateway }
-    attestor:
-      namespaces: [slack.t0123abc]
-      chatScopes:
-        - kind: slack
-          transport: scientist-slack
-          conversation: { kind: [channel, thread], ids: [c0123abc] }
+```cedar
+permit(principal in Dekopon::Group::"maintainers",
+       action in Dekopon::Action::"memory-chat:*", resource)
+when { context.agent == "reviewer"
+       && context has conversation && context.conversation.id == "c0123abc"
+       && ["channel", "thread"].contains(context.conversation.kind) };
 ```
 
 Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The

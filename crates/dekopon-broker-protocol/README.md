@@ -112,11 +112,9 @@ mismatched claim is rejected as `invalid-request` before anything is authorized,
 audited. `recordDeliveredTurn` requires a chat claim; the other operations accept a subject-only
 claim, a chat claim, or none.
 
-An attestor whose grant has no `chatScopes` entries keeps ordinary attested authority for an allowed
-subject even when its claim carries a scope. That context has no trusted chat scope, so durable
-memory is structurally unavailable. Once any `chatScopes` entry is authored, a chat claim must
-satisfy the service-specific canonical checks and an exact matching grant. Claim shape itself grants
-nothing.
+A chat claim must satisfy the service-specific canonical checks; it then binds Cedar's `transport`
+and `conversation` context. Claim shape itself grants nothing: which transports and conversations an
+agent may act in is written in policy.
 
 ## Command execution refusals
 
