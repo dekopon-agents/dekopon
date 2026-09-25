@@ -25,7 +25,7 @@
 //! Everything lives in the `Dekopon` namespace:
 //!
 //! - `Dekopon::Principal::"<principal-id>"` — enumerated from the deployment's peers and mapped
-//!   principals. No attributes.
+//!   principals, each a member of its configured `Dekopon::Group::"<group-id>"` entities.
 //! - `Dekopon::Provider::"<provider-id>"` — enumerated from loaded manifests; the resource of every
 //!   capability action.
 //! - `Dekopon::Agent::"<agent-id>"` — the resource type of [`AGENT_PROMPT_ACTION`]. Instances are
@@ -34,7 +34,8 @@
 //! - `Dekopon::Secret::"drn:..."` — canonical public DRNs from the owner-only private map; the
 //!   resource of [`SECRET_USE_ACTION`].
 //! - `Dekopon::Action::"<capability-id>"` — one action per loaded capability, plus fixed
-//!   `agent.prompt` and, when secrets exist, `secret.use` actions.
+//!   `agent.prompt` and, when secrets exist, `secret.use` actions. Each capability is in the
+//!   `"<provider>:*"` action group, and read-only ones also in `"<provider>:read-only"`.
 //!
 //! # Context
 //!
@@ -99,7 +100,7 @@ use cedar_policy::{
 };
 use dekopon_capability::EffectKind;
 use dekopon_core::{
-    AgentId, CapabilityId, IdentifierError, PrincipalId, ProviderId, RiskLevel, SecretDrn,
+    AgentId, CapabilityId, GroupId, IdentifierError, PrincipalId, ProviderId, RiskLevel, SecretDrn,
     SecretSinkKind,
 };
 use serde_json::json;
@@ -118,16 +119,22 @@ const PROVIDER_TYPE: &str = "Dekopon::Provider";
 const AGENT_TYPE: &str = "Dekopon::Agent";
 const SECRET_TYPE: &str = "Dekopon::Secret";
 const ACTION_TYPE: &str = "Dekopon::Action";
+const GROUP_TYPE: &str = "Dekopon::Group";
+const PROVIDER_GROUP_SUFFIX: &str = ":*";
+const READ_ONLY_GROUP_SUFFIX: &str = ":read-only";
 const DIGEST_DOMAIN: &[u8] = b"dekopon-policy-v1\0";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
+    memberships: BTreeMap<PrincipalId, BTreeSet<GroupId>>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
+    read_only: BTreeSet<CapabilityId>,
     secrets: BTreeSet<SecretDrn>,
     phantom_capabilities: BTreeSet<CapabilityId>,
     phantom_providers: BTreeSet<ProviderId>,
+    phantom_action_groups: BTreeSet<String>,
 }
 
 impl PolicyWorld {
@@ -185,6 +192,51 @@ impl PolicyWorld {
         self.secrets.iter()
     }
 
+    #[must_use]
+    pub fn with_group_members(
+        mut self,
+        members: impl IntoIterator<Item = (PrincipalId, GroupId)>,
+    ) -> Self {
+        for (principal, group) in members {
+            self.principals.insert(principal.clone());
+            self.memberships.entry(principal).or_default().insert(group);
+        }
+        self
+    }
+
+    /// Only read-only capabilities get an effect group, so a provider upgrade that adds a write can
+    /// never become reachable through a grant written before it existed.
+    #[must_use]
+    pub fn with_read_only(mut self, capabilities: impl IntoIterator<Item = CapabilityId>) -> Self {
+        self.read_only.extend(capabilities);
+        self
+    }
+
+    fn groups(&self) -> BTreeSet<&GroupId> {
+        self.memberships.values().flatten().collect()
+    }
+
+    fn action_groups_of(&self, capability: &CapabilityId, provider: &ProviderId) -> Vec<String> {
+        let mut groups = vec![format!("{provider}{PROVIDER_GROUP_SUFFIX}")];
+        if self.read_only.contains(capability) {
+            groups.push(format!("{provider}{READ_ONLY_GROUP_SUFFIX}"));
+        }
+        groups
+    }
+
+    fn action_groups(&self) -> BTreeMap<String, BTreeSet<&CapabilityId>> {
+        let mut groups = BTreeMap::<String, BTreeSet<&CapabilityId>>::new();
+        for (capability, provider) in &self.capabilities {
+            for group in self.action_groups_of(capability, provider) {
+                groups.entry(group).or_default().insert(capability);
+            }
+        }
+        for phantom in &self.phantom_action_groups {
+            groups.entry(phantom.clone()).or_default();
+        }
+        groups
+    }
+
     /// An undeclared name is kept as a phantom rather than dropping its policy, since dropping it
     /// would silently revoke the policy's other grants too; a phantom can never authorize
     /// execution.
@@ -202,6 +254,9 @@ impl PolicyWorld {
                     if let Ok(provider) = entry.name.parse::<ProviderId>() {
                         world.phantom_providers.insert(provider);
                     }
+                }
+                UnresolvedKind::ActionGroup => {
+                    world.phantom_action_groups.insert(entry.name.clone());
                 }
             }
         }
@@ -260,14 +315,24 @@ impl PolicyWorld {
         let secret_context = context(&["capability", "provider", "sink"]);
 
         let mut actions = serde_json::Map::new();
-        for capability in self
+        for (capability, groups) in self
             .capabilities
-            .keys()
-            .chain(self.phantom_capabilities.iter())
+            .iter()
+            .map(|(capability, provider)| (capability, self.action_groups_of(capability, provider)))
+            .chain(
+                self.phantom_capabilities
+                    .iter()
+                    .map(|capability| (capability, Vec::new())),
+            )
         {
+            let member_of = groups
+                .into_iter()
+                .map(|group| json!({ "id": group }))
+                .collect::<Vec<_>>();
             actions.insert(
                 capability.as_str().to_owned(),
                 json!({
+                    "memberOf": member_of,
                     "appliesTo": {
                         "principalTypes": ["Principal"],
                         "resourceTypes": ["Provider"],
@@ -275,6 +340,9 @@ impl PolicyWorld {
                     }
                 }),
             );
+        }
+        for group in self.action_groups().into_keys() {
+            actions.insert(group, json!({}));
         }
         actions.insert(
             AGENT_PROMPT_ACTION.to_owned(),
@@ -287,7 +355,11 @@ impl PolicyWorld {
             }),
         );
         let mut entity_types = serde_json::Map::from_iter([
-            ("Principal".to_owned(), entity_shape.clone()),
+            (
+                "Principal".to_owned(),
+                json!({ "memberOfTypes": ["Group"], "shape": { "type": "Record", "attributes": {} } }),
+            ),
+            ("Group".to_owned(), entity_shape.clone()),
             ("Provider".to_owned(), entity_shape.clone()),
             ("Agent".to_owned(), entity_shape),
         ]);
@@ -398,6 +470,7 @@ impl PolicyDecision {
 pub enum UnresolvedKind {
     Capability,
     Provider,
+    ActionGroup,
 }
 
 impl UnresolvedKind {
@@ -406,6 +479,7 @@ impl UnresolvedKind {
         match self {
             Self::Capability => "capability",
             Self::Provider => "provider",
+            Self::ActionGroup => "action group",
         }
     }
 }
@@ -752,6 +826,7 @@ fn classify_policies(
 ) -> Result<(BTreeSet<CapabilityId>, Vec<UnresolvedName>), PolicyBuildError> {
     let mut referenced_capabilities = BTreeSet::new();
     let mut unresolved = Vec::new();
+    let action_groups = world.action_groups();
     for policy in policies.policies() {
         let id = policy.id().to_string();
         for uid in policy.entity_literals() {
@@ -795,6 +870,21 @@ fn classify_policies(
                         });
                     }
                 }
+                GROUP_TYPE => {
+                    let group = value.parse::<GroupId>().map_err(|source| {
+                        PolicyBuildError::MalformedGroup {
+                            policy: id.clone(),
+                            group: value.clone(),
+                            source,
+                        }
+                    })?;
+                    if !world.groups().contains(&group) {
+                        return Err(PolicyBuildError::UnknownGroup {
+                            policy: id.clone(),
+                            group: value,
+                        });
+                    }
+                }
                 SECRET_TYPE => {
                     let secret = value.parse::<SecretDrn>().map_err(|source| {
                         PolicyBuildError::MalformedSecret {
@@ -812,6 +902,23 @@ fn classify_policies(
                 }
                 ACTION_TYPE => {
                     if matches!(value.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
+                        continue;
+                    }
+                    if action_group_provider(&value).is_some() {
+                        if action_groups.contains_key(&value) {
+                            continue;
+                        }
+                        if handling == Handling::Refuse {
+                            return Err(PolicyBuildError::UnknownAction {
+                                policy: id.clone(),
+                                action: value,
+                            });
+                        }
+                        unresolved.push(UnresolvedName {
+                            policy: id.clone(),
+                            name: value,
+                            kind: UnresolvedKind::ActionGroup,
+                        });
                         continue;
                     }
                     let parsed = value.parse::<CapabilityId>().ok();
@@ -850,17 +957,38 @@ fn classify_policies(
     Ok((referenced_capabilities, unresolved))
 }
 
+fn action_group_provider(value: &str) -> Option<ProviderId> {
+    value
+        .strip_suffix(PROVIDER_GROUP_SUFFIX)
+        .or_else(|| value.strip_suffix(READ_ONLY_GROUP_SUFFIX))?
+        .parse()
+        .ok()
+}
+
 fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, PolicyBuildError> {
+    let principal_type = entity_type_name(PRINCIPAL_TYPE)?;
+    let group_type = entity_type_name(GROUP_TYPE)?;
     let mut entities = Vec::new();
+    for principal in &world.principals {
+        let parents = world
+            .memberships
+            .get(principal)
+            .into_iter()
+            .flatten()
+            .map(|group| entity_uid(&group_type, group.as_str()))
+            .collect::<HashSet<_>>();
+        entities.push(Entity::new_no_attrs(
+            entity_uid(&principal_type, principal.as_str()),
+            parents,
+        ));
+    }
+    for group in world.groups() {
+        entities.push(Entity::new_no_attrs(
+            entity_uid(&group_type, group.as_str()),
+            HashSet::new(),
+        ));
+    }
     for (type_name, ids) in [
-        (
-            PRINCIPAL_TYPE,
-            world
-                .principals
-                .iter()
-                .map(PrincipalId::as_str)
-                .collect::<Vec<_>>(),
-        ),
         (
             PROVIDER_TYPE,
             world
@@ -931,6 +1059,10 @@ fn policy_digest(
     for principal in &world.principals {
         hasher.update(format!("{PRINCIPAL_TYPE}::{:?}", principal.as_str()).as_bytes());
         hasher.update([0]);
+        for group in world.memberships.get(principal).into_iter().flatten() {
+            hasher.update(format!("in {GROUP_TYPE}::{:?}", group.as_str()).as_bytes());
+            hasher.update([0]);
+        }
     }
     for provider in &world.providers {
         hasher.update(format!("{PROVIDER_TYPE}::{:?}", provider.as_str()).as_bytes());
@@ -954,6 +1086,15 @@ fn policy_digest(
     for action in actions {
         hasher.update(action.as_bytes());
         hasher.update([0]);
+    }
+    hasher.update(b"action-groups\0");
+    for (group, members) in world.action_groups() {
+        hasher.update(group.as_bytes());
+        hasher.update([0]);
+        for member in members {
+            hasher.update(member.as_str().as_bytes());
+            hasher.update([0]);
+        }
     }
 
     hasher.update(b"phantoms\0");
@@ -1009,6 +1150,15 @@ pub enum PolicyBuildError {
         secret: String,
         #[source]
         source: dekopon_core::SecretDrnError,
+    },
+    #[error("policy {policy} names group {group:?}, which no principal belongs to")]
+    UnknownGroup { policy: String, group: String },
+    #[error("policy {policy} names malformed group {group:?}")]
+    MalformedGroup {
+        policy: String,
+        group: String,
+        #[source]
+        source: IdentifierError,
     },
     #[error("policy {policy} names undeclared provider {provider:?}")]
     UnknownProvider { policy: String, provider: String },

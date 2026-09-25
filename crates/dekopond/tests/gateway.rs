@@ -124,10 +124,10 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
                 }]
             }
         }],
-        "identityMappings": [
-            {"subject": MAPPED_SUBJECT, "principal": MAPPED_PRINCIPAL},
-            {"subject": OTHER_MAPPED_SUBJECT, "principal": OTHER_MAPPED_PRINCIPAL}
-        ],
+        "principals": {
+            MAPPED_PRINCIPAL: {"subjects": [MAPPED_SUBJECT]},
+            OTHER_MAPPED_PRINCIPAL: {"subjects": [OTHER_MAPPED_SUBJECT]}
+        },
         "constraintSets": {
             "cli-probe.upper": {
                 "provider": "cli-probe", "effect": "read-only", "risk": "Low",

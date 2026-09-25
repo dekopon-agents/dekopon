@@ -53,12 +53,7 @@ fn world(config: &BrokerdConfig, registry: &BrokerProviderRegistry) -> PolicyWor
             .identities
             .iter()
             .map(|identity| identity.principal.clone())
-            .chain(
-                config
-                    .identity_mappings
-                    .iter()
-                    .map(|mapping| mapping.principal.clone()),
-            ),
+            .chain(config.principals.keys().cloned()),
         registry
             .capabilities()
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
@@ -360,8 +355,8 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
 
     let identity = config.identities.first().expect("one peer identity");
     let grant = identity.attestor.as_ref().expect("the gateway may attest");
-    let mapping = config.identity_mappings.first().expect("one mapping");
-    let subject = mapping.subject.canonical();
+    let (principal, entry) = config.principals.iter().next().expect("one principal");
+    let subject = entry.subjects.first().expect("one subject").canonical();
     assert!(
         grant
             .namespaces
@@ -369,6 +364,6 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
             .any(|namespace| subject == *namespace || subject.starts_with(&format!("{namespace}."))),
         "{subject} sits outside the gateway's attestor namespaces"
     );
-    assert_eq!(mapping.principal.as_str(), PRINCIPAL);
+    assert_eq!(principal.as_str(), PRINCIPAL);
     assert_eq!(identity.principal.as_str(), GATEWAY);
 }

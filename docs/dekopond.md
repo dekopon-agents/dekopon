@@ -1151,7 +1151,7 @@ dekopond                subject = ExternalSubject::{slack,discord,telegram,whats
       | invoke(proposal, subject, agent, scope)
       v
 dekopon-brokerd         attestor grant bounds the namespace
-                        identityMappings turn the subject into a principal
+                        principals turn the subject into a principal
                         policy must permit agent.prompt for that principal and agent
                         policy conditioned on context.via decides what it may then reach
                         credentials resolve, the provider executes, audit records it

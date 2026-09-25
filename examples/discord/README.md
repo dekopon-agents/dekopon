@@ -106,13 +106,13 @@ identities:
     attestor:
       namespaces: [discord]
 
-identityMappings:
-  - subject: discord.987654321098765432
-    principal: maintainer
+principals:
+  maintainer:
+    subjects: [discord.987654321098765432]
 ```
 
 The subject is routing metadata, not authority. The broker alone resolves it through
-`identityMappings`, and Cedar must separately permit that principal to drive the routed agent.
+`principals`, and Cedar must separately permit that principal to drive the routed agent.
 An unmapped Discord sender is refused before any model call.
 
 A persistent route is `privateConversation` when `scope` is omitted. Under

@@ -28,12 +28,13 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
+use dekopon_capability::EffectKind;
 use dekopon_core::error_chain;
 use thiserror::Error;
 
 pub use config::{
     AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError,
-    HostLimitsConfig, IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig,
+    HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity, PrincipalConfig, ResolvedConfig,
     ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
@@ -175,29 +176,40 @@ where
             .max_frame_bytes
             .saturating_sub(config::MINIMUM_RESPONSE_OVERHEAD_BYTES),
     )?;
-    let identity_directory = IdentityDirectory::new(
-        config
-            .identity_mappings
-            .iter()
-            .map(|mapping| (mapping.subject.clone(), mapping.principal.clone())),
-    )
-    .map_err(BrokerdError::Broker)?;
+    let identity_directory =
+        IdentityDirectory::new(config.principals.iter().flat_map(|(principal, entry)| {
+            entry
+                .subjects
+                .iter()
+                .map(|subject| (subject.clone(), principal.clone()))
+        }))
+        .map_err(BrokerdError::Broker)?;
     let world = PolicyWorld::new(
         config
             .identities
             .iter()
             .map(|identity| identity.principal.clone())
-            .chain(
-                config
-                    .identity_mappings
-                    .iter()
-                    .map(|mapping| mapping.principal.clone()),
-            ),
+            .chain(config.principals.keys().cloned()),
         registry
             .capabilities()
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
-    .map(|world| world.with_secrets(secret_drns))
+    .map(|world| {
+        world
+            .with_secrets(secret_drns)
+            .with_group_members(config.principals.iter().flat_map(|(principal, entry)| {
+                entry
+                    .groups
+                    .iter()
+                    .map(|group| (principal.clone(), group.clone()))
+            }))
+            .with_read_only(
+                registry
+                    .capabilities()
+                    .filter(|(_, capability)| capability.effect == EffectKind::ReadOnly)
+                    .map(|(_, capability)| capability.id.clone()),
+            )
+    })
     .map_err(|source| BrokerdError::Policy { source })?;
     let leniency = if config.strict {
         Leniency::Strict
