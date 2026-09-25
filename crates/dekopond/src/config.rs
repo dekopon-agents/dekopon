@@ -844,21 +844,40 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
+/// `Check` keeps going past a directory's fragment refusals so they are reported beside whatever
+/// the rest of startup finds; every rule is otherwise the one boot applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadMode {
+    Boot,
+    Check,
+}
+
 pub async fn load(
     path: impl AsRef<Path>,
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
+    load_in(path, expected_uid, LoadMode::Boot)
+        .await
+        .map(|(resolved, _)| resolved)
+}
+
+pub async fn load_in(
+    path: impl AsRef<Path>,
+    expected_uid: u32,
+    mode: LoadMode,
+) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
     let path = absolute(path.as_ref())?;
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-        return load_directory(path, expected_uid).await;
+        return load_directory(path, expected_uid, mode).await;
     }
     let config = decode(&read_config_file(path.clone(), expected_uid).await?)?;
-    resolve(
+    let resolved = resolve(
         config,
         path,
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
-    )
+    )?;
+    Ok((resolved, Vec::new()))
 }
 
 const MERGE_RULES: MergeRules = MergeRules {
@@ -871,7 +890,8 @@ const MERGE_RULES: MergeRules = MergeRules {
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-) -> Result<ResolvedConfig, ConfigError> {
+    mode: LoadMode,
+) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
     let paths = fragments::scan_directory(&directory, expected_uid, "yaml")?;
     let first = paths
         .first()
@@ -903,18 +923,38 @@ async fn load_directory(
         .filter(|(path, transport)| defined.get(transport).is_some_and(|owner| owner != path))
         .map(|(path, transport)| format!("{transport} in {}", path.display()))
         .collect::<Vec<_>>();
+    let mut refusals = Vec::new();
     if !stray.is_empty() {
-        return Err(ConfigError::RouteOutsideTransportFragment { routes: stray });
+        let refusal = ConfigError::RouteOutsideTransportFragment { routes: stray };
+        if mode == LoadMode::Boot {
+            return Err(refusal);
+        }
+        refusals.push(refusal);
     }
-    let merged = fragments::merge(parsed, &MERGE_RULES)?;
-    let config = serde_yaml::from_value::<DekopondConfig>(serde_yaml::Value::Mapping(merged))
-        .map_err(|source| ConfigError::Decode { source })?;
-    resolve(
+    let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
+    if let Some(refusal) = refusal {
+        if mode == LoadMode::Boot {
+            return Err(refusal.into());
+        }
+        refusals.push(refusal.into());
+    }
+    // A later refusal is reported as the fragment refusal it may well be caused by.
+    let later =
+        |error: ConfigError, mut refusals: Vec<ConfigError>| refusals.pop().unwrap_or(error);
+    let config = match serde_yaml::from_value::<DekopondConfig>(serde_yaml::Value::Mapping(merged))
+    {
+        Ok(config) => config,
+        Err(source) => return Err(later(ConfigError::Decode { source }, refusals)),
+    };
+    match resolve(
         config,
         first,
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
-    )
+    ) {
+        Ok(resolved) => Ok((resolved, refusals)),
+        Err(error) => Err(later(error, refusals)),
+    }
 }
 
 fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {

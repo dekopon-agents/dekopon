@@ -14166,3 +14166,92 @@ async fn a_configuration_directory_keeps_each_route_with_its_transport() {
         matches!(error, ConfigError::RouteOutsideTransportFragment { routes } if routes.len() == 1)
     );
 }
+
+fn check_fixture(root: &Path, agent: &str, fragments: &[(&str, Value)]) -> PathBuf {
+    let directory = root.join("dekopond.d");
+    fs::create_dir(&directory).expect("create dekopond.d");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("private dekopond.d");
+    fs::write(
+        root.join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .expect("write catalog fixture");
+    let whole = document(root);
+    let mut chat = json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "transports": [
+            { "name": "chat", "kind": "discordGateway", "botTokenEnv": "DEKOPOND_CHECK_NEVER_SET" }
+        ],
+        "routes": [
+            { "transport": "chat", "conversation": { "kind": ["directMessage"] }, "agent": agent }
+        ]
+    });
+    let host = json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "catalogPath": whole["catalogPath"],
+        "broker": whole["broker"],
+        "models": whole["models"]
+    });
+    for (name, fragment) in [("chat.yaml", chat.take()), ("host.yaml", host)]
+        .into_iter()
+        .chain(
+            fragments
+                .iter()
+                .map(|(name, fragment)| (*name, fragment.clone())),
+        )
+    {
+        let path = directory.join(name);
+        fs::write(
+            &path,
+            serde_json::to_vec(&fragment).expect("fragment serializes"),
+        )
+        .expect("write fragment");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure fragment");
+    }
+    directory
+}
+
+#[tokio::test]
+async fn check_passes_a_directory_whose_transport_token_variable_is_unset() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+
+    let report = crate::check(&directory, None).await;
+
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::TransportCredential { transport, variable }
+            if transport == "chat" && variable == "DEKOPOND_CHECK_NEVER_SET"
+    )));
+}
+
+#[tokio::test]
+async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "nobody",
+        &[(
+            "twice.yaml",
+            json!({"apiVersion": config::CONFIG_API_VERSION, "catalogPath": "/elsewhere.yaml"}),
+        )],
+    );
+
+    let report = crate::check(&directory, None).await;
+
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::DekopondError::Config(ConfigError::Fragments(
+            dekopon_core::fragments::FragmentError::Conflicts { conflicts }
+        )) if conflicts.iter().any(|conflict| conflict.key == "catalogPath")
+    )));
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::DekopondError::Route(RouteError { problems })
+            if problems.iter().any(|problem| matches!(
+                problem,
+                RouteProblem::UnknownAgent { agent } if agent == "nobody"
+            ))
+    )));
+}

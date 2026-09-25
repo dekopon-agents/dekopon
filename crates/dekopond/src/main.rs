@@ -46,12 +46,28 @@ const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(cli::Command::Auth(options)) = &cli.command {
-        return if auth_output::run(options) == 0 {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
+    match &cli.command {
+        Some(cli::Command::Auth(options)) => {
+            return if auth_output::run(options) == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+        Some(cli::Command::Check(check)) => {
+            if cli.config.is_some() {
+                eprintln!("dekopond: --config cannot be used with check");
+                return ExitCode::from(2);
+            }
+            return match bounded_runtime(BLOCKING_EXIT_TIMEOUT, run_check(check)) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("dekopond: could not start the async runtime: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        None => {}
     }
     let Some(config) = cli.config else {
         eprintln!("dekopond: --config is required for serving");
@@ -77,6 +93,53 @@ fn bounded_runtime<T>(
     let value = runtime.block_on(body);
     runtime.shutdown_timeout(exit_timeout);
     Ok(value)
+}
+
+#[cfg(unix)]
+#[derive(serde::Serialize)]
+struct CheckOutput {
+    ok: bool,
+    problems: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[cfg(unix)]
+async fn run_check(check: &cli::CheckArgs) -> ExitCode {
+    let report = dekopond::check(&check.config, check.catalog.as_deref()).await;
+    let output = CheckOutput {
+        ok: report.problems.is_empty(),
+        problems: report
+            .problems
+            .iter()
+            .map(|problem| error_chain(problem))
+            .collect(),
+        warnings: report.warnings.iter().map(ToString::to_string).collect(),
+    };
+    match check.output {
+        cli::CheckFormat::Table => {
+            for problem in &output.problems {
+                println!("problem\t{problem}");
+            }
+            for warning in &output.warnings {
+                println!("warning\t{warning}");
+            }
+            if output.ok {
+                println!("ok");
+            }
+        }
+        cli::CheckFormat::Json => match serde_json::to_string_pretty(&output) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("dekopond: could not render check output: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    if output.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(unix)]
