@@ -22,7 +22,7 @@ use dekopon_agent::{
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
-    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult, Trigger,
+    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
 };
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
@@ -49,9 +49,11 @@ use crate::{
     progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, InboundMessage, OutboundReply, PastMessage,
-        ThreadOwnership, TransportError, bound_inbound, bound_outbound, credential_from,
+        AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
+        PastMessage, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
+        credential_from,
     },
+    wake::{Anchor, SessionWakes},
 };
 
 pub(crate) const UNAUTHORIZED_REPLY: &str = "You're not authorized to use this agent.";
@@ -610,6 +612,7 @@ pub(crate) struct SessionRunner {
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub active_sessions: ActiveSessions,
+    pub wakes: Option<Arc<crate::wake::WakeStore>>,
 }
 
 struct RecalledWindow {
@@ -673,7 +676,14 @@ async fn recall_window(
                 .min(PLATFORM_RECALL_MAX_MESSAGES);
             let read = tokio::time::timeout(
                 PLATFORM_RECALL_TIMEOUT,
-                history.recent(&message.conversation, &message.message_id, limit),
+                history.recent(
+                    &message.conversation,
+                    match &message.message_id {
+                        MessageId::Native(id) => Some(id),
+                        MessageId::Wake(_) => None,
+                    },
+                    limit,
+                ),
             )
             .await;
             let reason = match read {
@@ -881,6 +891,11 @@ async fn execute(
     // all keyed on the same conversation key, so a stop can never be filed apart from its session.
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
+        if let MessageId::Wake(id) = message.message_id {
+            tracing::info!(event = "gateway_wake_busy", wake.id = %id);
+            answer(&driver, &message, &message.text).await;
+            return "wake-busy";
+        }
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
         if (runner.reply_on_busy || !message.constituents.is_empty())
             && let Some(_reply) = runner.gate.refusal()
@@ -1171,6 +1186,20 @@ async fn session(
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
     let leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
     drop(sink);
+    let wakes = route
+        .wakes
+        .then_some(runner.wakes.as_ref())
+        .flatten()
+        .zip(Anchor::from_inbound(message, &route.agent))
+        .map(|(store, anchor)| {
+            SessionWakes::new(
+                anchor,
+                Arc::clone(store),
+                runner.broker.clone(),
+                tokio::runtime::Handle::current(),
+                shell,
+            )
+        });
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.signal().watch();
     let result = tokio::task::spawn_blocking(move || {
@@ -1203,6 +1232,9 @@ async fn session(
         }
         if reply_optional {
             inputs = inputs.with_optional_reply();
+        }
+        if let Some(wakes) = wakes.as_ref() {
+            inputs = inputs.with_wakes(wakes);
         }
         let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
             .map_err(SessionError::from);
@@ -1463,7 +1495,7 @@ fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestatio
             transport,
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
-            trigger: Trigger::Message,
+            trigger: message.message_id.trigger(),
         },
     ))
 }
@@ -1474,7 +1506,11 @@ async fn record_delivered_turn(
     claim: Attestation,
     assistant: String,
 ) {
-    let Some(delivery) = delivery_identity(message, &claim) else {
+    let MessageId::Native(message_id) = &message.message_id else {
+        tracing::debug!(event = "gateway_memory_record_skipped", reason = "wake");
+        return;
+    };
+    let Some(delivery) = delivery_identity(message, message_id, &claim) else {
         tracing::warn!(
             event = "gateway_memory_record_failed",
             category = "delivery-identity",
@@ -1517,6 +1553,7 @@ async fn record_delivered_turn(
 
 pub(crate) fn delivery_identity(
     message: &InboundMessage,
+    message_id: &str,
     claim: &Attestation,
 ) -> Option<DeliveryIdentity> {
     let scope = claim.scope.as_ref()?;
@@ -1524,18 +1561,18 @@ pub(crate) fn delivery_identity(
     match message.transport_kind {
         dekopon_broker_protocol::ChatTransportKind::Slack => Some(DeliveryIdentity::Slack {
             channel: conversation.id.clone(),
-            timestamp: message.message_id.clone(),
+            timestamp: message_id.to_owned(),
         }),
         dekopon_broker_protocol::ChatTransportKind::Discord => Some(DeliveryIdentity::Discord {
             channel: conversation
                 .api_channel(dekopon_broker_protocol::ChatTransportKind::Discord)
                 .to_owned(),
-            message: message.message_id.clone(),
+            message: message_id.to_owned(),
         }),
         dekopon_broker_protocol::ChatTransportKind::Telegram => Some(DeliveryIdentity::Telegram {
             chat: conversation.id.clone(),
             topic: conversation.thread.clone(),
-            message: message.message_id.clone(),
+            message: message_id.to_owned(),
         }),
         dekopon_broker_protocol::ChatTransportKind::Whatsapp => {
             let container = conversation.container.as_deref()?;
@@ -1546,11 +1583,11 @@ pub(crate) fn delivery_identity(
             Some(DeliveryIdentity::Whatsapp {
                 waba: waba.to_owned(),
                 phone_number: phone_number.to_owned(),
-                message: message.message_id.clone(),
+                message: message_id.to_owned(),
             })
         }
         dekopon_broker_protocol::ChatTransportKind::Local => {
-            let mut fields = message.message_id.rsplitn(3, '-');
+            let mut fields = message_id.rsplitn(3, '-');
             let sequence = fields.next()?.parse().ok()?;
             let connection = fields.next()?.parse().ok()?;
             let boot_nonce = fields.next()?.to_owned();

@@ -28,11 +28,12 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
-        PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits,
-        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, asset_buffer, bound_inbound, credential_client, floor_boundary, jitter_below,
-        receive_span, record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
+        OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds,
+        StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
+        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
+        floor_boundary, jitter_below, receive_span, record_conversation, reserve_for_chunk,
+        retry_after_from_body, split_message,
     },
 };
 
@@ -413,7 +414,8 @@ impl DiscordTransport {
                             .await?;
                         Ok(match routed {
                             Some(message) => {
-                                received.record("message.id", message.message_id.as_str());
+                                received
+                                    .record("message.id", message.message_id.to_string().as_str());
                                 PumpResult::Event(TransportEvent::Message(Box::new(message)))
                             }
                             None => PumpResult::Idle,
@@ -588,7 +590,7 @@ impl DiscordTransport {
             transport_kind: ChatTransportKind::Discord,
             subject: ExternalSubject::discord(user_id).map_err(TransportError::Subject)?,
             conversation,
-            message_id: message_id.to_owned(),
+            message_id: MessageId::Native(message_id.to_owned()),
             text,
             assets,
             addressed: Some(addressed),
@@ -995,18 +997,22 @@ impl ChatHistory for DiscordDriver {
     async fn recent(
         &self,
         conversation: &Conversation,
-        before: &str,
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PastMessage>, TransportError> {
         let bot = self.bot_user.get().ok_or(TransportError::Closed)?;
         let channel_id = conversation.api_channel(ChatTransportKind::Discord);
-        if !is_snowflake(channel_id) || !is_snowflake(before) {
+        if !is_snowflake(channel_id) || before.is_some_and(|before| !is_snowflake(before)) {
             return Err(TransportError::Response);
         }
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_HISTORY_MESSAGES).to_string();
+        let mut query = before
+            .map(|before| vec![("before", before)])
+            .unwrap_or_default();
+        query.push(("limit", limit.as_str()));
         let response = self
             .send_rest(
                 self.http
@@ -1014,7 +1020,7 @@ impl ChatHistory for DiscordDriver {
                         "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
                         self.endpoint
                     ))
-                    .query(&[("before", before), ("limit", limit.as_str())])
+                    .query(&query)
                     .header("authorization", format!("Bot {}", self.token.expose())),
             )
             .await?;
@@ -2833,7 +2839,7 @@ mod unit_tests {
         let recalled = driver(&endpoint)
             .history()
             .expect("Discord reads its own history")
-            .recent(&thread_conversation(), "1100000016777216000", 4)
+            .recent(&thread_conversation(), Some("1100000016777216000"), 4)
             .await
             .expect("the history reads");
 
@@ -2887,7 +2893,7 @@ mod unit_tests {
             .expect("the message routes");
 
         let recalled = driver(&endpoint)
-            .recent(&direct_conversation(), "200", 10)
+            .recent(&direct_conversation(), Some("200"), 10)
             .await
             .expect("the history reads");
         server.await.expect("the stand-in joins");
@@ -2904,7 +2910,7 @@ mod unit_tests {
 
         for limit in [MAX_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES + 1] {
             driver
-                .recent(&direct_conversation(), "200", limit)
+                .recent(&direct_conversation(), Some("200"), limit)
                 .await
                 .expect("the history reads");
         }
@@ -2924,7 +2930,7 @@ mod unit_tests {
         )]);
         let driver = driver(&endpoint);
 
-        let throttled = driver.recent(&direct_conversation(), "200", 10).await;
+        let throttled = driver.recent(&direct_conversation(), Some("200"), 10).await;
         server.await.expect("the stand-in joins");
 
         assert!(
@@ -2945,7 +2951,7 @@ mod unit_tests {
         )]);
 
         let refused = driver(&endpoint)
-            .recent(&direct_conversation(), "200", 10)
+            .recent(&direct_conversation(), Some("200"), 10)
             .await;
         server.await.expect("the stand-in joins");
 
@@ -2960,7 +2966,7 @@ mod unit_tests {
         let mut driver = driver(UNREACHABLE);
         driver.bot_user = std::sync::OnceLock::new();
 
-        let early = driver.recent(&direct_conversation(), "200", 10).await;
+        let early = driver.recent(&direct_conversation(), Some("200"), 10).await;
 
         assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
     }

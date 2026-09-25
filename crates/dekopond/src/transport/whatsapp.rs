@@ -36,10 +36,10 @@ use crate::{
     asset::{AssetSourceRef, PendingAsset},
     config::{LivenessMode, LivenessSettings},
     transport::{
-        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, OutboundReply,
-        ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, credential_client, receive_span, record_conversation,
-        split_message,
+        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
+        OutboundReply, ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent,
+        TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
+        record_conversation, split_message,
     },
 };
 
@@ -193,7 +193,7 @@ impl ClaimedIds {
     fn claim(&mut self, messages: Vec<InboundMessage>) -> Vec<InboundMessage> {
         let mut accepted = Vec::with_capacity(messages.len());
         for message in messages {
-            if self.0.insert(message.message_id.clone()) {
+            if self.0.insert(message.message_id.to_string()) {
                 accepted.push(message);
             }
         }
@@ -515,7 +515,7 @@ async fn process_webhook(
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
     let claimed: Vec<String> = accepted
         .iter()
-        .map(|message| message.message_id.clone())
+        .map(|message| message.message_id.to_string())
         .collect();
     let Ok(capacity) = Arc::clone(&state.queue_capacity).try_acquire_many_owned(permit_count)
     else {
@@ -655,7 +655,7 @@ fn parse_delivery(
                     transport_kind: ChatTransportKind::Whatsapp,
                     subject,
                     conversation,
-                    message_id: id.to_owned(),
+                    message_id: MessageId::Native(id.to_owned()),
                     text: bound_inbound(text),
                     assets,
                     addressed: None,
@@ -1253,7 +1253,7 @@ mod tests {
         });
         let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_id, "two");
+        assert_eq!(messages[0].message_id.to_string(), "two");
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
         assert_eq!(
             messages[0].conversation.container.as_deref(),
@@ -1403,7 +1403,7 @@ mod tests {
         let TransportEvent::Message(message) = event else {
             panic!("message event")
         };
-        assert_eq!(message.message_id, "wamid.loopback");
+        assert_eq!(message.message_id.to_string(), "wamid.loopback");
     }
 
     #[tokio::test]

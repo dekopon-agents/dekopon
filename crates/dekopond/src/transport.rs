@@ -3,15 +3,18 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    fmt,
     sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use dekopon_agent::attachment::GeneratedImage;
-use dekopon_broker_protocol::{ChatTransportKind, Conversation};
+use dekopon_agent::wake::WakeId;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, Trigger};
 use dekopon_core::ExternalSubject;
 use dekopon_model::ModelText;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -47,7 +50,7 @@ pub(crate) struct InboundMessage {
     pub conversation: Conversation,
     /// This is checked against the separately attested chat scope so a Slack timestamp cannot be
     /// replayed as a Discord snowflake; it is not used for redelivery rejection.
-    pub message_id: String,
+    pub message_id: MessageId,
     /// Reference lines naming attachments are appended by the session, not the transport, because
     /// AssetStore assigns the numbers and a transport minting its own would collide.
     pub text: String,
@@ -68,6 +71,30 @@ pub(crate) struct InboundMessage {
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
     pub late_photos: Option<crate::session::LatePhotoReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MessageId {
+    Native(String),
+    Wake(WakeId),
+}
+
+impl MessageId {
+    pub(crate) const fn trigger(&self) -> Trigger {
+        match self {
+            Self::Native(_) => Trigger::Message,
+            Self::Wake(_) => Trigger::Wake,
+        }
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Native(id) => formatter.write_str(id),
+            Self::Wake(id) => write!(formatter, "wake-{id}"),
+        }
+    }
 }
 
 /// drop.reason is declared on this span rather than by the transport that records it, because
@@ -210,7 +237,13 @@ pub(crate) struct CancelPress {
     pub ack: AckToken,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ReplyTarget {
     Slack {
         channel: String,
@@ -458,7 +491,7 @@ pub(crate) trait ChatHistory: Send + Sync {
     async fn recent(
         &self,
         conversation: &Conversation,
-        before: &str,
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PastMessage>, TransportError>;
 }

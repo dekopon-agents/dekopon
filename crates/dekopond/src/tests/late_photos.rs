@@ -35,7 +35,7 @@ fn photo(text: &str) -> InboundMessage {
     input.subject = ExternalSubject::whatsapp("16034700182").unwrap();
     input.conversation.container = Some("123:456".into());
     input.conversation.id = "16034700182".into();
-    input.message_id = "wamid.photo".into();
+    input.message_id = crate::transport::MessageId::Native("wamid.photo".into());
     input.reply = ReplyTarget::WhatsApp {
         recipient: "16034700182".into(),
     };

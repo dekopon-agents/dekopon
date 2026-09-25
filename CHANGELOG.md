@@ -16,6 +16,12 @@ All notable changes to Dekopon are documented here. The format is based on
   `gateway.session` records `conversation.recall_source`, `.recalled_turns` and `.carried_assets`.
 - The classic Slack manifest requests `channels:history`, `groups:history` and `mpim:history` for
   platform recall; reinstall the app to grant them.
+- Wakes. A route with `wakes: true` and a `sessions.wakes` store offers the `wake` tool: the agent
+  can come back to the same conversation, as the same person, after a delay, or when a watch
+  probe (a shell script run with no model, `$PREV` holding its last output) exits 0. Probe legs
+  attest `trigger: probe` and are refused every capability that writes (`probe-write`).
+- Chat scopes carry a required `trigger` (`message`, `wake`, `probe`), readable by owner Cedar
+  policy as `context.trigger`. The gateway and broker must be upgraded together.
 
 ## [dekopon-chart-0.12.0] - 2026-09-24
 
