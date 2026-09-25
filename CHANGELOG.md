@@ -7,12 +7,41 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-25
+
 ### Added
 
 - `dekopon-brokerd check <config> [--provider-set <providers.yaml> --store <dir>]` and
   `dekopond check <config> [--catalog <path>]` run each daemon's startup validation offline and
   report every problem at once as a table or JSON, without binding sockets, reading credentials or
   secrets, or requiring runtime paths to exist.
+- Cedar groups: a principal's `groups` make it a member of `Dekopon::Group::"<group>"`, so one
+  statement written `principal in Dekopon::Group::"family"` grants every member. A policy naming a
+  group nobody belongs to refuses startup. The policy digest covers membership.
+- Action groups: `Dekopon::Action::"<provider>:*"` holds every capability a provider declares and
+  `"<provider>:read-only"` its read-only ones. A capability a provider upgrade adds still has no
+  constraint set until it is listed under the provider's `capabilities`, so a `:*` grant reaches
+  nothing new without an owner edit.
+- Persistent routes rebuild a window that is not in memory from `memory.recall`: `journal` (a
+  gateway-owned JSONL transcript under `sessions.journal`, bounded by `forgetAfterMs` and a
+  whole-directory `maxBytes`) or `platform` (Slack and Discord message history). Idle expiry and
+  restarts no longer mean forgetting, and recalled windows keep their `Chat Asset #N` attachments.
+  `gateway.session` records `conversation.recall_source`, `.recalled_turns` and `.carried_assets`.
+- The classic Slack manifest requests `channels:history`, `groups:history` and `mpim:history` for
+  platform recall; reinstall the app to grant them.
+- Wakes. A route with `wakes: true` and a `sessions.wakes` store offers the `wake` tool: the agent
+  can come back to the same conversation, as the same person, after a delay, or when a watch
+  probe (a shell script run with no model, `$PREV` holding its last output) exits 0. Probe legs
+  attest `trigger: probe` and are refused every capability that writes (`probe-write`).
+- Chat scopes carry a required `trigger` (`message`, `wake`, `probe`), readable by owner Cedar
+  policy as `context.trigger`. The gateway and broker must be upgraded together.
+- A directory given as dekopond's config path is read as `*.yaml` fragments: `transports`, `models`
+  and `routes` concatenate, every other key is set once, and a route must sit in the fragment that
+  defines its transport.
+- A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
+  policy files. `principals`, `agents`, `capabilities` and `providerSettings` union by name,
+  `identities` and `providers` concatenate, every other key is set by one fragment, and every
+  collision refuses startup listing each key with its files. `policiesPath` is not allowed there.
 
 ### Changed
 
@@ -27,21 +56,10 @@ All notable changes to Dekopon are documented here. The format is based on
 - **Breaking:** agent specs lose `capabilities`, `providers` and `policyProfile`, which granted and
   checked nothing; they are now unknown fields. `instructionsFile` reads an agent's instructions
   from a file, and a catalog path may name a directory of `*.yaml` files.
-- A directory given as dekopond's config path is read as `*.yaml` fragments: `transports`, `models`
-  and `routes` concatenate, every other key is set once, and a route must sit in the fragment that
-  defines its transport.
 - **Breaking:** every Cedar statement needs an `@id`.
-- `serverLimits.maxFrameBytes` defaults to the smallest frame that fits the largest configured
-  input, output or chat-memory result plus overhead, so it no longer has to be raised by hand when
-  `hostLimits` grow. `shutdownGraceMs` stays explicit because the chart sizes the pod's
-  termination grace from it.
 - **Breaking:** `brokerPrincipal` and `policyRevision` are gone. Receipts and audit records carry
   the policy digest as the revision and `dekopon-broker` as the authorizing principal. An
   identity's `actor` defaults to the service actor of its own principal.
-- A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
-  policy files. `principals`, `agents`, `constraintSets` and `providerSettings` union by name,
-  `identities` and `providers` concatenate, every other key is set by one fragment, and every
-  collision refuses startup listing each key with its files. `policiesPath` is not allowed there.
 - **Breaking:** a route without `memory:` is `persistent` with the default window (15 minutes,
   12 turns, 64 KiB, private). Write `memory: { mode: oneShot }` to keep a route stateless. The
   retired route `match:` and memory-under-`conversation:` refusals are gone with the fields.
@@ -54,30 +72,10 @@ All notable changes to Dekopon are documented here. The format is based on
 - **Breaking:** `identityMappings` is replaced by `principals`, keyed by principal, each with
   `subjects` and optional `groups`. Rewrite `- { subject: S, principal: P }` entries as
   `P: { subjects: [S] }`; a subject named under two principals refuses startup listing every one.
-
-### Added
-
-- Cedar groups: a principal's `groups` make it a member of `Dekopon::Group::"<group>"`, so one
-  statement written `principal in Dekopon::Group::"family"` grants every member. A policy naming a
-  group nobody belongs to refuses startup. The policy digest covers membership.
-- Action groups: `Dekopon::Action::"<provider>:*"` holds every capability a provider declares and
-  `"<provider>:read-only"` its read-only ones. A capability a provider upgrade adds still has no
-  constraint set until it is listed under the provider's `capabilities`, so a `:*` grant reaches
-  nothing new without an owner edit.
-
-- Persistent routes rebuild a window that is not in memory from `memory.recall`: `journal` (a
-  gateway-owned JSONL transcript under `sessions.journal`, bounded by `forgetAfterMs` and a
-  whole-directory `maxBytes`) or `platform` (Slack and Discord message history). Idle expiry and
-  restarts no longer mean forgetting, and recalled windows keep their `Chat Asset #N` attachments.
-  `gateway.session` records `conversation.recall_source`, `.recalled_turns` and `.carried_assets`.
-- The classic Slack manifest requests `channels:history`, `groups:history` and `mpim:history` for
-  platform recall; reinstall the app to grant them.
-- Wakes. A route with `wakes: true` and a `sessions.wakes` store offers the `wake` tool: the agent
-  can come back to the same conversation, as the same person, after a delay, or when a watch
-  probe (a shell script run with no model, `$PREV` holding its last output) exits 0. Probe legs
-  attest `trigger: probe` and are refused every capability that writes (`probe-write`).
-- Chat scopes carry a required `trigger` (`message`, `wake`, `probe`), readable by owner Cedar
-  policy as `context.trigger`. The gateway and broker must be upgraded together.
+- `serverLimits.maxFrameBytes` defaults to the smallest frame that fits the largest configured
+  input, output or chat-memory result plus overhead, so it no longer has to be raised by hand when
+  `hostLimits` grow. `shutdownGraceMs` stays explicit because the chart sizes the pod's
+  termination grace from it.
 
 ## [dekopon-chart-0.13.0] - 2026-09-25
 

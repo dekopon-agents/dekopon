@@ -8,7 +8,35 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Chat-scope triggers (unreleased)
+## Principals, groups and capability blocks (0.22.0)
+
+Every broker configuration needs editing before the 0.22.0 broker will start; `dekopon-brokerd
+check` (and `dekopond check`) runs the new startup validation offline, so run it against the edited
+files first. The [changelog](../CHANGELOG.md#0220---2026-09-25) lists each change; the edits are:
+
+1. `identityMappings: [{subject, principal}]` becomes `principals: {<principal>: {subjects: [...],
+   groups: [...]}}`. Delete `brokerPrincipal` and `policyRevision`; `actor` may be omitted.
+2. Delete every `chatScopes` block. Move any conversation narrowing it carried into the Cedar
+   policies that grant the capabilities (`context has conversation && context.conversation.id ==
+   "…"`). An attestor may drop `namespaces` to speak for exactly the mapped subjects.
+3. `constraintSets` becomes `capabilities.<provider>`: shared `credential` and `constraints` at the
+   provider, one entry per capability under `capabilities` (`{}` inherits everything). Delete
+   `effect`, `risk` and `allowPlaintextLoopback: false`. A capability you do not list no longer
+   runs.
+4. `credentialByAgent` becomes one `agents.<agent>.credentials: {<alias>: <alias>}` per agent.
+5. Cedar: add `@id` to every statement; drop `context has via`/`context has agent` guards (both are
+   now required, and a direct peer holds no capability, so any `unless { context has via }` grant
+   is dead). `principal in Dekopon::Group::"…"` and `action in Dekopon::Action::"<provider>:*"` /
+   `"<provider>:read-only"` replace repeated lists.
+6. Catalog: delete `spec.capabilities`, `spec.providers` and `spec.policyProfile`.
+7. dekopond: a route with no `memory:` is now persistent; add `memory: { mode: oneShot }` where a
+   route must stay stateless.
+
+Any of the three configurations may become a directory of fragments; on Kubernetes, chart 0.13.0's
+`broker.configDirectory`, `gateway.configDirectory` and an empty `gateway.catalog.existingConfigMapKey`
+mount them. Roll both daemons together (see the next section).
+
+## Chat-scope triggers (0.22.0)
 
 Every chat attestation now carries a required `trigger`, and neither daemon accepts the other's
 older frames: roll `dekopon-brokerd` and `dekopond` together. No configuration changes. Wakes are
