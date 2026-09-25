@@ -14128,3 +14128,41 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
     assert_eq!(second.history.turns()[0].user(), "from disk");
     assert!(!store.resident(&key, &allowed, window(), now + window().idle_timeout));
 }
+
+#[tokio::test]
+async fn a_configuration_directory_keeps_each_route_with_its_transport() {
+    let root = temporary();
+    let fragments = root.path().join("dekopond.d");
+    fs::create_dir(&fragments).expect("create dekopond.d");
+    fs::set_permissions(&fragments, fs::Permissions::from_mode(0o700)).expect("private dekopond.d");
+    let whole = document(root.path());
+    let write = |name: &str, keys: &[&str]| {
+        let mut fragment = json!({"apiVersion": config::CONFIG_API_VERSION});
+        for key in keys {
+            fragment[*key] = whole[*key].clone();
+        }
+        let path = fragments.join(name);
+        fs::write(
+            &path,
+            serde_json::to_vec(&fragment).expect("fragment serializes"),
+        )
+        .expect("write fragment");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure fragment");
+    };
+    write("host.yaml", &["catalogPath", "broker"]);
+    write("models.yaml", &["models"]);
+    write("dev.yaml", &["transports", "routes"]);
+    let resolved = config::load(&fragments, crate::current_uid())
+        .await
+        .expect("a transport and its routes in one fragment resolve");
+    assert_eq!(resolved.routes.len(), 1);
+
+    write("dev.yaml", &["transports"]);
+    write("models.yaml", &["models", "routes"]);
+    let error = config::load(&fragments, crate::current_uid())
+        .await
+        .expect_err("a route away from its transport would reorder with file names");
+    assert!(
+        matches!(error, ConfigError::RouteOutsideTransportFragment { routes } if routes.len() == 1)
+    );
+}
