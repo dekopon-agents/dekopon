@@ -541,7 +541,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     }
 
     let (capabilities, words, _) = broker
-        .capability_surface(&gateway(), Some(&grant()), Some(&probe))
+        .capability_surface(&gateway(), Some(&attestor_grant()), Some(&probe))
         .expect("a probe is an authorized chat session");
     assert!(
         capabilities
@@ -554,7 +554,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     let result = broker
         .invoke(
             &gateway(),
-            Some(&grant()),
+            Some(&attestor_grant()),
             Some(&probe.bound_to(id.clone())),
             InvocationRequest {
                 id,
