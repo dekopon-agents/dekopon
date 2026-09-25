@@ -109,7 +109,7 @@ replaces that with a stable name, which is what an audit trail wants:
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context has via && context.via == "dekopond-gateway" };
+when { context.via == "dekopond-gateway" };
 ```
 
 Names must be bounded portable identifiers and unique across the set; two policies sharing one name

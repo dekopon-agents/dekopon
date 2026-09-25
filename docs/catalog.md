@@ -17,7 +17,7 @@ shipped component reads. Authoring one correctly means knowing which is which.
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
-broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. The
+broker's `capabilities` and Cedar policy decide that, and neither reads the catalog. The
 capabilities a session may reach come from the broker, which builds them from the provider
 manifests it loaded; an agent's `capabilities` list here is a declaration of intent that grants
 nothing and is compared against nothing, and a name misspelled in a
@@ -188,9 +188,9 @@ reads like it selects a behavior, so each is listed here rather than left to be 
 
 | Field | Looks like | Actually |
 |---|---|---|
-| `spec.capabilities` | The operations the agent may propose | Authored intent, compared against nothing. What a session may reach is the broker's answer to `capabilities` under that agent's attestation, built from the loaded provider manifests and the `constraintSets` policy allows. Adding a name here reaches nothing new; removing one narrows nothing. |
+| `spec.capabilities` | The operations the agent may propose | Authored intent, compared against nothing. What a session may reach is the broker's answer to `capabilities` under that agent's attestation, built from the loaded provider manifests and the provider `capabilities` blocks policy allows. Adding a name here reaches nothing new; removing one narrows nothing. |
 | `spec.providers` | The integrations the agent uses | Authored intent, compared against nothing. A capability's provider is fixed by the manifest that declares it, and the broker selects it. |
-| `spec.policyProfile` | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
+| `spec.policyProfile` | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the `capabilities` blocks in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
 | `status` | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 
@@ -247,7 +247,7 @@ a catalog that disagrees with it produces no error here and no error there.
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`improvement.md`](improvement.md) — catalog-mounted skills and opt-in suggestions.
 - [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries) —
-  `constraintSets`, Cedar policy, and the separate broker configuration that decides authority.
+  `capabilities`, Cedar policy, and the separate broker configuration that decides authority.
 - [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml) — a complete authored catalog.
 - [`examples/catalog/skills/pull-request-review/SKILL.md`](../examples/catalog/skills/pull-request-review/SKILL.md)
   — the skill that catalog's `reviewer` agent mounts, with one resource file.

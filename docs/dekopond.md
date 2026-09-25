@@ -313,7 +313,7 @@ render as concise Markdown tables:
 - route step/capability limits and the one-shot or persistent `memory:` window, including the effective persistent scope; and
 - the capability metadata in this sender's fresh `capabilities(subject, agent, scope)` result:
   identifier, selected provider, description, effect, and risk, as the provider manifest and the
-  broker's `constraintSets` define them.
+  broker's `capabilities` define them.
 
 That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and
 digests, denied or merely declared capabilities, execution constraints, credential bindings,
