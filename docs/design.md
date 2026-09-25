@@ -169,7 +169,7 @@ completed writes ([non-goals](#non-goals)).
 
 The independently released optional `memory-chat` provider uses JSONL only. Which capabilities make up
 the surface is the owner's declaration — one `route:` per record/recent/search role in
-`constraintSets` — not a reserved name, so renaming the provider drops no reservation and naming an
+`capabilities` — not a reserved name, so renaming the provider drops no reservation and naming an
 ordinary capability `memory.chat.export` gains none. Hidden recording is reachable solely through
 `recordDeliveredTurn` carrying a chat attestation, after complete gateway-attested transport
 acceptance. Recent and literal case-insensitive search are on demand and never automatically seed a

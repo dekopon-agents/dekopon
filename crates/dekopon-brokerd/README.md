@@ -6,7 +6,7 @@ policy set against owner-authored execution constraints, records every decision 
 event inside the caller's trace, and executes only statically linked Dekopon host interfaces.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides
-*who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit
+*who may do what*; `capabilities` decides *how narrowly the broker then does it*. A policy edit
 can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
 The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process
@@ -50,35 +50,64 @@ providers:
   - /opt/dekopon/providers          # a directory loads every *.wasm directly inside it
 identities:
   - uid: 1000
-    principal: local-user
-    actor:
-      type: human
-      principal: local-user
-constraintSets:
-  cli-probe.upper:
-    provider: cli-probe
-    effect: read-only
-    risk: Low
-    constraints:
+    principal: dekopond-gateway
+    actor: { type: service, principal: dekopond-gateway }
+    attestor: {}                    # speaks for exactly the subjects under `principals`
+principals:
+  local-user:
+    subjects: [slack.t0123abc.u9xyz]
+capabilities:
+  cli-probe:
+    constraints:                    # inherited by every capability listed below
       timeoutMs: 30000
       maxOutputBytes: 1048576
+    capabilities:
+      cli-probe.upper: {}           # only listed capabilities run
 ```
 
 ```cedar
 // policies.cedar — chmod 0600, owner-owned, single-link, 1 MiB maximum
-@id("local-user-probe")
+@id("local-user-may-prompt-reviewer")
 permit(principal == Dekopon::Principal::"local-user",
-       action == Dekopon::Action::"cli-probe.upper",
-       resource == Dekopon::Provider::"cli-probe")
-unless { context has via };
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"reviewer");
+
+@id("reviewer-probe-for-local-user")
+permit(principal == Dekopon::Principal::"local-user",
+       action == Dekopon::Action::"cli-probe.upper", resource)
+when { context.agent == "reviewer" };
 ```
 
-`effect` and `risk` reach a decision as `dekopon-policy`'s
-[context](../dekopon-policy/README.md#context).
+Every capability runs inside an attested agent session: `context.via` and `context.agent` are
+always present, and a directly connected peer is granted no capability whatever the policy says.
+Each capability's `effect` and `risk` come from its provider's manifest and reach a decision as
+`dekopon-policy`'s [context](../dekopon-policy/README.md#context).
+
+A capability entry may override any constraint field; a field replaces the provider's value whole,
+so a list such as `allowedHosts` is never appended to. An entry may also set `route` or its own
+`credential`.
+
+### A configuration directory
+
+The config path may name a directory instead of a file. Every `*.yaml` directly inside it is a
+fragment of the same document and every `*.cedar` is part of the policy set, both read in filename
+order under the same file rules. `principals`, `agents`, `capabilities` and `providerSettings`
+union by entry name, `identities` and `providers` concatenate, and every other key is set by exactly
+one fragment. Any collision refuses startup listing each colliding key with its files, so no
+fragment overrides another and file order never changes the result. `policiesPath` is not allowed
+in a directory.
+
+```text
+broker.d/
+  host.yaml          socket, telemetry, limits
+  peers.yaml         identities
+  family.yaml        principals in group family      family.cedar
+  mediawiki.yaml     capabilities.mediawiki
+```
 
 `policiesPath` is read under the configuration's own rules: the path is canonicalized, then opened
 without following symlinks and required to be a regular server-owned single-link file that is not
-group/world writable, at most 1 MiB, and valid UTF-8. It is required once any `constraintSets` entry
+group/world writable, at most 1 MiB, and valid UTF-8. It is required once any `capabilities` entry
 exists — a broker that declares executable capabilities and no policy would refuse every request
 while looking configured. An absent path means an empty policy set, which permits nothing.
 
@@ -204,22 +233,23 @@ bindings will be replaced by public DRNs; these examples remain current until th
 ```yaml
 # broker.yaml
 credentialsPath: /home/dekopon/.config/dekopon/broker-credentials.yaml
-constraintSets:
-  gh.pull-request.approve:
-    provider: gh
-    effect: external-write
-    risk: High
-    credential: github-pat
-    constraints:
-      timeoutMs: 15000
-      maxOutputBytes: 8192
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET, POST]
-        maxRequests: 2
-        maxRequestBytes: 16384
-        maxResponseBytes: 262144
-        allowPlaintextLoopback: false
+capabilities:
+  gh:
+    capabilities:
+      gh.pull-request.approve:
+        credential: github-pat
+        constraints:
+          timeoutMs: 15000
+          maxOutputBytes: 8192
+          http:
+            allowedHosts:
+              - api.github.com
+            allowedMethods:
+              - GET
+              - POST
+            maxRequests: 2
+            maxRequestBytes: 16384
+            maxResponseBytes: 262144
 ```
 
 ```yaml
@@ -327,22 +357,23 @@ organizations without being duplicated under a second capability namespace:
 agents:
   nestedset-github:
     credentials: { github-pat: github-pat-scientist-hq }
-constraintSets:
-  gh.issue.comment:
-    provider: gh
-    effect: external-write
-    risk: Medium
-    credential: github-pat                     # every agent that does not rebind it
-    constraints:
-      timeoutMs: 15000
-      maxOutputBytes: 8192
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET, POST]
-        maxRequests: 2
-        maxRequestBytes: 16384
-        maxResponseBytes: 262144
-        allowPlaintextLoopback: false
+capabilities:
+  gh:
+    capabilities:
+      gh.issue.comment:
+        credential: github-pat
+        constraints:
+          timeoutMs: 15000
+          maxOutputBytes: 8192
+          http:
+            allowedHosts:
+              - api.github.com
+            allowedMethods:
+              - GET
+              - POST
+            maxRequests: 2
+            maxRequestBytes: 16384
+            maxResponseBytes: 262144
 ```
 
 The key is the agent because a route already binds a transport and a match to an agent: one Slack
@@ -379,23 +410,23 @@ principals:
   maintainer:                          # the only place a subject becomes a principal
     subjects: [slack.t0123abc.u9xyz]   # canonical: lowercase dotted segments
     groups: [maintainers]              # optional; Cedar sees `principal in Dekopon::Group::"maintainers"`
-constraintSets:
-  # One entry per capability the policy below may reach; the reads are elided here.
-  gh.pull-request.comment:
-    provider: gh
-    effect: external-write
-    risk: Medium
-    credential: github-pat
-    constraints:
-      timeoutMs: 15000
-      maxOutputBytes: 8192
-      http:
-        allowedHosts: [api.github.com]
-        allowedMethods: [GET, POST]
-        maxRequests: 2
-        maxRequestBytes: 16384
-        maxResponseBytes: 262144
-        allowPlaintextLoopback: false
+capabilities:
+  gh:
+    capabilities:
+      gh.pull-request.comment:
+        credential: github-pat
+        constraints:
+          timeoutMs: 15000
+          maxOutputBytes: 8192
+          http:
+            allowedHosts:
+              - api.github.com
+            allowedMethods:
+              - GET
+              - POST
+            maxRequests: 2
+            maxRequestBytes: 16384
+            maxResponseBytes: 262144
 ```
 
 ```cedar
@@ -406,24 +437,20 @@ constraintSets:
 @id("boss-may-prompt-conditional-writer")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"xaviers-conditional-writer")
-when { context has via && context.via == "dekopond-gateway" };
+       resource == Dekopon::Agent::"xaviers-conditional-writer");
 
 @id("conditional-writer-surface")
 permit(principal == Dekopon::Principal::"cpetersen",
        action in [Dekopon::Action::"http-probe.fetch",
                   Dekopon::Action::"http-probe.conditional-write"],
        resource == Dekopon::Provider::"http-probe")
-when { context has agent && context.agent == "xaviers-conditional-writer"
-    && context has via && context.via == "dekopond-gateway" };
+when { context.agent == "xaviers-conditional-writer" };
 ```
 
 A grant is not a capability. It only lets the broker derive an attested context; what that context
-may then do is a policy statement, and `context.via` is how a policy keeps attested and direct
-authority disjoint. A policy that requires `context has via && context.via == "dekopond-gateway"`
-cannot authorize a directly connected peer, and one that requires `unless { context has via }`
-cannot authorize an attested proposal. Adding a gateway therefore cannot widen a grant that already
-existed.
+may then do is a policy statement. `context.via` names the attestor and is always present, so a
+policy may still pin one gateway; a directly connected peer carries no `via` and is granted no
+capability at all.
 
 The gateway names a subject and never a principal; `principals` is the only thing that
 resolves one, and an unmapped subject resolves to nothing. Refusals are audited denials recorded
@@ -726,7 +753,7 @@ stricter than `info` on the `dekopon_broker::audit` target drops the records fro
   listener itself is unusable ends the process.
 - Peer UID mapping is trusted configuration; payload identity claims do not exist.
 - Authorization decisions come from the Cedar policy set; execution bounds come from
-  `constraintSets` and are validated against loaded manifests, host ceilings, and the credential
+  `capabilities` and are validated against loaded manifests, host ceilings, and the credential
   store at startup. Neither file can widen the other.
 - Audit records carry the determining `policy.ids`, the `policy.digest` of the evaluated set, and
   the symbolic name of the `credential` the invocation selected. Its legacy selection binding
@@ -799,34 +826,36 @@ the access its role implies — read-write for record, read-only for the two rea
 reported together at startup rather than one per run.
 
 ```yaml
-constraintSets:
-  memory.chat.record:
-    route: chatMemoryRecord
-    provider: memory-chat
-    effect: local-write
-    risk: Medium
-    constraints:
-      timeoutMs: 30000
-      maxOutputBytes: 131072
-      storage: { interface: jsonl, access: read-write, namespace: chat }
-  memory.chat.recent:
-    route: chatMemoryRecent
-    provider: memory-chat
-    effect: read-only
-    risk: High
-    constraints:
-      timeoutMs: 30000
-      maxOutputBytes: 131072
-      storage: { interface: jsonl, access: read-only, namespace: chat }
-  memory.chat.search:
-    route: chatMemorySearch
-    provider: memory-chat
-    effect: read-only
-    risk: High
-    constraints:
-      timeoutMs: 30000
-      maxOutputBytes: 131072
-      storage: { interface: jsonl, access: read-only, namespace: chat }
+capabilities:
+  memory-chat:
+    capabilities:
+      memory.chat.record:
+        route: chatMemoryRecord
+        constraints:
+          timeoutMs: 30000
+          maxOutputBytes: 131072
+          storage:
+            interface: jsonl
+            access: read-write
+            namespace: chat
+      memory.chat.recent:
+        route: chatMemoryRecent
+        constraints:
+          timeoutMs: 30000
+          maxOutputBytes: 131072
+          storage:
+            interface: jsonl
+            access: read-only
+            namespace: chat
+      memory.chat.search:
+        route: chatMemorySearch
+        constraints:
+          timeoutMs: 30000
+          maxOutputBytes: 131072
+          storage:
+            interface: jsonl
+            access: read-only
+            namespace: chat
 ```
 
 `route:` is the only thing that reserves a capability. Omitted, it is `generic`, and the capability

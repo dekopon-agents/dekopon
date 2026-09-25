@@ -13,6 +13,10 @@ All notable changes to Dekopon are documented here. The format is based on
   `agents.<agent>.credentials` rebinds that name per acting agent
   (`agents: { nestedset-github: { credentials: { github-pat: github-pat-scientist-hq } } }`), and
   every rebinding's destinations are proved against each set that names the credential.
+- **Breaking:** `constraintSets` is replaced by per-provider `capabilities` blocks:
+  `capabilities.<provider>` carries a `credential` and `constraints` that each capability listed
+  under its `capabilities` inherits, and an entry overrides a field whole (lists replace, never
+  append). `effect` and `risk` are read from the provider manifest. Only listed capabilities run.
 - A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
   policy files. `principals`, `agents`, `constraintSets` and `providerSettings` union by name,
   `identities` and `providers` concatenate, every other key is set by one fragment, and every

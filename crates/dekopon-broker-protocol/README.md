@@ -128,7 +128,7 @@ not a failure at all: that is a usage error, and the provider's own message trav
 model to read.
 
 Reserved words are unreachable through this path, and what reserves them is the deployment's own
-`constraintSets`: every word belonging to the provider a chat-memory `route:` names is refused here
+`capabilities`: every word belonging to the provider a chat-memory `route:` names is refused here
 *before the guest runs*, so a reserved provider renders not even its help page for a caller without
 the surface, and so is any proposal that lands on a chat-memory-routed capability. Reservation
 follows what an operator declared rather than how a provider or capability happens to be spelled, so

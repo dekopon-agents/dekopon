@@ -674,7 +674,7 @@ init container is needed. See [`../../docs/secrets.md`](../../docs/secrets.md).
 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
-names `policiesPath`, `credentialsPath`, `secretMapPath`, or `constraintSets` with no corresponding value supplied;
+names `policiesPath`, `credentialsPath`, `secretMapPath`, or `capabilities` with no corresponding value supplied;
 an inline `broker.yaml`'s `identities` never map the broker's own UID, which the startup and
 readiness probes connect as; `paths.catalogDir` is inside `paths.configDir`; or
 `terminationGracePeriodSeconds` is shorter than the two drains it has to cover in sequence. When
