@@ -264,12 +264,32 @@ impl fmt::Display for ChatTransportKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Trigger {
+    Message,
+    Wake,
+    Probe,
+}
+
+impl Trigger {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Wake => "wake",
+            Self::Probe => "probe",
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatScopeClaim {
     pub transport: TransportId,
     pub kind: ChatTransportKind,
     pub conversation: Conversation,
+    pub trigger: Trigger,
 }
 
 impl fmt::Debug for ChatScopeClaim {

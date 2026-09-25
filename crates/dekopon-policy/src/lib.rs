@@ -211,7 +211,14 @@ impl PolicyWorld {
     fn schema_json(&self) -> serde_json::Value {
         // Every routing attribute must be declared optional in the schema, or Cedar's strict
         // validator rejects any policy referencing an absent one.
-        const ROUTING: [&str; 5] = ["via", "subject", "agent", "transportKind", "transport"];
+        const ROUTING: [&str; 6] = [
+            "via",
+            "subject",
+            "agent",
+            "transportKind",
+            "transport",
+            "trigger",
+        ];
         let mut routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
             (
                 name.to_owned(),
@@ -347,6 +354,7 @@ pub struct PolicyContext {
     pub agent: Option<String>,
     pub transport_kind: Option<String>,
     pub transport: Option<String>,
+    pub trigger: Option<String>,
     pub conversation: Option<PolicyConversation>,
 }
 
@@ -644,6 +652,7 @@ impl PolicyEngine {
             ("agent", context.agent),
             ("transportKind", context.transport_kind),
             ("transport", context.transport),
+            ("trigger", context.trigger),
         ] {
             if let Some(value) = value {
                 pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));

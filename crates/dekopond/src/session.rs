@@ -22,7 +22,7 @@ use dekopon_agent::{
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
-    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
+    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult, Trigger,
 };
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
@@ -1463,6 +1463,7 @@ fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestatio
             transport,
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
+            trigger: Trigger::Message,
         },
     ))
 }
