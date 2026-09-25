@@ -403,6 +403,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
                 id: "1338356895504793623".to_owned(),
                 thread: None,
             },
+            trigger: dekopon_broker::Trigger::Message,
         },
     );
     assert!(

@@ -657,6 +657,7 @@ permit(
     let engine = PolicyEngine::new(source, &world()).expect("the trigger gate validates");
     let context = |trigger: &str| PolicyContext {
         via: Some("dekopond-gateway".to_owned()),
+        agent: Some("reviewer".to_owned()),
         trigger: Some(trigger.to_owned()),
         ..PolicyContext::default()
     };
