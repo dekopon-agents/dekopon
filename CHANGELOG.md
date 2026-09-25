@@ -9,6 +9,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- **Breaking:** `credentialByAgent` is gone. A constraint set names one `credential`; top-level
+  `agents.<agent>.credentials` rebinds that name per acting agent
+  (`agents: { nestedset-github: { credentials: { github-pat: github-pat-scientist-hq } } }`), and
+  every rebinding's destinations are proved against each set that names the credential.
+- A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
+  policy files. `principals`, `agents`, `constraintSets` and `providerSettings` union by name,
+  `identities` and `providers` concatenate, every other key is set by one fragment, and every
+  collision refuses startup listing each key with its files. `policiesPath` is not allowed there.
 - **Breaking:** a route without `memory:` is `persistent` with the default window (15 minutes,
   12 turns, 64 KiB, private). Write `memory: { mode: oneShot }` to keep a route stateless. The
   retired route `match:` and memory-under-`conversation:` refusals are gone with the fields.

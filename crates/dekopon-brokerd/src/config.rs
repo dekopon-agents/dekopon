@@ -18,7 +18,7 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
 use dekopon_core::{
-    Actor, CapabilityId, ExternalSubject, FileHygieneError, FileTier, GroupId,
+    Actor, AgentId, CapabilityId, ExternalSubject, FileHygieneError, FileTier, GroupId,
     PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
@@ -70,6 +70,8 @@ pub struct BrokerdConfig {
     pub identities: Vec<PeerIdentity>,
     #[serde(default)]
     pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
+    #[serde(default)]
+    pub agents: BTreeMap<AgentId, AgentBindingConfig>,
     #[serde(default)]
     pub policies_path: Option<PathBuf>,
     #[serde(default)]
@@ -170,6 +172,12 @@ impl PeerIdentity {
     pub fn context(&self) -> Result<AuthenticatedContext, ContextError> {
         AuthenticatedContext::new(self.principal.clone(), self.actor.clone())
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentBindingConfig {
+    pub credentials: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -294,6 +302,7 @@ pub struct ResolvedConfig {
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
+    pub agents: BTreeMap<AgentId, AgentBindingConfig>,
     pub policies_path: Option<PathBuf>,
     pub policies: String,
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
@@ -339,7 +348,7 @@ pub async fn load(
 
 /// Keys whose values are named collections: fragments union them by entry name. Every other key is
 /// set by exactly one fragment, so no fragment can override another and file order never matters.
-const MERGED_BY_NAME: [&str; 3] = ["principals", "constraintSets", "providerSettings"];
+const MERGED_BY_NAME: [&str; 4] = ["principals", "agents", "constraintSets", "providerSettings"];
 const CONCATENATED: [&str; 2] = ["identities", "providers"];
 const FRAGMENT_EXTENSION: &str = "yaml";
 const POLICY_EXTENSION: &str = "cedar";
@@ -1002,6 +1011,7 @@ async fn resolve(
         strict: config.strict,
         identities: config.identities,
         principals: config.principals,
+        agents: config.agents,
         policies_path,
         policies: String::new(),
         constraint_sets: config.constraint_sets,

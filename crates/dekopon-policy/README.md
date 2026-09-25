@@ -11,7 +11,7 @@ context?** It does not decide how narrowly the broker then executes the result. 
 ceilings, allowed HTTP destinations and methods, call budgets, and credential binding live in
 owner-authored *constraint sets* inside `dekopon-broker`, validated at startup against loaded
 provider manifests, the component host's independent ceilings, and the credential store.
-*Committed direction:* the legacy `credential`/`credentialByAgent` bindings will be replaced by
+*Committed direction:* the legacy `credential`/`agents.<id>.credentials` bindings will be replaced by
 public DRNs, retaining the broker's execution ceilings and separate `secret.use` authorization
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 

@@ -41,7 +41,7 @@ daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-broker
 
 ### Authority, policy, and credentials
 
-The current `credential`/`credentialByAgent` bindings discussed below will be replaced by public
+The current `credential`/`agents.<id>.credentials` bindings discussed below will be replaced by public
 DRNs. This is committed direction, not an upgrade required today
 ([migration requirements](design.md#legacy-credential-bindings)).
 

@@ -643,7 +643,7 @@ both.
 ## Broker execution spans
 
 `broker.invocation` is not a flat bar. Beneath it the broker's own crates emit the spans below.
-The symbolic `credential` fields describe current `credential`/`credentialByAgent` selection.
+The symbolic `credential` fields describe current `credential`/`agents.<id>.credentials` selection.
 *Committed direction:* those bindings will be replaced by public DRNs, preserving refresh
 observability ([migration requirements](design.md#legacy-credential-bindings)); no telemetry field
 migration is implemented here.

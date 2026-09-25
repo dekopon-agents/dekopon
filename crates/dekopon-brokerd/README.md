@@ -197,7 +197,7 @@ or any `allowedHosts` entry is absent from the credential's `destinations`; at e
 engine injects `authorization: <scheme> <secret>` only after guest headers were validated and only
 for destinations inside the binding. Evidence and audit record `credentialInjected: true`, never the
 value. The terminal audit record also names which credential the invocation selected — the symbolic
-name from this file, never the secret. *Committed direction:* `credential`/`credentialByAgent`
+name from this file, never the secret. *Committed direction:* `credential`/`agents.<id>.credentials`
 bindings will be replaced by public DRNs; these examples remain current until that migration ships
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 
@@ -254,7 +254,7 @@ credential.
 
 ### `chatgptSubscription`: a credential the broker renews itself
 
-*Committed direction:* its legacy `credential`/`credentialByAgent` selection will be replaced by
+*Committed direction:* its legacy `credential`/`agents.<id>.credentials` selection will be replaced by
 public DRNs, retaining the refresh and injection behavior below
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 
@@ -314,24 +314,25 @@ today; the legacy selection bindings [will be replaced by public DRNs](../../doc
 
 ### One capability, one token per agent
 
-*Committed direction:* `credential`/`credentialByAgent` will be replaced by public DRNs while
+*Committed direction:* `credential`/`agents.<id>.credentials` will be replaced by public DRNs while
 preserving per-agent isolation ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 The following describes the current syntax and validation.
 
-`credential:` is the default for every caller. `credentialByAgent:` overrides it per acting agent,
-which is what lets one capability reach two organizations without being duplicated under a second
-capability namespace:
+A constraint set's `credential:` names the token every caller uses. An agent listed under top-level
+`agents:` may rebind that name to another credential, which is what lets one capability reach two
+organizations without being duplicated under a second capability namespace:
 
 ```yaml
-# broker.yaml
+# broker.d/scientist.yaml
+agents:
+  nestedset-github:
+    credentials: { github-pat: github-pat-scientist-hq }
 constraintSets:
   gh.issue.comment:
     provider: gh
     effect: external-write
     risk: Medium
-    credential: github-pat                     # every agent that has no entry below
-    credentialByAgent:
-      nestedset-github: github-pat-scientist-hq
+    credential: github-pat                     # every agent that does not rebind it
     constraints:
       timeoutMs: 15000
       maxOutputBytes: 8192
@@ -347,17 +348,14 @@ constraintSets:
 The key is the agent because a route already binds a transport and a match to an agent: one Slack
 workspace or channel selects the agent that answers, and the agent selects the token. The name comes
 from the attested context the broker derived from this file's own `attestor` grant and
-`principals`, so a request payload cannot ask for a different token. A caller with no agent,
-such as a direct service peer, matches no override and takes the default.
+`principals`, so a request payload cannot ask for a different token. A rebinding applies only to a
+set that names the credential being rebound.
 
-`credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
-transacts unauthenticated, exactly as a set with no credential at all does.
-
-Every credential the set can select is validated at startup, not just the default: an override
-naming a credential the store does not hold, or one whose `destinations` do not cover every
-`allowedHosts` entry of *this* set, refuses startup with the same errors the default does. An
-override naming an agent no policy can reach is not an error — the broker holds no agent catalog,
-and the name is inert until a route and a policy exist for it.
+Every credential a set can select is validated at startup: each agent's rebinding of the set's
+`credential` must name a credential the store holds whose `destinations` cover every
+`allowedHosts` entry of *this* set, or startup is refused. A rebinding for an agent no policy can
+reach is not an error — the broker holds no agent catalog, and the name is inert until a route and
+a policy exist for it.
 
 ### Attested identity
 
@@ -736,7 +734,7 @@ stricter than `info` on the `dekopon_broker::audit` target drops the records fro
 - Generic WASI and ambient I/O imports are unavailable.
 - Audit records contain metadata only.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped.
-  *Committed direction:* legacy `credential`/`credentialByAgent` selection will be replaced by public
+  *Committed direction:* legacy `credential`/`agents.<id>.credentials` selection will be replaced by public
   DRNs without weakening those bounds ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
   Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an
   injected credential exists solely inside the native HTTP engine and is never observable by guest

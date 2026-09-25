@@ -333,7 +333,7 @@ root filesystem, where `save_credentials` cannot create its temporary sibling. N
 
 ### The broker has a second, independent family
 
-*Committed direction:* the broker's `credential`/`credentialByAgent` bindings will be replaced by
+*Committed direction:* the broker's `credential`/`agents.<id>.credentials` bindings will be replaced by
 public DRNs. The shared refresh implementation and independent token families described here must
 survive that migration ([requirements](../../docs/design.md#legacy-credential-bindings)); the chart
 continues to seed the current credential kind.
@@ -413,7 +413,7 @@ deployment. It is not a backup, and restoring it over a live credential is a way
 pod, not to fix one. Rotation is: log in locally again, re-export, update the Secret,
 then either delete the file in the volume and restart, or set `reseed` for one roll.
 
-The broker configuration's legacy `credential`/`credentialByAgent` selection is
+The broker configuration's legacy `credential`/`agents.<id>.credentials` selection is
 [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); that does not
 change seed-once behavior or turn the vault copy into the live token.
 

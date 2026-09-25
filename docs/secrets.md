@@ -2,9 +2,9 @@
 
 **Status: current.** This document defines the broker-owned secret system: public inert DRNs, a
 separate Cedar decision, an owner-only map to physical stores, invocation-pinned resolution, and
-native HTTP Basic/Bearer sinks. Implicit `credential`/`credentialByAgent` bindings run beside it,
+native HTTP Basic/Bearer sinks. Implicit `credential`/`agents.<id>.credentials` bindings run beside it,
 under [`security-model.md`](security-model.md#per-agent-credentials-and-where-their-boundary-stops).
-*Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs;
+*Committed direction:* `credential`/`agents.<id>.credentials` bindings will be replaced by public DRNs;
 current configurations remain supported until that migration ships
 ([migration requirements](design.md#legacy-credential-bindings)).
 
@@ -427,7 +427,7 @@ intend to grant.
 
 ## Legacy credentials the broker renews
 
-*Committed direction:* these entries are selected through `credential`/`credentialByAgent`, which
+*Committed direction:* these entries are selected through `credential`/`agents.<id>.credentials`, which
 will be replaced by public DRNs. The migration must retain the shared refresh sequence, destination
 binding, and companion header described here; it is not implemented by the current private map
 ([migration requirements](design.md#legacy-credential-bindings)).
@@ -530,7 +530,7 @@ category are available only in broker logs.
 The authorized proposal serialization commits to the public DRN and sink. The effective execution
 constraints commit to the binding ID, owner `mapRevision`, and exact narrowed scope. Optional decision/execution audit
 fields record the public DRN and sink; the legacy `credential` field currently reports only the
-`credential`/`credentialByAgent` path, which [will be replaced by public DRNs](design.md#legacy-credential-bindings).
+`credential`/`agents.<id>.credentials` path, which [will be replaced by public DRNs](design.md#legacy-credential-bindings).
 This describes today's audit schema, not an already-shipped field migration. Raw value,
 backend, locator, selector, source revision, path/query, headers and bodies are absent. A record
 without those optional fields retains its serialized bytes and chain hashes.

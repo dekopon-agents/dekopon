@@ -33,9 +33,9 @@ use dekopon_core::error_chain;
 use thiserror::Error;
 
 pub use config::{
-    AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError,
-    HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity, PrincipalConfig, ResolvedConfig,
-    ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
+    AgentBindingConfig, AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion,
+    ConfigError, HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity, PrincipalConfig,
+    ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CHATGPT_AUTH_BYTES, HARD_MAX_CREDENTIALS,
@@ -238,8 +238,15 @@ where
         }
         policy
     };
-    let constraints =
-        ConstraintCatalog::new(config.constraint_sets).map_err(BrokerdError::Broker)?;
+    let constraints = ConstraintCatalog::new(config.constraint_sets)
+        .map_err(BrokerdError::Broker)?
+        .with_agent_credentials(
+            config
+                .agents
+                .into_iter()
+                .map(|(agent, binding)| (agent, binding.credentials))
+                .collect(),
+        );
     let (broker, warnings) = Broker::start(
         registry,
         config.broker_principal,

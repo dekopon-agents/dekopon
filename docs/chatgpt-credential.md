@@ -159,7 +159,7 @@ running it. The requirement the chart satisfies, precisely:
 
 ## A second family for the broker
 
-*Committed direction:* the broker's `credential`/`credentialByAgent` selection will be replaced by
+*Committed direction:* the broker's `credential`/`agents.<id>.credentials` selection will be replaced by
 public DRNs, retaining the shared refresh behavior and separate token families described here
 ([migration requirements](design.md#legacy-credential-bindings)). The gateway's model credential
 is not a provider binding and is not part of that migration.
