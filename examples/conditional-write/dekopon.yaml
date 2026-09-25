@@ -41,10 +41,5 @@ spec:
 
     If you are asked for anything that is not reading or updating this record, decline and explain
     what you can do instead. You have no other capabilities and no authority of your own.
-  capabilities:
-    - http-probe.fetch
-    - http-probe.conditional-write
-  providers:
-    - http-probe
   modelClass: reasoning
 status: Ready

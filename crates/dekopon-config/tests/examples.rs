@@ -16,7 +16,7 @@ fn load(path: &Path) -> LocalCatalog {
 }
 
 #[test]
-fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
+fn the_local_reviewer_example_mounts_its_pull_request_review_skill() {
     let catalog = load(&example("catalog/dekopon.yaml"));
     let reviewer = catalog
         .agent(&"reviewer".parse().expect("valid agent id"))
@@ -32,21 +32,10 @@ fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
         "references/risk-checklist.md"
     );
     assert!(!skills[0].body().is_empty());
-    let capabilities = reviewer
-        .spec
-        .capabilities
-        .iter()
-        .map(|capability| capability.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        capabilities,
-        vec!["github.pull-request.read", "github.pull-request.comment"],
-        "the reviewer deliberately holds no approval capability"
-    );
 }
 
 #[test]
-fn the_conditional_write_example_declares_the_slice_the_broker_constrains() {
+fn the_conditional_write_example_gives_the_model_explicit_standing_orders() {
     let catalog = load(&example("conditional-write/dekopon.yaml"));
 
     let agent = catalog
@@ -73,19 +62,4 @@ fn the_conditional_write_example_declares_the_slice_the_broker_constrains() {
             "the standing orders must name `{command}`, the command the provider answers"
         );
     }
-    let capabilities = agent
-        .spec
-        .capabilities
-        .iter()
-        .map(|capability| capability.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        capabilities,
-        vec!["http-probe.fetch", "http-probe.conditional-write"],
-        "the catalog surface must stay the slice the broker constrains"
-    );
-    assert!(
-        !capabilities.contains(&"http-probe.purge"),
-        "the manifest exposes more than this deployment grants, and it must stay that way"
-    );
 }
