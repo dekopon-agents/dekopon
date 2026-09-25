@@ -680,7 +680,7 @@ async fn recall_window(
                     &message.conversation,
                     match &message.message_id {
                         MessageId::Native(id) => Some(id),
-                        MessageId::Wake(_) => None,
+                        MessageId::Wake { .. } => None,
                     },
                     limit,
                 ),
@@ -891,9 +891,9 @@ async fn execute(
     // all keyed on the same conversation key, so a stop can never be filed apart from its session.
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
-        if let MessageId::Wake(id) = message.message_id {
+        if let MessageId::Wake { id, notice } = &message.message_id {
             tracing::info!(event = "gateway_wake_busy", wake.id = %id);
-            answer(&driver, &message, &message.text).await;
+            answer(&driver, &message, notice).await;
             return "wake-busy";
         }
         tracing::info!(event = "gateway_session_rejected", reason = "busy");

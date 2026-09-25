@@ -41,8 +41,19 @@ fn wake_store(directory: &Path) -> Arc<WakeStore> {
     )
 }
 
+fn slack_message(text: &str) -> InboundMessage {
+    let mut message = message(text);
+    message.transport_kind = dekopon_broker_protocol::ChatTransportKind::Slack;
+    message.reply = ReplyTarget::Slack {
+        channel: "d0123abc".to_owned(),
+        thread_ts: None,
+    };
+    message
+}
+
 fn anchor() -> Anchor {
-    Anchor::from_inbound(&message("anchor"), &route(model_config()).agent).expect("anchorable")
+    Anchor::from_inbound(&slack_message("anchor"), &route(model_config()).agent)
+        .expect("anchorable")
 }
 
 fn wake_route() -> crate::routes::BoundRoute {
@@ -146,9 +157,10 @@ fn only_exit_zero_fires_only_exit_one_waits_and_oversized_output_is_a_failure() 
 #[test]
 fn a_baseline_never_fires_and_a_broken_probe_is_never_stored() {
     let limits = dekopon_shell::Limits::default();
-    let (_, output) = Probe::baseline("echo green; exit 0".to_owned(), &NoProviders, limits)
-        .expect("an already-true condition is stored, not fired");
-    assert_eq!(output, "green");
+    assert!(
+        Probe::baseline("echo green; exit 0".to_owned(), &NoProviders, limits).is_ok(),
+        "an already-true condition is stored, not fired"
+    );
     assert!(matches!(
         Probe::baseline("exit 2".to_owned(), &NoProviders, limits),
         Err(WakeRefusal::Broken { exit: 2, .. })
@@ -160,11 +172,45 @@ fn a_baseline_never_fires_and_a_broken_probe_is_never_stored() {
 }
 
 #[test]
+fn a_local_chat_cannot_anchor_a_wake() {
+    assert!(Anchor::from_inbound(&message("later"), &route(model_config()).agent).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_interval_longer_than_its_run_is_refused_before_any_probe() {
+    use dekopon_agent::wake::{WakeRegistrar, WakeRequest};
+    let directory = temporary();
+    let store = wake_store(directory.path());
+    let wakes = crate::wake::SessionWakes::new(
+        anchor(),
+        Arc::clone(&store),
+        ResolvedBroker {
+            socket_path: directory.path().join("absent.sock"),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        tokio::runtime::Handle::current(),
+        dekopon_shell::Limits::default(),
+    );
+    let refused = tokio::task::spawn_blocking(move || {
+        wakes.schedule(WakeRequest::Watch {
+            note: "check".to_owned(),
+            script: "exit 1".to_owned(),
+            every: Duration::from_secs(u64::MAX),
+            until: Duration::from_secs(60),
+        })
+    })
+    .await
+    .expect("joined");
+    assert!(matches!(refused, Err(WakeRefusal::Interval { .. })));
+}
+
+#[test]
 fn a_due_watch_is_leased_once_and_a_cancel_mid_tick_never_fires() {
     let directory = temporary();
     let store = wake_store(directory.path());
     let now = SystemTime::now();
-    let (probe, _) = Probe::baseline(
+    let probe = Probe::baseline(
         "echo waiting; exit 1".to_owned(),
         &NoProviders,
         dekopon_shell::Limits::default(),
@@ -313,7 +359,7 @@ echo "after $PREV""#;
     run_session(
         Arc::clone(&runner),
         wake_route(),
-        message("tell me when it is green"),
+        slack_message("tell me when it is green"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
@@ -416,7 +462,6 @@ async fn a_wake_that_finds_its_conversation_busy_delivers_its_note() {
         .pop()
         .expect("due")
         .into_inbound();
-    let text = inbound.text.clone();
     let runner = runner_with_wakes(broker, ModelScript::forbidden(), &store);
     let _live = runner
         .gate
@@ -432,5 +477,9 @@ async fn a_wake_that_finds_its_conversation_busy_delivers_its_note() {
     )
     .await;
 
-    assert_eq!(driver.replies(), [text]);
+    assert_eq!(
+        driver.replies(),
+        ["stop"],
+        "the person reads their note, not the model's prompt"
+    );
 }

@@ -98,6 +98,10 @@ impl Wake {
             anchor: self.anchor.clone(),
             id: self.id,
             text: fired_text(self.id, &self.note, reason, output),
+            notice: match output {
+                Some(output) => format!("{}\n\n{output}", self.note),
+                None => self.note.clone(),
+            },
         }
     }
 }
@@ -107,6 +111,7 @@ pub(crate) struct Fired {
     anchor: Anchor,
     id: WakeId,
     text: String,
+    notice: String,
 }
 
 impl Fired {
@@ -119,7 +124,7 @@ impl Fired {
     }
 
     pub(crate) fn into_inbound(self) -> InboundMessage {
-        self.anchor.inbound(self.id, self.text)
+        self.anchor.inbound(self.id, self.text, self.notice)
     }
 }
 
@@ -418,10 +423,13 @@ impl Line {
             id: WakeId(self.id),
             anchor: Anchor {
                 transport: self.transport.parse().ok()?,
+                reply: match self.reply {
+                    ReplyTarget::Local { .. } => return None,
+                    reply => reply,
+                },
                 kind: self.kind,
                 subject: self.subject,
                 conversation: self.conversation,
-                reply: self.reply,
                 agent: self.agent,
                 scheduled_in: self.scheduled_in,
             },

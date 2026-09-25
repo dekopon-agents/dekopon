@@ -53,7 +53,10 @@ pub enum WakeRefusal {
     NoteTooLong { maximum: usize },
     #[error("that is further out than this chat allows ({} seconds at most)", maximum.as_secs())]
     Horizon { maximum: Duration },
-    #[error("a watch may check at most once every {} seconds", minimum.as_secs())]
+    #[error(
+        "a watch checks at most once every {} seconds, and at least once before it gives up",
+        minimum.as_secs()
+    )]
     Interval { minimum: Duration },
     #[error("this person already has {maximum} pending wakes; cancel one first")]
     Full { maximum: usize },
