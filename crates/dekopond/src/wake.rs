@@ -43,7 +43,11 @@ pub(crate) struct Anchor {
 }
 
 impl Anchor {
+    /// A local reply target is a connection number that a restart hands to another client.
     pub(crate) fn from_inbound(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
+        if matches!(message.reply, ReplyTarget::Local { .. }) {
+            return None;
+        }
         Some(Self {
             transport: message.transport.parse().ok()?,
             kind: message.transport_kind,
@@ -84,7 +88,7 @@ impl Anchor {
         )
     }
 
-    pub(crate) fn inbound(&self, id: WakeId, text: String) -> InboundMessage {
+    pub(crate) fn inbound(&self, id: WakeId, text: String, notice: String) -> InboundMessage {
         let span = receive_span(self.kind);
         if let Some(parent) = self.scheduled_in {
             dekopon_telemetry::link_remote(
@@ -101,7 +105,7 @@ impl Anchor {
             transport_kind: self.kind,
             subject: self.subject.clone(),
             conversation: self.conversation.clone(),
-            message_id: MessageId::Wake(id),
+            message_id: MessageId::Wake { id, notice },
             text,
             assets: Vec::new(),
             asset_overflow: false,
@@ -147,15 +151,12 @@ impl Probe {
         script: String,
         leg: &dyn CapabilityInvoker,
         limits: ShellLimits,
-    ) -> Result<(Self, String), WakeRefusal> {
+    ) -> Result<Self, WakeRefusal> {
         match Verdict::from(Interpreter::new(limits).run(&script, leg)) {
-            Verdict::Fire { output } | Verdict::Wait { output } => Ok((
-                Self {
-                    script,
-                    prev: output.clone(),
-                },
-                output,
-            )),
+            Verdict::Fire { output } | Verdict::Wait { output } => Ok(Self {
+                script,
+                prev: output,
+            }),
             Verdict::Failed { exit, output } => Err(WakeRefusal::Broken {
                 exit: exit.get(),
                 output,
@@ -269,7 +270,7 @@ impl WakeRegistrar for SessionWakes {
                 until,
             } => {
                 self.check(&note, until)?;
-                if every < self.bounds.min_interval {
+                if every < self.bounds.min_interval || every > until {
                     return Err(WakeRefusal::Interval {
                         minimum: self.bounds.min_interval,
                     });
@@ -278,7 +279,7 @@ impl WakeRegistrar for SessionWakes {
                     .anchor
                     .probe_leg(&self.broker, &self.runtime)
                     .ok_or(WakeRefusal::Unavailable)?;
-                let (probe, _) = Probe::baseline(script, &leg, self.limits)?;
+                let probe = Probe::baseline(script, &leg, self.limits)?;
                 self.store.register(
                     self.anchor.clone(),
                     note,
@@ -323,15 +324,17 @@ pub(crate) fn run_tick(
     runtime: &tokio::runtime::Handle,
     limits: Option<ShellLimits>,
 ) -> Option<Fired> {
-    let verdict = match (limits, tick.anchor().probe_leg(broker, runtime)) {
-        (Some(limits), Some(leg)) => tick.run(&leg, limits),
-        (None, _) => Verdict::Failed {
+    let verdict = match limits {
+        None => Verdict::Failed {
             exit: ExitCode::DENIED,
             output: "[gateway: no route answers this chat as this agent with wakes on]".to_owned(),
         },
-        (Some(_), None) => Verdict::Failed {
-            exit: ExitCode::DENIED,
-            output: "[gateway: the broker could not be reached to run the probe]".to_owned(),
+        Some(limits) => match tick.anchor().probe_leg(broker, runtime) {
+            Some(leg) => tick.run(&leg, limits),
+            None => Verdict::Failed {
+                exit: ExitCode::DENIED,
+                output: "[gateway: the broker could not be reached to run the probe]".to_owned(),
+            },
         },
     };
     let failed = matches!(verdict, Verdict::Failed { .. });

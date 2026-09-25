@@ -76,14 +76,14 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
-    Wake(WakeId),
+    Wake { id: WakeId, notice: String },
 }
 
 impl MessageId {
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
             Self::Native(_) => Trigger::Message,
-            Self::Wake(_) => Trigger::Wake,
+            Self::Wake { .. } => Trigger::Wake,
         }
     }
 }
@@ -92,7 +92,7 @@ impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(id) => formatter.write_str(id),
-            Self::Wake(id) => write!(formatter, "wake-{id}"),
+            Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
         }
     }
 }

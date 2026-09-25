@@ -64,9 +64,10 @@ use crate::{
         SessionRunner, model_bearer_token,
     },
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, ThreadOwnership,
-        TransportEvent, TransportIdentity, discord::DiscordTransport, local::LocalTransport,
-        slack::SlackTransport, telegram::TelegramTransport, whatsapp::WhatsappTransport,
+        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, MessageId,
+        ThreadOwnership, TransportEvent, TransportIdentity, discord::DiscordTransport,
+        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        whatsapp::WhatsappTransport,
     },
 };
 
@@ -275,14 +276,15 @@ where
                 }
             } => {
                 let Some(store) = wakes.clone() else { continue };
-                let due = tokio::task::spawn_blocking(move || store.take_due(SystemTime::now())).await;
+                let reading = Arc::clone(&store);
+                let due = tokio::task::spawn_blocking(move || reading.take_due(SystemTime::now())).await;
                 match due {
                     Ok(Ok(due)) => {
                         for fired in due.fired {
                             start_wake(&runner, &routes, &drivers, &mut sessions, fired);
                         }
                         for tick in due.ticks {
-                            spawn_tick(&runner, &routes, &mut ticks, tick);
+                            spawn_tick(&runner, &routes, &store, &mut ticks, tick);
                         }
                     }
                     Ok(Err(error)) => {
@@ -296,8 +298,10 @@ where
                 }
             },
             Some(result) = ticks.join_next() => {
-                if let Ok(Some(fired)) = result {
-                    start_wake(&runner, &routes, &drivers, &mut sessions, fired);
+                match result {
+                    Ok(Some(fired)) => start_wake(&runner, &routes, &drivers, &mut sessions, fired),
+                    Ok(None) => {}
+                    Err(_) => tracing::error!(event = "gateway_wake_task_failed"),
                 }
             },
             () = async {
@@ -347,8 +351,13 @@ where
 
     collector.shutdown();
 
+    // A tick that fires here has already retired its row, so its wake must still start.
     if timeout(grace, async {
-        while ticks.join_next().await.is_some() {}
+        while let Some(result) = ticks.join_next().await {
+            if let Ok(Some(fired)) = result {
+                start_wake(&runner, &routes, &drivers, &mut sessions, fired);
+            }
+        }
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
         }
@@ -357,9 +366,9 @@ where
     .is_err()
     {
         tracing::warn!(event = "gateway_sessions_abandoned");
-        ticks.abort_all();
+        // A blocking probe cannot be aborted; the runtime's shutdown timeout bounds it.
+        ticks.detach_all();
         sessions.abort_all();
-        while ticks.join_next().await.is_some() {}
         while sessions.join_next().await.is_some() {}
     }
     outcome
@@ -546,10 +555,13 @@ fn start_wake(
         return;
     }
     receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
-    if let Some(driver) = drivers.get(&message.transport).cloned() {
+    if let Some(driver) = drivers.get(&message.transport).cloned()
+        && let MessageId::Wake { notice, .. } = &message.message_id
+    {
+        let notice = notice.clone();
         sessions.spawn(
             async move {
-                session::answer(&driver, &message, &message.text).await;
+                session::answer(&driver, &message, &notice).await;
             }
             .instrument(receipt),
         );
@@ -559,12 +571,12 @@ fn start_wake(
 fn spawn_tick(
     runner: &Arc<SessionRunner>,
     routes: &RoutingTable,
+    store: &Arc<wake::WakeStore>,
     ticks: &mut JoinSet<Option<wake::Fired>>,
     tick: wake::Tick,
 ) {
-    let Some(store) = runner.wakes.clone() else {
-        return;
-    };
+    let store = Arc::clone(store);
+    // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
         .gate
         .admit(("wake".to_owned(), tick.id().to_string()))
