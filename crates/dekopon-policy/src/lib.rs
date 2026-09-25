@@ -791,7 +791,11 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
                 }
                 PolicyId::new(annotation)
             }
-            None => policy.id().clone(),
+            None => {
+                return Err(PolicyBuildError::MissingPolicyId {
+                    policy: policy.id().to_string(),
+                });
+            }
         };
         if !seen.insert(id.to_string()) {
             return Err(PolicyBuildError::DuplicatePolicyId {
@@ -1168,6 +1172,11 @@ pub enum PolicyBuildError {
     UnknownEntityType { policy: String, entity_type: String },
     #[error("policy {policy} has an @id annotation that is not a bounded portable identifier")]
     InvalidPolicyId { policy: String },
+    #[error(
+        "policy {policy} has no @id annotation; every statement needs one so audit records name it \
+         stably"
+    )]
+    MissingPolicyId { policy: String },
     #[error("policy identifier {policy:?} is used by more than one policy")]
     DuplicatePolicyId { policy: String },
     #[error(
