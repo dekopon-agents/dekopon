@@ -124,6 +124,7 @@ impl FailureClass {
             | PromptError::MissingSkillName { .. }
             | PromptError::UnexpectedSkillArguments { .. }
             | PromptError::InvalidSuggestion { .. }
+            | PromptError::InvalidWake { .. }
             | PromptError::UnreportedCapabilityWork
             | PromptError::EmptyAnswer => Some(Self::Model),
         }

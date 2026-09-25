@@ -25,11 +25,14 @@ use crate::{
         SessionOutcome,
     },
     skills::{self, SkillReads},
+    wake::{self, WakeRegistrar},
 };
 
 mod history;
 
-pub use crate::{improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME};
+pub use crate::{
+    improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
+};
 pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";
@@ -198,6 +201,7 @@ pub struct SessionInputs<'a> {
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    wakes: Option<&'a dyn WakeRegistrar>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -217,7 +221,14 @@ impl<'a> SessionInputs<'a> {
             optional_reply: false,
             skills: &[],
             improvement_suggestions: false,
+            wakes: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_wakes(mut self, wakes: &'a dyn WakeRegistrar) -> Self {
+        self.wakes = Some(wakes);
+        self
     }
 
     #[must_use]
@@ -302,6 +313,7 @@ struct SessionExtensions<'a> {
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    wakes: Option<&'a dyn WakeRegistrar>,
 }
 
 pub fn run_prompt_session<M, R>(
@@ -328,6 +340,7 @@ where
         optional_reply,
         skills,
         improvement_suggestions,
+        wakes,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -369,6 +382,7 @@ where
             optional_reply,
             skills,
             improvement_suggestions,
+            wakes,
         },
     );
     history.record(match &result {
@@ -444,6 +458,7 @@ where
         optional_reply,
         skills,
         improvement_suggestions,
+        wakes,
     } = extensions;
     let mut model_tools = vec![script_tool(&runtime.command_words())];
     if agent_config.is_some() {
@@ -457,6 +472,9 @@ where
     }
     if optional_reply {
         model_tools.push(decline_reply_tool());
+    }
+    if wakes.is_some() {
+        model_tools.push(wake::wake_tool());
     }
 
     let session_span = tracing::info_span!(
@@ -755,6 +773,18 @@ where
                 improvement::suggest_improvement_into(
                     &mut messages,
                     &mut suggestions,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                )?;
+                continue;
+            }
+            if call.function.name == WAKE_TOOL_NAME
+                && let Some(registrar) = wakes
+            {
+                wake::wake_into(
+                    &mut messages,
+                    registrar,
                     &call,
                     model_turns,
                     tool_call_index,
@@ -1396,6 +1426,12 @@ pub enum PromptError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("model arguments for tool {tool:?} do not match the wake schema")]
+    InvalidWake {
+        tool: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("model tried to suppress a reply after capability work with no reporting turn left")]
     UnreportedCapabilityWork,
     #[error("model returned neither tool calls nor a final answer")]
@@ -1423,6 +1459,7 @@ impl PromptError {
             Self::MissingSkillName { .. } => "missing-skill-name",
             Self::UnexpectedSkillArguments { .. } => "unexpected-skill-arguments",
             Self::InvalidSuggestion { .. } => "invalid-suggestion",
+            Self::InvalidWake { .. } => "invalid-wake",
             Self::UnreportedCapabilityWork => "unreported-capability-work",
             Self::EmptyAnswer => "empty-answer",
             Self::MaxSteps { .. } => "max-steps",

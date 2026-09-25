@@ -653,7 +653,7 @@ mod tests {
                 transport_kind: ChatTransportKind::Whatsapp,
                 subject: subject.clone(),
                 conversation: native.clone(),
-                message_id: "wamid.test".into(),
+                message_id: MessageId::Native("wamid.test".to_owned()),
                 text: String::new(),
                 assets: vec![asset::PendingAsset {
                     name: "photo.png".into(),

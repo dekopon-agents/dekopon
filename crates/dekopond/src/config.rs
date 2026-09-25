@@ -668,6 +668,8 @@ pub struct RouteConfig {
     pub(crate) progress_detail: ProgressDetail,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub wakes: bool,
     #[serde(default, rename = "match", skip_serializing)]
     pub retired_match: Option<serde::de::IgnoredAny>,
 }
@@ -713,6 +715,44 @@ pub struct ResolvedRoute {
     pub limits: RouteLimits,
     pub(crate) progress_detail: ProgressDetail,
     pub memory: MemoryPolicy,
+    pub wakes: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WakesConfig {
+    pub path: PathBuf,
+    #[serde(default = "default_wake_max_per_subject")]
+    pub max_per_subject: usize,
+    #[serde(default = "default_wake_min_interval_ms")]
+    pub min_interval_ms: u64,
+    #[serde(default = "default_wake_max_horizon_ms")]
+    pub max_horizon_ms: u64,
+}
+
+const fn default_wake_max_per_subject() -> usize {
+    20
+}
+
+const fn default_wake_min_interval_ms() -> u64 {
+    5 * 60 * 1_000
+}
+
+const fn default_wake_max_horizon_ms() -> u64 {
+    30 * 24 * 60 * 60 * 1_000
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WakeBounds {
+    pub max_per_subject: usize,
+    pub min_interval: Duration,
+    pub max_horizon: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedWakes {
+    pub path: PathBuf,
+    pub bounds: WakeBounds,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -741,6 +781,8 @@ pub struct SessionsConfig {
     pub max_conversations: usize,
     #[serde(default)]
     pub journal: Option<JournalConfig>,
+    #[serde(default)]
+    pub wakes: Option<WakesConfig>,
 }
 
 impl Default for SessionsConfig {
@@ -751,6 +793,7 @@ impl Default for SessionsConfig {
             reply_on_busy: true,
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
             journal: None,
+            wakes: None,
         }
     }
 }
@@ -805,6 +848,7 @@ pub struct ResolvedConfig {
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub journal: Option<ResolvedJournal>,
+    pub wakes: Option<ResolvedWakes>,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
 }
@@ -1255,6 +1299,25 @@ pub(crate) fn resolve(
                 })
             }
         };
+        if route.wakes {
+            match &config.sessions.wakes {
+                None => problems.push(ConfigProblem::WakesWithoutStore { route: index }),
+                Some(wakes)
+                    if Duration::from_millis(wakes.min_interval_ms)
+                        <= route.limits.script_timeout() =>
+                {
+                    problems.push(ConfigProblem::WakeIntervalWithinScriptTimeout {
+                        route: index,
+                        min_interval_ms: wakes.min_interval_ms,
+                        script_timeout_ms: route
+                            .limits
+                            .script_timeout_ms
+                            .unwrap_or(DEFAULT_SCRIPT_TIMEOUT_MS),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
         routes.push(ResolvedRoute {
             transport: route.transport,
             conversation,
@@ -1266,6 +1329,7 @@ pub(crate) fn resolve(
             limits: route.limits,
             progress_detail: route.progress_detail,
             memory,
+            wakes: route.wakes,
         });
     }
 
@@ -1290,6 +1354,19 @@ pub(crate) fn resolve(
     if config.sessions.max_conversations == 0 {
         problems.push(ConfigProblem::InvalidMaxConversations);
     }
+    let wakes = config.sessions.wakes.as_ref().map(|wakes| {
+        if wakes.max_per_subject == 0 || wakes.min_interval_ms == 0 || wakes.max_horizon_ms == 0 {
+            problems.push(ConfigProblem::InvalidWakeBounds);
+        }
+        ResolvedWakes {
+            path: resolve_path(wakes.path.clone()),
+            bounds: WakeBounds {
+                max_per_subject: wakes.max_per_subject,
+                min_interval: Duration::from_millis(wakes.min_interval_ms),
+                max_horizon: Duration::from_millis(wakes.max_horizon_ms),
+            },
+        }
+    });
     let journal = config.sessions.journal.as_ref().map(|journal| {
         if journal.max_bytes == 0 {
             problems.push(ConfigProblem::InvalidJournalBytes);
@@ -1373,6 +1450,7 @@ pub(crate) fn resolve(
                 stop_words,
                 sessions: config.sessions,
                 journal,
+                wakes,
                 shutdown_grace,
                 telemetry,
             })
@@ -1853,6 +1931,20 @@ pub enum ConfigProblem {
         "sessions.journal.maxBytes must be greater than zero; omit sessions.journal to keep nothing on disk"
     )]
     InvalidJournalBytes,
+    #[error("routes[{route}]: `wakes: true` needs `sessions.wakes`")]
+    WakesWithoutStore { route: usize },
+    #[error(
+        "sessions.wakes.maxPerSubject, minIntervalMs and maxHorizonMs must be greater than zero; omit sessions.wakes to turn wakes off"
+    )]
+    InvalidWakeBounds,
+    #[error(
+        "routes[{route}]: sessions.wakes.minIntervalMs ({min_interval_ms}) must exceed the route's script timeout ({script_timeout_ms} ms), or one watch's checks could overlap"
+    )]
+    WakeIntervalWithinScriptTimeout {
+        route: usize,
+        min_interval_ms: u64,
+        script_timeout_ms: u64,
+    },
     #[error("routes[{route}]: `memory.recall: journal` needs `sessions.journal`")]
     JournalRecallWithoutJournal { route: usize },
     #[error(

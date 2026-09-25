@@ -29,11 +29,12 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, NativeStatus,
-        OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status,
-        StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership,
-        TransportError, TransportEvent, TransportIdentity, asset_buffer, bound_inbound,
-        credential_client, floor_boundary, receive_span, record_conversation, reserve_for_chunk,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
+        NativeStatus, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
+        SeenIds, Status, StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation,
+        ThreadOwnership, TransportError, TransportEvent, TransportIdentity, asset_buffer,
+        bound_inbound, credential_client, floor_boundary, receive_span, record_conversation,
+        reserve_for_chunk,
     },
 };
 
@@ -323,7 +324,7 @@ impl SlackTransport {
                     .push_back(TransportEvent::CancelRequested(stopped));
             }
         } else if let Some(message) = self.routable(&team, event, received).await? {
-            received.record("message.id", message.message_id.as_str());
+            received.record("message.id", message.message_id.to_string().as_str());
             self.pending
                 .push_back(TransportEvent::Message(Box::new(message)));
         }
@@ -421,7 +422,7 @@ impl SlackTransport {
             transport_kind: ChatTransportKind::Slack,
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
             conversation,
-            message_id: ts.to_owned(),
+            message_id: MessageId::Native(ts.to_owned()),
             text,
             assets,
             addressed: is_shared.then_some(explicitly_addressed),
@@ -794,7 +795,7 @@ impl ChatHistory for SlackReplier {
     async fn recent(
         &self,
         conversation: &Conversation,
-        before: &str,
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PastMessage>, TransportError> {
         let bot = self.bot_user.get().ok_or(TransportError::Closed)?;
@@ -802,23 +803,21 @@ impl ChatHistory for SlackReplier {
         if channel.is_empty() || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(TransportError::Response);
         }
-        let cutoff = slack_instant(before).ok_or(TransportError::Response)?;
+        let cutoff = match before {
+            Some(before) => slack_instant(before).ok_or(TransportError::Response)?,
+            None => SystemTime::now(),
+        };
         if limit == 0 {
             return Ok(Vec::new());
         }
         let Some(thread) = conversation.thread.as_deref() else {
             let page_limit = limit.min(HISTORY_PAGE_LIMIT).to_string();
-            let page = self
-                .history_page(
-                    "conversations.history",
-                    &[
-                        ("channel", channel.as_str()),
-                        ("latest", before),
-                        ("inclusive", "false"),
-                        ("limit", page_limit.as_str()),
-                    ],
-                )
-                .await?;
+            let mut query = vec![("channel", channel.as_str())];
+            if let Some(before) = before {
+                query.push(("latest", before));
+            }
+            query.extend([("inclusive", "false"), ("limit", page_limit.as_str())]);
+            let page = self.history_page("conversations.history", &query).await?;
             let mut recalled = past_messages(&page, bot, cutoff)?;
             recalled.reverse();
             return Ok(recalled);
@@ -830,13 +829,11 @@ impl ChatHistory for SlackReplier {
         let mut recalled = VecDeque::with_capacity(limit.min(HISTORY_PAGE_LIMIT));
         let mut cursor = String::new();
         loop {
-            let mut query = vec![
-                ("channel", channel.as_str()),
-                ("ts", thread),
-                ("latest", before),
-                ("inclusive", "false"),
-                ("limit", page_limit.as_str()),
-            ];
+            let mut query = vec![("channel", channel.as_str()), ("ts", thread)];
+            if let Some(before) = before {
+                query.push(("latest", before));
+            }
+            query.extend([("inclusive", "false"), ("limit", page_limit.as_str())]);
             if !cursor.is_empty() {
                 query.push(("cursor", cursor.as_str()));
             }
@@ -3008,7 +3005,7 @@ mod driver_tests {
         let recalled = replier
             .history()
             .expect("Slack reads its own history")
-            .recent(&direct_conversation(), POSTED_TS, 3)
+            .recent(&direct_conversation(), Some(POSTED_TS), 3)
             .await
             .expect("the history reads");
 
@@ -3072,7 +3069,7 @@ mod driver_tests {
             .expect("routable");
 
         let recalled = replier(&mock.base, SlackExperience::Classic)
-            .recent(&direct_conversation(), POSTED_TS, 10)
+            .recent(&direct_conversation(), Some(POSTED_TS), 10)
             .await
             .expect("the history reads");
 
@@ -3100,7 +3097,7 @@ mod driver_tests {
         });
 
         let recalled = replier(&mock.base, SlackExperience::Agent)
-            .recent(&thread_conversation(), POSTED_TS, 3)
+            .recent(&thread_conversation(), Some(POSTED_TS), 3)
             .await
             .expect("the history reads");
 
@@ -3130,11 +3127,15 @@ mod driver_tests {
         let replier = replier(&mock.base, SlackExperience::Classic);
 
         replier
-            .recent(&direct_conversation(), POSTED_TS, HISTORY_PAGE_LIMIT)
+            .recent(&direct_conversation(), Some(POSTED_TS), HISTORY_PAGE_LIMIT)
             .await
             .expect("the history reads");
         replier
-            .recent(&direct_conversation(), POSTED_TS, HISTORY_PAGE_LIMIT + 1)
+            .recent(
+                &direct_conversation(),
+                Some(POSTED_TS),
+                HISTORY_PAGE_LIMIT + 1,
+            )
             .await
             .expect("the history reads");
 
@@ -3158,7 +3159,7 @@ mod driver_tests {
             spawn_slack_mock(|_, _| (200, json!({ "ok": false, "error": "channel_not_found" })));
 
         let refused = replier(&mock.base, SlackExperience::Classic)
-            .recent(&direct_conversation(), POSTED_TS, 10)
+            .recent(&direct_conversation(), Some(POSTED_TS), 10)
             .await;
 
         assert!(
@@ -3172,8 +3173,12 @@ mod driver_tests {
         let mock = spawn_slack_mock(|_, _| (429, json!({ "ok": false, "error": "ratelimited" })));
         let replier = replier(&mock.base, SlackExperience::Classic);
 
-        let throttled = replier.recent(&direct_conversation(), POSTED_TS, 10).await;
-        let held = replier.recent(&thread_conversation(), POSTED_TS, 10).await;
+        let throttled = replier
+            .recent(&direct_conversation(), Some(POSTED_TS), 10)
+            .await;
+        let held = replier
+            .recent(&thread_conversation(), Some(POSTED_TS), 10)
+            .await;
 
         for result in [&throttled, &held] {
             assert!(
@@ -3194,7 +3199,9 @@ mod driver_tests {
         let mut replier = replier(UNREACHABLE, SlackExperience::Classic);
         replier.bot_user = OnceLock::new();
 
-        let early = replier.recent(&direct_conversation(), POSTED_TS, 10).await;
+        let early = replier
+            .recent(&direct_conversation(), Some(POSTED_TS), 10)
+            .await;
 
         assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
     }

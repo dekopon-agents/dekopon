@@ -35,10 +35,10 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatTransport,
-        InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES, MessageRef,
-        NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, Status,
-        StreamLimits, StreamedText, TextStream, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, receive_span, record_conversation,
+        InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES, MessageId,
+        MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
+        Status, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
+        TransportIdentity, TypingLease, bound_inbound, receive_span, record_conversation,
     },
 };
 
@@ -225,7 +225,7 @@ impl LocalTransport {
                     transport_kind: ChatTransportKind::Local,
                     subject: request.subject,
                     conversation,
-                    message_id,
+                    message_id: MessageId::Native(message_id),
                     text: bound_inbound(&text),
                     assets: Vec::new(),
                     addressed: Some(true),

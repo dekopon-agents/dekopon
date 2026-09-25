@@ -146,6 +146,7 @@ routes:                                       # first match wins; order matters
       maxBytes: 65536                         # optional, default 65536 replayed history bytes
       recall: journal                         # optional: none | journal | platform; default journal when sessions.journal is set, else none
       forgetAfterMs: 604800000                # optional, default 604800000 (7 days); needs recall
+    wakes: true                               # optional, default false; offers the wake tool, needs sessions.wakes
 
 sessions:
   maxConcurrent: 4                            # optional, default 4
@@ -155,6 +156,11 @@ sessions:
   journal:                                    # optional; absent, no conversation text is written to disk
     path: /var/lib/dekopond/journal           # relative paths resolve against this file
     maxBytes: 67108864                        # every journal file together; least recently touched evicted
+  wakes:                                      # optional; absent, no route may schedule a wake
+    path: /var/lib/dekopond/wakes.jsonl       # relative paths resolve against this file
+    maxPerSubject: 20                         # optional, default 20 pending wakes per person
+    minIntervalMs: 300000                     # optional, default 5 minutes between watch checks; must exceed scriptTimeoutMs
+    maxHorizonMs: 2592000000                  # optional, default 30 days
 
 shutdownGraceMs: 120000                       # optional, default 120000
 
@@ -1056,6 +1062,40 @@ What the key is worth is measured, not assumed — [`inference.md`](inference.md
 
 On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. Without `sessions.journal` the daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); with it, journal routes keep their windows in the journal directory until the file is compacted, evicted, or deleted by the operator; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
 
+## Wakes
+
+A route with `wakes: true` offers the model a `wake` tool, so an agent can come back to a
+conversation later without anyone writing to it. A wake is a synthesized message: it carries the
+subject, conversation and reply target of the authenticated message that scheduled it, and the
+model chooses only when and the note it will read. It never names a person or a place.
+
+- `schedule` wakes the agent once, `afterSeconds` from now.
+- `watch` runs a probe script every `everySeconds` for up to `forSeconds`, with no model in the
+  loop. Exit 0 wakes the agent with the probe's output; exit 1 keeps waiting; any other exit, or
+  output over 8 KiB, wakes it with the failure and retires the watch. `$PREV` holds the previous
+  run's output. The first run happens while scheduling, with `$PREV` unset: it never wakes the
+  agent, and a probe that exits 2 or more there is refused rather than stored.
+- `list` and `cancel` see only the asking person's wakes. The tool is the only way to see them.
+
+Every probe run opens its own broker leg attested with `trigger: probe`. The broker neither lists
+nor authorizes a capability that is not read-only on that leg (`probe-write`), whatever policy
+says. The woken session attests `trigger: wake` and is authorized afresh, like any message, so
+a wake can do nothing the person could not do by typing; owner Cedar policy can narrow it further
+through `context.trigger`.
+
+Pending wakes live in one JSONL file (`0600`, rewritten through a rename, no fsync). A due wake's
+row is removed before its session starts, so a restart at that moment loses it; nothing is ever
+delivered twice. A due watch is leased by moving its next check forward in the same write, so one
+watch never runs two probes at once. Ticks take a `sessions.maxConcurrent` permit and are skipped,
+not queued, when none is free. A line that does not parse refuses startup; deleting the file
+resets every pending wake. On WhatsApp a wake cannot be scheduled past 24 hours after the message
+that asked for it, because Meta refuses free-form messages outside that window.
+
+A wake bypasses stop words, the addressed filter and media collection. If its conversation is
+busy, or its route no longer answers there as the same agent with `wakes: true`, the gateway posts
+the note itself instead of starting a session. Provider chat memory does not record wake turns;
+the resident window and the journal do. Platform recall for a wake reads the history up to now.
+
 ## Durable memory after transport acceptance
 
 The gateway receives an optional `ChatMemorySurface` only when the agent is enabled and the broker
@@ -1136,7 +1176,11 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Progress-call outcomes are debug-level `gateway_progress_rendered` records carrying the transport, the primitive, the outcome, and — for a stream render — how many characters were on screen; `gateway_progress_degraded` says which primitive stopped, `gateway_progress_budget_exhausted` that a session spent its edits, and `gateway_progress_dropped` that the policy's queue overflowed. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_busy`, `gateway_wake_cancelled`,
+`gateway_wake_tick_failed`, `gateway_wake_tick_skipped`, `gateway_wake_probe_unavailable`, and
+`gateway_wake_store_failed` (a failed write refuses that one change; a failed due read stops wake
+firing until restart);
+`gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Progress-call outcomes are debug-level `gateway_progress_rendered` records carrying the transport, the primitive, the outcome, and — for a stream render — how many characters were on screen; `gateway_progress_degraded` says which primitive stopped, `gateway_progress_budget_exhausted` that a session spent its edits, and `gateway_progress_dropped` that the policy's queue overflowed. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## Current process boundary
 

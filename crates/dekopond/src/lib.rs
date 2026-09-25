@@ -23,6 +23,7 @@ mod progress;
 mod routes;
 mod session;
 mod transport;
+mod wake;
 
 pub mod cli;
 
@@ -31,7 +32,7 @@ use std::{
     future::Future,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use dekopon_broker_protocol::{BrokerClient, ConversationKind};
@@ -51,6 +52,7 @@ pub use config::{
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
 pub use transport::TransportError;
+pub use wake::WakeStoreError;
 
 use crate::{
     asset::AssetStore,
@@ -144,6 +146,14 @@ where
         )),
         None => None,
     };
+    let wakes = match config.wakes.clone() {
+        Some(wakes) => Some(Arc::new(
+            tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
+                .await
+                .map_err(DekopondError::TransportTask)??,
+        )),
+        None => None,
+    };
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels::default()))),
@@ -160,6 +170,7 @@ where
         liveness: config.liveness.clone(),
         thread_ownership,
         active_sessions: session::ActiveSessions::new(config.sessions.max_concurrent),
+        wakes,
     });
 
     tracing::info!(
@@ -241,6 +252,8 @@ where
     F: Future<Output = ()> + Send,
 {
     let mut sessions = JoinSet::new();
+    let mut ticks = JoinSet::new();
+    let mut wakes = runner.wakes.clone();
     tokio::pin!(shutdown);
     let mut outcome = ServeOutcome::Shutdown;
 
@@ -249,9 +262,44 @@ where
             observe_session(result);
         }
         let deadline = collector.deadline();
+        let wake_deadline = wakes.as_ref().and_then(|store| store.next_at()).map(|at| {
+            tokio::time::Instant::now() + at.duration_since(SystemTime::now()).unwrap_or_default()
+        });
         tokio::select! {
             biased;
             () = &mut shutdown => break,
+            () = async {
+                match wake_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(store) = wakes.clone() else { continue };
+                let due = tokio::task::spawn_blocking(move || store.take_due(SystemTime::now())).await;
+                match due {
+                    Ok(Ok(due)) => {
+                        for fired in due.fired {
+                            start_wake(&runner, &routes, &drivers, &mut sessions, fired);
+                        }
+                        for tick in due.ticks {
+                            spawn_tick(&runner, &routes, &mut ticks, tick);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped");
+                        wakes = None;
+                    }
+                    Err(_) => {
+                        tracing::error!(event = "gateway_wake_store_failed", wakes = "stopped");
+                        wakes = None;
+                    }
+                }
+            },
+            Some(result) = ticks.join_next() => {
+                if let Ok(Some(fired)) = result {
+                    start_wake(&runner, &routes, &drivers, &mut sessions, fired);
+                }
+            },
             () = async {
                 match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -300,6 +348,7 @@ where
     collector.shutdown();
 
     if timeout(grace, async {
+        while ticks.join_next().await.is_some() {}
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
         }
@@ -308,7 +357,9 @@ where
     .is_err()
     {
         tracing::warn!(event = "gateway_sessions_abandoned");
+        ticks.abort_all();
         sessions.abort_all();
+        while ticks.join_next().await.is_some() {}
         while sessions.join_next().await.is_some() {}
     }
     outcome
@@ -471,6 +522,69 @@ fn start_session(
         message,
         driver,
     ));
+}
+
+/// A wake whose route no longer answers as its agent is delivered as its note, so the person still
+/// hears what they asked to be reminded of.
+fn start_wake(
+    runner: &Arc<SessionRunner>,
+    routes: &RoutingTable,
+    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
+    sessions: &mut JoinSet<()>,
+    fired: wake::Fired,
+) {
+    let agent = fired.agent().clone();
+    let id = fired.id();
+    let message = fired.into_inbound();
+    let answering = routes
+        .route(&message)
+        .is_some_and(|route| route.wakes && route.agent == agent);
+    let receipt = message.receive_span.clone();
+    receipt.in_scope(|| tracing::info!(event = "gateway_wake_fired", wake.id = %id));
+    if answering {
+        start_session(runner, routes, drivers, sessions, message);
+        return;
+    }
+    receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
+    if let Some(driver) = drivers.get(&message.transport).cloned() {
+        sessions.spawn(
+            async move {
+                session::answer(&driver, &message, &message.text).await;
+            }
+            .instrument(receipt),
+        );
+    }
+}
+
+fn spawn_tick(
+    runner: &Arc<SessionRunner>,
+    routes: &RoutingTable,
+    ticks: &mut JoinSet<Option<wake::Fired>>,
+    tick: wake::Tick,
+) {
+    let Some(store) = runner.wakes.clone() else {
+        return;
+    };
+    let Some(admission) = runner
+        .gate
+        .admit(("wake".to_owned(), tick.id().to_string()))
+    else {
+        tracing::info!(event = "gateway_wake_tick_skipped", wake.id = %tick.id(), reason = "busy");
+        return;
+    };
+    let limits = routes
+        .route_for_anchor(tick.anchor())
+        .map(|route| dekopon_shell::Limits {
+            max_capability_calls: route.limits.max_capability_calls,
+            timeout: route.script_timeout,
+            ..dekopon_shell::Limits::default()
+        });
+    let broker = runner.broker.clone();
+    let runtime = tokio::runtime::Handle::current();
+    ticks.spawn_blocking(move || {
+        let _admission = admission;
+        wake::run_tick(tick, &store, &broker, &runtime, limits)
+    });
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
@@ -727,6 +841,8 @@ pub enum DekopondError {
     TransportsLost,
     #[error("conversation journal directory is unusable: {kind}")]
     Journal { kind: std::io::ErrorKind },
+    #[error(transparent)]
+    WakeStore(#[from] WakeStoreError),
 }
 
 #[derive(Debug, Error)]

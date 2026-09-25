@@ -17,11 +17,11 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
-        ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText, TextStream,
-        TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease, asset_buffer,
-        bound_inbound, credential_client, floor_boundary, receive_span, record_conversation,
-        reserve_for_chunk, retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
+        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText,
+        TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
+        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
+        record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -134,7 +134,7 @@ impl TelegramTransport {
             })?;
             match routed {
                 Some(Routed::Message(message)) => {
-                    received.record("message.id", message.message_id.as_str());
+                    received.record("message.id", message.message_id.to_string().as_str());
                     self.pending.push_back(TransportEvent::Message(message));
                 }
                 Some(Routed::Cancel(pressed)) => {
@@ -227,7 +227,7 @@ impl TelegramTransport {
             subject: ExternalSubject::telegram(&user.to_string())
                 .map_err(TransportError::Subject)?,
             conversation,
-            message_id: message_id.to_string(),
+            message_id: MessageId::Native(message_id.to_string()),
             text: bound_inbound(text),
             assets,
             addressed: None,

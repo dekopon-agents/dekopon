@@ -300,7 +300,10 @@ pub(crate) fn disposition(receipt: &tracing::Span, outcome: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{asset::PendingAsset, transport::receive_span};
+    use crate::{
+        asset::PendingAsset,
+        transport::{MessageId, receive_span},
+    };
     use dekopon_broker_protocol::{Conversation, ConversationKind};
 
     fn message(photos: usize, text: &str) -> InboundMessage {
@@ -314,7 +317,7 @@ mod tests {
                 id: "15551234567".into(),
                 thread: None,
             },
-            message_id: "wamid.test".into(),
+            message_id: MessageId::Native("wamid.test".to_owned()),
             text: text.into(),
             assets: (0..photos)
                 .map(|_| PendingAsset {

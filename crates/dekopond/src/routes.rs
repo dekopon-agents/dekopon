@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use dekopon_agent::prompt::PromptLimits;
-use dekopon_broker_protocol::ConversationMatch;
+use dekopon_broker_protocol::{Conversation, ConversationMatch};
 use dekopon_config::{LocalCatalog, Skill};
 use dekopon_core::{AgentId, ExternalSubject};
 use thiserror::Error;
@@ -11,6 +11,7 @@ use crate::{
     config::{MemoryPolicy, ModelConfig, ResolvedConfig, render_problems},
     progress::ProgressDetail,
     transport::InboundMessage,
+    wake::Anchor,
 };
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,7 @@ pub(crate) struct BoundRoute {
     pub script_timeout: Duration,
     pub progress_detail: ProgressDetail,
     pub memory: MemoryPolicy,
+    pub wakes: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
     /// across the route's traffic, and grants nothing: every message still opens its own attested
     /// broker leg.
@@ -114,6 +116,7 @@ impl RoutingTable {
                 script_timeout: route.limits.script_timeout(),
                 progress_detail: route.progress_detail,
                 memory: route.memory,
+                wakes: route.wakes,
                 cache_key: cache_key::for_route(),
             });
         }
@@ -141,13 +144,32 @@ impl RoutingTable {
     }
 
     pub(crate) fn route_index(&self, message: &InboundMessage) -> Option<(usize, &BoundRoute)> {
+        self.find(&message.transport, &message.conversation, &message.subject)
+    }
+
+    pub(crate) fn route_for_anchor(&self, anchor: &Anchor) -> Option<&BoundRoute> {
+        self.find(
+            &anchor.transport().to_string(),
+            anchor.conversation(),
+            anchor.subject(),
+        )
+        .map(|(_, route)| route)
+        .filter(|route| route.wakes && &route.agent == anchor.agent())
+    }
+
+    fn find(
+        &self,
+        transport: &str,
+        conversation: &Conversation,
+        subject: &ExternalSubject,
+    ) -> Option<(usize, &BoundRoute)> {
         self.routes.iter().enumerate().find(|(_, route)| {
-            route.transport == message.transport
-                && route.conversation.matches(&message.conversation)
+            route.transport == transport
+                && route.conversation.matches(conversation)
                 && route
                     .subjects
                     .as_ref()
-                    .is_none_or(|subjects| subjects.contains(&message.subject))
+                    .is_none_or(|subjects| subjects.contains(subject))
         })
     }
 

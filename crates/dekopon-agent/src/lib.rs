@@ -52,6 +52,7 @@ pub mod meta;
 pub mod progress;
 pub mod prompt;
 pub mod skills;
+pub mod wake;
 
 pub use crate::progress::{
     BudgetLimit, CancelSource, CancelVia, CommandWord, FailureClass, ProgressEvent, ProgressSink,

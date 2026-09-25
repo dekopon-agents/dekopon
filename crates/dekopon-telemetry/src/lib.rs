@@ -54,6 +54,12 @@ pub fn link_span(execution: &tracing::Span, receipt: &tracing::Span) {
     }
 }
 
+pub fn link_remote(execution: &tracing::Span, parts: TraceContextParts) {
+    let context = remote_context(parts);
+    let span = context.span();
+    execution.add_link(span.span_context().clone());
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {

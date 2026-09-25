@@ -66,10 +66,10 @@ use crate::{
     transport::{
         AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, InboundMessage,
         InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
-        MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
-        Status, StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation,
-        ThreadOwnership, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        bound_inbound, bound_outbound, credential_value,
+        MessageId, MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage,
+        ReplyTarget, Status, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, bound_inbound, bound_outbound, credential_value,
     },
 };
 
@@ -866,6 +866,45 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |error| {
                 reports(error, |problem| {
                     matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
+                })
+            },
+        ),
+        (
+            "wakes on a route with no wake store",
+            mutate(|document| {
+                document["routes"][0]["wakes"] = json!(true);
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::WakesWithoutStore { .. })
+                })
+            },
+        ),
+        (
+            "a zero wake bound",
+            mutate(|document| {
+                document["sessions"] =
+                    json!({"wakes": {"path": "wakes.jsonl", "maxPerSubject": 0}});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidWakeBounds)
+                })
+            },
+        ),
+        (
+            "a watch interval a probe could outlast",
+            mutate(|document| {
+                document["sessions"] =
+                    json!({"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}});
+                document["routes"][0]["wakes"] = json!(true);
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(
+                        problem,
+                        ConfigProblem::WakeIntervalWithinScriptTimeout { .. }
+                    )
                 })
             },
         ),
@@ -2874,6 +2913,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
         memory: MemoryPolicy::OneShot,
+        wakes: false,
         cache_key: cache_key::for_route(),
     }
 }
@@ -2936,7 +2976,7 @@ fn message(text: &str) -> InboundMessage {
             id: "dev".to_owned(),
             thread: None,
         },
-        message_id: "0123456789abcdef0123456789abcdef-1-1".to_owned(),
+        message_id: MessageId::Native("0123456789abcdef0123456789abcdef-1-1".to_owned()),
         text: text.to_owned(),
         assets: Vec::new(),
         addressed: None,
@@ -2964,7 +3004,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         id: "16034700182".to_owned(),
         thread: None,
     };
-    inbound.message_id = "wamid.delivery".to_owned();
+    inbound.message_id = MessageId::Native("wamid.delivery".to_owned());
     inbound.reply = ReplyTarget::WhatsApp {
         recipient: "16034700182".to_owned(),
     };
@@ -2978,7 +3018,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
             trigger: dekopon_broker_protocol::Trigger::Message,
         },
     );
-    let delivery = crate::session::delivery_identity(&inbound, &claim)
+    let delivery = crate::session::delivery_identity(&inbound, "wamid.delivery", &claim)
         .expect("WhatsApp replies can be recorded after transport acceptance");
     assert_eq!(
         delivery,
@@ -3016,7 +3056,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
             id: "c0123abc".to_owned(),
             thread: Some("1700000000.000001".to_owned()),
         },
-        message_id: "1700000000.000002".to_owned(),
+        message_id: MessageId::Native("1700000000.000002".to_owned()),
         text: text.to_owned(),
         assets: Vec::new(),
         addressed: Some(!inherited),
@@ -3105,6 +3145,7 @@ fn runner_tracking(
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         active_sessions: crate::session::ActiveSessions::new(max_concurrent),
+        wakes: None,
     })
 }
 
@@ -11131,7 +11172,8 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         second.text, "second",
         "two requests on one connection are still two messages"
     );
-    let parts = first.message_id.split('-').collect::<Vec<_>>();
+    let first_id = first.message_id.to_string();
+    let parts = first_id.split('-').collect::<Vec<_>>();
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0].len(), 32, "a 128-bit boot nonce prefixes every ID");
     assert!(
@@ -11430,7 +11472,7 @@ async fn a_slack_envelope_opens_its_trace_before_it_is_acknowledged() {
     transport.connect().await.expect("slack transport connects");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(message.message_id, "1700000000.000042");
+    assert_eq!(message.message_id.to_string(), "1700000000.000042");
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "slack", "1700000000.000042");
@@ -11450,7 +11492,7 @@ async fn a_telegram_poll_item_opens_its_trace_before_the_offset_advances() {
         .expect("telegram transport connects");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(message.message_id, "77");
+    assert_eq!(message.message_id.to_string(), "77");
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "telegram", "77");
@@ -11478,7 +11520,7 @@ async fn a_discord_gateway_event_opens_its_trace_before_the_payload_is_read() {
         .expect("Discord transport connects");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(message.message_id, DISCORD_MESSAGE);
+    assert_eq!(message.message_id.to_string(), DISCORD_MESSAGE);
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "discord", DISCORD_MESSAGE);
@@ -11547,7 +11589,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
     stream.flush().await.expect("the delivery is flushed");
 
     let message = next_message(&mut transport).await;
-    assert_eq!(message.message_id, "wamid.traced");
+    assert_eq!(message.message_id.to_string(), "wamid.traced");
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "whatsapp", "wamid.traced");
@@ -11772,7 +11814,7 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
         .expect("the request is written");
 
     let message = next_message(&mut transport).await;
-    let message_id = message.message_id.clone();
+    let message_id = message.message_id.to_string();
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "local", &message_id);
@@ -12690,7 +12732,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             if edit > 0 {
                 message.assets.clear();
                 message.text = "Edit the most recent generated result".to_owned();
-                message.message_id = format!("follow-up-{edit}");
+                message.message_id = MessageId::Native(format!("follow-up-{edit}"));
             }
             run_session(
                 Arc::clone(&runner),
@@ -13470,7 +13512,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         );
     }
     for id in [2, 3] {
-        member.message_id = id.to_string();
+        member.message_id = MessageId::Native(id.to_string());
         member.reply = ReplyTarget::Telegram {
             chat_id: -100123,
             reply_to: Some(id),
@@ -13826,6 +13868,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/late_photos.rs"]
 mod late_photos;
+#[path = "tests/wakes.rs"]
+mod wakes;
 
 fn recall_window(recall: RecallSource) -> MemoryWindow {
     MemoryWindow { recall, ..window() }
@@ -13850,6 +13894,7 @@ fn journaled_runner(
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         active_sessions: crate::session::ActiveSessions::new(4),
+        wakes: None,
     })
 }
 
@@ -13971,13 +14016,13 @@ impl crate::transport::ChatHistory for HistoryDriver {
     async fn recent(
         &self,
         _conversation: &Conversation,
-        before: &str,
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<crate::transport::PastMessage>, TransportError> {
         self.asked
             .lock()
             .expect("asked")
-            .push((before.to_owned(), limit));
+            .push((before.unwrap_or_default().to_owned(), limit));
         self.past.clone().map_err(|()| TransportError::Response)
     }
 }
@@ -14012,7 +14057,7 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
     let inbound = message("read this thread");
-    let trigger = inbound.message_id.clone();
+    let trigger = inbound.message_id.to_string();
 
     run_session(
         runner,

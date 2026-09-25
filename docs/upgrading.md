@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Chat-scope triggers (unreleased)
+
+Every chat attestation now carries a required `trigger`, and neither daemon accepts the other's
+older frames: roll `dekopon-brokerd` and `dekopond` together. No configuration changes. Wakes are
+off until a route sets `wakes: true` and `sessions.wakes` names a writable file; on Kubernetes that
+file must sit on the gateway's state volume, outside the `sessions.journal` directory.
+
 ## Typed inference errors (0.20.0)
 
 Rust embedders match `dekopon_model::error::InferenceError` instead of `ModelError`;

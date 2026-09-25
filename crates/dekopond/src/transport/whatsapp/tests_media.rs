@@ -198,7 +198,7 @@ async fn six_staggered_signed_photos_form_one_lazy_batch_after_the_quiet_interva
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].assets.len(), 6);
     assert_eq!(ready[0].constituents.len(), 6);
-    assert_eq!(ready[0].message_id, "wamid.photo0");
+    assert_eq!(ready[0].message_id.to_string(), "wamid.photo0");
     assert!(ready[0].text.contains("edit all six"));
     assert!(
         collector
