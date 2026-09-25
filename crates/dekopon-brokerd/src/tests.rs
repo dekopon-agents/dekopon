@@ -364,53 +364,6 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
             "namespaces {namespaces} produced {error}"
         );
     }
-
-    for scope in [
-        json!({
-            "breadth": "exactChannel", "kind": "slack", "transport": "slack",
-            "conversation": {"kind": "any"}
-        }),
-        json!({
-            "kind": "discord", "transport": "discord",
-            "conversation": {"kind": ["channel"], "ids": ["00123"]}
-        }),
-        json!({
-            "kind": "discord", "transport": "discord",
-            "conversation": {"kind": ["groupDirectMessage"]}
-        }),
-        json!({
-            "kind": "telegram", "transport": "telegram",
-            "conversation": {"kind": ["channel"], "container": "t0123abc"}
-        }),
-        json!({
-            "kind": "slack", "transport": "slack", "conversation": {"kind": "channel"}
-        }),
-        json!({
-            "kind": "local", "transport": "dev", "conversation": {"kind": "any"}
-        }),
-        json!({
-            "kind": "slack", "transport": "slack",
-            "conversation": {"kind": ["channel"], "ids": [format!("c{}", "x".repeat(256))]}
-        }),
-        json!({
-            "kind": "discord", "transport": "discord",
-            "conversation": {"kind": ["thread"], "ids": ["123:456"]}
-        }),
-    ] {
-        let mut invalid = document.clone();
-        invalid["identities"][1]["attestor"]["chatScopes"] = json!([scope.clone()]);
-        write_config(&path, &invalid);
-        let error = config::load(&path, uid)
-            .await
-            .expect_err("a chat scope that can never name a conversation fails at startup");
-        assert!(
-            matches!(
-                error,
-                config::ConfigError::Attestor { .. } | config::ConfigError::Decode { .. }
-            ),
-            "scope {scope} produced {error}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -1483,8 +1436,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
             .capability_surface(
                 &gateway,
                 Some(&dekopon_broker::AttestorGrant {
-                    namespaces: vec!["slack.t0123abc".to_owned()],
-                    chat_scopes: Vec::new(),
+                    namespaces: Some(vec!["slack.t0123abc".to_owned()]),
                 }),
                 Some(&Attestation::for_subject(
                     "slack.t0123abc.u9xyz".parse().expect("canonical subject"),

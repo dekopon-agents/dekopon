@@ -246,8 +246,7 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                     .invoke(
                         &peer,
                         Some(&AttestorGrant {
-                            namespaces: vec!["slack.t0123abc".to_owned()],
-                            chat_scopes: Vec::new(),
+                            namespaces: Some(vec!["slack.t0123abc".to_owned()]),
                         }),
                         Some(&attestation),
                         request,
@@ -277,8 +276,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
     )
     .expect("gateway context binds");
     let grant = AttestorGrant {
-        namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: Vec::new(),
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
 
     assert!(
@@ -375,4 +373,73 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         .expect("a refused agent is still an accounted decision");
     assert_eq!(refused.result.outcome, InvocationOutcome::Denied);
     assert_eq!(refused.result.error.as_deref(), Some("agent-denied"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attestor_without_namespaces_speaks_for_exactly_the_mapped_subjects() {
+    let broker = broker("cpetersen").await;
+    let gateway = AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway context binds");
+    let grant = AttestorGrant { namespaces: None };
+    assert!(
+        broker
+            .capability_surface(
+                &gateway,
+                Some(&grant),
+                Some(&Attestation::for_subject(subject(), agent("some-agent"))),
+            )
+            .is_some()
+    );
+    assert!(
+        broker
+            .capability_surface(
+                &gateway,
+                Some(&grant),
+                Some(&Attestation::for_subject(
+                    "slack.t0123abc.uother".parse().expect("subject"),
+                    agent("some-agent"),
+                )),
+            )
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
+    let broker = broker("cpetersen").await;
+    let gateway = AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway context binds");
+    let discord_claim_for_a_slack_sender = Attestation::for_chat(
+        subject(),
+        agent("some-agent"),
+        ChatScopeClaim {
+            transport: "elote-logs".parse::<TransportId>().expect("transport"),
+            kind: ChatTransportKind::Discord,
+            conversation: Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: None,
+                id: "1338356895504793623".to_owned(),
+                thread: None,
+            },
+        },
+    );
+    assert!(
+        broker
+            .capability_surface(
+                &gateway,
+                Some(&AttestorGrant { namespaces: None }),
+                Some(&discord_claim_for_a_slack_sender),
+            )
+            .is_none()
+    );
 }

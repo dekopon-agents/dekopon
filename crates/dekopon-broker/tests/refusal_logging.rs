@@ -127,8 +127,7 @@ fn gateway() -> AuthenticatedContext {
 
 fn grant() -> AttestorGrant {
     AttestorGrant {
-        namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: Vec::new(),
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     }
 }
 
@@ -192,8 +191,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     assert!(ungranted.contains("gateway"), "{ungranted}");
 
     let narrow = AttestorGrant {
-        namespaces: vec!["slack.tother".to_owned()],
-        chat_scopes: Vec::new(),
+        namespaces: Some(vec!["slack.tother".to_owned()]),
     };
     assert!(
         broker

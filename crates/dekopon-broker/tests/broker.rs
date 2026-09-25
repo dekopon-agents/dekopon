@@ -276,8 +276,7 @@ fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) ->
 
 fn attestor_grant<'a>(namespaces: impl IntoIterator<Item = &'a str>) -> AttestorGrant {
     AttestorGrant {
-        namespaces: namespaces.into_iter().map(str::to_owned).collect(),
-        chat_scopes: Vec::new(),
+        namespaces: Some(namespaces.into_iter().map(str::to_owned).collect()),
     }
 }
 
@@ -2548,8 +2547,7 @@ fn attestor_scopes_match_on_segment_boundaries() {
         vec!["slack.t0123abc.u9xyz.extra".to_owned()],
     ] {
         let grant = AttestorGrant {
-            namespaces: invalid.clone(),
-            chat_scopes: Vec::new(),
+            namespaces: Some(invalid.clone()),
         };
         assert!(
             grant.validate().is_err(),
