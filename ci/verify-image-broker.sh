@@ -39,6 +39,9 @@ config.update({
     "identities": [{"uid": 65532, "principal": "image-peer",
                     "actor": {"type": "service", "principal": "image-peer"}}],
 })
+if tier != "current":
+    config["brokerPrincipal"] = "image-broker"
+    config["policyRevision"] = "image-proof"
 if tier in ("checkpoint", "audit-file"):
     config["auditPath"] = "/proof/audit.jsonl"
 if tier == "checkpoint":
@@ -54,7 +57,9 @@ PY
 # them rather than attributing them to the current checkout. Three tiers:
 #   checkpoint  no `probe` subcommand (0.12.0 and earlier); requires `auditPath` and the checkpoint pair.
 #   audit-file  has `probe` but still requires `auditPath`, the on-disk audit sink.
-#   current     has no on-disk audit sink and refuses `auditPath` as an unknown field.
+#   principal   no on-disk audit sink, but still requires `brokerPrincipal` and `policyRevision`
+#               (0.21.0 and earlier).
+#   current     accepts neither `auditPath` nor `brokerPrincipal`.
 # The first is read off the command surface. The second and third share it, so a strict decode
 # of a field neither knows tells them apart: the refusal names every field the binary accepts.
 help=$(docker run --rm "$image" dekopon-brokerd --help)
@@ -70,7 +75,11 @@ else
     echo "$refusal" >&2
     exit 1
   fi
-  if grep -q 'auditPath' <<<"$refusal"; then tier=audit-file; fi
+  if grep -q 'auditPath' <<<"$refusal"; then
+    tier=audit-file
+  elif grep -q 'brokerPrincipal' <<<"$refusal"; then
+    tier=principal
+  fi
 fi
 echo "released broker configuration tier: $tier"
 write_config "$tier"
