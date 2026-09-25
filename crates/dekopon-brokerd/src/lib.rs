@@ -23,16 +23,23 @@ mod secrets;
 mod server;
 mod socket;
 
-use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use config::LoadMode;
 use dekopon_broker::{
-    AuditLog, Broker, ConstraintCatalog, CredentialStore, IdentityDirectory, Leniency,
-    PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    AuditLog, Broker, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
+    Leniency, PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::error_chain;
+use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, error_chain};
+use dekopon_http_host::BoundCredential;
 use thiserror::Error;
 
 pub use config::{
@@ -73,7 +80,7 @@ where
     F: Future<Output = ()> + Send,
 {
     let uid = current_uid();
-    let config = config::load(config_path, uid).await?;
+    let mut config = config::load(config_path, uid).await?;
     let frame_limits = config.server_limits.frame_limits()?;
     let socket_parent = socket::validate_socket_parent(&config.socket_path, uid)?;
     // An owner-only socket under a private parent means other configured UIDs could never connect
@@ -93,28 +100,20 @@ where
             });
         }
     }
-    for provider in &config.providers {
-        socket::validate_owned_file(provider, uid)?;
-    }
     // A compilation cache holds compiled code the broker will execute. Anyone who can write into
     // it can choose what the privileged process runs, so it must sit under a private parent.
     if let Some(cache) = &config.host_options.cwasm_dir {
         socket::validate_private_parent(cache, uid)?;
     }
-    let credential_store = match &config.credentials_path {
+    let credentials = Credentials::Loaded(match &config.credentials_path {
         Some(path) => credentials::load(path, uid).await?,
         None => CredentialStore::empty(),
-    };
-    let secret_catalog = match &config.secret_map_path {
+    });
+    let secrets = Secrets::Loaded(match &config.secret_map_path {
         Some(path) => secrets::load(path, uid).await?,
         None => dekopon_broker::SecretCatalog::empty(),
-    };
-    let secret_drns = secret_catalog.drns().cloned().collect::<Vec<_>>();
-
-    // The audit record is the log event the broker emits inside the trace: stdout JSON always,
-    // an OTLP log record once `telemetry` names a receiver. Nothing else keeps a copy.
-    let audit = Arc::new(TraceOnlyAuditLog);
-    let storage_host = config
+    });
+    let storage = config
         .storage
         .as_ref()
         .map(|storage| {
@@ -141,7 +140,7 @@ where
             "http plaintext hosts allowed: [{hosts}]"
         );
     }
-    let asset_directory = match &config.assets {
+    let assets = match &config.assets {
         Some(config) => Some(
             assets::initialize(config)
                 .await
@@ -149,190 +148,31 @@ where
         ),
         None => None,
     };
-    let mut registry = match config.locked_providers {
-        Some(sources) => {
-            BrokerProviderRegistry::load_locked_with_options(
-                sources,
-                config.host_limits,
-                storage_host,
-                &config.host_options,
-            )
-            .await
-        }
-        None => {
-            BrokerProviderRegistry::load_with_options(
-                config.providers,
-                config.host_limits,
-                storage_host,
-                &config.host_options,
-            )
-            .await
-        }
-    }
-    .map_err(BrokerdError::Host)?;
-    if let Some(directory) = asset_directory {
-        registry.set_assets(directory);
-    }
-    validate_manifest_metadata(
-        &registry,
-        frame_limits
-            .max_frame_bytes
-            .saturating_sub(config::MINIMUM_RESPONSE_OVERHEAD_BYTES),
-    )?;
-    let identity_directory =
-        IdentityDirectory::new(config.principals.iter().flat_map(|(principal, entry)| {
-            entry
-                .subjects
-                .iter()
-                .map(|subject| (subject.clone(), principal.clone()))
-        }))
-        .map_err(BrokerdError::Broker)?;
-    let world = PolicyWorld::new(
-        config
-            .identities
-            .iter()
-            .map(|identity| identity.principal.clone())
-            .chain(config.principals.keys().cloned()),
-        registry
-            .capabilities()
-            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
-    )
-    .map(|world| {
-        world
-            .with_secrets(secret_drns)
-            .with_group_members(config.principals.iter().flat_map(|(principal, entry)| {
-                entry
-                    .groups
-                    .iter()
-                    .map(|group| (principal.clone(), group.clone()))
-            }))
-            .with_read_only(
-                registry
-                    .capabilities()
-                    .filter(|(_, capability)| capability.effect == EffectKind::ReadOnly)
-                    .map(|(_, capability)| capability.id.clone()),
-            )
-    })
-    .map_err(|source| BrokerdError::Policy { source })?;
-    let leniency = if config.strict {
-        Leniency::Strict
-    } else {
-        Leniency::Tolerant
-    };
-    let policy = if config.strict {
-        PolicyEngine::new(&config.policies, &world)
-            .map_err(|source| BrokerdError::Policy { source })?
-    } else {
-        let (policy, unresolved) = PolicyEngine::new_lenient(&config.policies, &world)
-            .map_err(|source| BrokerdError::Policy { source })?;
-        for entry in &unresolved {
-            tracing::warn!(
-                target: "dekopon_brokerd::audit",
-                {
-                    audit.event = "policy.name.unresolved",
-                    policy.id = %entry.policy,
-                    name.kind = entry.kind.label(),
-                    name = %entry.name,
-                },
-                "policy names {} {:?}, which no loaded provider declares; it can never match",
-                entry.kind.label(),
-                entry.name
-            );
-        }
-        policy
-    };
-    let (constraint_sets, problems) =
-        capabilities::constraint_sets(&config.capabilities, |provider| {
-            let declared = registry
-                .capabilities()
-                .filter(|(owner, _)| *owner == provider)
-                .map(|(_, capability)| capabilities::ManifestCapability {
-                    id: &capability.id,
-                    effect: capability.effect,
-                    risk: capability.risk,
-                })
-                .collect::<Vec<_>>();
-            (!declared.is_empty()).then_some(declared)
-        });
-    let (tolerable, fatal): (Vec<_>, Vec<_>) = problems
-        .into_iter()
-        .partition(|problem| problem.is_unloaded_name() && !config.strict);
-    if !fatal.is_empty() {
-        return Err(BrokerdError::Capabilities { problems: fatal });
-    }
-    for problem in &tolerable {
-        tracing::warn!(
-            target: "dekopon_brokerd::audit",
-            { audit.event = "config.startup.warning", reason = "unloaded-capability" },
-            "{problem}"
-        );
-    }
-    let constraints = ConstraintCatalog::new(constraint_sets)
-        .map_err(BrokerdError::Broker)?
-        .with_agent_credentials(
-            config
-                .agents
-                .into_iter()
-                .map(|(agent, binding)| (agent, binding.credentials))
-                .collect(),
-        );
-    // The revision stamped on receipts and audit records is the policy set's own fingerprint, so
-    // it moves exactly when authorization can.
-    let revision = policy.digest().to_owned();
-    let (broker, warnings) = Broker::start(
-        registry,
-        BROKER_PRINCIPAL
-            .parse()
-            .expect("the broker principal is a valid identifier"),
-        revision,
-        policy,
-        constraints,
-        credential_store,
-        identity_directory,
-        Arc::clone(&audit),
-        config.broker_limits,
-        leniency,
-    )
-    .map_err(BrokerdError::Broker)?;
-    let broker = broker
-        .with_secret_catalog(secret_catalog)
-        .map_err(BrokerdError::Broker)?;
-    let broker = match config.chat_memory {
-        Some(memory) => broker
-            .with_chat_memory(memory)
-            .map_err(BrokerdError::Broker)?,
-        None => broker,
-    };
-    for warning in &warnings {
-        tracing::warn!(
-            target: "dekopon_brokerd::audit",
-            {
-                audit.event = "config.startup.warning",
-                reason = warning.reason(),
-                capability.id = %warning.capability(),
-            },
-            "{warning}"
-        );
-    }
-    let broker = Arc::new(broker);
-    let mut identities = BTreeMap::new();
-    for identity in config.identities {
-        identities.insert(
-            identity.uid,
-            MappedPeer {
-                context: identity.context().map_err(BrokerdError::Context)?,
-                attestor: identity.attestor,
-            },
-        );
-    }
-    validate_capability_responses(&broker, &identities, frame_limits.max_frame_bytes)?;
     let limits = ServerLimits {
         frame: frame_limits,
         max_connections: config.server_limits.max_connections,
         shutdown_grace: config.server_limits.shutdown_grace(),
     };
-    let server = BrokerServer::new(broker, identities, limits)?;
-    let (listener, mut socket_guard) = socket::bind(&config.socket_path, uid).await?;
+    let socket_path = std::mem::take(&mut config.socket_path);
+    let mut warnings = Vec::new();
+    let prepared = prepare(
+        config,
+        frame_limits.max_frame_bytes,
+        Runtime {
+            credentials,
+            secrets,
+            storage,
+            assets,
+        },
+        &mut warnings,
+    )
+    .await;
+    for warning in &warnings {
+        warning.log();
+    }
+    let Ready { broker, identities } = prepared.map_err(BrokerdError::from_problems)?;
+    let server = BrokerServer::new(Arc::new(broker), identities, limits)?;
+    let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
     let result = server.serve(listener, shutdown).await;
 
@@ -350,6 +190,526 @@ where
     tracing::info!(event = "broker_stopped");
     cleanup?;
     Ok(())
+}
+
+/// Where `check` resolves a configuration's `providerSet`: the operator's provider set, synced into
+/// a private directory that keeps the lock and blob store between checks.
+#[derive(Debug)]
+pub struct CheckProviders {
+    pub provider_set: PathBuf,
+    pub store: PathBuf,
+}
+
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    pub problems: Vec<BrokerdError>,
+    pub warnings: Vec<StartupWarning>,
+}
+
+/// Runs the startup validation `run` runs, then stops: no socket, no credentials file, no secret
+/// map, no asset root and no provider storage root is touched.
+pub async fn check(
+    config_path: impl AsRef<Path>,
+    providers: Option<CheckProviders>,
+) -> CheckReport {
+    let mut report = CheckReport::default();
+    let uid = current_uid();
+    let (mut config, refusal) = match config::load_in(config_path, uid, LoadMode::Check).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            report.problems.push(error.into());
+            return report;
+        }
+    };
+    report.problems.extend(refusal.map(BrokerdError::from));
+    // A Check load leaves a providerSet's providers for this function to resolve.
+    match (config.providers.is_empty(), providers) {
+        (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
+            Ok(sources) => {
+                config.providers = sources
+                    .iter()
+                    .map(|source| source.path().to_path_buf())
+                    .collect();
+                config.locked_providers = Some(sources);
+            }
+            Err(error) => {
+                report.problems.push(error);
+                return report;
+            }
+        },
+        (true, None) => {
+            report.problems.push(BrokerdError::ProviderSetRequired);
+            return report;
+        }
+        (false, Some(_)) => report.problems.push(BrokerdError::ProviderSetUnused),
+        (false, None) => {}
+    }
+    let frame_limits = match config.server_limits.frame_limits() {
+        Ok(limits) => limits,
+        Err(error) => {
+            report.problems.push(error.into());
+            return report;
+        }
+    };
+    let scratch = match config.storage.as_ref().map(scratch_storage).transpose() {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            report.problems.push(error);
+            return report;
+        }
+    };
+    let runtime = Runtime {
+        credentials: match config.credentials_path {
+            Some(_) => Credentials::Unchecked,
+            None => Credentials::Loaded(CredentialStore::empty()),
+        },
+        secrets: match config.secret_map_path {
+            Some(_) => Secrets::Unchecked,
+            None => Secrets::Loaded(dekopon_broker::SecretCatalog::empty()),
+        },
+        storage: scratch.as_ref().map(|(_, host)| host.clone()),
+        assets: None,
+    };
+    if let Err(problems) = prepare(
+        config,
+        frame_limits.max_frame_bytes,
+        runtime,
+        &mut report.warnings,
+    )
+    .await
+    {
+        report.problems.extend(problems);
+    }
+    report
+}
+
+async fn resolve_provider_set(
+    providers: CheckProviders,
+    uid: u32,
+) -> Result<Vec<dekopon_broker_host::LockedProviderSource>, BrokerdError> {
+    let mut directory = tokio::fs::DirBuilder::new();
+    directory.mode(0o700);
+    match directory.create(&providers.store).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(BrokerdError::CheckDirectory {
+                path: providers.store,
+                source,
+            });
+        }
+    }
+    let lock_file = providers.store.join("providers.lock.yaml");
+    let store = providers.store.join("store");
+    let manager = ProviderManager::new(ProviderManagerOptions {
+        paths: ProviderManagerPaths {
+            provider_set: Some(providers.provider_set),
+            lock_file: lock_file.clone(),
+            store: store.clone(),
+        },
+        plaintext_loopback_registries: Vec::new(),
+    })
+    .map_err(BrokerdError::ProviderSet)?;
+    manager.sync().await.map_err(BrokerdError::ProviderSet)?;
+    provider_manager::load_locked_sources(&lock_file, &store, uid)
+        .await
+        .map_err(BrokerdError::ProviderSet)
+}
+
+/// Provider storage is opened in a throwaway directory so storage-backed constraints and chat
+/// memory are validated against a real host without touching the configured root.
+fn scratch_storage(
+    storage: &StorageConfig,
+) -> Result<(tempfile::TempDir, dekopon_storage_host::StorageHost), BrokerdError> {
+    let scratch = tempfile::tempdir().map_err(|source| BrokerdError::CheckDirectory {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let root = std::fs::canonicalize(scratch.path())
+        .map_err(|source| BrokerdError::CheckDirectory {
+            path: scratch.path().to_path_buf(),
+            source,
+        })?
+        .join("storage");
+    let host = dekopon_storage_host::StorageHost::open(root, storage.limits.clone())
+        .map_err(BrokerdError::Storage)?;
+    Ok((scratch, host))
+}
+
+enum Credentials {
+    Loaded(CredentialStore),
+    Unchecked,
+}
+
+enum Secrets {
+    Loaded(dekopon_broker::SecretCatalog),
+    Unchecked,
+}
+
+struct Runtime {
+    credentials: Credentials,
+    secrets: Secrets,
+    storage: Option<dekopon_storage_host::StorageHost>,
+    assets: Option<dekopon_http_host::asset::AssetDirectory>,
+}
+
+struct Ready {
+    broker: Broker<TraceOnlyAuditLog>,
+    identities: BTreeMap<u32, MappedPeer>,
+}
+
+/// Every problem found before the broker is built is returned together; the policy and the
+/// constraint sets are independent, so one refusing does not hide the other.
+async fn prepare(
+    config: ResolvedConfig,
+    max_frame_bytes: usize,
+    runtime: Runtime,
+    warnings: &mut Vec<StartupWarning>,
+) -> Result<Ready, Vec<BrokerdError>> {
+    let uid = current_uid();
+    for provider in &config.providers {
+        socket::validate_owned_file(provider, uid).map_err(|error| vec![error.into()])?;
+    }
+    let mut registry = match config.locked_providers {
+        Some(sources) => {
+            BrokerProviderRegistry::load_locked_with_options(
+                sources,
+                config.host_limits,
+                runtime.storage,
+                &config.host_options,
+            )
+            .await
+        }
+        None => {
+            BrokerProviderRegistry::load_with_options(
+                config.providers,
+                config.host_limits,
+                runtime.storage,
+                &config.host_options,
+            )
+            .await
+        }
+    }
+    .map_err(|error| vec![BrokerdError::Host(error)])?;
+    if let Some(directory) = runtime.assets {
+        registry.set_assets(directory);
+    }
+    let mut problems = Vec::new();
+    if let Err(error) = validate_manifest_metadata(
+        &registry,
+        max_frame_bytes.saturating_sub(config::MINIMUM_RESPONSE_OVERHEAD_BYTES),
+    ) {
+        problems.push(error);
+    }
+    let identity_directory = keep(
+        &mut problems,
+        IdentityDirectory::new(config.principals.iter().flat_map(|(principal, entry)| {
+            entry
+                .subjects
+                .iter()
+                .map(|subject| (subject.clone(), principal.clone()))
+        }))
+        .map_err(BrokerdError::Broker),
+    );
+    let world = keep(
+        &mut problems,
+        PolicyWorld::new(
+            config
+                .identities
+                .iter()
+                .map(|identity| identity.principal.clone())
+                .chain(config.principals.keys().cloned()),
+            registry
+                .capabilities()
+                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        )
+        .map(|world| {
+            world
+                .with_group_members(config.principals.iter().flat_map(|(principal, entry)| {
+                    entry
+                        .groups
+                        .iter()
+                        .map(|group| (principal.clone(), group.clone()))
+                }))
+                .with_read_only(
+                    registry
+                        .capabilities()
+                        .filter(|(_, capability)| capability.effect == EffectKind::ReadOnly)
+                        .map(|(_, capability)| capability.id.clone()),
+                )
+        })
+        .map_err(|source| BrokerdError::Policy { source }),
+    );
+    let (secret_catalog, secrets_unchecked) = match runtime.secrets {
+        Secrets::Loaded(catalog) => (Some(catalog), false),
+        Secrets::Unchecked => (None, true),
+    };
+    let policy = world.and_then(|world| {
+        let world = world.with_secrets(
+            secret_catalog
+                .iter()
+                .flat_map(|catalog| catalog.drns().cloned()),
+        );
+        keep(
+            &mut problems,
+            build_policy(
+                &config.policies,
+                world,
+                config.strict,
+                secrets_unchecked,
+                warnings,
+            ),
+        )
+    });
+    let (constraint_sets, capability_problems) =
+        capabilities::constraint_sets(&config.capabilities, |provider| {
+            let declared = registry
+                .capabilities()
+                .filter(|(owner, _)| *owner == provider)
+                .map(|(_, capability)| capabilities::ManifestCapability {
+                    id: &capability.id,
+                    effect: capability.effect,
+                    risk: capability.risk,
+                })
+                .collect::<Vec<_>>();
+            (!declared.is_empty()).then_some(declared)
+        });
+    let (tolerable, fatal): (Vec<_>, Vec<_>) = capability_problems
+        .into_iter()
+        .partition(|problem| problem.is_unloaded_name() && !config.strict);
+    if !fatal.is_empty() {
+        problems.push(BrokerdError::Capabilities { problems: fatal });
+    }
+    warnings.extend(
+        tolerable
+            .into_iter()
+            .map(StartupWarning::UnloadedCapability),
+    );
+    let (Some(identity_directory), Some(policy), true) =
+        (identity_directory, policy, problems.is_empty())
+    else {
+        return Err(problems);
+    };
+    let credential_store = match runtime.credentials {
+        Credentials::Loaded(store) => store,
+        Credentials::Unchecked => unchecked_credentials(&constraint_sets, &config.agents, warnings)
+            .map_err(|error| vec![error])?,
+    };
+    let constraints = ConstraintCatalog::new(constraint_sets)
+        .map_err(|error| vec![BrokerdError::Broker(error)])?
+        .with_agent_credentials(
+            config
+                .agents
+                .into_iter()
+                .map(|(agent, binding)| (agent, binding.credentials))
+                .collect(),
+        );
+    // The revision stamped on receipts and audit records is the policy set's own fingerprint, so
+    // it moves exactly when authorization can.
+    let revision = policy.digest().to_owned();
+    let leniency = if config.strict {
+        Leniency::Strict
+    } else {
+        Leniency::Tolerant
+    };
+    let (broker, broker_warnings) = Broker::start(
+        registry,
+        BROKER_PRINCIPAL
+            .parse()
+            .expect("the broker principal is a valid identifier"),
+        revision,
+        policy,
+        constraints,
+        credential_store,
+        identity_directory,
+        Arc::new(TraceOnlyAuditLog),
+        config.broker_limits,
+        leniency,
+    )
+    .map_err(|error| vec![BrokerdError::Broker(error)])?;
+    warnings.extend(broker_warnings.into_iter().map(StartupWarning::Broker));
+    let broker = match secret_catalog {
+        Some(catalog) => broker
+            .with_secret_catalog(catalog)
+            .map_err(|error| vec![BrokerdError::Broker(error)])?,
+        None => broker,
+    };
+    let broker = match config.chat_memory {
+        Some(memory) => broker
+            .with_chat_memory(memory)
+            .map_err(|error| vec![BrokerdError::Broker(error)])?,
+        None => broker,
+    };
+    let mut identities = BTreeMap::new();
+    for identity in config.identities {
+        identities.insert(
+            identity.uid,
+            MappedPeer {
+                context: identity
+                    .context()
+                    .map_err(|error| vec![BrokerdError::Context(error)])?,
+                attestor: identity.attestor,
+            },
+        );
+    }
+    validate_capability_responses(&broker, &identities, max_frame_bytes)
+        .map_err(|error| vec![error])?;
+    Ok(Ready { broker, identities })
+}
+
+fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) -> Option<T> {
+    result.map_err(|error| problems.push(error)).ok()
+}
+
+/// A secret map is broker-private and absent from a checkout, so an unchecked build admits each
+/// secret a policy names and reports it, and keeps validating everything else.
+fn build_policy(
+    policies: &str,
+    mut world: PolicyWorld,
+    strict: bool,
+    secrets_unchecked: bool,
+    warnings: &mut Vec<StartupWarning>,
+) -> Result<PolicyEngine, BrokerdError> {
+    let mut admitted = BTreeSet::new();
+    loop {
+        let built = if strict {
+            PolicyEngine::new(policies, &world).map(|policy| (policy, Vec::new()))
+        } else {
+            PolicyEngine::new_lenient(policies, &world)
+        };
+        let source = match built {
+            Ok((policy, unresolved)) => {
+                warnings.extend(unresolved.into_iter().map(|entry| {
+                    StartupWarning::UnresolvedPolicyName {
+                        policy: entry.policy,
+                        kind: entry.kind.label(),
+                        name: entry.name,
+                    }
+                }));
+                return Ok(policy);
+            }
+            Err(source) => source,
+        };
+        let PolicyBuildError::UnknownSecret { policy, secret } = &source else {
+            return Err(BrokerdError::Policy { source });
+        };
+        let drn = match secret.parse::<SecretDrn>() {
+            Ok(drn) if secrets_unchecked && admitted.insert(drn.clone()) => drn,
+            Ok(_) | Err(_) => return Err(BrokerdError::Policy { source }),
+        };
+        warnings.push(StartupWarning::SecretRequired {
+            policy: policy.clone(),
+            secret: secret.clone(),
+        });
+        world = world.with_secrets([drn]);
+    }
+}
+
+/// Never leaves this process: a check builds no server, so no request can carry it.
+const UNCHECKED_CREDENTIAL: &str = "dekopon-check-placeholder";
+const UNCHECKED_DESTINATION: &str = "credential.check.invalid";
+
+/// Stands in for each credential the constraint sets can select, bound to exactly the hosts that
+/// select it, so `Broker::start` still proves every other credential rule.
+fn unchecked_credentials(
+    sets: &BTreeMap<CapabilityId, ConstraintSet>,
+    agents: &BTreeMap<AgentId, AgentBindingConfig>,
+    warnings: &mut Vec<StartupWarning>,
+) -> Result<CredentialStore, BrokerdError> {
+    let mut destinations = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for set in sets.values() {
+        let Some(name) = set.credential.as_deref() else {
+            continue;
+        };
+        let hosts = set
+            .constraints
+            .http
+            .iter()
+            .flat_map(|http| http.allowed_hosts.iter().map(String::as_str));
+        let rebound = agents
+            .values()
+            .filter_map(|binding| binding.credentials.get(name).map(String::as_str));
+        for selectable in std::iter::once(name).chain(rebound) {
+            destinations
+                .entry(selectable)
+                .or_default()
+                .extend(hosts.clone());
+        }
+    }
+    let mut entries = Vec::with_capacity(destinations.len());
+    for (name, hosts) in destinations {
+        warnings.push(StartupWarning::CredentialRequired {
+            name: name.to_owned(),
+        });
+        let placeholder = |hosts: Vec<String>| {
+            BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(UNCHECKED_CREDENTIAL.to_owned()),
+                hosts,
+            )
+        };
+        let credential = placeholder(hosts.into_iter().map(str::to_owned).collect())
+            .or_else(|_| placeholder(vec![UNCHECKED_DESTINATION.to_owned()]))
+            .map_err(BrokerdError::UncheckedCredential)?;
+        entries.push((name.to_owned(), credential));
+    }
+    CredentialStore::new(entries).map_err(BrokerdError::Broker)
+}
+
+#[derive(Debug, Error)]
+pub enum StartupWarning {
+    #[error(
+        "policy {policy} names {kind} {name:?}, which no loaded provider declares; it can never match"
+    )]
+    UnresolvedPolicyName {
+        policy: String,
+        kind: &'static str,
+        name: String,
+    },
+    #[error("{0}")]
+    UnloadedCapability(capabilities::CapabilityProblem),
+    #[error("{0}")]
+    Broker(dekopon_broker::StartupWarning),
+    #[error("credential {name} is selected by a capability; boot requires it in credentialsPath")]
+    CredentialRequired { name: String },
+    #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
+    SecretRequired { policy: String, secret: String },
+}
+
+impl StartupWarning {
+    fn log(&self) {
+        match self {
+            Self::UnresolvedPolicyName { policy, kind, name } => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                {
+                    audit.event = "policy.name.unresolved",
+                    policy.id = %policy,
+                    name.kind = kind,
+                    name = %name,
+                },
+                "{self}"
+            ),
+            Self::UnloadedCapability(problem) => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                { audit.event = "config.startup.warning", reason = "unloaded-capability" },
+                "{problem}"
+            ),
+            Self::Broker(warning) => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                {
+                    audit.event = "config.startup.warning",
+                    reason = warning.reason(),
+                    capability.id = %warning.capability(),
+                },
+                "{warning}"
+            ),
+            Self::CredentialRequired { .. } | Self::SecretRequired { .. } => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                { audit.event = "config.startup.warning", reason = "unchecked-reference" },
+                "{self}"
+            ),
+        }
+    }
 }
 
 fn validate_capability_responses<A: AuditLog>(
@@ -463,6 +823,43 @@ pub enum BrokerdError {
     UnreachablePeerUids { configured: Vec<u32>, server: u32 },
     #[error("broker server failed")]
     Server(#[from] ServerError),
+    #[error("{}", render_errors(.problems))]
+    Startup { problems: Vec<BrokerdError> },
+    #[error("the configuration names a providerSet; check it with --provider-set and --store")]
+    ProviderSetRequired,
+    #[error("the configuration names provider paths; --provider-set does not apply to it")]
+    ProviderSetUnused,
+    #[error("the provider set could not be resolved")]
+    ProviderSet(#[source] ProviderManagerError),
+    #[error("check could not prepare its private directory {path}")]
+    CheckDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("check could not stand in for a configured credential")]
+    UncheckedCredential(#[source] dekopon_http_host::ConfigurationError),
+}
+
+impl BrokerdError {
+    fn from_problems(mut problems: Vec<Self>) -> Self {
+        match (problems.pop(), problems.is_empty()) {
+            (Some(only), true) => only,
+            (Some(last), false) => {
+                problems.push(last);
+                Self::Startup { problems }
+            }
+            (None, _) => Self::Startup { problems },
+        }
+    }
+}
+
+fn render_errors(problems: &[BrokerdError]) -> String {
+    problems
+        .iter()
+        .map(|problem| error_chain(problem))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]

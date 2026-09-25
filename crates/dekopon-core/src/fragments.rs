@@ -94,6 +94,16 @@ pub fn merge(
     fragments: Vec<(PathBuf, Mapping)>,
     rules: &MergeRules,
 ) -> Result<Mapping, FragmentError> {
+    let (merged, refusal) = merge_reporting(fragments, rules);
+    refusal.map_or(Ok(merged), Err)
+}
+
+/// Like [`merge`], but hands back the merged mapping beside the refusal; a colliding key keeps the
+/// value of the first fragment in filename order.
+pub fn merge_reporting(
+    fragments: Vec<(PathBuf, Mapping)>,
+    rules: &MergeRules,
+) -> (Mapping, Option<FragmentError>) {
     let mut merged = Mapping::new();
     let mut owners = BTreeMap::<String, Vec<PathBuf>>::new();
     let mut versions = BTreeSet::new();
@@ -139,13 +149,12 @@ pub fn merge(
         .filter(|(_, files)| files.len() > 1)
         .map(|(key, files)| FragmentConflict { key, files })
         .collect::<Vec<_>>();
-    if !conflicts.is_empty() {
-        return Err(FragmentError::Conflicts { conflicts });
-    }
-    if versions.len() > 1 {
-        return Err(FragmentError::MixedApiVersions);
-    }
-    Ok(merged)
+    let refusal = if conflicts.is_empty() {
+        (versions.len() > 1).then_some(FragmentError::MixedApiVersions)
+    } else {
+        Some(FragmentError::Conflicts { conflicts })
+    };
+    (merged, refusal)
 }
 
 #[cfg(test)]
