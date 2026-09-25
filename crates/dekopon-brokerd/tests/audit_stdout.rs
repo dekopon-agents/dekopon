@@ -15,7 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_broker_protocol::{BrokerClient, FrameLimits, InvocationRequest, TraceParent};
+use dekopon_broker_protocol::{
+    Attestation, BrokerClient, FrameLimits, InvocationRequest, TraceParent,
+};
 use dekopon_capability::InvocationOutcome;
 use dekopon_test_support::provider_fixture;
 use serde_json::{Value, json};
@@ -53,8 +55,13 @@ async fn a_broker_without_telemetry_records_every_decision_on_stdout() {
     let policies = private.join("policies.cedar");
     write_owner_only(
         &policies,
-        br#"@id("caller-upper")
-permit(principal == Dekopon::Principal::"caller",
+        br#"@id("chat-agent-session")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent");
+
+@id("cpetersen-upper")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe");"#,
     );
@@ -74,7 +81,9 @@ permit(principal == Dekopon::Principal::"caller",
                 "uid": uid,
                 "principal": "caller",
                 "actor": {"type": "agent", "agent": "brokerd-test"},
+                "attestor": {},
             }],
+            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
             "constraintSets": {
                 "cli-probe.upper": {
                     "provider": "cli-probe",
@@ -119,7 +128,10 @@ permit(principal == Dekopon::Principal::"caller",
     let client = BrokerClient::new(&socket, uid, FrameLimits::default()).expect("client");
     let result = client
         .invoke(
-            None,
+            Some(Attestation::for_subject(
+                "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                "chat-agent".parse().expect("valid agent"),
+            )),
             InvocationRequest {
                 id: "invoke-stdout".parse().expect("invocation"),
                 capability: "cli-probe.upper".parse().expect("capability"),
@@ -164,7 +176,7 @@ permit(principal == Dekopon::Principal::"caller",
         .expect("the decision reached stdout");
     assert_eq!(decision["capability.id"], "cli-probe.upper");
     assert_eq!(decision["decision.allowed"], true);
-    assert_eq!(decision["policy.ids"], "caller-upper");
+    assert_eq!(decision["policy.ids"], "cpetersen-upper");
     assert_eq!(decision["policy.revision"], "policy-test");
     assert!(decision["policy.digest"].is_string(), "{decision}");
     assert_eq!(decision["target"], "dekopon_broker::audit");

@@ -73,7 +73,13 @@ async fn ipc_process_boundary() {
             },
         )
         .unwrap();
-        let result = client.capabilities().await;
+        let result = client
+            .session_surface(Some(dekopon_broker_protocol::Attestation::for_subject(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "chat-agent".parse().unwrap(),
+            )))
+            .await
+            .map(|(capabilities, _, _)| capabilities);
         match role.as_str() {
             "mapped" | "owner" => assert_eq!(result.expect("mapped OS peer accepted").len(), 1),
             "wrong-pin" | "wrong-group" => {
@@ -164,19 +170,21 @@ async fn ipc_process_boundary() {
         "credentials": [{"name": "fixture-token", "kind": "bearerToken", "scheme": "Bearer", "destinations": ["example.com"], "secret": "IPC-PRIVATE-SENTINEL"}]
     })).unwrap()).unwrap();
     let policy = private.join("policy.cedar");
-    fs::write(&policy, r#"permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe");"#).unwrap();
+    fs::write(&policy, r#"permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe");"#).unwrap();
     let socket = ipc.join("broker.sock");
     let config = private.join("broker.json");
     let mut identities = vec![
-        json!({"uid": client_uid, "principal": "caller", "actor": {"type": "service", "principal": "caller"}}),
+        json!({"uid": client_uid, "principal": "caller", "actor": {"type": "service", "principal": "caller"}, "attestor": {}}),
     ];
     if root {
-        identities.push(json!({"uid": server_uid, "principal": "caller", "actor": {"type": "service", "principal": "caller"}}));
+        identities.push(json!({"uid": server_uid, "principal": "caller", "actor": {"type": "service", "principal": "caller"}, "attestor": {}}));
     }
     fs::write(&config, serde_json::to_vec(&json!({
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
         "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
+        "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
         "constraintSets": {"cli-probe.upper": {"provider": "cli-probe", "effect": "read-only", "risk": "Low", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
     })).unwrap()).unwrap();
     for path in [&provider, &credentials, &policy, &config] {

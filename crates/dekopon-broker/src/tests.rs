@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use dekopon_broker_host::BrokerHostError;
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
@@ -459,7 +461,6 @@ fn capability_authority_commits_exactly_these_fields() {
         effect: dekopon_capability::EffectKind::ReadOnly,
         risk: dekopon_core::RiskLevel::Low,
         credential: Some("probe-token".to_owned()),
-        credential_by_agent: Default::default(),
         constraints: ExecutionConstraints::default(),
     };
     let mut encoded = AuthorityEncoder::new();
@@ -696,7 +697,6 @@ fn policy_http_scope_values_are_bounded() {
             effect: dekopon_capability::EffectKind::ReadOnly,
             risk: dekopon_core::RiskLevel::Low,
             credential: None,
-            credential_by_agent: Default::default(),
             constraints: ExecutionConstraints {
                 http: Some(http),
                 ..ExecutionConstraints::default()
@@ -795,61 +795,68 @@ fn policy_http_scope_values_are_bounded() {
 }
 
 #[test]
-fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
+fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
     let document = r#"{
         "provider": "gh",
         "effect": "external-write",
         "risk": "Medium",
         "credential": "github-pat",
-        "credentialByAgent": { "nestedset-github": "github-pat-scientist-hq" },
         "constraints": { "timeoutMs": 1000, "maxOutputBytes": 1024 }
     }"#;
-    let set = serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
-    assert_eq!(
-        set.credential_by_agent
-            .get(&"nestedset-github".parse::<AgentId>().expect("valid agent")),
-        Some(&"github-pat-scientist-hq".to_owned())
-    );
-
-    let agent = |name: &str| Actor::Agent {
-        agent: name.parse::<AgentId>().expect("valid agent"),
+    let named =
+        serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
+    let unnamed = super::ConstraintSet {
+        credential: None,
+        ..named.clone()
     };
+    let agent = |name: &str| name.parse::<AgentId>().expect("valid agent");
+    let catalog = super::ConstraintCatalog::new([(
+        "gh.pull-request.merge"
+            .parse::<CapabilityId>()
+            .expect("valid capability"),
+        named.clone(),
+    )])
+    .expect("one set builds a catalog")
+    .with_agent_credentials(BTreeMap::from([(
+        agent("nestedset-github"),
+        BTreeMap::from([(
+            "github-pat".to_owned(),
+            "github-pat-scientist-hq".to_owned(),
+        )]),
+    )]));
+    let actor = |name: &str| Actor::Agent { agent: agent(name) };
+
     assert_eq!(
-        set.credential_for(&agent("nestedset-github")),
+        catalog.credential_for(&named, &actor("nestedset-github")),
         Some("github-pat-scientist-hq")
     );
     assert_eq!(
-        set.credential_for(&agent("dekoponville-github")),
+        catalog.credential_for(&named, &actor("dekoponville-github")),
         Some("github-pat")
     );
     assert_eq!(
-        set.credential_for(&Actor::Service {
-            principal: "local-user"
-                .parse::<PrincipalId>()
-                .expect("valid principal"),
-        }),
+        catalog.credential_for(
+            &named,
+            &Actor::Service {
+                principal: "local-user"
+                    .parse::<PrincipalId>()
+                    .expect("valid principal"),
+            }
+        ),
         Some("github-pat")
     );
-
-    assert!(
-        serde_json::from_str::<super::ConstraintSet>(
-            &document.replace("nestedset-github", "Nested Set")
-        )
-        .is_err(),
-        "a map key that is not a valid agent identifier must not decode"
+    assert_eq!(
+        catalog.credential_for(&unnamed, &actor("nestedset-github")),
+        None
     );
 
-    let without = serde_json::from_str::<super::ConstraintSet>(&document.replace(
-        r#""credentialByAgent": { "nestedset-github": "github-pat-scientist-hq" },"#,
-        "",
-    ))
-    .expect("a set with no overrides decodes");
-    assert!(without.credential_by_agent.is_empty());
     assert!(
-        !serde_json::to_string(&without)
-            .expect("serializes")
-            .contains("credentialByAgent"),
-        "an empty override map must stay off the wire"
+        serde_json::from_str::<super::ConstraintSet>(&document.replace(
+            r#""credential": "github-pat","#,
+            r#""credential": "github-pat", "credentialByAgent": {},"#,
+        ))
+        .is_err(),
+        "the retired per-set override key must not decode"
     );
 }
 
@@ -927,7 +934,6 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         effect: EffectKind::LocalWrite,
         risk: dekopon_core::RiskLevel::Low,
         credential: None,
-        credential_by_agent: Default::default(),
         constraints: ExecutionConstraints {
             asset: Some(AssetConstraints {
                 attach: true,

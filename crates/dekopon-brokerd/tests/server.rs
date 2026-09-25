@@ -51,28 +51,18 @@ fn context(principal: &str) -> AuthenticatedContext {
     .expect("trusted context binds")
 }
 
-const DIRECT_POLICY: &str = r#"
-@id("caller-upper")
-permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"cli-probe.upper",
-       resource == Dekopon::Provider::"cli-probe")
-when { context has agent && context.agent == "brokerd-test" }
-unless { context has via };
-"#;
-
-const ATTESTED_POLICY: &str = r#"
+const POLICY: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"chat-agent")
-when { context has via && context.via == "caller" };
+when { context.via == "caller" };
 
 @id("chat-agent-upper")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context has via && context.via == "caller"
-    && context has agent && context.agent == "chat-agent" };
+when { context.via == "caller" && context.agent == "chat-agent" };
 "#;
 
 fn probe_constraint_set() -> ConstraintSet {
@@ -84,7 +74,6 @@ fn probe_constraint_set() -> ConstraintSet {
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         credential: None,
-        credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),
     }
 }
@@ -151,10 +140,11 @@ fn bind_fixture(path: &Path) -> UnixListener {
 }
 
 async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
-    broker_with_audit_bound(8).await
+    broker_with(POLICY, 8).await
 }
 
-async fn broker_with_audit_bound(
+async fn broker_with(
+    policies: &str,
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
@@ -171,10 +161,10 @@ async fn broker_with_audit_bound(
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-test".to_owned(),
-            probe_engine(DIRECT_POLICY, ["caller"]),
+            probe_engine(policies, ["caller", "cpetersen"]),
             probe_catalog(),
             CredentialStore::empty(),
-            IdentityDirectory::empty(),
+            identities(),
             Arc::clone(&audit),
             BrokerLimits::default(),
         )
@@ -191,51 +181,28 @@ fn subject() -> ExternalSubject {
         .expect("canonical subject fixture")
 }
 
+fn identities() -> IdentityDirectory {
+    IdentityDirectory::new([(
+        subject(),
+        "cpetersen"
+            .parse::<PrincipalId>()
+            .expect("valid principal fixture"),
+    )])
+    .expect("one mapping builds a directory")
+}
+
 fn agent(name: &str) -> AgentId {
     name.parse::<AgentId>().expect("valid agent fixture")
+}
+
+fn session() -> Attestation {
+    Attestation::for_subject(subject(), agent("chat-agent"))
 }
 
 fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     }
-}
-
-async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("load cli-probe fixture");
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let identities = IdentityDirectory::new([(
-        subject(),
-        "cpetersen"
-            .parse::<PrincipalId>()
-            .expect("valid principal fixture"),
-    )])
-    .expect("one mapping builds a directory");
-    let broker = Arc::new(
-        Broker::new(
-            registry,
-            "broker-test"
-                .parse::<PrincipalId>()
-                .expect("valid broker principal"),
-            "policy-test".to_owned(),
-            probe_engine(
-                &format!("{DIRECT_POLICY}\n{ATTESTED_POLICY}"),
-                ["caller", "cpetersen"],
-            ),
-            probe_catalog(),
-            CredentialStore::empty(),
-            identities,
-            Arc::clone(&audit),
-            BrokerLimits::default(),
-        )
-        .expect("attested broker starts"),
-    );
-    (broker, audit)
 }
 
 fn server_limits() -> ServerLimits {
@@ -261,7 +228,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         uid,
         MappedPeer {
             context: context("caller"),
-            attestor: None,
+            attestor: Some(attestor_grant()),
         },
     );
     let limits = server_limits();
@@ -271,14 +238,14 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let (_, words, _) = client
-        .session_surface(None)
+        .session_surface(Some(session()))
         .await
         .expect("inspect the surface");
     assert_eq!(words, ["probe"]);
 
     match client
         .run_command(
-            None,
+            Some(session()),
             "probe".to_owned(),
             vec!["--help".to_owned()],
             None,
@@ -302,7 +269,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 
     let (capability, input) = match client
         .run_command(
-            None,
+            Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
             Some("hello".to_owned()),
@@ -323,7 +290,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 
     let result = client
         .invoke(
-            None,
+            Some(session()),
             InvocationRequest {
                 id: "invoke-probe-upper"
                     .parse::<InvocationId>()
@@ -352,18 +319,25 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
+async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
     let uid = current_uid();
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = broker().await;
+    let (broker, audit) = broker_with(
+        &format!(
+            "{POLICY}\n{}",
+            r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#
+        ),
+        8,
+    )
+    .await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
         MappedPeer {
             context: context("caller"),
-            attestor: None,
+            attestor: Some(attestor_grant()),
         },
     );
     let limits = server_limits();
@@ -372,19 +346,31 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let capabilities = client.capabilities().await.expect("inspect capabilities");
-    assert_eq!(capabilities.len(), 1);
-    assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
-    let result = client
-        .invoke(None, request("invoke-brokerd"), Default::default())
-        .await
-        .expect("invoke");
-    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        result.result.output,
-        Some(json!({"text": "HELLO THROUGH BROKER"}))
+    assert!(
+        client
+            .capabilities()
+            .await
+            .expect("inspect capabilities")
+            .is_empty()
     );
-    assert_eq!(audit.records().len(), 2);
+    let (capabilities, words, _) = client
+        .session_surface(None)
+        .await
+        .expect("inspect the surface");
+    assert!(capabilities.is_empty() && words.is_empty());
+    let result = client
+        .invoke(None, request("invoke-direct"), Default::default())
+        .await
+        .expect("a denial is a completed invocation response");
+    assert_eq!(result.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(result.result.error.as_deref(), Some("policy-error"));
+    assert_eq!(audit.records().len(), 1);
+
+    let (capabilities, _, _) = client
+        .session_surface(Some(session()))
+        .await
+        .expect("the same peer may still attest a session");
+    assert_eq!(capabilities.len(), 1);
 
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -461,15 +447,19 @@ async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization()
             .expect("write HTTP response");
     });
 
-    let policies = r#"@id("caller-fetch")
-permit(principal == Dekopon::Principal::"caller",
+    let policies = r#"@id("chat-agent-session")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent");
+
+@id("cpetersen-fetch")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"http-probe.fetch",
        resource == Dekopon::Provider::"http-probe")
-when { context has agent && context.agent == "brokerd-test" }
-unless { context has via };
+when { context.agent == "chat-agent" };
 
-@id("caller-secret")
-permit(principal == Dekopon::Principal::"caller",
+@id("cpetersen-secret")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"secret.use",
        resource == Dekopon::Secret::"drn:com.xrl:secret:test:api/token")
 when { context.capability == "http-probe.fetch"
@@ -489,7 +479,6 @@ when { context.capability == "http-probe.fetch"
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         credential: None,
-        credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints {
             asset: None,
             timeout_ms: 5_000,
@@ -517,8 +506,10 @@ when { context.capability == "http-probe.fetch"
         "identities": [{
             "uid": uid,
             "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
+            "actor": {"type": "agent", "agent": "brokerd-test"},
+            "attestor": {}
         }],
+        "principals": {"cpetersen": {"subjects": [SLACK_SUBJECT]}},
         "constraintSets": {
             "http-probe.fetch": serde_json::to_value(set).expect("constraint set")
         }
@@ -555,7 +546,7 @@ when { context.capability == "http-probe.fetch"
         }),
     };
     let result = client
-        .invoke(None, invocation.clone(), Default::default())
+        .invoke(Some(session()), invocation.clone(), Default::default())
         .await
         .expect("secret invocation succeeds");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
@@ -572,7 +563,7 @@ when { context.capability == "http-probe.fetch"
         "method": "GET"
     });
     let denied = client
-        .invoke(None, invocation, Default::default())
+        .invoke(Some(session()), invocation, Default::default())
         .await
         .expect("host refusal is accounted");
     assert_eq!(denied.result.outcome, InvocationOutcome::Failed);
@@ -609,13 +600,13 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = broker_with_audit_bound(1).await;
+    let (broker, audit) = broker_with(POLICY, 1).await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
         MappedPeer {
             context: context("caller"),
-            attestor: None,
+            attestor: Some(attestor_grant()),
         },
     );
     let limits = server_limits();
@@ -626,7 +617,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let ran = client
         .invoke(
-            None,
+            Some(session()),
             request("invoke-outcome-unaudited"),
             Default::default(),
         )
@@ -643,7 +634,11 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     assert_eq!(audit.records().len(), 1);
 
     let never_ran = client
-        .invoke(None, request("invoke-never-ran"), Default::default())
+        .invoke(
+            Some(session()),
+            request("invoke-never-ran"),
+            Default::default(),
+        )
         .await
         .expect_err("a full audit cannot authorize");
     let ClientError::Remote {
@@ -679,7 +674,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = attested_broker().await;
+    let (broker, audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -696,7 +691,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
         .invoke(
-            Some(Attestation::for_subject(subject(), agent("chat-agent"))),
+            Some(session()),
             request("invoke-attested-socket"),
             Default::default(),
         )
@@ -727,7 +722,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = attested_broker().await;
+    let (broker, audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -744,7 +739,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let result = client
         .invoke(
-            Some(Attestation::for_subject(subject(), agent("chat-agent"))),
+            Some(session()),
             request("invoke-ungranted-socket"),
             Default::default(),
         )
@@ -774,7 +769,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = attested_broker().await;
+    let (broker, audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -835,7 +830,7 @@ async fn attested_capabilities_over_the_socket() {
 
     let granted_path = directory.path().join("granted.sock");
     let granted_listener = bind_fixture(&granted_path);
-    let (broker, _audit) = attested_broker().await;
+    let (granted_broker, _audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -844,25 +839,18 @@ async fn attested_capabilities_over_the_socket() {
             attestor: Some(attestor_grant()),
         },
     );
-    let granted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let granted =
+        BrokerServer::new(granted_broker, identities, limits).expect("server limits valid");
     let (granted_stop, granted_stopped) = oneshot::channel::<()>();
     let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
     let (capabilities, _, _) = client
-        .session_surface(Some(Attestation::for_subject(
-            subject(),
-            agent("chat-agent"),
-        )))
+        .session_surface(Some(session()))
         .await
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
-    let own = client
-        .capabilities()
-        .await
-        .expect("the peer still sees its own grants");
-    assert_eq!(own.len(), 1);
 
     granted_stop.send(()).expect("signal clean shutdown");
     granted_task
@@ -872,7 +860,7 @@ async fn attested_capabilities_over_the_socket() {
 
     let ungranted_path = directory.path().join("ungranted.sock");
     let ungranted_listener = bind_fixture(&ungranted_path);
-    let (broker, _audit) = attested_broker().await;
+    let (ungranted_broker, _audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -881,17 +869,15 @@ async fn attested_capabilities_over_the_socket() {
             attestor: None,
         },
     );
-    let ungranted = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let ungranted =
+        BrokerServer::new(ungranted_broker, identities, limits).expect("server limits valid");
     let (ungranted_stop, ungranted_stopped) = oneshot::channel::<()>();
     let ungranted_task =
         tokio::spawn(ungranted.serve(ungranted_listener, shutdown_on(ungranted_stopped)));
 
     let client = BrokerClient::new(&ungranted_path, uid, limits.frame).expect("client starts");
     let refused = client
-        .session_surface(Some(Attestation::for_subject(
-            subject(),
-            agent("chat-agent"),
-        )))
+        .session_surface(Some(session()))
         .await
         .expect_err("a peer without attestor authority is refused");
     let ClientError::Remote { code, .. } = refused else {
@@ -1107,11 +1093,19 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     let capability: CapabilityId = "http-probe.purge".parse().unwrap();
     let provider: ProviderId = "http-probe".parse().unwrap();
     let world = PolicyWorld::new(
-        ["caller".parse::<PrincipalId>().unwrap()],
+        [
+            "caller".parse::<PrincipalId>().unwrap(),
+            "cpetersen".parse().unwrap(),
+        ],
         [(capability.clone(), provider.clone())],
     )
     .unwrap();
-    let engine = PolicyEngine::new(r#"permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe");"#, &world).unwrap();
+    let engine = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe");"#,
+        &world,
+    )
+    .unwrap();
     let catalog = ConstraintCatalog::new([(
         capability.clone(),
         ConstraintSet {
@@ -1120,7 +1114,6 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
             effect: EffectKind::ExternalWrite,
             risk: RiskLevel::High,
             credential: None,
-            credential_by_agent: Default::default(),
             constraints: ExecutionConstraints {
                 asset: Some(AssetConstraints {
                     attach: true,
@@ -1141,7 +1134,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
             engine,
             catalog,
             CredentialStore::empty(),
-            IdentityDirectory::empty(),
+            identities(),
             Arc::clone(&audit),
             BrokerLimits::default(),
         )
@@ -1154,7 +1147,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
             uid,
             MappedPeer {
                 context: context("caller"),
-                attestor: None,
+                attestor: Some(attestor_grant()),
             },
         )]),
         limits,
@@ -1167,7 +1160,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "attach"});
     let attached = client
-        .invoke(None, invocation, InvokeAssets::default())
+        .invoke(Some(session()), invocation, InvokeAssets::default())
         .await
         .unwrap();
     assert_eq!(attached.result.outcome, InvocationOutcome::Succeeded);
@@ -1184,7 +1177,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     invocation.input = json!({"assetMode": "send", "reference": "chat-asset:1"});
     let sent = client
         .invoke(
-            None,
+            Some(session()),
             invocation,
             InvokeAssets {
                 rows: vec![AssetRow {
@@ -1210,7 +1203,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "direct-write", "bytes": 1025});
     let refused = client
-        .invoke(None, invocation, InvokeAssets::default())
+        .invoke(Some(session()), invocation, InvokeAssets::default())
         .await
         .unwrap();
     assert_eq!(refused.result.outcome, InvocationOutcome::Failed);
@@ -1233,9 +1226,10 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     let mut invocation = request("failed-asset-response-write");
     invocation.capability = capability;
     invocation.input = json!({"assetMode": "attach"});
+    let attestation = session().bound_to(invocation.id.clone());
     stream
         .write_frame(
-            &RequestEnvelope::invoke(None, invocation, vec![], 0),
+            &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0),
             &[],
             limits.frame,
         )

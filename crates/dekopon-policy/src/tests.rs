@@ -76,8 +76,13 @@ fn secret_request(principal: &str, context: PolicyContext) -> PolicyRequest {
 fn via(name: &str) -> PolicyContext {
     PolicyContext {
         via: Some(name.to_owned()),
+        agent: Some("reviewer".to_owned()),
         ..PolicyContext::default()
     }
+}
+
+fn session() -> PolicyContext {
+    via("dekopond-gateway")
 }
 
 #[test]
@@ -89,7 +94,7 @@ fn empty_policy_text_is_valid_and_permits_nothing() {
         let decision = engine.authorize(capability_request(
             "cpetersen",
             "cli-probe.upper",
-            PolicyContext::default(),
+            session(),
         ));
         assert_eq!(decision, PolicyDecision::default());
         assert!(!decision.allowed);
@@ -171,62 +176,59 @@ fn strict_validation_rejects_attributes_an_action_never_carries() {
 }
 
 #[test]
-fn context_conditions_isolate_attested_and_direct_authority() {
+fn a_direct_peer_is_refused_every_action_and_an_attested_session_meets_policy() {
     let engine = PolicyEngine::new(
         r#"
         @id("attested-upper")
         permit(principal == Dekopon::Principal::"cpetersen",
                action == Dekopon::Action::"cli-probe.upper",
                resource == Dekopon::Provider::"cli-probe")
-        when { context has via && context.via == "dekopond-gateway" };
+        when { context.via == "dekopond-gateway" };
 
-        @id("direct-reverse")
-        permit(principal == Dekopon::Principal::"direct-caller",
-               action == Dekopon::Action::"cli-probe.reverse",
-               resource == Dekopon::Provider::"cli-probe")
-        unless { context has via };
+        @id("direct-everything")
+        permit(principal == Dekopon::Principal::"direct-caller", action, resource);
         "#,
-        &world(),
+        &world_with_secret(),
     )
     .expect("the workflow policy set validates");
 
     let attested = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.upper",
-        via("dekopond-gateway"),
+        session(),
     ));
     assert!(attested.allowed);
     assert_eq!(attested.determining_policy_ids, ["attested-upper"]);
+    assert!(
+        !engine
+            .authorize(capability_request(
+                "cpetersen",
+                "cli-probe.upper",
+                via("someone-elses-gateway"),
+            ))
+            .allowed
+    );
 
-    let direct = engine.authorize(capability_request(
-        "cpetersen",
-        "cli-probe.upper",
-        PolicyContext::default(),
-    ));
-    assert!(!direct.allowed);
-    assert!(direct.determining_policy_ids.is_empty());
-
-    let other_gateway = engine.authorize(capability_request(
-        "cpetersen",
-        "cli-probe.upper",
-        via("someone-elses-gateway"),
-    ));
-    assert!(!other_gateway.allowed);
-
-    let direct_grant = engine.authorize(capability_request(
-        "direct-caller",
-        "cli-probe.reverse",
-        PolicyContext::default(),
-    ));
-    assert!(direct_grant.allowed);
-    assert_eq!(direct_grant.determining_policy_ids, ["direct-reverse"]);
-
-    let borrowed = engine.authorize(capability_request(
-        "direct-caller",
-        "cli-probe.reverse",
-        via("dekopond-gateway"),
-    ));
-    assert!(!borrowed.allowed);
+    let no_agent = PolicyContext {
+        via: Some("dekopond-gateway".to_owned()),
+        ..PolicyContext::default()
+    };
+    for (context, why) in [
+        (PolicyContext::default(), "no attestation"),
+        (no_agent, "an attestation naming no agent"),
+    ] {
+        for request in [
+            capability_request("direct-caller", "cli-probe.reverse", context.clone()),
+            prompt_request("direct-caller", "reviewer", context.clone()),
+            secret_request("direct-caller", context.clone()),
+        ] {
+            let decision = engine.authorize(request);
+            assert!(!decision.allowed, "{why}");
+            assert!(decision.errors_present, "{why}");
+            assert!(decision.refusal.is_some(), "{why}");
+            assert!(decision.determining_policy_ids.is_empty(), "{why}");
+        }
+    }
 }
 
 #[test]
@@ -237,7 +239,7 @@ fn agent_prompt_matches_the_named_agent_only() {
         permit(principal == Dekopon::Principal::"cpetersen",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"pr-summarizer-linter")
-        when { context has via && context.via == "dekopond-gateway" };
+        when { context.via == "dekopond-gateway" };
         "#,
         &world(),
     )
@@ -298,7 +300,7 @@ fn forbid_overrides_permit_and_is_reported_as_the_reason() {
     let permitted = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.upper",
-        PolicyContext::default(),
+        session(),
     ));
     assert!(permitted.allowed);
     assert_eq!(permitted.determining_policy_ids, ["broad-permit"]);
@@ -306,7 +308,7 @@ fn forbid_overrides_permit_and_is_reported_as_the_reason() {
     let forbidden = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.reverse",
-        PolicyContext::default(),
+        session(),
     ));
     assert!(!forbidden.allowed);
     assert_eq!(forbidden.determining_policy_ids, ["no-reverse"]);
@@ -343,7 +345,7 @@ fn an_unconstrained_action_scope_names_no_capability() {
             .authorize(capability_request(
                 "cpetersen",
                 "cli-probe.upper",
-                PolicyContext::default()
+                session()
             ))
             .allowed
     );
@@ -510,10 +512,9 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
 }
 
 #[test]
-fn the_conversation_record_gates_every_action_and_is_absent_for_a_direct_peer() {
+fn the_conversation_record_gates_every_action() {
     fn chat(kind: &str, container: Option<&str>, id: &str, thread: Option<&str>) -> PolicyContext {
         PolicyContext {
-            via: Some("dekopond-gateway".to_owned()),
             transport_kind: Some("discord".to_owned()),
             transport: Some("elote-logs".to_owned()),
             conversation: Some(super::PolicyConversation {
@@ -522,7 +523,7 @@ fn the_conversation_record_gates_every_action_and_is_absent_for_a_direct_peer() 
                 id: id.to_owned(),
                 thread: thread.map(str::to_owned),
             }),
-            ..PolicyContext::default()
+            ..session()
         }
     }
 
@@ -533,7 +534,7 @@ permit(
   action == Dekopon::Action::"cli-probe.upper",
   resource == Dekopon::Provider::"cli-probe"
 ) when {
-  context has via && context.via == "dekopond-gateway"
+  context.via == "dekopond-gateway"
   && context has conversation && ["channel", "thread"].contains(context.conversation.kind)
   && context.conversation.id == "1338356895504793623"
 };
@@ -582,11 +583,7 @@ permit(
             false,
             "another channel",
         ),
-        (
-            PolicyContext::default(),
-            false,
-            "a direct peer has no conversation",
-        ),
+        (session(), false, "a session outside any conversation"),
     ] {
         let decision =
             engine.authorize(capability_request("cpetersen", "cli-probe.upper", context));
@@ -702,7 +699,7 @@ permit(
   action == Dekopon::Action::"cli-probe.upper",
   resource == Dekopon::Provider::"cli-probe"
 ) when {
-  context has via && context.via == "dekopond-gateway"
+  context.via == "dekopond-gateway"
   && context has channel && context.channel == "1338356895504793623"
 };
 "#;
@@ -711,14 +708,13 @@ permit(
     assert_eq!(engine.policy_count(), 1);
 
     let context = PolicyContext {
-        via: Some("dekopond-gateway".to_owned()),
         conversation: Some(super::PolicyConversation {
             kind: "channel".to_owned(),
             container: None,
             id: "1338356895504793623".to_owned(),
             thread: None,
         }),
-        ..PolicyContext::default()
+        ..session()
     };
     let decision = engine.authorize(capability_request("cpetersen", "cli-probe.upper", context));
     assert!(
@@ -740,9 +736,7 @@ fn every_action_declares_exactly_these_context_attributes() {
     let capability_context = json!({
         "type": "Record",
         "attributes": {
-            "via": { "type": "String", "required": false },
             "subject": { "type": "String", "required": false },
-            "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
             "trigger": { "type": "String", "required": false },
@@ -756,6 +750,8 @@ fn every_action_declares_exactly_these_context_attributes() {
                     "thread": { "type": "String", "required": false },
                 },
             },
+            "via": { "type": "String" },
+            "agent": { "type": "String" },
             "effect": { "type": "String" },
             "risk": { "type": "String" },
         }
@@ -763,9 +759,7 @@ fn every_action_declares_exactly_these_context_attributes() {
     let prompt_context = json!({
         "type": "Record",
         "attributes": {
-            "via": { "type": "String", "required": false },
             "subject": { "type": "String", "required": false },
-            "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
             "trigger": { "type": "String", "required": false },
@@ -779,14 +773,14 @@ fn every_action_declares_exactly_these_context_attributes() {
                     "thread": { "type": "String", "required": false },
                 },
             },
+            "via": { "type": "String" },
+            "agent": { "type": "String" },
         }
     });
     let secret_context = json!({
         "type": "Record",
         "attributes": {
-            "via": { "type": "String", "required": false },
             "subject": { "type": "String", "required": false },
-            "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
             "trigger": { "type": "String", "required": false },
@@ -800,6 +794,8 @@ fn every_action_declares_exactly_these_context_attributes() {
                     "thread": { "type": "String", "required": false },
                 },
             },
+            "via": { "type": "String" },
+            "agent": { "type": "String" },
             "capability": { "type": "String" },
             "provider": { "type": "String" },
             "sink": { "type": "String" },
@@ -874,7 +870,7 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
             .authorize(capability_request(
                 "cpetersen",
                 "cli-probe.upper",
-                PolicyContext::default()
+                session()
             ))
             .allowed,
         "the loaded capability in a tolerating policy must still be granted"
@@ -1020,7 +1016,7 @@ fn a_request_the_schema_cannot_express_says_so() {
     let decision = engine.authorize(capability_request(
         "cpetersen",
         "gh.pull-request.approve",
-        PolicyContext::default(),
+        session(),
     ));
     assert!(!decision.allowed);
     assert!(decision.errors_present);
@@ -1037,7 +1033,7 @@ fn a_request_the_schema_cannot_express_says_so() {
             .authorize(capability_request(
                 "direct-caller",
                 "cli-probe.upper",
-                PolicyContext::default()
+                session()
             ))
             .refusal
             .is_none()
@@ -1062,7 +1058,7 @@ fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
             .authorize(capability_request(
                 "cpetersen",
                 "cli-probe.reverse",
-                PolicyContext::default()
+                session()
             ))
             .allowed,
         "a forbid must override the permit it overlaps"
@@ -1083,13 +1079,13 @@ fn capability_permission_does_not_imply_secret_use() {
             .authorize(capability_request(
                 "cpetersen",
                 "cli-probe.upper",
-                PolicyContext::default()
+                session()
             ))
             .allowed
     );
     assert!(
         !engine
-            .authorize(secret_request("cpetersen", PolicyContext::default()))
+            .authorize(secret_request("cpetersen", session()))
             .allowed
     );
 }
@@ -1109,7 +1105,7 @@ fn secret_use_is_a_separate_exact_resource_decision() {
         &world_with_secret(),
     )
     .expect("secret policy validates");
-    let allowed = engine.authorize(secret_request("cpetersen", PolicyContext::default()));
+    let allowed = engine.authorize(secret_request("cpetersen", session()));
     assert!(allowed.allowed, "{allowed:?}");
     assert_eq!(allowed.determining_policy_ids, ["secret-use"]);
 
@@ -1199,11 +1195,8 @@ fn a_group_grant_reaches_its_members_and_no_one_else() {
         ("isaac", true),
         ("direct-caller", false),
     ] {
-        let decision = engine.authorize(capability_request(
-            principal,
-            "cli-probe.upper",
-            PolicyContext::default(),
-        ));
+        let decision =
+            engine.authorize(capability_request(principal, "cli-probe.upper", session()));
         assert_eq!(decision.allowed, allowed, "{principal}");
     }
 }
@@ -1234,12 +1227,12 @@ fn the_read_only_group_holds_reads_and_never_writes() {
     let read = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.upper",
-        PolicyContext::default(),
+        session(),
     ));
     let write = engine.authorize(capability_request(
         "cpetersen",
         "cli-probe.reverse",
-        PolicyContext::default(),
+        session(),
     ));
     assert!(read.allowed);
     assert!(!write.allowed);
@@ -1257,16 +1250,8 @@ fn the_provider_group_holds_every_capability_and_unless_carves_one_out() {
         &grouped_world(),
     )
     .expect("provider group loads");
-    let upper = engine.authorize(capability_request(
-        "isaac",
-        "cli-probe.upper",
-        PolicyContext::default(),
-    ));
-    let reverse = engine.authorize(capability_request(
-        "isaac",
-        "cli-probe.reverse",
-        PolicyContext::default(),
-    ));
+    let upper = engine.authorize(capability_request("isaac", "cli-probe.upper", session()));
+    let reverse = engine.authorize(capability_request("isaac", "cli-probe.reverse", session()));
     assert!(upper.allowed);
     assert_eq!(upper.determining_policy_ids, ["all-but-reverse"]);
     assert!(!reverse.allowed);

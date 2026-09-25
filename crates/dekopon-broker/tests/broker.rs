@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialRefreshError,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency,
-    PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog, SecretMaterial,
-    SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker,
+    BrokerBuildError, BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    CredentialRefreshError, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, Leniency, PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog,
+    SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
@@ -25,6 +25,8 @@ const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
+const GATEWAY: &str = "gateway";
+
 fn principal(name: &str) -> PrincipalId {
     name.parse::<PrincipalId>()
         .expect("valid principal fixture")
@@ -40,11 +42,32 @@ fn subject(canonical: &str) -> ExternalSubject {
         .expect("canonical subject fixture")
 }
 
-fn context(principal: &str) -> AuthenticatedContext {
-    agent_context(principal, "provider-test")
+fn caller_subject(name: &str) -> ExternalSubject {
+    subject(&format!("slack.t0123abc.{}", name.replace('-', "")))
 }
 
-fn agent_context(name: &str, agent_name: &str) -> AuthenticatedContext {
+fn callers<'a>(names: impl IntoIterator<Item = &'a str>) -> IdentityDirectory {
+    IdentityDirectory::new(
+        names
+            .into_iter()
+            .map(|name| (caller_subject(name), principal(name))),
+    )
+    .expect("distinct caller fixtures build a directory")
+}
+
+fn session(name: &str, agent_name: &str) -> AuthenticatedContext {
+    AuthenticatedContext::attested(
+        principal(name),
+        Actor::Agent {
+            agent: agent(agent_name),
+        },
+        principal(GATEWAY),
+        caller_subject(name),
+    )
+    .expect("attested context is valid")
+}
+
+fn direct_peer(name: &str, agent_name: &str) -> AuthenticatedContext {
     AuthenticatedContext::new(
         principal(name),
         Actor::Agent {
@@ -52,6 +75,25 @@ fn agent_context(name: &str, agent_name: &str) -> AuthenticatedContext {
         },
     )
     .expect("trusted agent context is valid")
+}
+
+async fn invoke_as(
+    broker: &Broker<InMemoryAuditLog>,
+    name: &str,
+    agent_name: &str,
+    request: InvocationRequest,
+) -> Result<AssetInvocationResult, BrokerError> {
+    let attestation = Attestation::for_subject(caller_subject(name), agent(agent_name))
+        .bound_to(request.id.clone());
+    broker
+        .invoke(
+            &service_context(GATEWAY),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&attestation),
+            request,
+            Default::default(),
+        )
+        .await
 }
 
 fn service_context(name: &str) -> AuthenticatedContext {
@@ -96,9 +138,15 @@ fn set_with_metadata(
         effect,
         risk,
         credential: None,
-        credential_by_agent: BTreeMap::new(),
         constraints,
     }
+}
+
+fn rebind_for_nestedset(name: &str, rebound: &str) -> BTreeMap<AgentId, BTreeMap<String, String>> {
+    BTreeMap::from([(
+        agent("nestedset-github"),
+        BTreeMap::from([(name.to_owned(), rebound.to_owned())]),
+    )])
 }
 
 fn catalog<'a>(entries: impl IntoIterator<Item = (&'a str, ConstraintSet)>) -> ConstraintCatalog {
@@ -203,29 +251,20 @@ fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
     )
 }
 
-fn direct_provider_policy(
-    name: &str,
-    agent_name: &str,
-    provider: &str,
-    capability: &str,
-) -> String {
+fn provider_policy(name: &str, agent_name: &str, provider: &str, capability: &str) -> String {
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
                   resource == Dekopon::Provider::"{provider}")
-           when {{ context has agent && context.agent == "{agent_name}" }}
-           unless {{ context has via }};"#
+           when {{ context.via == "{GATEWAY}" && context.agent == "{agent_name}" }};
+{}"#,
+        agent_prompt_policy(name, agent_name, GATEWAY)
     )
 }
 
-fn direct_http_policy(name: &str, agent_name: &str, capability: &str) -> String {
-    direct_provider_policy(name, agent_name, "http-probe", capability)
+fn http_policy(name: &str, agent_name: &str, capability: &str) -> String {
+    provider_policy(name, agent_name, "http-probe", capability)
 }
-
-const DIRECT_PEER_HTTP_POLICY: &str = r#"permit(principal == Dekopon::Principal::"direct-peer",
-       action == Dekopon::Action::"http-probe.fetch",
-       resource == Dekopon::Provider::"http-probe")
-unless { context has via };"#;
 
 fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
@@ -245,14 +284,8 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
-fn direct_policy(name: &str, agent_name: &str, capability: &str) -> String {
-    format!(
-        r#"permit(principal == Dekopon::Principal::"{name}",
-                  action == Dekopon::Action::"{capability}",
-                  resource == Dekopon::Provider::"cli-probe")
-           when {{ context has agent && context.agent == "{agent_name}" }}
-           unless {{ context has via }};"#
-    )
+fn probe_policy(name: &str, agent_name: &str, capability: &str) -> String {
+    provider_policy(name, agent_name, "cli-probe", capability)
 }
 
 fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
@@ -260,7 +293,7 @@ fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
         r#"permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"agent.prompt",
                   resource == Dekopon::Agent::"{agent_name}")
-           when {{ context has via && context.via == "{via}" }};"#
+           when {{ context.via == "{via}" }};"#
     )
 }
 
@@ -269,8 +302,8 @@ fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) ->
         r#"permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
                   resource == Dekopon::Provider::"cli-probe")
-           when {{ context has via && context.via == "{via}"
-                && context has agent && context.agent == "{agent_name}" }};"#
+           when {{ context.via == "{via}"
+                && context.agent == "{agent_name}" }};"#
     )
 }
 
@@ -343,7 +376,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
             .expect("valid broker principal"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.upper"),
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog([(
@@ -351,26 +384,24 @@ async fn policy_authorizes_and_audits_no_payloads() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the policy matches loaded provider metadata");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-once",
-                "cli-probe.upper",
-                json!({"text": "top-secret-payload"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("authorized invocation is accounted");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-once",
+            "cli-probe.upper",
+            json!({"text": "top-secret-payload"}),
+        ),
+    )
+    .await
+    .expect("authorized invocation is accounted");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -406,7 +437,11 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             .expect("valid broker principal"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("allowed-caller", "provider-test", "cli-probe.upper"),
+            &format!(
+                "{}\n{}",
+                probe_policy("allowed-caller", "provider-test", "cli-probe.upper"),
+                agent_prompt_policy("other-caller", "provider-test", GATEWAY),
+            ),
             ["allowed-caller", "other-caller"],
         ),
         catalog([(
@@ -414,32 +449,34 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["allowed-caller", "other-caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("policy is coherent");
 
-    let allowed = broker.capabilities(&context("allowed-caller"));
+    let allowed = broker.capabilities(&session("allowed-caller", "provider-test"));
     assert_eq!(allowed.len(), 1);
     assert_eq!(allowed[0].provider.as_str(), "cli-probe");
     assert_eq!(allowed[0].capability.id.as_str(), "cli-probe.upper");
-    assert!(broker.capabilities(&context("other-caller")).is_empty());
+    assert!(
+        broker
+            .capabilities(&session("other-caller", "provider-test"))
+            .is_empty()
+    );
 
-    let result = broker
-        .invoke(
-            &context("other-caller"),
-            None,
-            None,
-            request(
-                "invoke-denied",
-                "cli-probe.upper",
-                json!({"text": "secret"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("policy denial is audited");
+    let result = invoke_as(
+        &broker,
+        "other-caller",
+        "provider-test",
+        request(
+            "invoke-denied",
+            "cli-probe.upper",
+            json!({"text": "secret"}),
+        ),
+    )
+    .await
+    .expect("policy denial is audited");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
@@ -471,7 +508,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             set("different-provider", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         audit,
         BrokerLimits::default(),
     )
@@ -502,7 +539,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             ),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         audit,
         BrokerLimits::default(),
     )
@@ -535,7 +572,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             set("jsonplaceholder", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         audit,
         BrokerLimits::default(),
     )
@@ -583,38 +620,32 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        http_probe_engine(&direct_http_policy(
-            "caller",
-            "provider-test",
-            "http-probe.fetch",
-        )),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the HTTP constraint set matches trusted metadata and host ceilings");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-http",
-                "http-probe.fetch",
-                json!({
-                    "uri": format!("http://{authority}/private-path?token=query-secret"),
-                    "method": "POST",
-                    "headers": [{"name": "x-private-input", "value": "header-secret"}],
-                    "body": "body-secret"
-                }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("authorized HTTP request succeeds");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-http",
+            "http-probe.fetch",
+            json!({
+                "uri": format!("http://{authority}/private-path?token=query-secret"),
+                "method": "POST",
+                "headers": [{"name": "x-private-input", "value": "header-secret"}],
+                "body": "body-secret"
+            }),
+        ),
+    )
+    .await
+    .expect("authorized HTTP request succeeds");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -688,7 +719,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-jsonplaceholder".to_owned(),
-        jsonplaceholder_engine(&direct_provider_policy(
+        jsonplaceholder_engine(&provider_policy(
             "caller",
             "provider-test",
             "jsonplaceholder",
@@ -710,57 +741,53 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             ),
         ]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the external-write constraint set exactly matches trusted provider metadata");
-    let available = broker.capabilities(&context("caller"));
+    let available = broker.capabilities(&session("caller", "provider-test"));
     assert_eq!(available.len(), 1);
     assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
     assert_eq!(available[0].capability.risk, RiskLevel::Medium);
-    let read = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-json-read-with-write-rule",
-                "jsonplaceholder.posts.get",
-                json!({
-                    "postId": 7,
-                    "endpoint": format!("http://{authority}")
-                }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("ungranted read is denied and audited");
+    let read = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-json-read-with-write-rule",
+            "jsonplaceholder.posts.get",
+            json!({
+                "postId": 7,
+                "endpoint": format!("http://{authority}")
+            }),
+        ),
+    )
+    .await
+    .expect("ungranted read is denied and audited");
     assert_eq!(
         read.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
     assert_eq!(read.result.error.as_deref(), Some("policy-denied"));
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-json-write",
-                "jsonplaceholder.posts.create",
-                json!({
-                    "userId": 3,
-                    "title": "private title",
-                    "body": "private body",
-                    "endpoint": format!("http://{authority}")
-                }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("authorized JSONPlaceholder write succeeds");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-json-write",
+            "jsonplaceholder.posts.create",
+            json!({
+                "userId": 3,
+                "title": "private title",
+                "body": "private body",
+                "endpoint": format!("http://{authority}")
+            }),
+        ),
+    )
+    .await
+    .expect("authorized JSONPlaceholder write succeeds");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -827,7 +854,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-jsonplaceholder".to_owned(),
-        jsonplaceholder_engine(&direct_provider_policy(
+        jsonplaceholder_engine(&provider_policy(
             "caller",
             "provider-test",
             "jsonplaceholder",
@@ -843,31 +870,29 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
             ),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the external-write constraint set exactly matches trusted provider metadata");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-json-write-failure",
-                "jsonplaceholder.posts.create",
-                json!({
-                    "userId": 3,
-                    "title": "private title",
-                    "body": "private body",
-                    "endpoint": format!("http://{authority}")
-                }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("a failing provider is still durably accounted");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-json-write-failure",
+            "jsonplaceholder.posts.create",
+            json!({
+                "userId": 3,
+                "title": "private title",
+                "body": "private body",
+                "endpoint": format!("http://{authority}")
+            }),
+        ),
+    )
+    .await
+    .expect("a failing provider is still durably accounted");
 
     let wire = server.request();
     assert!(
@@ -964,11 +989,7 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        http_probe_engine(&direct_http_policy(
-            "caller",
-            "provider-test",
-            "http-probe.fetch",
-        )),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
@@ -978,26 +999,24 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
             },
         )]),
         credentials,
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the credentialed constraint set matches store and destinations");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-credentialed",
-                "http-probe.fetch",
-                json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("authorized credentialed request succeeds");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-credentialed",
+            "http-probe.fetch",
+            json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+        ),
+    )
+    .await
+    .expect("authorized credentialed request succeeds");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -1106,11 +1125,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         registry,
         principal("broker-test"),
         "policy-test".to_owned(),
-        http_probe_engine(&direct_http_policy(
-            "caller",
-            "provider-test",
-            "http-probe.fetch",
-        )),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
@@ -1120,26 +1135,24 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
             },
         )]),
         credentials,
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("a refreshing credential proves its destinations at startup");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-refreshing",
-                "http-probe.fetch",
-                json!({ "uri": format!("http://{authority}/images/generations"), "method": "GET" }),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("the renewed credential serves the invocation");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-refreshing",
+            "http-probe.fetch",
+            json!({ "uri": format!("http://{authority}/images/generations"), "method": "GET" }),
+        ),
+    )
+    .await
+    .expect("the renewed credential serves the invocation");
 
     assert_eq!(
         result.result.outcome,
@@ -1210,11 +1223,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
         registry,
         principal("broker-test"),
         "policy-test".to_owned(),
-        http_probe_engine(&direct_http_policy(
-            "caller",
-            "provider-test",
-            "http-probe.fetch",
-        )),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
@@ -1228,24 +1237,22 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
             source as Arc<dyn RefreshingCredential>,
         )])
         .expect("credential store builds"),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("the constraint set matches the credential's destinations");
 
-    let caller = context("caller");
     let invoke = |id: &'static str| {
-        broker.invoke(
-            &caller,
-            None,
-            None,
+        invoke_as(
+            &broker,
+            "caller",
+            "provider-test",
             request(
                 id,
                 "http-probe.fetch",
                 json!({ "uri": format!("http://{authority}/"), "method": "GET" }),
             ),
-            Default::default(),
         )
     };
 
@@ -1310,7 +1317,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
     let authority = server.authority().to_owned();
     let policy = format!(
         "{}\n{}",
-        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        http_policy("caller", "provider-test", "http-probe.fetch"),
         r#"@id("caller-secret-use")
            permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
@@ -1330,7 +1337,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
             set("http-probe", loopback_constraints(&authority)),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
@@ -1368,8 +1375,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
     proposal.secret_use = Some(SecretUseProposal::HttpBearer {
         secret: secret_drn(),
     });
-    let result = broker
-        .invoke(&context("caller"), None, None, proposal, Default::default())
+    let result = invoke_as(&broker, "caller", "provider-test", proposal)
         .await
         .expect("dual-authorized invocation completes");
     assert_eq!(
@@ -1408,14 +1414,10 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
         registry,
         principal("broker-test"),
         "policy-test".to_owned(),
-        http_probe_secret_engine(&direct_http_policy(
-            "caller",
-            "provider-test",
-            "http-probe.fetch",
-        )),
+        http_probe_secret_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
@@ -1449,8 +1451,7 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
     proposal.secret_use = Some(SecretUseProposal::HttpBearer {
         secret: secret_drn(),
     });
-    let result = broker
-        .invoke(&context("caller"), None, None, proposal, Default::default())
+    let result = invoke_as(&broker, "caller", "provider-test", proposal)
         .await
         .expect("denial audited");
     assert_eq!(
@@ -1484,7 +1485,7 @@ fn basic_secret_broker(
 ) -> Broker<InMemoryAuditLog> {
     let policy = format!(
         "{}\n{}",
-        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        http_policy("caller", "provider-test", "http-probe.fetch"),
         r#"@id("caller-basic-secret-use")
            permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
@@ -1503,7 +1504,7 @@ fn basic_secret_broker(
             set("http-probe", loopback_constraints(authority)),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(audit),
         BrokerLimits::default(),
     )
@@ -1545,7 +1546,7 @@ async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
 
     let proposed = broker
         .run_command(
-            &context("caller"),
+            &session("caller", "provider-test"),
             None,
             None,
             "httpprobe",
@@ -1601,7 +1602,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
 
     let proposed = bound_user
         .run_command(
-            &context("caller"),
+            &session("caller", "provider-test"),
             None,
             None,
             "httpprobe",
@@ -1629,32 +1630,28 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
         secret_use: secret_use.clone(),
     };
 
-    let refused = other_user
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            submit("invoke-basic-other-user"),
-            Default::default(),
-        )
-        .await
-        .expect("denial audited");
+    let refused = invoke_as(
+        &other_user,
+        "caller",
+        "provider-test",
+        submit("invoke-basic-other-user"),
+    )
+    .await
+    .expect("denial audited");
     assert_eq!(
         refused.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
     assert_eq!(refused.result.error.as_deref(), Some("secret-denied"));
 
-    let allowed = bound_user
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            submit("invoke-basic-bound-user"),
-            Default::default(),
-        )
-        .await
-        .expect("dual-authorized invocation completes");
+    let allowed = invoke_as(
+        &bound_user,
+        "caller",
+        "provider-test",
+        submit("invoke-basic-bound-user"),
+    )
+    .await
+    .expect("dual-authorized invocation completes");
     assert_eq!(
         allowed.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -1691,7 +1688,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
     let authority = "127.0.0.1:9";
     let policy = format!(
         "{}\n{}",
-        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        http_policy("caller", "provider-test", "http-probe.fetch"),
         r#"permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
                   resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
@@ -1707,7 +1704,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
             set("http-probe", loopback_constraints(authority)),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
@@ -1741,8 +1738,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
     proposal.secret_use = Some(SecretUseProposal::HttpBearer {
         secret: secret_drn(),
     });
-    let result = broker
-        .invoke(&context("caller"), None, None, proposal, Default::default())
+    let result = invoke_as(&broker, "caller", "provider-test", proposal)
         .await
         .expect("source failure is a normal audited result");
     assert_eq!(
@@ -1774,7 +1770,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     .expect("HTTP provider fixture loads");
     let server = LoopbackServer::serving(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-        3,
+        2,
     );
     let authority = server.authority().to_owned();
     let credentials = CredentialStore::new([
@@ -1805,12 +1801,11 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         "policy-test".to_owned(),
         engine(
             &format!(
-                "{}\n{}\n{}",
-                direct_http_policy("caller", "dekoponville-github", "http-probe.fetch"),
-                direct_http_policy("caller", "nestedset-github", "http-probe.fetch"),
-                DIRECT_PEER_HTTP_POLICY,
+                "{}\n{}",
+                http_policy("caller", "dekoponville-github", "http-probe.fetch"),
+                http_policy("caller", "nestedset-github", "http-probe.fetch"),
             ),
-            ["caller", "direct-peer"],
+            ["caller"],
             [("http-probe.fetch", "http-probe")],
         ),
         catalog([(
@@ -1818,59 +1813,45 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
             ConstraintSet {
                 route: CapabilityRoute::Generic,
                 credential: Some("github-pat".to_owned()),
-                credential_by_agent: BTreeMap::from([(
-                    agent("nestedset-github"),
-                    "github-pat-scientist-hq".to_owned(),
-                )]),
                 ..set("http-probe", loopback_constraints(&authority))
             },
-        )]),
+        )])
+        .with_agent_credentials(rebind_for_nestedset(
+            "github-pat",
+            "github-pat-scientist-hq",
+        )),
         credentials,
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("both the default and the override match the store and its destinations");
 
-    let fetch =
-        |id: &'static str, context: AuthenticatedContext| {
-            let authority = authority.clone();
-            let broker = &broker;
-            async move {
-                let result = broker
-                .invoke(
-                    &context,
-                    None,
-                    None,
-                    request(
-                        id,
-                        "http-probe.fetch",
-                        json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-                    ), Default::default())
-                .await
-                .expect("the authorized request is accounted");
-                assert_eq!(
-                    result.result.outcome,
-                    dekopon_capability::InvocationOutcome::Succeeded
-                );
-            }
-        };
-    fetch(
-        "invoke-nestedset",
-        agent_context("caller", "nestedset-github"),
-    )
-    .await;
-    fetch(
-        "invoke-dekoponville",
-        agent_context("caller", "dekoponville-github"),
-    )
-    .await;
-    fetch("invoke-direct", service_context("direct-peer")).await;
+    for (id, agent_name) in [
+        ("invoke-nestedset", "nestedset-github"),
+        ("invoke-dekoponville", "dekoponville-github"),
+    ] {
+        let result = invoke_as(
+            &broker,
+            "caller",
+            agent_name,
+            request(
+                id,
+                "http-probe.fetch",
+                json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+            ),
+        )
+        .await
+        .expect("the authorized request is accounted");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Succeeded
+        );
+    }
 
     let wire = || server.request_text();
     for (index, (present, absent)) in [
         (OVERRIDE_SECRET, DEFAULT_SECRET),
-        (DEFAULT_SECRET, OVERRIDE_SECRET),
         (DEFAULT_SECRET, OVERRIDE_SECRET),
     ]
     .into_iter()
@@ -1898,7 +1879,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         .collect::<Vec<_>>();
     assert_eq!(
         selected,
-        ["github-pat-scientist-hq", "github-pat", "github-pat"],
+        ["github-pat-scientist-hq", "github-pat"],
         "each terminal record names the credential its own invocation selected"
     );
     let serialized = serde_json::to_string(&records).expect("audit serializes");
@@ -1909,7 +1890,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
+async fn a_rebinding_never_adds_a_credential_to_a_set_that_names_none() {
     const SECRET: &str = "scientist-hq-token";
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
@@ -1939,71 +1920,56 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
         "policy-test".to_owned(),
         http_probe_engine(&format!(
             "{}\n{}",
-            direct_http_policy("caller", "dekoponville-github", "http-probe.fetch"),
-            direct_http_policy("caller", "nestedset-github", "http-probe.fetch"),
+            http_policy("caller", "dekoponville-github", "http-probe.fetch"),
+            http_policy("caller", "nestedset-github", "http-probe.fetch"),
         )),
         catalog([(
             "http-probe.fetch",
-            ConstraintSet {
-                route: CapabilityRoute::Generic,
-                credential: None,
-                credential_by_agent: BTreeMap::from([(
-                    agent("nestedset-github"),
-                    "github-pat-scientist-hq".to_owned(),
-                )]),
-                ..set("http-probe", loopback_constraints(&authority))
-            },
-        )]),
+            set("http-probe", loopback_constraints(&authority)),
+        )])
+        .with_agent_credentials(rebind_for_nestedset(
+            "github-pat",
+            "github-pat-scientist-hq",
+        )),
         credentials,
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
-    .expect("an override with no default is a coherent set");
+    .expect("a rebinding of a name no set uses is inert");
 
     for (id, agent_name) in [
         ("invoke-nestedset", "nestedset-github"),
         ("invoke-dekoponville", "dekoponville-github"),
     ] {
-        broker
-            .invoke(
-                &agent_context("caller", agent_name),
-                None,
-                None,
-                request(
-                    id,
-                    "http-probe.fetch",
-                    json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-                ),
-                Default::default(),
-            )
-            .await
-            .expect("the authorized request is accounted");
+        invoke_as(
+            &broker,
+            "caller",
+            agent_name,
+            request(
+                id,
+                "http-probe.fetch",
+                json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+            ),
+        )
+        .await
+        .expect("the authorized request is accounted");
     }
 
-    let wire = || server.request_text();
-    assert!(wire().contains(&format!("authorization: Bearer {SECRET}")));
-    let unauthenticated = wire();
-    assert!(
-        !unauthenticated
-            .to_ascii_lowercase()
-            .contains("authorization"),
-        "an unmatched agent must send no credential at all: {unauthenticated}"
-    );
+    for index in 0..2 {
+        let request = server.request_text();
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization"),
+            "request {index} carried a credential its set never named: {request}"
+        );
+    }
     server.join();
 
-    let records = audit.records();
-    let encoded = serde_json::to_value(&records).expect("audit serializes");
-    let selected = encoded
-        .as_array()
-        .expect("records serialize as an array")
-        .iter()
-        .filter_map(|record| record["credential"].as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected,
-        ["github-pat-scientist-hq"],
-        "an invocation with no credential names none, rather than naming the empty one"
+    let serialized = serde_json::to_string(&audit.records()).expect("audit serializes");
+    assert!(!serialized.contains(SECRET), "audit leaked a secret");
+    assert!(
+        !serialized.contains("\"credential\""),
+        "an invocation with no credential names none: {serialized}"
     );
 }
 
@@ -2047,7 +2013,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         ])
         .expect("credential store builds")
     };
-    let build_set = |set: ConstraintSet, store: CredentialStore| {
+    let build_set = |set: ConstraintSet, store: CredentialStore, rebound: Option<String>| {
         let registry_limits = BrokerHostLimits::default();
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
         async move {
@@ -2064,7 +2030,11 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                     .expect("valid broker principal"),
                 "policy-test".to_owned(),
                 http_probe_engine(""),
-                catalog([("http-probe.fetch", set)]),
+                catalog([("http-probe.fetch", set)]).with_agent_credentials(
+                    rebound.map_or_else(BTreeMap::new, |credential| {
+                        rebind_for_nestedset("fetch-token", &credential)
+                    }),
+                ),
                 store,
                 IdentityDirectory::empty(),
                 audit,
@@ -2080,6 +2050,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                 ..set("http-probe", constraints)
             },
             store,
+            None,
         )
     };
     let build_override = |credential: String, constraints: ExecutionConstraints| {
@@ -2087,10 +2058,10 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
             ConstraintSet {
                 route: CapabilityRoute::Generic,
                 credential: Some("fetch-token".to_owned()),
-                credential_by_agent: BTreeMap::from([(agent("nestedset-github"), credential)]),
                 ..set("http-probe", constraints)
             },
             store(),
+            Some(credential),
         )
     };
 
@@ -2154,10 +2125,8 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     ));
 }
 
-/// Via-isolation must fail closed both ways: an attested context must never match a policy written
-/// for direct peers, nor the reverse, even with identical principal and agent.
 #[tokio::test(flavor = "multi_thread")]
-async fn via_isolation_holds_in_both_directions() {
+async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_policy() {
     let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
     let broker = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
@@ -2166,11 +2135,11 @@ async fn via_isolation_holds_in_both_directions() {
         probe_engine(
             &format!(
                 "{}\n{}\n{}",
-                direct_policy("caller", "provider-test", "cli-probe.reverse"),
-                attested_policy("cpetersen", "some-agent", "gateway", "cli-probe.upper"),
-                agent_prompt_policy("cpetersen", "some-agent", "gateway"),
+                r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#,
+                attested_policy("cpetersen", "some-agent", GATEWAY, "cli-probe.upper"),
+                agent_prompt_policy("cpetersen", "some-agent", GATEWAY),
             ),
-            ["caller", "cpetersen", "gateway"],
+            ["caller", "cpetersen", GATEWAY],
         ),
         catalog([
             (
@@ -2187,9 +2156,9 @@ async fn via_isolation_holds_in_both_directions() {
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
-    .expect("direct and attested grants coexist in one policy set");
+    .expect("an unconditional grant and an attested grant coexist in one policy set");
 
-    let gateway = service_context("gateway");
+    let gateway = service_context(GATEWAY);
     let grant = attestor_grant(["slack.t0123abc"]);
     let subject = subject(SLACK_SUBJECT);
 
@@ -2214,32 +2183,6 @@ async fn via_isolation_holds_in_both_directions() {
     assert_eq!(
         attested.result.output,
         Some(json!({"text": "ON BEHALF OF"}))
-    );
-
-    let direct = broker
-        .invoke(
-            &agent_context("cpetersen", "some-agent"),
-            None,
-            None,
-            request(
-                "invoke-direct-as-mapped",
-                "cli-probe.upper",
-                json!({"text": "direct"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("direct proposal is accounted");
-    assert_eq!(
-        direct.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(direct.result.error.as_deref(), Some("policy-denied"));
-    assert!(
-        broker
-            .capabilities(&agent_context("cpetersen", "some-agent"))
-            .is_empty(),
-        "an attested rule must be invisible to the same principal connecting directly"
     );
 
     let crossed = broker
@@ -2275,19 +2218,47 @@ async fn via_isolation_holds_in_both_directions() {
         .0;
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].capability.id.as_str(), "cli-probe.upper");
-    let direct_visible = broker.capabilities(&context("caller"));
-    assert_eq!(direct_visible.len(), 1);
-    assert_eq!(
-        direct_visible[0].capability.id.as_str(),
-        "cli-probe.reverse"
-    );
+
+    for (id, peer) in [
+        (
+            "invoke-direct-granted",
+            direct_peer("caller", "provider-test"),
+        ),
+        ("invoke-direct-service", service_context("caller")),
+        (
+            "invoke-direct-as-mapped",
+            direct_peer("cpetersen", "some-agent"),
+        ),
+    ] {
+        let direct = broker
+            .invoke(
+                &peer,
+                None,
+                None,
+                request(id, "cli-probe.upper", json!({"text": "direct"})),
+                Default::default(),
+            )
+            .await
+            .expect("direct proposal is accounted");
+        assert_eq!(
+            direct.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied,
+            "{id}"
+        );
+        assert_eq!(direct.result.error.as_deref(), Some("policy-error"), "{id}");
+        assert_eq!(
+            broker.capability_view(&peer),
+            (Vec::new(), Vec::new()),
+            "{id}"
+        );
+    }
     assert!(
         broker.capabilities(&gateway).is_empty(),
         "attestor authority is not capability: the gateway holds nothing of its own"
     );
 
     let records = audit.records();
-    assert_eq!(records.len(), 4, "one allow plus execution, two denials");
+    assert_eq!(records.len(), 6, "one allow plus execution, four denials");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2591,7 +2562,7 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.reverse"),
+            &probe_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
         ),
         catalog([(
@@ -2599,7 +2570,7 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
     )
@@ -2623,25 +2594,23 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
     .expect("an unconstrained action scope names no capability, so startup has nothing to check");
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-unconstrained",
-                "cli-probe.reverse",
-                json!({"text": "x"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("the refusal is accounted");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-unconstrained",
+            "cli-probe.reverse",
+            json!({"text": "x"}),
+        ),
+    )
+    .await
+    .expect("the refusal is accounted");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
@@ -2652,7 +2621,7 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
     );
     assert!(
         broker
-            .capabilities(&context("caller"))
+            .capabilities(&session("caller", "provider-test"))
             .iter()
             .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
         "a capability with no constraint set is never listed"
@@ -2668,8 +2637,9 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
         "policy-test".to_owned(),
         probe_engine(
             &format!(
-                "@id(\"caller-upper\")\n{}",
-                direct_policy("caller", "provider-test", "cli-probe.upper")
+                "@id(\"caller-upper\")\n{}\n{}",
+                probe_policy("caller", "provider-test", "cli-probe.upper"),
+                agent_prompt_policy("other-caller", "provider-test", GATEWAY),
             ),
             ["caller", "other-caller"],
         ),
@@ -2678,7 +2648,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller", "other-caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
@@ -2686,30 +2656,26 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let digest = broker.policy_digest().to_owned();
     assert!(digest.starts_with("sha256:"));
 
-    broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request("invoke-explained", "cli-probe.upper", json!({"text": "hi"})),
-            Default::default(),
-        )
-        .await
-        .expect("the allowed invocation is accounted");
-    broker
-        .invoke(
-            &context("other-caller"),
-            None,
-            None,
-            request(
-                "invoke-unexplained",
-                "cli-probe.upper",
-                json!({"text": "hi"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("the denial is accounted");
+    invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request("invoke-explained", "cli-probe.upper", json!({"text": "hi"})),
+    )
+    .await
+    .expect("the allowed invocation is accounted");
+    invoke_as(
+        &broker,
+        "other-caller",
+        "provider-test",
+        request(
+            "invoke-unexplained",
+            "cli-probe.upper",
+            json!({"text": "hi"}),
+        ),
+    )
+    .await
+    .expect("the denial is accounted");
 
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
@@ -2730,7 +2696,7 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.reverse"),
+            &probe_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
         ),
         catalog([(
@@ -2738,7 +2704,7 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Tolerant,
@@ -2752,20 +2718,18 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
             if capability.as_str() == "cli-probe.reverse"
     ));
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-tolerated",
-                "cli-probe.reverse",
-                json!({"text": "x"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("the refusal is accounted");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-tolerated",
+            "cli-probe.reverse",
+            json!({"text": "x"}),
+        ),
+    )
+    .await
+    .expect("the refusal is accounted");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
@@ -2776,7 +2740,7 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     );
     assert!(
         broker
-            .capabilities(&context("caller"))
+            .capabilities(&session("caller", "provider-test"))
             .iter()
             .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
         "a tolerated capability is still never listed"
@@ -2801,12 +2765,12 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.upper"),
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted.clone()),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
     )
@@ -2822,12 +2786,12 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.upper"),
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
         Leniency::Tolerant,
@@ -2842,16 +2806,14 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     ));
     assert_eq!(warnings[0].reason(), "unrouted-constraint-set");
 
-    let result = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request("invoke-routed", "cli-probe.upper", json!({"text": "x"})),
-            Default::default(),
-        )
-        .await
-        .expect("the routed capability still executes");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request("invoke-routed", "cli-probe.upper", json!({"text": "x"})),
+    )
+    .await
+    .expect("the routed capability still executes");
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -2866,7 +2828,7 @@ async fn command_words_are_filtered_by_what_policy_allows() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.upper"),
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller", "stranger"],
         ),
         catalog([(
@@ -2874,26 +2836,40 @@ async fn command_words_are_filtered_by_what_policy_allows() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
     )
     .expect("broker starts");
 
-    assert_eq!(broker.command_words(&context("caller")), ["probe"]);
-    assert!(broker.command_words(&context("stranger")).is_empty());
-    assert_eq!(broker.capabilities(&context("caller")).len(), 1);
+    assert_eq!(
+        broker.command_words(&session("caller", "provider-test")),
+        ["probe"]
+    );
     assert!(
-        broker.capabilities(&context("stranger")).is_empty(),
+        broker
+            .command_words(&session("stranger", "provider-test"))
+            .is_empty()
+    );
+    assert_eq!(
+        broker
+            .capabilities(&session("caller", "provider-test"))
+            .len(),
+        1
+    );
+    assert!(
+        broker
+            .capabilities(&session("stranger", "provider-test"))
+            .is_empty(),
         "the ungranted context reaches nothing, which is what makes its empty vocabulary meaningful"
     );
     for name in ["caller", "stranger"] {
         assert_eq!(
-            broker.capability_view(&context(name)),
+            broker.capability_view(&session(name, "provider-test")),
             (
-                broker.capabilities(&context(name)),
-                broker.command_words(&context(name))
+                broker.capabilities(&session(name, "provider-test")),
+                broker.command_words(&session(name, "provider-test"))
             ),
             "the combined view must be the same answer as the two listings it replaces"
         );
@@ -2908,7 +2884,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            &direct_policy("caller", "provider-test", "cli-probe.upper"),
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog([(
@@ -2916,7 +2892,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
@@ -2925,7 +2901,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
 
     let error = broker
         .run_command(
-            &context("caller"),
+            &session("caller", "provider-test"),
             None,
             None,
             "gh",
@@ -2959,13 +2935,13 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
             set("cli-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
     )
     .expect("broker starts");
-    let caller = context("caller");
+    let caller = session("caller", "provider-test");
 
     match broker
         .run_command(&caller, None, None, "probe", &["--help".to_owned()], None)

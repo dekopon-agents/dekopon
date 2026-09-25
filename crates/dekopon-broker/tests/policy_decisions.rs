@@ -22,25 +22,23 @@ const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
 const POLICIES: &str = r#"
-@id("direct-upper")
+@id("unconditional-upper")
 permit(principal == Dekopon::Principal::"direct-caller",
        action == Dekopon::Action::"cli-probe.upper",
-       resource == Dekopon::Provider::"cli-probe")
-when { context has agent && context.agent == "provider-test" }
-unless { context has via };
+       resource == Dekopon::Provider::"cli-probe");
 
 @id("attested-reverse")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.reverse",
        resource == Dekopon::Provider::"cli-probe")
-when { context has via && context.via == "gateway"
-    && context has agent && context.agent == "some-agent" };
+when { context.via == "gateway"
+    && context.agent == "some-agent" };
 
 @id("prompt-gate")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"some-agent")
-when { context has via && context.via == "gateway" };
+when { context.via == "gateway" };
 "#;
 
 fn principal(name: &str) -> PrincipalId {
@@ -74,17 +72,17 @@ struct Row {
 
 const TABLE: &[Row] = &[
     Row {
-        label: "direct caller reaches its own direct grant",
+        label: "a direct peer is denied even an unconditional grant naming it",
         principal: "direct-caller",
         agent: "provider-test",
         via: None,
         capability: "cli-probe.upper",
-        allowed: true,
+        allowed: false,
     },
     Row {
-        label: "direct caller does not reach the attested grant",
-        principal: "direct-caller",
-        agent: "provider-test",
+        label: "the mapped principal arriving directly matches nothing",
+        principal: "cpetersen",
+        agent: "some-agent",
         via: None,
         capability: "cli-probe.reverse",
         allowed: false,
@@ -98,25 +96,9 @@ const TABLE: &[Row] = &[
         allowed: true,
     },
     Row {
-        label: "attested caller does not reach the direct grant",
+        label: "attested caller does not reach another principal's grant",
         principal: "cpetersen",
         agent: "some-agent",
-        via: Some("gateway"),
-        capability: "cli-probe.upper",
-        allowed: false,
-    },
-    Row {
-        label: "the mapped principal arriving directly matches nothing",
-        principal: "cpetersen",
-        agent: "some-agent",
-        via: None,
-        capability: "cli-probe.reverse",
-        allowed: false,
-    },
-    Row {
-        label: "the direct grant is not reachable through a gateway",
-        principal: "direct-caller",
-        agent: "provider-test",
         via: Some("gateway"),
         capability: "cli-probe.upper",
         allowed: false,
@@ -127,14 +109,6 @@ const TABLE: &[Row] = &[
         agent: "other-agent",
         via: Some("gateway"),
         capability: "cli-probe.reverse",
-        allowed: false,
-    },
-    Row {
-        label: "an out-of-scope principal matches nothing",
-        principal: "someone-else",
-        agent: "provider-test",
-        via: None,
-        capability: "cli-probe.upper",
         allowed: false,
     },
 ];
@@ -148,7 +122,6 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )
@@ -160,7 +133,6 @@ fn policy_engine() -> PolicyEngine {
             principal("cpetersen"),
             principal("direct-caller"),
             principal("gateway"),
-            principal("someone-else"),
         ],
         [
             (capability("cli-probe.upper"), provider()),
