@@ -120,33 +120,25 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             MAPPED_PRINCIPAL: {"subjects": [MAPPED_SUBJECT]},
             OTHER_MAPPED_PRINCIPAL: {"subjects": [OTHER_MAPPED_SUBJECT]}
         },
-        "constraintSets": {
-            "cli-probe.upper": {
-                "provider": "cli-probe", "effect": "read-only", "risk": "Low",
-                "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576}
+        "capabilities": {
+            "cli-probe": {
+                "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+                "capabilities": {"cli-probe.upper": {}}
             },
-            "memory.chat.record": {
-                "route": "chatMemoryRecord",
-                "provider": "memory-chat", "effect": "local-write", "risk": "Medium",
-                "constraints": {
-                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
-                    "storage": {"interface":"jsonl","access":"read-write","namespace":"chat"}
-                }
-            },
-            "memory.chat.recent": {
-                "route": "chatMemoryRecent",
-                "provider": "memory-chat", "effect": "read-only", "risk": "High",
+            "memory-chat": {
                 "constraints": {
                     "timeoutMs": 30_000, "maxOutputBytes": 131_072,
                     "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
-                }
-            },
-            "memory.chat.search": {
-                "route": "chatMemorySearch",
-                "provider": "memory-chat", "effect": "read-only", "risk": "High",
-                "constraints": {
-                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
-                    "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
+                },
+                "capabilities": {
+                    "memory.chat.record": {
+                        "route": "chatMemoryRecord",
+                        "constraints": {
+                            "storage": {"interface":"jsonl","access":"read-write","namespace":"chat"}
+                        }
+                    },
+                    "memory.chat.recent": {"route": "chatMemoryRecent"},
+                    "memory.chat.search": {"route": "chatMemorySearch"}
                 }
             }
         },

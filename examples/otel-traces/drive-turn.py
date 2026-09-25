@@ -144,9 +144,9 @@ permit(principal == Dekopon::Principal::"smoke-user",
                     "conversation": {"kind": "any", "ids": ["dev"]},
                     "localSubjectService": "tel"}]}}],
             "principals": {"smoke-user": {"subjects": ["tel.16034700182"]}},
-            "constraintSets": {"cli-probe.upper": {"provider": "cli-probe", "effect": "read-only",
-                "risk": "Low",
-                "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}},
+            "capabilities": {"cli-probe": {
+                "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
+                "capabilities": {"cli-probe.upper": {}}}},
             "telemetry": telemetry})
         broker = start("dekopon-brokerd", broker_config)
         ready("broker.sock", broker)

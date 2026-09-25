@@ -3,9 +3,9 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use dekopon_broker::{PolicyEngine, PolicyWorld};
+use dekopon_broker::{ConstraintSet, PolicyEngine, PolicyWorld};
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_brokerd::BrokerdConfig;
+use dekopon_brokerd::{BrokerdConfig, capabilities};
 use dekopon_capability::EffectKind;
 use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
@@ -61,6 +61,30 @@ fn world(config: &BrokerdConfig, registry: &BrokerProviderRegistry) -> PolicyWor
     .expect("the example's declared world is coherent")
 }
 
+fn constraint_sets(
+    config: &BrokerdConfig,
+    registry: &BrokerProviderRegistry,
+) -> BTreeMap<CapabilityId, ConstraintSet> {
+    let (sets, problems) = capabilities::constraint_sets(&config.capabilities, |provider| {
+        let declared = registry
+            .capabilities()
+            .filter(|(owner, _)| *owner == provider)
+            .map(|(_, capability)| capabilities::ManifestCapability {
+                id: &capability.id,
+                effect: capability.effect,
+                risk: capability.risk,
+            })
+            .collect::<Vec<_>>();
+        (!declared.is_empty()).then_some(declared)
+    });
+    assert_eq!(
+        problems,
+        [],
+        "the example's capabilities resolve against the loaded manifest"
+    );
+    sets
+}
+
 fn capability(name: &str) -> CapabilityId {
     name.parse().expect("valid capability identifier")
 }
@@ -75,7 +99,7 @@ fn attested(via: Option<&str>, agent: Option<&str>) -> PolicyContext {
 }
 
 fn capability_request(
-    sets: &BTreeMap<CapabilityId, dekopon_broker::ConstraintSet>,
+    sets: &BTreeMap<CapabilityId, ConstraintSet>,
     name: &str,
     context: PolicyContext,
 ) -> PolicyRequest {
@@ -110,6 +134,7 @@ async fn the_example_policy_compiles_against_the_checked_in_probe_provider() {
     let config = config();
     let registry = probe_registry().await;
     let world = world(&config, &registry);
+    let sets = constraint_sets(&config, &registry);
 
     let policy = PolicyEngine::new(&read("policies.cedar"), &world)
         .expect("the example policy validates against the world its own configuration declares");
@@ -117,7 +142,7 @@ async fn the_example_policy_compiles_against_the_checked_in_probe_provider() {
 
     for referenced in policy.referenced_capabilities() {
         assert!(
-            config.constraint_sets.contains_key(referenced),
+            sets.contains_key(referenced),
             "policy permits {referenced}, which has no constraint set in broker.yaml"
         );
     }
@@ -138,7 +163,7 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
     let registry = probe_registry().await;
     let world = world(&config, &registry);
     let policy = PolicyEngine::new(&read("policies.cedar"), &world).expect("example policy loads");
-    let sets = &config.constraint_sets;
+    let sets = &constraint_sets(&config, &registry);
 
     let session = policy.authorize(prompt_request(AGENT, attested(Some(GATEWAY), Some(AGENT))));
     assert!(session.allowed, "the mapped sender may drive the agent");
@@ -199,7 +224,7 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
     for name in UNGRANTED {
         let id = capability(name);
         assert!(
-            !config.constraint_sets.contains_key(&id),
+            !sets.contains_key(&id),
             "{name} must stay unconstrained in the example"
         );
         let decision = policy.authorize(PolicyRequest {
@@ -225,8 +250,8 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
         .map(|(provider, capability)| (capability.id.clone(), (provider.clone(), capability)))
         .collect::<BTreeMap<_, _>>();
 
-    let declared = config
-        .constraint_sets
+    let sets = constraint_sets(&config, &registry);
+    let declared = sets
         .keys()
         .map(|capability| capability.as_str())
         .collect::<Vec<_>>();
@@ -240,7 +265,7 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
         "the example declares exactly the read-and-conditional-write slice"
     );
 
-    for (id, set) in &config.constraint_sets {
+    for (id, set) in &sets {
         let (provider, capability) = manifest
             .get(id)
             .unwrap_or_else(|| panic!("{id} exists in the loaded http-probe manifest"));
@@ -277,8 +302,8 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
     }
 }
 
-#[test]
-fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
+#[tokio::test(flavor = "multi_thread")]
+async fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct File {
@@ -305,8 +330,8 @@ fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     assert_eq!(entry.kind, "bearerToken");
     assert_eq!(entry.scheme, "Bearer");
 
-    let config = config();
-    for (id, set) in &config.constraint_sets {
+    let sets = constraint_sets(&config(), &probe_registry().await);
+    for (id, set) in &sets {
         let Some(http) = &set.constraints.http else {
             continue;
         };
