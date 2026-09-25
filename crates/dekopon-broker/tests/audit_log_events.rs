@@ -1,42 +1,69 @@
 #![allow(clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dekopon_broker::{
-    AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
-    TraceOnlyAuditLog,
+    AssetInvocationResult, Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerError,
+    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
+    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, Redacted, RiskLevel,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
+    RiskLevel,
 };
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const SECRET: &str = "audit-log-record-must-never-see-this";
 
+const SUBJECT: &str = "slack.t0123abc.u9xyz";
+
 const POLICY: &str = r#"
 @id("http-fetch")
 permit(principal == Dekopon::Principal::"caller",
        action == Dekopon::Action::"http-probe.fetch",
        resource == Dekopon::Provider::"http-probe")
-when { context has agent && context.agent == "provider-test" };
+when { context.agent == "provider-test" };
+
+@id("prompt")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"provider-test");
 "#;
 
 fn principal(name: &str) -> PrincipalId {
     name.parse().expect("valid principal fixture")
 }
 
-fn caller() -> AuthenticatedContext {
-    AuthenticatedContext::new(
-        principal("caller"),
-        Actor::Agent {
-            agent: "provider-test".parse::<AgentId>().expect("valid agent"),
+async fn invoke_as_caller(
+    broker: &Broker<TraceOnlyAuditLog>,
+    request: InvocationRequest,
+) -> Result<AssetInvocationResult, BrokerError> {
+    let gateway = AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
         },
     )
-    .expect("trusted agent context is valid")
+    .expect("gateway context binds");
+    let attestation = Attestation::for_subject(
+        SUBJECT
+            .parse::<ExternalSubject>()
+            .expect("canonical subject"),
+        "provider-test".parse::<AgentId>().expect("valid agent"),
+    )
+    .bound_to(request.id.clone());
+    broker
+        .invoke(
+            &gateway,
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&attestation),
+            request,
+            Default::default(),
+        )
+        .await
 }
 
 fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRequest {
@@ -146,7 +173,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
                 credential: Some("fetch-token".to_owned()),
-                credential_by_agent: BTreeMap::new(),
                 constraints: loopback_constraints(&authority),
             },
         )])
@@ -161,37 +187,37 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
             .expect("valid credential fixture"),
         )])
         .expect("credential store builds"),
-        IdentityDirectory::empty(),
+        IdentityDirectory::new([(
+            SUBJECT
+                .parse::<ExternalSubject>()
+                .expect("canonical subject"),
+            principal("caller"),
+        )])
+        .expect("one mapping builds a directory"),
         Arc::new(TraceOnlyAuditLog),
         BrokerLimits::default(),
     )
     .expect("the credentialed constraint set matches store and destinations");
 
-    let allowed = broker
-        .invoke(
-            &caller(),
-            None,
-            None,
-            request(
-                "invoke-audited",
-                "http-probe.fetch",
-                serde_json::json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-            ), Default::default())
-        .await
-        .expect("authorized credentialed request succeeds");
+    let allowed = invoke_as_caller(
+        &broker,
+        request(
+            "invoke-audited",
+            "http-probe.fetch",
+            serde_json::json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+        ),
+    )
+    .await
+    .expect("authorized credentialed request succeeds");
     assert_eq!(allowed.result.outcome, InvocationOutcome::Succeeded);
     server.join();
 
-    let denied = broker
-        .invoke(
-            &caller(),
-            None,
-            None,
-            request("invoke-refused", "http-probe.absent", serde_json::json!({})),
-            Default::default(),
-        )
-        .await
-        .expect("an unconstrained capability is still an accounted decision");
+    let denied = invoke_as_caller(
+        &broker,
+        request("invoke-refused", "http-probe.absent", serde_json::json!({})),
+    )
+    .await
+    .expect("an unconstrained capability is still an accounted decision");
     assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
 
     let records = audit_records(&captured);

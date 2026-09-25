@@ -69,14 +69,14 @@ fn broker_policies() -> String {
 permit(principal == Dekopon::Principal::"{principal}",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"{AGENT}")
-when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}" }};
+when {{ context.via == "{GATEWAY_PRINCIPAL}" }};
 
 @id("chat-agent-probe-{suffix}")
 permit(principal == Dekopon::Principal::"{principal}",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
-     && context has agent && context.agent == "{AGENT}" }};
+when {{ context.via == "{GATEWAY_PRINCIPAL}"
+     && context.agent == "{AGENT}" }};
 
 @id("chat-agent-memory-{suffix}")
 permit(principal == Dekopon::Principal::"{principal}",
@@ -84,8 +84,8 @@ permit(principal == Dekopon::Principal::"{principal}",
                   Dekopon::Action::"memory.chat.recent",
                   Dekopon::Action::"memory.chat.search"],
        resource == Dekopon::Provider::"memory-chat")
-when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
-     && context has agent && context.agent == "{AGENT}"
+when {{ context.via == "{GATEWAY_PRINCIPAL}"
+     && context.agent == "{AGENT}"
      && context has transportKind && context.transportKind == "local"
      && context has transport && context.transport == "dev"
      && context has conversation && context.conversation.id == "dev" }};

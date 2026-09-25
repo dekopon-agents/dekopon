@@ -13,14 +13,14 @@ const POLICIES: &str = r#"
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"chat-agent")
-when { context has via && context.via == "gateway" };
+when { context.via == "gateway" };
 
 @id("chat-agent-upper")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context has via && context.via == "gateway"
-    && context has agent && context.agent == "chat-agent" };
+when { context.via == "gateway"
+    && context.agent == "chat-agent" };
 "#;
 
 fn constraint_set() -> serde_json::Value {
@@ -32,7 +32,6 @@ fn constraint_set() -> serde_json::Value {
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         credential: None,
-        credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),
     })
     .expect("constraint set serializes")

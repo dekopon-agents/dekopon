@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits,
@@ -29,14 +29,14 @@ const POLICIES: &str = r#"
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.reverse",
        resource == Dekopon::Provider::"cli-probe")
-when { context has via && context.via == "gateway"
-    && context has agent && context.agent == "some-agent" };
+when { context.via == "gateway"
+    && context.agent == "some-agent" };
 
 @id("prompt-gate")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"some-agent")
-when { context has via && context.via == "gateway" };
+when { context.via == "gateway" };
 
 @id("broken-gate")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -75,7 +75,6 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )

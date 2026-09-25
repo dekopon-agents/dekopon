@@ -11,19 +11,19 @@ use std::{
 };
 
 use dekopon_broker::{
-    AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld,
+    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog,
+    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    BrokerClient, BrokerResponse, ERROR_INVALID_REQUEST, FrameLimits, RequestEnvelope,
+    Attestation, BrokerClient, BrokerResponse, ERROR_INVALID_REQUEST, FrameLimits, RequestEnvelope,
     ResponseEnvelope, read_frame,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, RiskLevel,
 };
 use dekopon_test_support::{CaptureLayer, provider_fixture, shutdown_on};
 use serde_json::json;
@@ -36,13 +36,19 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
+const SUBJECT: &str = "slack.t0123abc.u9xyz";
+
 const POLICY: &str = r#"
-@id("caller-upper")
-permit(principal == Dekopon::Principal::"caller",
+@id("chat-agent-session")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent");
+
+@id("cpetersen-upper")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context has agent && context.agent == "brokerd-test" }
-unless { context has via };
+when { context.agent == "chat-agent" };
 "#;
 
 async fn take_after(captured: &CaptureLayer, marker: &str) -> String {
@@ -97,7 +103,10 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
     .await
     .expect("cli-probe provider fixture loads");
     let world = PolicyWorld::new(
-        ["caller".parse::<PrincipalId>().expect("valid principal")],
+        [
+            "caller".parse::<PrincipalId>().expect("valid principal"),
+            "cpetersen".parse().expect("valid principal"),
+        ],
         [(
             "cli-probe.upper"
                 .parse::<CapabilityId>()
@@ -116,7 +125,6 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )])
@@ -129,7 +137,13 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             PolicyEngine::new(POLICY, &world).expect("fixture policy validates"),
             catalog,
             CredentialStore::empty(),
-            IdentityDirectory::empty(),
+            IdentityDirectory::new([(
+                SUBJECT
+                    .parse::<ExternalSubject>()
+                    .expect("canonical subject"),
+                "cpetersen".parse::<PrincipalId>().expect("valid principal"),
+            )])
+            .expect("one mapping builds a directory"),
             Arc::new(InMemoryAuditLog::new(audit_bound).expect("valid audit bound")),
             BrokerLimits::default(),
         )
@@ -143,7 +157,7 @@ fn identities(uid: u32) -> BTreeMap<u32, MappedPeer> {
         uid,
         MappedPeer {
             context: context(),
-            attestor: None,
+            attestor: Some(AttestorGrant { namespaces: None }),
         },
     );
     identities
@@ -240,7 +254,16 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         input: json!({"text": "hello through broker"}),
     };
     client
-        .invoke(None, request, Default::default())
+        .invoke(
+            Some(Attestation::for_subject(
+                SUBJECT
+                    .parse::<ExternalSubject>()
+                    .expect("canonical subject"),
+                "chat-agent".parse::<AgentId>().expect("valid agent"),
+            )),
+            request,
+            Default::default(),
+        )
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
     let unaudited = take_after(&captured, "broker_outcome_unaudited").await;

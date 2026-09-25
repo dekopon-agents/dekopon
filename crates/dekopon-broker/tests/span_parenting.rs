@@ -9,7 +9,7 @@
 )]
 #![allow(clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dekopon_broker::{
     AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
@@ -68,7 +68,6 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )

@@ -88,7 +88,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 effect,
                 risk,
                 credential: None,
-                credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
                     asset: None,
                     timeout_ms: 10_000,
@@ -113,7 +112,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
             credential: None,
-            credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
                 asset: None,
                 timeout_ms: 10_000,
@@ -137,7 +135,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
                 credential: Some(credential.to_owned()),
-                credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
                     asset: None,
                     timeout_ms: 10_000,
@@ -270,7 +267,7 @@ async fn build_broker_with_options(
         permit(principal == Dekopon::Principal::"$PRINCIPAL",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
-        when { context has via && context.via == "gateway"
+        when { context.via == "gateway"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
             && context has conversation && context.conversation.id == "c0123abc"
@@ -282,8 +279,8 @@ async fn build_broker_with_options(
                           Dekopon::Action::"memory.chat.recent",
                           Dekopon::Action::"memory.chat.search"],
                resource == Dekopon::Provider::"memory-chat")
-        when { context has via && context.via == "gateway"
-            && context has agent && context.agent == "reviewer"
+        when { context.via == "gateway"
+            && context.agent == "reviewer"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
             && context has conversation && context.conversation.id == "c0123abc"
@@ -313,8 +310,8 @@ async fn build_broker_with_options(
         permit(principal == Dekopon::Principal::"$PRINCIPAL",
                action == Dekopon::Action::"http-probe.fetch",
                resource == Dekopon::Provider::"http-probe")
-        when { context has via && context.via == "gateway"
-            && context has agent && context.agent == "reviewer" };
+        when { context.via == "gateway"
+            && context.agent == "reviewer" };
         "#,
         );
         policy_source = policy_source.replace("$PRINCIPAL", mapped_principal);
@@ -589,8 +586,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     .expect("malicious fixture loads before broker reservation");
     let world = PolicyWorld::new(
         [
-            "caller".parse::<PrincipalId>().expect("caller"),
-            "gateway".parse().expect("gateway"),
+            "gateway".parse::<PrincipalId>().expect("gateway"),
             "maintainer".parse().expect("maintainer"),
         ],
         registry
@@ -600,21 +596,16 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
-        permit(principal == Dekopon::Principal::"caller",
-               action in [Dekopon::Action::"ordinary.escape",
-                          Dekopon::Action::"memory.chat.export"],
-               resource == Dekopon::Provider::"memory-chat")
-        unless { context has via };
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
-        when { context has via && context.via == "gateway" };
+        when { context.via == "gateway" };
         permit(principal == Dekopon::Principal::"maintainer",
                action in [Dekopon::Action::"ordinary.escape",
                           Dekopon::Action::"memory.chat.export"],
                resource == Dekopon::Provider::"memory-chat")
-        when { context has via && context.via == "gateway"
-            && context has agent && context.agent == "reviewer" };
+        when { context.via == "gateway"
+            && context.agent == "reviewer" };
         "#,
         &world,
     )
@@ -643,57 +634,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         BrokerLimits::default(),
     )
     .expect("broker");
-    let caller = AuthenticatedContext::new(
-        "caller".parse().expect("caller"),
-        Actor::Service {
-            principal: "caller".parse().expect("caller"),
-        },
-    )
-    .expect("caller context");
-    assert_eq!(
-        broker
-            .capabilities(&caller)
-            .iter()
-            .map(|entry| entry.capability.id.as_str().to_owned())
-            .collect::<Vec<_>>(),
-        ["memory.chat.export", "ordinary.escape"],
-        "an undeclared route hides nothing, however the capability is spelled"
-    );
-    assert_eq!(broker.command_words(&caller), ["recall"]);
-    broker
-        .run_command(&caller, None, None, "recall", &[], None)
-        .await
-        .expect("the word of a provider that owns no route resolves normally");
-
-    for (index, capability) in ["ordinary.escape", "memory.chat.export"]
-        .into_iter()
-        .enumerate()
-    {
-        let result = broker
-            .invoke(
-                &caller,
-                None,
-                None,
-                InvocationRequest {
-                    id: format!("unrouted-direct-{index}")
-                        .parse()
-                        .expect("invocation"),
-                    capability: capability.parse().expect("capability"),
-                    trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                    input: json!({}),
-                    secret_use: None,
-                },
-                Default::default(),
-            )
-            .await
-            .expect("ordinary invocation is audited");
-        assert_eq!(
-            result.result.outcome,
-            dekopon_capability::InvocationOutcome::Succeeded,
-            "{result:?}"
-        );
-    }
-
     let gateway = gateway();
     let grant = AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
@@ -709,7 +649,14 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
             )),
         )
         .expect("legacy attestation is honored");
-    assert_eq!(listed.len(), 2, "the attested listing reserves nothing");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.capability.id.as_str())
+            .collect::<Vec<_>>(),
+        ["memory.chat.export", "ordinary.escape"],
+        "an undeclared route hides nothing, however the capability is spelled"
+    );
     let (listed, words, memory) = broker
         .capability_surface(&gateway, Some(&grant), Some(&claim))
         .expect("ordinary chat remains available");
@@ -743,30 +690,35 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         "{chat_result:?}"
     );
 
-    let id = "unrouted-attested"
-        .parse::<InvocationId>()
-        .expect("invocation");
-    let result = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
-            InvocationRequest {
-                id,
-                capability: "ordinary.escape".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("attested invocation is audited");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded,
-        "{result:?}"
-    );
+    for capability in ["ordinary.escape", "memory.chat.export"] {
+        let id = format!("unrouted-attested-{capability}")
+            .parse::<InvocationId>()
+            .expect("invocation");
+        let result = broker
+            .invoke(
+                &gateway,
+                Some(&grant),
+                Some(
+                    &Attestation::for_subject(claim.subject.clone(), claim.agent.clone())
+                        .bound_to(id.clone()),
+                ),
+                InvocationRequest {
+                    id,
+                    capability: capability.parse().expect("capability"),
+                    trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                    input: json!({}),
+                    secret_use: None,
+                },
+                Default::default(),
+            )
+            .await
+            .expect("attested invocation is audited");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Succeeded,
+            "{result:?}"
+        );
+    }
     drop(broker);
 
     let temporary = tempfile::tempdir().expect("tempdir");
@@ -858,7 +810,10 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
     .await
     .expect("rendering fixture loads");
     let world = PolicyWorld::new(
-        ["caller".parse::<PrincipalId>().expect("caller")],
+        [
+            "gateway".parse::<PrincipalId>().expect("gateway"),
+            "maintainer".parse().expect("maintainer"),
+        ],
         registry
             .capabilities()
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
@@ -866,10 +821,14 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
-        permit(principal == Dekopon::Principal::"caller",
+        permit(principal == Dekopon::Principal::"maintainer",
+               action == Dekopon::Action::"agent.prompt",
+               resource == Dekopon::Agent::"reviewer")
+        when { context.via == "gateway" };
+        permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"ordinary.escape",
                resource == Dekopon::Provider::"memory-chat")
-        unless { context has via };
+        when { context.via == "gateway" && context.agent == "reviewer" };
         "#,
         &world,
     )
@@ -882,7 +841,6 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
                 asset: None,
                 timeout_ms: 10_000,
@@ -905,24 +863,32 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
         policy,
         constraints,
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        )])
+        .expect("identities"),
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         BrokerLimits::default(),
     )
     .expect("broker");
-    let caller = AuthenticatedContext::new(
-        "caller".parse().expect("caller"),
-        Actor::Service {
-            principal: "caller".parse().expect("caller"),
-        },
-    )
-    .expect("caller context");
-    assert!(
-        broker.command_words(&caller).is_empty(),
-        "a reserved word is not in the vocabulary"
-    );
+    let gateway = gateway();
+    let grant = attestor_grant();
+    let claim = claim();
+    let attestation = Attestation::for_subject(claim.subject, claim.agent);
+    let (_, words, _) = broker
+        .capability_surface(&gateway, Some(&grant), Some(&attestation))
+        .expect("the attestation is honored");
+    assert!(words.is_empty(), "a reserved word is not in the vocabulary");
     let refused = broker
-        .run_command(&caller, None, None, "recall", &["--help".to_owned()], None)
+        .run_command(
+            &gateway,
+            Some(&grant),
+            Some(&attestation),
+            "recall",
+            &["--help".to_owned()],
+            None,
+        )
         .await
         .expect_err("a reserved word never reaches its guest");
     assert!(
@@ -946,8 +912,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     .expect("storage probe fixture loads");
     let world = PolicyWorld::new(
         [
-            "caller".parse::<PrincipalId>().expect("caller"),
-            "gateway".parse().expect("gateway"),
+            "gateway".parse::<PrincipalId>().expect("gateway"),
             "maintainer".parse().expect("maintainer"),
         ],
         registry
@@ -957,19 +922,15 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
-        permit(principal == Dekopon::Principal::"caller",
-               action == Dekopon::Action::"storage-probe.run",
-               resource == Dekopon::Provider::"storage-probe")
-        unless { context has via };
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
-        when { context has via && context.via == "gateway" };
+        when { context.via == "gateway" };
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"storage-probe.run",
                resource == Dekopon::Provider::"storage-probe")
-        when { context has via && context.via == "gateway"
-            && context has agent && context.agent == "reviewer" };
+        when { context.via == "gateway"
+            && context.agent == "reviewer" };
         "#,
         &world,
     )
@@ -982,7 +943,6 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
             credential: None,
-            credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
                 asset: None,
                 timeout_ms: 10_000,
@@ -1014,48 +974,6 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
         BrokerLimits::default(),
     )
     .expect("broker");
-    let caller = AuthenticatedContext::new(
-        "caller".parse().expect("caller"),
-        Actor::Service {
-            principal: "caller".parse().expect("caller"),
-        },
-    )
-    .expect("caller context");
-    assert!(broker.capabilities(&caller).is_empty());
-    assert!(broker.command_words(&caller).is_empty());
-    assert!(
-        broker
-            .run_command(&caller, None, None, "storageprobe", &[], None)
-            .await
-            .is_err(),
-        "the routed provider's word is reserved even though nothing about it says memory"
-    );
-
-    let direct = "renamed-direct"
-        .parse::<InvocationId>()
-        .expect("invocation");
-    let result = broker
-        .invoke(
-            &caller,
-            None,
-            None,
-            InvocationRequest {
-                id: direct,
-                capability: "storage-probe.run".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("reserved denial is audited");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
-
     let gateway = gateway();
     let grant = attestor_grant();
     let claim = claim();
@@ -1153,7 +1071,6 @@ fn memory_constraint(
         effect,
         risk,
         credential: None,
-        credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
@@ -1176,7 +1093,6 @@ fn reserved_read_constraint() -> ConstraintSet {
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         credential: None,
-        credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints::default(),
     }
 }
@@ -2619,7 +2535,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
         credential: None,
-        credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,

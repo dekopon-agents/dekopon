@@ -13,8 +13,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    AttestorGrant, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
+    TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -44,12 +45,16 @@ const SUBJECT: &str = "slack.t0123abc.u9xyz";
 const AGENT: &str = "chat-agent";
 
 const POLICY: &str = r#"
-@id("caller-upper")
-permit(principal == Dekopon::Principal::"caller",
+@id("chat-agent-session")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent");
+
+@id("cpetersen-upper")
+permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context has agent && context.agent == "brokerd-test" }
-unless { context has via };
+when { context.agent == "chat-agent" };
 "#;
 
 #[derive(Clone, Debug)]
@@ -256,6 +261,15 @@ fn trace_parent() -> TraceParent {
     TraceParent::new(CLIENT_TRACE_ID, CLIENT_SPAN_ID, 1).expect("valid W3C parent fixture")
 }
 
+fn session() -> Attestation {
+    Attestation::for_subject(
+        SUBJECT
+            .parse::<ExternalSubject>()
+            .expect("canonical subject fixture"),
+        AGENT.parse::<AgentId>().expect("valid agent fixture"),
+    )
+}
+
 fn chat_claim() -> Attestation {
     Attestation::for_chat(
         SUBJECT
@@ -293,7 +307,7 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
     .await
     .expect("load cli-probe fixture");
     let world = PolicyWorld::new(
-        [principal("caller")],
+        [principal("caller"), principal("cpetersen")],
         [(
             "cli-probe.upper"
                 .parse::<CapabilityId>()
@@ -318,13 +332,18 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
                     credential: None,
-                    credential_by_agent: BTreeMap::new(),
                     constraints: ExecutionConstraints::default(),
                 },
             )])
             .expect("one capability builds a catalog"),
             CredentialStore::empty(),
-            IdentityDirectory::empty(),
+            IdentityDirectory::new([(
+                SUBJECT
+                    .parse::<ExternalSubject>()
+                    .expect("canonical subject fixture"),
+                principal("cpetersen"),
+            )])
+            .expect("one mapping builds a directory"),
             Arc::new(TraceOnlyAuditLog),
             BrokerLimits::default(),
         )
@@ -371,7 +390,7 @@ async fn serve() -> Served<impl std::fmt::Debug> {
                     },
                 )
                 .expect("trusted context binds"),
-                attestor: None,
+                attestor: Some(AttestorGrant { namespaces: None }),
             },
         )]),
         ServerLimits {
@@ -403,7 +422,7 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
     let invoked = served
         .client
         .invoke(
-            None,
+            Some(session()),
             InvocationRequest {
                 id: "invoke-traced".parse::<InvocationId>().expect("invocation"),
                 capability: "cli-probe.upper"
@@ -489,7 +508,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
     let proposed = served
         .client
         .run_command(
-            None,
+            Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
             None,
@@ -508,7 +527,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
     let help = served
         .client
         .run_command(
-            None,
+            Some(session()),
             "probe".to_owned(),
             vec!["--help".to_owned()],
             None,
@@ -523,7 +542,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
     let declined = served
         .client
         .run_command(
-            None,
+            Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
             None,
@@ -542,7 +561,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
     let refused = served
         .client
         .run_command(
-            None,
+            Some(session()),
             "nosuchword".to_owned(),
             Vec::new(),
             None,

@@ -4,26 +4,35 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dekopon_broker::{
-    AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld,
+    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
-use dekopon_core::{Actor, CapabilityId, PrincipalId, ProviderId, RiskLevel};
+use dekopon_core::{
+    Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel,
+};
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+
+const SUBJECT: &str = "slack.t0123abc.u9xyz";
 
 const POLICIES: &str = r#"
 @id("allow-count")
 permit(principal == Dekopon::Principal::"caller",
        action == Dekopon::Action::"cli-probe.count",
        resource == Dekopon::Provider::"cli-probe");
+
+@id("prompt")
+permit(principal == Dekopon::Principal::"caller",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"reviewer");
 "#;
 
 fn principal(name: &str) -> PrincipalId {
@@ -45,7 +54,6 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
-            credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),
         },
     )
@@ -73,21 +81,27 @@ async fn broker() -> Broker<InMemoryAuditLog> {
         PolicyEngine::new(POLICIES, &world).expect("the policy set validates"),
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         CredentialStore::empty(),
-        IdentityDirectory::empty(),
+        IdentityDirectory::new([(
+            SUBJECT
+                .parse::<ExternalSubject>()
+                .expect("canonical subject"),
+            principal("caller"),
+        )])
+        .expect("one mapping builds a directory"),
         Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
         BrokerLimits::default(),
     )
     .expect("the broker starts")
 }
 
-fn caller() -> AuthenticatedContext {
+fn gateway() -> AuthenticatedContext {
     AuthenticatedContext::new(
-        principal("caller"),
+        principal("gateway"),
         Actor::Service {
-            principal: principal("caller"),
+            principal: principal("gateway"),
         },
     )
-    .expect("caller context binds")
+    .expect("gateway context binds")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -97,14 +111,24 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
 
     let input = serde_json::json!({ "text": "x".repeat(16_000) });
     let input_bytes = input.to_string().len();
+    let id = "invoke-bounded"
+        .parse::<dekopon_core::InvocationId>()
+        .expect("valid invocation fixture");
+    let attestation = Attestation::for_subject(
+        SUBJECT
+            .parse::<ExternalSubject>()
+            .expect("canonical subject"),
+        "reviewer".parse::<AgentId>().expect("valid agent"),
+    )
+    .bound_to(id.clone());
     let result = broker()
         .await
         .invoke(
-            &caller(),
-            None,
-            None,
+            &gateway(),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&attestation),
             InvocationRequest {
-                id: "invoke-bounded".parse().expect("valid invocation fixture"),
+                id,
                 capability: capability(),
                 trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input,

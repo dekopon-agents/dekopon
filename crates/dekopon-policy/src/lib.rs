@@ -39,7 +39,7 @@
 //!
 //! # Context
 //!
-//! Capability actions carry `{ via?, subject?, agent?, effect, risk }`;
+//! Capability actions carry `{ via, agent, subject?, effect, risk }`;
 //! `agent.prompt` carries routing fields only. `secret.use` adds exact capability/provider/sink
 //! fields beside the authenticated routing context. The public DRN is strongly typed untrusted
 //! proposal data and remains inert without an owner binding; message content and arbitrary provider
@@ -72,7 +72,11 @@
 //!         effect: EffectKind::ReadOnly,
 //!         risk: RiskLevel::Low,
 //!     },
-//!     context: PolicyContext::default(),
+//!     context: PolicyContext {
+//!         via: Some("dekopond-gateway".to_owned()),
+//!         agent: Some("reviewer".to_owned()),
+//!         ..PolicyContext::default()
+//!     },
 //! });
 //! assert!(decision.allowed);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
