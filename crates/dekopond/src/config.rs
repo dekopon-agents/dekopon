@@ -16,7 +16,11 @@ use dekopon_broker_protocol::{
     ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES,
     FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
-use dekopon_core::{AgentId, ExternalSubject, FileHygieneError, FileTier, read_trusted_file};
+use dekopon_core::{
+    AgentId, ExternalSubject, FileHygieneError, FileTier,
+    fragments::{self, FragmentError, MergeRules},
+    read_trusted_file,
+};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -845,10 +849,94 @@ pub async fn load(
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let path = absolute(path.as_ref())?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return load_directory(path, expected_uid).await;
+    }
+    let config = decode(&read_config_file(path.clone(), expected_uid).await?)?;
+    resolve(
+        config,
+        path,
+        &BrokerSocketDiscovery::from_process(None),
+        expected_uid,
+    )
+}
+
+const MERGE_RULES: MergeRules = MergeRules {
+    merged_by_name: &[],
+    concatenated: &["transports", "models", "routes"],
+};
+
+/// Routes match first-to-last within one transport, so a route must sit in the fragment that
+/// defines its transport; otherwise renaming a file could reorder them.
+async fn load_directory(
+    directory: PathBuf,
+    expected_uid: u32,
+) -> Result<ResolvedConfig, ConfigError> {
+    let paths = fragments::scan_directory(&directory, expected_uid, "yaml")?;
+    let first = paths
+        .first()
+        .cloned()
+        .ok_or_else(|| ConfigError::EmptyConfigDirectory {
+            path: directory.clone(),
+        })?;
+    let mut parsed = Vec::with_capacity(paths.len());
+    let mut defined = BTreeMap::<String, PathBuf>::new();
+    let mut referenced = Vec::<(PathBuf, String)>::new();
+    for path in paths {
+        let bytes = read_config_file(path.clone(), expected_uid).await?;
+        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
+            ConfigError::DecodeFragment {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        for transport in names_under(&mapping, "transports", "name") {
+            defined.insert(transport, path.clone());
+        }
+        for transport in names_under(&mapping, "routes", "transport") {
+            referenced.push((path.clone(), transport));
+        }
+        parsed.push((path, mapping));
+    }
+    let stray = referenced
+        .into_iter()
+        .filter(|(path, transport)| defined.get(transport).is_some_and(|owner| owner != path))
+        .map(|(path, transport)| format!("{transport} in {}", path.display()))
+        .collect::<Vec<_>>();
+    if !stray.is_empty() {
+        return Err(ConfigError::RouteOutsideTransportFragment { routes: stray });
+    }
+    let merged = fragments::merge(parsed, &MERGE_RULES)?;
+    let config = serde_yaml::from_value::<DekopondConfig>(serde_yaml::Value::Mapping(merged))
+        .map_err(|source| ConfigError::Decode { source })?;
+    resolve(
+        config,
+        first,
+        &BrokerSocketDiscovery::from_process(None),
+        expected_uid,
+    )
+}
+
+fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {
+    serde_yaml::from_slice::<DekopondConfig>(document)
+        .map_err(|source| ConfigError::Decode { source })
+}
+
+fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<String> {
+    mapping
+        .get(list)
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get(field)?.as_str().map(str::to_owned))
+        .collect()
+}
+
+async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
     // This file isn't a secret, since credentials live in the environment and transport credential
     // files, so the bar here is only that nobody else can rewrite it.
     let owned = path.clone();
-    let bytes = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         read_trusted_file(
             &owned,
             expected_uid,
@@ -871,25 +959,6 @@ pub async fn load(
             path: path.clone(),
             source: insecure,
         },
-    })?;
-    let config = decode(&bytes)?;
-    resolve(
-        config,
-        path,
-        &BrokerSocketDiscovery::from_process(None),
-        expected_uid,
-    )
-}
-
-const RETIRED_ACTIVITY_FIELD: &str = "unknown field `activity`";
-
-fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {
-    serde_yaml::from_slice::<DekopondConfig>(document).map_err(|source| {
-        if source.to_string().contains(RETIRED_ACTIVITY_FIELD) {
-            ConfigError::RetiredActivityBlock { source }
-        } else {
-            ConfigError::Decode { source }
-        }
     })
 }
 
@@ -1754,13 +1823,21 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
-    #[error(
-        "gateway configuration declares activity:, which this release replaced; write liveness: instead, with classicFallback where the old activity block had it"
-    )]
-    RetiredActivityBlock {
+    #[error("gateway configuration fragment {path} is not strict valid YAML")]
+    DecodeFragment {
+        path: PathBuf,
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("configuration directory {path} holds no *.yaml fragment")]
+    EmptyConfigDirectory { path: PathBuf },
+    #[error(transparent)]
+    Fragments(#[from] FragmentError),
+    #[error(
+        "routes must sit in the fragment that defines their transport; move: {}",
+        routes.join("; ")
+    )]
+    RouteOutsideTransportFragment { routes: Vec<String> },
     #[error("configured path has no parent")]
     MissingParent,
     #[error("{path}: {}", render_problems(.problems))]
@@ -2175,37 +2252,6 @@ mod tests {
             rendered.contains("progressDetail: off requires streaming"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn a_retired_activity_block_is_refused_by_name() {
-        let document = format!(
-            "{PREAMBLE}{}",
-            "transports:\n\
-             \x20 - name: slack\n\
-             \x20   kind: slackSocketMode\n\
-             \x20   appTokenEnv: A\n\
-             \x20   botTokenEnv: B\n\
-             \x20   activity: { mode: native, classicFallback: reaction }\n\
-             routes:\n\
-             \x20 - transport: slack\n\
-             \x20   conversation: { kind: [directMessage] }\n\
-             \x20   agent: reviewer\n"
-        );
-        let error = super::decode(document.as_bytes())
-            .expect_err("a file that still carries the retired block must not decode");
-
-        let rendered = error.to_string();
-        for expected in [
-            "declares activity:",
-            "write liveness: instead",
-            "classicFallback",
-        ] {
-            assert!(
-                rendered.contains(expected),
-                "the refusal has to carry the migration; {expected:?} is missing from:\n{rendered}"
-            );
-        }
     }
 
     #[test]
