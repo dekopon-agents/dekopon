@@ -35,6 +35,8 @@ Extensibility through Wasm providers:
 The operator surface on top:
 
 - Strict YAML and JSON agent resources, with duplicate, invalid-name and unknown-field detection reported in one refusal.
+- Configuration as directories: each daemon and the agent catalog may read a folder of small files — one per tenant, provider or transport — where any collision refuses startup, and `dekopon-brokerd check` / `dekopond check` run the startup validation offline as a pre-flight. Principals carry Cedar groups and providers group their capabilities, so one statement grants a family or a provider's reads. See [upgrading to 0.22.0](docs/upgrading.md#principals-groups-and-capability-blocks-0220).
+- Wakes: an agent may come back to the same conversation after a delay or when a model-free watch probe fires; probe runs are refused every writing capability.
 - Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
 - A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed Meta WhatsApp Cloud API webhook with bounded PNG/JPEG photo inputs, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Both daemons export OTLP to a receiver on a private CA: the standard `OTEL_EXPORTER_OTLP_CERTIFICATE` adds its PEM roots beside WebPKI, and chart 0.11.0 wires it through `otlp.caBundle`. See [upgrading to 0.21.0](docs/upgrading.md#otlp-private-ca-0210).
@@ -74,12 +76,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.21.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.21.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.21.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.22.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.22.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.22.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.21.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.21.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.22.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.22.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
