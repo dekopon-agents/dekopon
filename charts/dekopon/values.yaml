@@ -338,6 +338,8 @@ gateway:
   catalog:
     inline: ""
     existingConfigMap: ""
+    # Empty mounts every key of existingConfigMap as an agents directory; point catalogPath at
+    # paths.catalogDir itself.
     existingConfigMapKey: dekopon.yaml
     # Filename the catalog is mounted as, and therefore the leaf your catalogPath must name.
     fileName: dekopon.yaml

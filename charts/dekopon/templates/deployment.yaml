@@ -444,7 +444,7 @@ spec:
             - name: DEKOPON_BROKER_UID
               value: {{ $uid | quote }}
             - name: DEKOPON_CONFIG
-              value: {{ .Values.paths.catalogDir }}/{{ .Values.gateway.catalog.fileName }}
+              value: {{ .Values.paths.catalogDir }}{{ if or .Values.gateway.catalog.existingConfigMapKey (not .Values.gateway.catalog.existingConfigMap) }}/{{ .Values.gateway.catalog.fileName }}{{ end }}
             - name: HOME
               value: /tmp
 {{- with .Values.console.subject }}
@@ -560,9 +560,11 @@ spec:
           {{- if .Values.gateway.catalog.existingConfigMap }}
           configMap:
             name: {{ .Values.gateway.catalog.existingConfigMap }}
+            {{- with .Values.gateway.catalog.existingConfigMapKey }}
             items:
-              - key: {{ .Values.gateway.catalog.existingConfigMapKey }}
-                path: {{ .Values.gateway.catalog.fileName }}
+              - key: {{ . }}
+                path: {{ $.Values.gateway.catalog.fileName }}
+            {{- end }}
           {{- else }}
           configMap:
             name: {{ include "dekopon.catalogConfigMapName" . }}
