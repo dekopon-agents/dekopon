@@ -7,8 +7,7 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
-    ContextError,
+    AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ContextError,
 };
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
@@ -18,12 +17,14 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, FileHygieneError, FileTier, GroupId,
+    Actor, AgentId, ExternalSubject, FileHygieneError, FileTier, GroupId,
     PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
+
+use crate::capabilities::ProviderCapabilities;
 use thiserror::Error;
 
 pub use crate::HARD_MAX_PROVIDERS;
@@ -75,7 +76,7 @@ pub struct BrokerdConfig {
     #[serde(default)]
     pub policies_path: Option<PathBuf>,
     #[serde(default)]
-    pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    pub capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
     #[serde(default)]
     pub provider_settings: BTreeMap<ProviderId, serde_json::Value>,
     #[serde(default)]
@@ -305,7 +306,7 @@ pub struct ResolvedConfig {
     pub agents: BTreeMap<AgentId, AgentBindingConfig>,
     pub policies_path: Option<PathBuf>,
     pub policies: String,
-    pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    pub capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
     pub host_limits: BrokerHostLimits,
     pub host_options: BrokerHostOptions,
     pub plaintext_hosts: PlaintextHosts,
@@ -333,7 +334,7 @@ pub async fn load(
     let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
-    if !config.constraint_sets.is_empty() && config.policies_path.is_none() {
+    if !config.capabilities.is_empty() && config.policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
     }
     let mut resolved = resolve(config, path, expected_uid).await?;
@@ -348,11 +349,15 @@ pub async fn load(
 
 /// Keys whose values are named collections: fragments union them by entry name. Every other key is
 /// set by exactly one fragment, so no fragment can override another and file order never matters.
-const MERGED_BY_NAME: [&str; 4] = ["principals", "agents", "constraintSets", "providerSettings"];
+const MERGED_BY_NAME: [&str; 4] = ["principals", "agents", "capabilities", "providerSettings"];
 const CONCATENATED: [&str; 2] = ["identities", "providers"];
 const FRAGMENT_EXTENSION: &str = "yaml";
 const POLICY_EXTENSION: &str = "cedar";
 
+#[allow(
+    clippy::map_err_ignore,
+    reason = "the policy file's FromUtf8Error would carry its offending bytes back into a log line; PolicyNotUtf8 names the file and deliberately stops there"
+)]
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
@@ -382,7 +387,7 @@ async fn load_directory(
     if config.policies_path.is_some() {
         return Err(ConfigError::PoliciesPathInDirectory);
     }
-    if !config.constraint_sets.is_empty() && policy_files.is_empty() {
+    if !config.capabilities.is_empty() && policy_files.is_empty() {
         return Err(ConfigError::MissingPoliciesPath);
     }
     let mut resolved = resolve(config, first, expected_uid).await?;
@@ -1014,7 +1019,7 @@ async fn resolve(
         agents: config.agents,
         policies_path,
         policies: String::new(),
-        constraint_sets: config.constraint_sets,
+        capabilities: config.capabilities,
         host_limits,
         host_options: BrokerHostOptions {
             cwasm_dir: managed_provider_paths
@@ -1112,7 +1117,7 @@ pub enum ConfigError {
         source: ContextError,
     },
     #[error(
-        "constraintSets requires a policiesPath; a broker with capabilities and no policy \
+        "capabilities requires a policiesPath; a broker with capabilities and no policy \
              would refuse every request"
     )]
     MissingPoliciesPath,
