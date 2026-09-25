@@ -626,6 +626,43 @@ permit(
 }
 
 #[test]
+fn owner_policy_can_keep_writes_to_turns_a_person_typed() {
+    let source = r#"
+@id("typed-only")
+permit(
+  principal == Dekopon::Principal::"cpetersen",
+  action == Dekopon::Action::"cli-probe.upper",
+  resource == Dekopon::Provider::"cli-probe"
+) when { context has trigger && context.trigger == "message" };
+"#;
+    let engine = PolicyEngine::new(source, &world()).expect("the trigger gate validates");
+    let context = |trigger: &str| PolicyContext {
+        via: Some("dekopond-gateway".to_owned()),
+        trigger: Some(trigger.to_owned()),
+        ..PolicyContext::default()
+    };
+
+    assert!(
+        engine
+            .authorize(capability_request(
+                "cpetersen",
+                "cli-probe.upper",
+                context("message")
+            ))
+            .allowed
+    );
+    assert!(
+        !engine
+            .authorize(capability_request(
+                "cpetersen",
+                "cli-probe.upper",
+                context("wake")
+            ))
+            .allowed
+    );
+}
+
+#[test]
 fn a_retired_or_unguarded_context_attribute_fails_validation() {
     for (source, why) in [
         (
@@ -708,6 +745,7 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
+            "trigger": { "type": "String", "required": false },
             "conversation": {
                 "type": "Record",
                 "required": false,
@@ -730,6 +768,7 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
+            "trigger": { "type": "String", "required": false },
             "conversation": {
                 "type": "Record",
                 "required": false,
@@ -750,6 +789,7 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
+            "trigger": { "type": "String", "required": false },
             "conversation": {
                 "type": "Record",
                 "required": false,

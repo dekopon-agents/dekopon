@@ -11,7 +11,7 @@ use super::{
     ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
     InvocationOutcome, InvocationRequest, InvocationResult, PROTOCOL_VERSION, ProtocolError,
     ProtocolVersion, ProviderFailureDetail, RequestEnvelope, ResponseEnvelope, TraceParent,
-    TraceParentError, read_frame, write_frame,
+    TraceParentError, Trigger, read_frame, write_frame,
 };
 
 fn conversation(
@@ -48,6 +48,7 @@ fn scope() -> ChatScopeClaim {
             "c0123abc",
             Some("1712345678.000100"),
         ),
+        trigger: Trigger::Message,
     }
 }
 
@@ -1210,6 +1211,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
             "c0123abc",
             Some("1712345678.000100"),
         ),
+        trigger: Trigger::Message,
     };
     assert!(
         DeliveryIdentity::Slack {
@@ -1239,11 +1241,13 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Channel, Some("999"), "123", None),
+        trigger: Trigger::Message,
     };
     let discord_thread = ChatScopeClaim {
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
+        trigger: Trigger::Message,
     };
     assert!(
         DeliveryIdentity::Discord {
@@ -1273,6 +1277,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
         conversation: conversation(ConversationKind::Thread, None, "-1001", Some("42")),
+        trigger: Trigger::Message,
     };
     assert!(
         DeliveryIdentity::Telegram {
@@ -1316,6 +1321,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
             &i64::MIN.to_string(),
             Some(&i64::MAX.to_string()),
         ),
+        trigger: Trigger::Message,
     };
     assert!(
         DeliveryIdentity::Telegram {
@@ -1336,6 +1342,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
             "16034700182",
             None,
         ),
+        trigger: Trigger::Message,
     };
     let whatsapp_delivery = DeliveryIdentity::Whatsapp {
         waba: "123".to_owned(),
@@ -1369,6 +1376,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         transport: "dev".parse().expect("transport"),
         kind: ChatTransportKind::Local,
         conversation: conversation(ConversationKind::DirectMessage, None, "conversation", None),
+        trigger: Trigger::Message,
     };
     let local_identity = |boot_nonce: &str, connection, sequence| DeliveryIdentity::Local {
         transport: "dev".parse().expect("transport"),

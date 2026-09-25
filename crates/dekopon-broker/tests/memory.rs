@@ -387,6 +387,7 @@ fn claim_for(conversation: &str) -> Attestation {
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: slack_conversation(conversation),
+            trigger: dekopon_broker::Trigger::Message,
         },
     )
 }
@@ -556,6 +557,54 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     );
     assert!(scoped_words.iter().any(|word| word == storage_word));
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let broker = build_broker(
+        &directory.join("provider-storage"),
+        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
+    )
+    .await;
+    let mut probe = claim();
+    if let Some(scope) = probe.scope.as_mut() {
+        scope.trigger = dekopon_broker::Trigger::Probe;
+    }
+
+    let (capabilities, words, _) = broker
+        .capability_surface(&gateway(), Some(&grant()), Some(&probe))
+        .expect("a probe is an authorized chat session");
+    assert!(
+        capabilities
+            .iter()
+            .all(|entry| entry.capability.id.as_str() != "storage-probe.run")
+    );
+    assert!(!words.iter().any(|word| word == "storageprobe"));
+
+    let id = "probe-write".parse::<InvocationId>().expect("invocation");
+    let result = broker
+        .invoke(
+            &gateway(),
+            Some(&grant()),
+            Some(&probe.bound_to(id.clone())),
+            InvocationRequest {
+                id,
+                capability: "storage-probe.run".parse().expect("capability"),
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                input: json!({"mode": "quota-denial"}),
+                secret_use: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("the refusal is accounted");
+    assert_eq!(
+        result.result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(result.result.error.as_deref(), Some("probe-write"));
+}
+
 /// The reserved chat-memory surface is determined by the declared route, not a provider's name or
 /// capability naming, so mimicking the shipped provider gains or loses nothing.
 #[tokio::test(flavor = "multi_thread")]

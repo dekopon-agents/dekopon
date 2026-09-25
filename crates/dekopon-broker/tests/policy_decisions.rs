@@ -307,6 +307,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                         id: "c0123abc".to_owned(),
                         thread: Some("1712345678.000100".to_owned()),
                     },
+                    trigger: dekopon_broker::Trigger::Message,
                 },
             )),
         )
@@ -335,6 +336,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                             id: "c0123abc".to_owned(),
                             thread: Some("1712345678.000100".to_owned()),
                         },
+                        trigger: dekopon_broker::Trigger::Message,
                     },
                 )
                 .bound_to(ordinary.id.clone()),

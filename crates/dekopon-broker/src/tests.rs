@@ -13,9 +13,9 @@ use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
     AuthorityEncoder, BrokerBuildError, CapabilityRoute, ChatMemoryConfig, ChatScopeClaim,
     ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, Conversation, ConversationKind,
-    ConversationKindMatch, ConversationMatch, InMemoryAuditLog, encode_capability_authority,
-    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
-    provider_failure_detail, public_host_error,
+    ConversationKindMatch, ConversationMatch, InMemoryAuditLog, Trigger,
+    encode_capability_authority, encode_execution_constraints, encode_host_limits,
+    encode_memory_config, encode_storage_limits, provider_failure_detail, public_host_error,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -841,6 +841,7 @@ fn a_whatsapp_or_telegram_direct_message_must_be_the_attested_senders_own() {
             id: "16034700182".to_owned(),
             thread: None,
         },
+        trigger: Trigger::Message,
     };
     assert!(attestor.permits_chat(
         &ExternalSubject::whatsapp("16034700182").expect("subject"),
@@ -863,6 +864,7 @@ fn a_whatsapp_or_telegram_direct_message_must_be_the_attested_senders_own() {
             id: "5551234".to_owned(),
             thread: None,
         },
+        trigger: Trigger::Message,
     };
     assert!(attestor.permits_chat(
         &ExternalSubject::telegram("5551234").expect("subject"),
@@ -888,6 +890,7 @@ fn a_thread_claim_is_authorized_by_its_parents_grant_and_only_with_thread_in_the
             id: id.to_owned(),
             thread: thread.map(str::to_owned),
         },
+        trigger: Trigger::Message,
     };
     let subject = ExternalSubject::discord("578258790881951745").expect("subject");
     let with = |kind: ConversationKindMatch| AttestorGrant {

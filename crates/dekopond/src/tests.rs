@@ -2975,6 +2975,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
             conversation: inbound.conversation.clone(),
+            trigger: dekopon_broker_protocol::Trigger::Message,
         },
     );
     let delivery = crate::session::delivery_identity(&inbound, &claim)

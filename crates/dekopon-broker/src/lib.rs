@@ -52,7 +52,7 @@ use dekopon_broker_host::{
 pub use dekopon_broker_protocol::{
     Attestation, AvailableCapability, ChatMemorySurface, ChatScopeClaim, ChatTransportKind,
     Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
+    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest, Trigger,
 };
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
@@ -1251,6 +1251,9 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
         transport: context
             .chat_scope()
             .map(|scope| scope.transport.to_string()),
+        trigger: context
+            .chat_scope()
+            .map(|scope| scope.trigger.as_str().to_owned()),
         conversation: context.chat_scope().map(|scope| PolicyConversation {
             kind: scope.conversation.kind.as_str().to_owned(),
             container: scope.conversation.container.clone(),
@@ -1258,6 +1261,14 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
             thread: scope.conversation.thread.clone(),
         }),
     }
+}
+
+/// A watch probe runs unattended every tick, so it may only read, whatever owner policy permits.
+fn probe_permits(context: &AuthenticatedContext, effect: EffectKind) -> bool {
+    context
+        .chat_scope()
+        .is_none_or(|scope| scope.trigger != Trigger::Probe)
+        || effect == EffectKind::ReadOnly
 }
 
 fn validate_trusted_metadata(
@@ -1983,6 +1994,7 @@ where
             .filter(|(capability, set)| {
                 set.route.is_generic()
                     && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && probe_permits(context, set.effect)
                     && self.authorize_capability(context, capability, set).allowed
             })
             .collect()
@@ -2702,6 +2714,13 @@ where
                     .await
                     .map(ControlFlow::Break);
             };
+            if !probe_permits(context, set.effect) {
+                authorize.record("outcome", "probe-write");
+                return self
+                    .deny(context, &request, unevaluated_refusal("probe-write"))
+                    .await
+                    .map(ControlFlow::Break);
+            }
             if set.constraints.storage.is_some() && context.chat_scope().is_none() {
                 authorize.record("outcome", "chat-scope-required");
                 return self
