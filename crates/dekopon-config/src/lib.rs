@@ -172,12 +172,20 @@ impl LocalCatalog {
             } else {
                 base.join(&file)
             };
-            match skill::read_bounded_text(&resolved, MAX_INSTRUCTIONS_BYTES) {
+            // Read like the catalog yaml beside it: a ConfigMap mount makes every key a symlink.
+            match fs::read_to_string(&resolved) {
+                Ok(text) if text.len() > MAX_INSTRUCTIONS_BYTES => {
+                    problems.push(CatalogProblem::InstructionsTooLarge {
+                        agent: id.to_string(),
+                        length: text.len(),
+                        maximum: MAX_INSTRUCTIONS_BYTES,
+                    });
+                }
                 Ok(text) => agent.spec.instructions = Some(text),
                 Err(source) => problems.push(CatalogProblem::Instructions {
                     agent: id.to_string(),
                     path: file.display().to_string(),
-                    source: Box::new(source),
+                    source,
                 }),
             }
         }
@@ -511,7 +519,13 @@ pub enum CatalogProblem {
         agent: String,
         path: String,
         #[source]
-        source: Box<SkillError>,
+        source: io::Error,
+    },
+    #[error("agent {agent} instructionsFile is {length} bytes; maximum is {maximum}")]
+    InstructionsTooLarge {
+        agent: String,
+        length: usize,
+        maximum: usize,
     },
     #[error("{origin}: unsupported API version {version:?}")]
     UnsupportedApiVersion { origin: String, version: String },

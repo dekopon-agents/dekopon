@@ -222,6 +222,9 @@ pub async fn check(
         }
     };
     report.problems.extend(refusal.map(BrokerdError::from));
+    if config.identities.is_empty() {
+        report.warnings.push(StartupWarning::IdentitiesRequired);
+    }
     // A Check load leaves a providerSet's providers for this function to resolve.
     match (config.providers.is_empty(), providers) {
         (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
@@ -674,6 +677,8 @@ pub enum StartupWarning {
     CredentialRequired { name: String },
     #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
     SecretRequired { policy: String, secret: String },
+    #[error("no identities; boot requires them, from a fragment or the chart's peers.yaml")]
+    IdentitiesRequired,
 }
 
 impl StartupWarning {
@@ -703,7 +708,9 @@ impl StartupWarning {
                 },
                 "{warning}"
             ),
-            Self::CredentialRequired { .. } | Self::SecretRequired { .. } => tracing::warn!(
+            Self::CredentialRequired { .. }
+            | Self::SecretRequired { .. }
+            | Self::IdentitiesRequired => tracing::warn!(
                 target: "dekopon_brokerd::audit",
                 { audit.event = "config.startup.warning", reason = "unchecked-reference" },
                 "{self}"

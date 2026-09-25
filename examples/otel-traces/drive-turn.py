@@ -140,10 +140,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "providers": [str(root / "examples/providers/cli-probe-provider.wasm")],
             "identities": [{"uid": os.geteuid(), "principal": "dekopond-gateway",
                 "actor": {"type": "service", "principal": "dekopond-gateway"},
-                "attestor": {"namespaces": ["tel"], "chatScopes": [{
-                    "kind": "local", "transport": "dev",
-                    "conversation": {"kind": "any", "ids": ["dev"]},
-                    "localSubjectService": "tel"}]}}],
+                "attestor": {"namespaces": ["tel"]}}],
             "principals": {"smoke-user": {"subjects": ["tel.16034700182"]}},
             "capabilities": {"cli-probe": {
                 "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},

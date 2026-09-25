@@ -68,6 +68,7 @@ pub struct BrokerdConfig {
     /// is still denied unconstrained-capability at invocation regardless of this setting.
     #[serde(default)]
     pub strict: bool,
+    #[serde(default)]
     pub identities: Vec<PeerIdentity>,
     #[serde(default)]
     pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
@@ -353,8 +354,6 @@ pub async fn load(
         .map(|(resolved, _)| resolved)
 }
 
-/// A `Check` load keeps going past colliding fragments and returns that refusal beside the
-/// configuration it resolved from the first fragment of each colliding key.
 #[allow(
     clippy::map_err_ignore,
     reason = "the policy file's FromUtf8Error would carry its offending bytes back into a log line; PolicyNotUtf8 names the file and deliberately stops there"
@@ -579,7 +578,7 @@ async fn resolve(
             maximum: HARD_MAX_PROVIDERS,
         });
     }
-    if config.identities.is_empty() {
+    if config.identities.is_empty() && mode == LoadMode::Boot {
         return Err(ConfigError::NoIdentities);
     }
     let source_parent = source.parent().ok_or(ConfigError::MissingParent)?;
@@ -1052,8 +1051,8 @@ pub enum ConfigError {
         source: ContextError,
     },
     #[error(
-        "capabilities requires a policiesPath; a broker with capabilities and no policy \
-             would refuse every request"
+        "capabilities requires a policy (policiesPath, or a *.cedar file in a directory); a \
+             broker with capabilities and no policy would refuse every request"
     )]
     MissingPoliciesPath,
     #[error(

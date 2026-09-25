@@ -457,3 +457,27 @@ fn instructions_file_is_read_beside_the_catalog_and_excludes_inline_instructions
         "{error}"
     );
 }
+
+#[test]
+fn instructions_file_is_read_through_a_config_map_symlink() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let data = directory.path().join("..data");
+    std::fs::create_dir(&data).expect("create ..data");
+    std::fs::write(data.join("reviewer.md"), "Review carefully.").expect("write instructions");
+    std::os::unix::fs::symlink("..data/reviewer.md", directory.path().join("reviewer.md"))
+        .expect("link instructions like a ConfigMap volume");
+    std::fs::write(
+        directory.path().join("reviewer.yaml"),
+        "apiVersion: dekopon.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: reviewer\nspec:\n  description: Reviews\n  instructionsFile: reviewer.md\n",
+    )
+    .expect("write agent");
+    let catalog =
+        LocalCatalog::load(directory.path()).expect("a symlinked instructions file loads");
+    let agent = catalog
+        .agent(&"reviewer".parse().expect("agent id"))
+        .expect("reviewer is loaded");
+    assert_eq!(
+        agent.spec.instructions.as_deref(),
+        Some("Review carefully.")
+    );
+}

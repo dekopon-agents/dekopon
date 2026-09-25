@@ -98,8 +98,7 @@ pub fn merge(
     refusal.map_or(Ok(merged), Err)
 }
 
-/// Like [`merge`], but hands back the merged mapping beside the refusal; a colliding key keeps the
-/// value of the first fragment in filename order.
+/// Like [`merge`], but hands back the merged mapping beside the refusal.
 pub fn merge_reporting(
     fragments: Vec<(PathBuf, Mapping)>,
     rules: &MergeRules,
