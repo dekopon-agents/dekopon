@@ -1848,3 +1848,28 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     assert!(!socket.parent().expect("socket parent").exists());
     assert!(!credentials.exists());
 }
+
+#[tokio::test]
+async fn a_partial_server_limits_block_keeps_the_other_defaults() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    let mut document = attested_document(uid);
+    document["serverLimits"] = json!({"shutdownGraceMs": 420_000});
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid).await.expect("config resolves");
+    assert_eq!(
+        resolved.server_limits.max_connections,
+        config::DEFAULT_MAX_CONNECTIONS
+    );
+    assert_eq!(resolved.server_limits.shutdown_grace_ms, 420_000);
+}

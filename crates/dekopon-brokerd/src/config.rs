@@ -259,7 +259,7 @@ impl HostLimitsConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerLimitsConfig {
     /// Defaults to the smallest frame every configured request and response fits in.
     pub max_frame_bytes: Option<usize>,
