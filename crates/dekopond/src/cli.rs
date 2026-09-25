@@ -23,6 +23,33 @@ pub struct Cli {
 pub enum Command {
     /// Manage model-account authentication without starting the gateway.
     Auth(AuthOptions),
+    /// Run startup validation on a configuration without serving: the broker is never contacted
+    /// and no credential variable, model login or journal is read.
+    Check(CheckArgs),
+}
+
+/// Options for an offline configuration check.
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Gateway configuration file or configuration directory.
+    #[arg(value_name = "CONFIG")]
+    pub config: PathBuf,
+    /// Agent catalog file or directory to check instead of the configured catalogPath.
+    #[arg(long, value_name = "PATH")]
+    pub catalog: Option<PathBuf>,
+    /// Render problems and warnings as a table or JSON.
+    #[arg(long, value_enum, default_value_t = CheckFormat::Table, value_name = "FORMAT")]
+    pub output: CheckFormat,
+}
+
+/// How `check` renders its result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum CheckFormat {
+    /// One line per problem or warning.
+    Table,
+    /// `{ "ok", "problems", "warnings" }`.
+    Json,
 }
 
 /// Options scoped to authentication, not daemon logging.
@@ -226,8 +253,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        AuthCommand, AuthOptions, ChatGptAuthCommand, Cli, Command, ExportFormat, dns_label,
-        dns_subdomain,
+        AuthCommand, AuthOptions, ChatGptAuthCommand, CheckFormat, Cli, Command, ExportFormat,
+        dns_label, dns_subdomain,
     };
 
     #[test]
@@ -256,6 +283,32 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn check_takes_a_positional_configuration_without_the_serving_flag() {
+        let cli = Cli::try_parse_from([
+            "dekopond",
+            "check",
+            "dekopond.d",
+            "--catalog",
+            "agents.d",
+            "--output",
+            "json",
+        ])
+        .expect("check parses without --config");
+
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert_eq!(check.config, std::path::Path::new("dekopond.d"));
+        assert_eq!(
+            check.catalog.as_deref(),
+            Some(std::path::Path::new("agents.d"))
+        );
+        assert_eq!(check.output, CheckFormat::Json);
+        assert!(Cli::try_parse_from(["dekopond", "check"]).is_err());
+        assert!(Cli::try_parse_from(["dekopond", "check", "x", "--output", "yaml"]).is_err());
     }
 
     #[test]

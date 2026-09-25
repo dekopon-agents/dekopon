@@ -96,6 +96,11 @@ class Dekopon < Formula
 
         dekopond auth chatgpt --help
 
+      Check a configuration offline, as startup would, before deploying it:
+
+        dekopon-brokerd check broker.d --provider-set providers.yaml --store DIR
+        dekopond check dekopond.d --catalog agents.d
+
       dekopon-brokerd and dekopond are daemons. Nothing was started, and neither
       runs until you write it an owner-authored configuration file:
 

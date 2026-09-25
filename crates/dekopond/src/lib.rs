@@ -231,6 +231,95 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    pub problems: Vec<DekopondError>,
+    pub warnings: Vec<CheckWarning>,
+}
+
+#[derive(Debug, Error)]
+pub enum CheckWarning {
+    #[error("transport {transport} reads {variable} from the environment at boot")]
+    TransportCredential { transport: String, variable: String },
+    #[error("model {model} reads {variable} from the environment at boot")]
+    ModelCredential { model: String, variable: String },
+}
+
+/// Runs the configuration, catalog and route validation `run` runs, then stops: the broker socket
+/// is never probed, no credential variable or model login is read, and no journal is opened.
+pub async fn check(config_path: impl AsRef<Path>, catalog_path: Option<&Path>) -> CheckReport {
+    let mut report = CheckReport::default();
+    let (config, refusals) =
+        match config::load_in(config_path, current_uid(), config::LoadMode::Check).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                report.problems.push(error.into());
+                return report;
+            }
+        };
+    report
+        .problems
+        .extend(refusals.into_iter().map(DekopondError::from));
+    let catalog = match LocalCatalog::load(catalog_path.unwrap_or(&config.catalog_path)) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            report.problems.push(DekopondError::Catalog(error));
+            return report;
+        }
+    };
+    let routes = match RoutingTable::bind(&config, &catalog) {
+        Ok(routes) => routes,
+        Err(error) => {
+            report.problems.push(error.into());
+            return report;
+        }
+    };
+    for spec in &config.transports {
+        report.warnings.extend(
+            transport_credential_variables(spec)
+                .into_iter()
+                .map(|variable| CheckWarning::TransportCredential {
+                    transport: spec.name().to_owned(),
+                    variable: variable.to_owned(),
+                }),
+        );
+    }
+    for model in routes.bound_models() {
+        let mut required = None;
+        let missing = session::model_bearer_token_with(model, |variable| {
+            required = Some(variable.to_owned());
+            None
+        })
+        .is_err();
+        if let (true, Some(variable)) = (missing, required) {
+            report.warnings.push(CheckWarning::ModelCredential {
+                model: model.name().to_owned(),
+                variable,
+            });
+        }
+    }
+    report
+}
+
+fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
+    match spec {
+        TransportConfig::SlackSocketMode {
+            app_token_env,
+            bot_token_env,
+            ..
+        } => vec![app_token_env, bot_token_env],
+        TransportConfig::DiscordGateway { bot_token_env, .. }
+        | TransportConfig::TelegramLongPoll { bot_token_env, .. } => vec![bot_token_env],
+        TransportConfig::WhatsappCloudApi {
+            app_secret_env,
+            verify_token_env,
+            access_token_env,
+            ..
+        } => vec![app_secret_env, verify_token_env, access_token_env],
+        TransportConfig::Local { .. } => Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServeOutcome {
     Shutdown,

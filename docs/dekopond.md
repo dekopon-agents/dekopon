@@ -23,6 +23,23 @@ dekopond --config /path/to/dekopond.yaml
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
 
+## Check a configuration
+
+```console
+dekopond check dekopond.d --catalog agents.d
+dekopond check dekopond.yaml --output json
+```
+
+`check` runs the configuration, catalog and route validation startup runs and stops before the
+broker probe. It prints every problem and warning at once, one per line or as
+`{ "ok", "problems", "warnings" }`, and exits 0 with no problems, 1 with problems and 2 on a usage
+error. `--catalog` replaces `catalogPath`, which usually names a deployment path. Files may be the
+invoking user's own 0644 files; symlinks and group/world-writable files are still refused. Nothing
+runtime is touched: the broker socket is never contacted, no transport or model credential
+variable is read (each one boot will read is listed as a warning), no ChatGPT login is opened and
+no journal directory is created. Transport clients are not built, so checks that live in their
+constructors run only at boot.
+
 ## Configuration
 
 ```yaml

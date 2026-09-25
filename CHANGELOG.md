@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `dekopon-brokerd check <config> [--provider-set <providers.yaml> --store <dir>]` and
+  `dekopond check <config> [--catalog <path>]` run each daemon's startup validation offline and
+  report every problem at once as a table or JSON, without binding sockets, reading credentials or
+  secrets, or requiring runtime paths to exist.
+
 ### Changed
 
 - **Breaking:** `credentialByAgent` is gone. A constraint set names one `credential`; top-level
