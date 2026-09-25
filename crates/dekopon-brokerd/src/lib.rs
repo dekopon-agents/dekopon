@@ -13,6 +13,7 @@
     )
 )]
 mod assets;
+pub mod capabilities;
 mod config;
 mod credentials;
 mod provider_manager;
@@ -238,7 +239,33 @@ where
         }
         policy
     };
-    let constraints = ConstraintCatalog::new(config.constraint_sets)
+    let (constraint_sets, problems) =
+        capabilities::constraint_sets(&config.capabilities, |provider| {
+            let declared = registry
+                .capabilities()
+                .filter(|(owner, _)| *owner == provider)
+                .map(|(_, capability)| capabilities::ManifestCapability {
+                    id: &capability.id,
+                    effect: capability.effect,
+                    risk: capability.risk,
+                })
+                .collect::<Vec<_>>();
+            (!declared.is_empty()).then_some(declared)
+        });
+    let (tolerable, fatal): (Vec<_>, Vec<_>) = problems
+        .into_iter()
+        .partition(|problem| problem.is_unloaded_name() && !config.strict);
+    if !fatal.is_empty() {
+        return Err(BrokerdError::Capabilities { problems: fatal });
+    }
+    for problem in &tolerable {
+        tracing::warn!(
+            target: "dekopon_brokerd::audit",
+            { audit.event = "config.startup.warning", reason = "unloaded-capability" },
+            "{problem}"
+        );
+    }
+    let constraints = ConstraintCatalog::new(constraint_sets)
         .map_err(BrokerdError::Broker)?
         .with_agent_credentials(
             config
@@ -381,6 +408,10 @@ pub enum BrokerdError {
     Socket(#[from] SocketError),
     #[error("broker configuration is invalid")]
     Config(#[from] ConfigError),
+    #[error("capability configuration is invalid: {}", render_problems(.problems))]
+    Capabilities {
+        problems: Vec<capabilities::CapabilityProblem>,
+    },
     #[error("broker credentials are unavailable or invalid")]
     Credentials(#[from] CredentialsError),
     #[error("broker private secret map is unavailable or invalid")]
@@ -429,3 +460,11 @@ pub enum BrokerdError {
 
 #[cfg(test)]
 mod tests;
+
+fn render_problems(problems: &[capabilities::CapabilityProblem]) -> String {
+    problems
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
