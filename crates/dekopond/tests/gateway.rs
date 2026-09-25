@@ -114,15 +114,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "uid": uid,
             "principal": GATEWAY_PRINCIPAL,
             "actor": {"type": "service", "principal": GATEWAY_PRINCIPAL},
-            "attestor": {
-                "namespaces": ["tel"],
-                "chatScopes": [{
-                    "kind": "local",
-                    "transport": "dev",
-                    "conversation": {"kind": "any", "ids": ["dev"]},
-                    "localSubjectService": "tel"
-                }]
-            }
+            "attestor": {"namespaces": ["tel"]}
         }],
         "principals": {
             MAPPED_PRINCIPAL: {"subjects": [MAPPED_SUBJECT]},

@@ -10,11 +10,10 @@ use std::{
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
-    BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatScopeGrant,
-    ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation, ConversationKind,
-    ConversationKindMatch, ConversationMatch, CredentialStore, DeliveredTurnRequest,
-    DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
-    RouteConflict,
+    BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatTransportKind,
+    ConstraintCatalog, ConstraintSet, Conversation, ConversationKind, CredentialStore,
+    DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
+    PolicyWorld, RouteConflict,
 };
 
 const MEMORY_RECORD: &str = "memory.chat.record";
@@ -274,7 +273,8 @@ async fn build_broker_with_options(
         when { context has via && context.via == "gateway"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
-            && context has conversation && context.conversation.id == "c0123abc" };
+            && context has conversation && context.conversation.id == "c0123abc"
+            && ["channel", "thread"].contains(context.conversation.kind) };
 
         @id("memory")
         permit(principal == Dekopon::Principal::"$PRINCIPAL",
@@ -286,7 +286,8 @@ async fn build_broker_with_options(
             && context has agent && context.agent == "reviewer"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
-            && context has conversation && context.conversation.id == "c0123abc" };
+            && context has conversation && context.conversation.id == "c0123abc"
+            && ["channel", "thread"].contains(context.conversation.kind) };
         "#
     .replace("$PRINCIPAL", mapped_principal);
     if permit_generic_storage {
@@ -392,37 +393,9 @@ fn claim_for(conversation: &str) -> Attestation {
     )
 }
 
-fn grant() -> AttestorGrant {
-    grant_for(&["c0123abc:1712345678.000100"])
-}
-
-fn grant_for(conversations: &[&str]) -> AttestorGrant {
-    let mut ids = conversations
-        .iter()
-        .map(|conversation| {
-            conversation
-                .split_once(':')
-                .map_or(*conversation, |(id, _)| id)
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    ids.dedup();
+fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
-        namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: vec![ChatScopeGrant {
-            kind: ChatTransportKind::Slack,
-            transport: "scientist-slack".parse().expect("transport"),
-            conversation: ConversationMatch {
-                kind: ConversationKindMatch::Kinds(vec![
-                    ConversationKind::Channel,
-                    ConversationKind::Thread,
-                ]),
-                container: None,
-                ids: Some(ids),
-            },
-            local_subject_service: None,
-            breadth: None,
-        }],
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     }
 }
 
@@ -454,7 +427,7 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
     let id = "audit-full-record"
         .parse::<InvocationId>()
         .expect("invocation");
-    let attestor = grant();
+    let attestor = attestor_grant();
     let session = claim();
     let error = broker
         .record_delivered_turn(
@@ -527,8 +500,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
 
     let session = claim();
     let legacy_grant = AttestorGrant {
-        namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: Vec::new(),
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
     let (legacy_capabilities, legacy_words, _memory) = broker
         .capability_surface(
@@ -548,7 +520,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     assert!(!legacy_words.iter().any(|word| word == storage_word));
 
     let (scoped_capabilities, scoped_words, _) = broker
-        .capability_surface(&gateway(), Some(&grant()), Some(&session))
+        .capability_surface(&gateway(), Some(&attestor_grant()), Some(&session))
         .expect("scoped chat is authorized");
     assert!(
         scoped_capabilities
@@ -724,8 +696,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
 
     let gateway = gateway();
     let grant = AttestorGrant {
-        namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: Vec::new(),
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
     let claim = claim();
     let (listed, _, _) = broker
@@ -1086,7 +1057,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
 
     let gateway = gateway();
-    let grant = grant();
+    let grant = attestor_grant();
     let claim = claim();
     let (listed, words, _memory) = broker
         .capability_surface(
@@ -1218,7 +1189,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
     let broker = build_broker(&root, Arc::clone(&audit)).await;
     let claim = claim();
-    let grant = grant();
+    let grant = attestor_grant();
     let (capabilities, words, memory) = broker
         .capability_surface(&gateway(), Some(&grant), Some(&claim))
         .expect("chat scope accepted");
@@ -1588,7 +1559,7 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
         false,
     )
     .await;
-    let attestor = grant_for(&[conversation]);
+    let attestor = attestor_grant();
     let session = claim_for(conversation);
     let result = record_turn_in(
         &broker,
@@ -1681,7 +1652,7 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
     let refused = broker
         .invoke(
             &gateway(),
-            Some(&grant()),
+            Some(&attestor_grant()),
             Some(&claim().bound_to(id.clone())),
             InvocationRequest {
                 id,
@@ -1782,7 +1753,7 @@ async fn record_turn(
     record_turn_in(
         broker,
         &claim(),
-        &grant(),
+        &attestor_grant(),
         invocation,
         timestamp,
         user,
@@ -1846,7 +1817,15 @@ async fn query_memory_result(
     capability: &str,
     input: serde_json::Value,
 ) -> dekopon_capability::InvocationResult {
-    query_memory_result_in(broker, &claim(), &grant(), invocation, capability, input).await
+    query_memory_result_in(
+        broker,
+        &claim(),
+        &attestor_grant(),
+        invocation,
+        capability,
+        input,
+    )
+    .await
 }
 
 async fn query_memory_result_in(
@@ -1901,7 +1880,7 @@ async fn two_authorized_conversations_remain_physically_and_logically_isolated()
     let broker = build_broker(&root, Arc::new(InMemoryAuditLog::new(32).expect("audit"))).await;
     let first = claim_for("c0123abc:1712345678.000100");
     let second = claim_for("c0123abc:1712345678.000200");
-    let grant = grant_for(&["c0123abc:1712345678.000100", "c0123abc:1712345678.000200"]);
+    let grant = attestor_grant();
 
     assert_eq!(
         record_turn_in(
@@ -2176,7 +2155,7 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
     let result = broker
         .invoke(
             &gateway(),
-            Some(&grant()),
+            Some(&attestor_grant()),
             Some(&session.bound_to(id.clone())),
             InvocationRequest {
                 id,

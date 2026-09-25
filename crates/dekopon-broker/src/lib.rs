@@ -62,7 +62,7 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
     ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
-    SecretUseProposal, SubjectError, SubjectService, TraceId, error_chain,
+    SecretUseProposal, SubjectService, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
@@ -1049,96 +1049,24 @@ impl SecretCatalog {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(from = "serde::de::IgnoredAny")]
-pub struct RetiredKey;
-
-impl From<serde::de::IgnoredAny> for RetiredKey {
-    fn from(_ignored: serde::de::IgnoredAny) -> Self {
-        Self
-    }
-}
-
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ChatScopeGrant {
-    pub kind: ChatTransportKind,
-    pub transport: dekopon_core::TransportId,
-    pub conversation: ConversationMatch,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_subject_service: Option<String>,
-    #[serde(default, skip_serializing)]
-    pub breadth: Option<RetiredKey>,
-}
-
-impl fmt::Debug for ChatScopeGrant {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ChatScopeGrant([REDACTED])")
-    }
-}
-
-impl ChatScopeGrant {
-    fn validate(&self) -> Result<(), BrokerBuildError> {
-        if self.breadth.is_some() {
-            return Err(BrokerBuildError::RetiredChatScopeBreadth);
-        }
-        if self.kind == ChatTransportKind::Local {
-            let Some(service) = &self.local_subject_service else {
-                return Err(BrokerBuildError::InvalidChatScope);
-            };
-            service
-                .parse::<SubjectService>()
-                .map_err(|source| BrokerBuildError::InvalidChatScopeService { source })?;
-        } else if self.local_subject_service.is_some() {
-            return Err(BrokerBuildError::InvalidChatScope);
-        }
-        let problems = self.conversation.validate(self.kind);
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(BrokerBuildError::InvalidChatScopeConversation { problems })
-        }
-    }
-
-    fn permits(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-        self.kind == scope.kind
-            && self.transport == scope.transport
-            && self.conversation.matches(&scope.conversation)
-            && (self.kind != ChatTransportKind::Local
-                || self.local_subject_service.as_deref() == Some(subject.service().as_str()))
-    }
-}
-
-fn render_conversation_problems(problems: &[ConversationMatchProblem]) -> String {
-    problems
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AttestorGrant {
-    pub namespaces: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub chat_scopes: Vec<ChatScopeGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespaces: Option<Vec<String>>,
 }
 
 impl AttestorGrant {
     pub fn validate(&self) -> Result<(), BrokerBuildError> {
-        if self.namespaces.is_empty() || self.namespaces.len() > MAX_POLICY_SCOPE_ENTRIES {
+        let Some(namespaces) = &self.namespaces else {
+            return Ok(());
+        };
+        if namespaces.is_empty() || namespaces.len() > MAX_POLICY_SCOPE_ENTRIES {
             return Err(BrokerBuildError::InvalidAttestorScope {
-                scope: self.namespaces.len().to_string(),
+                scope: namespaces.len().to_string(),
             });
         }
-        if self.chat_scopes.len() > MAX_POLICY_SCOPE_ENTRIES {
-            return Err(BrokerBuildError::InvalidChatScope);
-        }
-        for scope in &self.chat_scopes {
-            scope.validate()?;
-        }
-        for scope in &self.namespaces {
+        for scope in namespaces {
             let mut segments = scope.split('.');
             let service = segments.next().unwrap_or_default();
             let service_valid = service.parse::<SubjectService>().is_ok();
@@ -1157,21 +1085,15 @@ impl AttestorGrant {
         Ok(())
     }
 
+    /// Without `namespaces` an attestor may speak for exactly the mapped subjects, which the
+    /// identity directory has already resolved by the time this is asked.
     #[must_use]
     pub fn permits(&self, subject: &ExternalSubject) -> bool {
-        self.namespaces
-            .iter()
-            .any(|namespace| subject.in_namespace(namespace))
-    }
-
-    #[must_use]
-    pub fn permits_chat(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-        self.permits(subject)
-            && scope.conversation.is_canonical_for(scope.kind, subject)
-            && self
-                .chat_scopes
+        self.namespaces.as_ref().is_none_or(|namespaces| {
+            namespaces
                 .iter()
-                .any(|grant| grant.permits(subject, scope))
+                .any(|namespace| subject.in_namespace(namespace))
+        })
     }
 }
 
@@ -1516,22 +1438,6 @@ pub enum BrokerBuildError {
     SecretBindingExceedsCapability { binding: String },
     #[error("attestor namespace scope {scope:?} is not a canonical subject prefix")]
     InvalidAttestorScope { scope: String },
-    #[error("attestor chat scope is invalid")]
-    InvalidChatScope,
-    #[error(
-        "attestor chat scope still names `breadth`, which is gone; write \
-         `conversation: {{ kind: [channel], ids: [...] }}` (or `kind: any`) instead"
-    )]
-    RetiredChatScopeBreadth,
-    #[error("attestor chat scope conversation is invalid: {}", render_conversation_problems(.problems))]
-    InvalidChatScopeConversation {
-        problems: Vec<ConversationMatchProblem>,
-    },
-    #[error("attestor chat scope names an invalid local subject service")]
-    InvalidChatScopeService {
-        #[source]
-        source: SubjectError,
-    },
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
     #[error(
@@ -2325,9 +2231,15 @@ where
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
         };
+        if !grant.permits(&claim.subject) {
+            return (refused(), Some(unevaluated_refusal("attestation-denied")));
+        }
         let derived = match &claim.scope {
-            Some(scope) if !grant.chat_scopes.is_empty() => {
-                if !grant.permits_chat(&claim.subject, scope) {
+            Some(scope) => {
+                if !scope
+                    .conversation
+                    .is_canonical_for(scope.kind, &claim.subject)
+                {
                     return (refused(), Some(unevaluated_refusal("attestation-denied")));
                 }
                 AuthenticatedContext::attested_chat(
@@ -2338,17 +2250,12 @@ where
                     scope.clone(),
                 )
             }
-            Some(_) | None => {
-                if !grant.permits(&claim.subject) {
-                    return (refused(), Some(unevaluated_refusal("attestation-denied")));
-                }
-                AuthenticatedContext::attested(
-                    principal.clone(),
-                    actor,
-                    peer.principal().clone(),
-                    claim.subject.clone(),
-                )
-            }
+            None => AuthenticatedContext::attested(
+                principal.clone(),
+                actor,
+                peer.principal().clone(),
+                claim.subject.clone(),
+            ),
         };
         let Ok(context) = derived else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
