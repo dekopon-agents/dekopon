@@ -253,7 +253,8 @@ fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
 
 fn provider_policy(name: &str, agent_name: &str, provider: &str, capability: &str) -> String {
     format!(
-        r#"permit(principal == Dekopon::Principal::"{name}",
+        r#"@id("{name}-{capability}-via-{agent_name}")
+           permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
                   resource == Dekopon::Provider::"{provider}")
            when {{ context.via == "{GATEWAY}" && context.agent == "{agent_name}" }};
@@ -290,7 +291,8 @@ fn probe_policy(name: &str, agent_name: &str, capability: &str) -> String {
 
 fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
     format!(
-        r#"permit(principal == Dekopon::Principal::"{name}",
+        r#"@id("{name}-prompts-{agent_name}")
+           permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"agent.prompt",
                   resource == Dekopon::Agent::"{agent_name}")
            when {{ context.via == "{via}" }};"#
@@ -299,7 +301,8 @@ fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
 
 fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) -> String {
     format!(
-        r#"permit(principal == Dekopon::Principal::"{name}",
+        r#"@id("{name}-{capability}-attested-via-{agent_name}")
+           permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
                   resource == Dekopon::Provider::"cli-probe")
            when {{ context.via == "{via}"
@@ -1689,7 +1692,8 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
     let policy = format!(
         "{}\n{}",
         http_policy("caller", "provider-test", "http-probe.fetch"),
-        r#"permit(principal == Dekopon::Principal::"caller",
+        r#"@id("caller-secret-use")
+           permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
                   resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
     );
@@ -2135,7 +2139,7 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
         probe_engine(
             &format!(
                 "{}\n{}\n{}",
-                r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#,
+                r#"@id("caller-unconstrained") permit(principal == Dekopon::Principal::"caller", action, resource);"#,
                 attested_policy("cpetersen", "some-agent", GATEWAY, "cli-probe.upper"),
                 agent_prompt_policy("cpetersen", "some-agent", GATEWAY),
             ),
@@ -2586,7 +2590,7 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         principal("broker-test"),
         "policy-test".to_owned(),
         probe_engine(
-            r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#,
+            r#"@id("caller-unconstrained") permit(principal == Dekopon::Principal::"caller", action, resource);"#,
             ["caller"],
         ),
         catalog([(
@@ -2637,7 +2641,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
         "policy-test".to_owned(),
         probe_engine(
             &format!(
-                "@id(\"caller-upper\")\n{}\n{}",
+                "{}\n{}",
                 probe_policy("caller", "provider-test", "cli-probe.upper"),
                 agent_prompt_policy("other-caller", "provider-test", GATEWAY),
             ),
@@ -2680,7 +2684,10 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     for index in [0, 1] {
-        assert_eq!(encoded[index]["policy_ids"], json!(["caller-upper"]));
+        assert_eq!(
+            encoded[index]["policy_ids"],
+            json!(["caller-cli-probe.upper-via-provider-test"])
+        );
         assert_eq!(encoded[index]["policy_digest"], json!(digest));
     }
     assert_eq!(encoded[2]["reason"], "policy-denied");

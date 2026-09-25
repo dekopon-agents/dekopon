@@ -596,10 +596,12 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
+        @id("maintainer-prompt")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
         when { context.via == "gateway" };
+        @id("maintainer-reserved-looking-names")
         permit(principal == Dekopon::Principal::"maintainer",
                action in [Dekopon::Action::"ordinary.escape",
                           Dekopon::Action::"memory.chat.export"],
@@ -821,10 +823,12 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
+        @id("maintainer-prompt")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
         when { context.via == "gateway" };
+        @id("maintainer-ordinary-escape")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"ordinary.escape",
                resource == Dekopon::Provider::"memory-chat")
@@ -922,10 +926,12 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     .expect("policy world");
     let policy = PolicyEngine::new(
         r#"
+        @id("maintainer-prompt")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
         when { context.via == "gateway" };
+        @id("maintainer-storage-probe-run")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"storage-probe.run",
                resource == Dekopon::Provider::"storage-probe")
