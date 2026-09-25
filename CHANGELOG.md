@@ -91,6 +91,11 @@ All notable changes to Dekopon are documented here. The format is based on
   to `console.subject`).
 - `gateway.configDirectory.configMap` does the same for dekopond's `*.yaml` fragments in
   `dekopond.d`, owned by 65533; `gateway.config` must be empty.
+- `gateway.catalog.existingConfigMapKey: ""` mounts the whole ConfigMap as an `agents.d` directory.
+- `gateway.wakes` mounts a gateway-owned 0700 directory on the state claim for dekopond's wake
+  store, beside the journal and refused if it shares the journal's subdir or mount path (the
+  journal adopts every `*.jsonl` in its directory). Off by default; name a file under its
+  `mountPath` in `sessions.wakes.path`.
 
 ### Changed
 
