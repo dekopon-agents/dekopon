@@ -332,7 +332,7 @@ fn collect_resources(
     Ok(())
 }
 
-pub(crate) fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> {
+fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| SkillError::Read {
         path: path.to_path_buf(),
         source,

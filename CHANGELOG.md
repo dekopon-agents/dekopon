@@ -61,8 +61,9 @@ All notable changes to Dekopon are documented here. The format is based on
   statement written `principal in Dekopon::Group::"family"` grants every member. A policy naming a
   group nobody belongs to refuses startup. The policy digest covers membership.
 - Action groups: `Dekopon::Action::"<provider>:*"` holds every capability a provider declares and
-  `"<provider>:read-only"` its read-only ones. Writes are never grouped, so a provider upgrade
-  cannot make a new write reachable through an existing grant.
+  `"<provider>:read-only"` its read-only ones. A capability a provider upgrade adds still has no
+  constraint set until it is listed under the provider's `capabilities`, so a `:*` grant reaches
+  nothing new without an owner edit.
 
 - Persistent routes rebuild a window that is not in memory from `memory.recall`: `journal` (a
   gateway-owned JSONL transcript under `sessions.journal`, bounded by `forgetAfterMs` and a

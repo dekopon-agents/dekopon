@@ -209,8 +209,6 @@ impl PolicyWorld {
         self
     }
 
-    /// Only read-only capabilities get an effect group, so a provider upgrade that adds a write can
-    /// never become reachable through a grant written before it existed.
     #[must_use]
     pub fn with_read_only(mut self, capabilities: impl IntoIterator<Item = CapabilityId>) -> Self {
         self.read_only.extend(capabilities);
