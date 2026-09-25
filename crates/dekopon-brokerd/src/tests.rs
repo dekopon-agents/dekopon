@@ -48,8 +48,6 @@ fn attested_document(uid: u32) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "policiesPath": "policies.cedar",
         "providers": ["cli-probe.wasm"],
         "identities": [
@@ -375,8 +373,6 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     let document = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
@@ -434,8 +430,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
     let document = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
@@ -614,8 +608,6 @@ async fn telemetry_section_is_optional_and_strict() {
     let base = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
@@ -774,8 +766,6 @@ fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value 
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "providers": providers,
         "identities": [{
             "uid": uid,

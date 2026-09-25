@@ -106,8 +106,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-gateway",
         "policiesPath": directory.join("policies.cedar"),
         "providers": [provider("cli-probe"), provider("memory-chat")],
         "identities": [{

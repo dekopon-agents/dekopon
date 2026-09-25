@@ -486,8 +486,6 @@ when { context.capability == "http-probe.fetch"
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "secretMapPath": &secret_map_path,
         "providers": [provider_fixture("http-probe-provider.wasm")],
@@ -903,8 +901,6 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "strict": true,
         "providers": [provider_fixture("cli-probe-provider.wasm")],
@@ -969,8 +965,6 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "providers": [provider_fixture("cli-probe-provider.wasm")],
         "identities": [{

@@ -73,8 +73,6 @@ permit(principal == Dekopon::Principal::"cpetersen",
         &serde_json::to_vec(&json!({
             "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
             "socketPath": &socket,
-            "brokerPrincipal": "broker-test",
-            "policyRevision": "policy-test",
             "policiesPath": &policies,
             "providers": [&provider],
             "identities": [{
@@ -175,8 +173,8 @@ permit(principal == Dekopon::Principal::"cpetersen",
     assert_eq!(decision["capability.id"], "cli-probe.upper");
     assert_eq!(decision["decision.allowed"], true);
     assert_eq!(decision["policy.ids"], "cpetersen-upper");
-    assert_eq!(decision["policy.revision"], "policy-test");
     assert!(decision["policy.digest"].is_string(), "{decision}");
+    assert_eq!(decision["policy.revision"], decision["policy.digest"]);
     assert_eq!(decision["target"], "dekopon_broker::audit");
 
     let execution = records
