@@ -261,7 +261,8 @@ impl HostLimitsConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerLimitsConfig {
-    pub max_frame_bytes: usize,
+    /// Defaults to the smallest frame every configured request and response fits in.
+    pub max_frame_bytes: Option<usize>,
     pub io_timeout_ms: u64,
     pub max_connections: usize,
     pub shutdown_grace_ms: u64,
@@ -270,7 +271,7 @@ pub struct ServerLimitsConfig {
 impl Default for ServerLimitsConfig {
     fn default() -> Self {
         Self {
-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_frame_bytes: None,
             io_timeout_ms: u64::try_from(DEFAULT_IO_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             shutdown_grace_ms: u64::try_from(DEFAULT_SHUTDOWN_GRACE.as_millis())
@@ -282,7 +283,7 @@ impl Default for ServerLimitsConfig {
 impl ServerLimitsConfig {
     pub fn frame_limits(&self) -> Result<FrameLimits, ConfigError> {
         FrameLimits {
-            max_frame_bytes: self.max_frame_bytes,
+            max_frame_bytes: self.max_frame_bytes.unwrap_or(DEFAULT_MAX_FRAME_BYTES),
             io_timeout: Duration::from_millis(self.io_timeout_ms),
         }
         .validate()
@@ -756,7 +757,6 @@ async fn resolve(
     {
         return Err(ConfigError::InvalidServerLimits);
     }
-    let frame_limits = config.server_limits.frame_limits()?;
     let plaintext_hosts = PlaintextHosts::new(&config.http.plaintext_hosts)
         .map_err(|source| ConfigError::InvalidPlaintextHost { source })?;
     if config.http.extra_ca_bundles.len() > 8 || config.http.non_public_https.len() > 8 {
@@ -823,8 +823,22 @@ async fn resolve(
     }
     let maximum_response = host_limits
         .max_output_bytes
+        .max(host_limits.max_input_bytes)
+        .max(
+            chat_memory
+                .as_ref()
+                .and_then(|memory| usize::try_from(memory.max_result_bytes).ok())
+                .unwrap_or(0),
+        )
         .checked_add(MINIMUM_RESPONSE_OVERHEAD_BYTES)
         .ok_or(ConfigError::InvalidHostLimits)?;
+    let mut server_limits = config.server_limits;
+    server_limits.max_frame_bytes = Some(
+        server_limits
+            .max_frame_bytes
+            .unwrap_or_else(|| maximum_response.max(DEFAULT_MAX_FRAME_BYTES)),
+    );
+    let frame_limits = server_limits.frame_limits()?;
     if frame_limits.max_frame_bytes < maximum_response {
         return Err(ConfigError::SmallResponseFrame {
             minimum: maximum_response,
@@ -864,7 +878,7 @@ async fn resolve(
             })
             .ok_or(ConfigError::InvalidServerLimits)?;
     }
-    if config.server_limits.shutdown_grace() < minimum_shutdown {
+    if server_limits.shutdown_grace() < minimum_shutdown {
         return Err(ConfigError::ShortShutdownGrace);
     }
 
@@ -907,7 +921,7 @@ async fn resolve(
         plaintext_hosts,
         worst_case_guest_memory_bytes,
         broker_limits: config.broker_limits,
-        server_limits: config.server_limits,
+        server_limits,
         storage,
         assets,
         chat_memory,

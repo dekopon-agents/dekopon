@@ -1699,3 +1699,27 @@ async fn a_configuration_directory_merges_fragments_and_refuses_every_collision(
         .collect::<Vec<_>>();
     assert_eq!(keys, ["principals.cpetersen", "socketPath"]);
 }
+
+#[tokio::test]
+async fn an_unset_frame_ceiling_fits_the_largest_configured_request_or_response() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    let mut document = attested_document(uid);
+    document["hostLimits"] = json!({"maxInputBytes": 12_582_912, "maxOutputBytes": 4_194_304});
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid).await.expect("config resolves");
+    assert_eq!(
+        resolved.server_limits.max_frame_bytes,
+        Some(12_582_912 + config::MINIMUM_RESPONSE_OVERHEAD_BYTES)
+    );
+}

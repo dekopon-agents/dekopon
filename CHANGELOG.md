@@ -24,6 +24,10 @@ All notable changes to Dekopon are documented here. The format is based on
   and `routes` concatenate, every other key is set once, and a route must sit in the fragment that
   defines its transport.
 - **Breaking:** every Cedar statement needs an `@id`.
+- `serverLimits.maxFrameBytes` defaults to the smallest frame that fits the largest configured
+  input, output or chat-memory result plus overhead, so it no longer has to be raised by hand when
+  `hostLimits` grow. `shutdownGraceMs` stays explicit because the chart sizes the pod's
+  termination grace from it.
 - **Breaking:** `brokerPrincipal` and `policyRevision` are gone. Receipts and audit records carry
   the policy digest as the revision and `dekopon-broker` as the authorizing principal. An
   identity's `actor` defaults to the service actor of its own principal.
