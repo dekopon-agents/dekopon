@@ -402,6 +402,14 @@ gateway:
     subdir: gateway-journal
     mountPath: /var/lib/dekopond/journal
 
+  # The gateway's wake store (dekopond `sessions.wakes.path`), a directory on the state claim
+  # beside the journal and never inside it: the journal adopts every *.jsonl in its directory.
+  # Point `sessions.wakes.path` at a file under mountPath, such as <mountPath>/wakes.jsonl.
+  wakes:
+    enabled: false
+    subdir: gateway-wakes
+    mountPath: /var/lib/dekopond/wakes
+
   # dekopond.yaml names environment variable NAMES, never values, so every chat and model
   # credential is an ordinary secretKeyRef with no file hygiene involved. Example:
   #

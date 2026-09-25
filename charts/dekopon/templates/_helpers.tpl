@@ -139,6 +139,14 @@ than configured: an emptyDir here would turn seed-once into seed-per-reschedule.
 {{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.journal.subdir -}}
 {{- end -}}
 
+{{- define "dekopon.wakesEnabled" -}}
+{{- if and .Values.gateway.enabled .Values.gateway.wakes.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{- define "dekopon.wakesDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.wakes.subdir -}}
+{{- end -}}
+
 {{- define "dekopon.brokerChatgptSecretName" -}}
 {{- printf "%s-broker-chatgpt" (include "dekopon.fullname" .) -}}
 {{- end -}}
@@ -505,6 +513,32 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- end -}}
 {{- if and .Values.gateway.journal.enabled (not .Values.gateway.enabled) -}}
 {{- fail "gateway.journal.enabled has no effect without gateway.enabled" -}}
+{{- end -}}
+{{- if include "dekopon.wakesEnabled" . -}}
+{{- $problems := list -}}
+{{- $subdir := .Values.gateway.wakes.subdir -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $subdir)) (eq $subdir ".") (eq $subdir "..") -}}
+{{- $problems = append $problems (printf "gateway.wakes.subdir must be one non-dot path segment joined onto paths.stateDir, got %q" $subdir) -}}
+{{- end -}}
+{{- $taken := dict "gateway.journal.subdir" (and (include "dekopon.journalEnabled" .) .Values.gateway.journal.subdir) "gateway.chatgpt.subdir" (and (include "dekopon.chatgptEnabled" .) .Values.gateway.chatgpt.subdir) "broker.chatgpt.subdir" (and (include "dekopon.brokerChatgptEnabled" .) .Values.broker.chatgpt.subdir) "broker.providerSet.subdir" (and (include "dekopon.providerSetEnabled" .) .Values.broker.providerSet.subdir) -}}
+{{- range $name, $other := $taken -}}
+{{- if eq $other $subdir -}}
+{{- $problems = append $problems (printf "gateway.wakes.subdir and %s are both %q; the journal would adopt and evict the wake file" $name $subdir) -}}
+{{- end -}}
+{{- end -}}
+{{- $mount := .Values.gateway.wakes.mountPath -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $mount)) (ne (clean $mount) $mount) -}}
+{{- $problems = append $problems (printf "gateway.wakes.mountPath must be a canonical absolute path, got %q" $mount) -}}
+{{- end -}}
+{{- if and (include "dekopon.journalEnabled" .) (eq $mount .Values.gateway.journal.mountPath) -}}
+{{- $problems = append $problems "gateway.wakes.mountPath equals gateway.journal.mountPath; the journal would adopt and evict the wake file" -}}
+{{- end -}}
+{{- if $problems -}}
+{{- fail (printf "gateway.wakes is misconfigured: %s" (join "; " $problems)) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.gateway.wakes.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.wakes.enabled has no effect without gateway.enabled" -}}
 {{- end -}}
 
 {{/* The managed provider set. Collected the same way broker.chatgpt's problems are, and for the
