@@ -124,7 +124,7 @@ destination-bound credential rides alongside an authorized invocation, never ins
 secret material; the native engine injects it after guest-header validation, and the guest never
 observes it. For public DRNs, authorization commits the inert DRN, sink, and binding scope while the
 resolved bytes ride separately, and the host refuses any credential whose identity does not match
-that commitment. *Committed direction:* the broker's legacy `credential`/`credentialByAgent`
+that commitment. *Committed direction:* the broker's legacy `credential`/`agents.<id>.credentials`
 selection will be replaced by public DRNs; this host retains authorization-bound native injection
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 It supports buffered exchanges and bounded asset-backed streaming, not CONNECT tunnels,

@@ -36,7 +36,7 @@ member ID. Socket Mode means no public HTTP endpoint and no inbound firewall hol
 
 ## 2. Create the token and the credentials file
 
-This example uses the current `credential`/`credentialByAgent` binding path.
+This example uses the current `credential`/`agents.<id>.credentials` binding path.
 *Committed direction:* it will be replaced by public DRNs
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)); keep the existing
 configuration until that migration ships.

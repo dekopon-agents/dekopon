@@ -466,29 +466,7 @@ pub struct ConstraintSet {
     /// authorized it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
-    /// This is a second, caller-side credential axis keyed by agent identity from the
-    /// broker-derived trusted context, never a caller claim, letting one capability use different
-    /// secrets per caller.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub credential_by_agent: BTreeMap<AgentId, String>,
     pub constraints: ExecutionConstraints,
-}
-
-impl ConstraintSet {
-    #[must_use]
-    pub fn credential_for(&self, actor: &Actor) -> Option<&str> {
-        let selected = match actor {
-            Actor::Agent { agent } => self.credential_by_agent.get(agent),
-            Actor::Human { .. } | Actor::Service { .. } => None,
-        };
-        selected.or(self.credential.as_ref()).map(String::as_str)
-    }
-
-    fn selectable_credentials(&self) -> impl Iterator<Item = &String> {
-        self.credential
-            .iter()
-            .chain(self.credential_by_agent.values())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -547,6 +525,7 @@ impl fmt::Display for StartupWarning {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConstraintCatalog {
     sets: BTreeMap<CapabilityId, ConstraintSet>,
+    agent_credentials: BTreeMap<AgentId, BTreeMap<String, String>>,
 }
 
 impl ConstraintCatalog {
@@ -564,7 +543,48 @@ impl ConstraintCatalog {
                 return Err(BrokerBuildError::DuplicateConstraintSet { capability });
             }
         }
-        Ok(Self { sets })
+        Ok(Self {
+            sets,
+            agent_credentials: BTreeMap::new(),
+        })
+    }
+
+    /// Keyed by the agent the broker derived from the attestation, never a caller claim: an agent
+    /// rebinds a credential name its capabilities already use, so one capability can reach a
+    /// different organization's token per agent.
+    #[must_use]
+    pub fn with_agent_credentials(
+        mut self,
+        bindings: BTreeMap<AgentId, BTreeMap<String, String>>,
+    ) -> Self {
+        self.agent_credentials = bindings;
+        self
+    }
+
+    #[must_use]
+    pub fn credential_for<'a>(&'a self, set: &'a ConstraintSet, actor: &Actor) -> Option<&'a str> {
+        let name = set.credential.as_deref()?;
+        let rebound = match actor {
+            Actor::Agent { agent } => self
+                .agent_credentials
+                .get(agent)
+                .and_then(|bindings| bindings.get(name)),
+            Actor::Human { .. } | Actor::Service { .. } => None,
+        };
+        Some(rebound.map_or(name, String::as_str))
+    }
+
+    fn selectable_credentials<'a>(&'a self, set: &'a ConstraintSet) -> Vec<&'a str> {
+        let Some(name) = set.credential.as_deref() else {
+            return Vec::new();
+        };
+        let mut names = vec![name];
+        names.extend(
+            self.agent_credentials
+                .values()
+                .filter_map(|bindings| bindings.get(name).map(String::as_str)),
+        );
+        names
     }
 
     pub fn retain_routed(&mut self, registry: &BrokerProviderRegistry) -> Vec<CapabilityId> {
@@ -629,7 +649,12 @@ impl ConstraintCatalog {
         self.validate_routes()?;
         for (capability_id, set) in &self.sets {
             validate_set_constraints(set)?;
-            validate_set_credential(capability_id, set, credentials)?;
+            validate_set_credential(
+                capability_id,
+                set,
+                &self.selectable_credentials(set),
+                credentials,
+            )?;
             registry
                 .validate_constraints(&set.constraints)
                 .map_err(|source| BrokerBuildError::HostConstraint { source })?;
@@ -1226,10 +1251,10 @@ fn validate_trusted_metadata(
 fn validate_set_credential(
     capability_id: &CapabilityId,
     set: &ConstraintSet,
+    names: &[&str],
     credentials: &CredentialStore,
 ) -> Result<(), BrokerBuildError> {
-    let mut names = set.selectable_credentials().peekable();
-    if names.peek().is_none() {
+    if names.is_empty() {
         return Ok(());
     }
     let Some(http) = &set.constraints.http else {
@@ -1237,13 +1262,13 @@ fn validate_set_credential(
             capability: capability_id.clone(),
         });
     };
-    for name in names {
+    for &name in names {
         let credential =
             credentials
                 .get(name)
                 .ok_or_else(|| BrokerBuildError::UnknownCredential {
                     capability: capability_id.clone(),
-                    name: name.clone(),
+                    name: name.to_owned(),
                 })?;
         // Coverage must be checked from declared destinations only; resolving a refreshing
         // credential would make startup depend on a live token endpoint.
@@ -1251,7 +1276,7 @@ fn validate_set_credential(
             if !credential.covers(host) {
                 return Err(BrokerBuildError::CredentialDestinationMismatch {
                     capability: capability_id.clone(),
-                    name: name.clone(),
+                    name: name.to_owned(),
                     host: host.clone(),
                 });
             }
@@ -1791,7 +1816,6 @@ where
             if set.effect != effect
                 || set.risk != risk
                 || set.credential.is_some()
-                || !set.credential_by_agent.is_empty()
                 || set.constraints.http.is_some()
                 || set.constraints.max_output_bytes
                     < if route == CapabilityRoute::ChatMemoryRecord {
@@ -2381,7 +2405,7 @@ where
                 &mut encoded,
                 capability,
                 set,
-                set.credential_for(context.actor()),
+                self.constraints.credential_for(set, context.actor()),
                 digest,
             );
         }
@@ -2748,7 +2772,7 @@ where
         }
         if let Some(secret) = request.secret_use.as_ref() {
             execute.record("credential", secret.secret().as_str());
-        } else if let Some(credential) = set.credential_for(context.actor()) {
+        } else if let Some(credential) = self.constraints.credential_for(&set, context.actor()) {
             execute.record("credential", credential);
         }
         self.execute(context, request, set, policy_ids, assets, outputs)
@@ -3079,7 +3103,10 @@ where
         };
 
         let proposed_secret = authorized.proposal().secret_use.clone();
-        let legacy_credential_name = set.credential_for(context.actor()).map(str::to_owned);
+        let legacy_credential_name = self
+            .constraints
+            .credential_for(&set, context.actor())
+            .map(str::to_owned);
         let audit_credential = proposed_secret
             .is_none()
             .then_some(legacy_credential_name.as_deref())

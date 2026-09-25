@@ -38,7 +38,7 @@ authorization server retires its predecessor, so a second implementation of that
 way to revoke a token family. Two holders of one *file* are coordinated by the snapshot and the lock;
 two holders of one *account* want two files and two logins.
 
-*Committed direction:* the broker's `credential`/`credentialByAgent` bindings will be replaced by
+*Committed direction:* the broker's `credential`/`agents.<id>.credentials` bindings will be replaced by
 public DRNs without duplicating or removing this refresh implementation
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)). The gateway's model
 credential is not part of that provider-binding migration.
