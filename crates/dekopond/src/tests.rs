@@ -184,7 +184,10 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     assert_eq!(resolved.broker.server_uid, 501);
     assert!(resolved.telemetry.is_none());
     assert_eq!(resolved.sessions.max_conversations, 1024);
-    assert_eq!(resolved.routes[0].memory, MemoryPolicy::OneShot);
+    assert!(matches!(
+        resolved.routes[0].memory,
+        MemoryPolicy::Persistent(_)
+    ));
 }
 
 #[tokio::test]
@@ -748,29 +751,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |error| {
                 reports(error, |problem| {
                     matches!(problem, ConfigProblem::InvalidSessionLimits)
-                })
-            },
-        ),
-        (
-            "a retired route match block",
-            mutate(|document| {
-                document["routes"][0]["match"] = json!({"kind": "directMessage"});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::RetiredRouteMatch { .. })
-                })
-            },
-        ),
-        (
-            "a memory window written under the match block",
-            mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"kind": ["directMessage"], "mode": "persistent"});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::RetiredMemoryBlock { .. })
                 })
             },
         ),

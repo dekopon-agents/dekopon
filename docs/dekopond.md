@@ -4,7 +4,7 @@
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
-**Status: Current.** A route is `oneShot` unless configured otherwise; durable memory is a separate
+**Status: Current.** A route is `persistent` unless configured otherwise; durable memory is a separate
 broker/agent opt-in and does not turn that default into automatic replay. The chart enforces the
 [current local process boundary](security-model.md#current-local-process-boundary).
 
@@ -138,7 +138,7 @@ routes:                                       # first match wins; order matters
       maxCapabilityCalls: 16
       maxDurationMs: 300000                   # whole-session wall clock; omitted means none, 0 refused
       scriptTimeoutMs: 240000                 # one script's deadline; default 30000, 0 refused
-    memory:                                   # optional; default { mode: oneShot }
+    memory:                                   # optional; default { mode: persistent }
       mode: persistent                        # oneShot | persistent
       scope: privateConversation              # privateConversation (default) | sharedConversation
       idleTimeoutMs: 900000                   # optional, default 900000 (15 minutes)
@@ -925,7 +925,7 @@ answer the person is already reading.
 
 ## Sessions
 
-Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `memory:` block — that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
+Each routed message runs one session. On a `oneShot` route (`memory: { mode: oneShot }`) that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, conversation)` in-flight set, keyed on the same conversation identity the session registry and the memory key use, stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
@@ -948,7 +948,7 @@ whole gateway through the same bounded drain as shutdown, but with a nonzero exi
 
 **Status: Current.** History is a trust surface rather than a feature flag; [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
 
-A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. `oneShot` is the route default.
+A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. `persistent` with the default window is the route default; `memory: { mode: oneShot }` opts out.
 
 ### The history lives in the gateway
 
@@ -1007,7 +1007,7 @@ The loss is real and worth naming: the model cannot re-read a command it ran thr
 
 | Setting | Where | Bounds |
 |---|---|---|
-| `mode` | route `memory:` | `oneShot` (default) or `persistent` |
+| `mode` | route `memory:` | `persistent` (default) or `oneShot` |
 | `scope` | persistent route | `privateConversation` (default) or explicit `sharedConversation` |
 | `idleTimeoutMs` | persistent route | How long an untouched conversation survives; default 900000 |
 | `maxTurns` | persistent route | Exchanges the window replays; default 12 |
@@ -1102,8 +1102,7 @@ the resident window and the journal do. Platform recall for a wake reads the his
 
 The gateway receives an optional `ChatMemorySurface` only when the agent is enabled and the broker
 freshly permits all three exact memory capabilities under a matching subject namespace,
-owner-authored `chatScopes` grant whose `conversation:` selector claims it, a canonical transport
-and conversation claim, a storage constraint, and Cedar context. The storage namespace's two
+a canonical transport and conversation claim, a storage constraint, and Cedar context. The storage namespace's two
 conversation-derived scope values are `channel := conversation.id` and
 `conversation := conversation.key()`, so a Slack channel and a non-thread Discord channel keep the
 namespaces they had in 0.13, while WhatsApp, Telegram topics, and Discord threads change shape and

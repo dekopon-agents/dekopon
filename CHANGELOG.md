@@ -9,6 +9,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- **Breaking:** a route without `memory:` is `persistent` with the default window (15 minutes,
+  12 turns, 64 KiB, private). Write `memory: { mode: oneShot }` to keep a route stateless. The
+  retired route `match:` and memory-under-`conversation:` refusals are gone with the fields.
+- **Breaking:** `chatScopes` is deleted. A chat scope a gateway attests binds Cedar's `transport`
+  and `conversation` once it is canonical for the sender's service; narrowing by channel or
+  conversation is written in policy. An attestor without `namespaces` speaks for exactly the
+  mapped subjects.
+- **Breaking:** Cedar's `via` and `agent` context attributes are required, so policies read them
+  without `context has` guards. A direct peer (no attestation) is granted no capability.
 - **Breaking:** `identityMappings` is replaced by `principals`, keyed by principal, each with
   `subjects` and optional `groups`. Rewrite `- { subject: S, principal: P }` entries as
   `P: { subjects: [S] }`; a subject named under two principals refuses startup listing every one.
