@@ -52,8 +52,6 @@ pub enum ConfigApiVersion {
 pub struct BrokerdConfig {
     pub api_version: ConfigApiVersion,
     pub socket_path: PathBuf,
-    pub broker_principal: PrincipalId,
-    pub policy_revision: String,
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
     /// Loading validates descriptors without network access; an actual secret source is resolved
@@ -166,14 +164,18 @@ impl TelemetryConfig {
 pub struct PeerIdentity {
     pub uid: u32,
     pub principal: PrincipalId,
-    pub actor: Actor,
+    #[serde(default)]
+    pub actor: Option<Actor>,
     #[serde(default)]
     pub attestor: Option<AttestorGrant>,
 }
 
 impl PeerIdentity {
     pub fn context(&self) -> Result<AuthenticatedContext, ContextError> {
-        AuthenticatedContext::new(self.principal.clone(), self.actor.clone())
+        let actor = self.actor.clone().unwrap_or_else(|| Actor::Service {
+            principal: self.principal.clone(),
+        });
+        AuthenticatedContext::new(self.principal.clone(), actor)
     }
 }
 
@@ -296,8 +298,6 @@ impl ServerLimitsConfig {
 pub struct ResolvedConfig {
     pub source: PathBuf,
     pub socket_path: PathBuf,
-    pub broker_principal: PrincipalId,
-    pub policy_revision: String,
     pub credentials_path: Option<PathBuf>,
     pub secret_map_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
@@ -881,8 +881,6 @@ async fn resolve(
     Ok(ResolvedConfig {
         source,
         socket_path,
-        broker_principal: config.broker_principal,
-        policy_revision: config.policy_revision,
         credentials_path,
         secret_map_path,
         providers,

@@ -15,8 +15,6 @@ apiVersion: dekopon.dev/brokerd/v1alpha1
 
 socketPath: /home/xavier/.local/run/dekopon/broker.sock
 
-brokerPrincipal: local-broker
-policyRevision: conditional-write-2026-01
 
 # Relative to this file's directory. Copy broker-credentials.yaml.example, fill in the PAT, and
 # `chmod 600` it. Startup fails closed if it is missing, group-readable, or names no `api-token`.

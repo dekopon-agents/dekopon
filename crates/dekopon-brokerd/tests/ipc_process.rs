@@ -184,7 +184,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     }
     fs::write(&config, serde_json::to_vec(&json!({
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
-        "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
+        "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
         "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
         "capabilities": {"cli-probe": {"constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}, "capabilities": {"cli-probe.upper": {}}}}

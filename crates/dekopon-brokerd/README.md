@@ -42,8 +42,6 @@ non-sticky path ancestors are rejected.
 # broker.yaml
 apiVersion: dekopon.dev/brokerd/v1alpha1
 socketPath: /home/dekopon/.local/run/dekopon/broker.sock
-brokerPrincipal: local-broker
-policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
 providers:
   - /home/dekopon/lib/dekopon/cli-probe-provider.wasm

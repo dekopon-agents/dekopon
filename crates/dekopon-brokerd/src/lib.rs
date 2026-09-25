@@ -14,6 +14,8 @@
 )]
 mod assets;
 pub mod capabilities;
+
+const BROKER_PRINCIPAL: &str = "dekopon-broker";
 mod config;
 mod credentials;
 mod provider_manager;
@@ -274,10 +276,15 @@ where
                 .map(|(agent, binding)| (agent, binding.credentials))
                 .collect(),
         );
+    // The revision stamped on receipts and audit records is the policy set's own fingerprint, so
+    // it moves exactly when authorization can.
+    let revision = policy.digest().to_owned();
     let (broker, warnings) = Broker::start(
         registry,
-        config.broker_principal,
-        config.policy_revision,
+        BROKER_PRINCIPAL
+            .parse()
+            .expect("the broker principal is a valid identifier"),
+        revision,
         policy,
         constraints,
         credential_store,

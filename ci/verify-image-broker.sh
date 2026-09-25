@@ -35,8 +35,6 @@ if len(sys.argv) > 3:
 config.update({
     "apiVersion": "dekopon.dev/brokerd/v1alpha1",
     "socketPath": "/proof/broker.sock",
-    "brokerPrincipal": "image-broker",
-    "policyRevision": "image-proof",
     "providers": ["/opt/dekopon/providers/cli-probe-provider.wasm"],
     "identities": [{"uid": 65532, "principal": "image-peer",
                     "actor": {"type": "service", "principal": "image-peer"}}],

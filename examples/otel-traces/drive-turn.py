@@ -136,7 +136,6 @@ permit(principal == Dekopon::Principal::"smoke-user",
         broker_config = write("broker.json", {
             "apiVersion": "dekopon.dev/brokerd/v1alpha1",
             "socketPath": str(directory / "broker.sock"),
-            "brokerPrincipal": "broker-smoke", "policyRevision": "policy-smoke",
             "policiesPath": write("policies.cedar", policy),
             "providers": [str(root / "examples/providers/cli-probe-provider.wasm")],
             "identities": [{"uid": os.geteuid(), "principal": "dekopond-gateway",

@@ -24,6 +24,9 @@ All notable changes to Dekopon are documented here. The format is based on
   and `routes` concatenate, every other key is set once, and a route must sit in the fragment that
   defines its transport.
 - **Breaking:** every Cedar statement needs an `@id`.
+- **Breaking:** `brokerPrincipal` and `policyRevision` are gone. Receipts and audit records carry
+  the policy digest as the revision and `dekopon-broker` as the authorizing principal. An
+  identity's `actor` defaults to the service actor of its own principal.
 - A directory given as the broker's config path is read as flat `*.yaml` fragments plus `*.cedar`
   policy files. `principals`, `agents`, `constraintSets` and `providerSettings` union by name,
   `identities` and `providers` concatenate, every other key is set by one fragment, and every
