@@ -185,7 +185,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
         "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
-        "constraintSets": {"cli-probe.upper": {"provider": "cli-probe", "effect": "read-only", "risk": "Low", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
+        "capabilities": {"cli-probe": {"constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}, "capabilities": {"cli-probe.upper": {}}}}
     })).unwrap()).unwrap();
     for path in [&provider, &credentials, &policy, &config] {
         owned(path, server_uid, gid, 0o600, root);

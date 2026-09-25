@@ -112,15 +112,14 @@ broker:
   # crates/dekopon-brokerd/README.md, and examples/conditional-write/ is a working set.
   config:
     # Chart default: the cli-probe example from crates/dekopon-brokerd/README.md, repointed at the
-    # chart's paths. It is a real, deny-by-default configuration that starts and authorizes
-    # exactly one read-only capability for this pod's own UID — a broker you can install and
-    # watch become ready before you give it anything that matters. Replace it.
+    # chart's paths. It is a real, deny-by-default configuration that starts with the probe
+    # provider loaded and nothing executable — a broker you can install and watch become ready
+    # before you give it anything that matters. Replace it.
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
       brokerPrincipal: local-broker
       policyRevision: chart-default
-      policiesPath: /etc/dekopon/policies.cedar
       providers:
         - /opt/dekopon/providers/cli-probe-provider.wasm
       identities:
@@ -130,14 +129,6 @@ broker:
           actor:
             type: service
             principal: dekopon-pod
-      constraintSets:
-        cli-probe.upper:
-          provider: cli-probe
-          effect: read-only
-          risk: Low
-          constraints:
-            timeoutMs: 30000
-            maxOutputBytes: 1048576
       serverLimits:
         # A present section requires every field. These are the daemon's own defaults.
         maxFrameBytes: 2097152
@@ -156,16 +147,11 @@ broker:
     existingSecret: ""
     existingSecretKey: broker.yaml
 
-  # Cedar policy set. Required whenever broker.yaml declares any constraintSets, because a broker
+  # Cedar policy set. Required whenever broker.yaml declares any capabilities, because a broker
   # that declares executable capabilities and no policy refuses every request while looking
   # configured. An @id("…") annotation is what audit records carry as policy_ids.
   policies:
-    inline: |
-      @id("pod-probe")
-      permit(principal == Dekopon::Principal::"dekopon-pod",
-             action == Dekopon::Action::"cli-probe.upper",
-             resource == Dekopon::Provider::"cli-probe")
-      unless { context has via };
+    inline: ""
     existingSecret: ""
     existingSecretKey: policies.cedar
 

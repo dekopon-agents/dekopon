@@ -23,18 +23,13 @@ when { context.via == "gateway"
     && context.agent == "chat-agent" };
 "#;
 
-fn constraint_set() -> serde_json::Value {
-    serde_json::to_value(ConstraintSet {
-        route: CapabilityRoute::Generic,
-        provider: "cli-probe"
-            .parse::<ProviderId>()
-            .expect("valid provider fixture"),
-        effect: EffectKind::ReadOnly,
-        risk: RiskLevel::Low,
-        credential: None,
-        constraints: ExecutionConstraints::default(),
+fn probe_capabilities() -> serde_json::Value {
+    json!({
+        "cli-probe": {
+            "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+            "capabilities": {"cli-probe.upper": {}}
+        }
     })
-    .expect("constraint set serializes")
 }
 
 fn write_owner_only(path: &Path, contents: &[u8]) {
@@ -78,7 +73,7 @@ fn attested_document(uid: u32) -> serde_json::Value {
         "principals": {
             "cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}
         },
-        "constraintSets": {"cli-probe.upper": constraint_set()}
+        "capabilities": probe_capabilities()
     })
 }
 
@@ -118,7 +113,14 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
         )
     );
     assert!(resolved.policies.contains("agent.prompt"));
-    assert_eq!(resolved.constraint_sets.len(), 1);
+    assert_eq!(
+        resolved.capabilities[&"cli-probe".parse::<ProviderId>().expect("provider")]
+            .capabilities
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["cli-probe.upper"]
+    );
 
     let mut orphaned = document.clone();
     orphaned
@@ -382,7 +384,7 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"cli-probe.upper": constraint_set()}
+        "capabilities": probe_capabilities()
     });
     write_config(&path, &document);
     fs::write(
@@ -441,7 +443,7 @@ async fn plaintext_hosts_are_validated_at_startup() {
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"cli-probe.upper": constraint_set()}
+        "capabilities": probe_capabilities()
     });
     fs::write(
         directory.path().join("cli-probe.wasm"),
@@ -621,7 +623,7 @@ async fn telemetry_section_is_optional_and_strict() {
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"cli-probe.upper": constraint_set()}
+        "capabilities": probe_capabilities()
     });
     fs::write(
         directory.path().join("cli-probe.wasm"),
@@ -1383,7 +1385,14 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     .expect("declared world builds");
     let catalog = ConstraintCatalog::new([(
         capability,
-        serde_json::from_value(constraint_set()).expect("constraint set decodes"),
+        ConstraintSet {
+            route: CapabilityRoute::Generic,
+            provider: "cli-probe".parse().expect("valid provider fixture"),
+            effect: EffectKind::ReadOnly,
+            risk: RiskLevel::Low,
+            credential: None,
+            constraints: ExecutionConstraints::default(),
+        },
     )])
     .expect("one capability builds a catalog");
     let broker = Broker::new(

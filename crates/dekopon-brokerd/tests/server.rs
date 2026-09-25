@@ -22,9 +22,10 @@ use dekopon_broker_protocol::{
     ERROR_UNAUTHENTICATED, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_brokerd::{
-    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, current_uid, run,
+    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, capabilities,
+    current_uid, run,
 };
-use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
+use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretUseProposal,
@@ -76,6 +77,15 @@ fn probe_constraint_set() -> ConstraintSet {
         credential: None,
         constraints: ExecutionConstraints::default(),
     }
+}
+
+fn probe_capabilities() -> serde_json::Value {
+    json!({
+        "cli-probe": {
+            "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+            "capabilities": {"cli-probe.upper": {}}
+        }
+    })
 }
 
 fn probe_catalog() -> ConstraintCatalog {
@@ -473,28 +483,6 @@ when { context.capability == "http-probe.fetch"
         authority
     );
     write_owner_only(&secret_map_path, secret_map.as_bytes());
-    let set = ConstraintSet {
-        route: CapabilityRoute::Generic,
-        provider: "http-probe".parse().expect("provider"),
-        effect: EffectKind::ReadOnly,
-        risk: RiskLevel::Low,
-        credential: None,
-        constraints: ExecutionConstraints {
-            asset: None,
-            timeout_ms: 5_000,
-            max_output_bytes: 64 * 1024,
-            http: Some(HttpConstraints {
-                allowed_hosts: vec![authority.clone()],
-                allowed_methods: vec!["GET".to_owned()],
-                max_requests: 1,
-                max_request_bytes: 64 * 1024,
-                max_response_bytes: 64 * 1024,
-                allow_plaintext_loopback: true,
-            }),
-            storage: None,
-            secret_use: None,
-        },
-    };
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
@@ -510,8 +498,22 @@ when { context.capability == "http-probe.fetch"
             "attestor": {}
         }],
         "principals": {"cpetersen": {"subjects": [SLACK_SUBJECT]}},
-        "constraintSets": {
-            "http-probe.fetch": serde_json::to_value(set).expect("constraint set")
+        "capabilities": {
+            "http-probe": {
+                "constraints": {
+                    "timeoutMs": 5_000,
+                    "maxOutputBytes": 64 * 1024,
+                    "http": {
+                        "allowedHosts": [&authority],
+                        "allowedMethods": ["GET"],
+                        "maxRequests": 1,
+                        "maxRequestBytes": 64 * 1024,
+                        "maxResponseBytes": 64 * 1024,
+                        "allowPlaintextLoopback": true
+                    }
+                },
+                "capabilities": {"http-probe.fetch": {}}
+            }
         }
     });
     write_owner_only(
@@ -911,10 +913,7 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
-        "constraintSets": {
-            "cli-probe.upper": serde_json::to_value(probe_constraint_set())
-                .expect("constraint set serializes")
-        }
+        "capabilities": probe_capabilities()
     });
     write_owner_only(
         &config_path,
@@ -976,10 +975,7 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
-        "constraintSets": {
-            "cli-probe.upper": serde_json::to_value(probe_constraint_set())
-                .expect("constraint set serializes")
-        }
+        "capabilities": probe_capabilities()
     });
     write_owner_only(
         &config_path,
@@ -1253,4 +1249,43 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         .write(vec![0; 1024])
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capability_the_owner_did_not_list_gets_no_constraint_set() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("load cli-probe fixture");
+    let unlisted = "cli-probe.reverse"
+        .parse::<CapabilityId>()
+        .expect("valid capability fixture");
+    assert!(
+        registry
+            .capabilities()
+            .any(|(_, capability)| capability.id == unlisted),
+        "the fixture declares a capability the block leaves out"
+    );
+    let providers = serde_json::from_value(probe_capabilities()).expect("capabilities decode");
+
+    let (sets, problems) = capabilities::constraint_sets(&providers, |provider| {
+        let declared = registry
+            .capabilities()
+            .filter(|(owner, _)| *owner == provider)
+            .map(|(_, capability)| capabilities::ManifestCapability {
+                id: &capability.id,
+                effect: capability.effect,
+                risk: capability.risk,
+            })
+            .collect::<Vec<_>>();
+        (!declared.is_empty()).then_some(declared)
+    });
+
+    assert_eq!(problems, []);
+    assert_eq!(
+        sets.keys().map(CapabilityId::as_str).collect::<Vec<_>>(),
+        ["cli-probe.upper"]
+    );
 }

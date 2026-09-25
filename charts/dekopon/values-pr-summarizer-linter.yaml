@@ -39,11 +39,8 @@ broker:
       principals:
         maintainer:
           subjects: [slack.t0123abcd.u0123abcd]
-      constraintSets:
-        gh.content.read:
-          provider: gh
-          effect: read-only
-          risk: Low
+      capabilities:
+        gh:
           credential: github-pat
           constraints:
             timeoutMs: 10000
@@ -55,81 +52,33 @@ broker:
               maxRequestBytes: 16384
               maxResponseBytes: 2097152
               allowPlaintextLoopback: false
-        gh.pull-request.read:
-          provider: gh
-          effect: read-only
-          risk: Low
-          credential: github-pat
-          constraints:
-            timeoutMs: 10000
-            maxOutputBytes: 32768
-            http:
-              allowedHosts: [api.github.com]
-              allowedMethods: [GET]
-              maxRequests: 1
-              maxRequestBytes: 16384
-              maxResponseBytes: 262144
-              allowPlaintextLoopback: false
-        gh.pull-request.files:
-          provider: gh
-          effect: read-only
-          risk: Low
-          credential: github-pat
-          constraints:
-            timeoutMs: 10000
-            maxOutputBytes: 131072
-            http:
-              allowedHosts: [api.github.com]
-              allowedMethods: [GET]
-              maxRequests: 1
-              maxRequestBytes: 16384
-              maxResponseBytes: 1048576
-              allowPlaintextLoopback: false
-        gh.pull-request.diff:
-          provider: gh
-          effect: read-only
-          risk: Low
-          credential: github-pat
-          constraints:
-            timeoutMs: 10000
-            maxOutputBytes: 262144
-            http:
-              allowedHosts: [api.github.com]
-              allowedMethods: [GET]
-              maxRequests: 1
-              maxRequestBytes: 16384
-              maxResponseBytes: 2097152
-              allowPlaintextLoopback: false
-        gh.pull-request.status:
-          provider: gh
-          effect: read-only
-          risk: Low
-          credential: github-pat
-          constraints:
-            timeoutMs: 10000
-            maxOutputBytes: 131072
-            http:
-              allowedHosts: [api.github.com]
-              allowedMethods: [GET]
-              maxRequests: 2
-              maxRequestBytes: 16384
-              maxResponseBytes: 1048576
-              allowPlaintextLoopback: false
-        gh.pull-request.comment:
-          provider: gh
-          effect: external-write
-          risk: Medium
-          credential: github-pat
-          constraints:
-            timeoutMs: 15000
-            maxOutputBytes: 8192
-            http:
-              allowedHosts: [api.github.com]
-              allowedMethods: [GET, POST]
-              maxRequests: 2
-              maxRequestBytes: 16384
-              maxResponseBytes: 262144
-              allowPlaintextLoopback: false
+          capabilities:
+            gh.content.read: {}
+            gh.pull-request.read:
+              constraints:
+                maxOutputBytes: 32768
+                http:
+                  maxResponseBytes: 262144
+            gh.pull-request.files:
+              constraints:
+                maxOutputBytes: 131072
+                http:
+                  maxResponseBytes: 1048576
+            gh.pull-request.diff: {}
+            gh.pull-request.status:
+              constraints:
+                maxOutputBytes: 131072
+                http:
+                  maxRequests: 2
+                  maxResponseBytes: 1048576
+            gh.pull-request.comment:
+              constraints:
+                timeoutMs: 15000
+                maxOutputBytes: 8192
+                http:
+                  allowedMethods: [GET, POST]
+                  maxRequests: 2
+                  maxResponseBytes: 262144
       serverLimits:
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000

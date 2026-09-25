@@ -562,7 +562,6 @@ jobs:
           socketPath: /run/dekopon/broker.sock
           brokerPrincipal: local-broker
           policyRevision: chart-default
-          policiesPath: /etc/dekopon/policies.cedar
           providers:
             - /opt/dekopon/providers/cli-probe-provider.wasm
           identities:
@@ -571,14 +570,6 @@ jobs:
               actor:
                 type: service
                 principal: dekopon-pod
-          constraintSets:
-            cli-probe.upper:
-              provider: cli-probe
-              effect: read-only
-              risk: Low
-              constraints:
-                timeoutMs: 30000
-                maxOutputBytes: 1048576
           YAML
           if helm template dekopon charts/dekopon \
             --set-file broker.config.inline="$RUNNER_TEMP/foreign-uid-broker.yaml" \

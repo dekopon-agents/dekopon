@@ -84,12 +84,10 @@ permit(principal == Dekopon::Principal::"cpetersen",
                 "attestor": {},
             }],
             "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
-            "constraintSets": {
-                "cli-probe.upper": {
-                    "provider": "cli-probe",
-                    "effect": "read-only",
-                    "risk": "Low",
+            "capabilities": {
+                "cli-probe": {
                     "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
+                    "capabilities": {"cli-probe.upper": {}},
                 }
             },
         }))

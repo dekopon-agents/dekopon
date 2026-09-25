@@ -62,46 +62,42 @@ principals:
   cpetersen:
     subjects: [slack.t0123abcd.u0123abcd]
 
-constraintSets:
-  # One entry per capability the policy may reach. A capability with no entry is denied
-  # `unconstrained-capability` before Cedar is consulted, and a policy naming one refuses startup
-  # when `strict` is set.
+capabilities:
+  # One block per provider. Only the capabilities listed under it run: an unlisted one, including
+  # one a provider upgrade adds, is denied `unconstrained-capability` before Cedar is consulted, and
+  # a policy naming one refuses startup when `strict` is set. Each listed capability inherits the
+  # provider's credential and constraints; a field it sets replaces the inherited one whole.
   #
   # The credential is destination-bound in the credentials file and injected inside the native HTTP
   # engine; the model, the shell session, and the guest component never observe it.
-  http-probe.fetch:
-    provider: http-probe
-    effect: read-only
-    risk: Low
+  http-probe:
     credential: api-token
     constraints:
-      timeoutMs: 10000
-      maxOutputBytes: 262144
       http:
         allowedHosts: [api.example.com]
-        allowedMethods: [GET]
-        maxRequests: 1
         maxRequestBytes: 16384
-        maxResponseBytes: 2097152
         allowPlaintextLoopback: false
-  http-probe.conditional-write:
-    provider: http-probe
-    effect: external-write
-    risk: High
-    credential: api-token
-    constraints:
-      timeoutMs: 15000
-      maxOutputBytes: 8192
-      http:
-        # Two calls and two methods because the write pre-reads: one GET for the resource, one
-        # POST carrying the etag it just observed. That pre-read is what makes the capability
-        # `conditional` and what lets it refuse a resource that moved, before anything is written.
-        allowedHosts: [api.example.com]
-        allowedMethods: [GET, POST]
-        maxRequests: 2
-        maxRequestBytes: 16384
-        maxResponseBytes: 262144
-        allowPlaintextLoopback: false
+    capabilities:
+      http-probe.fetch:
+        constraints:
+          timeoutMs: 10000
+          maxOutputBytes: 262144
+          http:
+            allowedMethods: [GET]
+            maxRequests: 1
+            maxResponseBytes: 2097152
+      http-probe.conditional-write:
+        constraints:
+          timeoutMs: 15000
+          maxOutputBytes: 8192
+          http:
+            # Two calls and two methods because the write pre-reads: one GET for the resource, one
+            # POST carrying the etag it just observed. That pre-read is what makes the capability
+            # `conditional` and what lets it refuse a resource that moved, before anything is
+            # written.
+            allowedMethods: [GET, POST]
+            maxRequests: 2
+            maxResponseBytes: 262144
 
 # Optional. Uncomment to export broker spans; the ingest token is read from
 # OTEL_EXPORTER_OTLP_HEADERS by the SDK and never appears in this file.
