@@ -1,0 +1,21 @@
+broker:
+  config:
+    inline: ""
+  configDirectory:
+    configMap: dekopon-broker-d
+  credentials:
+    existingSecret: dekopon-broker-credentials
+
+gateway:
+  enabled: true
+  configDirectory:
+    configMap: dekopon-dekopond-d
+  catalog:
+    existingConfigMap: dekopon-agents
+    existingConfigMapKey: dekopon.yaml
+
+console:
+  enabled: true
+  image:
+    tag: v0.1.0
+  subject: discord.1

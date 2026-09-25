@@ -473,7 +473,7 @@ kubectl exec -it deploy/dekopon -c console -- dekopon-console
 ```
 
 The broker decides what it may do. `broker.yaml` needs an identity for UID 65535 whose attestor
-namespaces cover `console.subject`, and Cedar statements that name that identity's principal as
+namespaces cover `console.subject` (`broker.configDirectory.peers` renders it), and Cedar statements that name that identity's principal as
 `context.via`. With no such statements the console lists agents and is refused everything else.
 
 ## Storage, uninstall, and recovery
@@ -661,6 +661,30 @@ to an object that already exists. Setting both is an error.
 
 Use `existingSecret` for credentials and the private map. An inline value is stored in the release,
 returned by `helm get values`, and usually committed.
+
+### Configuration directories
+
+`broker.configDirectory.configMap` replaces `broker.yaml` and `policies.cedar` with a ConfigMap of
+fragments: the init container copies every `*.yaml` and `*.cedar` key into
+`<paths.configDir>/broker.d` as `65532`-owned `0600` files, asserts each one, hands the directory
+to `65532` as `0700`, and the broker starts with `--config <paths.configDir>/broker.d`. Clear
+`broker.config.inline` (it has a default) and leave `broker.config.existingSecret` and
+`broker.policies.*` empty; the chart refuses to render otherwise. Credentials, the secret map,
+bootstrap files and the ChatGPT seed still land beside `broker.d`, and a fragment names them by
+path (`credentialsPath: /etc/dekopon/broker-credentials.yaml`).
+
+`broker.configDirectory.peers` (on by default) adds a chart-rendered `peers.yaml` with the pod's
+own identities: `65532` as `dekopon-probe`, `65533` as `dekopond-gateway` with `attestor: {}` when
+the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespaces:
+[<console.subject>]` when the console is enabled with a subject. A ConfigMap key named
+`peers.yaml` fails the init container while this is on.
+
+`gateway.configDirectory.configMap` does the same for dekopond: every `*.yaml` key lands in
+`dekopond.d`, owned by `65533`, and `gateway.config` must be empty.
+
+The chart cannot hash a ConfigMap it did not render, so Reloader is the restart path: annotate the
+ConfigMap `reloader.stakater.com/match: "true"` and put `reloader.stakater.com/search: "true"` in
+`deploymentAnnotations`.
 
 `broker.secretBootstrapFiles` copies operator-managed Secret keys through the existing root init
 boundary into `<paths.configDir>/<file>` as broker-UID-owned `0600` files, which is how token/session

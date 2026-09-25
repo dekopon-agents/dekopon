@@ -71,6 +71,24 @@ All notable changes to Dekopon are documented here. The format is based on
 - Chat scopes carry a required `trigger` (`message`, `wake`, `probe`), readable by owner Cedar
   policy as `context.trigger`. The gateway and broker must be upgraded together.
 
+## [dekopon-chart-0.13.0] - 2026-09-25
+
+### Added
+
+- `broker.configDirectory.configMap` copies every `*.yaml` and `*.cedar` key of a ConfigMap into
+  `<paths.configDir>/broker.d` as 65532-owned 0600 files and starts the broker with `--config` on
+  that directory; `broker.config` and `broker.policies` must be empty. With
+  `broker.configDirectory.peers` (default on) the chart also renders `peers.yaml` there, mapping
+  the broker's own UID, the gateway's 65533 (attestor) and the console's 65535 (attestor scoped
+  to `console.subject`).
+- `gateway.configDirectory.configMap` does the same for dekopond's `*.yaml` fragments in
+  `dekopond.d`, owned by 65533; `gateway.config` must be empty.
+
+### Changed
+
+- **Breaking:** the default `broker.config.inline` drops `brokerPrincipal` and `policyRevision`,
+  which the broker no longer accepts.
+
 ## [dekopon-chart-0.12.0] - 2026-09-24
 
 ### Added

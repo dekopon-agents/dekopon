@@ -12,6 +12,14 @@
 {{- $storageRoot := .Values.providerStorage.rootPath -}}
 {{- $assetsRoot := .Values.brokerAssets.rootPath -}}
 {{- $providerSetDir := include "dekopon.providerSetDir" . -}}
+{{- $configDirs := list -}}
+{{- if .Values.broker.configDirectory.configMap -}}
+{{- $configDirs = append $configDirs (dict "dest" (printf "%s/broker.d" $cfg) "src" "/dekopon-broker-d-source" "volume" "broker-config-directory" "configMap" .Values.broker.configDirectory.configMap "owner" "$uid" "group" "$gid" "globs" "*.yaml *.cedar" "peers" .Values.broker.configDirectory.peers) -}}
+{{- end -}}
+{{- if and .Values.gateway.enabled .Values.gateway.configDirectory.configMap -}}
+{{- $configDirs = append $configDirs (dict "dest" (printf "%s/dekopond.d" $gcfg) "src" "/dekopon-gateway-d-source" "volume" "gateway-config-directory" "configMap" .Values.gateway.configDirectory.configMap "owner" "$gateway_uid" "group" "$gateway_gid" "globs" "*.yaml" "peers" false) -}}
+{{- end -}}
+{{- $sources := concat $files $seed -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -113,6 +121,13 @@ spec:
                 chown 0:0 "$d"
                 chmod 0700 "$d"
               done
+{{- range $configDirs }}
+              if [ -d "{{ .dest }}" ]; then
+                chown 0:0 "{{ .dest }}"
+                chmod 0700 "{{ .dest }}"
+                rm -rf "{{ .dest }}"
+              fi
+{{- end }}
               rm -f {{ $cfg }}/* {{ $gcfg }}/*
 
               # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
@@ -143,6 +158,52 @@ spec:
                 rc=1
               fi
               {{- end }}
+{{- range $dir := $configDirs }}
+
+              mkdir -m 0700 "{{ .dest }}"
+{{- if .peers }}
+              cat > "{{ .dest }}/peers.yaml" <<'PEERS'
+              {{- include "dekopon.peersFragment" $ | nindent 14 }}
+              PEERS
+              chown "{{ .owner }}:{{ .group }}" "{{ .dest }}/peers.yaml"
+              chmod 0600 "{{ .dest }}/peers.yaml"
+{{- end }}
+              found=0
+              # The globs skip ..data and the ..<timestamp> directory a ConfigMap volume carries.
+              for f in{{ range splitList " " $dir.globs }} {{ $dir.src }}/{{ . }}{{ end }}; do
+                [ -f "$f" ] || continue
+                name=${f##*/}
+{{- if .peers }}
+                if [ "$name" = peers.yaml ]; then
+                  echo "{{ .configMap }}: key peers.yaml collides with the chart-rendered peers.yaml; rename it or set broker.configDirectory.peers=false" >&2
+                  rc=1
+                  continue
+                fi
+{{- end }}
+                install -m 0600 -o "{{ .owner }}" -g "{{ .group }}" "$f" "{{ .dest }}/$name"
+                case "$name" in *.yaml) found=1 ;; esac
+              done
+              if [ "$found" -eq 0 ]; then
+                echo "{{ .configMap }}: no *.yaml keys to copy into {{ .dest }}" >&2
+                rc=1
+              fi
+              for f in "{{ .dest }}"/*; do
+                [ -e "$f" ] || continue
+                got=$(stat -c '%u:%g:%a:%h:%F' "$f")
+                if [ "$got" != "{{ .owner }}:{{ .group }}:600:1:regular file" ]; then
+                  echo "$f: got $got, want {{ .owner }}:{{ .group }}:600:1:regular file" >&2
+                  rc=1
+                fi
+              done
+              # Handed over only after the assertions above, which root without CAP_DAC_OVERRIDE
+              # can no longer make once the directory is 0700 and not its own.
+              chown "{{ .owner }}:{{ .group }}" "{{ .dest }}"
+              got=$(stat -c '%u:%a:%F' "{{ .dest }}")
+              if [ "$got" != "{{ .owner }}:700:directory" ]; then
+                echo "{{ .dest }}: got $got, want {{ .owner }}:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
 
 {{- range $seed }}
 {{- $seedUid := ternary "$gateway_uid" "$uid" (eq .owner "gateway") }}
@@ -261,9 +322,16 @@ spec:
               cpu: 100m
               memory: 32Mi
           volumeMounts:
+{{- if $sources }}
             - name: config-source
               mountPath: {{ $src }}
               readOnly: true
+{{- end }}
+{{- range $configDirs }}
+            - name: {{ .volume }}
+              mountPath: {{ .src }}
+              readOnly: true
+{{- end }}
             - name: config
               mountPath: {{ $cfg }}
             - name: gateway-config
@@ -287,7 +355,7 @@ spec:
           image: {{ include "dekopon.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["dekopond"]
-          args: ["--config", "{{ $cfg }}/dekopond.yaml"]
+          args: ["--config", "{{ $cfg }}/{{ if .Values.gateway.configDirectory.configMap }}dekopond.d{{ else }}dekopond.yaml{{ end }}"]
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65533 "runAsGroup" 65533)) | nindent 12 }}
           env:
@@ -404,6 +472,7 @@ spec:
         {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" false) | nindent 8 }}
         {{- end }}
       volumes:
+{{- if $sources }}
         # Read-only symlink farm. Only the init container ever sees it.
         - name: config-source
           projected:
@@ -413,13 +482,20 @@ spec:
               {{- /* A managed file's projected path is its own name; a seed's is `source`, which
                      keeps two credential families that both default to chatgpt-auth.json from
                      claiming one path in this volume. */}}
-              {{- range (concat $files $seed) }}
+              {{- range $sources }}
               - secret:
                   name: {{ .secret }}
                   items:
                     - key: {{ .key }}
                       path: {{ default .file .source }}
               {{- end }}
+{{- end }}
+{{- range $configDirs }}
+        - name: {{ .volume }}
+          configMap:
+            name: {{ .configMap }}
+            defaultMode: 0400
+{{- end }}
         # Memory-backed, so broker-credentials.yaml never reaches the node's disk.
         - name: config
           emptyDir:

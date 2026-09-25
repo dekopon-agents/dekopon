@@ -118,8 +118,6 @@ broker:
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
-      brokerPrincipal: local-broker
-      policyRevision: chart-default
       providers:
         - /opt/dekopon/providers/cli-probe-provider.wasm
       identities:
@@ -146,6 +144,18 @@ broker:
         maxTotalMemoryBytes: 268435456
     existingSecret: ""
     existingSecretKey: broker.yaml
+
+  # The alternative to config and policies: a ConfigMap whose every *.yaml and *.cedar key becomes
+  # a fragment in <paths.configDir>/broker.d, and the broker starts with --config on that
+  # directory. broker.config.inline (clear the default), existingSecret and broker.policies must
+  # all be empty. credentials, secretMap and chatgpt still land as single files beside broker.d;
+  # a fragment names them by path. Nothing rolls the pod when the ConfigMap changes: annotate it
+  # for Reloader.
+  configDirectory:
+    configMap: ""
+    # Renders peers.yaml into broker.d: identities for the broker's own UID (the probe), the
+    # gateway's 65533 when gateway.enabled, and the console's 65535 scoped to console.subject.
+    peers: true
 
   # Cedar policy set. Required whenever broker.yaml declares any capabilities, because a broker
   # that declares executable capabilities and no policy refuses every request while looking
@@ -317,6 +327,11 @@ gateway:
     inline: ""
     existingSecret: ""
     existingSecretKey: dekopond.yaml
+
+  # The alternative to config: a ConfigMap whose every *.yaml key becomes a fragment in
+  # dekopond.d, and dekopond starts with --config on that directory. gateway.config must be empty.
+  configDirectory:
+    configMap: ""
 
   # catalogPath is the one file with no hygiene rules at all — dekopond reads it with a plain
   # read_to_string. A ConfigMap mount is fine and nothing is copied.

@@ -541,6 +541,17 @@ jobs:
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set console.enabled=true --set console.image.tag=v0.1.0 \
             --set console.subject=discord.1 > "$RUNNER_TEMP/console.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/ci/values-config-directory.yaml > "$RUNNER_TEMP/config-directory.yaml"
+          grep -q -- '"--config", "/etc/dekopon/broker.d"' "$RUNNER_TEMP/config-directory.yaml"
+          grep -q -- '"--config", "/etc/dekopon/dekopond.d"' "$RUNNER_TEMP/config-directory.yaml"
+          grep -q 'namespaces: \["discord.1"\]' "$RUNNER_TEMP/config-directory.yaml"
+          if helm template dekopon charts/dekopon -f charts/dekopon/ci/values-config-directory.yaml \
+            --set broker.config.inline=x > /dev/null 2> "$RUNNER_TEMP/config-directory.err"; then
+            echo "broker.config.inline beside broker.configDirectory.configMap was accepted" >&2
+            exit 1
+          fi
+          grep -q 'broker.configDirectory.configMap replaces broker.config' "$RUNNER_TEMP/config-directory.err"
           # Retired broker UI configuration must fail, never silently disappear.
           if helm template dekopon charts/dekopon --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml" 2> "$RUNNER_TEMP/http-bind.err"; then
             echo "retired broker listener configuration was accepted" >&2
@@ -560,8 +571,6 @@ jobs:
           cat > "$RUNNER_TEMP/foreign-uid-broker.yaml" <<'YAML'
           apiVersion: dekopon.dev/brokerd/v1alpha1
           socketPath: /run/dekopon/broker.sock
-          brokerPrincipal: local-broker
-          policyRevision: chart-default
           providers:
             - /opt/dekopon/providers/cli-probe-provider.wasm
           identities:
@@ -635,6 +644,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/provider-set.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/config-directory.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a
