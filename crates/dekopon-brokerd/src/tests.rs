@@ -1648,3 +1648,64 @@ async fn assets_paths_are_resolved_and_refuse_overlap_in_both_directions() {
         Err(config::ConfigError::AssetsStateCollision)
     ));
 }
+
+#[tokio::test]
+async fn a_configuration_directory_merges_fragments_and_refuses_every_collision() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let uid = current_uid();
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let directory = root.path().join("broker.d");
+    fs::create_dir(&directory).expect("create broker.d");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("restrict broker.d");
+    fs::write(root.path().join("cli-probe.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+
+    let mut host = attested_document(uid);
+    let object = host.as_object_mut().expect("config object");
+    let principals = object.remove("principals").expect("principals");
+    let capabilities = object.remove("capabilities").expect("capabilities");
+    object.remove("policiesPath");
+    for (key, value) in object.iter_mut() {
+        if key == "providers" {
+            *value = json!(["../cli-probe.wasm"]);
+        }
+    }
+    write_config(&directory.join("host.yaml"), &host);
+    write_config(
+        &directory.join("people.yaml"),
+        &json!({"apiVersion": config::CONFIG_API_VERSION, "principals": principals}),
+    );
+    write_config(
+        &directory.join("probe.yaml"),
+        &json!({"apiVersion": config::CONFIG_API_VERSION, "capabilities": capabilities}),
+    );
+    write_owner_only(&directory.join("probe.cedar"), POLICIES.as_bytes());
+
+    let resolved = config::load(&directory, uid)
+        .await
+        .expect("disjoint fragments resolve");
+    assert_eq!(resolved.principals.len(), 1);
+    assert_eq!(resolved.capabilities.len(), 1);
+    assert!(resolved.policies.contains("chat-agent-upper"));
+
+    write_config(
+        &directory.join("twice.yaml"),
+        &json!({
+            "apiVersion": config::CONFIG_API_VERSION,
+            "socketPath": "/elsewhere.sock",
+            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.uother"]}}
+        }),
+    );
+    let Err(config::ConfigError::Fragments(dekopon_core::fragments::FragmentError::Conflicts {
+        conflicts,
+    })) = config::load(&directory, uid).await
+    else {
+        panic!("colliding fragments must refuse startup");
+    };
+    let keys = conflicts
+        .iter()
+        .map(|conflict| conflict.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["principals.cpetersen", "socketPath"]);
+}

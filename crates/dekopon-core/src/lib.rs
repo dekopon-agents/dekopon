@@ -17,6 +17,8 @@ mod accept;
 mod attribute;
 mod diagnostics;
 mod failure;
+#[cfg(unix)]
+pub mod fragments;
 mod redaction;
 mod skill;
 mod subject;

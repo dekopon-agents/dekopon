@@ -25,6 +25,7 @@ thiserror.workspace = true
 # wasm guest never listens, so the dependency stays off every non-Unix build of this crate.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+serde_yaml.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
