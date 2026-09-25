@@ -100,9 +100,9 @@ Everything is startup-fixed. There is no per-request parsing, compilation, or en
 ## Explaining a decision
 
 `PolicyDecision::determining_policy_ids` carries the identifiers of the policies that decided the
-answer, sorted, and the broker writes them into every audit record as `policy.ids`. Cedar names
-text-parsed policies positionally (`policy0`, `policy1`, …); an optional `@id("…")` annotation
-replaces that with a stable name, which is what an audit trail wants:
+answer, sorted, and the broker writes them into every audit record as `policy.ids`. Every statement
+requires an `@id("…")` annotation naming it, because Cedar's positional names (`policy0`, `policy1`,
+…) shift whenever a policy is added, which an audit trail cannot tolerate:
 
 ```cedar
 @id("chat-agent-upper")

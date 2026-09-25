@@ -105,7 +105,8 @@ fn empty_policy_text_is_valid_and_permits_nothing() {
 #[test]
 fn undeclared_names_refuse_construction() {
     let unknown_principal = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"nobody",
+        r#"@id("names-nobody")
+           permit(principal == Dekopon::Principal::"nobody",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -117,7 +118,8 @@ fn undeclared_names_refuse_construction() {
     ));
 
     let unknown_provider = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("names-github")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"github");"#,
         &world(),
@@ -129,7 +131,8 @@ fn undeclared_names_refuse_construction() {
     ));
 
     let unknown_action = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("names-gh-pull-request-approve")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"gh.pull-request.approve",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -141,7 +144,8 @@ fn undeclared_names_refuse_construction() {
     ));
 
     let unknown_type = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Robot::"hal",
+        r#"@id("names-robot-hal")
+           permit(principal == Dekopon::Robot::"hal",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -156,7 +160,8 @@ fn undeclared_names_refuse_construction() {
 #[test]
 fn strict_validation_rejects_attributes_an_action_never_carries() {
     let error = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("prompt-checks-effect")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"agent.prompt",
                   resource == Dekopon::Agent::"reviewer")
            when { context.effect == "read-only" };"#,
@@ -166,7 +171,8 @@ fn strict_validation_rejects_attributes_an_action_never_carries() {
     assert!(matches!(error, PolicyBuildError::Validation { .. }));
 
     PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("upper-checks-effect")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe")
            when { context.effect == "read-only" };"#,
@@ -317,7 +323,8 @@ fn forbid_overrides_permit_and_is_reported_as_the_reason() {
 #[test]
 fn referenced_capabilities_cover_every_action_a_policy_names() {
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("upper-and-reverse")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action in [Dekopon::Action::"cli-probe.upper", Dekopon::Action::"cli-probe.reverse"],
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -335,7 +342,8 @@ fn referenced_capabilities_cover_every_action_a_policy_names() {
 #[test]
 fn an_unconstrained_action_scope_names_no_capability() {
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen", action, resource);"#,
+        r#"@id("cpetersen-unconstrained")
+           permit(principal == Dekopon::Principal::"cpetersen", action, resource);"#,
         &world(),
     )
     .expect("an unconstrained scope validates");
@@ -378,6 +386,18 @@ fn source_and_count_bounds_fail_closed() {
 }
 
 #[test]
+fn a_statement_without_an_id_refuses_construction() {
+    let err = PolicyEngine::new(
+        r#"permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"cli-probe.upper",
+                  resource == Dekopon::Provider::"cli-probe");"#,
+        &world(),
+    )
+    .expect_err("a statement with no @id must refuse startup");
+    assert!(matches!(err, PolicyBuildError::MissingPolicyId { .. }));
+}
+
+#[test]
 fn policy_identifiers_are_bounded_and_unique() {
     let duplicate = PolicyEngine::new(
         r#"
@@ -413,8 +433,9 @@ fn policy_identifiers_are_bounded_and_unique() {
 
 #[test]
 fn digest_is_stable_across_formatting_and_moves_with_meaning() {
-    let compact = r#"permit(principal == Dekopon::Principal::"cpetersen",action == Dekopon::Action::"cli-probe.upper",resource == Dekopon::Provider::"cli-probe");"#;
+    let compact = r#"@id("cpetersen-upper") permit(principal == Dekopon::Principal::"cpetersen",action == Dekopon::Action::"cli-probe.upper",resource == Dekopon::Provider::"cli-probe");"#;
     let spaced = "
+        @id(\"cpetersen-upper\")
         permit(
             principal == Dekopon::Principal::\"cpetersen\",
             action    == Dekopon::Action::\"cli-probe.upper\",
@@ -428,7 +449,8 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     assert_eq!(baseline.digest().len(), "sha256:".len() + 64);
 
     let different_policy = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"direct-caller",
+        r#"@id("direct-caller-upper")
+           permit(principal == Dekopon::Principal::"direct-caller",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -663,20 +685,23 @@ permit(
 fn a_retired_or_unguarded_context_attribute_fails_validation() {
     for (source, why) in [
         (
-            r#"permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
+            r#"@id("guards-container")
+               permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
                  context has conversation
                  && context.conversation.container == "1153119165809434697"
                };"#,
             "`container` is optional, so it needs `context.conversation has container`",
         ),
         (
-            r#"permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
+            r#"@id("guards-retired-channel")
+               permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
                  context.channel == "1338356895504793623"
                };"#,
             "`context.channel` is gone; the id lives at `context.conversation.id`",
         ),
         (
-            r#"permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
+            r#"@id("guards-conversation-as-string")
+               permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
                  context has conversation && context.conversation == "1338356895504793623"
                };"#,
             "the conversation is a record, never a string",
@@ -837,7 +862,8 @@ fn every_action_declares_exactly_these_context_attributes() {
 #[test]
 fn debug_output_carries_no_policy_source() {
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("cpetersen-upper")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -880,7 +906,8 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
 #[test]
 fn a_tolerated_capability_is_never_reported_as_referenced() {
     let (engine, unresolved) = PolicyEngine::new_lenient(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("upper-and-unloaded-gh")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action in [Dekopon::Action::"cli-probe.upper",
                              Dekopon::Action::"gh.pull-request.approve"],
                   resource == Dekopon::Provider::"cli-probe");"#,
@@ -898,7 +925,8 @@ fn a_tolerated_capability_is_never_reported_as_referenced() {
 
 #[test]
 fn strict_construction_refuses_precisely_what_lenient_tolerates() {
-    let text = r#"permit(principal == Dekopon::Principal::"cpetersen",
+    let text = r#"@id("cpetersen-gh-approve")
+                  permit(principal == Dekopon::Principal::"cpetersen",
                           action == Dekopon::Action::"gh.pull-request.approve",
                           resource == Dekopon::Provider::"gh");"#;
 
@@ -928,7 +956,8 @@ fn strict_construction_refuses_precisely_what_lenient_tolerates() {
 #[test]
 fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
     let action = PolicyEngine::new_lenient(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("names-gh-read")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"GH.Read",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -940,7 +969,8 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
     );
 
     let provider = PolicyEngine::new_lenient(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("names-a-malformed-provider")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"Not A Provider");"#,
         &world(),
@@ -955,7 +985,8 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
     );
 
     let (_, unresolved) = PolicyEngine::new_lenient(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("cpetersen-gh-approve-2")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"gh.pull-request.approve",
                   resource == Dekopon::Provider::"gh");"#,
         &world(),
@@ -967,7 +998,8 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
 #[test]
 fn an_undeclared_principal_stays_fatal_under_leniency() {
     let error = PolicyEngine::new_lenient(
-        r#"permit(principal == Dekopon::Principal::"nobody",
+        r#"@id("names-nobody-leniently")
+           permit(principal == Dekopon::Principal::"nobody",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -982,7 +1014,8 @@ fn an_undeclared_principal_stays_fatal_under_leniency() {
 #[test]
 fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
     let error = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"Ops Team",
+        r#"@id("names-ops-team")
+           permit(principal == Dekopon::Principal::"Ops Team",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -1006,7 +1039,8 @@ fn a_malformed_principal_is_not_reported_as_merely_undeclared() {
 #[test]
 fn a_request_the_schema_cannot_express_says_so() {
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("cpetersen-upper")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world(),
@@ -1042,10 +1076,12 @@ fn a_request_the_schema_cannot_express_says_so() {
 
 #[test]
 fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
-    let text = r#"permit(principal == Dekopon::Principal::"cpetersen",
+    let text = r#"@id("cpetersen-upper-and-reverse")
+                  permit(principal == Dekopon::Principal::"cpetersen",
                           action in [Dekopon::Action::"cli-probe.upper",
                                      Dekopon::Action::"cli-probe.reverse"],
                           resource == Dekopon::Provider::"cli-probe");
+                  @id("cpetersen-no-reverse")
                   forbid(principal == Dekopon::Principal::"cpetersen",
                          action == Dekopon::Action::"cli-probe.reverse",
                          resource == Dekopon::Provider::"cli-probe");"#;
@@ -1068,7 +1104,8 @@ fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
 #[test]
 fn capability_permission_does_not_imply_secret_use() {
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("cpetersen-upper")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#,
         &world_with_secret(),
@@ -1110,7 +1147,8 @@ fn secret_use_is_a_separate_exact_resource_decision() {
     assert_eq!(allowed.determining_policy_ids, ["secret-use"]);
 
     let unknown = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen",
+        r#"@id("names-typo-drn")
+           permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"secret.use",
                   resource == Dekopon::Secret::"drn:com.xrl:secret:prod:api/typo");"#,
         &world_with_secret(),

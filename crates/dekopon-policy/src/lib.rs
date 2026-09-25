@@ -59,7 +59,8 @@
 //!     )],
 //! )?;
 //! let engine = PolicyEngine::new(
-//!     r#"permit(principal == Dekopon::Principal::"cpetersen",
+//!     r#"@id("cpetersen-may-cli-probe-upper")
+//!        permit(principal == Dekopon::Principal::"cpetersen",
 //!               action == Dekopon::Action::"cli-probe.upper",
 //!               resource == Dekopon::Provider::"cli-probe");"#,
 //!     &world,

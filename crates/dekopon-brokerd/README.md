@@ -592,9 +592,9 @@ The context each action carries is `dekopon-policy`'s
 authenticated transport state or this configuration — never from a request payload, and never from
 message content or provider input.
 
-An optional `@id("…")` annotation names a policy. That name is what audit records carry in
-`policy.ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
-`policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
+An `@id("…")` annotation is required on every policy. That name is what audit records carry in
+`policy.ids`; without one Cedar would name policies positionally (`policy0`, `policy1`, …) and
+inserting a policy would renumber the ones below it. Names must be unique.
 
 At decision time a capability with no constraint set is denied `unconstrained-capability` before
 Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
@@ -883,6 +883,7 @@ A chat claim that is canonical for the sender's service enters Cedar as the opti
 conversations it covers.
 
 ```cedar
+@id("maintainers-memory-chat-c0123abc")
 permit(principal in Dekopon::Group::"maintainers",
        action in Dekopon::Action::"memory-chat:*", resource)
 when { context.agent == "reviewer"

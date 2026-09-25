@@ -337,7 +337,7 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
     let (broker, audit) = broker_with(
         &format!(
             "{POLICY}\n{}",
-            r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#
+            r#"@id("caller-unconstrained") permit(principal == Dekopon::Principal::"caller", action, resource);"#
         ),
         8,
     )
@@ -922,19 +922,22 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
 
     for (policies, label) in [
         (
-            r#"permit(principal == Dekopon::Principal::"nobody",
+            r#"@id("names-nobody")
+               permit(principal == Dekopon::Principal::"nobody",
                       action == Dekopon::Action::"cli-probe.upper",
                       resource == Dekopon::Provider::"cli-probe");"#,
             "an undeclared principal",
         ),
         (
-            r#"permit(principal == Dekopon::Principal::"caller",
+            r#"@id("names-an-unloaded-capability")
+               permit(principal == Dekopon::Principal::"caller",
                       action == Dekopon::Action::"cli-probe.nonexistent",
                       resource == Dekopon::Provider::"cli-probe");"#,
             "an unloaded capability",
         ),
         (
-            r#"permit(principal == Dekopon::Principal::"caller",
+            r#"@id("names-an-unconstrained-capability")
+               permit(principal == Dekopon::Principal::"caller",
                       action == Dekopon::Action::"cli-probe.reverse",
                       resource == Dekopon::Provider::"cli-probe");"#,
             "a capability with no constraint set",
@@ -984,19 +987,22 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
 
     for (policies, label) in [
         (
-            r#"permit(principal == Dekopon::Principal::"caller",
+            r#"@id("names-an-unloaded-capability")
+               permit(principal == Dekopon::Principal::"caller",
                       action == Dekopon::Action::"cli-probe.nonexistent",
                       resource == Dekopon::Provider::"cli-probe");"#,
             "an unloaded capability",
         ),
         (
-            r#"permit(principal == Dekopon::Principal::"caller",
+            r#"@id("names-an-unconstrained-capability")
+               permit(principal == Dekopon::Principal::"caller",
                       action == Dekopon::Action::"cli-probe.reverse",
                       resource == Dekopon::Provider::"cli-probe");"#,
             "a capability with no constraint set",
         ),
         (
-            r#"permit(principal == Dekopon::Principal::"caller",
+            r#"@id("mixes-loaded-and-unloaded")
+               permit(principal == Dekopon::Principal::"caller",
                       action in [Dekopon::Action::"cli-probe.upper",
                                  Dekopon::Action::"cli-probe.nonexistent"],
                       resource == Dekopon::Provider::"cli-probe");"#,
@@ -1011,7 +1017,8 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
 
     write_owner_only(
         &policies_path,
-        r#"permit(principal == Dekopon::Principal::"nobody",
+        r#"@id("names-nobody")
+           permit(principal == Dekopon::Principal::"nobody",
                   action == Dekopon::Action::"cli-probe.upper",
                   resource == Dekopon::Provider::"cli-probe");"#
             .as_bytes(),
@@ -1097,7 +1104,9 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     )
     .unwrap();
     let engine = PolicyEngine::new(
-        r#"permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+        r#"@id("cpetersen-may-prompt-chat-agent")
+permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+@id("cpetersen-http-probe-purge")
 permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe");"#,
         &world,
     )

@@ -123,9 +123,11 @@ def main():
     try:
         telemetry = {"endpoint": endpoint, "transport": "http", "serviceName": service,
                      "exportTimeoutMs": 15000}
-        policy = '''permit(principal == Dekopon::Principal::"smoke-user",
+        policy = '''@id("smoke-user-may-prompt-chat-agent")
+permit(principal == Dekopon::Principal::"smoke-user",
  action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent")
  when { context has via && context.via == "dekopond-gateway" };
+@id("chat-agent-cli-probe-upper-surface")
 permit(principal == Dekopon::Principal::"smoke-user",
  action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe")
  when { context has via && context.via == "dekopond-gateway"

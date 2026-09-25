@@ -170,7 +170,9 @@ async fn ipc_process_boundary() {
         "credentials": [{"name": "fixture-token", "kind": "bearerToken", "scheme": "Bearer", "destinations": ["example.com"], "secret": "IPC-PRIVATE-SENTINEL"}]
     })).unwrap()).unwrap();
     let policy = private.join("policy.cedar");
-    fs::write(&policy, r#"permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+    fs::write(&policy, r#"@id("cpetersen-may-prompt-chat-agent")
+permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
+@id("cpetersen-cli-probe-upper")
 permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe");"#).unwrap();
     let socket = ipc.join("broker.sock");
     let config = private.join("broker.json");
