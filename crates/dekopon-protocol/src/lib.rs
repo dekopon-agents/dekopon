@@ -121,14 +121,8 @@ mod tests {
                 enabled: true,
                 instructions: Some("Review the diff and comment; never approve.".to_owned()),
                 skills: vec!["skills/pull-request-review".into()],
-                capabilities: vec![
-                    "github.pull-request.read"
-                        .parse()
-                        .expect("valid capability fixture"),
-                ],
-                providers: vec!["github".parse().expect("valid provider fixture")],
+                instructions_file: None,
                 model_class: Some("reasoning".to_owned()),
-                policy_profile: Some("review-read-only".to_owned()),
             },
             status: Some(AgentStatus::Ready),
         }

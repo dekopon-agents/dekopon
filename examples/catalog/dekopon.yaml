@@ -18,13 +18,7 @@ spec:
   # untrusted model text exactly as `instructions` is, and grants nothing.
   skills:
     - skills/pull-request-review
-  capabilities:
-    - github.pull-request.read
-    - github.pull-request.comment
-  providers:
-    - github
   modelClass: reasoning
-  policyProfile: pull-request-review
 status: Ready
 ---
 apiVersion: dekopon.dev/v1alpha1
@@ -36,10 +30,5 @@ metadata:
 spec:
   description: Finds recurring tool gaps without making external changes
   enabled: false
-  capabilities:
-    - github.repository.read
-  providers:
-    - github
   modelClass: analysis
-  policyProfile: repository-read-only
 status: Disabled

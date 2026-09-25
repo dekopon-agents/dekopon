@@ -12,23 +12,6 @@ fn problems(error: &ConfigError) -> &[CatalogProblem] {
     }
 }
 
-fn valid_documents(agent_name: &str) -> String {
-    format!(
-        r#"apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: {agent_name}
-spec:
-  description: Test agent
-  capabilities:
-    - github.pull-request.read
-  providers:
-    - github
-status: Ready
-"#
-    )
-}
-
 fn standalone_agent(name: &str) -> String {
     format!(
         r#"apiVersion: dekopon.dev/v1alpha1
@@ -46,7 +29,7 @@ status: Ready
 fn loads_multiple_documents_and_sorts_resources() {
     let input = format!(
         "{}---\n{}",
-        valid_documents("zebra"),
+        standalone_agent("zebra"),
         standalone_agent("alpha")
     );
     let file = tempfile::NamedTempFile::new().expect("temporary config");
@@ -91,15 +74,13 @@ fn rejects_duplicate_resources() {
 }
 
 #[test]
-fn a_withdrawn_kind_names_the_upgrade_rather_than_reading_as_a_typo() {
+fn every_unsupported_kind_is_reported_by_name() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1
 kind: Provider
 metadata:
   name: github
 spec:
   description: Test provider
-  type: github
-  credentialRef: test-credential
 ---
 apiVersion: dekopon.dev/v1alpha1
 kind: Capability
@@ -107,38 +88,34 @@ metadata:
   name: github.pull-request.read
 spec:
   description: Test capability
-  provider: github
-  effect: read-only
-  risk: Low
 "#;
-    let error = LocalCatalog::from_str("withdrawn.yaml", input)
-        .expect_err("a catalog carrying the withdrawn kinds must fail");
+    let error = LocalCatalog::from_str("unsupported.yaml", input)
+        .expect_err("a catalog naming unsupported kinds must fail");
 
     assert!(
         matches!(
             problems(&error),
             [
-                CatalogProblem::RemovedKind { .. },
-                CatalogProblem::RemovedKind { .. }
-            ]
+                CatalogProblem::UnsupportedKind { kind: first, .. },
+                CatalogProblem::UnsupportedKind { kind: second, .. }
+            ] if first == "Provider" && second == "Capability"
         ),
         "{error}"
     );
     let rendered = error.to_string();
     assert!(
-        rendered.contains("kind Provider is no longer part of the catalog"),
+        rendered.contains(r#"unsupported resource kind "Provider""#),
         "{rendered}"
     );
     assert!(
-        rendered.contains("kind Capability is no longer part of the catalog"),
+        rendered.contains(r#"unsupported resource kind "Capability""#),
         "{rendered}"
     );
-    assert!(rendered.contains("come from the broker"), "{rendered}");
 }
 
 #[test]
 fn rejects_unknown_fields() {
-    let input = valid_documents("reviewer").replacen(
+    let input = standalone_agent("reviewer").replacen(
         "description: Test agent",
         "description: Test agent\n  unknownSetting: true",
         1,
@@ -172,9 +149,6 @@ metadata:
   name: github.pull-request.read
 spec:
   description: Test capability
-  provider: github
-  effect: read-only
-  risk: Low
 ---
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent
@@ -196,7 +170,7 @@ spec:
         "{rendered}"
     );
     assert!(
-        rendered.contains("document 3: kind Capability is no longer part of the catalog"),
+        rendered.contains(r#"document 3: unsupported resource kind "Capability""#),
         "{rendered}"
     );
     assert!(
@@ -207,7 +181,7 @@ spec:
 
 #[test]
 fn a_future_api_version_gets_the_dedicated_message() {
-    let input = valid_documents("reviewer").replace("v1alpha1", "v1alpha2");
+    let input = standalone_agent("reviewer").replace("v1alpha1", "v1alpha2");
     let error = LocalCatalog::from_str("future.yaml", &input).expect_err("v1alpha2 must fail");
 
     assert!(
@@ -305,7 +279,7 @@ fn write_config(path: &Path) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("fixture directory");
     }
-    fs::write(path, valid_documents("reviewer")).expect("fixture config");
+    fs::write(path, standalone_agent("reviewer")).expect("fixture config");
 }
 
 fn write_skill(root: &Path, name: &str) {
@@ -411,4 +385,75 @@ fn every_unmountable_skill_is_reported_in_one_refusal() {
         "{error}"
     );
     assert!(error.to_string().contains("could not be loaded"), "{error}");
+}
+
+#[test]
+fn a_catalog_directory_loads_every_file_and_refuses_an_agent_named_twice() {
+    let root = tempdir().expect("temporary directory");
+    fs::write(root.path().join("alpha.yaml"), standalone_agent("alpha")).expect("first agent file");
+    fs::write(root.path().join("bravo.yaml"), standalone_agent("bravo"))
+        .expect("second agent file");
+
+    let catalog = LocalCatalog::load(root.path()).expect("a directory of distinct agents loads");
+    let names = catalog
+        .agents()
+        .map(|agent| agent.metadata.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["alpha", "bravo"]);
+
+    fs::write(root.path().join("charlie.yaml"), standalone_agent("alpha"))
+        .expect("duplicate agent file");
+    let error =
+        LocalCatalog::load(root.path()).expect_err("an agent named in two files is a duplicate");
+
+    assert!(
+        matches!(problems(&error), [CatalogProblem::DuplicateResource { .. }]),
+        "{error}"
+    );
+    assert!(error.to_string().contains("first declared"), "{error}");
+}
+
+#[test]
+fn instructions_file_is_read_beside_the_catalog_and_excludes_inline_instructions() {
+    let root = tempdir().expect("temporary directory");
+    fs::write(
+        root.path().join("instructions.md"),
+        "Read the pull request and comment once.\n",
+    )
+    .expect("instructions file");
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        "apiVersion: dekopon.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: reviewer\nspec:\n  \
+         description: Test agent\n  instructionsFile: instructions.md\nstatus: Ready\n",
+    )
+    .expect("catalog naming instructionsFile");
+
+    let catalog =
+        LocalCatalog::load(&catalog_path).expect("instructionsFile reads into instructions");
+    let reviewer = catalog
+        .agent(&"reviewer".parse().expect("valid agent id"))
+        .expect("the reviewer agent exists");
+    assert_eq!(
+        reviewer.spec.instructions.as_deref(),
+        Some("Read the pull request and comment once.\n")
+    );
+
+    fs::write(
+        &catalog_path,
+        "apiVersion: dekopon.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: reviewer\nspec:\n  \
+         description: Test agent\n  instructions: Inline orders.\n  instructionsFile: instructions.md\n\
+         status: Ready\n",
+    )
+    .expect("catalog naming both instructions and instructionsFile");
+
+    let error = LocalCatalog::load(&catalog_path)
+        .expect_err("an agent naming both instructions and instructionsFile must fail");
+    assert!(
+        matches!(
+            problems(&error),
+            [CatalogProblem::InstructionsTwice { agent }] if agent == "reviewer"
+        ),
+        "{error}"
+    );
 }
