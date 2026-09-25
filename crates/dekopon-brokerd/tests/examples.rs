@@ -361,6 +361,7 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
         grant
             .namespaces
             .iter()
+            .flatten()
             .any(|namespace| subject == *namespace || subject.starts_with(&format!("{namespace}."))),
         "{subject} sits outside the gateway's attestor namespaces"
     );
