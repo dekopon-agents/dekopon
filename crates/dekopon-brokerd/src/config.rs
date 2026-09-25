@@ -18,7 +18,9 @@ use dekopon_broker_protocol::{
 };
 use dekopon_core::{
     Actor, AgentId, ExternalSubject, FileHygieneError, FileTier, GroupId,
-    PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId, read_trusted_file,
+    PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId,
+    fragments::{self, FragmentError, MergeRules},
+    read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -347,10 +349,10 @@ pub async fn load(
     Ok(resolved)
 }
 
-/// Keys whose values are named collections: fragments union them by entry name. Every other key is
-/// set by exactly one fragment, so no fragment can override another and file order never matters.
-const MERGED_BY_NAME: [&str; 4] = ["principals", "agents", "capabilities", "providerSettings"];
-const CONCATENATED: [&str; 2] = ["identities", "providers"];
+const MERGE_RULES: MergeRules = MergeRules {
+    merged_by_name: &["principals", "agents", "capabilities", "providerSettings"],
+    concatenated: &["identities", "providers"],
+};
 const FRAGMENT_EXTENSION: &str = "yaml";
 const POLICY_EXTENSION: &str = "cedar";
 
@@ -362,8 +364,8 @@ async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
-    let fragments = scan_directory(&directory, expected_uid, FRAGMENT_EXTENSION)?;
-    let policy_files = scan_directory(&directory, expected_uid, POLICY_EXTENSION)?;
+    let fragments = fragments::scan_directory(&directory, expected_uid, FRAGMENT_EXTENSION)?;
+    let policy_files = fragments::scan_directory(&directory, expected_uid, POLICY_EXTENSION)?;
     let first = fragments
         .first()
         .cloned()
@@ -381,7 +383,7 @@ async fn load_directory(
         })?;
         parsed.push((path, mapping));
     }
-    let merged = merge_fragments(parsed)?;
+    let merged = fragments::merge(parsed, &MERGE_RULES)?;
     let config = serde_yaml::from_value::<BrokerdConfig>(serde_yaml::Value::Mapping(merged))
         .map_err(|source| ConfigError::Decode { source })?;
     if config.policies_path.is_some() {
@@ -406,134 +408,6 @@ async fn load_directory(
     }
     resolved.policies = policies;
     Ok(resolved)
-}
-
-fn scan_directory(
-    directory: &Path,
-    expected_uid: u32,
-    extension: &str,
-) -> Result<Vec<PathBuf>, ConfigError> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    let metadata =
-        std::fs::symlink_metadata(directory).map_err(|source| ConfigError::ResolvePath {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-    if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o022 != 0 {
-        return Err(ConfigError::InsecureConfigDirectory {
-            path: directory.to_path_buf(),
-        });
-    }
-    let entries = std::fs::read_dir(directory).map_err(|source| ConfigError::ResolvePath {
-        path: directory.to_path_buf(),
-        source,
-    })?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| ConfigError::ResolvePath {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|candidate| candidate == extension)
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn merge_fragments(
-    fragments: Vec<(PathBuf, serde_yaml::Mapping)>,
-) -> Result<serde_yaml::Mapping, ConfigError> {
-    use serde_yaml::Value;
-
-    let mut merged = serde_yaml::Mapping::new();
-    let mut owners = BTreeMap::<String, Vec<PathBuf>>::new();
-    let mut versions = BTreeSet::new();
-    for (path, fragment) in fragments {
-        for (key, value) in fragment {
-            let name = key.as_str().unwrap_or_default().to_owned();
-            if name == "apiVersion" {
-                versions.insert(serde_yaml::to_string(&value).unwrap_or_default());
-                merged.insert(key, value);
-                continue;
-            }
-            let collection =
-                CONCATENATED.contains(&name.as_str()) || MERGED_BY_NAME.contains(&name.as_str());
-            match (merged.get_mut(&key), value) {
-                (Some(Value::Sequence(into)), Value::Sequence(from)) if collection => {
-                    into.extend(from);
-                }
-                (Some(Value::Mapping(into)), Value::Mapping(from))
-                    if MERGED_BY_NAME.contains(&name.as_str()) =>
-                {
-                    for (entry, entry_value) in from {
-                        let owner = format!("{name}.{}", entry.as_str().unwrap_or_default());
-                        owners.entry(owner).or_default().push(path.clone());
-                        into.insert(entry, entry_value);
-                    }
-                }
-                (None, value) => {
-                    if let (true, Value::Mapping(entries)) =
-                        (MERGED_BY_NAME.contains(&name.as_str()), &value)
-                    {
-                        for entry in entries.keys() {
-                            let owner = format!("{name}.{}", entry.as_str().unwrap_or_default());
-                            owners.entry(owner).or_default().push(path.clone());
-                        }
-                    }
-                    owners.entry(name).or_default().push(path.clone());
-                    merged.insert(key, value);
-                }
-                (Some(_), _) => {
-                    owners.entry(name).or_default().push(path.clone());
-                }
-            }
-        }
-    }
-    let conflicts = owners
-        .into_iter()
-        .filter(|(_, files)| files.len() > 1)
-        .map(|(key, files)| FragmentConflict { key, files })
-        .collect::<Vec<_>>();
-    if !conflicts.is_empty() {
-        return Err(ConfigError::FragmentConflicts { conflicts });
-    }
-    if versions.len() > 1 {
-        return Err(ConfigError::MixedApiVersions);
-    }
-    Ok(merged)
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct FragmentConflict {
-    pub key: String,
-    pub files: Vec<PathBuf>,
-}
-
-impl std::fmt::Display for FragmentConflict {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let files = self
-            .files
-            .iter()
-            .map(|file| file.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(formatter, "{} is set in {files}", self.key)
-    }
-}
-
-fn render_conflicts(conflicts: &[FragmentConflict]) -> String {
-    conflicts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 async fn read_owner_only(
@@ -1127,20 +1001,14 @@ pub enum ConfigError {
     PoliciesPathInDirectory,
     #[error("configuration directory {path} holds no *.yaml fragment")]
     EmptyConfigDirectory { path: PathBuf },
-    #[error(
-        "configuration directory {path} must be owned by the broker and not group or world writable"
-    )]
-    InsecureConfigDirectory { path: PathBuf },
     #[error("configuration fragment {path} is not strict valid YAML")]
     DecodeFragment {
         path: PathBuf,
         #[source]
         source: serde_yaml::Error,
     },
-    #[error("configuration fragments conflict: {}", render_conflicts(.conflicts))]
-    FragmentConflicts { conflicts: Vec<FragmentConflict> },
-    #[error("configuration fragments disagree on apiVersion")]
-    MixedApiVersions,
+    #[error(transparent)]
+    Fragments(#[from] FragmentError),
     #[error("broker policy file is not valid UTF-8: {path}")]
     PolicyNotUtf8 { path: PathBuf },
     #[error("peer attestor grant is invalid")]
