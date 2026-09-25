@@ -50,6 +50,26 @@ enum Command {
     },
     /// Resolve, materialize, and verify a startup-fixed provider set.
     Provider(ProviderArgs),
+    /// Run startup validation on a configuration without serving: no socket is bound and no
+    /// credentials file, secret map, asset root or storage root is read or created.
+    Check(CheckArgs),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Args)]
+struct CheckArgs {
+    /// Broker configuration file or configuration directory.
+    #[arg(value_name = "CONFIG")]
+    config: PathBuf,
+    /// Operator-authored provider set to resolve when the configuration names a providerSet.
+    #[arg(long, value_name = "PATH", requires = "store")]
+    provider_set: Option<PathBuf>,
+    /// Private directory that keeps the resolved provider lock and blob store between checks.
+    #[arg(long, value_name = "DIR", requires = "provider_set")]
+    store: Option<PathBuf>,
+    /// Render problems and warnings as a table or JSON.
+    #[arg(long, value_enum, default_value_t)]
+    output: OutputFormat,
 }
 
 #[cfg(unix)]
@@ -180,6 +200,18 @@ async fn execute(cli: Cli) -> ExitCode {
                 filter: ConsoleFilter::Environment("warn".to_owned()),
             });
             observed(install, execute_provider(provider)).await
+        }
+        Some(Command::Check(check)) => {
+            let install = Install::new(Console {
+                format: ConsoleFormat::Text {
+                    ansi: None,
+                    target: false,
+                    timestamps: false,
+                },
+                writer: ConsoleWriter::Stderr,
+                filter: ConsoleFilter::Environment("error".to_owned()),
+            });
+            observed(install, execute_check(check)).await
         }
         None => {
             let config = cli
@@ -338,6 +370,57 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
+#[derive(Serialize)]
+struct CheckOutput {
+    ok: bool,
+    problems: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[cfg(unix)]
+async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
+    let providers = check
+        .provider_set
+        .zip(check.store)
+        .map(|(provider_set, store)| dekopon_brokerd::CheckProviders {
+            provider_set,
+            store,
+        });
+    let report = dekopon_brokerd::check(&check.config, providers).await;
+    let output = CheckOutput {
+        ok: report.problems.is_empty(),
+        problems: report
+            .problems
+            .iter()
+            .map(|problem| error_chain(problem))
+            .collect(),
+        warnings: report.warnings.iter().map(ToString::to_string).collect(),
+    };
+    render(check.output, &output, || {
+        let lines = output
+            .problems
+            .iter()
+            .map(|problem| format!("problem\t{problem}"))
+            .chain(
+                output
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("warning\t{warning}")),
+            )
+            .chain(output.ok.then(|| "ok".to_owned()))
+            .collect::<Vec<_>>();
+        lines.join("\n")
+    })?;
+    if output.ok {
+        Ok(())
+    } else {
+        Err(AppError::CheckFailed {
+            problems: output.problems.len(),
+        })
+    }
+}
+
+#[cfg(unix)]
 fn render<T: Serialize>(
     output: OutputFormat,
     value: &T,
@@ -366,8 +449,10 @@ enum AppError {
     Broker(#[source] dekopon_brokerd::BrokerdError),
     #[error("provider manager failed")]
     Provider(#[source] dekopon_brokerd::ProviderManagerError),
-    #[error("could not render provider-manager output")]
+    #[error("could not render command output")]
     Output(#[source] serde_json::Error),
+    #[error("configuration check found {problems} problem(s)")]
+    CheckFailed { problems: usize },
 }
 
 #[cfg(all(test, unix))]
@@ -459,6 +544,45 @@ mod tests {
         ])
         .expect("offline list parses without desired state");
         assert!(validate_cli(&list).is_ok());
+    }
+
+    #[test]
+    fn check_takes_a_positional_configuration_and_pairs_the_provider_set_with_a_store() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "check",
+            "broker.d",
+            "--provider-set",
+            "providers.yaml",
+            "--store",
+            "cache",
+            "--output",
+            "json",
+        ])
+        .expect("check parses");
+        assert!(validate_cli(&cli).is_ok());
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert_eq!(check.config, Path::new("broker.d"));
+        assert_eq!(check.output, OutputFormat::Json);
+
+        for unpaired in [
+            [
+                "dekopon-brokerd",
+                "check",
+                "broker.d",
+                "--provider-set",
+                "p.yaml",
+            ],
+            ["dekopon-brokerd", "check", "broker.d", "--store", "cache"],
+        ] {
+            assert!(Cli::try_parse_from(unpaired).is_err());
+        }
+        assert!(Cli::try_parse_from(["dekopon-brokerd", "check"]).is_err());
+        let daemon = Cli::try_parse_from(["dekopon-brokerd", "--config=x", "check", "broker.d"])
+            .expect("shape parses before validation");
+        assert!(validate_cli(&daemon).is_err());
     }
 
     #[test]

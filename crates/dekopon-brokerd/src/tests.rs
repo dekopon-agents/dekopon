@@ -1723,3 +1723,128 @@ async fn an_unset_frame_ceiling_fits_the_largest_configured_request_or_response(
         Some(12_582_912 + config::MINIMUM_RESPONSE_OVERHEAD_BYTES)
     );
 }
+
+fn example_path(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(name)
+}
+
+#[tokio::test]
+async fn check_passes_the_conditional_write_example_in_place() {
+    let report = super::check(example_path("examples/conditional-write/broker.yaml"), None).await;
+    assert!(
+        report.problems.is_empty(),
+        "{:?}",
+        report
+            .problems
+            .iter()
+            .map(|problem| dekopon_core::error_chain(problem))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_a_fragment_collision_an_unknown_group_and_a_missing_field_together() {
+    use super::{BrokerdError, capabilities::CapabilityProblem};
+    use dekopon_broker::PolicyBuildError;
+    use dekopon_core::fragments::FragmentError;
+
+    let uid = current_uid();
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let directory = root.path().join("broker.d");
+    fs::create_dir(&directory).expect("create broker.d");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("restrict broker.d");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+        .expect("checked cli-probe component");
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    write_config(
+        &directory.join("host.yaml"),
+        &json!({
+            "apiVersion": config::CONFIG_API_VERSION,
+            "socketPath": "../run/broker.sock",
+            "providers": ["../cli-probe.wasm"],
+            "identities": [{
+                "uid": uid,
+                "principal": "gateway",
+                "actor": {"type": "service", "principal": "gateway"},
+                "attestor": {"namespaces": ["slack.t0123abc"]}
+            }],
+            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}}
+        }),
+    );
+    write_config(
+        &directory.join("probe.yaml"),
+        &json!({
+            "apiVersion": config::CONFIG_API_VERSION,
+            "socketPath": "/elsewhere.sock",
+            "capabilities": {"cli-probe": {"capabilities": {"cli-probe.upper": {}}}}
+        }),
+    );
+    write_owner_only(
+        &directory.join("probe.cedar"),
+        format!(
+            "{POLICIES}\n@id(\"strangers-upper\")\npermit(principal in Dekopon::Group::\"strangers\", \
+             action == Dekopon::Action::\"cli-probe.upper\", resource);\n"
+        )
+        .as_bytes(),
+    );
+
+    let report = super::check(&directory, None).await;
+
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Config(config::ConfigError::Fragments(FragmentError::Conflicts { conflicts }))
+            if conflicts.iter().any(|conflict| conflict.key == "socketPath")
+    )));
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } }
+            if group == "strangers"
+    )));
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Capabilities { problems }
+            if problems.iter().any(|problem| matches!(
+                problem,
+                CapabilityProblem::MissingField { field: "timeoutMs", .. }
+            ))
+    )));
+}
+
+#[tokio::test]
+async fn check_binds_no_socket_and_reads_no_credentials_file() {
+    use super::StartupWarning;
+
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let example = example_path("examples/conditional-write");
+    let mut document = serde_yaml::from_str::<serde_json::Value>(
+        &fs::read_to_string(example.join("broker.yaml")).expect("example broker.yaml"),
+    )
+    .expect("example decodes");
+    let socket = directory.path().join("run/broker.sock");
+    let credentials = directory.path().join("broker-credentials.yaml");
+    document["socketPath"] = json!(socket);
+    document["credentialsPath"] = json!(credentials);
+    document["providers"] =
+        json!([
+            fs::canonicalize(example_path("examples/providers/http-probe-provider.wasm"))
+                .expect("checked http-probe component")
+        ]);
+    let path = directory.path().join("broker.yaml");
+    write_config(&path, &document);
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        &fs::read(example.join("policies.cedar")).expect("example policies"),
+    );
+
+    let report = super::check(&path, None).await;
+
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        StartupWarning::CredentialRequired { name } if name == "api-token"
+    )));
+    assert!(!socket.parent().expect("socket parent").exists());
+    assert!(!credentials.exists());
+}

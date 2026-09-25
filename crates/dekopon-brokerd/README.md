@@ -30,6 +30,29 @@ Success exits 0 without output; absent, refused, unmapped, wrong-server, malform
 endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects `--config`, loads no
 components or credentials, invokes nothing, and initializes no telemetry.
 
+## Check a configuration
+
+```console
+dekopon-brokerd check broker.d --provider-set providers.yaml --store ~/.cache/dekopon-check
+dekopon-brokerd check broker.yaml --output json
+```
+
+`check` runs the startup validation the daemon runs — strict decoding, fragment merging, provider
+loading, Cedar policy against the declared world, capability blocks, constraint sets against the
+loaded manifests, frame and memory ceilings — and stops before binding anything. It prints every
+problem and warning at once, one per line or as `{ "ok", "problems", "warnings" }`, and exits 0
+with no problems, 1 with problems and 2 on a usage error. Configuration files may be the invoking
+user's own 0644 files, as in a Git checkout; symlinks and group/world-writable files are still
+refused. Runtime paths are not required to exist and are never touched: the socket and its parent,
+`credentialsPath`, `secretMapPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
+stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. Secrets are not
+read: each credential a capability can select and each secret a policy names is reported as a
+warning naming what boot will require, and credential destination coverage and the secret map are
+not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
+(its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
+provider paths loads them directly. The peer-UID socket-parent check and the cwasm cache are
+runtime-only and skipped.
+
 ## Configuration
 
 The configuration must be a regular single-link file owned by the server UID and must not be
