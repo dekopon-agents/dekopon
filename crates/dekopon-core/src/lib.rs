@@ -237,6 +237,7 @@ identifier!(
     "principal",
     "A validated authenticated principal identifier."
 );
+identifier!(GroupId, "group", "A validated principal group identifier.");
 
 /// A DRN is deliberately inert: knowing or copying one grants no authority; the actual backend
 /// location stays in the broker's private secret map.

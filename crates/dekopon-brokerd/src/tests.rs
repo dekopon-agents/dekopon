@@ -76,9 +76,9 @@ fn attested_document(uid: u32) -> serde_json::Value {
                 "actor": {"type": "service", "principal": "console"}
             }
         ],
-        "identityMappings": [
-            {"subject": "slack.t0123abc.u9xyz", "principal": "cpetersen"}
-        ],
+        "principals": {
+            "cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}
+        },
         "constraintSets": {"cli-probe.upper": constraint_set()}
     })
 }
@@ -101,9 +101,9 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     let resolved = config::load(&path, uid)
         .await
         .expect("a complete attested path resolves");
-    assert_eq!(resolved.identity_mappings.len(), 1);
+    assert_eq!(resolved.principals.len(), 1);
     assert_eq!(
-        resolved.identity_mappings[0].subject.canonical(),
+        resolved.principals[&"cpetersen".parse().expect("principal")].subjects[0].canonical(),
         "slack.t0123abc.u9xyz"
     );
     assert!(
@@ -333,17 +333,18 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     let document = attested_document(uid);
 
     let mut duplicated = document.clone();
-    duplicated["identityMappings"] = json!([
-        {"subject": "slack.t0123abc.u9xyz", "principal": "cpetersen"},
-        {"subject": "slack.t0123abc.u9xyz", "principal": "someone-else"}
-    ]);
+    duplicated["principals"] = json!({
+        "cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "discord.1"]},
+        "someone-else": {"subjects": ["slack.t0123abc.u9xyz", "discord.1"]}
+    });
     write_config(&path, &duplicated);
     let error = config::load(&path, uid)
         .await
         .expect_err("one subject must not name two principals");
     assert!(matches!(
         error,
-        config::ConfigError::DuplicateSubject { subject } if subject == "slack.t0123abc.u9xyz"
+        config::ConfigError::DuplicateSubjects { subjects }
+            if subjects == ["discord.1", "slack.t0123abc.u9xyz"]
     ));
 
     for namespaces in [

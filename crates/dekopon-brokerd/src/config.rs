@@ -18,8 +18,8 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
 use dekopon_core::{
-    Actor, CapabilityId, ExternalSubject, FileHygieneError, FileTier, PROVIDER_COMPONENT_EXTENSION,
-    PrincipalId, ProviderId, read_trusted_file,
+    Actor, CapabilityId, ExternalSubject, FileHygieneError, FileTier, GroupId,
+    PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -69,7 +69,7 @@ pub struct BrokerdConfig {
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     #[serde(default)]
-    pub identity_mappings: Vec<IdentityMapping>,
+    pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
     #[serde(default)]
     pub policies_path: Option<PathBuf>,
     #[serde(default)]
@@ -172,11 +172,11 @@ impl PeerIdentity {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct IdentityMapping {
-    pub subject: ExternalSubject,
-    pub principal: PrincipalId,
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrincipalConfig {
+    pub subjects: Vec<ExternalSubject>,
+    pub groups: BTreeSet<GroupId>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -293,7 +293,7 @@ pub struct ResolvedConfig {
     pub locked_providers: Option<Vec<LockedProviderSource>>,
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
-    pub identity_mappings: Vec<IdentityMapping>,
+    pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
     pub policies_path: Option<PathBuf>,
     pub policies: String,
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
@@ -656,12 +656,20 @@ async fn resolve(
         }
     }
     let mut mapped_subjects = BTreeSet::new();
-    for mapping in &config.identity_mappings {
-        if !mapped_subjects.insert(mapping.subject.canonical()) {
-            return Err(ConfigError::DuplicateSubject {
-                subject: mapping.subject.canonical(),
-            });
+    let mut duplicate_subjects = BTreeSet::new();
+    for subject in config
+        .principals
+        .values()
+        .flat_map(|principal| &principal.subjects)
+    {
+        if !mapped_subjects.insert(subject.canonical()) {
+            duplicate_subjects.insert(subject.canonical());
         }
+    }
+    if !duplicate_subjects.is_empty() {
+        return Err(ConfigError::DuplicateSubjects {
+            subjects: duplicate_subjects.into_iter().collect(),
+        });
     }
     if !config.constraint_sets.is_empty() && policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
@@ -805,7 +813,7 @@ async fn resolve(
         locked_providers,
         strict: config.strict,
         identities: config.identities,
-        identity_mappings: config.identity_mappings,
+        principals: config.principals,
         policies_path,
         policies: String::new(),
         constraint_sets: config.constraint_sets,
@@ -917,8 +925,8 @@ pub enum ConfigError {
         #[source]
         source: dekopon_broker::BrokerBuildError,
     },
-    #[error("identity mapping duplicates subject {subject:?}")]
-    DuplicateSubject { subject: String },
+    #[error("subjects mapped to more than one principal: {subjects:?}")]
+    DuplicateSubjects { subjects: Vec<String> },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
     #[error("invalid broker frame limits")]

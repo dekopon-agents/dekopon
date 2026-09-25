@@ -172,7 +172,7 @@ when it is present every field is required. Unknown fields and unknown API versi
 Startup also requires aggregate provider metadata, every mapped peer's capability response, and the
 *widest* response any session could receive to fit the frame ceiling. That last bound is what
 matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the
-principals its `identityMappings` name hold the capability sets that reach the wire through an
+principals its `principals` name hold the capability sets that reach the wire through an
 attested `capabilities`.
 
 ```console
@@ -347,7 +347,7 @@ constraintSets:
 The key is the agent because a route already binds a transport and a match to an agent: one Slack
 workspace or channel selects the agent that answers, and the agent selects the token. The name comes
 from the attested context the broker derived from this file's own `attestor` grant and
-`identityMappings`, so a request payload cannot ask for a different token. A caller with no agent,
+`principals`, so a request payload cannot ask for a different token. A caller with no agent,
 such as a direct service peer, matches no override and takes the default.
 
 `credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
@@ -362,7 +362,7 @@ and the name is inert until a route and a policy exist for it.
 ### Attested identity
 
 A peer identity may carry an optional `attestor` grant, which lets it propose on behalf of an
-authenticated external chat identity. `identityMappings` is the other half: it is the only place a
+authenticated external chat identity. `principals` is the other half: it is the only place a
 canonical subject becomes a principal. The example's `credential` binding is current syntax that
 [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); identity attestation
 remains separate from credential selection.
@@ -381,9 +381,10 @@ identities:
         - kind: slack
           transport: scientist-slack
           conversation: { kind: any }   # or a kind list with `container`/`ids`
-identityMappings:
-  - subject: slack.t0123abc.u9xyz      # canonical: lowercase dotted segments
-    principal: maintainer              # the only place a subject becomes a principal
+principals:
+  maintainer:                          # the only place a subject becomes a principal
+    subjects: [slack.t0123abc.u9xyz]   # canonical: lowercase dotted segments
+    groups: [maintainers]              # optional; Cedar sees `principal in Dekopon::Group::"maintainers"`
 constraintSets:
   # One entry per capability the policy below may reach; the reads are elided here.
   gh.pull-request.comment:
@@ -430,7 +431,7 @@ cannot authorize a directly connected peer, and one that requires `unless { cont
 cannot authorize an attested proposal. Adding a gateway therefore cannot widen a grant that already
 existed.
 
-The gateway names a subject and never a principal; `identityMappings` is the only thing that
+The gateway names a subject and never a principal; `principals` is the only thing that
 resolves one, and an unmapped subject resolves to nothing. Refusals are audited denials recorded
 against the gateway's own principal, with reason `attestation-denied` (no grant, or a subject
 outside its namespaces), `unmapped-subject` (granted, but no mapping names that subject), or
@@ -549,15 +550,18 @@ ceiling an authorization could narrow, so changing it does not rotate stored aut
 
 Policies are [Cedar](https://cedarpolicy.com), validated at startup against a schema generated from
 this configuration. Everything a policy may name has to exist: principals come from `identities` and
-`identityMappings`, providers and capability actions come from the loaded provider manifests, and
+`principals`, providers and capability actions come from the loaded provider manifests, and
 `agent.prompt` is fixed. A policy naming anything else refuses startup rather than becoming policy
 that can never match.
 
 | Cedar name | Comes from |
 | --- | --- |
-| `Dekopon::Principal::"…"` | an `identities` entry or an `identityMappings` principal |
+| `Dekopon::Principal::"…"` | an `identities` entry or a `principals` key |
+| `Dekopon::Group::"…"` | a `principals.<id>.groups` entry; a group nobody belongs to refuses startup |
 | `Dekopon::Provider::"…"` | a loaded provider manifest |
 | `Dekopon::Action::"…"` | a loaded capability, or the fixed `agent.prompt` |
+| `Dekopon::Action::"<provider>:*"` | every capability the provider declares |
+| `Dekopon::Action::"<provider>:read-only"` | the provider's `read-only` capabilities; writes are never grouped |
 | `Dekopon::Agent::"…"` | any agent name; the catalog belongs to the gateway, not the broker |
 | `Dekopon::Secret::"drn:…"` | a public DRN declared by the owner-only secret map |
 | `Dekopon::Action::"secret.use"` | fixed separate permission to consume one exact DRN |
@@ -582,7 +586,7 @@ deployment whose provider set is fixed, where a mismatch means someone made a mi
 those warnings becomes a startup refusal.
 
 One thing is fatal in both modes: a policy naming a principal that no `identities` or
-`identityMappings` entry declares. Principals come from this file rather than from a loaded
+`principals` entry declares. Principals come from this file rather than from a loaded
 component, so an undeclared one is always a typo.
 
 Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar strict validation.

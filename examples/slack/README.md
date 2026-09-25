@@ -170,9 +170,9 @@ Find the workspace team ID (`T…`) and the sender’s member ID (`U…`, availa
 ID** in their profile). Lowercase both and add the canonical subject to `broker.yaml`:
 
 ```yaml
-identityMappings:
-  - subject: slack.t0123abc.u9xyz
-    principal: maintainer
+principals:
+  maintainer:
+    subjects: [slack.t0123abc.u9xyz]
 ```
 
 Also make sure the gateway identity’s attestor namespace covers that workspace:

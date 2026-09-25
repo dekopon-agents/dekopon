@@ -815,10 +815,11 @@ fn every_action_declares_exactly_these_context_attributes() {
         [
             "cli-probe.reverse",
             "cli-probe.upper",
+            "cli-probe:*",
             AGENT_PROMPT_ACTION,
             SECRET_USE_ACTION
         ],
-        "the world's two capabilities and the two fixed actions each get a context record"
+        "the world's two capabilities, their provider group and the two fixed actions"
     );
     for (action, expected) in [
         ("cli-probe.upper", &capability_context),
@@ -1166,4 +1167,141 @@ fn world_refusal_names_all_reserved_and_duplicate_capabilities() {
         duplicates,
         ["cli-probe.count", "cli-probe.reverse"].map(|id| id.parse().expect("valid id"))
     );
+}
+
+fn grouped_world() -> PolicyWorld {
+    world()
+        .with_group_members([
+            (
+                "cpetersen".parse().expect("principal"),
+                "family".parse().expect("group"),
+            ),
+            (
+                "isaac".parse().expect("principal"),
+                "family".parse().expect("group"),
+            ),
+        ])
+        .with_read_only(["cli-probe.upper".parse().expect("capability")])
+}
+
+#[test]
+fn a_group_grant_reaches_its_members_and_no_one_else() {
+    let engine = PolicyEngine::new(
+        r#"@id("family-upper")
+        permit(principal in Dekopon::Group::"family",
+               action == Dekopon::Action::"cli-probe.upper",
+               resource);"#,
+        &grouped_world(),
+    )
+    .expect("group policy loads");
+    for (principal, allowed) in [
+        ("cpetersen", true),
+        ("isaac", true),
+        ("direct-caller", false),
+    ] {
+        let decision = engine.authorize(capability_request(
+            principal,
+            "cli-probe.upper",
+            PolicyContext::default(),
+        ));
+        assert_eq!(decision.allowed, allowed, "{principal}");
+    }
+}
+
+#[test]
+fn a_group_nobody_belongs_to_refuses_construction() {
+    let error = PolicyEngine::new(
+        r#"@id("typo")
+        permit(principal in Dekopon::Group::"famly",
+               action == Dekopon::Action::"cli-probe.upper",
+               resource);"#,
+        &grouped_world(),
+    )
+    .expect_err("an empty group is a typo");
+    assert!(matches!(error, PolicyBuildError::UnknownGroup { group, .. } if group == "famly"));
+}
+
+#[test]
+fn the_read_only_group_holds_reads_and_never_writes() {
+    let engine = PolicyEngine::new(
+        r#"@id("reads")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action in Dekopon::Action::"cli-probe:read-only",
+               resource);"#,
+        &grouped_world(),
+    )
+    .expect("read-only group loads");
+    let read = engine.authorize(capability_request(
+        "cpetersen",
+        "cli-probe.upper",
+        PolicyContext::default(),
+    ));
+    let write = engine.authorize(capability_request(
+        "cpetersen",
+        "cli-probe.reverse",
+        PolicyContext::default(),
+    ));
+    assert!(read.allowed);
+    assert!(!write.allowed);
+    assert_eq!(engine.referenced_capabilities().count(), 0);
+}
+
+#[test]
+fn the_provider_group_holds_every_capability_and_unless_carves_one_out() {
+    let engine = PolicyEngine::new(
+        r#"@id("all-but-reverse")
+        permit(principal in Dekopon::Group::"family",
+               action in Dekopon::Action::"cli-probe:*",
+               resource)
+        unless { action == Dekopon::Action::"cli-probe.reverse" };"#,
+        &grouped_world(),
+    )
+    .expect("provider group loads");
+    let upper = engine.authorize(capability_request(
+        "isaac",
+        "cli-probe.upper",
+        PolicyContext::default(),
+    ));
+    let reverse = engine.authorize(capability_request(
+        "isaac",
+        "cli-probe.reverse",
+        PolicyContext::default(),
+    ));
+    assert!(upper.allowed);
+    assert_eq!(upper.determining_policy_ids, ["all-but-reverse"]);
+    assert!(!reverse.allowed);
+}
+
+#[test]
+fn an_action_group_of_an_unloaded_provider_is_tolerated_only_when_lenient() {
+    let policy = r#"@id("absent")
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action in Dekopon::Action::"absent:read-only",
+               resource);"#;
+    assert!(matches!(
+        PolicyEngine::new(policy, &grouped_world()),
+        Err(PolicyBuildError::UnknownAction { .. })
+    ));
+    let (_, unresolved) =
+        PolicyEngine::new_lenient(policy, &grouped_world()).expect("lenient tolerates it");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].kind, UnresolvedKind::ActionGroup);
+}
+
+#[test]
+fn the_digest_moves_when_membership_changes() {
+    let policy = r#"@id("family-upper")
+        permit(principal in Dekopon::Group::"family",
+               action == Dekopon::Action::"cli-probe.upper",
+               resource);"#;
+    let before = PolicyEngine::new(policy, &grouped_world()).expect("loads");
+    let after = PolicyEngine::new(
+        policy,
+        &grouped_world().with_group_members([(
+            "direct-caller".parse().expect("principal"),
+            "family".parse().expect("group"),
+        )]),
+    )
+    .expect("loads");
+    assert_ne!(before.digest(), after.digest());
 }

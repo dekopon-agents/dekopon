@@ -40,9 +40,9 @@ broker:
           actor:
             type: service
             principal: dekopond-gateway
-      identityMappings:
-        - subject: slack.t0123abcd.u0123abcd
-          principal: maintainer
+      principals:
+        maintainer:
+          subjects: [slack.t0123abcd.u0123abcd]
       constraintSets:
         gh.content.read:
           provider: gh

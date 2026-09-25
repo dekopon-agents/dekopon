@@ -73,7 +73,7 @@ Exactly these, and nothing else:
 | `uid: 501` | `broker.yaml` | your UID (`id -u`) |
 | `serverUid: 501` | `dekopond.yaml` | the same UID |
 | `slack.t0123abcd` | `broker.yaml`, `attestor.namespaces` | `slack.` + your lowercased team ID |
-| `slack.t0123abcd.u0123abcd` | `broker.yaml`, `identityMappings` | the lowercased `slack.<team>.<user>` of the person allowed to use this |
+| `slack.t0123abcd.u0123abcd` | `broker.yaml`, `principals` | the lowercased `slack.<team>.<user>` of the person allowed to use this |
 | `replace-me_XXXX…` | `broker-credentials.yaml` | the token from step 2 |
 
 Everything else already resolves. Relative paths in both configurations resolve against the
@@ -273,7 +273,7 @@ spans in the telemetry store.
 
 | Symptom | Cause | Where it shows |
 |---|---|---|
-| Slack replies `You're not authorized to use this agent.` | any one of three: the sender's subject is not in `identityMappings`; the peer identity has no `attestor` grant, or the subject sits outside its `namespaces`; or no policy permits `agent.prompt` for that principal and agent — check the `via` condition names your gateway's `principal`. The broker answers all three identically on purpose: a refusal must not disclose whether a subject is even mapped. | gateway stdout, `{"event":"gateway_session_rejected","reason":"attestation-refused"}`. **No audit record** — a refused capability listing is not a proposal, so there is nothing to audit and no model call was paid for. Work the three causes in the configuration. |
+| Slack replies `You're not authorized to use this agent.` | any one of three: the sender's subject is not in `principals`; the peer identity has no `attestor` grant, or the subject sits outside its `namespaces`; or no policy permits `agent.prompt` for that principal and agent — check the `via` condition names your gateway's `principal`. The broker answers all three identically on purpose: a refusal must not disclose whether a subject is even mapped. | gateway stdout, `{"event":"gateway_session_rejected","reason":"attestation-refused"}`. **No audit record** — a refused capability listing is not a proposal, so there is nothing to audit and no model call was paid for. Work the three causes in the configuration. |
 | The same reply, but the log says `"reason":"unauthorized"` | attested, mapped, and permitted to drive the agent — and policy grants it zero capabilities. Usually the second policy statement's `context.agent` or `context.via` disagreeing with the first's. | gateway stdout |
 | The agent answers that it could not write | the write was denied or refused | broker stdout, a `broker.decision` with `"decision.allowed": false` and a `decision.reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `unconstrained-capability`, or a deny-by-default with no `policy.ids`), or a `precondition-failed` provider error when the record moved |
 | Broker exits: `policy permits capability X, which has no constraint set` | `policies.cedar` names a capability `broker.yaml` does not constrain | startup, before the socket is bound |

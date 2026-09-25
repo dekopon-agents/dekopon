@@ -7,7 +7,20 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `identityMappings` is replaced by `principals`, keyed by principal, each with
+  `subjects` and optional `groups`. Rewrite `- { subject: S, principal: P }` entries as
+  `P: { subjects: [S] }`; a subject named under two principals refuses startup listing every one.
+
 ### Added
+
+- Cedar groups: a principal's `groups` make it a member of `Dekopon::Group::"<group>"`, so one
+  statement written `principal in Dekopon::Group::"family"` grants every member. A policy naming a
+  group nobody belongs to refuses startup. The policy digest covers membership.
+- Action groups: `Dekopon::Action::"<provider>:*"` holds every capability a provider declares and
+  `"<provider>:read-only"` its read-only ones. Writes are never grouped, so a provider upgrade
+  cannot make a new write reachable through an existing grant.
 
 - Persistent routes rebuild a window that is not in memory from `memory.recall`: `journal` (a
   gateway-owned JSONL transcript under `sessions.journal`, bounded by `forgetAfterMs` and a

@@ -56,11 +56,11 @@ identities:
       # subjects in this workspace; it resolves none of them to a principal.
       namespaces: [slack.t0123abcd]
 
-identityMappings:
+principals:
   # The only place a Slack user becomes a principal. An unmapped sender reaches nothing, which is
   # why the Slack app can be installed workspace-wide without widening anything.
-  - subject: slack.t0123abcd.u0123abcd
-    principal: cpetersen
+  cpetersen:
+    subjects: [slack.t0123abcd.u0123abcd]
 
 constraintSets:
   # One entry per capability the policy may reach. A capability with no entry is denied
