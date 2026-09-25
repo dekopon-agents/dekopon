@@ -143,7 +143,12 @@ struct Frame {
     positional: Vec<Value>,
 }
 
-pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits) -> ScriptOutcome {
+pub(crate) fn run(
+    script: &str,
+    prev: Option<&str>,
+    invoker: &dyn CapabilityInvoker,
+    limits: Limits,
+) -> ScriptOutcome {
     let program = match parse(script) {
         Ok(program) => program,
         Err(error) => {
@@ -162,7 +167,10 @@ pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits)
         budget: Budget::start(limits),
         limits,
         output: OutputBuffer::new(&limits),
-        globals: BTreeMap::new(),
+        globals: prev
+            .map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
+            .into_iter()
+            .collect(),
         frames: Vec::new(),
         functions: BTreeMap::new(),
         function_names: BTreeSet::new(),

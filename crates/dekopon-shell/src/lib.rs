@@ -363,7 +363,16 @@ impl Interpreter {
     }
 
     pub fn run(&self, script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
-        interp::run(script, invoker, self.limits)
+        interp::run(script, None, invoker, self.limits)
+    }
+
+    pub fn run_with_prev(
+        &self,
+        script: &str,
+        prev: &str,
+        invoker: &dyn CapabilityInvoker,
+    ) -> ScriptOutcome {
+        interp::run(script, Some(prev), invoker, self.limits)
     }
 }
 
