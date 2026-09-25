@@ -14,7 +14,6 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 pub use dekopon_core::AgentStatus;
-use dekopon_core::{CapabilityId, ProviderId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -78,19 +77,12 @@ pub struct AgentSpec {
     /// and they grant no authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<PathBuf>,
-    /// Capabilities the agent may propose. This list itself grants no provider authority.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<CapabilityId>,
-    /// Catalog validation requires this list to exactly match the providers the agent's
-    /// capabilities route to and refuses any drift between them; the list itself grants nothing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<ProviderId>,
+    /// Read at catalog load, relative to the catalog file, into `instructions`; a spec names one or
+    /// the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_class: Option<String>,
-    /// This field is inert; no runtime authority reader consumes it, since broker authority comes
-    /// only from the Cedar policy file and the per-capability constraint sets in broker.yaml.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_profile: Option<String>,
 }
 
 const fn default_enabled() -> bool {

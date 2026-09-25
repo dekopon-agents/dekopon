@@ -26,6 +26,7 @@ pub mod skill;
 pub use skill::{Skill, SkillError, SkillResource, load_skill};
 
 pub const CONFIG_ENV: &str = "DEKOPON_CONFIG";
+pub const MAX_INSTRUCTIONS_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct LocalCatalog {
@@ -37,44 +38,96 @@ pub struct LocalCatalog {
 }
 
 impl LocalCatalog {
+    /// A directory is read as every `*.yaml` directly inside it, in filename order; an agent named in
+    /// two files is a duplicate like one named twice in a file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let read = |file: &Path| {
+            fs::read_to_string(file).map_err(|source| ConfigError::Read {
+                path: file.display().to_string(),
+                source,
+            })
+        };
+        if !fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Self::from_str(path, &read(path)?);
+        }
+        let entries = fs::read_dir(path).map_err(|source| ConfigError::Read {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_str(path, &contents)
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let file = entry.path();
+            if file
+                .extension()
+                .is_some_and(|extension| extension == "yaml")
+            {
+                files.push(file);
+            }
+        }
+        files.sort();
+        let sources = files
+            .iter()
+            .map(|file| Ok((file.clone(), read(file)?)))
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+        Self::from_sources(path, &sources)
     }
 
     pub fn from_str(source: impl AsRef<Path>, contents: &str) -> Result<Self, ConfigError> {
-        let source = source.as_ref().to_path_buf();
+        let source = source.as_ref();
+        Self::from_sources(source, &[(source.to_path_buf(), contents.to_owned())])
+    }
+
+    fn from_sources(source: &Path, files: &[(PathBuf, String)]) -> Result<Self, ConfigError> {
+        let source = source.to_path_buf();
         let source_name = source.display().to_string();
+        let many = files.len() > 1;
         let mut resources = Vec::new();
 
-        for (document_index, document) in serde_yaml::Deserializer::from_str(contents).enumerate() {
-            let document_number = document_index + 1;
-            let value = Value::deserialize(document).map_err(|error| {
-                let location = error.location().map_or_else(String::new, |location| {
-                    format!(" at line {}, column {}", location.line(), location.column())
-                });
-                ConfigError::Parse {
-                    path: source_name.clone(),
-                    origin: format!("document {document_number}{location}"),
-                    source: error,
-                }
-            })?;
-
-            match value {
-                Value::Null => {}
-                Value::Sequence(items) => {
-                    for (item_index, item) in items.into_iter().enumerate() {
-                        resources.push((
-                            format!("document {document_number}, item {}", item_index + 1),
-                            item,
-                        ));
+        for (file, contents) in files {
+            let file_name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let prefix = if many {
+                format!("{file_name} ")
+            } else {
+                String::new()
+            };
+            for (document_index, document) in
+                serde_yaml::Deserializer::from_str(contents).enumerate()
+            {
+                let document_number = document_index + 1;
+                let value = Value::deserialize(document).map_err(|error| {
+                    let location = error.location().map_or_else(String::new, |location| {
+                        format!(" at line {}, column {}", location.line(), location.column())
+                    });
+                    ConfigError::Parse {
+                        path: file.display().to_string(),
+                        origin: format!("document {document_number}{location}"),
+                        source: error,
                     }
+                })?;
+
+                match value {
+                    Value::Null => {}
+                    Value::Sequence(items) => {
+                        for (item_index, item) in items.into_iter().enumerate() {
+                            resources.push((
+                                format!(
+                                    "{prefix}document {document_number}, item {}",
+                                    item_index + 1
+                                ),
+                                item,
+                            ));
+                        }
+                    }
+                    other => resources.push((format!("{prefix}document {document_number}"), other)),
                 }
-                other => resources.push((format!("document {document_number}"), other)),
             }
         }
 
@@ -89,7 +142,6 @@ impl LocalCatalog {
             let outcome = match string_field(&value, "kind").map(str::to_owned) {
                 Some(kind) => match kind.as_str() {
                     Agent::KIND => agents.insert(&origin, value),
-                    "Capability" | "Provider" => Err(CatalogProblem::RemovedKind { origin, kind }),
                     _ => Err(CatalogProblem::UnsupportedKind { origin, kind }),
                 },
                 None => Err(CatalogProblem::MissingKind { origin }),
@@ -98,8 +150,37 @@ impl LocalCatalog {
                 problems.push(problem);
             }
         }
-        let base = source.parent().map(Path::to_path_buf).unwrap_or_default();
+        let base = if many || source.is_dir() {
+            source.clone()
+        } else {
+            source.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
         let skills = load_agent_skills(&agents, &base, &mut problems);
+        let mut agents = agents.into_map();
+        for (id, agent) in &mut agents {
+            let Some(file) = agent.spec.instructions_file.clone() else {
+                continue;
+            };
+            if agent.spec.instructions.is_some() {
+                problems.push(CatalogProblem::InstructionsTwice {
+                    agent: id.to_string(),
+                });
+                continue;
+            }
+            let resolved = if file.is_absolute() {
+                file.clone()
+            } else {
+                base.join(&file)
+            };
+            match skill::read_bounded_text(&resolved, MAX_INSTRUCTIONS_BYTES) {
+                Ok(text) => agent.spec.instructions = Some(text),
+                Err(source) => problems.push(CatalogProblem::Instructions {
+                    agent: id.to_string(),
+                    path: file.display().to_string(),
+                    source: Box::new(source),
+                }),
+            }
+        }
 
         if !problems.is_empty() {
             return Err(ConfigError::Invalid {
@@ -110,7 +191,7 @@ impl LocalCatalog {
 
         Ok(Self {
             source,
-            agents: agents.into_map(),
+            agents,
             skills,
         })
     }
@@ -423,12 +504,15 @@ pub enum CatalogProblem {
     MissingKind { origin: String },
     #[error("{origin}: unsupported resource kind {kind:?}")]
     UnsupportedKind { origin: String, kind: String },
-    #[error(
-        "{origin}: kind {kind} is no longer part of the catalog; remove the document. \
-         Capabilities and providers come from the broker, which builds them from provider \
-         manifests and its own constraint sets"
-    )]
-    RemovedKind { origin: String, kind: String },
+    #[error("agent {agent} sets both instructions and instructionsFile")]
+    InstructionsTwice { agent: String },
+    #[error("agent {agent} instructionsFile {path}: {source}")]
+    Instructions {
+        agent: String,
+        path: String,
+        #[source]
+        source: Box<SkillError>,
+    },
     #[error("{origin}: unsupported API version {version:?}")]
     UnsupportedApiVersion { origin: String, version: String },
     #[error("{origin}: invalid {kind}: {source}")]
