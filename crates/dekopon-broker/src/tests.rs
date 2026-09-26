@@ -512,6 +512,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
             max_request_bytes: 3,
             max_response_bytes: 4,
             allow_plaintext_loopback: false,
+            propagate_trace: false,
         }),
         storage: None,
         secret_use: None,
@@ -527,7 +528,10 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         ($mutation:expr) => {{
             let mut changed = baseline.clone();
             ($mutation)(&mut changed);
-            assert_ne!(bytes(&baseline), bytes(&changed));
+            assert_ne!(
+                super::digest_parts(b"execution-constraints", &[&bytes(&baseline)]),
+                super::digest_parts(b"execution-constraints", &[&bytes(&changed)]),
+            );
         }};
     }
     changes!(|v: &mut ExecutionConstraints| v.timeout_ms += 1);
@@ -540,6 +544,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         .as_mut()
         .expect("HTTP")
         .allow_plaintext_loopback = true);
+    changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").propagate_trace = true);
     changes!(|v: &mut ExecutionConstraints| v
         .http
         .as_mut()
@@ -711,6 +716,7 @@ fn policy_http_scope_values_are_bounded() {
         max_request_bytes: 1,
         max_response_bytes: 1,
         allow_plaintext_loopback: false,
+        propagate_trace: false,
     };
     assert!(super::validate_set_constraints(&constrain(valid.clone())).is_ok());
 
@@ -957,6 +963,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         max_request_bytes: 1,
         max_response_bytes: 1,
         allow_plaintext_loopback: false,
+        propagate_trace: false,
     });
     assert!(matches!(
         super::validate_set_constraints(&set),

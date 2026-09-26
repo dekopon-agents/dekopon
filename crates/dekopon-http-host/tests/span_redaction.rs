@@ -21,6 +21,7 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
     let mut client = BufferedHttpClient::authorized(
         HttpConstraints {
             allowed_hosts: vec![authority.clone()],
+            propagate_trace: false,
             allowed_methods: vec!["POST".to_owned()],
             max_requests: 2,
             max_request_bytes: 64 * 1024,
@@ -72,6 +73,7 @@ async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &C
     let mut client = BufferedHttpClient::authorized(
         HttpConstraints {
             allowed_hosts: vec!["127.0.0.1:9".to_owned()],
+            propagate_trace: false,
             allowed_methods: vec!["GET".to_owned()],
             max_requests: 2,
             max_request_bytes: 64 * 1024,

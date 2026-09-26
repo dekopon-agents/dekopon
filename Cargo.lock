@@ -980,9 +980,12 @@ dependencies = [
  "bytes",
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-telemetry",
  "dekopon-test-support",
  "futures-util",
  "http-body",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "serde",
  "serde_json",
@@ -991,6 +994,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

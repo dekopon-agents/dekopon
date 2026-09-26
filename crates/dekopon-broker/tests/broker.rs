@@ -274,6 +274,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority.to_owned()],
+            propagate_trace: false,
             allowed_methods: vec!["GET".to_owned()],
             max_requests: 1,
             max_request_bytes: 64 * 1024,
@@ -606,6 +607,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
+            propagate_trace: false,
             allowed_hosts: vec![authority.clone()],
             allowed_methods: vec!["POST".to_owned()],
             max_requests: 1,
@@ -701,6 +703,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            propagate_trace: false,
         }),
         storage: None,
         secret_use: None,
@@ -840,6 +843,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
+            propagate_trace: false,
             allowed_hosts: vec![authority.clone()],
             allowed_methods: vec!["POST".to_owned()],
             max_requests: 1,
@@ -1985,6 +1989,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: hosts,
+            propagate_trace: false,
             allowed_methods: vec!["GET".to_owned()],
             max_requests: 1,
             max_request_bytes: 64 * 1024,

@@ -50,6 +50,7 @@ pub struct HttpPatch {
     pub max_request_bytes: Option<u64>,
     pub max_response_bytes: Option<u64>,
     pub allow_plaintext_loopback: Option<bool>,
+    pub propagate_trace: Option<bool>,
 }
 
 impl ConstraintsPatch {
@@ -100,6 +101,7 @@ impl ConstraintsPatch {
                             .max_response_bytes
                             .ok_or_else(|| missing("http.maxResponseBytes"))?,
                         allow_plaintext_loopback: http.allow_plaintext_loopback.unwrap_or(false),
+                        propagate_trace: http.propagate_trace.unwrap_or(false),
                     })
                 })
                 .transpose()?,
@@ -127,6 +129,7 @@ impl HttpPatch {
             allow_plaintext_loopback: self
                 .allow_plaintext_loopback
                 .or(base.allow_plaintext_loopback),
+            propagate_trace: self.propagate_trace.or(base.propagate_trace),
         }
     }
 }
@@ -304,6 +307,41 @@ gh:
             .clone()
             .expect("http");
         assert_eq!(http.allowed_hosts, ["uploads.github.com"]);
+    }
+
+    #[test]
+    fn trace_propagation_defaults_off_and_capabilities_override_the_provider_opt_in() {
+        for (provider, capability, expected) in [
+            ("", "{}", false),
+            ("      propagateTrace: true\n", "{}", true),
+            (
+                "      propagateTrace: true\n",
+                "{propagateTrace: false}",
+                false,
+            ),
+            ("", "{propagateTrace: true}", true),
+        ] {
+            let (sets, problems) = resolve(&format!(
+                "{DEFAULTS}{provider}  capabilities:\n    gh.repo.read:\n      constraints: {{ http: {capability} }}\n"
+            ));
+            assert!(problems.is_empty());
+            let http = sets[&id("gh.repo.read")]
+                .constraints
+                .http
+                .as_ref()
+                .expect("http");
+            assert_eq!(http.propagate_trace, expected);
+            let serialized = serde_json::to_value(http).expect("HTTP constraints serialize");
+            assert_eq!(
+                serialized.get("propagateTrace"),
+                expected.then_some(&serde_json::Value::Bool(true))
+            );
+            assert_eq!(
+                serde_json::from_value::<dekopon_capability::HttpConstraints>(serialized)
+                    .expect("HTTP constraints round-trip"),
+                *http
+            );
+        }
     }
 
     #[test]

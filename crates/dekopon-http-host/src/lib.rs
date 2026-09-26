@@ -927,6 +927,22 @@ impl BufferedHttpClient {
             }
         }
 
+        if grant.propagate_trace
+            && let Some(context) = dekopon_telemetry::current_trace_context()
+        {
+            let value = format!(
+                "00-{:032x}-{:016x}-{:02x}",
+                u128::from_be_bytes(context.trace_id),
+                u64::from_be_bytes(context.span_id),
+                context.flags,
+            );
+            let header = HeaderValue::from_str(&value).map_err(|error| {
+                tracing::error!(%error, "broker trace context header could not be rendered");
+                http_error(ErrorCode::Internal, "trace context could not be rendered")
+            })?;
+            prepared.headers.insert("traceparent", header);
+        }
+
         Ok((prepared, grant, evidence_index))
     }
 
@@ -1448,6 +1464,8 @@ fn is_forbidden_request_header(name: &HeaderName, companion: Option<&HeaderName>
             | "proxy-authorization"
             | "proxy-connection"
             | "te"
+            | "traceparent"
+            | "tracestate"
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
@@ -1646,6 +1664,7 @@ mod tests {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            propagate_trace: false,
         }
     }
 

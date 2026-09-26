@@ -171,6 +171,36 @@ form matches only HTTPS on 443 — and still needs that set's `allowPlaintextLoo
 decides is whether the host will speak plaintext to a destination the authorization already
 permits. Empty, the default, is the loopback-only rule unchanged.
 
+### Trace propagation to first-party destinations
+
+`propagateTrace` belongs to an HTTP constraint set and defaults to `false`. Opt in only
+first-party endpoints inside your trust boundary, in a separate constraint set from third-party
+destinations. For example, an installed provider's first-party capability can have:
+
+```yaml
+capabilities:
+  internal-service:
+    capabilities:
+      internal-service.read:
+        constraints:
+          timeoutMs: 5000
+          maxOutputBytes: 4096
+          http:
+            allowedHosts: [api.example.com]
+            allowedMethods: [GET]
+            maxRequests: 1
+            maxRequestBytes: 1024
+            maxResponseBytes: 4096
+            propagateTrace: true
+```
+
+The broker sends W3C `traceparent` with the current trace id, the `http.request` egress span's
+id and its trace flags on every buffered or streaming request under that grant. Without an OTel
+context it sends no header and the request proceeds. Injected bytes do not count against guest
+request limits. `tracestate` is never sent. A provider that sets either header itself is refused
+with `InvalidHeader`, even when propagation is off. Destination, method and transport restrictions
+remain independent; this flag grants no network access.
+
 ### Additional CA trust and non-public HTTPS egress
 
 These are **independent** broker-owned settings. `extraCABundles` adds PEM roots to
@@ -527,7 +557,8 @@ telemetry:
 Spans carry provider input and the full HTTP URL, always: there is no metadata-only mode
 ([goal 2](../../docs/design.md#constitution)). They never carry a credential — `Redacted` values
 render their marker wherever they are formatted, and headers and bodies are excluded outright. Audit
-records are unaffected.
+records are unaffected. Outbound HTTP trace propagation is separately opted in per constraint set
+with [`propagateTrace`](#trace-propagation-to-first-party-destinations).
 
 The section has no credential field. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters

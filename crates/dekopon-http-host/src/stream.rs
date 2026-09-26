@@ -514,6 +514,7 @@ mod tests {
                 .unwrap(),
                 max_response_bytes: maximum,
                 allow_plaintext_loopback: true,
+                propagate_trace: false,
             },
             credential,
             HttpHostCeilings::default(),

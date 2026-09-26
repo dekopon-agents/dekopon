@@ -23,6 +23,11 @@ The additive streaming interface consumes bounded asset handles, not guest paths
 Userinfo and URI fragments are refused. Header syntax/count/bytes, request body and complete
 encoded request size, remaining calls, exact authority/effective port and method are enforced.
 Authority-defining, hop-by-hop, proxy and broker-managed credential headers are not guest controlled.
+Guest `traceparent` and `tracestate` headers are always refused with `InvalidHeader`. When the
+grant opts in with `propagateTrace`, buffered and streaming requests inject the current
+`http.request` span's W3C `traceparent` outside guest byte accounting. No header is sent without
+an OTel context, and `tracestate` is never sent. Operators opt in only first-party destinations
+inside their trust boundary, using a separate constraint set from third-party destinations.
 
 Destination-bound credentials are injected only after guest-header validation; a guest
 `authorization` header is rejected, not overwritten. Binding refusal never falls back to an
