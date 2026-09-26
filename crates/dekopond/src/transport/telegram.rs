@@ -18,9 +18,9 @@ use crate::{
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
-        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText,
-        TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
+        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SteerAck, StreamLimits,
+        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
         record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
@@ -518,6 +518,13 @@ impl InboundReaction for TelegramDriver {
 }
 
 #[async_trait]
+impl SteerAck for TelegramDriver {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        InboundReaction::set(self, target, true).await
+    }
+}
+
+#[async_trait]
 impl ProgressMessage for TelegramDriver {
     fn limits(&self) -> ProgressLimits {
         ProgressLimits {
@@ -843,6 +850,10 @@ impl ChatDriver for TelegramDriver {
     }
 
     fn reaction(&self) -> Option<&dyn InboundReaction> {
+        Some(self)
+    }
+
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
         Some(self)
     }
 
@@ -1285,6 +1296,23 @@ mod tests {
         assert_eq!(
             body["message_thread_id"], 11,
             "a forum topic's action belongs to the topic, not the chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_ack_sets_eyes_on_the_inbound_message() {
+        let api = bot_api(posting);
+        driver(&api.base)
+            .steer_ack()
+            .expect("steering ack")
+            .seen(&target())
+            .await
+            .expect("eyes accepted");
+        assert_eq!(
+            api.bodies("setMessageReaction"),
+            [json!({
+                "chat_id": 42, "message_id": 7, "reaction": [{ "type": "emoji", "emoji": "👀" }]
+            })]
         );
     }
 

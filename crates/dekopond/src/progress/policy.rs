@@ -38,7 +38,7 @@ const MAX_EDITS: u32 = 60;
 pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(2);
 const DEADLINE_MISSED: &str = "deadline";
 
-async fn bounded<T>(
+pub(crate) async fn bounded<T>(
     call: impl std::future::Future<Output = Result<T, TransportError>>,
 ) -> Result<T, &'static str> {
     match tokio::time::timeout(CALL_DEADLINE, call).await {

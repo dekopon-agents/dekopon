@@ -37,7 +37,7 @@ use crate::{
         AckToken, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatTransport,
         InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES, MessageId,
         MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
-        Status, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
+        Status, SteerAck, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, receive_span, record_conversation,
     },
 };
@@ -510,6 +510,10 @@ impl ChatDriver for LocalDriver {
         Some(self)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        Some(self)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         Some(self)
     }
@@ -645,6 +649,13 @@ impl InboundReaction for LocalDriver {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
         self.emit(Self::connection(target)?, &json!({ "reaction": present }))
             .await
+    }
+}
+
+#[async_trait]
+impl SteerAck for LocalDriver {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        InboundReaction::set(self, target, true).await
     }
 }
 
@@ -843,6 +854,22 @@ mod unit_tests {
             }
         });
         lines
+    }
+
+    #[tokio::test]
+    async fn steering_ack_preserves_the_local_reaction_frame() {
+        let driver = LocalDriver::default();
+        let lines = connect(&driver, 7);
+        driver
+            .steer_ack()
+            .expect("steering ack")
+            .seen(&LivenessTarget::Local { connection: 7 })
+            .await
+            .expect("line written");
+        assert_eq!(
+            *lines.lock().expect("recorded lines"),
+            [json!({ "reaction": true })]
+        );
     }
 
     #[tokio::test]

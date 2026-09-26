@@ -40,7 +40,8 @@ use dekopon_model::{
 };
 use dekopon_test_support::{
     FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver, RecordingProgress,
-    RecordingReaction, RecordingStatus, RecordingStream, RecordingTyping, StreamCall,
+    RecordingReaction, RecordingStatus, RecordingSteerAck, RecordingStream, RecordingTyping,
+    StreamCall,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -67,7 +68,7 @@ use crate::{
         AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, InboundMessage,
         InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
         MessageId, MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage,
-        ReplyTarget, Status, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        ReplyTarget, Status, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
         ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
         TypingLease, bound_inbound, bound_outbound, credential_value,
     },
@@ -2515,6 +2516,11 @@ impl ChatDriver for RecordingDriver {
             .map(|object| object as &dyn InboundReaction)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        self.steer_ack_object()
+            .map(|object| object as &dyn SteerAck)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         self.cancel_button_object()
             .map(|object| object as &dyn CancelButton)
@@ -2669,6 +2675,14 @@ impl InboundReaction for RecordingReaction {
         let failure = self.charge();
         self.record(rendered_target(target), present);
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl SteerAck for RecordingSteerAck {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        self.record(rendered_target(target));
+        Ok(())
     }
 }
 

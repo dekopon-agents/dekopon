@@ -31,10 +31,10 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
         NativeStatus, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, Status, StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation,
-        ThreadOwnership, TransportError, TransportEvent, TransportIdentity, asset_buffer,
-        bound_inbound, credential_client, floor_boundary, receive_span, record_conversation,
-        reserve_for_chunk,
+        SeenIds, Status, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
+        record_conversation, reserve_for_chunk,
     },
 };
 
@@ -780,6 +780,12 @@ impl ChatDriver for SlackReplier {
         .then_some(self as &dyn InboundReaction)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        self.reaction_available
+            .load(Ordering::Acquire)
+            .then_some(self as &dyn SteerAck)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         (self.experience == SlackExperience::Classic).then_some(self as &dyn CancelButton)
     }
@@ -922,7 +928,12 @@ impl InboundReaction for SlackReplier {
                 return Ok(());
             }
             return match self
-                .set_reaction(channel_id, message_ts, "reactions.remove")
+                .set_reaction(
+                    channel_id,
+                    message_ts,
+                    "reactions.remove",
+                    LIVENESS_REACTION,
+                )
                 .await
             {
                 Err(TransportError::Service { code }) if code == "no_reaction" => Ok(()),
@@ -935,7 +946,7 @@ impl InboundReaction for SlackReplier {
             });
         }
         match self
-            .set_reaction(channel_id, message_ts, "reactions.add")
+            .set_reaction(channel_id, message_ts, "reactions.add", LIVENESS_REACTION)
             .await
         {
             Ok(()) => {
@@ -947,15 +958,37 @@ impl InboundReaction for SlackReplier {
             }
             Err(TransportError::Service { code }) if code == "already_reacted" => Ok(()),
             Err(error) => {
-                if permanent_reaction_error(&error)
-                    && self.reaction_available.swap(false, Ordering::AcqRel)
-                {
-                    tracing::warn!(
-                        event = "gateway_progress_degraded",
-                        transport = "slack",
-                        surface = "reaction"
-                    );
-                }
+                self.reaction_failed(&error);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SteerAck for SlackReplier {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        let LivenessTarget::Slack {
+            channel_id,
+            message_ts,
+            ..
+        } = target
+        else {
+            return Err(TransportError::Response);
+        };
+        if !self.reaction_available.load(Ordering::Acquire) {
+            return Err(TransportError::Service {
+                code: "missing_scope".to_owned(),
+            });
+        }
+        match self
+            .set_reaction(channel_id, message_ts, "reactions.add", "eyes")
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(TransportError::Service { code }) if code == "already_reacted" => Ok(()),
+            Err(error) => {
+                self.reaction_failed(&error);
                 Err(error)
             }
         }
@@ -1342,18 +1375,30 @@ impl SlackReplier {
             .map(|_| ())
     }
 
+    fn reaction_failed(&self, error: &TransportError) {
+        if permanent_reaction_error(error) && self.reaction_available.swap(false, Ordering::AcqRel)
+        {
+            tracing::warn!(
+                event = "gateway_progress_degraded",
+                transport = "slack",
+                surface = "reaction"
+            );
+        }
+    }
+
     async fn set_reaction(
         &self,
         channel: &str,
         timestamp: &str,
         method: &str,
+        name: &str,
     ) -> Result<(), TransportError> {
         self.liveness_call(
             method,
             &json!({
                 "channel": channel,
                 "timestamp": timestamp,
-                "name": LIVENESS_REACTION,
+                "name": name,
             }),
         )
         .await
@@ -1909,7 +1954,7 @@ mod driver_tests {
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
             LivenessTarget, MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status,
-            StreamedText, TextStream, TransportError, TransportEvent, credential_client,
+            SteerAck, StreamedText, TextStream, TransportError, TransportEvent, credential_client,
             receive_span,
         },
     };
@@ -2297,6 +2342,37 @@ mod driver_tests {
             ChatDriver::reaction(&replier).is_some(),
             "and the configured fallback is what the policy is left with"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_ack_ignores_classic_fallback_and_is_not_removed_as_progress() {
+        let mock = spawn_slack_mock(accepting);
+        let replier = replier_with(&mock.base, SlackExperience::Agent, false);
+        assert!(ChatDriver::steer_ack(&replier).is_some());
+        SteerAck::seen(&replier, &target())
+            .await
+            .expect("eyes accepted");
+        InboundReaction::set(&replier, &target(), false)
+            .await
+            .expect("untracked eyes stay");
+        assert_eq!(
+            mock.body("/api/reactions.add"),
+            json!({
+                "channel": CHANNEL, "timestamp": INBOUND_TS, "name": "eyes"
+            })
+        );
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_reaction_scope_disables_further_steering_acks() {
+        let mock = spawn_slack_mock(|_, _| (200, json!({"ok": false, "error": "missing_scope"})));
+        let replier = replier_with(&mock.base, SlackExperience::Agent, false);
+        assert!(matches!(SteerAck::seen(&replier, &target()).await,
+            Err(TransportError::Service { code }) if code == "missing_scope"));
+        assert!(SteerAck::seen(&replier, &target()).await.is_err());
+        assert!(ChatDriver::steer_ack(&replier).is_none());
+        assert_eq!(mock.calls().len(), 1);
     }
 
     #[tokio::test]

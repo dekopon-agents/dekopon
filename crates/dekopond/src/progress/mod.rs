@@ -13,7 +13,7 @@ mod text;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use policy::{ProgressInputs, ProgressPolicy, Terminal};
+pub(crate) use policy::{ProgressInputs, ProgressPolicy, Terminal, bounded};
 pub(crate) use text::{ProgressDetail, ProgressText, Templates};
 
 pub(crate) const DEFAULT_KEEP_ALIVE_AT: [u64; 2] = [15, 45];

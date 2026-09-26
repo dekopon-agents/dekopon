@@ -443,6 +443,11 @@ pub(crate) trait InboundReaction: Send + Sync {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError>;
 }
 
+#[async_trait]
+pub(crate) trait SteerAck: Send + Sync {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError>;
+}
+
 /// Implementations must acknowledge before the event reaches the bounded inbound channel, since
 /// that send can block past the interaction deadline.
 #[async_trait]
@@ -472,6 +477,10 @@ pub(crate) trait ChatDriver: Send + Sync {
     }
 
     fn reaction(&self) -> Option<&dyn InboundReaction> {
+        None
+    }
+
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
         None
     }
 
