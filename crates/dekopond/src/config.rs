@@ -71,6 +71,14 @@ pub enum SlackExperience {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) enum Steering {
+    #[default]
+    Abort,
+    Boundary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum SlackLivenessFallback {
     #[default]
     None,
@@ -660,6 +668,8 @@ pub struct RouteConfig {
     #[serde(default)]
     pub(crate) progress_detail: ProgressDetail,
     #[serde(default)]
+    pub(crate) steering: Steering,
+    #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub wakes: bool,
@@ -705,6 +715,7 @@ pub struct ResolvedRoute {
     pub inspect_agent_config: bool,
     pub limits: RouteLimits,
     pub(crate) progress_detail: ProgressDetail,
+    pub(crate) steering: Steering,
     pub memory: MemoryPolicy,
     pub wakes: bool,
 }
@@ -1418,6 +1429,7 @@ pub(crate) fn resolve(
             inspect_agent_config: route.inspect_agent_config,
             limits: route.limits,
             progress_detail: route.progress_detail,
+            steering: route.steering,
             memory,
             wakes: route.wakes,
         });

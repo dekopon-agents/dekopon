@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     cache_key,
-    config::{MemoryPolicy, ModelConfig, ResolvedConfig, render_problems},
+    config::{MemoryPolicy, ModelConfig, ResolvedConfig, Steering, render_problems},
     progress::ProgressDetail,
     transport::InboundMessage,
     wake::Anchor,
@@ -31,6 +31,7 @@ pub(crate) struct BoundRoute {
     pub max_duration: Option<Duration>,
     pub script_timeout: Duration,
     pub progress_detail: ProgressDetail,
+    pub steering: Steering,
     pub memory: MemoryPolicy,
     pub wakes: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
@@ -115,6 +116,7 @@ impl RoutingTable {
                 max_duration: route.limits.max_duration_ms.map(Duration::from_millis),
                 script_timeout: route.limits.script_timeout(),
                 progress_detail: route.progress_detail,
+                steering: route.steering,
                 memory: route.memory,
                 wakes: route.wakes,
                 cache_key: cache_key::for_route(),

@@ -215,7 +215,7 @@ fn audience(reply: &ReplyTarget) -> ReplyTarget {
     }
 }
 
-fn combined_text<'a>(members: impl Iterator<Item = &'a InboundMessage>) -> String {
+pub(crate) fn combined_text<'a>(members: impl Iterator<Item = &'a InboundMessage>) -> String {
     members
         .enumerate()
         .map(|(index, member)| {

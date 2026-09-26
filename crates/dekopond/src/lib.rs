@@ -170,7 +170,6 @@ where
         asset_fetchers,
         liveness: config.liveness.clone(),
         thread_ownership,
-        active_sessions: session::ActiveSessions::default(),
         wakes,
     });
 
@@ -506,8 +505,9 @@ fn dispatch(
             subject: message.subject.canonical(),
             via: dekopon_agent::CancelVia::StopReply,
         };
-        let pending_cancelled = collector.cancel(&request);
-        let active_outcome = runner.active_sessions.cancel(&request);
+        let stopped = runner.gate.cancel(&request);
+        let pending_cancelled = collector.cancel(&request) || stopped.dropped;
+        let active_outcome = stopped.running;
         if pending_cancelled {
             if matches!(
                 active_outcome,
@@ -665,7 +665,7 @@ fn spawn_tick(
     // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
         .gate
-        .admit(("wake".to_owned(), tick.id().to_string()))
+        .admit_probe(("wake".to_owned(), tick.id().to_string()))
     else {
         tracing::info!(event = "gateway_wake_tick_skipped", wake.id = %tick.id(), reason = "busy");
         return;
@@ -686,7 +686,7 @@ fn spawn_tick(
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
-    match runner.active_sessions.cancel(request).ignored_reason() {
+    match runner.gate.cancel(request).running.ignored_reason() {
         None => tracing::info!(
             event = "gateway_session_stop_requested",
             transport = %request.transport,
