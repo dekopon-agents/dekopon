@@ -9,11 +9,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Provider storage supports private-conversation, shared-conversation and agent scopes, with
+  optional idle retention based on a broker-owned last-used marker. The broker sweeps expired
+  resources at startup and every 12 hours, skipping active leases and retaining data by default.
+
 - HTTP constraint sets accept `propagateTrace: true` to send a broker-owned W3C `traceparent`
   to first-party destinations inside the operator's trust boundary. Buffered and streaming
   requests parent downstream work on the HTTP egress span without charging guest byte budgets.
 
 ### Changed
+
+- Storage constraints replace `namespace: chat` with `scope: private-conversation`; shared scopes
+  keep stable data across authorized callers without sharing gateway conversation history.
 
 - Provider-supplied `traceparent` and `tracestate` request headers are refused with `InvalidHeader`
   on every HTTP grant, including grants that do not opt into trace propagation.

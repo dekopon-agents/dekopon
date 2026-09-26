@@ -878,6 +878,20 @@ Storage constraints require `scope: private-conversation|shared-conversation|age
 idle TTL, and zero, overflow, unknown fields and conflicting retention settings for the same
 provider and scope refuse startup. No existing chat-memory data gains a TTL by default.
 
+The broker runs a bounded storage sweep at startup and every 12 hours; missed ticks do not cause
+catch-up bursts. One sweep runs at a time on a joined blocking task while requests continue to be
+served. Shutdown starts no further sweeps and waits for a started sweep before releasing storage.
+A stuck native filesystem operation can therefore exceed the server shutdown grace period.
+
+A resource's broker-owned `last-used` marker mtime is refreshed on admitted storage access,
+including reads and failed provider calls. A busy lease, unknown age or missing retention policy
+prevents deletion. TTL is cleanup eligibility, not immediate expiration: access before deletion
+refreshes the resource. The next access after deletion creates empty storage. Shortening a TTL
+can make existing data eligible on the next sweep; agent databases should use `retention: {mode:
+keep}` unless automatic deletion is intended. `storage_sweep_failed` reports a failed scan without
+stopping request serving; `storage_sweep_task_failed` reports a cleanup-task failure and ends the
+broker with an error.
+
 The three capabilities that make up the surface are named by their `route:`, not by their spelling.
 Exactly one constraint set declares each of `chatMemoryRecord`, `chatMemoryRecent`, and
 `chatMemorySearch`; they must all name one provider, and each must declare `jsonl` chat storage at
