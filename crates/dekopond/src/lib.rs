@@ -492,8 +492,8 @@ fn dispatch(
         return;
     };
     // Checked before the addressed filter, since a channel stop word like the bot mention plus stop
-    // would otherwise be dropped as unaddressed before the matcher ever saw it; it only fires for a
-    // session this sender started.
+    // would otherwise be dropped as unaddressed before the matcher saw it; only this sender's
+    // running or pending input may be stopped.
     if transport::is_stop_word(
         identities.get(&message.transport),
         &message.text,

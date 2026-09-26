@@ -6,8 +6,8 @@ its bounded agent/script session. Broker coverage is component loading and decod
 from mapped peers. Neither collects telemetry from Kubernetes nodes or other processes.
 
 The two daemons export **independently**: the broker cannot observe gateway model or script spans.
-Their records meet in the backend, correlated by trace context. One complete trace per message is
-the goal this document serves; [the constitution](design.md#constitution) states it.
+Their records meet in the backend, correlated by trace context. Receipt traces show admission;
+execution follows the running session's trace. See [the constitution](design.md#constitution).
 
 ## Which signal carries what
 
@@ -493,23 +493,26 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
-`unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or
-liveness call was made, `steered` joins the sender's running turn, and `queued` waits for a new turn.
+`unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model call or
+session progress starts. Queued or steered input may already carry its admission 👀 acknowledgment;
+that does not mean it was authorized. `steered` joins the sender's running turn, and `queued` waits
+for a new turn.
 `busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
-all process-wide permits are taken (`busy.cause = saturated`). `cancelled` means a
-stop won the race against terminal delivery, and `failed` names a category and the `error` that
+all process-wide permits are taken for a new conversation (`busy.cause = saturated`). `cancelled`
+means cancellation won before completion was claimed, and `failed` names a category and the `error` that
 produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
 
-Each non-admitted message emits `gateway.admission` on `dekopond::audit`, with `outcome`
+Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopond::audit`, with `outcome`
 (`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
 plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
 Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with
 `reason = mailbox-full`. An interrupted model call records `accounting.model.turn` with
 `outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains
-the steer text. These records remain useful without a `gateway.session` wrapper span.
+the steer text and reuses the interrupted call's `model.turn` index. Aborted calls remain observable
+but do not count toward completed steps. These records remain useful without a `gateway.session` wrapper span.
 
 Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
 `gateway_transport_recovering` carries the configured `transport`, stable error `category`,
@@ -532,8 +535,8 @@ In-flight presentation is metadata-minimal. Every event a running session produc
 `turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,
 `calls_max`, `index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`,
 `class`, `by`, `edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has.
-`turn` is the turn a `model_turn` or `answered` record is about; `turns` is how many the session
-spent, on `kind = finished`. There is no field on
+`turn` is the turn a `model_turn`, `answered` or `steered` record is about; `turns` counts completed
+model calls on `kind = finished`. There is no field on
 it a prompt, a capability argument, a provider result, or model text could be written into. A text
 delta is the one event with no record of its own: it is the newest rendering of one value, it
 arrives hundreds of times per turn, and what a reader needs is the count — which rides
@@ -592,12 +595,12 @@ carries a phone number, a WABA identifier, a message ID, or message text.
 ### What conversation history changes
 
 A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —
-changes the meaning of a field that already exists. A route left on the `oneShot` default changes
-nothing here.
+is the default and changes the meaning of a field that already exists. A route explicitly set to
+`oneShot` replays no history.
 
 **`message.count` is the field.** It appears on the `prompt.model_turn` span and on the
 `accounting.model.turn` record, and it counts one exchange: the system prompt, the message a person
-sent, and whatever the model and its tool have said back within this session. A session seeded with
+sent, consumed steers, and whatever the model and its tool have said back within this session. A session seeded with
 history counts the replayed window *plus* this exchange, so the same field on the same span means
 something different depending on a route's `memory.mode`. A panel plotting it across the
 switchover shows a step change that is not a regression, and averaging across both averages two

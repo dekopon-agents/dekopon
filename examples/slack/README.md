@@ -92,8 +92,13 @@ state that accepted set; invalid labels are refused. See
 
 ## Configure in-flight liveness
 
-Liveness is opt-in and starts only after the sender's fresh broker authorization succeeds. Busy,
-unrouted, ambient, and unauthorized messages show nothing.
+Session liveness is opt-in and starts after fresh broker authorization. A same-sender steer joins
+the running leg; a queued sender opens a fresh leg when their turn starts. Accepted steers and
+queued non-wake messages with liveness targets get best-effort `eyes`, independent of `classicFallback` but
+subject to reaction-scope availability. This admission acknowledgment can precede a later
+authorization refusal; it does not signify permission to run. Unauthorized turns get no session
+progress or inference. Busy refusals, unrouted and ambient messages get no liveness indicator;
+a busy refusal can still get the configured text reply.
 
 Classic/free profile:
 

@@ -35,7 +35,7 @@ pub(crate) struct BoundRoute {
     pub memory: MemoryPolicy,
     pub wakes: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
-    /// across the route's traffic, and grants nothing: every message still opens its own attested
+    /// across the route's traffic, and grants nothing: every new session opens its own attested
     /// broker leg.
     pub cache_key: String,
 }

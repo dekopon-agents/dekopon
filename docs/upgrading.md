@@ -8,6 +8,31 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Chat steering (unreleased)
+
+Steering is enabled on every route by default. A same-sender message during a running turn now
+interrupts only the model call and joins that turn; it never interrupts a tool, script or provider
+call. To wait for the current step instead, add this key to the route:
+
+```yaml
+steering: boundary  # abort is the default
+```
+
+Other senders and fired wakes wait as follow-up turns with fresh broker legs. The conversation
+mailbox holds eight pending items, counting steers and follow-ups together. Busy replies now mean
+that mailbox is full or all process-wide permits are taken for a new conversation.
+`sessions.replyOnBusy` is unchanged and gates those replies; a collected batch is eligible regardless.
+Sending still requires refusal-reply capacity and successful transport delivery.
+
+Later photos use ordinary steering, not the retired special intake or its completion notices.
+Accepted steers and queued non-wake messages get best-effort 👀 acknowledgments when a liveness
+target exists. A user stop drops only that sender's queued input and stops their run if it is still
+cancellable; a completed answer cannot be cancelled while it is being delivered.
+Queues are memory-only: shutdown grace lets them finish, but aborting the owner loses pending
+follow-ups, including wakes. Consumed steers join recorded user text; no journal migration is needed.
+
+See [session behavior](dekopond.md#sessions) and [admission telemetry](observability.md#gateway-spans).
+
 ## Broker-owned HTTP trace headers (0.23.0)
 
 Remove provider-supplied `traceparent` and `tracestate` request headers before upgrading: the
