@@ -645,6 +645,12 @@ No credential fields: the package is public and the pull is anonymous.
 
 ## Configuration values
 
+`serviceAccount.create` defaults to `false`; `serviceAccount.name` selects an existing account,
+or `default` when empty. With `create: true`, the chart creates an account named by
+`serviceAccount.name` or the release fullname and applies `serviceAccount.annotations` (default `{}`).
+The Deployment uses that account. Both the pod and a chart-created account disable automatic token
+mounting; explicit broker-only projections are the opt-in below. The chart grants no RBAC permissions.
+
 Each operator-supplied file is either inline, in which case the chart writes a Secret, or a reference
 to an object that already exists. Setting both is an error.
 
@@ -695,6 +701,51 @@ consumed through `source.kind: kubernetesProjection`; the map's root must equal 
 `mountPath`. Names, canonical absolute mount paths, required volume maps, and overlap with chart
 paths are checked at template time. Bootstrap tokens requiring the ordinary `0600` loader use `broker.secretBootstrapFiles`; no custom
 init container is needed. See [`../../docs/secrets.md`](../../docs/secrets.md).
+
+A Secret source mount:
+
+```yaml
+broker:
+  secretSourceVolumes:
+    - name: api-secret
+      mountPath: /var/run/dekopon-secrets/api
+      volume:
+        secret:
+          secretName: api-secret
+```
+
+A projected ServiceAccount token uses the same value, with no init copy so kubelet rotation stays
+visible. The token volume is mounted only into the broker, never the gateway or copy init container:
+
+```yaml
+serviceAccount:
+  create: true
+broker:
+  secretSourceVolumes:
+    - name: api-token
+      mountPath: /var/run/dekopon-secrets/api-token
+      volume:
+        projected:
+          sources:
+            - serviceAccountToken:
+                audience: <aud>
+                expirationSeconds: 600
+                path: token
+```
+
+Replace `<aud>` with the receiving service's audience. In the private secret map, use:
+
+```yaml
+source:
+  kind: kubernetesProjection
+  root: /var/run/dekopon-secrets/api-token
+  key: token
+  declaredOrigin: serviceAccountToken
+```
+
+This origin needs a broker version that supports it (added after `0.22.0`); the chart's default
+`appVersion` remains `0.22.0`. Select a supporting image when using this example. The broker reads
+per invocation rather than caching the token.
 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`

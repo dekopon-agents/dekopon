@@ -30,6 +30,11 @@ initImage:
 nameOverride: ""
 fullnameOverride: ""
 
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
 # ---------------------------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------------------------
@@ -266,6 +271,17 @@ broker:
   #   volume:
   #     secret:
   #       secretName: api-secret
+  # Projected tokens stay live (no init copy); use source.kind=kubernetesProjection and
+  # declaredOrigin: serviceAccountToken with root equal to mountPath and key: token.
+  # - name: api-token
+  #   mountPath: /var/run/dekopon-secrets/api-token
+  #   volume:
+  #     projected:
+  #       sources:
+  #         - serviceAccountToken:
+  #             audience: <aud>
+  #             expirationSeconds: 600
+  #             path: token
   secretSourceVolumes: []
 
   # Owner-managed bootstrap/session files copied by the existing root init boundary into the

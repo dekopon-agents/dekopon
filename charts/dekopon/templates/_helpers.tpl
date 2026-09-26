@@ -18,6 +18,14 @@ Name helpers.
 {{- end -}}
 {{- end -}}
 
+{{- define "dekopon.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "dekopon.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "dekopon.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
