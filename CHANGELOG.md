@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- A retained chat asset no longer holds the `gateway.session` span that spooled it. The span, with
+  `gateway.message` and `transport.receive` above it, closed only when retention dropped the asset:
+  exported hours late, or never when the process exited first. `asset.spool` read and cleanup spans
+  now parent to the span active where they run.
+
 ## [0.23.0] - 2026-09-26
 
 ### Added

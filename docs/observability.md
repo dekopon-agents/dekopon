@@ -481,10 +481,10 @@ the ordinary `broker.decision` and `broker.execution` records, not a separate au
 Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
 `duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
 changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
-path, payload, URL or base64. Reads inherit their active consumption span; final cleanup and reads
-outside an active scope retain the originating message span so they do not create disconnected
-roots. Synchronous IO never holds a span guard across an await. WhatsApp's final media boundaries
-emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
+path, payload, URL or base64. Reads and cleanup parent to whatever span is active when they run,
+or start a root span outside one. A retained asset never holds the span that created it, so
+retention cannot keep `gateway.session` and its ancestors from closing and exporting. Synchronous
+IO never holds a span guard across an await. WhatsApp's final media boundaries emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
 `outcome=accepted|failed` and the stable transport error category in `reason`. Upload acceptance
 alone is not delivery; only validated message acceptance completes the send. Cancelled futures can
 close these spans without a terminal outcome. Broker/provider W3C propagation is unchanged.
