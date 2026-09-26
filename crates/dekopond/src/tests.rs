@@ -2505,7 +2505,6 @@ impl TypingLease for RecordingTyping {
 #[async_trait]
 impl NativeStatus for RecordingStatus {
     async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
-        let failure = self.charge();
         self.record(
             rendered_target(target),
             match status {
@@ -2513,6 +2512,7 @@ impl NativeStatus for RecordingStatus {
                 Status::Idle => "idle",
             },
         );
+        let failure = self.charge();
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
