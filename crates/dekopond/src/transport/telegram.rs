@@ -606,6 +606,7 @@ impl TextStream for TelegramDriver {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         self.finalize_in_place(message, reply).await
     }
@@ -1459,8 +1460,7 @@ mod tests {
             }
         );
         let streamed = StreamedText {
-            text: ModelText::default(),
-            truncated: false,
+            ..StreamedText::default()
         };
         let message = driver
             .show(&target(), None, &streamed, true)
@@ -1490,6 +1490,7 @@ mod tests {
         let streamed = StreamedText {
             text: whole.truncated(MAX_STREAM_CHARS),
             truncated: true,
+            ..StreamedText::default()
         };
 
         let message = driver
@@ -1543,6 +1544,7 @@ mod tests {
         let streamed = StreamedText {
             text: whole.clone(),
             truncated: true,
+            ..StreamedText::default()
         };
 
         driver

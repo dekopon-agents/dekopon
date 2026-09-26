@@ -690,6 +690,7 @@ where
         if turn.tool_calls.is_empty() {
             check_cancelled(cancellation)?;
             if model_turns < limits.max_steps && drain_steers(steering, &mut messages, steers) {
+                emit(progress, ProgressEvent::Steered { turn: model_turns });
                 continue;
             }
             let answer = turn
@@ -2085,6 +2086,7 @@ mod tests {
             [
                 "model-turn 1/2",
                 "answered 1 calls=0",
+                "steered 1",
                 "model-turn 2/2",
                 "answered 2 calls=0",
                 "finished Answered turns=2 calls=0"
@@ -2203,6 +2205,66 @@ mod tests {
         assert_eq!(outcome.answer, "done");
         assert_eq!(model.steers.drain(), ["msg2"]);
         assert_eq!(history.turns()[0].user(), "msg1");
+    }
+
+    #[test]
+    fn a_boundary_draft_is_reset_before_the_replacement_declines() {
+        struct StreamingDraft(SteeringModel);
+        impl ChatModel for StreamingDraft {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                tools: &[ModelTool],
+                options: &CompletionOptions,
+                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+            ) -> Result<AssistantTurn, InferenceError> {
+                if self
+                    .0
+                    .scripted
+                    .observed_messages
+                    .lock()
+                    .expect("messages")
+                    .is_empty()
+                {
+                    let events = dekopon_model::events_from_transcript(
+                        dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                    )
+                    .expect("streamed draft");
+                    for event in events {
+                        if on_event(event).is_break() {
+                            return Err(InferenceError::Cancelled);
+                        }
+                    }
+                }
+                self.0.complete(messages, tools, options, on_event)
+            }
+        }
+        let model = StreamingDraft(SteeringModel::new(
+            [answer("draft"), decline(json!({}))],
+            SteerMode::Boundary,
+        ));
+        let (sink, progress) = recording_sink();
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(2, 4))
+                .with_steering(model.0.steers.as_ref())
+                .with_optional_reply()
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("replacement declines");
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        let mut text = dekopon_model::ModelText::default();
+        assert!(!sink.forwarded_chars().is_empty());
+        for event in sink.events.lock().expect("progress").iter() {
+            match event {
+                ProgressEvent::TextDelta { text: delta, .. } => text.push(delta),
+                ProgressEvent::Steered { .. } => text = dekopon_model::ModelText::default(),
+                ProgressEvent::Finished { .. } => assert!(text.as_str().is_empty()),
+                _ => {}
+            }
+        }
     }
 
     #[test]

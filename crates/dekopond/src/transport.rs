@@ -190,8 +190,9 @@ pub(crate) struct MessageRef {
     pub id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct StreamedText {
+    pub generation: u64,
     pub text: ModelText,
     pub truncated: bool,
 }
@@ -424,6 +425,9 @@ pub(crate) trait ProgressMessage: Send + Sync {
 #[async_trait]
 pub(crate) trait TextStream: Send + Sync {
     fn limits(&self) -> StreamLimits;
+    async fn discard(&self, _message: &MessageRef) -> Result<(), TransportError> {
+        Ok(())
+    }
     async fn show(
         &self,
         target: &LivenessTarget,
@@ -435,6 +439,7 @@ pub(crate) trait TextStream: Send + Sync {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        generation: u64,
     ) -> Result<(), TransportError>;
 }
 

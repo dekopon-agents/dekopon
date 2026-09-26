@@ -262,6 +262,7 @@ impl TextStream for Surfaces {
         &self,
         _message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         if self.recorder.counted(&self.recorder.refuse_finalize) {
             return Err(TransportError::Response);

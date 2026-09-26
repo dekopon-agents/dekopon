@@ -2659,6 +2659,7 @@ impl TextStream for RecordingStream {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         let failure = self.charge();
         self.record(StreamCall::Finalize {
