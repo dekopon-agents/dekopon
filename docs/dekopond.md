@@ -1120,8 +1120,11 @@ It cannot resolve or invoke record. After model success, the gateway bounds the 
 (empty output uses the fixed normal answer), asks the transport to accept those exact bytes, and
 only then opens one fresh broker client for one `recordDeliveredTurn` carrying the session's chat
 attestation. The recorded user text is the original bounded sender text followed by each consumed
-steer's raw text, joined by blank lines, excluding gateway timing and attachment reference notes;
-assistant text is exactly what the transport accepted. No response,
+steer's raw text, joined by blank lines, excluding gateway timing and attachment reference notes.
+If the combined user and assistant text exceeds the existing 64-KiB recording ceiling, only the
+recorded user text is shortened to a UTF-8-safe prefix ending in `[…]`; space is reserved for that
+marker and the entire accepted assistant text. This does not truncate prompt or journal history.
+Assistant text is exactly what the transport accepted. No response,
 denial, timeout, EOF, partial Discord delivery, or outcome-unaudited is retried, and none changes
 the already delivered `answered` outcome.
 
