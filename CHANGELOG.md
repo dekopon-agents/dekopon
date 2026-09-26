@@ -18,7 +18,8 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dekopon-telemetry`'s exporter stack (OTLP, tonic, the OpenTelemetry SDK, the log bridge and the
   blocking reqwest client) sits behind a new default-off `exporter` feature that `dekopond` and
   `dekopon-brokerd` enable. `dekopon-http-host`, and through it `dekopon-broker-host` and the
-  provider SDK testkit, now link only the trace-context surface.
+  provider SDK testkit, now link only the trace-context surface. Embedders that call the install API must enable
+  `exporter` when re-pinning (see `docs/upgrading.md`).
 - Provider-supplied `traceparent` and `tracestate` request headers are refused with `InvalidHeader`
   on every HTTP grant, including grants that do not opt into trace propagation.
 
