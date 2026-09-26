@@ -731,7 +731,7 @@ mod tests {
         StorageLimits,
         layout::{scan_usage, usage_with_directory_entry},
     };
-    use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 
     fn probe_host(limits: StorageLimits) -> (tempfile::TempDir, StorageHost) {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -749,7 +749,7 @@ mod tests {
                 "storage-probe".parse().expect("provider"),
                 StorageInterface::DurableFiles,
                 StorageAccess::ReadWrite,
-                StorageNamespace::Chat,
+                StorageScope::PrivateConversation,
                 "reviewer".parse().expect("agent"),
                 "slack.t0123abc.u9xyz".parse().expect("subject"),
                 "slack",

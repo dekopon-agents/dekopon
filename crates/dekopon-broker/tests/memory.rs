@@ -23,8 +23,7 @@ use dekopon_broker_host::{
 };
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
-    EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageNamespace,
+    EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface, StorageScope,
 };
 use dekopon_core::{
     Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, Redacted, RiskLevel, TransportId,
@@ -96,7 +95,8 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                     storage: Some(StorageConstraints {
                         interface: StorageInterface::Jsonl,
                         access,
-                        namespace: StorageNamespace::Chat,
+                        scope: StorageScope::PrivateConversation,
+                        retention: Default::default(),
                     }),
                     secret_use: None,
                 },
@@ -120,7 +120,8 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::DurableFiles,
                     access: StorageAccess::ReadWrite,
-                    namespace: StorageNamespace::Chat,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
                 }),
                 secret_use: None,
             },
@@ -854,7 +855,8 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::Jsonl,
                     access: StorageAccess::ReadOnly,
-                    namespace: StorageNamespace::Chat,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
                 }),
                 secret_use: None,
             },
@@ -958,7 +960,8 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::Jsonl,
                     access: StorageAccess::ReadWrite,
-                    namespace: StorageNamespace::Chat,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
                 }),
                 secret_use: None,
             },
@@ -1086,7 +1089,8 @@ fn memory_constraint(
             storage: Some(StorageConstraints {
                 interface: StorageInterface::Jsonl,
                 access,
-                namespace: StorageNamespace::Chat,
+                scope: StorageScope::PrivateConversation,
+                retention: Default::default(),
             }),
             secret_use: None,
         },
@@ -1453,7 +1457,7 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
             "memory-chat".parse().expect("provider"),
             StorageInterface::Jsonl,
             StorageAccess::ReadWrite,
-            StorageNamespace::Chat,
+            StorageScope::PrivateConversation,
             "reviewer".parse().expect("agent"),
             "slack.t0123abc.u9xyz".parse().expect("subject"),
             "slack",
@@ -2554,7 +2558,8 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
     let read_only = Some(StorageConstraints {
         interface: StorageInterface::Jsonl,
         access: StorageAccess::ReadOnly,
-        namespace: StorageNamespace::Chat,
+        scope: StorageScope::PrivateConversation,
+        retention: Default::default(),
     });
     let constraints = ConstraintCatalog::new([
         (

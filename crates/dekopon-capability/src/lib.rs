@@ -413,8 +413,73 @@ pub enum StorageAccess {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum StorageNamespace {
-    Chat,
+pub enum StorageScope {
+    PrivateConversation,
+    SharedConversation,
+    Agent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StorageRetention {
+    #[default]
+    Keep,
+    IdleTtl(std::time::Duration),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StorageRetentionMode {
+    Keep,
+    IdleTtl,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StorageRetentionWire {
+    mode: StorageRetentionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_ttl_ms: Option<std::num::NonZeroU64>,
+}
+
+impl Serialize for StorageRetention {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Keep => StorageRetentionWire {
+                mode: StorageRetentionMode::Keep,
+                idle_ttl_ms: None,
+            },
+            Self::IdleTtl(duration) => {
+                let millis = u64::try_from(duration.as_millis())
+                    .ok()
+                    .and_then(std::num::NonZeroU64::new)
+                    .ok_or_else(|| {
+                        serde::ser::Error::custom(
+                            "idle TTL must be a positive number of milliseconds fitting in u64",
+                        )
+                    })?;
+                StorageRetentionWire {
+                    mode: StorageRetentionMode::IdleTtl,
+                    idle_ttl_ms: Some(millis),
+                }
+            }
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageRetention {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = StorageRetentionWire::deserialize(deserializer)?;
+        match (wire.mode, wire.idle_ttl_ms) {
+            (StorageRetentionMode::Keep, None) => Ok(Self::Keep),
+            (StorageRetentionMode::IdleTtl, Some(millis)) => Ok(Self::IdleTtl(
+                std::time::Duration::from_millis(millis.get()),
+            )),
+            _ => Err(serde::de::Error::custom(
+                "idleTtlMs must occur exactly when mode is idle-ttl",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -422,8 +487,49 @@ pub enum StorageNamespace {
 pub struct StorageConstraints {
     pub interface: StorageInterface,
     pub access: StorageAccess,
-    /// Namespace is broker-owned; guests can never supply or influence it themselves.
-    pub namespace: StorageNamespace,
+    /// Owner configuration chooses scope; a provider argument cannot select storage identity.
+    pub scope: StorageScope,
+    #[serde(default)]
+    pub retention: StorageRetention,
+}
+
+#[cfg(test)]
+mod storage_retention_tests {
+    use super::{StorageConstraints, StorageRetention, StorageScope};
+
+    #[test]
+    fn storage_scope_and_retention_are_strict_and_default_to_keep() {
+        let configured = r#"{"interface":"durable-files","access":"read-only","scope":"agent"}"#;
+        let parsed: StorageConstraints = serde_json::from_str(configured).expect("scope");
+        assert_eq!(parsed.scope, StorageScope::Agent);
+        assert_eq!(parsed.retention, StorageRetention::Keep);
+        let ttl = r#"{"interface":"durable-files","access":"read-only","scope":"shared-conversation","retention":{"mode":"idle-ttl","idleTtlMs":60000}}"#;
+        let parsed: StorageConstraints = serde_json::from_str(ttl).expect("idle TTL");
+        assert_eq!(
+            parsed.retention,
+            StorageRetention::IdleTtl(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(serde_json::to_string(&parsed).expect("encode"), ttl);
+        for invalid in [
+            r#"{"mode":"idle-ttl","idleTtlMs":0}"#,
+            r#"{"mode":"idle-ttl","idleTtlMs":18446744073709551616}"#,
+            r#"{"mode":"idle-ttl","idleTtlMs":1,"other":true}"#,
+            r#"{"mode":"idle-ttl"}"#,
+            r#"{"mode":"keep","idleTtlMs":1}"#,
+            r#"{"mode":"later"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<StorageRetention>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<StorageConstraints>(
+                r#"{"interface":"jsonl","access":"read-only","namespace":"chat"}"#
+            )
+            .is_err()
+        );
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
