@@ -30,7 +30,7 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
         OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds,
-        StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
+        SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
         floor_boundary, jitter_below, receive_span, record_conversation, reserve_for_chunk,
         retry_after_from_body, split_message,
@@ -982,6 +982,10 @@ impl ChatDriver for DiscordDriver {
         Some(self)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        Some(self)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         Some(self)
     }
@@ -1113,6 +1117,19 @@ impl InboundReaction for DiscordDriver {
             self.http.delete(url)
         };
         self.liveness_empty(request).await
+    }
+}
+
+#[async_trait]
+impl SteerAck for DiscordDriver {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        let (channel_id, message_id, _) = discord_coordinates(target)?;
+        self.liveness_empty(self.http.put(format!(
+            "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
+            self.endpoint,
+            percent_encoded("👀")
+        )))
+        .await
     }
 }
 
@@ -2177,6 +2194,24 @@ mod unit_tests {
                 .all(|chunk| chunk.encode_utf16().count() <= 2_000)
         );
         assert_eq!(chunks.concat(), answer);
+    }
+
+    #[tokio::test]
+    async fn steering_ack_puts_eyes_on_the_inbound_message() {
+        let (endpoint, server) = loopback(vec![(204, String::new())]);
+        driver(&endpoint)
+            .steer_ack()
+            .expect("steering ack")
+            .seen(&target())
+            .await
+            .expect("eyes accepted");
+        let recorded = server.await.expect("server joins");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "PUT");
+        assert_eq!(
+            recorded[0].path,
+            "/api/v10/channels/100/messages/200/reactions/%F0%9F%91%80/@me"
+        );
     }
 
     #[tokio::test]

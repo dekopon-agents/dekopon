@@ -121,6 +121,55 @@ fn a_followup_gets_fresh_cancellation_and_is_stopped_as_its_own_subject() {
     drop(held(&gate, &route));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() {
+    for (subject, connection) in [(SUBJECT, Some(2)), ("tel.999", Some(3)), (SUBJECT, None)] {
+        let directory = temporary();
+        let listings = if subject == SUBJECT { 1 } else { 2 };
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            (0..listings)
+                .map(|_| {
+                    ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new())
+                })
+                .collect(),
+        )
+        .await;
+        let model = BlockedModel::new("finished");
+        let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 4);
+        let driver = Arc::new(RecordingDriver::default().with_steer_ack());
+        let mut route = route(model_config());
+        route.steering = Steering::Boundary;
+        let mut first = message("first");
+        first.liveness = Some(LivenessTarget::Local { connection: 1 });
+        let held = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            first,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        model.wait_until_entered().await;
+        let mut next = message_from(subject, "next");
+        next.liveness = connection.map(|connection| LivenessTarget::Local { connection });
+        run_session(
+            runner,
+            route,
+            next,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        let expected = connection
+            .map(|connection| dekopon_test_support::DriverCall::Seen {
+                target: format!("local:{connection}"),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(driver.calls(), expected);
+        model.release();
+        held.await.expect("holder and any follow-up finish");
+    }
+}
+
 #[test]
 fn leftover_steers_never_become_another_subjects_input() {
     let gate = SessionGate::new(1);

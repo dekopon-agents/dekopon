@@ -27,6 +27,9 @@ pub enum DriverCall {
         target: String,
         present: bool,
     },
+    Seen {
+        target: String,
+    },
     CancelAck {
         subject: String,
     },
@@ -267,6 +270,20 @@ impl RecordingReaction {
 }
 
 #[derive(Debug)]
+pub struct RecordingSteerAck {
+    log: Log,
+}
+
+impl RecordingSteerAck {
+    pub fn record(&self, target: String) {
+        self.log
+            .lock()
+            .expect("driver log")
+            .push(DriverCall::Seen { target });
+    }
+}
+
+#[derive(Debug)]
 pub struct RecordingCancelButton {
     log: Log,
     injector: Injector,
@@ -292,6 +309,7 @@ pub struct RecordingDriver {
     progress: Option<RecordingProgress>,
     stream: Option<RecordingStream>,
     reaction: Option<RecordingReaction>,
+    steer_ack: Option<RecordingSteerAck>,
     cancel_button: Option<RecordingCancelButton>,
 }
 
@@ -305,6 +323,7 @@ impl Default for RecordingDriver {
             progress: None,
             stream: None,
             reaction: None,
+            steer_ack: None,
             cancel_button: None,
         }
     }
@@ -357,6 +376,14 @@ impl RecordingDriver {
         self.reaction = Some(RecordingReaction {
             log: Arc::clone(&self.log),
             injector: Injector::default(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_steer_ack(mut self) -> Self {
+        self.steer_ack = Some(RecordingSteerAck {
+            log: Arc::clone(&self.log),
         });
         self
     }
@@ -449,6 +476,11 @@ impl RecordingDriver {
     }
 
     #[must_use]
+    pub fn steer_ack_object(&self) -> Option<&RecordingSteerAck> {
+        self.steer_ack.as_ref()
+    }
+
+    #[must_use]
     pub fn cancel_button_object(&self) -> Option<&RecordingCancelButton> {
         self.cancel_button.as_ref()
     }
@@ -516,6 +548,7 @@ fn render(call: DriverCall) -> String {
         DriverCall::Reaction { present, .. } => {
             format!("reaction:{}", if present { "set" } else { "cleared" })
         }
+        DriverCall::Seen { .. } => "seen".to_owned(),
         DriverCall::CancelAck { subject } => format!("cancel.ack:{subject}"),
     }
 }

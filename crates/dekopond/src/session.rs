@@ -1014,6 +1014,8 @@ async fn execute(
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
     }
+    let liveness = message.liveness.clone();
+    let is_wake = matches!(message.message_id, MessageId::Wake { .. });
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
             Some(run_admitted(runner, route, message, driver, receipts, admission).await)
@@ -1021,10 +1023,14 @@ async fn execute(
         Admit::Steered(receipts) => {
             tracing::Span::current().record("outcome", "steered");
             receipts.finish("steered");
+            acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             None
         }
         Admit::Queued => {
             tracing::Span::current().record("outcome", "queued");
+            if !is_wake {
+                acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
+            }
             None
         }
         Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
@@ -1038,6 +1044,23 @@ async fn execute(
             receipts.finish("busy");
             None
         }
+    }
+}
+
+async fn acknowledge_steer(
+    driver: &dyn ChatDriver,
+    target: Option<&crate::transport::LivenessTarget>,
+    transport: &str,
+) {
+    if let (Some(ack), Some(target)) = (driver.steer_ack(), target)
+        && let Err(error) = crate::progress::bounded(ack.seen(target)).await
+    {
+        let error = if error == "deadline" {
+            "timeout"
+        } else {
+            error
+        };
+        tracing::debug!(event = "gateway_steer_ack_failed", transport, error = %error);
     }
 }
 
