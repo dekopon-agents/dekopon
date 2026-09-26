@@ -639,6 +639,7 @@ impl TextStream for LocalDriver {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         self.finalize_in_place(message, reply).await
     }
@@ -830,7 +831,7 @@ mod unit_tests {
         .expect("the recorded transcript parses");
         StreamedText {
             text: dekopon_test_support::scripted_text(&events),
-            truncated: false,
+            ..StreamedText::default()
         }
     }
 
@@ -920,7 +921,7 @@ mod unit_tests {
             .expect("a later delta re-emits the same message");
         assert_eq!(again, streaming, "cumulative text stays in one message");
         stream
-            .finalize(&streaming, &OutboundReply::text("the answer"))
+            .finalize(&streaming, &OutboundReply::text("the answer"), 0)
             .await
             .expect("the line is written");
         driver

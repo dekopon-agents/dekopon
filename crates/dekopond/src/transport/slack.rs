@@ -1146,8 +1146,10 @@ impl TextStream for SlackReplier {
             self.streams.lock().expect("Slack stream registry").insert(
                 timestamp.to_owned(),
                 StreamState {
+                    generation: text.generation,
                     appended: whole.len(),
                     marked: text.truncated,
+                    replacing: false,
                 },
             );
             return Ok(MessageRef {
@@ -1161,7 +1163,22 @@ impl TextStream for SlackReplier {
             .expect("Slack stream registry")
             .get(&message.id)
             .copied()
-            .unwrap_or_default();
+            .ok_or(TransportError::Response)?;
+        if state.replacing || state.generation != text.generation {
+            if !state.replacing {
+                TextStream::discard(self, message).await?;
+                self.streams.lock().expect("Slack stream registry").insert(
+                    message.id.clone(),
+                    StreamState {
+                        replacing: true,
+                        ..state
+                    },
+                );
+            }
+            self.update_stream(message, &streamed_markdown(whole, text.truncated))
+                .await?;
+            return Ok(message.clone());
+        }
         let appended = state.appended;
         let delta = if appended <= whole.len() && whole.is_char_boundary(appended) {
             &whole[appended..]
@@ -1183,6 +1200,7 @@ impl TextStream for SlackReplier {
             StreamState {
                 appended: whole.len(),
                 marked: state.marked || text.truncated,
+                ..state
             },
         );
         Ok(message.clone())
@@ -1192,6 +1210,7 @@ impl TextStream for SlackReplier {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        generation: u64,
     ) -> Result<(), TransportError> {
         let LivenessTarget::Slack { channel_id, .. } = &message.target else {
             return Err(TransportError::Response);
@@ -1200,6 +1219,32 @@ impl TextStream for SlackReplier {
             return Err(TransportError::Service {
                 code: "answer-has-attachments".to_owned(),
             });
+        }
+        let state = self
+            .streams
+            .lock()
+            .expect("Slack stream registry")
+            .get(&message.id)
+            .copied()
+            .ok_or(TransportError::Response)?;
+        if state.replacing || state.generation != generation {
+            if !state.replacing {
+                TextStream::discard(self, message).await?;
+                self.streams.lock().expect("Slack stream registry").insert(
+                    message.id.clone(),
+                    StreamState {
+                        replacing: true,
+                        ..StreamState::default()
+                    },
+                );
+            }
+            self.update_stream(message, &reply.text).await?;
+            let _state = self
+                .streams
+                .lock()
+                .expect("Slack stream registry")
+                .take(&message.id);
+            return Ok(());
         }
         let mut body = json!({
             "channel": channel_id,
@@ -1220,6 +1265,28 @@ impl TextStream for SlackReplier {
             .take(&message.id);
         result
     }
+
+    async fn discard(&self, message: &MessageRef) -> Result<(), TransportError> {
+        let LivenessTarget::Slack { channel_id, .. } = &message.target else {
+            return Err(TransportError::Response);
+        };
+        let state = self
+            .streams
+            .lock()
+            .expect("Slack stream registry")
+            .take(&message.id);
+        if state.is_some_and(|state| !state.replacing) {
+            self.liveness_call(
+                "chat.stopStream",
+                &json!({
+                    "channel": channel_id,
+                    "ts": message.id,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1236,6 +1303,23 @@ impl CancelButton for SlackReplier {
 }
 
 impl SlackReplier {
+    async fn update_stream(&self, message: &MessageRef, text: &str) -> Result<(), TransportError> {
+        let LivenessTarget::Slack { channel_id, .. } = &message.target else {
+            return Err(TransportError::Response);
+        };
+        self.liveness_call(
+            "chat.update",
+            &json!({
+                "channel": channel_id,
+                "ts": message.id,
+                "text": text,
+                "blocks": [{ "type": "markdown", "text": text }],
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn upload_attachments(
         &self,
         channel: String,
@@ -1521,8 +1605,10 @@ fn streamed_markdown(text: &str, mark: bool) -> String {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StreamState {
+    generation: u64,
     appended: usize,
     marked: bool,
+    replacing: bool,
 }
 
 struct Tracked<T> {
@@ -2055,7 +2141,7 @@ mod driver_tests {
     fn streamed(text: ModelText) -> StreamedText {
         StreamedText {
             text,
-            truncated: false,
+            ..StreamedText::default()
         }
     }
 
@@ -2063,6 +2149,7 @@ mod driver_tests {
         StreamedText {
             text,
             truncated: true,
+            ..StreamedText::default()
         }
     }
 
@@ -2581,7 +2668,7 @@ mod driver_tests {
         )
         .await
         .expect("unchanged text is not an append");
-        TextStream::finalize(&replier, &stream, &OutboundReply::text(whole.as_str()))
+        TextStream::finalize(&replier, &stream, &OutboundReply::text(whole.as_str()), 0)
             .await
             .expect("Slack closes the stream");
 
@@ -2619,6 +2706,198 @@ mod driver_tests {
             "the answer lands in the streamed message rather than beside it"
         );
         assert_eq!(mock.calls().len(), 3, "{:?}", mock.calls());
+    }
+
+    fn streaming_policy(
+        mock: &SlackMock,
+    ) -> (
+        crate::progress::ProgressPolicy,
+        Arc<dyn dekopon_agent::ProgressSink>,
+    ) {
+        use crate::{
+            config::{LivenessMode, ProgressSurface, ResolvedLiveness},
+            progress::{ProgressInputs, ProgressPolicy},
+        };
+        let liveness = Arc::new(ResolvedLiveness {
+            settings: LivenessSettings {
+                mode: LivenessMode::Native,
+                stream: true,
+                progress: ProgressSurface::Off,
+                ..LivenessSettings::default()
+            },
+            ..ResolvedLiveness::default()
+        });
+        let (policy, sink) = ProgressPolicy::start(ProgressInputs {
+            driver: Arc::new(replier(&mock.base, SlackExperience::Agent)),
+            target: Some(target()),
+            reply: crate::transport::ReplyTarget::Slack {
+                channel: CHANNEL.to_owned(),
+                thread_ts: Some(INBOUND_TS.to_owned()),
+            },
+            transport: "slack".to_owned(),
+            detail: ProgressDetail::Off,
+            settings: liveness.settings,
+            keep_alive: liveness.keep_alive.clone(),
+            liveness,
+            cancellation: crate::session::SessionCancellation::new(),
+            max_duration: None,
+        });
+        (policy, sink)
+    }
+
+    fn delta(text: &str) -> dekopon_agent::ProgressEvent {
+        let body = json!({"choices": [{"delta": {"content": text}}]});
+        let events =
+            dekopon_model::events_from_transcript(&format!("data: {body}\n\ndata: [DONE]\n\n"))
+                .expect("delta");
+        dekopon_agent::ProgressEvent::TextDelta {
+            turn: 1,
+            text: dekopon_test_support::scripted_text(&events),
+            cumulative_chars: text.chars().count(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steer_replaces_equal_length_text_in_the_same_slack_message() {
+        use crate::progress::Terminal;
+        use dekopon_agent::ProgressEvent;
+        for terminal_first in [false, true] {
+            let (sent, mut received) = tokio::sync::mpsc::channel(8);
+            let mock = spawn_slack_mock(move |path, body| {
+                sent.try_send(path.to_owned()).expect("bounded calls");
+                accepting(path, body)
+            });
+            let (mut policy, sink) = streaming_policy(&mock);
+            sink.emit(delta("abc"));
+            assert_eq!(
+                received.recv().await.as_deref(),
+                Some("/api/chat.startStream")
+            );
+            sink.emit(ProgressEvent::Steered { turn: 1 });
+            sink.emit(delta("XYZ"));
+            if !terminal_first {
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+                        .await
+                        .expect("replacement stops the old stream")
+                        .as_deref(),
+                    Some("/api/chat.stopStream")
+                );
+                assert_eq!(received.recv().await.as_deref(), Some("/api/chat.update"));
+            }
+            assert!(
+                policy
+                    .terminal(Terminal::Answered(OutboundReply::text("XYZ")))
+                    .await
+            );
+            let calls = mock.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>(),
+                if terminal_first {
+                    vec![
+                        "/api/chat.startStream",
+                        "/api/chat.stopStream",
+                        "/api/chat.update",
+                    ]
+                } else {
+                    vec![
+                        "/api/chat.startStream",
+                        "/api/chat.stopStream",
+                        "/api/chat.update",
+                        "/api/chat.update",
+                    ]
+                }
+            );
+            for (_, body) in &calls[2..] {
+                assert_eq!(body["ts"], STREAM_TS);
+                assert_eq!(body["text"], "XYZ");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_terminal_after_a_steer_stops_the_slack_stream_without_an_empty_edit() {
+        use crate::progress::Terminal;
+        use dekopon_agent::ProgressEvent;
+        let (sent, mut received) = tokio::sync::mpsc::channel(8);
+        let mock = spawn_slack_mock(move |path, body| {
+            sent.try_send(path.to_owned()).expect("bounded calls");
+            accepting(path, body)
+        });
+        let (mut policy, sink) = streaming_policy(&mock);
+        sink.emit(delta("abc"));
+        assert_eq!(
+            received.recv().await.as_deref(),
+            Some("/api/chat.startStream")
+        );
+        sink.emit(ProgressEvent::Steered { turn: 1 });
+        assert!(!policy.terminal(Terminal::Silent).await);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/api/chat.startStream", "/api/chat.stopStream",]
+        );
+        assert_eq!(
+            mock.body("/api/chat.stopStream"),
+            json!({"channel": CHANNEL, "ts": STREAM_TS})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_stop_is_not_retried_by_terminal_cleanup() {
+        use crate::progress::Terminal;
+        use dekopon_agent::ProgressEvent;
+        for (generation_reset, render_reset) in [(false, false), (true, false), (true, true)] {
+            let (sent, mut received) = tokio::sync::mpsc::channel(8);
+            let mock = spawn_slack_mock(move |path, body| {
+                sent.try_send(path.to_owned()).expect("bounded calls");
+                if path == "/api/chat.stopStream" {
+                    (200, json!({"ok": false, "error": "internal_error"}))
+                } else {
+                    accepting(path, body)
+                }
+            });
+            let (mut policy, sink) = streaming_policy(&mock);
+            sink.emit(delta("abc"));
+            assert_eq!(
+                received.recv().await.as_deref(),
+                Some("/api/chat.startStream")
+            );
+            if generation_reset {
+                sink.emit(ProgressEvent::Steered { turn: 1 });
+                sink.emit(delta("XYZ"));
+            }
+            if render_reset {
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+                        .await
+                        .expect("reset attempts one stop")
+                        .as_deref(),
+                    Some("/api/chat.stopStream"),
+                );
+            }
+            assert!(
+                policy
+                    .terminal(Terminal::Answered(OutboundReply::text("XYZ")))
+                    .await
+            );
+            assert_eq!(
+                mock.calls()
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "/api/chat.startStream",
+                    "/api/chat.stopStream",
+                    "/api/chat.postMessage",
+                ]
+            );
+        }
     }
 
     #[tokio::test]

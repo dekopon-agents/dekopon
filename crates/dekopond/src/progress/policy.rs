@@ -10,7 +10,6 @@ use std::{
 };
 
 use dekopon_agent::{BudgetLimit, CancelSource, ProgressEvent};
-use dekopon_model::ModelText;
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
     time::Instant,
@@ -127,7 +126,7 @@ impl ProgressPolicy {
         let coordination = Arc::new(Coordination::default());
         let counters = Arc::new(ProgressCounters::default());
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
-        let (text_tx, text_rx) = watch::channel(ModelText::default());
+        let (text_tx, text_rx) = watch::channel(StreamedText::default());
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let cancellation = inputs.cancellation.clone();
         let adapter = Arc::new(ProgressAdapter::new(
@@ -259,7 +258,7 @@ struct Surface {
     deadline: Option<Instant>,
     message: Option<MessageRef>,
     streaming: bool,
-    latest_text: Option<ModelText>,
+    latest_text: Option<StreamedText>,
     posted_on_text: bool,
     next_typing: Option<Instant>,
     next_keep_alive: Option<Instant>,
@@ -444,8 +443,8 @@ impl Surface {
         }
     }
 
-    async fn on_text(&mut self, text: ModelText) {
-        if text.as_str().is_empty() {
+    async fn on_text(&mut self, text: StreamedText) {
+        if text.text.as_str().is_empty() {
             self.latest_text = None;
             self.stream_pending = false;
             return;
@@ -668,12 +667,13 @@ impl Surface {
             return;
         };
         let limits = stream.limits();
-        let truncated = latest.as_str().chars().count() > limits.max_chars;
+        let truncated = latest.text.as_str().chars().count() > limits.max_chars;
         let text = StreamedText {
+            generation: latest.generation,
             text: if truncated {
-                latest.truncated(limits.max_chars)
+                latest.text.truncated(limits.max_chars)
             } else {
-                latest
+                latest.text
             },
             truncated,
         };
@@ -706,17 +706,18 @@ impl Surface {
         }
     }
 
-    async fn terminal(&mut self, terminal: Terminal, text: ModelText) -> bool {
-        self.latest_text = (!text.as_str().is_empty()).then_some(text);
+    async fn terminal(&mut self, terminal: Terminal, text: StreamedText) -> bool {
+        let generation = text.generation;
+        self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
         self.stream_pending = false;
         self.coordination.seal();
         self.record_terminal(&terminal);
         let streamed = self.streamed_text();
         match terminal {
-            Terminal::Answered(reply) => self.finalize(reply).await,
+            Terminal::Answered(reply) => self.finalize(reply, generation).await,
             Terminal::Failed(line) => match streamed {
                 Some(partial) => {
-                    self.finalize(OutboundReply::text(ended(&partial, &line)))
+                    self.finalize(OutboundReply::text(ended(&partial, &line)), generation)
                         .await
                 }
                 None => {
@@ -730,12 +731,13 @@ impl Surface {
                     Some(partial) => ended(&partial, &stopped),
                     None => stopped,
                 };
-                self.finalize(OutboundReply::text(reply)).await
+                self.finalize(OutboundReply::text(reply), generation).await
             }
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {
                     Some(partial) => {
-                        self.finalize(OutboundReply::text(partial)).await;
+                        self.finalize(OutboundReply::text(partial), generation)
+                            .await;
                     }
                     None => self.discard().await,
                 }
@@ -748,18 +750,20 @@ impl Surface {
         self.streaming.then(|| {
             self.latest_text
                 .as_ref()
-                .map(ModelText::as_str)
+                .map(|text| text.text.as_str())
                 .unwrap_or_default()
                 .to_owned()
         })
     }
 
-    async fn finalize(&mut self, reply: OutboundReply) -> bool {
+    async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> bool {
         if let Some(message) = self.message.clone() {
             let driver = Arc::clone(&self.driver);
             let finalized = if self.streaming {
                 match driver.stream() {
-                    Some(stream) => Some(bounded(stream.finalize(&message, &reply)).await),
+                    Some(stream) => {
+                        Some(bounded(stream.finalize(&message, &reply, generation)).await)
+                    }
                     None => None,
                 }
             } else {
@@ -803,10 +807,14 @@ impl Surface {
         let Some(message) = self.message.take() else {
             return;
         };
+        let driver = Arc::clone(&self.driver);
         if self.streaming {
+            if let Some(stream) = driver.stream() {
+                let outcome = bounded(stream.discard(&message)).await;
+                self.observe(outcome, "stream-discard");
+            }
             return;
         }
-        let driver = Arc::clone(&self.driver);
         let Some(progress) = driver.progress() else {
             return;
         };
@@ -905,7 +913,7 @@ fn ended(partial: &str, ending: &str) -> String {
 async fn run(
     mut surface: Surface,
     mut events: mpsc::Receiver<ProgressEvent>,
-    mut text: watch::Receiver<ModelText>,
+    mut text: watch::Receiver<StreamedText>,
     mut terminal: oneshot::Receiver<TerminalRequest>,
     cancellation: SessionCancellation,
 ) {

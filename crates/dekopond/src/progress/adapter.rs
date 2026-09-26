@@ -7,7 +7,7 @@ use dekopon_agent::{ProgressEvent, ProgressSink};
 use dekopon_model::ModelText;
 use tokio::sync::{mpsc, watch};
 
-use crate::session::SessionCancellation;
+use crate::{session::SessionCancellation, transport::StreamedText};
 
 pub(crate) const EVENT_QUEUE: usize = 64;
 
@@ -22,7 +22,7 @@ pub(crate) struct ProgressCounters {
 pub(crate) struct ProgressAdapter {
     transport: String,
     events: mpsc::Sender<ProgressEvent>,
-    text: watch::Sender<ModelText>,
+    text: watch::Sender<StreamedText>,
     turn: AtomicU32,
     counters: Arc<ProgressCounters>,
     cancellation: SessionCancellation,
@@ -32,7 +32,7 @@ impl ProgressAdapter {
     pub(crate) fn new(
         transport: String,
         events: mpsc::Sender<ProgressEvent>,
-        text: watch::Sender<ModelText>,
+        text: watch::Sender<StreamedText>,
         counters: Arc<ProgressCounters>,
         cancellation: SessionCancellation,
     ) -> Self {
@@ -54,14 +54,18 @@ impl ProgressSink for ProgressAdapter {
             let restart = self.turn.swap(*turn, Ordering::Relaxed) != *turn;
             self.text.send_modify(|cumulative| {
                 if restart {
-                    *cumulative = ModelText::default();
+                    cumulative.text = ModelText::default();
+                    cumulative.generation += 1;
                 }
-                cumulative.push(text);
+                cumulative.text.push(text);
             });
             return;
         }
         if matches!(event, ProgressEvent::Steered { .. }) {
-            self.text.send_replace(ModelText::default());
+            self.text.send_modify(|cumulative| {
+                cumulative.text = ModelText::default();
+                cumulative.generation += 1;
+            });
             self.turn.store(NO_TURN, Ordering::Relaxed);
         }
         // Claimed synchronously here, on the loop's own thread, so a stop word arriving while the

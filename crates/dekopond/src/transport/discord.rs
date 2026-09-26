@@ -1214,6 +1214,7 @@ impl TextStream for DiscordDriver {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         self.finalize_in_place(message, reply).await
     }
@@ -2119,7 +2120,7 @@ mod unit_tests {
         .expect("the recorded transcript parses");
         StreamedText {
             text: dekopon_test_support::scripted_text(&events),
-            truncated: false,
+            ..StreamedText::default()
         }
     }
 

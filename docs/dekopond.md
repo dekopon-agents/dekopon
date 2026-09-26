@@ -404,8 +404,9 @@ not fetch assets, contact the model/provider or publish progress. One lead messa
 reply target and native delivery identity; other message IDs are not fabricated into an album ID.
 An authenticated stop removes only that actor's pending work and preserves the existing ownership
 rules for active sessions. Shutdown discards pending batches without starting them. Original
-receipt traces retain their input and terminal disposition; the lead-parented execution exports
-causal links to every constituent (see [observability](observability.md)). Asset leases, history
+receipt traces retain their input and terminal disposition. Ordinary collected executions export
+causal links to every constituent; consumed steers link their constituents only to the admission
+span, not the running execution (see [observability](observability.md)). Asset leases, history
 scope, generation fences and on-demand fetch budgets are unchanged.
 
 ## Asset handles and delivery
@@ -927,6 +928,9 @@ read steers before the next model call, and replace a draft answer when another 
 An interrupted call does not spend `maxSteps`; session duration and per-call timeouts still apply.
 Steers left at the last step, decline or failure fold into a follow-up under their original sender.
 Consumed steer text joins the turn's user text in history and the journal, without a format change.
+Journal writes cap only the JSON-encoded user string at 64 KiB. If needed, the user text is
+shortened to a UTF-8-safe prefix ending in `[…]`; the raw answer, metadata and assets remain
+intact. The complete line can exceed 64 KiB and is not rejected for its size.
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -1123,7 +1127,8 @@ attestation. The recorded user text is the original bounded sender text followed
 steer's raw text, joined by blank lines, excluding gateway timing and attachment reference notes.
 If the combined user and assistant text exceeds the existing 64-KiB recording ceiling, only the
 recorded user text is shortened to a UTF-8-safe prefix ending in `[…]`; space is reserved for that
-marker and the entire accepted assistant text. This does not truncate prompt or journal history.
+marker and the entire accepted assistant text. This recording bound leaves prompt history
+unchanged; journal writes apply their own encoded-user bound.
 Assistant text is exactly what the transport accepted. No response,
 denial, timeout, EOF, partial Discord delivery, or outcome-unaudited is retried, and none changes
 the already delivered `answered` outcome.
