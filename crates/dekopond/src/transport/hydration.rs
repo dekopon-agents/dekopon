@@ -305,7 +305,7 @@ mod tests {
         );
         for (operation, parent) in [
             ("read", "transport.delivery"),
-            ("cleanup", "gateway.session"),
+            ("cleanup", "transport.delivery"),
         ] {
             let spans = capture.records().into_iter().filter(|record| matches!(record,
                 Record::Span { name: "asset.spool", fields, parent: actual }

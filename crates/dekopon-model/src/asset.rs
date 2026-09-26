@@ -66,7 +66,6 @@ struct Owner {
     file: Mutex<Option<BlobFile>>,
     directory: Option<TempDir>,
     len: usize,
-    origin: tracing::Span,
 }
 
 /// Equality here means the same lease, not equal file contents, and reads always use the original
@@ -100,7 +99,6 @@ impl DiskBlob {
         bytes: &[u8],
         write: impl FnOnce(&mut NamedTempFile, &[u8]) -> io::Result<()>,
     ) -> Result<Self, BlobError> {
-        let origin = tracing::Span::current();
         operation("write", bytes.len(), || {
             if bytes.len() > MAX_ATTACHMENT_BYTES {
                 return Err(BlobError::TooLarge);
@@ -120,7 +118,6 @@ impl DiskBlob {
                 file: Mutex::new(Some(BlobFile::Path(file))),
                 directory: Some(directory),
                 len: bytes.len(),
-                origin,
             };
             {
                 let mut guard = owner
@@ -153,7 +150,6 @@ impl DiskBlob {
             file: Mutex::new(Some(BlobFile::Fd(file))),
             directory: None,
             len,
-            origin: tracing::Span::current(),
         })))
     }
 
@@ -229,18 +225,10 @@ impl DiskBlob {
     }
 
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
-        let current = tracing::Span::current();
-        let parent = if current.is_none() {
-            self.0.origin.clone()
-        } else {
-            current
-        };
-        parent.in_scope(|| {
-            operation("read", self.len(), || {
-                let mut bytes = vec![0; self.len()];
-                self.read_exact_at(&mut bytes, 0)?;
-                Ok(bytes)
-            })
+        operation("read", self.len(), || {
+            let mut bytes = vec![0; self.len()];
+            self.read_exact_at(&mut bytes, 0)?;
+            Ok(bytes)
         })
     }
 }
@@ -310,21 +298,19 @@ impl From<DiskBlob> for BlobReference {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        self.origin.in_scope(|| {
-            operation("cleanup", self.len, || {
-                let file = self
-                    .file
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let file_result = file.map_or(Ok(()), BlobFile::close);
-                let directory_result = self.directory.take().map_or(Ok(()), TempDir::close);
-                file_result?;
-                directory_result?;
-                Ok(())
-            })
-            .unwrap_or(())
-        });
+        operation("cleanup", self.len, || {
+            let file = self
+                .file
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let file_result = file.map_or(Ok(()), BlobFile::close);
+            let directory_result = self.directory.take().map_or(Ok(()), TempDir::close);
+            file_result?;
+            directory_result?;
+            Ok(())
+        })
+        .unwrap_or(());
     }
 }
 

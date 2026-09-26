@@ -11252,7 +11252,7 @@ fn capture_spans() -> (
 }
 
 #[test]
-fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
+fn spool_spans_never_record_payload_or_paths() {
     use dekopon_model::asset::DiskBlob;
     let (capture, _guard) = capture_spans();
     let session = tracing::info_span!("gateway.session");
@@ -11276,14 +11276,54 @@ fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
         !text.contains("secret pixel sentinel") && !text.contains("dekopon-assets-"),
         "{text}"
     );
-    assert!(
-        capture
-            .span_parents()
-            .iter()
-            .filter(|(name, _)| *name == "asset.spool")
-            .all(|(_, parent)| parent.as_deref() == Some("gateway.session")),
-        "{text}"
-    );
+}
+
+#[test]
+fn retained_asset_does_not_hold_its_session_span_open() {
+    use dekopon_model::asset::DiskBlob;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("asset-retention-test")))
+        .set_default();
+
+    let message = tracing::info_span!("gateway.message");
+    let session = tracing::info_span!(parent: &message, "gateway.session");
+    let retained = session.in_scope(|| DiskBlob::from_bytes(b"retained pixels").expect("spool"));
+    drop(session);
+    drop(message);
+    provider.force_flush().unwrap();
+
+    {
+        let spans = exported.0.lock().unwrap();
+        for name in ["gateway.message", "gateway.session"] {
+            assert!(
+                spans.iter().any(|span| span.name == name),
+                "{name} waited on the retained asset"
+            );
+        }
+    }
+    drop(retained);
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
