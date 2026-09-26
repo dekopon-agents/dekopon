@@ -201,6 +201,7 @@ enum KubernetesObjectKind {
 enum KubernetesProjectionOrigin {
     Secret,
     ConfigMap,
+    ServiceAccountToken,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2019,6 +2020,56 @@ secrets:
         assert_eq!(parsed.secrets.len(), 10);
     }
 
+    #[test]
+    fn service_account_token_origin_parses_without_non_secret_acknowledgement() {
+        let source: SecretSource = serde_yaml::from_str(
+            "kind: kubernetesProjection\nroot: /run/projected\nkey: token\ndeclaredOrigin: serviceAccountToken\n",
+        )
+        .expect("projected token source");
+        assert!(matches!(
+            &source,
+            SecretSource::KubernetesProjection {
+                declared_origin: super::KubernetesProjectionOrigin::ServiceAccountToken,
+                acknowledge_non_secret_source: false,
+                ..
+            }
+        ));
+        assert!(source.validate().is_ok());
+    }
+
+    #[test]
+    fn config_map_projection_requires_non_secret_acknowledgement() {
+        let yaml = r#"
+apiVersion: dekopon.dev/secret-map/v1alpha1
+mapRevision: test
+secrets:
+  - drn: drn:com.xrl:secret:test:projection/value
+    source: { kind: kubernetesProjection, root: /run/projected, key: value, declaredOrigin: configMap }
+    bindings:
+      - id: api-token
+        capability: http-probe.fetch
+        sink: httpBearer
+        allowedHosts: [api.example.test]
+        allowedMethods: [GET]
+        allowedPaths: [{ match: exact, path: /v1/thing }]
+"#;
+        let mut map: super::SecretMapFile = serde_yaml::from_str(yaml).expect("projection map");
+        let path = std::path::Path::new("/run/map.yaml");
+        assert!(matches!(
+            super::validate_map(map.clone(), path, uid()),
+            Err(SecretMapError::Validation { .. })
+        ));
+        let SecretSource::KubernetesProjection {
+            acknowledge_non_secret_source,
+            ..
+        } = &mut map.secrets[0].source
+        else {
+            panic!("projection fixture");
+        };
+        *acknowledge_non_secret_source = true;
+        assert!(super::validate_map(map, path, uid()).is_ok());
+    }
+
     #[tokio::test]
     async fn secure_file_map_resolves_only_after_catalog_construction() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -2241,37 +2292,47 @@ secrets:
     }
 
     #[tokio::test]
-    async fn kubernetes_projection_reads_one_atomic_writer_generation_at_a_time() {
+    async fn service_account_token_projection_reads_one_atomic_writer_generation_per_resolution() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("tempdir");
         let root = directory.path().join("projection");
         tokio::fs::create_dir(&root).await.expect("root");
-        for (generation, value) in [
-            ("..gen-one", b"one".as_slice()),
-            ("..gen-two", b"two".as_slice()),
-        ] {
+        let first = b"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlLW9uZSJ9.c2lnbmF0dXJl";
+        let second = b"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlLXR3byJ9.c2lnbmF0dXJl";
+        for (generation, value) in [("..gen-one", first), ("..gen-two", second)] {
             let path = root.join(generation);
             tokio::fs::create_dir(&path).await.expect("generation");
-            tokio::fs::write(path.join("password"), value)
+            tokio::fs::write(path.join("token"), value)
                 .await
                 .expect("projected value");
         }
         symlink("..gen-one", root.join("..data")).expect("initial data link");
+        symlink("..data/token", root.join("token")).expect("key link");
+        let replacement = root.join("..data-next");
+        let data_link = root.join("..data");
+        let source = SecretSource::KubernetesProjection {
+            root,
+            key: "token".to_owned(),
+            declared_origin: super::KubernetesProjectionOrigin::ServiceAccountToken,
+            acknowledge_non_secret_source: false,
+        };
+        let resolver = resolver();
         assert_eq!(
-            super::read_kubernetes_projection(&root, "password")
+            resolver
+                .resolve_source(&source)
                 .await
                 .expect("first snapshot"),
-            b"one"
+            first
         );
-        let replacement = root.join("..data-next");
         symlink("..gen-two", &replacement).expect("replacement link");
-        std::fs::rename(replacement, root.join("..data")).expect("atomic swap");
+        std::fs::rename(replacement, data_link).expect("atomic swap");
         assert_eq!(
-            super::read_kubernetes_projection(&root, "password")
+            resolver
+                .resolve_source(&source)
                 .await
                 .expect("second snapshot"),
-            b"two"
+            second
         );
     }
 

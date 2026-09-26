@@ -9,6 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Private `kubernetesProjection` secret sources accept `declaredOrigin: serviceAccountToken`
+  without a non-secret acknowledgement and read the current kubelet-projected token per invocation.
 - HTTP constraint sets accept `propagateTrace: true` to send a broker-owned W3C `traceparent`
   to first-party destinations inside the operator's trust boundary. Buffered and streaming
   requests parent downstream work on the HTTP egress span without charging guest byte budgets.
@@ -17,6 +19,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Provider-supplied `traceparent` and `tracestate` request headers are refused with `InvalidHeader`
   on every HTTP grant, including grants that do not opt into trace propagation.
+
+## [dekopon-chart-0.14.0] - 2026-09-26
+
+### Added
+
+- Optional `serviceAccount.create`, `serviceAccount.name`, and `serviceAccount.annotations`
+  select or create the pod's ServiceAccount while keeping automatic token mounting disabled.
+- Projected ServiceAccount token examples use the existing broker-only `secretSourceVolumes`
+  mounts to preserve live token rotation without exposing tokens to the gateway.
 
 ## [0.22.0] - 2026-09-25
 

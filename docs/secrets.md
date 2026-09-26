@@ -276,7 +276,7 @@ source:
   kind: kubernetesProjection
   root: /var/run/dekopon-api-secret
   key: credentials.json
-  declaredOrigin: secret # secret | configMap
+  declaredOrigin: secret # secret | configMap | serviceAccountToken
   acknowledgeNonSecretSource: false # required true for configMap
 ```
 
@@ -292,7 +292,12 @@ AtomicWriter root (commonly `01777`) is accepted only when `statvfs` proves the 
 otherwise the root itself must not be group/world writable. The chart always mounts configured
 secret sources read-only. `subPath` should not be used because it does not receive projected updates.
 
-The on-disk layout cannot prove whether kubelet sourced a Secret or ConfigMap, so every projection
+A projected ServiceAccount token uses `declaredOrigin: serviceAccountToken` with the same reader
+and needs no `acknowledgeNonSecretSource`, just like `secret`. Kubelet refreshes the token at 80%
+of its TTL; the broker reads the current projection per invocation. Mount it live through
+`broker.secretSourceVolumes`, never an init copy or `subPath`.
+
+The on-disk layout cannot prove whether kubelet sourced a Secret, ConfigMap, or ServiceAccount token, so every projection
 entry must explicitly state `declaredOrigin`. A ConfigMap declaration requires `acknowledgeNonSecretSource: true`; this is
 an explicit operator claim rather than filesystem attestation. Values receive Dekopon's downstream
 redaction but do not gain Kubernetes Secret storage/RBAC properties retroactively.
