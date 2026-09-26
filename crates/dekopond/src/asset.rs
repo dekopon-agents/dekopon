@@ -582,11 +582,15 @@ pub(crate) struct SessionAssets {
     fetcher: Option<Arc<dyn AssetFetcher>>,
     runtime: Handle,
     images_supported: bool,
-    available: bool,
+    available: AtomicBool,
     spent: Mutex<u32>,
 }
 
 impl SessionAssets {
+    pub(crate) fn arrived(&self, fetchable: bool) {
+        self.available.fetch_or(fetchable, Ordering::Relaxed);
+    }
+
     pub fn new(
         store: Arc<AssetStore>,
         access: AssetAccess,
@@ -601,7 +605,7 @@ impl SessionAssets {
             fetcher,
             runtime,
             images_supported,
-            available,
+            available: AtomicBool::new(available),
             spent: Mutex::new(0),
         }
     }
@@ -612,7 +616,7 @@ impl AssetSource for SessionAssets {
         if !self.access.is_active() {
             return true;
         }
-        if self.available && self.fetcher.is_some() {
+        if self.available.load(Ordering::Relaxed) && self.fetcher.is_some() {
             return false;
         }
         !self.store.get_inventory(&self.access).iter().any(|asset| {

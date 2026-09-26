@@ -400,7 +400,7 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 `gateway.session` is the agent invocation span. Its canonical OpenTelemetry GenAI attributes use
@@ -494,12 +494,22 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
 `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or
-liveness call was made, `busy` means admission control refused the message, `cancelled` means a
+liveness call was made, `steered` joins the sender's running turn, and `queued` waits for a new turn.
+`busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
+all process-wide permits are taken (`busy.cause = saturated`). `cancelled` means a
 stop won the race against terminal delivery, and `failed` names a category and the `error` that
 produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
+
+Each non-admitted message emits `gateway.admission` on `dekopond::audit`, with `outcome`
+(`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
+plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
+Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with
+`reason = mailbox-full`. An interrupted model call records `accounting.model.turn` with
+`outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains
+the steer text. These records remain useful without a `gateway.session` wrapper span.
 
 Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
 `gateway_transport_recovering` carries the configured `transport`, stable error `category`,

@@ -191,6 +191,38 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 }
 
 #[tokio::test]
+async fn steering_defaults_to_abort_and_boundary_survives_route_binding() {
+    let directory = temporary();
+    for (value, expected) in [
+        (None, crate::config::Steering::Abort),
+        (Some("boundary"), crate::config::Steering::Boundary),
+    ] {
+        let mut document = document(directory.path());
+        if let Some(value) = value {
+            document["routes"][0]["steering"] = json!(value);
+        }
+        let resolved = load(directory.path(), &document)
+            .await
+            .expect("steering configuration");
+        assert_eq!(resolved.routes[0].steering, expected);
+        let routes =
+            RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).expect("routes");
+        assert_eq!(
+            routes.route(&message("hello")).expect("route").steering,
+            expected
+        );
+    }
+    for value in ["Abort", "queue"] {
+        let mut document = document(directory.path());
+        document["routes"][0]["steering"] = json!(value);
+        assert!(matches!(
+            load(directory.path(), &document).await,
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -2892,6 +2924,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         max_duration: None,
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
+        steering: crate::config::Steering::Abort,
         memory: MemoryPolicy::OneShot,
         wakes: false,
         cache_key: cache_key::for_route(),
@@ -3122,7 +3155,6 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::default(),
         wakes: None,
     })
 }
@@ -4202,23 +4234,26 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
 
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel("tel.999", CancelVia::Button)),
+            .gate
+            .cancel(&cancel("tel.999", CancelVia::Button))
+            .running,
         CancelOutcome::OtherSubject,
         "another chat user cannot stop the initiator's work"
     );
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::NativeStop)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
         CancelOutcome::Cancelled
     );
     // A second cancel attempt while the first is still draining must be a no-op, or the policy
     // would write the stopped reply twice.
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+            .running,
         CancelOutcome::AlreadyCancelled
     );
     model.release();
@@ -4706,7 +4741,7 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     let runner = runner(broker, Arc::clone(&models), 1);
     let _held = runner
         .gate
-        .admit(("other".to_owned(), "other".to_owned()))
+        .admit_probe(("other".to_owned(), "other".to_owned()))
         .expect("the first session is admitted");
     let driver = Arc::new(RecordingDriver::default());
 
@@ -4728,17 +4763,17 @@ async fn one_conversation_runs_one_session_at_a_time() {
     let key = ("slack".to_owned(), "c0123abc:1.0".to_owned());
 
     let first = gate
-        .admit(key.clone())
+        .admit_probe(key.clone())
         .expect("the first message is admitted");
-    assert!(gate.admit(key.clone()).is_none());
+    assert!(gate.admit_probe(key.clone()).is_none());
     assert!(
-        gate.admit(("slack".to_owned(), "c0123abc:2.0".to_owned()))
+        gate.admit_probe(("slack".to_owned(), "c0123abc:2.0".to_owned()))
             .is_some()
     );
 
     drop(first);
     assert!(
-        gate.admit(key).is_some(),
+        gate.admit_probe(key).is_some(),
         "a finished session releases its conversation"
     );
 }
@@ -4746,14 +4781,16 @@ async fn one_conversation_runs_one_session_at_a_time() {
 #[tokio::test]
 async fn concurrency_is_bounded_across_every_conversation() {
     let gate = SessionGate::new(2);
-    let first = gate.admit(("a".to_owned(), "a".to_owned())).expect("first");
+    let first = gate
+        .admit_probe(("a".to_owned(), "a".to_owned()))
+        .expect("first");
     let second = gate
-        .admit(("b".to_owned(), "b".to_owned()))
+        .admit_probe(("b".to_owned(), "b".to_owned()))
         .expect("second");
-    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_none());
+    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_none());
 
     drop(first);
-    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_some());
+    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_some());
     drop(second);
 }
 
@@ -4764,7 +4801,7 @@ async fn refusal_replies_waiting_on_a_chat_service_are_bounded_apart_from_sessio
     let _second = gate.refusal().expect("second refusal reply");
     assert!(gate.refusal().is_none(), "one past the ceiling is skipped");
     assert!(
-        gate.admit(("a".to_owned(), "a".to_owned())).is_some(),
+        gate.admit_probe(("a".to_owned(), "a".to_owned())).is_some(),
         "pending refusals leave session admission alone"
     );
 
@@ -12025,7 +12062,7 @@ impl CancelOrigin {
         session: &tokio::task::JoinHandle<()>,
     ) -> Option<CancelOutcome> {
         match self {
-            Self::User(via) => Some(runner.active_sessions.cancel(&cancel(SUBJECT, via))),
+            Self::User(via) => Some(runner.gate.cancel(&cancel(SUBJECT, via)).running),
             Self::Operator => {
                 session.abort();
                 None
@@ -12187,7 +12224,7 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
             .expect("the session parks on its capability listing");
 
         assert_eq!(
-            runner.active_sessions.cancel(&cancel(SUBJECT, via)),
+            runner.gate.cancel(&cancel(SUBJECT, via)).running,
             CancelOutcome::Cancelled,
             "{via:?} found no session to stop"
         );
@@ -12503,8 +12540,9 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
         .expect("a bystander's press is still acknowledged");
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel("tel.16035550100", CancelVia::Button)),
+            .gate
+            .cancel(&cancel("tel.16035550100", CancelVia::Button))
+            .running,
         CancelOutcome::OtherSubject,
         "a bystander cannot stop this session"
     );
@@ -12557,8 +12595,9 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
 
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+            .running,
         CancelOutcome::Cancelled,
         "a session with no liveness surface is registered like any other"
     );
@@ -13326,8 +13365,9 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
         if already_cancelled {
             assert_eq!(
                 runner
-                    .active_sessions
-                    .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+                    .gate
+                    .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+                    .running,
                 CancelOutcome::Cancelled
             );
         } else {
@@ -13895,6 +13935,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/steering.rs"]
+mod steering;
 #[path = "tests/wakes.rs"]
 mod wakes;
 
@@ -13920,7 +13962,6 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::default(),
         wakes: None,
     })
 }
