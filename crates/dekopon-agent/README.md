@@ -47,7 +47,9 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   metadata such as a prompt cache key: they change how a provider routes the request, never
   what the model is asked, so the default is byte-identical to the call without them.
 - `prompt::SessionInputs` — the builder those entry points fill in and
-  `prompt::run_prompt_session` runs. Two of its opt-ins are described below:
+  `prompt::run_prompt_session` runs. `with_steering(&dyn prompt::SteerSource)` drains queued
+  user text at step boundaries and retries model-only interruptions without spending a step.
+  Two other opt-ins are described below:
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
   offers no tool; `with_improvement_suggestions()` offers `suggest_improvement`, which is never
   offered unless the embedder called it.

@@ -391,7 +391,8 @@ impl Surface {
                 self.render(Line::Status, false).await;
             }
             ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
-            ProgressEvent::TextDelta { .. }
+            ProgressEvent::Steered { .. }
+            | ProgressEvent::TextDelta { .. }
             | ProgressEvent::KeepAlive { .. }
             | ProgressEvent::Cancelled { .. }
             | ProgressEvent::Failed { .. }
@@ -444,14 +445,18 @@ impl Surface {
     }
 
     async fn on_text(&mut self, text: ModelText) {
-        let empty = text.as_str().is_empty();
+        if text.as_str().is_empty() {
+            self.latest_text = None;
+            self.stream_pending = false;
+            return;
+        }
         self.latest_text = Some(text);
         if self.streams() {
             self.stream_pending = true;
             self.flush_stream().await;
             return;
         }
-        if !self.posted_on_text && !empty {
+        if !self.posted_on_text {
             self.posted_on_text = true;
             if self.message.is_none() {
                 self.render(Line::Status, true).await;
@@ -701,7 +706,9 @@ impl Surface {
         }
     }
 
-    async fn terminal(&mut self, terminal: Terminal) -> bool {
+    async fn terminal(&mut self, terminal: Terminal, text: ModelText) -> bool {
+        self.latest_text = (!text.as_str().is_empty()).then_some(text);
+        self.stream_pending = false;
         self.coordination.seal();
         self.record_terminal(&terminal);
         let streamed = self.streamed_text();
@@ -726,7 +733,7 @@ impl Surface {
                 self.finalize(OutboundReply::text(reply)).await
             }
             Terminal::Silent => {
-                match streamed {
+                match streamed.filter(|partial| !partial.is_empty()) {
                     Some(partial) => {
                         self.finalize(OutboundReply::text(partial)).await;
                     }
@@ -917,7 +924,8 @@ async fn run(
             biased;
             request = &mut terminal => {
                 let Ok(request) = request else { break };
-                let delivered = surface.terminal(request.terminal).await;
+                let latest = text.borrow_and_update().clone();
+                let delivered = surface.terminal(request.terminal, latest).await;
                 if request.done.send(delivered).is_err() {
                     tracing::debug!(event = "gateway_progress_terminal_unobserved");
                 }
@@ -925,7 +933,8 @@ async fn run(
             }
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
-                surface.terminal(Terminal::Cancelled { by }).await;
+                let latest = text.borrow_and_update().clone();
+                surface.terminal(Terminal::Cancelled { by }, latest).await;
                 break;
             }
             () = coordination.finished() => break,
