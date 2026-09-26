@@ -3173,6 +3173,147 @@ fn runner_tracking(
     })
 }
 
+struct InterruptibleModel {
+    turns: Mutex<VecDeque<AssistantTurn>>,
+    prompts: Mutex<Vec<Vec<ModelMessage>>>,
+    tools: Mutex<Vec<Vec<String>>>,
+    entered: tokio::sync::Notify,
+    release: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_signal: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    interrupted: AtomicUsize,
+}
+
+impl InterruptibleModel {
+    fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Arc<Self> {
+        let (release, release_signal) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            turns: Mutex::new(turns.into_iter().collect()),
+            prompts: Mutex::new(Vec::new()),
+            tools: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: Mutex::new(Some(release)),
+            release_signal: Mutex::new(Some(release_signal)),
+            interrupted: AtomicUsize::new(0),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
+            .await
+            .expect("model entered");
+    }
+
+    fn release(&self) {
+        self.release
+            .lock()
+            .expect("release")
+            .take()
+            .expect("one release")
+            .send(())
+            .expect("model still waiting");
+    }
+
+    fn prompt(&self, index: usize) -> Vec<(String, String)> {
+        self.prompts.lock().expect("prompts")[index]
+            .iter()
+            .map(|message| {
+                let value = serde_json::to_value(message).expect("message");
+                (
+                    value["role"].as_str().unwrap_or_default().to_owned(),
+                    value["content"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> usize {
+        self.prompts.lock().expect("prompts").len()
+    }
+
+    fn tool_names(&self, index: usize) -> Vec<String> {
+        self.tools.lock().expect("tools")[index].clone()
+    }
+}
+
+impl ModelFactory for Arc<InterruptibleModel> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(InterruptibleHandle {
+            model: Arc::clone(self),
+            runtime,
+            cancel,
+        }))
+    }
+}
+
+struct InterruptibleHandle {
+    model: Arc<InterruptibleModel>,
+    runtime: tokio::runtime::Handle,
+    cancel: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ChatModel for InterruptibleHandle {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        _options: &CompletionOptions,
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        self.model
+            .prompts
+            .lock()
+            .expect("prompts")
+            .push(messages.to_vec());
+        self.model
+            .tools
+            .lock()
+            .expect("tools")
+            .push(tools.iter().map(|tool| tool.name.clone()).collect());
+        let release = self
+            .model
+            .release_signal
+            .lock()
+            .expect("release receiver")
+            .take();
+        if let Some(release) = release {
+            let mut cancel = self.cancel.clone();
+            self.model.entered.notify_one();
+            let interrupted = self.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        stopped = cancel.wait_for(|stopped| *stopped) => {
+                            assert!(stopped.is_ok(), "model cancellation stays open");
+                            true
+                        }
+                        released = release => {
+                            released.expect("test releases the model");
+                            false
+                        }
+                    }
+                })
+                .await
+                .expect("model released or cancelled")
+            });
+            if interrupted {
+                self.model.interrupted.fetch_add(1, Ordering::SeqCst);
+                return Err(InferenceError::Cancelled);
+            }
+        }
+        Ok(self
+            .model
+            .turns
+            .lock()
+            .expect("turns")
+            .pop_front()
+            .expect("scripted turn"))
+    }
+}
+
 struct BlockedModel {
     entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     entered_signal: tokio::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -13951,6 +14092,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/steering.rs"]
 mod steering;
+#[path = "tests/steering_e2e.rs"]
+mod steering_e2e;
 #[path = "tests/wakes.rs"]
 mod wakes;
 
