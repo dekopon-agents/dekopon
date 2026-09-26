@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-26
+
 ### Added
 
 - Private `kubernetesProjection` secret sources accept `declaredOrigin: serviceAccountToken`
@@ -33,6 +35,10 @@ All notable changes to Dekopon are documented here. The format is based on
   select or create the pod's ServiceAccount while keeping automatic token mounting disabled.
 - Projected ServiceAccount token examples use the existing broker-only `secretSourceVolumes`
   mounts to preserve live token rotation without exposing tokens to the gateway.
+
+### Changed
+
+- Default application version is now 0.23.0.
 
 ## [0.22.0] - 2026-09-25
 

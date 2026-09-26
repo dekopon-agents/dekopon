@@ -523,7 +523,7 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-`appVersion` is `0.22.0`. It is not decorative: `dekopon.labels` renders it as
+`appVersion` is `0.23.0`. It is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
 every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -534,7 +534,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.22.0
+ghcr.io/dekopon-agents/dekopon:v0.23.0
 ```
 
 There is no `latest`. Prefer `image.digest`; it pins across the
@@ -743,9 +743,8 @@ source:
   declaredOrigin: serviceAccountToken
 ```
 
-This origin needs a broker version that supports it (added after `0.22.0`); the chart's default
-`appVersion` remains `0.22.0`. Select a supporting image when using this example. The broker reads
-per invocation rather than caching the token.
+This origin requires broker `0.23.0` or later, supported by the chart's default `appVersion`.
+The broker reads per invocation rather than caching the token.
 
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`

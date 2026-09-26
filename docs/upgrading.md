@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Broker-owned HTTP trace headers (next release)
+## Broker-owned HTTP trace headers (0.23.0)
 
 Remove provider-supplied `traceparent` and `tracestate` request headers before upgrading: the
 native HTTP host now refuses either with `InvalidHeader`, even when propagation is disabled.
@@ -17,7 +17,7 @@ HTTP constraint set with `propagateTrace: true`; omission remains off. The broke
 egress span's `traceparent`, never `tracestate`. See the
 [broker configuration example](../crates/dekopon-brokerd/README.md#trace-propagation-to-first-party-destinations).
 
-## Embedders: `dekopon-telemetry` exporter feature (next release)
+## Embedders: `dekopon-telemetry` exporter feature (0.23.0)
 
 The OTLP install API (`Install`, `ExporterSettings`, `Transport`, `TelemetryGuard`,
 `TelemetryError`, `CA_CERTIFICATE_ENV`) is now behind `dekopon-telemetry`'s default-off `exporter`
