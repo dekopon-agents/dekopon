@@ -17,6 +17,15 @@ HTTP constraint set with `propagateTrace: true`; omission remains off. The broke
 egress span's `traceparent`, never `tracestate`. See the
 [broker configuration example](../crates/dekopon-brokerd/README.md#trace-propagation-to-first-party-destinations).
 
+## Embedders: `dekopon-telemetry` exporter feature (next release)
+
+The OTLP install API (`Install`, `ExporterSettings`, `Transport`, `TelemetryGuard`,
+`TelemetryError`, `CA_CERTIFICATE_ENV`) is now behind `dekopon-telemetry`'s default-off `exporter`
+feature. A crate that installs telemetry — a gateway, console or test harness embedding Dekopon —
+must enable it when re-pinning: `dekopon-telemetry = { version = "=X.Y.Z", features = ["exporter"] }`.
+Without it the build fails with `E0432` on those imports. Crates that only read trace context
+(`current_trace_context`, `remote_context`, the link helpers) need no change.
+
 ## Principals, groups and capability blocks (0.22.0)
 
 Every broker configuration needs editing before the 0.22.0 broker will start; `dekopon-brokerd
