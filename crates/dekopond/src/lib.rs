@@ -170,7 +170,7 @@ where
         asset_fetchers,
         liveness: config.liveness.clone(),
         thread_ownership,
-        active_sessions: session::ActiveSessions::new(config.sessions.max_concurrent),
+        active_sessions: session::ActiveSessions::default(),
         wakes,
     });
 
@@ -480,9 +480,9 @@ fn dispatch(
     stop_words: &[String],
     sessions: &mut JoinSet<()>,
     collector: &mut collection::Collector,
-    mut message: InboundMessage,
+    message: InboundMessage,
 ) {
-    let Some((route_id, route)) = routes.route_index(&message) else {
+    let Some((route_id, _)) = routes.route_index(&message) else {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -567,7 +567,6 @@ fn dispatch(
         );
         return;
     }
-    message.late_photos = runner.active_sessions.late_photos(route, &message);
     match collector.offer(route_id, message) {
         collection::Offered::Pending => {}
         collection::Offered::Immediate(message) => {
@@ -582,8 +581,6 @@ fn dispatch(
                 sessions.spawn(async move {
                     let _permit = permit;
                     let reply = match reason {
-                        "late-instructions" => "Your instruction was not processed. Please send it after the current request completes; the earlier photos are still being collected.",
-                        "different-run" => "This input was not processed because another request's photos are still being collected. Please send it separately after that request completes.",
                         "collection-full" => "Busy collecting other requests. Please try again shortly.",
                         "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
                         "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",

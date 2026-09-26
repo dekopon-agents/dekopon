@@ -249,7 +249,6 @@ impl TelegramTransport {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             constituents: Vec::new(),
-            late_photos: None,
             asset_overflow: false,
         }))
     }

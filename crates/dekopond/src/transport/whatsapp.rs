@@ -2,7 +2,6 @@
 //! atomically, and only acknowledges once a whole delivery is enqueued.
 
 mod media;
-pub(crate) use media::MAX_IMAGE_BYTES;
 #[cfg(test)]
 pub(crate) mod tests_media;
 
@@ -671,7 +670,6 @@ fn parse_delivery(
                     received_at: tokio::time::Instant::now(),
                     native_group: None,
                     constituents: Vec::new(),
-                    late_photos: None,
                     asset_overflow: false,
                 });
             }
