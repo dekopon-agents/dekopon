@@ -92,9 +92,6 @@ struct Conversation {
 
 struct Slot {
     generation: u64,
-    input_revision: u64,
-    seed_revision: u64,
-    gateway_notice: Option<&'static str>,
     asset_fence: Arc<AssetFence>,
     granted: Vec<String>,
     pending: usize,
@@ -114,41 +111,8 @@ pub(crate) struct ConversationSeed<'a> {
     pub cache_key: String,
     pub assets: AssetAccess,
     pub lease: ConversationLease<'a>,
-    pub input: ConversationInput,
-    pub gateway_notice: Option<&'static str>,
     /// True only for the call that created this generation, which alone restores recalled assets.
     pub created: bool,
-}
-
-/// This input becomes invalid after any later normal request, even within the same generation, so
-/// don't reuse a stale one.
-#[derive(Clone)]
-pub(crate) struct ConversationInput {
-    key: ConversationKey,
-    generation: u64,
-    revision: u64,
-    seed_revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LateAssetRefusal {
-    Missing,
-    StaleInput,
-    GrantChanged,
-    Expired,
-    InventoryUnavailable,
-}
-
-impl LateAssetRefusal {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Missing => "missing-generation",
-            Self::StaleInput => "stale-input",
-            Self::GrantChanged => "grant-changed",
-            Self::Expired => "expired",
-            Self::InventoryUnavailable => "inventory-unavailable",
-        }
-    }
 }
 
 pub(crate) struct ConversationLease<'a> {
@@ -333,9 +297,6 @@ impl ConversationStore {
                 key.clone(),
                 Slot {
                     generation,
-                    input_revision: 1,
-                    seed_revision: 1,
-                    gateway_notice: None,
                     asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
                     pending: 1,
@@ -347,13 +308,6 @@ impl ConversationStore {
             }
             return ConversationSeed {
                 created: true,
-                gateway_notice: None,
-                input: ConversationInput {
-                    key: key.clone(),
-                    generation,
-                    revision: 1,
-                    seed_revision: 1,
-                },
                 history,
                 cache_key,
                 assets: AssetAccess::persistent(key.clone(), generation, asset_fence),
@@ -371,14 +325,6 @@ impl ConversationStore {
             .slots
             .get_mut(key)
             .expect("the conversation slot was checked above");
-        slot.input_revision = slot
-            .input_revision
-            .checked_add(1)
-            .expect("conversation input revision space exhausted");
-        slot.seed_revision = slot
-            .seed_revision
-            .checked_add(1)
-            .expect("conversation seed revision space exhausted");
         slot.pending = slot
             .pending
             .checked_add(1)
@@ -398,13 +344,6 @@ impl ConversationStore {
         );
         ConversationSeed {
             created: false,
-            gateway_notice: slot.gateway_notice.take(),
-            input: ConversationInput {
-                key: key.clone(),
-                generation: slot.generation,
-                revision: slot.input_revision,
-                seed_revision: slot.seed_revision,
-            },
             history,
             cache_key,
             assets: AssetAccess::persistent(
@@ -420,83 +359,6 @@ impl ConversationStore {
                 active: true,
             },
         }
-    }
-
-    pub fn invalidate_late_input(&self, key: &ConversationKey) {
-        let mut state = self.state.lock().expect("conversation store");
-        if let Some(slot) = state.slots.get_mut(key) {
-            slot.input_revision = slot
-                .input_revision
-                .checked_add(1)
-                .expect("conversation input revision space exhausted");
-        }
-    }
-
-    pub fn remember_gateway_notice(&self, input: &ConversationInput, notice: &'static str) {
-        let mut state = self.state.lock().expect("conversation store");
-        if let Some(slot) = state.slots.get_mut(&input.key)
-            && slot.generation == input.generation
-            && slot.seed_revision == input.seed_revision
-        {
-            slot.gateway_notice = Some(notice);
-        }
-    }
-
-    pub fn retain_late_assets<T>(
-        &self,
-        input: &ConversationInput,
-        granted: &[String],
-        window: MemoryWindow,
-        cache_key: &str,
-        register: impl FnOnce() -> Option<T>,
-    ) -> Result<T, LateAssetRefusal> {
-        let now = Instant::now();
-        let mut state = self.state.lock().expect("conversation store");
-        let slot = state
-            .slots
-            .get(&input.key)
-            .ok_or(LateAssetRefusal::Missing)?;
-        if slot.generation != input.generation || slot.input_revision != input.revision {
-            return Err(LateAssetRefusal::StaleInput);
-        }
-        let reason = if slot.granted != granted || granted.is_empty() {
-            Some(EvictionReason::GrantChanged)
-        } else if slot
-            .live
-            .as_ref()
-            .is_some_and(|live| expired(live, window.idle_timeout, now))
-        {
-            Some(EvictionReason::Idle)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            if let Some(slot) = state.slots.remove(&input.key) {
-                slot.asset_fence.deactivate();
-                evicted(reason);
-            }
-            return Err(match reason {
-                EvictionReason::GrantChanged => LateAssetRefusal::GrantChanged,
-                EvictionReason::Idle => LateAssetRefusal::Expired,
-                EvictionReason::Capacity => LateAssetRefusal::Missing,
-            });
-        }
-        let result = register().ok_or(LateAssetRefusal::InventoryUnavailable)?;
-        let slot = state
-            .slots
-            .get_mut(&input.key)
-            .ok_or(LateAssetRefusal::Missing)?;
-        let live = slot.live.get_or_insert_with(|| Conversation {
-            history: History::new(window.limits),
-            cache_key: cache_key.to_owned(),
-            touched: now,
-        });
-        live.touched = now;
-        self.enforce_ceiling(&mut state);
-        if !state.slots.contains_key(&input.key) {
-            return Err(LateAssetRefusal::Missing);
-        }
-        Ok(result)
     }
 
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {

@@ -239,16 +239,6 @@ impl AssetStore {
         }
     }
 
-    pub(crate) fn retention_enabled(&self) -> bool {
-        self.conversations > 0
-            && self
-                .retention
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .budget
-                > 0
-    }
-
     #[cfg(test)]
     pub fn assets_for(
         &self,

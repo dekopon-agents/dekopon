@@ -287,7 +287,6 @@ impl ModelCache {
 
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
-    late_permits: Arc<Semaphore>,
     refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
@@ -296,7 +295,6 @@ impl SessionGate {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent)),
-            late_permits: Arc::new(Semaphore::new(max_concurrent)),
             refusals: Arc::new(Semaphore::new(max_concurrent)),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         }
@@ -453,15 +451,10 @@ impl Drop for CancellationOnDrop {
     }
 }
 
-mod late_photos;
-pub(crate) use late_photos::{LatePhotoReceipt, LatePhotos};
-
 type ActiveSessionKey = (String, String);
 
 #[derive(Clone)]
 struct ActiveSession {
-    started_at: tokio::time::Instant,
-    late_photos: LatePhotos,
     subject: dekopon_core::ExternalSubject,
     cancellation: SessionCancellation,
 }
@@ -486,33 +479,19 @@ impl CancelOutcome {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ActiveSessions {
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
-    recent: Arc<Mutex<late_photos::RecentSessions>>,
-    intakes: late_photos::LateIntakes,
 }
 
 impl ActiveSessions {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            entries: Arc::default(),
-            intakes: late_photos::LateIntakes::default(),
-            recent: Arc::new(Mutex::new(late_photos::RecentSessions::new(capacity))),
-        }
-    }
-
     fn register(
         &self,
         message: &InboundMessage,
-        route: &BoundRoute,
         cancellation: SessionCancellation,
     ) -> ActiveRegistration {
         let key = (message.transport.clone(), message.conversation.key());
-        let late_photos = LatePhotos::new(route, message, cancellation.clone());
         let session = ActiveSession {
-            started_at: tokio::time::Instant::now(),
-            late_photos: late_photos.clone(),
             subject: message.subject.clone(),
             cancellation: cancellation.clone(),
         };
@@ -532,8 +511,6 @@ impl ActiveSessions {
             }
         };
         ActiveRegistration {
-            recent: Arc::clone(&self.recent),
-            late_photos,
             entries: Arc::clone(&self.entries),
             key,
             cancellation,
@@ -542,11 +519,6 @@ impl ActiveSessions {
     }
 
     pub(crate) fn cancel(&self, request: &CancelRequest) -> CancelOutcome {
-        let execution = self.cancel_execution(request);
-        self.intakes.cancel(request, execution)
-    }
-
-    fn cancel_execution(&self, request: &CancelRequest) -> CancelOutcome {
         let key = (request.transport.clone(), request.conversation_id.clone());
         let Some(session) = self
             .entries
@@ -574,8 +546,6 @@ impl ActiveSessions {
 }
 
 struct ActiveRegistration {
-    recent: Arc<Mutex<late_photos::RecentSessions>>,
-    late_photos: LatePhotos,
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
     key: ActiveSessionKey,
     cancellation: SessionCancellation,
@@ -590,12 +560,8 @@ impl Drop for ActiveRegistration {
         let mut entries = self.entries.lock().expect("active session registry");
         if entries.get(&self.key).is_some_and(|session| {
             Arc::ptr_eq(&session.cancellation.state, &self.cancellation.state)
-        }) && let Some(session) = entries.remove(&self.key)
-        {
-            self.recent
-                .lock()
-                .expect("recent session registry")
-                .complete(self.key.clone(), session);
+        }) {
+            entries.remove(&self.key);
         }
     }
 }
@@ -831,12 +797,6 @@ pub(crate) fn run_session(
     driver: Arc<dyn ChatDriver>,
 ) -> impl std::future::Future<Output = ()> + Send {
     let receipts = crate::collection::Dispositions(message.constituents.clone());
-    let intake = message.late_photos.as_ref().and_then(|_| {
-        runner
-            .active_sessions
-            .intakes
-            .register(&runner.gate, &message)
-    });
     async move {
         let span = {
             let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
@@ -853,7 +813,7 @@ pub(crate) fn run_session(
         for receipt in &receipts.0 {
             dekopon_telemetry::link_span(&span, receipt);
         }
-        let outcome = execute(runner, route, message, driver, intake)
+        let outcome = execute(runner, route, message, driver)
             .instrument(span.clone())
             .await;
         span.record("outcome", outcome);
@@ -866,25 +826,9 @@ async fn execute(
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    intake: Option<late_photos::LateIntake>,
 ) -> &'static str {
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
-    }
-
-    if let Some(late) = &message.late_photos {
-        let Some(intake) = intake else {
-            if late.is_stopped() {
-                return "stopped";
-            }
-            if let Some(_reply) = runner.gate.refusal() {
-                answer(&driver, &message, late_photos::REFUSED_REPLY).await;
-            }
-            return "late-busy";
-        };
-        return late
-            .retain(&runner, &route, &message, &driver, &intake)
-            .await;
     }
 
     // The admission slot, the active-session registry, the cancel request, and the memory key are
@@ -904,14 +848,6 @@ async fn execute(
         }
         return "busy";
     };
-
-    if message.transport_kind == dekopon_broker_protocol::ChatTransportKind::Whatsapp
-        && route.memory.window().is_some()
-    {
-        runner
-            .conversations
-            .invalidate_late_input(&conversation_key(&route, &message));
-    }
 
     let outcome = session(&runner, &route, &message, &driver)
         .instrument(tracing::info_span!(
@@ -941,10 +877,9 @@ async fn session(
     driver: &Arc<dyn ChatDriver>,
 ) -> &'static str {
     let cancellation = SessionCancellation::new();
-    let _active_registration =
-        runner
-            .active_sessions
-            .register(message, route, cancellation.clone());
+    let _active_registration = runner
+        .active_sessions
+        .register(message, cancellation.clone());
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
@@ -1002,7 +937,7 @@ async fn session(
     );
 
     let window = route.memory.window();
-    let (seeded, cache_key, conversation_lease, asset_access, gateway_notice) = match window {
+    let (seeded, cache_key, conversation_lease, asset_access) = match window {
         Some(window) => {
             let recalled = if runner
                 .conversations
@@ -1025,8 +960,6 @@ async fn session(
                 cache_key,
                 assets,
                 lease,
-                input,
-                gateway_notice,
                 created,
             } = runner.conversations.begin(
                 &key,
@@ -1043,17 +976,13 @@ async fn session(
                     .assets
                     .restore(&assets, recalled_assets, next_asset_id, Instant::now());
             }
-            _active_registration
-                .late_photos
-                .authorized(input, assets.clone(), cache_key.clone());
-            (history, cache_key, Some(lease), assets, gateway_notice)
+            (history, cache_key, Some(lease), assets)
         }
         None => (
             History::default(),
             route.cache_key.clone(),
             None,
             AssetAccess::one_shot(key.clone()),
-            None,
         ),
     };
     let span = tracing::Span::current();
@@ -1106,12 +1035,6 @@ async fn session(
     let journal_access = asset_access.clone();
     let text = match runner.assets.take_delivery_notice(&asset_access) {
         Some(note) => bound_inbound(&format!("{note}\n{text}")),
-        None => text,
-    };
-    let text = match gateway_notice {
-        Some(notice) => bound_inbound(&format!(
-            "[Gateway follow-up previously delivered: {notice}]\n{text}"
-        )),
         None => text,
     };
     let text = match window.map(|window| window.scope) {
@@ -1259,20 +1182,11 @@ async fn session(
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
-            let notice = _active_registration
-                .late_photos
-                .finish(&runner.assets, false);
             let replied = progress
-                .terminal(Terminal::Failed(late_photos::append_notice(
+                .terminal(Terminal::Failed(bound_outbound(
                     liveness.templates.failed(),
-                    notice,
                 )))
                 .await;
-            if replied && let Some(notice) = notice {
-                _active_registration
-                    .late_photos
-                    .remember_notice(&runner.conversations, notice);
-            }
             return if replied { "failed" } else { "reply-failed" };
         }
     };
@@ -1308,9 +1222,6 @@ async fn session(
         return "declined";
     }
 
-    let late_notice = _active_registration
-        .late_photos
-        .finish(&runner.assets, outcome.is_ok());
     let (terminal, completed_outcome, delivered_answer) = match &outcome {
         Ok(outcome) => {
             let text = bound_outbound(if outcome.answer.is_empty() && images.is_empty() {
@@ -1318,7 +1229,6 @@ async fn session(
             } else {
                 outcome.answer.as_str()
             });
-            let text = late_photos::append_notice(&text, late_notice);
             let reply = if images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
@@ -1332,10 +1242,7 @@ async fn session(
                 category = "unreported-capability-work"
             );
             (
-                Terminal::Failed(late_photos::append_notice(
-                    UNREPORTED_WORK_REPLY,
-                    late_notice,
-                )),
+                Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned()),
                 "failed",
                 None,
             )
@@ -1347,10 +1254,7 @@ async fn session(
                 error = %error
             );
             (
-                Terminal::Failed(late_photos::append_notice(
-                    liveness.templates.failed(),
-                    late_notice,
-                )),
+                Terminal::Failed(bound_outbound(liveness.templates.failed())),
                 "failed",
                 None,
             )
@@ -1363,11 +1267,6 @@ async fn session(
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
-        if let Some(notice) = late_notice {
-            _active_registration
-                .late_photos
-                .remember_notice(&runner.conversations, notice);
-        }
         if memory_surface.is_some()
             && let Some(answer) = delivered_answer
             && let Some(claim) = chat_claim

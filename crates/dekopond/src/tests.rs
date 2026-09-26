@@ -2967,7 +2967,6 @@ fn message(text: &str) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
-        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3050,7 +3049,6 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
-        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3124,7 +3122,7 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::new(max_concurrent),
+        active_sessions: crate::session::ActiveSessions::default(),
         wakes: None,
     })
 }
@@ -4825,6 +4823,54 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
 
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_failure_template_is_bounded_before_delivery() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([]);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut runner = runner(broker, models, 4);
+    let (templates, problems) = crate::progress::Templates::resolve(
+        &crate::config::TemplateOverrides {
+            failed: Some("x".repeat(MAX_OUTBOUND_TEXT_BYTES * 2)),
+            ..Default::default()
+        },
+        crate::session::STOPPED_REPLY,
+        FAILURE_REPLY,
+    );
+    assert!(problems.is_empty());
+    Arc::get_mut(&mut runner)
+        .expect("unshared runner")
+        .liveness
+        .insert(
+            "dev".to_owned(),
+            Arc::new(ResolvedLiveness {
+                templates,
+                ..ResolvedLiveness::default()
+            }),
+        );
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("fail"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let replies = driver.replies();
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].len() <= MAX_OUTBOUND_TEXT_BYTES);
+    assert!(replies[0].contains("[...truncated by the gateway...]"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -13091,43 +13137,6 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn photo_burst_busy_at_collection_deadline_is_disposed_even_when_busy_replies_disabled() {
-    let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
-    let models = ModelScript::forbidden();
-    let mut runner = runner(broker, Arc::clone(&models), 1);
-    Arc::get_mut(&mut runner).unwrap().reply_on_busy = false;
-    let photo = burst_photo("");
-    let active = runner
-        .gate
-        .admit((photo.transport.clone(), photo.conversation.key()))
-        .expect("active run");
-    let mut collector = burst_collector(None);
-    assert!(matches!(
-        collector.offer(0, photo),
-        crate::collection::Offered::Pending
-    ));
-    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
-    let driver = Arc::new(RecordingDriver::default());
-    run_session(
-        Arc::clone(&runner),
-        route(model_config()),
-        ready,
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
-    )
-    .await;
-    assert_eq!(driver.replies(), [BUSY_REPLY]);
-    drop(active);
-    assert!(
-        collector
-            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
-            .is_empty()
-    );
-    assert_eq!(models.requests(), 0);
-    assert!(observed.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refused_assets() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -13886,8 +13895,6 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
-#[path = "tests/late_photos.rs"]
-mod late_photos;
 #[path = "tests/wakes.rs"]
 mod wakes;
 
@@ -13913,7 +13920,7 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::new(4),
+        active_sessions: crate::session::ActiveSessions::default(),
         wakes: None,
     })
 }
