@@ -23,6 +23,7 @@ use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
     ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
+    MAX_DELIVERED_TURN_TEXT_BYTES,
 };
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
@@ -1703,7 +1704,7 @@ async fn record_delivered_turn(
     runner: &SessionRunner,
     message: &InboundMessage,
     claim: Attestation,
-    user: String,
+    mut user: String,
     assistant: String,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
@@ -1717,6 +1718,12 @@ async fn record_delivered_turn(
         );
         return;
     };
+    let budget = MAX_DELIVERED_TURN_TEXT_BYTES - assistant.len();
+    if user.len() > budget {
+        const MARKER: &str = "[…]";
+        user.truncate(user.floor_char_boundary(budget - MARKER.len()));
+        user.push_str(MARKER);
+    }
     let result: Result<(), MemoryRecordFailure> = async {
         let identifiers = IdSequence::for_session();
         let client = BrokerClient::new(

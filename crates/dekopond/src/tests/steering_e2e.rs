@@ -76,6 +76,77 @@ async fn both_steering_flavors_consume_the_second_message_before_one_final_reply
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_steered_text_is_recorded_with_a_marked_prefix_and_the_exact_answer() {
+    let (capture, _subscriber) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    )
+    .await;
+    let accepted = "delivered 🦀";
+    let models = InterruptibleModel::new([answer("draft"), answer(accepted)]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = route(model_config());
+    route.steering = Steering::Boundary;
+    let first = "α".repeat(8 * 1024);
+    let steer = "🦀".repeat(4 * 1024);
+    let held = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(&first),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    for _ in 0..3 {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(&steer),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    models.release();
+    finish_run(held).await;
+    assert_eq!(driver.replies(), [accepted]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    let record = observed.recv().await.expect("bounded record request");
+    let BrokerRequest::RecordDeliveredTurn { turn, .. } = record.request else {
+        panic!("expected delivered turn: {record:?}");
+    };
+    assert!(turn.is_bounded());
+    assert_eq!(turn.assistant, accepted);
+    let aggregate = [first.as_str(), &steer, &steer, &steer].join("\n\n");
+    let budget = 64 * 1024 - accepted.len() - "[…]".len();
+    assert!(aggregate.len() > 64 * 1024);
+    assert!(!aggregate.is_char_boundary(budget));
+    let end = aggregate.floor_char_boundary(budget);
+    assert_eq!(turn.user, format!("{}[…]", &aggregate[..end]));
+    assert!(
+        !capture
+            .events_text()
+            .contains("gateway_memory_record_failed")
+    );
+    assert!(observed.try_recv().is_err(), "record once, without a retry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_photo_steer_is_acknowledged_and_offers_fetch_in_the_retried_turn() {
     struct NoFetch;
     impl AssetFetcher for NoFetch {

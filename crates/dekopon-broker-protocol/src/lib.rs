@@ -629,6 +629,8 @@ where
     deserializer.deserialize_option(OptionalServiceDecimal)
 }
 
+pub const MAX_DELIVERED_TURN_TEXT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DeliveredTurnRequest {
@@ -653,7 +655,7 @@ impl DeliveredTurnRequest {
         self.user
             .len()
             .checked_add(self.assistant.len())
-            .is_some_and(|bytes| bytes <= 64 * 1024)
+            .is_some_and(|bytes| bytes <= MAX_DELIVERED_TURN_TEXT_BYTES)
     }
 }
 
@@ -661,7 +663,7 @@ fn deserialize_turn_text<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<D, { 64 * 1024 }>(deserializer)
+    deserialize_bounded_string::<D, MAX_DELIVERED_TURN_TEXT_BYTES>(deserializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

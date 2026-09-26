@@ -1149,14 +1149,19 @@ guarantee.
 ### Collected media inputs
 
 `gateway.message.received` records every routed constituent in its original receipt trace, before
-collection. A collected `gateway.message` is parented by the lead receipt and carries exported
-OpenTelemetry links to all original receipts (including the lead), with `batch.members` bounded
-at eight. Each receipt gets `gateway_input_disposition` with the shared terminal outcome, or a
-local refusal, stop, shutdown or abandonment. No service album ID or synthetic delivery identity
-is invented. Following a constituent's causal link reaches the one model/provider/progress and
-reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
-membership while original text stays on its own input audit event. Delivery failures remain
-in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.
+collection. An ordinary collected admission's `gateway.message` is parented by the lead receipt
+and carries exported OpenTelemetry links to its original receipts (including the lead), with
+`batch.members` bounded at eight. Those links reach that admission's model/provider/progress and
+reply execution. A consumed collected steer instead links to its admission-only `gateway.message`,
+not to the holder's execution; consuming it adds no holder span link. Leftover steers folded into
+a follow-up carry the last steer's receipt parent and the merged constituents, so that follow-up's
+`batch.members` can exceed eight.
+
+Receipts record `gateway_input_disposition` for steering, execution, local refusal, stop, shutdown
+or abandonment. No service album ID or synthetic delivery identity is invented. Non-payload
+counts/outcomes describe membership while original text stays on its own input audit event;
+delivery failures belong to the executing turn's trace. A single-message, uncollected admission
+keeps its ordinary trace.
 
 Gateway assets are recorded by reference, declared content type, stored byte count and SHA-256,
 never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.decode` spans as
