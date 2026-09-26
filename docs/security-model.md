@@ -265,8 +265,12 @@ configured transport and agent keys prevent aliasing another route's history.
 **Status: current.** The broker may hold a separate provider-storage PVC.
 Components receive no WASI, host path, environment, socket, or
 ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
-instance, invocation, capability, provider, interface, access, chat namespace, scope commitment,
-and limits. HTTP and storage authority cannot coexist in one v1 capability. Description and command
+instance, invocation, capability, provider, interface, access, configured storage scope, scope
+commitment, and limits. Private conversation scope retains the authenticated subject;
+shared-conversation scope retains transport and conversation without subject; agent scope retains
+provider and agent. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
+use stable storage continuity so different callers' effective permissions cannot rotate a shared
+resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
 resolution receive a disabled sticky context.
 
 Chat storage needs more than the existing subject attestation. New operations carry an

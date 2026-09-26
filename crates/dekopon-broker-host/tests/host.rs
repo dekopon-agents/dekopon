@@ -19,7 +19,7 @@ use dekopon_broker_host::{
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation, StorageAccess,
-    StorageConstraints, StorageInterface, StorageNamespace, broker::AuthorizationGate,
+    StorageConstraints, StorageInterface, StorageScope, broker::AuthorizationGate,
 };
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
@@ -1457,7 +1457,7 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
         "storage-probe".parse().expect("provider"),
         StorageInterface::DurableFiles,
         StorageAccess::ReadWrite,
-        StorageNamespace::Chat,
+        StorageScope::PrivateConversation,
         "provider-test".parse().expect("agent"),
         subject.parse().expect("subject"),
         "slack",
@@ -1564,7 +1564,8 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
             storage: Some(StorageConstraints {
                 interface,
                 access,
-                namespace: StorageNamespace::Chat,
+                scope: StorageScope::PrivateConversation,
+                retention: Default::default(),
             }),
             secret_use: None,
         };
@@ -1575,7 +1576,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 "storage-probe".parse().expect("provider"),
                 interface,
                 access,
-                StorageNamespace::Chat,
+                StorageScope::PrivateConversation,
                 "provider-test".parse().expect("agent"),
                 "slack.t0123abc.u9xyz".parse().expect("subject"),
                 "slack",

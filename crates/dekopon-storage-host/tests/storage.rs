@@ -14,7 +14,7 @@ use std::{
     thread,
 };
 
-use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 use dekopon_core::error_chain;
 use dekopon_storage_host::{
     ContinuityPolicy, Durability, LockLevel, OpenOptions, StorageGrantRequest, StorageHost,
@@ -70,7 +70,7 @@ fn vfs_request(invocation: &str, access: StorageAccess) -> StorageGrantRequest {
         "storage-probe".parse().expect("provider"),
         StorageInterface::DurableFiles,
         access,
-        StorageNamespace::Chat,
+        StorageScope::PrivateConversation,
         "reviewer".parse().expect("agent"),
         "slack.t0123abc.u9xyz".parse().expect("subject"),
         "slack",
@@ -95,7 +95,7 @@ fn scoped_request(
         "memory-chat".parse().expect("provider"),
         StorageInterface::Jsonl,
         access,
-        StorageNamespace::Chat,
+        StorageScope::PrivateConversation,
         "reviewer".parse().expect("agent"),
         subject.parse().expect("subject"),
         "slack",
@@ -475,7 +475,7 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
                 provider.parse().expect("provider"),
                 StorageInterface::Jsonl,
                 StorageAccess::ReadOnly,
-                StorageNamespace::Chat,
+                StorageScope::PrivateConversation,
                 agent.parse().expect("agent"),
                 subject.parse().expect("subject"),
                 kind,

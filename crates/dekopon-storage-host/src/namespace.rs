@@ -1,7 +1,8 @@
 use std::{
-    fs::{File, TryLockError},
+    fs::{File, FileTimes, TryLockError},
+    io::Write as _,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,82 @@ use crate::{
 };
 
 const POINTER_VERSION: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
+const IDENTITY_VERSION: &str = "dekopon.dev/storage-resource/v1alpha1";
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ResourceIdentity {
+    api_version: String,
+    scope: dekopon_capability::StorageScope,
+    values: Vec<String>,
+}
+
+fn identity(request: &StorageGrantRequest) -> ResourceIdentity {
+    ResourceIdentity {
+        api_version: IDENTITY_VERSION.to_owned(),
+        scope: request.scope(),
+        values: request.scope_values(),
+    }
+}
+
+pub(crate) fn read_identity(
+    base: &Directory,
+) -> Result<Option<(dekopon_capability::StorageScope, Vec<String>)>, StorageHostError> {
+    if !base.exists("identity")? {
+        return Ok(None);
+    }
+    let document: ResourceIdentity = serde_json::from_slice(&base.read_bounded("identity", 4_096)?)
+        .map_err(|error| {
+            crate::report_decode_failure("storage-resource", &error);
+            base.corrupt("identity", "storage-resource")
+        })?;
+    if document.api_version != IDENTITY_VERSION
+        || document.values.len() > 7
+        || document.values.iter().any(|value| value.len() > 1024)
+    {
+        return Err(base.corrupt("identity", "storage-resource"));
+    }
+    Ok(Some((document.scope, document.values)))
+}
+
+pub(crate) fn marker_time(base: &Directory) -> Result<Option<SystemTime>, StorageHostError> {
+    if !base.exists("last-used")? {
+        return Ok(None);
+    }
+    let file = base.open_private("last-used", false)?;
+    let metadata = file.metadata().map_err(|source| base.io_error(source))?;
+    if metadata.len() != 0 {
+        return Err(base.corrupt("last-used", "last-used"));
+    }
+    metadata
+        .modified()
+        .map(Some)
+        .map_err(|source| base.io_error(source))
+}
+
+fn touch_marker(base: &Directory, create: bool) -> Result<(), StorageHostError> {
+    let file = if create {
+        base.create_private("last-used")?
+    } else {
+        base.open_private("last-used", false)?
+    };
+    if file
+        .metadata()
+        .map_err(|source| base.io_error(source))?
+        .len()
+        != 0
+    {
+        return Err(base.corrupt("last-used", "last-used"));
+    }
+    let now = SystemTime::now();
+    let previous = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(|source| base.io_error(source))?;
+    file.set_times(FileTimes::new().set_modified(now.max(previous)))
+        .map_err(|source| base.io_error(source))?;
+    file.sync_all().map_err(|source| base.io_error(source))
+}
 
 #[derive(Debug)]
 pub(crate) struct Namespace {
@@ -47,6 +124,8 @@ pub(crate) struct NamespacePlan {
     reset: Option<Reset>,
     existing_base: Option<Directory>,
     existing_base_lease: Option<File>,
+    resource_identity: Vec<u8>,
+    new_metadata: bool,
     before_usage: Usage,
     reserved_bytes: u64,
     reserved_entries: u64,
@@ -99,7 +178,33 @@ impl NamespacePlan {
         })()
         .map_err(|error: StorageHostError| error.in_namespace(&base_token, None))?;
 
+        let expected = identity(request);
+        let resource_identity = serde_json::to_vec(&expected).map_err(|error| {
+            tracing::error!(error = %error, "could not encode storage identity");
+            StorageHostError::Arithmetic
+        })?;
+        if resource_identity.len() > 4_096 {
+            return Err(StorageHostError::QuotaExceeded);
+        }
         let base = existing_base.as_ref();
+        let new_metadata = if let Some(base) = base {
+            match (read_identity(base)?, marker_time(base)?) {
+                (Some((scope, values)), Some(_))
+                    if scope == expected.scope && values == expected.values =>
+                {
+                    false
+                }
+                (None, None)
+                    if request.scope() == dekopon_capability::StorageScope::PrivateConversation =>
+                {
+                    true
+                }
+                (Some(_), _) => return Err(base.corrupt("identity", "storage-resource-identity")),
+                _ => return Err(base.corrupt("last-used", "storage-resource-metadata")),
+            }
+        } else {
+            true
+        };
         let select = |reset| {
             select_generation(
                 base,
@@ -143,6 +248,10 @@ impl NamespacePlan {
                     .ok_or(StorageHostError::Arithmetic)?
             }
         };
+        if new_metadata {
+            simulation.create_entry(resource_identity.len() as u64)?;
+            simulation.create_entry(0)?;
+        }
         if let Some(pointer) = &selection.authority_pointer {
             simulation.replace(pointer_length, pointer.len() as u64)?;
         } else if let Some(length) = selection.removed_pointer_length {
@@ -158,6 +267,8 @@ impl NamespacePlan {
             reset,
             existing_base,
             existing_base_lease,
+            resource_identity,
+            new_metadata,
             before_usage,
             reserved_bytes: simulation.peak_bytes,
             reserved_entries: simulation.peak_entries,
@@ -213,6 +324,14 @@ impl NamespacePlan {
             base.remove_file("current")?;
             base.sync()?;
         }
+        if self.new_metadata {
+            let mut file = base.create_private("identity")?;
+            file.write_all(&self.resource_identity)
+                .and_then(|()| file.sync_all())
+                .map_err(|source| base.io_error(source))?;
+            base.sync()?;
+        }
+        touch_marker(&base, self.new_metadata)?;
         Ok(Namespace {
             base_token: self.base_token,
             generation_token: self.generation_token,

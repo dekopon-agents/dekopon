@@ -1583,7 +1583,7 @@ impl BrokerProviderRegistry {
                     || grant.provider() != authorized.provider()
                     || grant.interface() != constraints.interface
                     || grant.access() != constraints.access
-                    || grant.namespace() != constraints.namespace
+                    || grant.scope() != constraints.scope
                 {
                     return Err(BrokerHostError::StorageGrantMismatch.into());
                 }

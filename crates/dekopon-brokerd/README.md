@@ -872,6 +872,12 @@ chatMemory:
   compactionThresholdBytes: 12582912
 ```
 
+Storage constraints require `scope: private-conversation|shared-conversation|agent`. The
+`namespace: chat` key is not accepted. Optional `retention: {mode: keep}` defaults to Keep;
+`retention: {mode: idle-ttl, idleTtlMs: 86400000}` opts the addressed storage family into an
+idle TTL, and zero, overflow, unknown fields and conflicting retention settings for the same
+provider and scope refuse startup. No existing chat-memory data gains a TTL by default.
+
 The three capabilities that make up the surface are named by their `route:`, not by their spelling.
 Exactly one constraint set declares each of `chatMemoryRecord`, `chatMemoryRecent`, and
 `chatMemorySearch`; they must all name one provider, and each must declare `jsonl` chat storage at
@@ -890,7 +896,7 @@ capabilities:
           storage:
             interface: jsonl
             access: read-write
-            namespace: chat
+            scope: private-conversation
       memory.chat.recent:
         route: chatMemoryRecent
         constraints:
@@ -899,7 +905,7 @@ capabilities:
           storage:
             interface: jsonl
             access: read-only
-            namespace: chat
+            scope: private-conversation
       memory.chat.search:
         route: chatMemorySearch
         constraints:
@@ -908,7 +914,7 @@ capabilities:
           storage:
             interface: jsonl
             access: read-only
-            namespace: chat
+            scope: private-conversation
 ```
 
 `route:` is the only thing that reserves a capability. Omitted, it is `generic`, and the capability

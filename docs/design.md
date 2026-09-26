@@ -174,9 +174,11 @@ ordinary capability `memory.chat.export` gains none. Hidden recording is reachab
 `recordDeliveredTurn` carrying a chat attestation, after complete gateway-attested transport
 acceptance. Recent and literal case-insensitive search are on demand and never automatically seed a
 prompt. Both
-continuity policies always include provider, agent, canonical sender, transport, channel, and
-conversation: `stable` survives semantic authority changes; the default
+continuity policies for private conversation storage include provider, agent, canonical sender,
+transport, channel, and conversation: `stable` survives semantic authority changes; the default
 `authority-bound` persists an opaque pointer and random epoch so A→B→A creates three generations.
+Generic shared-conversation and agent-scoped storage deliberately omit the sender and use stable
+continuity; authenticated authorization remains individual for every caller.
 The store has finite permanent deduplication and no deletion/export UX or encryption-at-rest claim.
 
 Slack Agent channel continuation is also current. One explicitly
