@@ -7,12 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Same-sender messages and photos steer a running chat turn with per-route `steering: abort`
+  (default) or `boundary`. Model-only interruptions do not spend a completed model step or cancel
+  tool, script or provider work. Other senders and wakes queue follow-ups under their own broker legs.
+- Best-effort 👀 acknowledgments for accepted steers and queued non-wake messages with liveness
+  targets, plus admission telemetry distinguishing queueing from bounded refusals.
+
+### Changed
+
+- Busy replies now mean process-wide saturation for a new conversation or a full eight-item
+  conversation mailbox. `sessions.replyOnBusy` remains; collected batches are eligible for a busy
+  reply regardless, subject to the bounded refusal-reply capacity and transport delivery.
+- Photos arriving during their sender's turn use ordinary steering and the running asset access.
+  Consumed steer text joins history and delivered-turn memory without changing the journal format.
+
 ### Fixed
 
 - A retained chat asset no longer holds the `gateway.session` span that spooled it. The span, with
   `gateway.message` and `transport.receive` above it, closed only when retention dropped the asset:
   exported hours late, or never when the process exited first. `asset.spool` read and cleanup spans
   now parent to the span active where they run.
+
+### Removed
+
+- The separate late-photo intake, retained/expired/refused paths and completion notices.
 
 ## [0.23.0] - 2026-09-26
 

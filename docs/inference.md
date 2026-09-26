@@ -253,17 +253,18 @@ One long-lived optimization is in place: `dekopond` shares one model client per 
 
 ## How scoped conversation memory works
 
-A route opts in with a `memory:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
+A route selects replay behavior with a `memory:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
-`oneShot` is the route default and sends no history at all. A persistent route seeds the prompt with
+`persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
 compacted `(question, final answer)` pairs ahead of the new message, oldest dropped first until both
 the turn and byte bounds hold. A shared turn is prefixed with
 `[gateway: authenticated participant: <canonical-subject>]` before it is sent and retained, so that
-canonical ID is model input whatever the telemetry gate says; private and one-shot prompt bytes carry
-no prefix and go out unchanged.
+canonical ID is model input whatever the telemetry gate says; private and one-shot turns carry
+no participant prefix. Consumed steers join the turn's user text in history.
 
-Every message opens a fresh attested broker leg before inference. An empty grant stops before the
+Every new session opens a fresh attested broker leg before inference; same-sender steers use the
+running session's leg. An empty grant stops before the
 model call and removes remembered state for that key; a broker or attestation failure stops before
 inference with no fresh grant vector to replace state with. A capability set that differs from the one
 stored beside the conversation drops the entry and closes its attachment generation, and on a shared
