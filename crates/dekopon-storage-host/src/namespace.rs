@@ -199,8 +199,12 @@ impl NamespacePlan {
                 {
                     true
                 }
-                (Some(_), _) => return Err(base.corrupt("identity", "storage-resource-identity")),
-                _ => return Err(base.corrupt("last-used", "storage-resource-metadata")),
+                (Some(_), Some(_)) | (None, Some(_)) | (None, None) => {
+                    return Err(base.corrupt("identity", "storage-resource-identity"));
+                }
+                (Some(_), None) => {
+                    return Err(base.corrupt("last-used", "storage-resource-metadata"));
+                }
             }
         } else {
             true

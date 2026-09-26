@@ -81,6 +81,25 @@ fn base(root: &std::path::Path, token: &str) -> std::path::PathBuf {
     root.join("namespaces").join(token)
 }
 
+fn logical_usage(directory: &std::path::Path) -> (u64, u64) {
+    let mut bytes = 0;
+    let mut entries = 0;
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        let metadata = entry.metadata().unwrap();
+        entries += 1;
+        bytes += 4096;
+        if metadata.is_dir() {
+            let (child_bytes, child_entries) = logical_usage(&entry.path());
+            bytes += child_bytes;
+            entries += child_entries;
+        } else {
+            bytes += metadata.len();
+        }
+    }
+    (bytes, entries)
+}
+
 fn old_marker(path: &std::path::Path) {
     File::options()
         .write(true)
@@ -426,6 +445,7 @@ fn admitted_reads_refresh_mtime_and_future_markers_and_busy_leases_are_not_expir
 
 #[test]
 fn missing_or_corrupt_metadata_cannot_authorize_deletion() {
+    use std::os::unix::fs::PermissionsExt as _;
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().canonicalize().unwrap().join("storage");
     let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
@@ -449,8 +469,28 @@ fn missing_or_corrupt_metadata_cannot_authorize_deletion() {
     let ttl = policies(StorageRetention::IdleTtl(Duration::from_secs(10)));
     fs::remove_file(path.join("last-used")).unwrap();
     assert_eq!(host.sweep(&ttl).unwrap().deleted, 0);
-    assert!(host.grant(make()).is_err());
-    File::create(path.join("last-used")).unwrap();
+    assert!(matches!(
+        host.grant(make()),
+        Err(dekopon_storage_host::StorageHostError::Corrupt {
+            scope: "storage-resource-metadata",
+            ..
+        })
+    ));
+    fs::write(path.join("last-used"), b"not-a-marker").unwrap();
+    fs::set_permissions(path.join("last-used"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(host.sweep(&ttl).unwrap().errors, 1);
+    let refusal = host.grant(make());
+    assert!(
+        matches!(
+            refusal,
+            Err(dekopon_storage_host::StorageHostError::Corrupt {
+                scope: "last-used",
+                ..
+            })
+        ),
+        "{refusal:?}"
+    );
+    fs::write(path.join("last-used"), b"").unwrap();
     fs::write(path.join("identity"), b"broken").unwrap();
     assert_eq!(host.sweep(&ttl).unwrap().errors, 1);
     assert!(path.exists());
@@ -528,14 +568,26 @@ fn partial_sweep_error_preserves_identity_then_recovers_and_releases_quota() {
         .unwrap()
         .namespace()
         .to_owned();
+    let path = base(&root, &token);
+    let mut first_generation = None;
+    let mut pointers = Vec::new();
     for surface in [b"a".as_slice(), b"b"] {
         let mut handle = host.begin(host.grant(make(surface)).unwrap()).unwrap();
         handle
             .jsonl_append("turns.jsonl", 0, br#"{"one":true}"#)
             .unwrap();
         handle.commit().unwrap();
+        pointers.push(fs::read(path.join("current")).unwrap());
+        if first_generation.is_none() {
+            first_generation = Some(
+                fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|entry| entry.is_dir())
+                    .unwrap(),
+            );
+        }
     }
-    let path = base(&root, &token);
     let mut generations = fs::read_dir(&path)
         .unwrap()
         .filter_map(Result::ok)
@@ -544,6 +596,13 @@ fn partial_sweep_error_preserves_identity_then_recovers_and_releases_quota() {
         .collect::<Vec<_>>();
     generations.sort();
     assert_eq!(generations.len(), 2);
+    let (retained_pointer, removed_surface): (&[u8], &[u8]) =
+        if generations[0] == first_generation.unwrap() {
+            (&pointers[0], b"a")
+        } else {
+            (&pointers[1], b"b")
+        };
+    fs::write(path.join("current"), retained_pointer).unwrap();
     let protected = generations[1].join("data");
     fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
     old_marker(&path.join("last-used"));
@@ -559,6 +618,10 @@ fn partial_sweep_error_preserves_identity_then_recovers_and_releases_quota() {
     assert_eq!(result.errors, 1);
     assert!(path.join("identity").exists());
     assert!(path.join("last-used").exists());
+    assert_eq!(fs::read(path.join("current")).unwrap(), retained_pointer);
+    let reset = host.grant(make(removed_surface)).unwrap_err();
+    assert!(reset.namespace_reset(), "{reset:?}");
+    old_marker(&path.join("last-used"));
     assert_eq!(host.sweep(&ttl).unwrap().deleted, 1);
     assert!(!path.exists());
     host.begin(
@@ -575,4 +638,139 @@ fn partial_sweep_error_preserves_identity_then_recovers_and_releases_quota() {
     .unwrap()
     .commit()
     .unwrap();
+}
+
+#[test]
+fn partial_sweep_releases_root_bytes_and_entries_before_retry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for ceiling in ["bytes", "entries"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap().join("storage");
+        let seed = StorageHost::open(&root, StorageLimits::default()).unwrap();
+        let make = |surface: &[u8]| {
+            request(
+                StorageScope::PrivateConversation,
+                "slack.t0123abc.u9xyz",
+                "reviewer",
+                "storage-probe",
+                "thread-1",
+                surface,
+            )
+        };
+        let token = seed
+            .prepare_grant(make(b"a"))
+            .unwrap()
+            .namespace()
+            .to_owned();
+        let path = base(&root, &token);
+        let mut first_generation = None;
+        let mut pointers = Vec::new();
+        for surface in [b"a".as_slice(), b"b"] {
+            let mut handle = seed.begin(seed.grant(make(surface)).unwrap()).unwrap();
+            handle
+                .jsonl_append("turns.jsonl", 0, br#"{"one":true}"#)
+                .unwrap();
+            handle.commit().unwrap();
+            pointers.push(fs::read(path.join("current")).unwrap());
+            if first_generation.is_none() {
+                first_generation = Some(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|entry| entry.is_dir())
+                        .unwrap(),
+                );
+            }
+        }
+        let mut generations = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry.is_dir())
+            .collect::<Vec<_>>();
+        generations.sort();
+        assert_eq!(generations.len(), 2);
+        let current_surface: &[u8] = if generations[1] == first_generation.unwrap() {
+            fs::write(path.join("current"), &pointers[0]).unwrap();
+            b"a"
+        } else {
+            b"b"
+        };
+        let baseline = logical_usage(&root);
+        drop(seed);
+        let limits = StorageLimits {
+            max_root_bytes: if ceiling == "bytes" {
+                baseline.0
+            } else {
+                StorageLimits::default().max_root_bytes
+            },
+            startup_max_entries: if ceiling == "entries" {
+                baseline.1
+            } else {
+                StorageLimits::default().startup_max_entries
+            },
+            max_namespaces: 2,
+            max_namespace_bytes: 32 * 1024,
+            max_file_bytes: 4096,
+            max_files_per_namespace: 4,
+            ..StorageLimits::default()
+        };
+        let host = StorageHost::open(&root, limits).unwrap();
+        let mut before = host
+            .begin(host.grant(make(current_surface)).unwrap())
+            .unwrap();
+        assert!(
+            matches!(
+                before.jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#),
+                Err(dekopon_storage_host::StorageHostError::QuotaExceeded)
+            ),
+            "{ceiling}"
+        );
+        drop(before);
+
+        let protected = generations[1].join("data");
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+        old_marker(&path.join("last-used"));
+        let ttl = BTreeMap::from([(
+            (
+                "storage-probe".parse().unwrap(),
+                StorageScope::PrivateConversation,
+            ),
+            StorageRetention::IdleTtl(Duration::from_secs(10)),
+        )]);
+        assert_eq!(host.sweep(&ttl).unwrap().errors, 1, "{ceiling}");
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
+        let after_partial = logical_usage(&root);
+        assert!(
+            after_partial.0 < baseline.0 && after_partial.1 < baseline.1,
+            "{ceiling}"
+        );
+        assert!(path.join("current").exists(), "{ceiling}");
+        let mut after = host
+            .begin(host.grant(make(current_surface)).unwrap())
+            .unwrap();
+        assert!(after.jsonl_size("turns.jsonl").unwrap() > 0, "{ceiling}");
+        after
+            .jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#)
+            .unwrap();
+        after.commit().unwrap();
+
+        old_marker(&path.join("last-used"));
+        assert_eq!(host.sweep(&ttl).unwrap().deleted, 1, "{ceiling}");
+        assert!(!path.exists(), "{ceiling}");
+        host.begin(
+            host.grant(request(
+                StorageScope::Agent,
+                "slack.t0123abc.u9xyz",
+                "reviewer",
+                "storage-probe",
+                "thread-2",
+                b"new",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+    }
 }

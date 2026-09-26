@@ -1618,7 +1618,7 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
         .expect("base token")
         .to_string_lossy()
         .into_owned();
-    let named = format!("storage.scope=\"{token}\"");
+    let named = format!("storage.namespace=\"{token}\"");
     assert!(
         capture
             .spans()

@@ -81,8 +81,14 @@ impl StorageHost {
             usage_with_directory_entry(scan_usage(&base, self.inner.limits.startup_max_entries)?)?;
         let mut remaining = self.inner.limits.startup_max_entries;
         let deletion = (|| {
+            // The current pointer must survive a failed data removal, or the next grant can
+            // silently select a new authority generation without the reset refusal.
             for name in base.entries_bounded(remaining)? {
-                if name != "base.lock" && name != "identity" && name != "last-used" {
+                if name != "base.lock"
+                    && name != "identity"
+                    && name != "last-used"
+                    && name != "current"
+                {
                     remove_entry(&base, &name, &mut remaining)?;
                 }
             }
@@ -96,6 +102,7 @@ impl StorageHost {
             .lock()
             .expect("storage namespace observation lock");
         let deletion = deletion.and_then(|()| {
+            base.remove_file_if_exists("current")?;
             base.remove_file("last-used")?;
             base.remove_file("identity")?;
             base.remove_file("base.lock")?;
