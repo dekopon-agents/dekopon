@@ -495,6 +495,42 @@ fn capability_authority_commits_exactly_these_fields() {
 }
 
 #[test]
+fn a_flag_false_http_constraint_set_encodes_as_before_the_field_existed() {
+    let constraints = ExecutionConstraints {
+        timeout_ms: 30_000,
+        max_output_bytes: 1_048_576,
+        http: Some(HttpConstraints {
+            allowed_hosts: vec!["a.example:443".to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 3,
+            max_response_bytes: 4,
+            allow_plaintext_loopback: false,
+            propagate_trace: false,
+        }),
+        ..ExecutionConstraints::default()
+    };
+    let mut legacy = AuthorityEncoder::new();
+    legacy.number("execution.timeoutMs", 30_000);
+    legacy.number("execution.maxOutputBytes", 1_048_576);
+    legacy.byte("execution.http.present", 1);
+    legacy.number("execution.http.allowedHostCount", 1);
+    legacy.text("execution.http.allowedHost", "a.example:443");
+    legacy.number("execution.http.allowedMethodCount", 1);
+    legacy.text("execution.http.allowedMethod", "GET");
+    legacy.number("execution.http.maxRequests", 2);
+    legacy.number("execution.http.maxRequestBytes", 3);
+    legacy.number("execution.http.maxResponseBytes", 4);
+    legacy.boolean("execution.http.allowPlaintextLoopback", false);
+    legacy.byte("execution.storage.present", 0);
+    legacy.byte("execution.asset.present", 0);
+
+    let mut encoded = AuthorityEncoder::new();
+    encode_execution_constraints(&mut encoded, &constraints);
+    assert_eq!(encoded.finish(), legacy.finish());
+}
+
+#[test]
 fn execution_authority_normalizes_sets_but_commits_every_constraint() {
     fn bytes(constraints: &ExecutionConstraints) -> Vec<u8> {
         let mut encoded = AuthorityEncoder::new();
@@ -528,10 +564,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         ($mutation:expr) => {{
             let mut changed = baseline.clone();
             ($mutation)(&mut changed);
-            assert_ne!(
-                super::digest_parts(b"execution-constraints", &[&bytes(&baseline)]),
-                super::digest_parts(b"execution-constraints", &[&bytes(&changed)]),
-            );
+            assert_ne!(bytes(&baseline), bytes(&changed));
         }};
     }
     changes!(|v: &mut ExecutionConstraints| v.timeout_ms += 1);

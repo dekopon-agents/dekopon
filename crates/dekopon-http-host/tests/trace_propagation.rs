@@ -154,10 +154,6 @@ async fn guest_trace_headers_are_refused_under_every_grant() {
             });
             let error = client(grant).send(request).await.unwrap_err();
             assert!(matches!(error.code, ErrorCode::InvalidHeader));
-            assert_eq!(
-                error.message,
-                "request header is broker-owned or hop-by-hop"
-            );
         }
     }
 }

@@ -936,8 +936,7 @@ impl BufferedHttpClient {
                 u64::from_be_bytes(context.span_id),
                 context.flags,
             );
-            let header = HeaderValue::from_str(&value).map_err(|error| {
-                tracing::error!(%error, "broker trace context header could not be rendered");
+            let header = HeaderValue::from_str(&value).map_err(|_error| {
                 http_error(ErrorCode::Internal, "trace context could not be rendered")
             })?;
             prepared.headers.insert("traceparent", header);
