@@ -23,6 +23,9 @@ pub enum ProgressEvent {
         turn: u32,
         of: u32,
     },
+    Steered {
+        turn: u32,
+    },
     TextDelta {
         /// Never reasoning or tool-call arguments, only visible answer text; cumulative_chars lets
         /// a driver enforce its own length ceiling without re-accumulating deltas itself.

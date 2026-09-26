@@ -60,6 +60,10 @@ impl ProgressSink for ProgressAdapter {
             });
             return;
         }
+        if matches!(event, ProgressEvent::Steered { .. }) {
+            self.text.send_replace(ModelText::default());
+            self.turn.store(NO_TURN, Ordering::Relaxed);
+        }
         // Claimed synchronously here, on the loop's own thread, so a stop word arriving while the
         // session unwinds loses the race instead of overwriting the finished answer with the
         // stopped reply.
@@ -101,6 +105,11 @@ pub(crate) fn record(event: &ProgressEvent) {
         ProgressEvent::ModelTurn { turn, of } => tracing::info!(
             target: "dekopond::audit",
             { audit.event = "gateway.progress", kind = "model_turn", turn = *turn, of = *of },
+            "gateway progress"
+        ),
+        ProgressEvent::Steered { turn } => tracing::info!(
+            target: "dekopond::audit",
+            { audit.event = "gateway.progress", kind = "steered", turn = *turn },
             "gateway progress"
         ),
         ProgressEvent::TextDelta { .. } => {}

@@ -715,15 +715,16 @@ async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
         harness.recorder.calls()
     );
 
+    let text = recorded_delta();
     harness.sink.emit(ProgressEvent::TextDelta {
         turn: 1,
-        text: ModelText::default(),
-        cumulative_chars: 0,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
     });
     settle().await;
     assert_eq!(
         harness.recorder.texts(),
-        vec![String::new()],
+        vec![text.as_str().to_owned()],
         "the stream is the one surface: {:?}",
         harness.recorder.calls()
     );
@@ -872,6 +873,80 @@ async fn answer_streaming_is_independent_of_progress_and_detail_off() {
             Some(&Call::StreamFinalize("done".to_owned()))
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn steering_clears_pending_text_and_restarts_the_same_numbered_turn() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    let delta = || ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    };
+    harness.sink.emit(delta());
+    settle().await;
+    harness.sink.emit(delta());
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    settle().await;
+    advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Stream(text.as_str().to_owned())]
+    );
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 1, of: 1 });
+    harness.sink.emit(delta());
+    settle().await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [
+            Call::Stream(text.as_str().to_owned()),
+            Call::Stream(text.as_str().to_owned())
+        ]
+    );
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_terminal_after_steering_never_sends_an_empty_edit() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    });
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Stream(text.as_str().to_owned())]
+    );
 }
 
 #[tokio::test(start_paused = true)]
