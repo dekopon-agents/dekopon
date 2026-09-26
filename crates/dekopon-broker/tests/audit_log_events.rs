@@ -94,6 +94,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            propagate_trace: false,
         }),
         storage: None,
         secret_use: None,

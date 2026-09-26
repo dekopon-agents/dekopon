@@ -146,6 +146,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                         max_request_bytes: 4_096,
                         max_response_bytes: 4_096,
                         allow_plaintext_loopback: true,
+                        propagate_trace: false,
                     }),
                     storage: None,
                     secret_use: None,

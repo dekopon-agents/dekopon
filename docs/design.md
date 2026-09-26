@@ -38,7 +38,7 @@ that serves none of them is a deletion candidate, however well built.
    telemetry's. Completeness beats volume: an attribute may be truncated with a marker, a span
    is never dropped. Multi-message media collection retains each original receipt and terminal
    disposition in its own trace; shared execution is parented by the lead receipt and exports
-   causal links to every constituent. The lead alone owns native delivery identity. No `traceparent` header is sent to a third-party endpoint. The telemetry
+   causal links to every constituent. The lead alone owns native delivery identity. No `traceparent` header is sent to an endpoint unless its constraint set opts in with `propagateTrace`; operators opt in only first-party endpoints inside their trust boundary, and a provider can never set one. The telemetry
    store is inside the operator's trust boundary. The `telemetryPayloads` gate, every metadata-only
    mode, the `<withheld>` command word, the 256-span INFO cap, and the storage blind spans are
    gone: a command word is recorded with its arguments, piped value, and output, each cut at 4096

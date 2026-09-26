@@ -3539,6 +3539,9 @@ fn encode_execution_constraints(
             "execution.http.allowPlaintextLoopback",
             http.allow_plaintext_loopback,
         );
+        if http.propagate_trace {
+            encoded.boolean("execution.http.propagateTrace", true);
+        }
     } else {
         encoded.byte("execution.http.present", 0);
     }

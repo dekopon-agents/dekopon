@@ -145,6 +145,8 @@ pub struct HttpConstraints {
     pub max_response_bytes: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_plaintext_loopback: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub propagate_trace: bool,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -757,6 +759,7 @@ mod tests {
             max_request_bytes: 1024,
             max_response_bytes: 1024,
             allow_plaintext_loopback: false,
+            propagate_trace: false,
         };
         let cases = [
             (
@@ -870,6 +873,7 @@ mod tests {
             max_request_bytes: 65_536,
             max_response_bytes: 1_048_576,
             allow_plaintext_loopback: true,
+            propagate_trace: false,
         };
 
         http.validate().expect("an exact grant is enforceable");
@@ -885,6 +889,7 @@ mod tests {
                 max_request_bytes: 65_536,
                 max_response_bytes: 1_048_576,
                 allow_plaintext_loopback: false,
+                propagate_trace: false,
             }),
             ..ExecutionConstraints::default()
         };

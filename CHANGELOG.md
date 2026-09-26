@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- HTTP constraint sets accept `propagateTrace: true` to send a broker-owned W3C `traceparent`
+  to first-party destinations inside the operator's trust boundary. Buffered and streaming
+  requests parent downstream work on the HTTP egress span without charging guest byte budgets.
+
+### Changed
+
+- Provider-supplied `traceparent` and `tracestate` request headers are refused with `InvalidHeader`
+  on every HTTP grant, including grants that do not opt into trace propagation.
+
 ## [0.22.0] - 2026-09-25
 
 ### Added

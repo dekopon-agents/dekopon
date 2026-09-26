@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker-owned HTTP trace headers (next release)
+
+Remove provider-supplied `traceparent` and `tracestate` request headers before upgrading: the
+native HTTP host now refuses either with `InvalidHeader`, even when propagation is disabled.
+To propagate a trace to a first-party destination inside your trust boundary, give it a dedicated
+HTTP constraint set with `propagateTrace: true`; omission remains off. The broker supplies the
+egress span's `traceparent`, never `tracestate`. See the
+[broker configuration example](../crates/dekopon-brokerd/README.md#trace-propagation-to-first-party-destinations).
+
 ## Principals, groups and capability blocks (0.22.0)
 
 Every broker configuration needs editing before the 0.22.0 broker will start; `dekopon-brokerd
