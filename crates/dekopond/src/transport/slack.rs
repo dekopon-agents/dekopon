@@ -1023,6 +1023,8 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "thread_ts": thread_ts,
             "text": text.as_str(),
+            "unfurl_links": false,
+            "unfurl_media": false,
             "blocks": self.progress_blocks(text.as_str(), cancel, conversation_id),
         });
         let body = self.liveness_call("chat.postMessage", &body).await?;
@@ -1058,6 +1060,8 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": text.as_str(),
+            "unfurl_links": false,
+            "unfurl_media": false,
             "blocks": self.progress_blocks(text.as_str(), cancel, conversation_id),
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
@@ -2571,6 +2575,34 @@ mod driver_tests {
             1,
             "Slack's own Stop control is the one on an Agent session: {posted}"
         );
+    }
+
+    #[tokio::test]
+    async fn progress_disables_unfurls_without_changing_the_answer_body() {
+        let mock = spawn_slack_mock(accepting);
+        let replier = replier(&mock.base, SlackExperience::Classic);
+        let text = ProgressText::for_test("https://example.com…");
+        let message = ProgressMessage::post(&replier, &target(), &text, false)
+            .await
+            .unwrap();
+        ProgressMessage::edit(&replier, &message, &text, false)
+            .await
+            .unwrap();
+        ProgressMessage::finalize(
+            &replier,
+            &message,
+            &OutboundReply::text("https://example.com"),
+        )
+        .await
+        .unwrap();
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        for (_, body) in &calls[..2] {
+            assert_eq!(body["unfurl_links"], false);
+            assert_eq!(body["unfurl_media"], false);
+        }
+        assert!(calls[2].1.get("unfurl_links").is_none());
+        assert!(calls[2].1.get("unfurl_media").is_none());
     }
 
     #[tokio::test]

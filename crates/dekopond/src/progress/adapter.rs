@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use dekopon_agent::{ProgressEvent, ProgressSink};
@@ -19,11 +19,17 @@ pub(crate) struct ProgressCounters {
     pub dropped: AtomicU32,
     pub notes_dropped: AtomicU32,
     pub deltas: AtomicU32,
+    pub note_generation: AtomicU64,
+}
+
+pub(crate) struct QueuedEvent {
+    pub event: ProgressEvent,
+    pub note_generation: u64,
 }
 
 pub(crate) struct ProgressAdapter {
     transport: String,
-    events: mpsc::Sender<ProgressEvent>,
+    events: mpsc::Sender<QueuedEvent>,
     text: watch::Sender<StreamedText>,
     turn: AtomicU32,
     notes: AtomicU32,
@@ -34,7 +40,7 @@ pub(crate) struct ProgressAdapter {
 impl ProgressAdapter {
     pub(crate) fn new(
         transport: String,
-        events: mpsc::Sender<ProgressEvent>,
+        events: mpsc::Sender<QueuedEvent>,
         text: watch::Sender<StreamedText>,
         counters: Arc<ProgressCounters>,
         cancellation: SessionCancellation,
@@ -76,6 +82,17 @@ impl ProgressSink for ProgressAdapter {
             });
             return;
         }
+        let note_generation = if matches!(
+            event,
+            ProgressEvent::ModelTurn { .. } | ProgressEvent::Steered { .. }
+        ) {
+            self.counters
+                .note_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
+        } else {
+            self.counters.note_generation.load(Ordering::Acquire)
+        };
         if matches!(event, ProgressEvent::Steered { .. }) {
             self.text.send_modify(|cumulative| {
                 cumulative.text = ModelText::default();
@@ -96,7 +113,10 @@ impl ProgressSink for ProgressAdapter {
             let _ = self.cancellation.claim_completion();
         }
         record(&event);
-        if let Err(error) = self.events.try_send(event) {
+        if let Err(error) = self.events.try_send(QueuedEvent {
+            event,
+            note_generation,
+        }) {
             let dropped = self.counters.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 event = "gateway_progress_dropped",

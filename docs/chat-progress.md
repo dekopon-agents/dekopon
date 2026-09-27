@@ -115,12 +115,12 @@ loop reports it as `Cancelled { by }` instead.
 - `CommandWord` is the provider-authored capability identifier or command word — the same
   vocabulary the trace already carries — bounded to 32 characters with a marker at construction,
   because it is rendered to a person.
-- `ProgressText`, the gateway's own type, is built only from operator-authored templates plus
-  numeric state, and drivers see nothing else.
+- `ProgressText`, the gateway's own type, is built from operator templates, session counters,
+  the bounded command word and, on an opted-in route, a bounded note.
 - `ProgressNote` carries a cleaned, bounded model-authored note under the
   [security model's liveness rule](security-model.md#current-gateway-posture).
   `BrokerLeg` emits it only with `with_progress_notes()`; the route opt-in is `progressNotes: true`.
-  The adapter records the note now; rendering remains committed direction.
+  The adapter records the note and the policy renders it inside the operator's note template.
 
 A prompt, a provider result, and attachment bytes have no field anywhere in this vocabulary.
 The shell's progress-note operand is the one opt-in exception: it enters only through
@@ -165,7 +165,9 @@ predecessor had — sealing synchronously before terminal delivery, finishing in
 after, "an issued call is never cancelled", and a two-consecutive-failures breaker — plus an event
 inbox and a clock.
 
-Discrete events ride a bounded channel; overflow is counted, never silently dropped. Cumulative
+Discrete events ride a bounded channel; overflow is counted, never silently dropped. Note
+invalidation advances a shared generation before enqueueing a model-turn or steering event, so a
+full inbox cannot retain a live old note or resurrect one already queued. Cumulative
 streamed text is a *value*, not an event, so it rides a watch channel: the policy reads the latest
 value once per minimum interval, which is what it would do anyway, and no coalescing code exists.
 
@@ -178,7 +180,7 @@ Rendering, for whichever capability objects the driver returns, at the route's d
    durable indicators to rest; typing renewals stop.
 2. Where Auto has no working indicator (or an explicit message-backed Stop button is requested),
    or with explicit `progress: message`, an editable progress message is posted on the first of
-   `TextDelta`, `ToolStarted`, `Answered` with tool
+   `TextDelta`, `Note`, `ToolStarted`, `Answered` with tool
    calls, or the 15 s keep-alive tick — never on `ModelTurn { turn: 1 }` alone, so a fast one-turn
    answer never gets one.
 3. Every later event edits that message, coalesced to the latest state under the driver's minimum
@@ -188,7 +190,7 @@ Rendering, for whichever capability objects the driver returns, at the route's d
 
 Detail levels are per route: `off` suppresses progress prose but not explicitly requested answer
 streaming or ambient indicators; `plain` shows
-verbs only, with elapsed reaching it on keep-alive ticks and nowhere else; `detailed` adds turn and
+stock verbs or the opted-in note, with elapsed in the default templates only on keep-alive ticks; `detailed` adds turn and
 call counts, and elapsed on every edit. The defaults are what `plain` is shaped around: a counter
 frozen between edits reads as a hang, which is the opposite of what the surface is for, and turn and
 call counts are route budgets that mean nothing to the person waiting, so they stay on the trace. A
@@ -196,7 +198,15 @@ route that asks for `detailed` is spending that staleness deliberately, for an o
 their own agent rather than a person waiting on an answer.
 
 Default templates are operator strings overridable per transport: `Working on it…`,
-`Running {word}…`, `Still working ({elapsed_s} s)…`, `Stopped.`, and one fixed failure line.
+`Running {word}…`, `Still working ({elapsed_s} s)…`, `{note}…`, `{note} (~{eta_s} s)…`,
+`Stopped.`, and one fixed failure line.
+
+A live note has priority over both tool/status and keep-alive lines, even through individual tool
+completions. A later note replaces it; a new model turn, steering, or any terminal outcome clears
+it. Staleness is checked only at keep-alive ticks, using the [note lifetime rules](dekopond.md#configuration),
+not a new timer. Notes share the existing coalescing and 60-edit budget: an identical line still
+costs an edit, so a long polling loop can exhaust that budget before the 24-note cap is reached.
+Detailed counters still append to a note line, and note content is never parsed for placeholders.
 
 Terminal handling has exactly **one** writer, the policy task:
 
@@ -318,10 +328,14 @@ transports:
       stream: true                 # default false
       cancelButton: true           # default false
       keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }
-      templates: { working: "Working on it…", tool: "Running {word}…" }
+      templates:
+        working: "Working on it…"
+        tool: "Running {word}…"
+        note: "{note} ({elapsed_s} s)…"
 stopWords: [stop, cancel]
 routes:
   - progressDetail: plain          # off | plain | detailed
+    progressNotes: true            # optional, false by default
     limits: { maxSteps: 12, maxCapabilityCalls: 16, maxDurationMs: 300000 }
 ```
 
@@ -346,7 +360,7 @@ warning-and-continue. [`upgrading.md`](upgrading.md) records the rename and the 
 ## Telemetry
 
 Every event rides the message's trace as a `gateway.progress` record carrying kinds, counts,
-durations, and the command word — never text. Renders emit a debug record naming the transport, the
+durations, and the command word, with the bounded opted-in note as the one text exception. Renders emit a debug record naming the transport, the
 primitive, the outcome, and, for a stream render, the character count that was on screen, which is
 what answers "what had the person actually read when they pressed Stop": the model's partial answer
 is on `agent.model.answer`, and rendering lags it by the minimum interval and truncates at the

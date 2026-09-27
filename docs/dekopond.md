@@ -70,6 +70,8 @@ transports:
         working: "Working on it…"
         tool: "Running {word}…"
         keepAlive: "Still working ({elapsed_s} s)…"
+        note: "{note}…"
+        noteEta: "{note} (~{eta_s} s)…"
         stopped: "Stopped."
         failed: "The agent could not complete this request."
   - name: community-discord
@@ -203,9 +205,11 @@ The `memory:` block — which was called `conversation:` before 0.14.0 — is ta
 `progressNotes: true` offers the shell's `progress` builtin in the bash tool description and
 admits its bounded, model-authored notes to `gateway.progress` telemetry. It defaults to false:
 turning it on is consent for this text to reach telemetry and chat under the
-[security model's liveness rule](security-model.md#current-gateway-posture). *Committed direction:*
-chat rendering arrives with the note templates; notes are recorded but not rendered yet.
-A transport with liveness off or no progress surface still records an opted-in note.
+[security model's liveness rule](security-model.md#current-gateway-posture). A live note owns an
+active progress message until another note replaces it, the next model turn or steering clears it,
+or the session ends; individual tool completions do not clear it. At a keep-alive tick, a note older
+than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts down.
+A transport with liveness off or no active progress message still records an opted-in note.
 
 ### OpenRouter model settings
 
@@ -274,7 +278,8 @@ A gateway that starts and then refuses everything is worse than one that does no
   loop rather than a keep-alive;
 - a `liveness.templates` line using a placeholder that field cannot render. The known placeholders
   are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
-  `{elapsed_s}`; `stopped` and `failed` are written after the session ended and render none. Every
+  `{elapsed_s}`, plus `{note}` only in `note`/`noteEta` and `{eta_s}` only in `noteEta`;
+  neither note field permits `{word}`. `stopped` and `failed` render none. Every
   offending placeholder in the block is named, not the first;
 - an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
 - a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
@@ -867,15 +872,18 @@ call that creates the surface — the first `post`, or the first stream render �
 first deadline miss instead: the transport may still land it, and a second attempt would post a
 second message beside one this session holds no reference to.
 
-**Templates.** Five operator strings, each overridable per transport, all defaulting to the
-sentences this daemon ships. `tool` may use `{word}`; `working`, `tool`, and `keepAlive` may also
-use `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`; `stopped` and `failed` are
-written after the session ended and use none. A placeholder a field cannot render is a startup
-refusal naming it. The rendered command word is a provider manifest's own, bounded to 32 characters;
-no prompt, capability argument, provider result, or model text can reach a progress line, because
-the type the drivers receive is built only from these templates and the session's numbers.
-*Committed direction:* a route's `progressNotes: true` will admit one bounded model-authored
-note under the [security model's liveness rule](security-model.md#current-gateway-posture).
+**Templates.** Seven operator strings, each overridable per transport, default to the sentences
+this daemon ships. `tool` permits `{word}`; `working`, `tool`, `keepAlive`, `note`, and `noteEta`
+permit `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`. Only `note`/`noteEta` permit
+`{note}`, and only `noteEta` permits `{eta_s}`; neither permits `{word}`. `stopped` and `failed`
+render no placeholders. A placeholder a field cannot render is a startup refusal naming it.
+The command word comes from a provider manifest and is bounded to 32 characters. A bounded note
+on a route with `progressNotes: true` is the one model-authored text admitted to a progress line;
+no prompt, other capability argument, or provider result is admitted. Note text is inserted as a
+literal value, never expanded as a template: a note containing `{elapsed_s}` shows those characters.
+Slack, Discord and Telegram progress posts and edits disable link previews/unfurls. Discord
+explicitly restores previews when the progress message becomes the answer; Telegram's edit defaults
+already restore them. Ordinary answer and stream paths keep their existing behavior.
 
 **Streaming.** With enabled liveness, `stream: true` and a driver that implements it, the model's answer appears as it
 is written, cut to the transport's own character ceiling with a trailing `…` where it was cut, and
@@ -929,7 +937,7 @@ session starts without prior history; the `persistent` clauses in steps 4 and 5 
 
 1. **Admission.** A process-wide semaphore bounds concurrent work. The per-`(transport, conversation)` map is checked first: the same sender steers a running turn; other senders, wakes, and input arriving after cancellation or completion is claimed queue as follow-ups. Together steers and follow-ups hold at most eight items. Only a full mailbox (`busy.cause = same-conversation`) or lack of a permit for a new conversation (`saturated`) refuses admission. A refusal is eligible for `I'm busy — try again shortly.` when `replyOnBusy` is set; a collected batch is eligible regardless. Sending still requires a free refusal-reply permit and successful transport delivery. Follow-ups run inline under the existing permit, with their own route, subject, fresh cancellation, broker leg and receipt trace. A conversation with a steady stream of messages keeps its permit until its mailbox is empty.
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or session progress starts**. Queued or steered input may already have received its admission acknowledgment, which does not signify authorization.
-3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note (*Committed direction:* not yet implemented). The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
+3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
 4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 

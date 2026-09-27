@@ -399,6 +399,13 @@ pub(crate) trait NativeStatus: Send + Sync {
     async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError>;
 }
 
+#[derive(Debug)]
+pub(crate) enum LinkPreviews {
+    Default,
+    Disabled,
+    Enabled,
+}
+
 #[async_trait]
 pub(crate) trait ProgressMessage: Send + Sync {
     fn limits(&self) -> ProgressLimits;

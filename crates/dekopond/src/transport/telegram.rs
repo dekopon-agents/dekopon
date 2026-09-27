@@ -17,11 +17,12 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
-        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SteerAck, StreamLimits,
-        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
-        record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LinkPreviews, LivenessTarget, MessageId,
+        MessageRef, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SteerAck,
+        StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
+        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
+        floor_boundary, receive_span, record_conversation, reserve_for_chunk,
+        retry_after_from_body, split_message,
     },
 };
 
@@ -539,7 +540,13 @@ impl ProgressMessage for TelegramDriver {
         text: &ProgressText,
         cancel: bool,
     ) -> Result<MessageRef, TransportError> {
-        self.post_text(target, bounded(text.as_str()), cancel).await
+        self.post_text(
+            target,
+            bounded(text.as_str()),
+            cancel,
+            LinkPreviews::Disabled,
+        )
+        .await
     }
 
     async fn edit(
@@ -548,8 +555,13 @@ impl ProgressMessage for TelegramDriver {
         text: &ProgressText,
         cancel: bool,
     ) -> Result<(), TransportError> {
-        self.edit_text(message, bounded(text.as_str()), cancel)
-            .await
+        self.edit_text(
+            message,
+            bounded(text.as_str()),
+            cancel,
+            LinkPreviews::Disabled,
+        )
+        .await
     }
 
     async fn delete(&self, message: &MessageRef) -> Result<(), TransportError> {
@@ -596,9 +608,12 @@ impl TextStream for TelegramDriver {
             rendered.push_str(TRUNCATION_MARKER);
         }
         let Some(message) = message else {
-            return self.post_text(target, rendered, cancel).await;
+            return self
+                .post_text(target, rendered, cancel, LinkPreviews::Default)
+                .await;
         };
-        self.edit_text(message, rendered, cancel).await?;
+        self.edit_text(message, rendered, cancel, LinkPreviews::Default)
+            .await?;
         Ok(message.clone())
     }
 
@@ -687,6 +702,7 @@ impl TelegramDriver {
         target: &LivenessTarget,
         text: String,
         cancel: bool,
+        previews: LinkPreviews,
     ) -> Result<MessageRef, TransportError> {
         let LivenessTarget::Telegram {
             chat_id,
@@ -704,6 +720,9 @@ impl TelegramDriver {
         if let Some(message_thread_id) = message_thread_id {
             body["message_thread_id"] = json!(message_thread_id);
         }
+        if let LinkPreviews::Disabled = previews {
+            body["link_preview_options"] = json!({"is_disabled": true});
+        }
         let posted = self.liveness_call("sendMessage", &body).await?;
         let id = posted["result"]["message_id"]
             .as_i64()
@@ -720,14 +739,18 @@ impl TelegramDriver {
         message: &MessageRef,
         text: String,
         cancel: bool,
+        previews: LinkPreviews,
     ) -> Result<(), TransportError> {
         let (chat_id, message_thread_id, message_id) = addressed(message)?;
-        let body = json!({
+        let mut body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
             "reply_markup": reply_markup(chat_id, message_thread_id, cancel),
         });
+        if let LinkPreviews::Disabled = previews {
+            body["link_preview_options"] = json!({"is_disabled": true});
+        }
         match self.liveness_call("editMessageText", &body).await {
             Ok(_) => Ok(()),
             Err(TransportError::Service { ref code }) if code.contains(NOT_MODIFIED) => Ok(()),
@@ -745,7 +768,8 @@ impl TelegramDriver {
                 code: "answer-does-not-fit".to_owned(),
             });
         }
-        self.edit_text(message, bounded(&reply.text), false).await
+        self.edit_text(message, bounded(&reply.text), false, LinkPreviews::Default)
+            .await
     }
 }
 
@@ -1358,13 +1382,17 @@ mod tests {
             }
         );
         let message = driver
-            .post_text(&target(), "Working on it…".to_owned(), false)
+            .post(&target(), &ProgressText::for_test("Working on it…"), false)
             .await
             .expect("the progress message posts");
         assert_eq!(message.id, "9");
         assert_eq!(message.target, target());
         driver
-            .edit_text(&message, "Running gpt-image…".to_owned(), false)
+            .edit(
+                &message,
+                &ProgressText::for_test("Running gpt-image…"),
+                false,
+            )
             .await
             .expect("the progress message edits");
         driver
@@ -1388,6 +1416,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_finalization_restores_the_apis_default_preview_state() {
+        use std::sync::{Arc, Mutex};
+
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&states);
+        let api = bot_api(move |method, body| {
+            let disabled = body["link_preview_options"]["is_disabled"]
+                .as_bool()
+                .unwrap_or(false);
+            observed.lock().unwrap().push(disabled);
+            posting(method, body)
+        });
+        let driver = driver(&api.base);
+        let text = ProgressText::for_test("https://example.com…");
+        let message = ProgressMessage::post(&driver, &target(), &text, false)
+            .await
+            .unwrap();
+        ProgressMessage::edit(&driver, &message, &text, false)
+            .await
+            .unwrap();
+        ProgressMessage::finalize(
+            &driver,
+            &message,
+            &OutboundReply::text("https://example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.body("sendMessage")["link_preview_options"],
+            json!({"is_disabled": true})
+        );
+        let edits = api.bodies("editMessageText");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits[0]["link_preview_options"],
+            json!({"is_disabled": true})
+        );
+        assert!(edits[1].get("link_preview_options").is_none());
+        assert_eq!(*states.lock().unwrap(), [true, true, false]);
+    }
+
+    #[tokio::test]
     async fn an_edit_that_changes_nothing_is_the_success_it_describes() {
         let api = bot_api(|_, _| {
             json!({
@@ -1400,7 +1470,7 @@ mod tests {
         });
         let driver = driver(&api.base);
         driver
-            .edit_text(&surface(), "Working on it…".to_owned(), false)
+            .edit(&surface(), &ProgressText::for_test("Working on it…"), false)
             .await
             .expect("a re-render of unchanged state is not a failure");
     }
@@ -1412,7 +1482,7 @@ mod tests {
         );
         let driver = driver(&api.base);
         let error = driver
-            .edit_text(&surface(), "Working on it…".to_owned(), false)
+            .edit(&surface(), &ProgressText::for_test("Working on it…"), false)
             .await
             .expect_err("a deleted message cannot be edited");
         assert!(
@@ -1475,6 +1545,9 @@ mod tests {
             "one message per session, grown by edits rather than by posts"
         );
         assert_eq!(api.methods(), ["sendMessage", "editMessageText"]);
+        for method in ["sendMessage", "editMessageText"] {
+            assert!(api.body(method).get("link_preview_options").is_none());
+        }
         assert_eq!(
             api.body("sendMessage")["text"],
             "[empty response]",
@@ -1575,7 +1648,11 @@ mod tests {
         let api = bot_api(posting);
         let driver = driver(&api.base);
         let message = driver
-            .post_text(&topic_target(), "Working on it…".to_owned(), true)
+            .post(
+                &topic_target(),
+                &ProgressText::for_test("Working on it…"),
+                true,
+            )
             .await
             .expect("the progress message posts");
         assert_eq!(
@@ -1585,7 +1662,7 @@ mod tests {
             })
         );
         driver
-            .edit_text(&message, "Stopped.".to_owned(), false)
+            .edit(&message, &ProgressText::for_test("Stopped."), false)
             .await
             .expect("the progress message edits");
         assert_eq!(

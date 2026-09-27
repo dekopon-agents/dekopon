@@ -1,6 +1,5 @@
 //! The policy is the sole terminal writer once a session starts, so a stopped reply can't land
-//! ahead of the partial answer it follows; the text type itself guarantees no model text or
-//! credential reaches a progress line.
+//! ahead of the partial answer it follows.
 
 use std::time::Duration;
 
