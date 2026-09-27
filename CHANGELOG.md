@@ -32,6 +32,14 @@ All notable changes to Dekopon are documented here. The format is based on
   now runs to completion, including the native Idle write, before the acknowledgment that lets the
   same thread's next turn start.
 
+### Removed
+
+- Slack no longer streams the answer: `liveness.stream: true` is refused on every
+  `slackSocketMode` transport (top level and per conversation kind), and the
+  `chat.startStream`/`appendStream`/`stopStream` path is gone from the Slack driver. Progress on
+  Slack now shows through the progress message or, on Agent installations, `liveness.statusText`;
+  other transports keep streaming unchanged.
+
 ## [dekopon-chart-0.17.0] - 2026-09-27
 
 ### Added

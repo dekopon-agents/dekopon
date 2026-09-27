@@ -1623,11 +1623,13 @@ fn resolve_liveness(
     }
 
     let whatsapp = matches!(transport, TransportConfig::WhatsappCloudApi { .. });
+    let slack = matches!(transport, TransportConfig::SlackSocketMode { .. });
     let slack_agent = experience == Some(SlackExperience::Agent);
     fn unsupported_surfaces(
         problems: &mut Vec<ConfigProblem>,
         transport: &str,
         whatsapp: bool,
+        slack: bool,
         slack_agent: bool,
         settings: LivenessSettings,
     ) {
@@ -1654,6 +1656,13 @@ fn resolve_liveness(
                 });
             }
         }
+        if slack && settings.stream {
+            problems.push(ConfigProblem::UnsupportedLivenessSurface {
+                transport: transport.to_owned(),
+                surface: "stream",
+                reason: "Slack no longer streams the answer; progress notes carry it as Agent status text or the progress message",
+            });
+        }
         if slack_agent && settings.cancel_button {
             problems.push(ConfigProblem::UnsupportedLivenessSurface {
                 transport: transport.to_owned(),
@@ -1662,7 +1671,14 @@ fn resolve_liveness(
             });
         }
     }
-    unsupported_surfaces(problems, &name, whatsapp, slack_agent, liveness.settings());
+    unsupported_surfaces(
+        problems,
+        &name,
+        whatsapp,
+        slack,
+        slack_agent,
+        liveness.settings(),
+    );
     let chat_kind = transport.chat_kind();
     for (kind, overlay) in &liveness.conversations {
         if !chat_kind.produces(*kind) {
@@ -1675,6 +1691,7 @@ fn resolve_liveness(
             problems,
             &name,
             whatsapp,
+            slack,
             slack_agent,
             LivenessSettings {
                 stream: overlay.stream.unwrap_or_default(),
@@ -2283,6 +2300,30 @@ routes:
                     }
                 )));
             }
+        }
+    }
+
+    #[test]
+    fn slack_cannot_use_liveness_stream_however_it_is_set() {
+        for block in [
+            "stream: true".to_owned(),
+            "conversations: { channel: { stream: true } }".to_owned(),
+        ] {
+            let error = resolved(&format!(
+                "transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    liveness: {{ mode: native, classicFallback: reaction, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n"
+            ))
+            .unwrap_err();
+            let ConfigError::Invalid { problems, .. } = error else {
+                panic!("expected a semantic refusal")
+            };
+            assert!(problems.iter().any(|problem| matches!(
+                problem,
+                super::ConfigProblem::UnsupportedLivenessSurface {
+                    transport,
+                    surface: "stream",
+                    ..
+                } if transport == "slack"
+            )));
         }
     }
 
