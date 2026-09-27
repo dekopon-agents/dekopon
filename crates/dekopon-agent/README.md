@@ -40,6 +40,8 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   `dekopon_model::ModelText` — model-authored visible text only, bounded at 8 KiB of cumulative
   text per turn — and `CommandWord`, the provider-authored word bounded to 32 characters for
   display. Prompts, shell arguments, tool output, and provider results have no field to travel in.
+  *Committed direction:* `Note` will carry the bounded model-authored progress note on opted-in
+  routes, as defined by the [security model's liveness rule](../../docs/security-model.md#current-gateway-posture).
   `FailureClass::of` classifies a `PromptError` by naming every variant, and answers `None` for a
   cancellation, which is an outcome rather than a failure.
 - `prompt::run_prompt_with_history_and_options` — that same continuation carrying a
