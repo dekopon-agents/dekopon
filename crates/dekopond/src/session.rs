@@ -1400,7 +1400,6 @@ async fn session(
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
     let skills = Arc::clone(&route.skills);
-    let improvement_suggestions = route.improvement_suggestions;
     let progress_notes = route.progress_notes;
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
@@ -1451,9 +1450,6 @@ async fn session(
         // user.
         if inspect_agent_config {
             inputs = inputs.with_agent_config(&agent_config);
-        }
-        if improvement_suggestions {
-            inputs = inputs.with_improvement_suggestions();
         }
         if progress_notes {
             inputs = inputs.with_progress_notes();

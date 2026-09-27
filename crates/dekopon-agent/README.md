@@ -54,10 +54,8 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   user text at step boundaries and retries model-only interruptions without spending a step.
   `with_progress_notes()` appends the builtin's guidance to the bash tool description; without
   it that description is unchanged. Enable it alongside `BrokerLeg::with_progress_notes()`.
-  Two other opt-ins are described below:
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
-  offers no tool; `with_improvement_suggestions()` offers `suggest_improvement`, which is never
-  offered unless the embedder called it.
+  offers no tool. `suggest_improvement` needs no opt-in: every session offers it.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
@@ -119,7 +117,7 @@ are: it shapes an answer and grants nothing, so nothing secret belongs in one.
 
 `improvement` is the tap-the-glass channel. `suggest_improvement`
 (`prompt::IMPROVEMENT_TOOL_NAME`) lets the model record one structured note for the operator:
-`category` (`instructions`, `skill`, `capability`, `tool`, `limits`, `other`), `target` (at most
+`category` (`instructions`, `skill`, `capability`, `tool`, `limits`, `efficiency`, `other`), `target` (at most
 `MAX_SUGGESTION_TARGET_BYTES`, 128), `summary` (`MAX_SUGGESTION_SUMMARY_BYTES`, 512), `evidence`
 and `proposal` (`MAX_SUGGESTION_DETAIL_BYTES`, 2048 each), and `confidence` (`low`, `medium`,
 `high`), at most `MAX_SUGGESTIONS_PER_SESSION` (3) times per session. Its description tells the
@@ -152,8 +150,8 @@ suggestion records fire in either payload mode. `agent.skill.read` carries `skil
 operator-authored name the request matched, never the one the model typed), `skill.resource`
 (empty for the instructions), `skill.bytes`, and `skill.repeated`; `agent.skill.refused` carries a
 `reason` of `unknown-skill` or `unknown-resource`. `agent.improvement.suggested` carries
-`suggestion.index` and the six bounded fields, model-authored text included, because offering the
-tool was the opt-in for exactly that; `agent.improvement.refused` carries a `reason` of
+`suggestion.index` and the six bounded fields, model-authored text included, same as every other
+model-authored record (goal 2); `agent.improvement.refused` carries a `reason` of
 `invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, or `session-limit` and
 none of the submitted text. A `read_skill` result reaches the log stream only inside the next
 turn's `agent.model.prompt` delta, with payloads on; neither `agent.tool.script` nor

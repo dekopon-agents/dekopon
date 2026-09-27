@@ -25,7 +25,6 @@ pub(crate) struct BoundRoute {
     pub instructions: Option<String>,
     pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
-    pub improvement_suggestions: bool,
     pub inspect_agent_config: bool,
     pub limits: PromptLimits,
     pub max_duration: Option<Duration>,
@@ -108,7 +107,6 @@ impl RoutingTable {
                 instructions: agent.spec.instructions.clone(),
                 skills: Arc::from(catalog.agent_skills(&route.agent).to_vec()),
                 model: Arc::clone(model),
-                improvement_suggestions: route.improvement_suggestions,
                 inspect_agent_config: route.inspect_agent_config,
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,

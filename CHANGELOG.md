@@ -7,6 +7,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `suggest_improvement`'s `category` gains `efficiency`, for a note about an awkward path a
+  session took even after succeeding: a workaround it built, a retry loop, a multi-step dance one
+  capability or command word would have collapsed, or output it reshaped by hand every time. The
+  tool's description now invites those alongside defects, and `docs/improvement.md`'s example
+  query groups the category apart from the other five.
+
 ### Changed
 
 - **Breaking:** `sessions.journal.maxBytes` is removed and refused. Journal files not written for
@@ -16,6 +24,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - Journal lines no longer cap the encoded user text at 64 KiB.
 - **Breaking:** the `storage.maxPendingTransactions` limit is renamed `maxActiveInvocations`; the
   old key is refused.
+- **Breaking:** `suggest_improvement` is offered on every `dekopond` session; consent was the
+  route-level `improvementSuggestions` flag's only job, and model-authored notes go to telemetry
+  like every other record ([goal 2](docs/design.md#constitution)).
 
 ### Removed
 
@@ -42,6 +53,8 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dedup-conflict` and `dedup-capacity` are no longer distinct chat-memory failure
   classifications in `record_delivered_turn`'s routed error and telemetry category; both now
   classify as the generic `provider-failure`.
+- The route-level `improvementSuggestions` key. `RouteConfig` still refuses unknown fields, so a
+  route that still sets it is a startup refusal, not a silent no-op.
 
 ### Fixed
 

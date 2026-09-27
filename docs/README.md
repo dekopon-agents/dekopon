@@ -20,7 +20,7 @@ Read in this order:
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential from a local login to a pod.
 6. [`inference.md`](inference.md) — exact model request types and wire shape, prompt-cache optimization and retention caveats, bounded chat history, durable on-demand chat turns, and the broader memory design space.
 7. [`observability.md`](observability.md) — gateway and broker OTLP traces, the broker audit record and where it goes, what telemetry excludes, and the OpenObserve development example.
-8. [`improvement.md`](improvement.md) — the operator-driven improvement loop: skills as progressive disclosure of operator-authored knowledge, opt-in `suggest_improvement` records, and what is absent.
+8. [`improvement.md`](improvement.md) — the operator-driven improvement loop: skills as progressive disclosure of operator-authored knowledge, `suggest_improvement` records, and what is absent.
 9. [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — the host, policy, credential, and provider-lifecycle authority boundary, with status called out per slice.
 10. [`secrets.md`](secrets.md) — public inert DRNs, separate `secret.use` authorization, the owner-only private map, executable source adapters, exact HTTP sinks, and rotation and reflection limits.
 11. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon through 1Password and External Secrets, including the Kubernetes projection boundary the direct secret-map adapter handles separately.

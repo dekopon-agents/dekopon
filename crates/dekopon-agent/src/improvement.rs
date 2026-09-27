@@ -1,5 +1,5 @@
-//! Purely advisory: nothing changes because a model asked, and it is opt-in per session since
-//! enabling it puts model-authored text in scope for the log sink.
+//! Purely advisory: nothing changes because a model asked. Offered on every session; the
+//! model-authored text it records goes to telemetry like everything else (goal 2).
 
 use std::fmt;
 
@@ -26,6 +26,7 @@ pub enum ImprovementCategory {
     Capability,
     Tool,
     Limits,
+    Efficiency,
     Other,
 }
 
@@ -38,6 +39,7 @@ impl ImprovementCategory {
             Self::Capability => "capability",
             Self::Tool => "tool",
             Self::Limits => "limits",
+            Self::Efficiency => "efficiency",
             Self::Other => "other",
         }
     }
@@ -106,12 +108,17 @@ pub(crate) fn improvement_tool() -> ModelTool {
              be improved. Use it when you noticed something the operator could fix: standing \
              instructions that were wrong, missing, or contradictory; a skill that would have \
              helped or that misled you; a capability you needed but were not granted; a limit \
-             you ran into; a tool that behaved differently from how it was described. Before \
-             recording one, ask whether a future session of this agent would plausibly act better \
-             because of it: skip one-off facts, live values a script should query again, and \
-             anything your instructions already say. Ground every field in something you observed \
-             in this session's tool results, such as an exit code, a refusal message, or a missing \
-             fact, rather than in speculation. Call it \
+             you ran into; a tool that behaved differently from how it was described; or, even on \
+             a task that succeeded, an awkward path the operator can't see from the answer alone: \
+             a workaround you built, a retry loop, a multi-step dance one capability or command \
+             word would have collapsed, output you reshaped by hand every time, or a provider \
+             whose `--help` you had to guess at. Succeeding the long way is still worth a note. \
+             Before recording one, ask whether a future session of this agent would plausibly act \
+             better because of it: skip one-off facts, live values a script should query again, \
+             and anything your instructions already say. Ground every field in something you \
+             observed in this session's tool results — an exit code, a refusal message, a missing \
+             fact, or, for an efficiency note, the session's own scripts and their exit codes — \
+             rather than in speculation. Call it \
              after the task is done or when it is genuinely blocked, at most {MAX_SUGGESTIONS_PER_SESSION} \
              times per session, never instead of answering, and without asking the person for \
              permission. Recording a note changes nothing in this session; it goes to the \
@@ -126,7 +133,7 @@ pub(crate) fn improvement_tool() -> ModelTool {
             "properties": {
                 "category": {
                     "type": "string",
-                    "enum": ["instructions", "skill", "capability", "tool", "limits", "other"],
+                    "enum": ["instructions", "skill", "capability", "tool", "limits", "efficiency", "other"],
                     "description": "What kind of thing the operator would change."
                 },
                 "target": {
@@ -267,11 +274,13 @@ fn validate(raw: RawSuggestion) -> Result<ImprovementSuggestion, (&'static str, 
         "capability" => ImprovementCategory::Capability,
         "tool" => ImprovementCategory::Tool,
         "limits" => ImprovementCategory::Limits,
+        "efficiency" => ImprovementCategory::Efficiency,
         "other" => ImprovementCategory::Other,
         _ => {
             return Err((
                 "invalid-category",
-                "`category` must be one of instructions, skill, capability, tool, limits, other."
+                "`category` must be one of instructions, skill, capability, tool, limits, \
+                 efficiency, other."
                     .to_owned(),
             ));
         }
@@ -352,6 +361,12 @@ mod tests {
         assert_eq!(suggestion.category, ImprovementCategory::Capability);
         assert_eq!(suggestion.confidence, SuggestionConfidence::High);
         assert_eq!(suggestion.target, "gh.pull-request.read");
+    }
+
+    #[test]
+    fn an_efficiency_suggestion_validates() {
+        let suggestion = validate(raw("efficiency", "medium")).expect("valid");
+        assert_eq!(suggestion.category, ImprovementCategory::Efficiency);
     }
 
     #[test]

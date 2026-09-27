@@ -2961,7 +2961,6 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         instructions: Some("Answer briefly.".to_owned()),
         skills: Arc::from(Vec::new()),
         model: Arc::new(model),
-        improvement_suggestions: false,
         inspect_agent_config: true,
         limits: PromptLimits {
             max_steps: 4,
@@ -4556,7 +4555,6 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
 
     assert_eq!(route.skills.len(), 1);
     assert_eq!(route.skills[0].name().as_str(), "counting");
-    assert!(!route.improvement_suggestions);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4595,8 +4593,8 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let tools = models.tool_names(0);
     assert!(tools.contains(&SKILL_TOOL_NAME.to_owned()), "{tools:?}");
     assert!(
-        !tools.contains(&IMPROVEMENT_TOOL_NAME.to_owned()),
-        "suggestions are a route opt-in: {tools:?}"
+        tools.contains(&IMPROVEMENT_TOOL_NAME.to_owned()),
+        "suggestions are offered on every session: {tools:?}"
     );
     let listing = models
         .prompt(0)
@@ -4626,7 +4624,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
+async fn the_suggestion_tool_is_offered_on_every_route() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -4638,10 +4636,7 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
     .await;
     let models = ModelScript::new([suggest_improvement(), answer("Noted.")]);
     let driver = Arc::new(RecordingDriver::default());
-    let route = crate::routes::BoundRoute {
-        improvement_suggestions: true,
-        ..route(model_config())
-    };
+    let route = route(model_config());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
@@ -4670,26 +4665,17 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
 }
 
 #[tokio::test]
-async fn improvement_suggestions_are_a_per_route_opt_in() {
+async fn a_leftover_improvement_suggestions_key_is_refused() {
     let directory = temporary();
     let mut document = document(directory.path());
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("the default configuration resolves");
-    assert!(!resolved.routes[0].improvement_suggestions);
-
     document["routes"][0]["improvementSuggestions"] = json!(true);
-    let resolved = load(directory.path(), &document)
+
+    let error = load(directory.path(), &document)
         .await
-        .expect("the opt-in resolves");
-    assert!(resolved.routes[0].improvement_suggestions);
-    let routes =
-        RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).expect("the route binds");
+        .expect_err("the retired route key is now unknown");
     assert!(
-        routes
-            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-            .expect("route matches")
-            .improvement_suggestions
+        matches!(error, ConfigError::Decode { .. }),
+        "an unknown field is a decode refusal, not a later check: {error:?}"
     );
 }
 
@@ -4725,7 +4711,11 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     assert_eq!(models.requests(), 2);
     assert_eq!(
         models.tool_names(0),
-        vec!["bash".to_owned(), AGENT_CONFIG_TOOL_NAME.to_owned()]
+        vec![
+            "bash".to_owned(),
+            IMPROVEMENT_TOOL_NAME.to_owned(),
+            AGENT_CONFIG_TOOL_NAME.to_owned()
+        ]
     );
 
     let result = models

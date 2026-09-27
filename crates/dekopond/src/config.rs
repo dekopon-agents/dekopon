@@ -666,8 +666,6 @@ pub struct RouteConfig {
         deserialize_with = "refuse_chat_asset_inputs"
     )]
     _retired_chat_asset_inputs: (),
-    #[serde(default)]
-    pub improvement_suggestions: bool,
     /// Turning inspect_agent_config off only removes the structured config dump; the instructions
     /// stay in the system prompt regardless, so this is never a real secrecy gate against a
     /// determined user.
@@ -723,7 +721,6 @@ pub struct ResolvedRoute {
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
     pub model: Option<String>,
-    pub improvement_suggestions: bool,
     pub inspect_agent_config: bool,
     pub limits: RouteLimits,
     pub(crate) progress_detail: ProgressDetail,
@@ -1440,7 +1437,6 @@ pub(crate) fn resolve(
             subjects: route.subjects,
             agent: route.agent,
             model: route.model,
-            improvement_suggestions: route.improvement_suggestions,
             inspect_agent_config: route.inspect_agent_config,
             limits: route.limits,
             progress_detail: route.progress_detail,
