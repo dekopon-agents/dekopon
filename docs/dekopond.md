@@ -150,6 +150,7 @@ routes:                                       # first match wins; order matters
     improvementSuggestions: true              # optional; offers suggest_improvement, recorded to telemetry
     inspectAgentConfig: false                 # optional, default true; withholds inspect_agent_config
     progressDetail: plain                     # optional: off | plain (default) | detailed
+    progressNotes: false                      # optional; true lets the model write one bounded note on the progress line
     steering: abort                           # optional: abort (default) | boundary
     limits:                                   # maxDurationMs and scriptTimeoutMs are optional
       maxSteps: 8
@@ -198,6 +199,13 @@ The route's `conversation:` block is the **match**: `kind` is the word `any` or 
 The `memory:` block — which was called `conversation:` before 0.14.0 — is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
 
 `improvementSuggestions: true` offers that route's sessions the `suggest_improvement` tool: a bounded channel for the model to tell the operator how the agent could be improved — an instruction that was wrong, a skill or capability it lacked, a limit it hit — at most three times per session. It is off by default because each recorded suggestion is model-authored text written to the telemetry sink as `agent.improvement.suggested`; setting the flag is the consent that puts it there. A suggestion is advisory by construction: no instruction, skill, limit, or grant moves because a model asked, and nothing it records is relayed to chat.
+
+`progressNotes: true` offers the shell's `progress` builtin in the bash tool description and
+admits its bounded, model-authored notes to `gateway.progress` telemetry. It defaults to false:
+turning it on is consent for this text to reach telemetry and chat under the
+[security model's liveness rule](security-model.md#current-gateway-posture). *Committed direction:*
+chat rendering arrives with the note templates; notes are recorded but not rendered yet.
+A transport with liveness off or no progress surface still records an opted-in note.
 
 ### OpenRouter model settings
 
@@ -269,6 +277,7 @@ A gateway that starts and then refuses everything is worse than one that does no
   `{elapsed_s}`; `stopped` and `failed` are written after the session ended and render none. Every
   offending placeholder in the block is named, not the first;
 - an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
+- a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
 - a route with `limits.maxDurationMs: 0`, which would cancel every session the instant it started;
 - a route with `limits.scriptTimeoutMs: 0`, which would end every script the instant it started, or one whose `scriptTimeoutMs` is greater than its `maxDurationMs`, where the session bound is reached first and the script deadline could never take effect; that refusal names both numbers;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;

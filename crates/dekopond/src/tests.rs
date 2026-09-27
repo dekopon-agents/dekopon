@@ -224,6 +224,48 @@ async fn steering_defaults_to_abort_and_boundary_survives_route_binding() {
 }
 
 #[tokio::test]
+async fn progress_notes_default_off_and_bind_only_when_enabled() {
+    let directory = temporary();
+    for enabled in [false, true] {
+        let mut document = document(directory.path());
+        if enabled {
+            document["routes"][0]["progressNotes"] = json!(true);
+        }
+        let resolved = load(directory.path(), &document).await.unwrap();
+        assert_eq!(resolved.routes[0].progress_notes, enabled);
+        let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).unwrap();
+        assert_eq!(
+            routes.route(&message("hello")).unwrap().progress_notes,
+            enabled
+        );
+    }
+    let mut document = document(directory.path());
+    document["routes"][0]["progressNotes"] = json!("yes");
+    assert!(matches!(
+        load(directory.path(), &document).await,
+        Err(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
+async fn progress_notes_without_detail_reports_every_conflicting_route() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["progressNotes"] = json!(true);
+    document["routes"][0]["progressDetail"] = json!("off");
+    let route = document["routes"][0].clone();
+    document["routes"].as_array_mut().unwrap().push(route);
+    let Err(ConfigError::Invalid { problems, .. }) = load(directory.path(), &document).await else {
+        panic!("both note/detail conflicts must be refused");
+    };
+    for index in 0..2 {
+        assert!(problems.iter().any(|problem| matches!(
+            problem, crate::config::ConfigProblem::ProgressNotesWithoutDetail { route } if *route == index
+        )));
+    }
+}
+
+#[tokio::test]
 async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -2940,6 +2982,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
         steering: crate::config::Steering::Abort,
+        progress_notes: false,
         memory: MemoryPolicy::OneShot,
         wakes: false,
         cache_key: cache_key::for_route(),

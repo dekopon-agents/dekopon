@@ -1398,10 +1398,14 @@ async fn session(
         .is_some_and(|continuation| continuation.inherited);
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
+    let progress_notes = route.progress_notes;
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
-    let leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    let mut leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    if progress_notes {
+        leg = leg.with_progress_notes();
+    }
     drop(sink);
     let wakes = route
         .wakes
@@ -1447,6 +1451,9 @@ async fn session(
         }
         if improvement_suggestions {
             inputs = inputs.with_improvement_suggestions();
+        }
+        if progress_notes {
+            inputs = inputs.with_progress_notes();
         }
         if reply_optional {
             inputs = inputs.with_optional_reply();

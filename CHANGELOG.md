@@ -10,6 +10,8 @@ All notable changes to Dekopon are documented here. The format is based on
 ### Added
 
 - Shell `progress "text" [--eta S]` builtin for optional invoker notes, silent without a note sink.
+- Opt-in route `progressNotes` enables cleaned, bounded progress notes and `gateway.progress`
+  note telemetry, with per-script and per-session caps. Chat rendering follows separately.
 
 ### Changed
 

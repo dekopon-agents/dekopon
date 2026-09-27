@@ -532,16 +532,21 @@ when a non-exporting session's minted trace falls back to the hasher constructio
 `gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
 minted from something predictable.
 
-In-flight presentation is metadata-minimal. Every event a running session produces is one
+In-flight presentation is metadata-minimal apart from opted-in progress notes. Each admitted event a running session produces is one
 `gateway.progress` record on the message's own trace, carrying `kind` and whichever of `agent`,
 `turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,
 `calls_max`, `index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`,
-`class`, `by`, `edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has.
+`class`, `by`, `edits`, `keep_alives`, `stream.deltas`, `progress.dropped`, and
+`progress.notes_dropped` that kind has.
 `turn` is the turn a `model_turn`, `answered` or `steered` record is about; `turns` counts completed
-model calls on `kind = finished`. There is no field on
-it a prompt, a capability argument, a provider result, or model text could be written into.
-*Committed direction:* an opted-in route's `kind = note` record will carry the bounded note
-specified by the [security model's liveness rule](security-model.md#current-gateway-posture). A text
+model calls on `kind = finished`. The model-text exception is `kind = note`, carrying `note`
+and optional `note.eta_s` (whole seconds) on a route with `progressNotes: true`; its bounds are
+specified by the [security model's liveness rule](security-model.md#current-gateway-posture).
+Notes beyond the session cap are neither recorded nor queued, and the terminal record's
+`progress.notes_dropped` counts only those session-cap drops. Empty notes and per-script cap
+drops instead emit `agent_progress_note_dropped` at debug level with `reason = empty` or
+`script-cap`, never the text. No other prompt, capability argument, or provider result has a
+field in this record. A text
 delta is the one event with no record of its own: it is the newest rendering of one value, it
 arrives hundreds of times per turn, and what a reader needs is the count — which rides
 `stream.deltas` on the terminal record and on `prompt.model_turn`. That span also carries

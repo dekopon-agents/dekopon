@@ -12,6 +12,12 @@ pub(crate) const STREAMED_TEXT_BOUND_BYTES: usize = 8 * 1024;
 /// A command word is provider-authored, so it is untrusted text on its way to a person's screen
 /// even though it is not itself a credential path.
 const MAX_COMMAND_WORD_CHARS: usize = 32;
+const MAX_NOTE_CHARS: usize = 100;
+const NOTE_FORMAT_CHARACTERS: &[char] = &[
+    '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}',
+    '\u{202d}', '\u{202e}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{2066}',
+    '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+];
 
 #[derive(Clone, Debug)]
 pub enum ProgressEvent {
@@ -25,6 +31,10 @@ pub enum ProgressEvent {
     },
     Steered {
         turn: u32,
+    },
+    Note {
+        text: ProgressNote,
+        eta: Option<Duration>,
     },
     TextDelta {
         /// Never reasoning or tool-call arguments, only visible answer text; cumulative_chars lets
@@ -84,6 +94,46 @@ impl CommandWord {
             bounded.push('…');
         }
         Self(bounded)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgressNote(String);
+
+impl ProgressNote {
+    pub(crate) fn new(raw: &str) -> Option<Self> {
+        let mut text = String::new();
+        let mut count = 0;
+        let mut separator = false;
+        for character in raw.chars() {
+            if matches!(character, '<' | '>' | '@' | '[' | ']' | '`')
+                || NOTE_FORMAT_CHARACTERS.contains(&character)
+            {
+                continue;
+            }
+            if character.is_whitespace() || character.is_control() {
+                separator = !text.is_empty();
+                continue;
+            }
+            if separator && count < MAX_NOTE_CHARS {
+                text.push(' ');
+                count += 1;
+            }
+            if count == MAX_NOTE_CHARS {
+                text.truncate(text.trim_end().len());
+                text.push('…');
+                return Some(Self(text));
+            }
+            text.push(character);
+            count += 1;
+            separator = false;
+        }
+        (!text.is_empty()).then_some(Self(text))
     }
 
     #[must_use]
@@ -169,8 +219,44 @@ pub trait ProgressSink: Send + Sync {
 mod tests {
     use dekopon_model::error::InferenceError;
 
-    use super::{CommandWord, FailureClass, MAX_COMMAND_WORD_CHARS};
+    use super::{CommandWord, FailureClass, MAX_COMMAND_WORD_CHARS, ProgressNote};
     use crate::prompt::PromptError;
+
+    #[test]
+    fn a_note_deletes_mention_and_markdown_delimiters() {
+        assert_eq!(
+            ProgressNote::new("<!channel> ping @here [x](https://e.example)")
+                .unwrap()
+                .as_str(),
+            "!channel ping here x(https://e.example)"
+        );
+        assert_eq!(ProgressNote::new("`code`").unwrap().as_str(), "code");
+    }
+
+    #[test]
+    fn a_note_deletes_format_characters() {
+        assert_eq!(ProgressNote::new("a\u{202e}b").unwrap().as_str(), "ab");
+    }
+
+    #[test]
+    fn a_note_collapses_whitespace_and_controls_between_kept_characters() {
+        assert_eq!(
+            ProgressNote::new("a\n\tb \u{7}  c").unwrap().as_str(),
+            "a b c"
+        );
+    }
+
+    #[test]
+    fn a_long_note_is_cut_by_characters_with_a_marker() {
+        let note = ProgressNote::new(&"あ".repeat(150)).unwrap();
+        assert_eq!(note.as_str().chars().count(), 101);
+        assert!(note.as_str().ends_with('…'));
+    }
+
+    #[test]
+    fn a_note_empty_after_cleaning_is_absent() {
+        assert_eq!(ProgressNote::new("  <@>  "), None);
+    }
 
     #[test]
     fn a_command_word_past_the_rendering_bound_is_marked_rather_than_refused() {

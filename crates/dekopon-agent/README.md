@@ -36,12 +36,13 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   loop reports `ModelTurn`, `TextDelta`, `Answered`, and one of `Cancelled`, `Failed`, or
   `Finished`; the broker leg reports `ToolStarted`, `ToolFinished`, and `Attachment` from
   `BrokerLeg::with_progress`, which also takes the session's capability-call ceiling because the
-  leg cannot derive it. Every event is metadata except `TextDelta`, which carries
+  leg cannot derive it. Apart from opted-in `Note`, every event is metadata except `TextDelta`, which carries
   `dekopon_model::ModelText` — model-authored visible text only, bounded at 8 KiB of cumulative
   text per turn — and `CommandWord`, the provider-authored word bounded to 32 characters for
-  display. Prompts, shell arguments, tool output, and provider results have no field to travel in.
-  *Committed direction:* `Note` will carry the bounded model-authored progress note on opted-in
-  routes, as defined by the [security model's liveness rule](../../docs/security-model.md#current-gateway-posture).
+  display. `BrokerLeg::with_progress_notes()` admits `Note` with a cleaned `ProgressNote` and
+  optional ETA, within the [security model's liveness bounds](../../docs/security-model.md#current-gateway-posture).
+  Apart from that note operand, prompts, shell arguments, tool output and provider results have
+  no field to travel in.
   `FailureClass::of` classifies a `PromptError` by naming every variant, and answers `None` for a
   cancellation, which is an outcome rather than a failure.
 - `prompt::run_prompt_with_history_and_options` — that same continuation carrying a
@@ -51,6 +52,8 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
 - `prompt::SessionInputs` — the builder those entry points fill in and
   `prompt::run_prompt_session` runs. `with_steering(&dyn prompt::SteerSource)` drains queued
   user text at step boundaries and retries model-only interruptions without spending a step.
+  `with_progress_notes()` appends the builtin's guidance to the bash tool description; without
+  it that description is unchanged. Enable it alongside `BrokerLeg::with_progress_notes()`.
   Two other opt-ins are described below:
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
   offers no tool; `with_improvement_suggestions()` offers `suggest_improvement`, which is never

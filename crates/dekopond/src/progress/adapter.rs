@@ -12,10 +12,12 @@ use crate::{session::SessionCancellation, transport::StreamedText};
 pub(crate) const EVENT_QUEUE: usize = 64;
 
 const NO_TURN: u32 = 0;
+const MAX_NOTES_PER_SESSION: u32 = 24;
 
 #[derive(Debug, Default)]
 pub(crate) struct ProgressCounters {
     pub dropped: AtomicU32,
+    pub notes_dropped: AtomicU32,
     pub deltas: AtomicU32,
 }
 
@@ -24,6 +26,7 @@ pub(crate) struct ProgressAdapter {
     events: mpsc::Sender<ProgressEvent>,
     text: watch::Sender<StreamedText>,
     turn: AtomicU32,
+    notes: AtomicU32,
     counters: Arc<ProgressCounters>,
     cancellation: SessionCancellation,
 }
@@ -41,6 +44,7 @@ impl ProgressAdapter {
             events,
             text,
             turn: AtomicU32::new(NO_TURN),
+            notes: AtomicU32::new(0),
             counters,
             cancellation,
         }
@@ -49,6 +53,17 @@ impl ProgressAdapter {
 
 impl ProgressSink for ProgressAdapter {
     fn emit(&self, event: ProgressEvent) {
+        if matches!(event, ProgressEvent::Note { .. })
+            && self
+                .notes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_NOTES_PER_SESSION).then_some(count + 1)
+                })
+                .is_err()
+        {
+            self.counters.notes_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let ProgressEvent::TextDelta { turn, text, .. } = &event {
             self.counters.deltas.fetch_add(1, Ordering::Relaxed);
             let restart = self.turn.swap(*turn, Ordering::Relaxed) != *turn;
@@ -96,9 +111,6 @@ impl ProgressSink for ProgressAdapter {
     }
 }
 
-/// Metadata only, by construction: every field here is a counter, duration, or fixed operator word,
-/// with none that a prompt, capability argument, provider result, or model text could be written
-/// into.
 pub(crate) fn record(event: &ProgressEvent) {
     match event {
         ProgressEvent::Started { agent, max_steps } => tracing::info!(
@@ -114,6 +126,11 @@ pub(crate) fn record(event: &ProgressEvent) {
         ProgressEvent::Steered { turn } => tracing::info!(
             target: "dekopond::audit",
             { audit.event = "gateway.progress", kind = "steered", turn = *turn },
+            "gateway progress"
+        ),
+        ProgressEvent::Note { text, eta } => tracing::info!(
+            target: "dekopond::audit",
+            { audit.event = "gateway.progress", kind = "note", note = text.as_str(), note.eta_s = eta.map(|eta| eta.as_secs()) },
             "gateway progress"
         ),
         ProgressEvent::TextDelta { .. } => {}

@@ -209,6 +209,7 @@ pub struct SessionInputs<'a> {
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
 
@@ -230,6 +231,7 @@ impl<'a> SessionInputs<'a> {
             optional_reply: false,
             skills: &[],
             improvement_suggestions: false,
+            progress_notes: false,
             wakes: None,
         }
     }
@@ -258,6 +260,12 @@ impl<'a> SessionInputs<'a> {
     #[must_use]
     pub const fn with_improvement_suggestions(mut self) -> Self {
         self.improvement_suggestions = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_progress_notes(mut self) -> Self {
+        self.progress_notes = true;
         self
     }
 
@@ -329,6 +337,7 @@ struct SessionExtensions<'a> {
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
 
@@ -357,6 +366,7 @@ where
         optional_reply,
         skills,
         improvement_suggestions,
+        progress_notes,
         wakes,
     } = inputs;
     let fallback = CompletionOptions::default();
@@ -400,6 +410,7 @@ where
             optional_reply,
             skills,
             improvement_suggestions,
+            progress_notes,
             wakes,
         },
     );
@@ -498,9 +509,14 @@ where
         optional_reply,
         skills,
         improvement_suggestions,
+        progress_notes,
         wakes,
     } = extensions;
-    let mut model_tools = vec![script_tool(&runtime.command_words())];
+    let mut script = script_tool(&runtime.command_words());
+    if progress_notes {
+        script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+    }
+    let mut model_tools = vec![script];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
     }
@@ -1827,6 +1843,7 @@ mod tests {
             }
             ProgressEvent::ModelTurn { turn, of } => format!("model-turn {turn}/{of}"),
             ProgressEvent::Steered { turn } => format!("steered {turn}"),
+            ProgressEvent::Note { text, eta } => format!("note {:?} {eta:?}", text.as_str()),
             ProgressEvent::TextDelta {
                 turn,
                 text,
@@ -3121,6 +3138,29 @@ mod tests {
             tool.description
         );
         assert_no_doubled_spaces(&tool.description);
+    }
+
+    #[test]
+    fn the_progress_description_is_offered_only_by_the_session_opt_in() {
+        for enabled in [false, true] {
+            let model = ScriptedModel::new([answer("done")]);
+            let runtime = RecordingRuntime::new(0);
+            let mut inputs = SessionInputs::new("work", limits(1, 1));
+            if enabled {
+                inputs = inputs.with_progress_notes();
+            }
+            run_prompt_session(&model, &runtime, inputs, &mut History::default()).unwrap();
+            let tools = model.observed_tools.lock().unwrap();
+            let script = tools[0]
+                .iter()
+                .find(|tool| tool.name == SCRIPT_TOOL_NAME)
+                .unwrap();
+            let mut expected = script_tool(&runtime.command_words()).description;
+            if enabled {
+                expected.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+            }
+            assert_eq!(script.description, expected);
+        }
     }
 
     fn assert_no_doubled_spaces(description: &str) {

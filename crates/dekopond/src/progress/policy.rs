@@ -391,6 +391,7 @@ impl Surface {
             }
             ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
             ProgressEvent::Steered { .. }
+            | ProgressEvent::Note { .. }
             | ProgressEvent::TextDelta { .. }
             | ProgressEvent::KeepAlive { .. }
             | ProgressEvent::Cancelled { .. }
@@ -852,6 +853,7 @@ impl Surface {
                 keep_alives = self.keep_alives,
                 stream.deltas = self.counters.deltas.load(Ordering::Relaxed),
                 progress.dropped = self.counters.dropped.load(Ordering::Relaxed),
+                progress.notes_dropped = self.counters.notes_dropped.load(Ordering::Relaxed),
             },
             "gateway progress"
         );
