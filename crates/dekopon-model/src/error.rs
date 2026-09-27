@@ -21,8 +21,6 @@ impl ProviderCode {
 pub enum InferenceError {
     #[error("invalid model request: {0}")]
     InvalidRequest(#[from] RequestError),
-    #[error("unsupported model feature: {0}")]
-    Unsupported(#[from] UnsupportedFeature),
     #[error("model request failed: {0}")]
     Provider(#[from] ProviderFailure),
     #[error("model transport failed: {0}")]
@@ -63,12 +61,6 @@ pub enum RequestError {
     EmptyModel,
     #[error("bearer tokens require HTTPS or a loopback HTTP endpoint")]
     InsecureBearer,
-}
-
-#[derive(Debug, Error)]
-pub enum UnsupportedFeature {
-    #[error("model returned unsupported tool kind {0:?}")]
-    ToolKind(String),
 }
 
 #[derive(Debug, Error)]

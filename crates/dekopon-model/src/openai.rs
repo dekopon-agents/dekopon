@@ -294,11 +294,8 @@ fn turn_from_response(
         .message
         .tool_calls
         .into_iter()
-        .map(|call| call.into_model(secrets))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        .filter_map(|call| call.into_model(secrets).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(complete_turn(
         choice.message.content,
         tool_calls,
@@ -558,6 +555,7 @@ struct WireAssistantMessage {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WireToolCall {
+    #[serde(default)]
     id: String,
     #[serde(rename = "type")]
     kind: String,
@@ -578,6 +576,11 @@ impl WireToolCall {
     ) -> Result<Option<ModelToolCall>, InferenceError> {
         let call = self;
         if call.kind != "function" {
+            tracing::debug!(
+                event = "unknown_tool_item_skipped",
+                kind = %secrets.sanitize(&call.kind),
+                "skipped a tool item of a kind this client does not know"
+            );
             return Ok(None);
         }
         let function = call
@@ -810,7 +813,7 @@ impl ChatStream {
         let tool_calls = self
             .calls
             .into_iter()
-            .map(|call| {
+            .filter_map(|call| {
                 WireToolCall {
                     id: call.id,
                     kind: if call.kind.is_empty() {
@@ -824,11 +827,9 @@ impl ChatStream {
                     }),
                 }
                 .into_model(secrets)
+                .transpose()
             })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(complete_turn(
             (!self.content.is_empty()).then_some(self.content),
             tool_calls,
@@ -1951,8 +1952,8 @@ mod tests {
         assert!(recorded(&events).is_empty());
     }
 
-    #[tokio::test]
-    async fn an_unknown_tool_item_is_skipped_and_the_answer_survives() {
+    #[test]
+    fn an_unknown_tool_item_is_skipped_and_the_answer_survives() {
         let response: ChatResponse = serde_json::from_value(json!({
             "choices": [{
                 "finish_reason": "stop",

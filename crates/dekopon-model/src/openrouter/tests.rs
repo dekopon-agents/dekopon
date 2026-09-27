@@ -584,12 +584,30 @@ async fn finish_reasons_keep_complete_text_and_skip_unknown_tools_but_refuse_fil
             "finish_reason":"stop"
         }]})
     );
-    let server = MockServer::start(vec![MockResponse::sse(&body)]);
-    let turn = generate(&client(&server, Settings::default()), &[])
+    let server = MockServer::start(vec![
+        MockResponse::sse(&body),
+        MockResponse::sse(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+        )),
+    ]);
+    let client = client(&server, Settings::default());
+    let mut messages = vec![ModelMessage::user("go")];
+    let turn = generate(&client, &messages)
         .await
         .expect("an unknown tool item is skipped, not rejected");
     assert_eq!(turn.content.as_deref(), Some("answer"));
     assert!(turn.tool_calls.is_empty());
+
+    messages.push(assistant_message(&turn));
+    messages.push(ModelMessage::user("continue"));
+    generate(&client, &messages)
+        .await
+        .expect("the follow-up turn completes");
+
+    let second_request = request_json(&server.requests()[1]).to_string();
+    assert!(!second_request.contains("computer"));
+    assert!(!second_request.contains("call-1"));
     requests_have_only_the_authored_headers(&server);
 }
 
