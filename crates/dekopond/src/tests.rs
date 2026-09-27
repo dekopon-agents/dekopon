@@ -3158,6 +3158,7 @@ fn fixture_liveness() -> BTreeMap<String, Arc<ResolvedLiveness>> {
             classic_fallback: SlackLivenessFallback::None,
             progress: ProgressSurface::Message,
             stream: true,
+            status_text: false,
             cancel_button: true,
         },
         keep_alive: KeepAlive {
@@ -12895,6 +12896,7 @@ fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_aliv
             classic_fallback: SlackLivenessFallback::None,
             progress: ProgressSurface::Message,
             stream: false,
+            status_text: false,
             cancel_button: true,
         },
         keep_alive: KeepAlive {

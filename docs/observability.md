@@ -553,7 +553,7 @@ arrives hundreds of times per turn, and what a reader needs is the count — whi
 `stream.first_delta_ms`, the wait before the turn's first visible text.
 
 The rendering itself is debug-level. `gateway_progress_rendered` carries `transport`, `primitive`
-(`typing`, `status`, `reaction`, `progress`, `stream`, `finalize`, `delete`), `outcome`, the stable
+(`typing`, `status`, `status_text`, `reaction`, `progress`, `stream`, `finalize`, `delete`), `outcome`, the stable
 transport-error category on a failure, and `chars` on a stream render — which is what was actually
 on screen, rather than what the model had written by then. `gateway_progress_degraded` names the
 `primitive` that two consecutive failures stopped for that session and the `category` of the failure
@@ -565,7 +565,7 @@ carries the running `count` of events the policy's bounded queue could not take,
 the session task that asked for it had already gone, so the receipt saying whether the person was
 told went nowhere.
 A permanent Slack installation fallback emits the same degraded record with `transport=slack` and a
-`surface` of `agent-status` or `reaction`, which is a transport-wide breaker rather than a
+`surface` of `agent-status`, `assistant-status` or `reaction`, which is a transport-wide breaker rather than a
 per-session one. `gateway_session_stop_requested` carries the transport and
 `via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
 the transport and `reason` (`no-session`, `other-subject`, `already-ended`). Three transport-side

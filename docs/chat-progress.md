@@ -46,7 +46,7 @@ is cooperative, at the next boundary, and never rolls back. Streaming moves that
 
 | Surface | Liveness | Edit in place | Streamed text | Cancel affordance |
 |---|---|---|---|---|
-| Slack agent experience | native session status, with the service's own Stop control | `chat.update`, 4,000 characters | `chat.startStream` / `appendStream` / `stopStream`, thread replies only | the service's Stop |
+| Slack agent experience | native session status and Stop; opt-in status text via `assistant.threads.setStatus` | `chat.update`, 4,000 characters | `chat.startStream` / `appendStream` / `stopStream`, thread replies only | the service's Stop |
 | Slack classic | reaction on the inbound message | `chat.update` | the same streaming methods, in a thread | a Block Kit button, acknowledged over the socket |
 | Discord | typing lease, renewed inside 10 s; bot reactions | message edit, 2,000 characters | cumulative edits on a 2 s floor | a button, acknowledged within 3 s |
 | Telegram | chat action, renewed inside 5 s; bot reactions | `editMessageText`, 4,096 UTF-16 units | cumulative edits on a 3 s floor | an inline keyboard, answered within the query's deadline |
@@ -187,6 +187,9 @@ Rendering, for whichever capability objects the driver returns, at the route's d
    edit interval, 60 edits per session, 10 keep-alives.
 4. Keep-alive at 15 s, 45 s, then every 60 s, always an edit and never a new post.
 5. With streaming on and a `TextStream` present, the stream is the surface.
+6. Slack Agent `statusText: true` can hand over to custom status text on the first note, sharing
+   the same line selection, coalescing and edit budget. See the [Slack transport contract](dekopond.md#slack-socket-mode)
+   for the hidden native Stop, refresh lease, fallback and terminal ordering.
 
 Detail levels are per route: `off` suppresses progress prose but not explicitly requested answer
 streaming or ambient indicators; `plain` shows

@@ -228,6 +228,7 @@ impl Breaker {
 struct Breakers {
     typing: Breaker,
     status: Breaker,
+    status_text: Breaker,
     reaction: Breaker,
     progress: Breaker,
     stream: Breaker,
@@ -237,6 +238,13 @@ struct Breakers {
 enum Line {
     Status,
     KeepAlive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusTextState {
+    Waiting,
+    HandedOver,
+    RestoreAttempted,
 }
 
 struct Surface {
@@ -272,6 +280,7 @@ struct Surface {
     breakers: Breakers,
     indicator_active: bool,
     status_attempted: bool,
+    status_text: StatusTextState,
     reaction_attempted: bool,
 }
 
@@ -313,6 +322,7 @@ impl Surface {
             breakers: Breakers::default(),
             indicator_active: false,
             status_attempted: false,
+            status_text: StatusTextState::Waiting,
             reaction_attempted: false,
         }
     }
@@ -488,7 +498,7 @@ impl Surface {
         }
         if !self.posted_on_text {
             self.posted_on_text = true;
-            if self.message.is_none() {
+            if self.message.is_none() && self.status_text == StatusTextState::Waiting {
                 self.render(Line::Status, true).await;
             }
         }
@@ -535,6 +545,9 @@ impl Surface {
                 self.state.note = None;
             }
             self.render(Line::KeepAlive, true).await;
+            if self.next_keep_alive.is_none() {
+                self.restore_native_status().await;
+            }
         }
         // Cleared before attempting the render, not after, so a declined render does not leave a
         // past deadline that wakes this loop again immediately.
@@ -602,24 +615,49 @@ impl Surface {
 
     async fn render(&mut self, line: Line, allow_post: bool) {
         self.clear_obsolete_note();
-        if !self.writes_progress() || !self.coordination.running() {
+        if !self.coordination.running() {
             return;
         }
-        if !self.breakers.progress.allows() {
+        let driver = Arc::clone(&self.driver);
+        let status_text = if self.native()
+            && self.detail != ProgressDetail::Off
+            && self.settings.status_text
+            && !self.writes_progress()
+            && (self.state.note.is_some() || self.status_text != StatusTextState::Waiting)
+        {
+            driver.status_text()
+        } else {
+            None
+        };
+        if self.status_text != StatusTextState::Waiting && status_text.is_none() {
+            self.restore_native_status().await;
+            return;
+        }
+        if !self.writes_progress() && status_text.is_none() {
             return;
         }
         let Some(target) = self.target.clone() else {
             return;
         };
-        let driver = Arc::clone(&self.driver);
-        let Some(progress) = driver.progress() else {
-            return;
+        let progress = driver.progress();
+        let min_interval = if let Some(status_text) = status_text {
+            if !self.breakers.status_text.allows() {
+                self.restore_native_status().await;
+                return;
+            }
+            status_text.min_interval()
+        } else {
+            if !self.breakers.progress.allows() {
+                return;
+            }
+            let Some(progress) = progress else { return };
+            if self.message.is_none() && !allow_post {
+                return;
+            }
+            progress.limits().min_edit_interval
         };
-        if self.message.is_none() && !allow_post {
-            return;
-        }
         let now = Instant::now();
-        if self.message.is_some()
+        if (self.message.is_some() || self.status_text != StatusTextState::Waiting)
             && let Some(earliest) = self.earliest_edit
             && now < earliest
         {
@@ -641,39 +679,88 @@ impl Surface {
         self.pending = None;
         self.state.elapsed = now.saturating_duration_since(self.started.unwrap_or(now));
         let text = self.line(line);
-        let cancel = self.cancel_control();
-        let limits = progress.limits();
-        let creating = self.message.is_none();
-        let outcome = match self.message.clone() {
-            Some(message) => bounded(progress.edit(&message, &text, cancel))
+        let creating = status_text.is_none() && self.message.is_none();
+        let outcome = if let Some(status_text) = status_text {
+            if self.status_text == StatusTextState::Waiting {
+                self.status_text = StatusTextState::HandedOver;
+                if let Some(status) = driver.status() {
+                    self.status_attempted = true;
+                    let outcome = bounded(status.set(&target, Status::Idle)).await;
+                    self.observe(outcome, "status");
+                }
+            }
+            bounded(status_text.show(&target, &text))
                 .await
-                .map(|()| None),
-            None => bounded(progress.post(&target, &text, cancel))
-                .await
-                .map(Some),
+                .map(|()| None)
+        } else {
+            let Some(progress) = progress else { return };
+            let cancel = self.cancel_control();
+            match self.message.clone() {
+                Some(message) => bounded(progress.edit(&message, &text, cancel))
+                    .await
+                    .map(|()| None),
+                None => bounded(progress.post(&target, &text, cancel))
+                    .await
+                    .map(Some),
+            }
         };
-        self.earliest_edit = Some(Instant::now() + limits.min_edit_interval);
+        self.earliest_edit = Some(Instant::now() + min_interval);
         self.edits = self.edits.saturating_add(1);
+        let (breaker, primitive) = if status_text.is_some() {
+            (&mut self.breakers.status_text, "status_text")
+        } else {
+            (&mut self.breakers.progress, "progress")
+        };
         match outcome {
             Ok(posted) => {
-                self.breakers.progress.succeeded();
+                breaker.succeeded();
                 if let Some(message) = posted {
                     self.message = Some(message);
                 }
                 tracing::debug!(
                     event = "gateway_progress_rendered",
                     transport = %self.transport,
-                    primitive = "progress",
+                    primitive,
                     outcome = "ok"
                 );
             }
             Err(category) if creating && category == DEADLINE_MISSED => {
-                self.breakers.progress.orphaned(&self.transport, "progress")
+                breaker.orphaned(&self.transport, primitive)
             }
-            Err(category) => self
-                .breakers
-                .progress
-                .failed(&self.transport, "progress", category),
+            Err(category) => breaker.failed(&self.transport, primitive, category),
+        }
+        if status_text.is_some()
+            && (!self.breakers.status_text.allows()
+                || driver.status_text().is_none()
+                || self.next_keep_alive.is_none()
+                || self.edits >= MAX_EDITS)
+        {
+            self.restore_native_status().await;
+        }
+    }
+
+    async fn restore_native_status(&mut self) {
+        if self.status_text != StatusTextState::HandedOver {
+            return;
+        }
+        self.status_text = StatusTextState::RestoreAttempted;
+        let driver = Arc::clone(&self.driver);
+        if let (Some(target), Some(status)) = (&self.target, driver.status()) {
+            self.status_attempted = true;
+            let outcome = bounded(status.set(target, Status::Working)).await;
+            self.observe(outcome, "status");
+        }
+    }
+
+    async fn clear_status_text(&mut self) {
+        if self.status_text == StatusTextState::Waiting {
+            return;
+        }
+        self.status_text = StatusTextState::Waiting;
+        let driver = Arc::clone(&self.driver);
+        if let (Some(target), Some(status_text)) = (&self.target, driver.status_text()) {
+            let outcome = bounded(status_text.clear(target)).await;
+            self.observe(outcome, "status_text");
         }
     }
 
@@ -759,6 +846,7 @@ impl Surface {
         self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
         self.stream_pending = false;
         self.coordination.seal();
+        self.clear_status_text().await;
         self.record_terminal(&terminal);
         let streamed = self.streamed_text();
         match terminal {
@@ -907,6 +995,11 @@ impl Surface {
     }
 
     async fn cleanup(&mut self) {
+        self.state.note = None;
+        self.clear_status_text().await;
+        if !self.streaming {
+            self.discard().await;
+        }
         if !self.native() {
             return;
         }
@@ -932,6 +1025,7 @@ impl Surface {
         let breaker = match primitive {
             "typing" => &mut self.breakers.typing,
             "status" => &mut self.breakers.status,
+            "status_text" => &mut self.breakers.status_text,
             "reaction" => &mut self.breakers.reaction,
             _ => &mut self.breakers.progress,
         };

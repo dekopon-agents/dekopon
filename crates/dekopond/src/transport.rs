@@ -399,6 +399,17 @@ pub(crate) trait NativeStatus: Send + Sync {
     async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError>;
 }
 
+#[async_trait]
+pub(crate) trait StatusText: Send + Sync {
+    fn min_interval(&self) -> Duration;
+    async fn show(
+        &self,
+        target: &LivenessTarget,
+        text: &ProgressText,
+    ) -> Result<(), TransportError>;
+    async fn clear(&self, target: &LivenessTarget) -> Result<(), TransportError>;
+}
+
 #[derive(Debug)]
 pub(crate) enum LinkPreviews {
     Default,
@@ -477,6 +488,10 @@ pub(crate) trait ChatDriver: Send + Sync {
     }
 
     fn status(&self) -> Option<&dyn NativeStatus> {
+        None
+    }
+
+    fn status_text(&self) -> Option<&dyn StatusText> {
         None
     }
 

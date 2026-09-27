@@ -27,7 +27,7 @@ use crate::{
     transport::{
         CancelButton, CancelPress, ChatDriver, InboundReaction, LivenessTarget, MessageRef,
         NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, Status,
-        StreamLimits, StreamedText, TextStream, TransportError, TypingLease,
+        StatusText, StreamLimits, StreamedText, TextStream, TransportError, TypingLease,
     },
 };
 
@@ -36,6 +36,8 @@ enum Call {
     Reaction(bool),
     Typing,
     Status(Status),
+    StatusText(String),
+    ClearStatusText,
     Post(String),
     Edit(String),
     Delete,
@@ -51,6 +53,7 @@ const STALL: Duration = Duration::from_secs(60);
 struct Recorder {
     calls: Mutex<Vec<Call>>,
     refuse_progress: AtomicU32,
+    refuse_status_text: AtomicU32,
     refuse_finalize: AtomicU32,
     stall_progress: AtomicU32,
     stall_finalize: AtomicU32,
@@ -103,6 +106,7 @@ impl Recorder {
 struct Offers {
     typing: bool,
     status: bool,
+    status_text: bool,
     reaction: bool,
     progress: bool,
     stream: bool,
@@ -114,6 +118,7 @@ impl Default for Offers {
         Self {
             typing: true,
             status: true,
+            status_text: false,
             reaction: true,
             progress: true,
             stream: false,
@@ -144,6 +149,31 @@ impl TypingLease for Surfaces {
 impl NativeStatus for Surfaces {
     async fn set(&self, _target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
         self.recorder.push(Call::Status(status));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StatusText for Surfaces {
+    fn min_interval(&self) -> Duration {
+        self.min_edit_interval
+    }
+
+    async fn show(
+        &self,
+        _target: &LivenessTarget,
+        text: &crate::progress::ProgressText,
+    ) -> Result<(), TransportError> {
+        self.recorder
+            .push(Call::StatusText(text.as_str().to_owned()));
+        if self.recorder.counted(&self.recorder.refuse_status_text) {
+            return Err(TransportError::Response);
+        }
+        Ok(())
+    }
+
+    async fn clear(&self, _target: &LivenessTarget) -> Result<(), TransportError> {
+        self.recorder.push(Call::ClearStatusText);
         Ok(())
     }
 }
@@ -301,6 +331,12 @@ impl ChatDriver for TestDriver {
             .then_some(&self.surfaces as &dyn NativeStatus)
     }
 
+    fn status_text(&self) -> Option<&dyn StatusText> {
+        self.offers
+            .status_text
+            .then_some(&self.surfaces as &dyn StatusText)
+    }
+
     fn progress(&self) -> Option<&dyn ProgressMessage> {
         self.offers
             .progress
@@ -352,6 +388,7 @@ fn liveness_with(stream: bool, keep_alive: KeepAlive) -> Arc<ResolvedLiveness> {
             classic_fallback: crate::config::SlackLivenessFallback::None,
             progress: ProgressSurface::Message,
             stream,
+            status_text: false,
             cancel_button: false,
         },
         keep_alive,
@@ -648,6 +685,324 @@ async fn a_dropped_invalidation_clears_the_live_note_and_rejects_queued_old_note
         );
         harness.policy.terminal(Terminal::Silent).await;
     }
+}
+
+fn status_harness(keep_alive: KeepAlive) -> Harness {
+    let mut config = liveness_with(false, keep_alive);
+    let settings = &mut Arc::get_mut(&mut config).unwrap().settings;
+    settings.progress = ProgressSurface::Auto;
+    settings.status_text = true;
+    start(
+        Offers {
+            status_text: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Plain,
+        config,
+    )
+}
+
+#[tokio::test]
+async fn an_available_status_text_surface_still_requires_transport_opt_in() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let mut config = ticking();
+    Arc::get_mut(&mut config).unwrap().settings.progress = ProgressSurface::Auto;
+    let mut harness = start(
+        Offers {
+            status_text: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Plain,
+        config,
+    );
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    assert_eq!(harness.recorder.calls(), [Call::Status(Status::Working)]);
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn status_text_hands_over_only_for_a_note_and_uses_existing_coalescing_and_ticks() {
+    let first = note_event("rendering", Some(Duration::from_secs(40))).await;
+    let later = note_event("uploading", None).await;
+    tokio::time::pause();
+    let mut harness = status_harness(KeepAlive::default());
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    assert_eq!(harness.recorder.calls(), [Call::Status(Status::Working)]);
+    harness.sink.emit(first);
+    settle().await;
+    assert_eq!(
+        harness.recorder.calls(),
+        [
+            Call::Status(Status::Working),
+            Call::Status(Status::Idle),
+            Call::StatusText("rendering (~40 s)…".to_owned())
+        ]
+    );
+    let text = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text,
+    });
+    harness.sink.emit(later);
+    settle().await;
+    assert_eq!(harness.recorder.calls().len(), 3);
+    advance(Duration::from_secs(4)).await;
+    assert_eq!(
+        harness.recorder.calls().last(),
+        Some(&Call::StatusText("uploading…".to_owned()))
+    );
+    advance(Duration::from_secs(12)).await;
+    assert_eq!(
+        harness
+            .recorder
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, Call::StatusText(_)))
+            .count(),
+        3
+    );
+    advance(Duration::from_secs(4)).await;
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 2, of: 8 });
+    settle().await;
+    assert_eq!(
+        harness.recorder.calls().last(),
+        Some(&Call::StatusText("Working on it…".to_owned()))
+    );
+    assert!(harness.recorder.texts().is_empty());
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn every_terminal_clears_status_text_before_delivery_and_native_cleanup() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    for (terminal, answer) in [
+        (
+            Terminal::Answered(OutboundReply::text("done")),
+            Some("done"),
+        ),
+        (
+            Terminal::Failed(FAILURE_REPLY.to_owned()),
+            Some(FAILURE_REPLY),
+        ),
+        (
+            Terminal::Cancelled {
+                by: CancelSource::Budget {
+                    limit: BudgetLimit::WallClock,
+                },
+            },
+            Some(STOPPED_REPLY),
+        ),
+        (Terminal::Silent, None),
+    ] {
+        let mut harness = status_harness(KeepAlive::default());
+        harness.sink.emit(started());
+        harness.sink.emit(note.clone());
+        settle().await;
+        harness.policy.terminal(terminal).await;
+        settle().await;
+        let mut expected = vec![
+            Call::Status(Status::Working),
+            Call::Status(Status::Idle),
+            Call::StatusText("waiting…".to_owned()),
+            Call::ClearStatusText,
+        ];
+        expected.extend(answer.map(|answer| Call::Reply(answer.to_owned())));
+        expected.push(Call::Status(Status::Idle));
+        assert_eq!(harness.recorder.calls(), expected);
+    }
+}
+
+#[tokio::test]
+async fn a_stop_after_handover_clears_status_text_before_the_stopped_reply() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let mut harness = status_harness(KeepAlive::default());
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    assert!(harness.cancellation.cancel(CancelSource::User {
+        via: CancelVia::StopReply
+    }));
+    settle().await;
+    assert_eq!(
+        &harness.recorder.calls()[3..],
+        [
+            Call::ClearStatusText,
+            Call::Reply(STOPPED_REPLY.to_owned()),
+            Call::Status(Status::Idle)
+        ]
+    );
+    assert!(!harness.policy.terminal(Terminal::Silent).await);
+}
+
+#[tokio::test]
+async fn two_status_text_failures_restore_native_working_once_and_stop_showing() {
+    let note = note_event("waiting", None).await;
+    let (capture, _guard) = capture();
+    tokio::time::pause();
+    let mut harness = status_harness(KeepAlive::default());
+    harness
+        .recorder
+        .refuse_status_text
+        .store(2, Ordering::Relaxed);
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    advance(Duration::from_secs(16)).await;
+    let calls = harness.recorder.calls();
+    assert_eq!(
+        calls,
+        [
+            Call::Status(Status::Working),
+            Call::Status(Status::Idle),
+            Call::StatusText("waiting…".to_owned()),
+            Call::StatusText("waiting…".to_owned()),
+            Call::Status(Status::Working)
+        ]
+    );
+    advance(Duration::from_secs(31)).await;
+    assert_eq!(harness.recorder.calls(), calls);
+    let degraded = events_named(&capture, "gateway_progress_degraded");
+    assert_eq!(degraded.len(), 1);
+    assert!(
+        degraded[0].contains("primitive=\"status_text\"")
+            && degraded[0].contains("category=\"response\"")
+    );
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn the_last_status_tick_restores_working_without_adding_a_refresh_timer() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let mut harness = status_harness(KeepAlive {
+        max: 1,
+        ..KeepAlive::default()
+    });
+    harness.sink.emit(started());
+    harness.sink.emit(note.clone());
+    settle().await;
+    advance(Duration::from_secs(16)).await;
+    let calls = harness.recorder.calls();
+    assert_eq!(
+        calls,
+        [
+            Call::Status(Status::Working),
+            Call::Status(Status::Idle),
+            Call::StatusText("waiting…".to_owned()),
+            Call::StatusText("waiting…".to_owned()),
+            Call::Status(Status::Working)
+        ]
+    );
+    advance(Duration::from_secs(120)).await;
+    assert_eq!(harness.recorder.calls(), calls);
+    harness.sink.emit(note);
+    settle().await;
+    assert_eq!(harness.recorder.calls().len(), calls.len() + 1);
+    assert_eq!(
+        harness.recorder.calls().last(),
+        Some(&Call::StatusText("waiting…".to_owned()))
+    );
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn exhausting_status_edits_restores_working_before_the_remaining_keep_alive() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let mut harness = status_harness(KeepAlive {
+        at: vec![Duration::from_secs(600)],
+        every: Duration::from_secs(600),
+        max: 1,
+    });
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    for turn in 1..60 {
+        advance(Duration::from_secs(4)).await;
+        harness
+            .sink
+            .emit(ProgressEvent::ModelTurn { turn, of: 100 });
+        settle().await;
+    }
+    assert_eq!(
+        harness
+            .recorder
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, Call::StatusText(_)))
+            .count(),
+        60
+    );
+    let calls = harness.recorder.calls();
+    assert_eq!(
+        &calls[calls.len() - 2..],
+        [
+            Call::StatusText("Working on it…".to_owned()),
+            Call::Status(Status::Working)
+        ]
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| **call == Call::Status(Status::Working))
+            .count(),
+        2
+    );
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 60, of: 100 });
+    settle().await;
+    advance(Duration::from_secs(4)).await;
+    assert_eq!(harness.recorder.calls(), calls);
+    advance(Duration::from_secs(600)).await;
+    assert_eq!(harness.recorder.calls(), calls);
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn abandoning_the_policy_deletes_its_progress_note_without_replying() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Post("waiting…".to_owned())]
+    );
+    drop(harness.policy);
+    settle().await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Post("waiting…".to_owned()), Call::Delete]
+    );
+}
+
+#[tokio::test]
+async fn abandoning_the_policy_clears_its_owned_status_text() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let harness = status_harness(KeepAlive::default());
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    drop(harness.policy);
+    settle().await;
+    assert_eq!(
+        &harness.recorder.calls()[3..],
+        [Call::ClearStatusText, Call::Status(Status::Idle)]
+    );
 }
 
 #[tokio::test]
@@ -1107,6 +1462,7 @@ async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messa
         let mut harness = start(
             Offers {
                 status,
+                status_text: false,
                 typing,
                 reaction,
                 progress,
