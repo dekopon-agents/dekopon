@@ -73,7 +73,7 @@ pub use config::{StorageConfigError, StorageLimits};
 pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
 pub use sweep::{RetentionPolicies, SweepSummary};
-pub use vfs::{Durability, FileStat, LockLevel, OpenOptions};
+pub use vfs::{Durability, FileStat, OpenOptions};
 
 use key::{
     DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_NAMESPACE_PATH,

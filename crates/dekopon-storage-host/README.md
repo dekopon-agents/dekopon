@@ -29,8 +29,7 @@ usage after a partial syscall failure retains conservative headroom. Sparse gaps
 and JSONL's host-added LF consume write/quota budgets. Authority-pointer replacement and entry
 operations retain temporary headroom; direct JSONL replacement and positional writes reserve
 live-file growth, not a staged copy of the existing file.
-`maxPendingTransactions` bounds concurrently active invocation handles; it is not a transaction
-queue.
+`maxActiveInvocations` bounds concurrently active invocation handles.
 
 `maxReadBytesPerInvocation` bounds what one invocation pulls into memory. A positional durable-file
 read or JSONL chunk charges the length it asks for, whatever it returns, and `maxReadBytesPerCall`
@@ -64,29 +63,6 @@ last invocation handle closes.
 
 A file identity is nonzero, equality-only, and stable for one live logical file. It is not an inode,
 path, generation, timestamp, or ordering value.
-
-### Lock table
-
-Promotion is exactly:
-
-```text
-none -> shared -> reserved -> pending -> exclusive
-```
-
-A skipped or reversed promotion is `invalid-argument`. `unlock(to)` may downgrade to any level no
-higher than the handle's current level; drop releases every level. Shared locks coexist. Only one
-handle may hold reserved or pending. Pending blocks every new shared reader while existing shared
-readers drain. Exclusive requires every other handle on that file to be at `none`. Incompatible handles in the same invocation return `busy` immediately rather than waiting
-and deadlocking a single-threaded guest. `check-reserved-lock` observes reserved, pending, or
-exclusive on any live handle.
-
-These are rollback-journal primitives, and no I/O path consults them: read, write, size, truncate,
-and sync never inspect handle lock state, so a guest may read and write at `none`. The table
-constrains the shape of a lock sequence, not access.
-
-Turso is WAL-only, its own lock surface is two-state, and `turso_core` never calls `lock_file` at
-all, so an adapter that never locks is equally correct — do not read a coarser guest lock surface as
-a compatibility failure.
 
 There is no SHM operation and no multiprocess-database claim. There is no WAL *implementation*
 either, but a single-instance WAL engine needs neither: its log is an ordinary durable file and its

@@ -14,8 +14,16 @@ All notable changes to Dekopon are documented here. The format is based on
 - Each journal line carries the conversation's whole attachment inventory and next asset number,
   and compaction reads the whole file. Files from earlier releases are deleted on first recall.
 - Journal lines no longer cap the encoded user text at 64 KiB.
+- **Breaking:** the `storage.maxPendingTransactions` limit is renamed `maxActiveInvocations`; the
+  old key is refused.
 
 ### Removed
+
+- **Breaking:** the unused durable-files lock ladder (`lock-level`, `file.lock`, `file.unlock`,
+  `file.check-reserved-lock`) leaves `dekopon:storage`, now `0.1.1`, the host and
+  `dekopon-provider-storage`. The patch bump bends semver on purpose: Wasmtime still links `0.1.0`
+  guests that never imported the ladder, such as memory-chat. A component importing it is refused
+  at load; upgrade turso-sql to 0.5.0 first.
 
 - `dekopon-model`'s `InferenceError::Unsupported` and `UnsupportedFeature` are gone now that
   nothing constructs them; a pre-1.0 break to `dekopon-model`'s public error API.

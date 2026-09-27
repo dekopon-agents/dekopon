@@ -319,11 +319,9 @@ classified as untrusted. An actively malicious same-UID process
 racing filesystem mutation is out of scope. Native filesystem operations can remain blocked after
 a timeout signal; the finalization budget prevents starting the next bounded finalization step after
 its deadline, while leases/reservations stay held until an already-started blocking operation
-drains, so this is not a hard wall-clock guarantee. Durable-files has rollback-journal lock primitives that no I/O path
-consults: reads, writes, size, truncate, and sync never inspect handle lock state, so the lock table
-is well-formedness bookkeeping rather than an access control. There is no SHM operation and no
-multiprocess-database claim. A single-instance WAL engine needs neither and runs on these primitives
-unchanged; the out-of-tree `turso-sql` provider ships one, calls `lock` zero times, and opens
+drains, so this is not a hard wall-clock guarantee. Durable-files has no lock operation, no SHM
+operation and no multiprocess-database claim. A single-instance WAL engine needs none of them and
+runs on these primitives unchanged; the out-of-tree `turso-sql` provider ships one and opens
 exactly two files.
 Writes apply per host call. A trap can leave partial database/log changes; neither sync nor
 invocation success promises cross-file atomicity or crash recovery ([`design.md`](design.md#non-goals)).

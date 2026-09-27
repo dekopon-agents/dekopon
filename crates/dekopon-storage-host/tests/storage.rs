@@ -17,8 +17,8 @@ use std::{
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 use dekopon_core::error_chain;
 use dekopon_storage_host::{
-    ContinuityPolicy, Durability, LockLevel, OpenOptions, StorageGrantRequest, StorageHost,
-    StorageHostError, StorageLimits,
+    ContinuityPolicy, Durability, OpenOptions, StorageGrantRequest, StorageHost, StorageHostError,
+    StorageLimits,
 };
 use dekopon_test_support::{CaptureLayer, snapshot_tree};
 use tempfile::TempDir;
@@ -1240,56 +1240,6 @@ fn rename_then_recreate_assigns_a_fresh_live_identity() {
     let a = transaction.vfs_stat("a.db").expect("stat a").expect("a");
     let b = transaction.vfs_stat("b.db").expect("stat b").expect("b");
     assert_ne!(a.identity, b.identity);
-    transaction.abort();
-}
-
-#[test]
-fn pending_lock_blocks_a_new_shared_reader_while_existing_readers_drain() {
-    let (_temporary, root) = fixture();
-    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
-    let mut transaction = host
-        .begin(
-            host.grant(vfs_request("vfs-locks", StorageAccess::ReadWrite))
-                .expect("grant"),
-        )
-        .expect("transaction");
-    let first = transaction
-        .vfs_open(
-            "main.db",
-            OpenOptions {
-                read: true,
-                write: true,
-                create: true,
-                ..OpenOptions::default()
-            },
-        )
-        .expect("first");
-    let reopen = OpenOptions {
-        read: true,
-        write: true,
-        ..OpenOptions::default()
-    };
-    let second = transaction.vfs_open("main.db", reopen).expect("second");
-    let third = transaction.vfs_open("main.db", reopen).expect("third");
-    transaction
-        .vfs_lock(first, LockLevel::Shared)
-        .expect("first shared");
-    transaction
-        .vfs_lock(second, LockLevel::Shared)
-        .expect("second shared");
-    transaction
-        .vfs_lock(first, LockLevel::Reserved)
-        .expect("reserved");
-    transaction
-        .vfs_lock(first, LockLevel::Pending)
-        .expect("pending");
-    assert!(matches!(
-        transaction.vfs_lock(third, LockLevel::Shared),
-        Err(StorageHostError::Busy)
-    ));
-    transaction.vfs_close(first).expect("close first");
-    transaction.vfs_close(second).expect("close second");
-    transaction.vfs_close(third).expect("close third");
     transaction.abort();
 }
 

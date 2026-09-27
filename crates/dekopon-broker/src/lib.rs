@@ -3740,9 +3740,10 @@ fn encode_storage_limits(
             "storage.finalizationBudgetMs",
             limits.finalization_budget_ms,
         ),
+        // The label keeps the key's old name: renaming it would rotate every authority-bound generation.
         (
             "storage.maxPendingTransactions",
-            limits.max_pending_transactions,
+            limits.max_active_invocations,
         ),
         ("storage.startupMaxEntries", limits.startup_max_entries),
     ] {

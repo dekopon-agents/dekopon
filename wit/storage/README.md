@@ -1,10 +1,10 @@
-# `dekopon:storage@0.1.0`
+# `dekopon:storage@0.1.1`
 
 Canonical WIT source for Dekopon's broker-owned, namespace-bound provider storage interfaces.
 
 The `jsonl` interface offers bounded chunk reads and direct per-call append and replacement.
 Completed writes survive invocation failure; there is no invocation-wide rollback or atomicity. The
-`durable-files` interface offers engine-neutral positional files, rollback-journal lock levels,
+`durable-files` interface offers engine-neutral positional files,
 bounded entropy, and bounded clocks. Neither interface exposes host paths, namespace selection,
 SQL, sockets, environment variables, or WASI. An import is only a structural requirement; only
 `dekopon-brokerd` can bind it to a freshly authorized storage grant.

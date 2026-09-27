@@ -23,7 +23,7 @@ struct LedgerState {
     root_entries_reserved: u64,
     namespace_reserved: BTreeMap<String, u64>,
     open_handles: u64,
-    pending_transactions: u64,
+    active_invocations: u64,
 }
 
 impl QuotaLedger {
@@ -121,7 +121,7 @@ impl QuotaLedger {
         namespace_usage: Usage,
     ) -> Result<Reservation, StorageHostError> {
         let mut state = self.state.lock().expect("storage quota ledger");
-        if state.pending_transactions >= self.limits.max_pending_transactions {
+        if state.active_invocations >= self.limits.max_active_invocations {
             return Err(StorageHostError::Busy);
         }
         state
@@ -130,8 +130,8 @@ impl QuotaLedger {
         state
             .namespace_entries
             .insert(namespace.clone(), namespace_usage.entries);
-        state.pending_transactions = state
-            .pending_transactions
+        state.active_invocations = state
+            .active_invocations
             .checked_add(1)
             .ok_or(StorageHostError::Arithmetic)?;
         Ok(Reservation {
@@ -439,5 +439,5 @@ fn release_locked(state: &mut LedgerState, namespace: &str, reserved: u64, entri
             state.namespace_reserved.remove(namespace);
         }
     }
-    state.pending_transactions = state.pending_transactions.saturating_sub(1);
+    state.active_invocations = state.active_invocations.saturating_sub(1);
 }

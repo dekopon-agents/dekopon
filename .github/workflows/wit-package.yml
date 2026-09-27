@@ -44,7 +44,7 @@ concurrency:
 env:
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
   HTTP_WIT_PACKAGE: dekopon:http@1.1.0
-  STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
+  STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
 
 jobs:
@@ -137,7 +137,7 @@ jobs:
             case "$provider" in
               clock-probe) expected='dekopon:clock/wall@1.0.0' ;;
               http-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
-              storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
+              storage-probe) expected='dekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
             if [ -z "$expected" ]; then
@@ -383,24 +383,21 @@ jobs:
               },
               {
                 "name":"durable-files",
-                "types":{"open-flags":6,"durability":7,"lock-level":8,"storage-error":9,"file-stat":10,"file":11},
+                "types":{"open-flags":6,"durability":7,"storage-error":8,"file-stat":9,"file":10},
                 "package":0,
                 "functions": {
-                  "[method]file.read-at":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"offset","type":"u64"},{"name":"max-bytes","type":"u32"}],"result":14},
-                  "[method]file.write-at":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"offset","type":"u64"},{"name":"bytes","type":13}],"result":15},
-                  "[method]file.size":{"kind":{"method":11},"params":[{"name":"self","type":12}],"result":16},
-                  "[method]file.truncate":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"size","type":"u64"}],"result":15},
-                  "[method]file.sync":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"mode","type":7}],"result":15},
-                  "[method]file.lock":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"level","type":8}],"result":15},
-                  "[method]file.unlock":{"kind":{"method":11},"params":[{"name":"self","type":12},{"name":"to","type":8}],"result":15},
-                  "[method]file.check-reserved-lock":{"kind":{"method":11},"params":[{"name":"self","type":12}],"result":17},
-                  "open":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"flags","type":6}],"result":19},
-                  "stat":{"kind":"freestanding","params":[{"name":"name","type":"string"}],"result":21},
-                  "remove":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"mode","type":7}],"result":15},
-                  "rename-atomic":{"kind":"freestanding","params":[{"name":"from","type":"string"},{"name":"to","type":"string"},{"name":"replace","type":"bool"},{"name":"mode","type":7}],"result":15},
-                  "random-bytes":{"kind":"freestanding","params":[{"name":"length","type":"u32"}],"result":14},
-                  "monotonic-time-ns":{"kind":"freestanding","params":[],"result":16},
-                  "wall-time-ms":{"kind":"freestanding","params":[],"result":16}
+                  "[method]file.read-at":{"kind":{"method":10},"params":[{"name":"self","type":11},{"name":"offset","type":"u64"},{"name":"max-bytes","type":"u32"}],"result":13},
+                  "[method]file.write-at":{"kind":{"method":10},"params":[{"name":"self","type":11},{"name":"offset","type":"u64"},{"name":"bytes","type":12}],"result":14},
+                  "[method]file.size":{"kind":{"method":10},"params":[{"name":"self","type":11}],"result":15},
+                  "[method]file.truncate":{"kind":{"method":10},"params":[{"name":"self","type":11},{"name":"size","type":"u64"}],"result":14},
+                  "[method]file.sync":{"kind":{"method":10},"params":[{"name":"self","type":11},{"name":"mode","type":7}],"result":14},
+                  "open":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"flags","type":6}],"result":17},
+                  "stat":{"kind":"freestanding","params":[{"name":"name","type":"string"}],"result":19},
+                  "remove":{"kind":"freestanding","params":[{"name":"name","type":"string"},{"name":"mode","type":7}],"result":14},
+                  "rename-atomic":{"kind":"freestanding","params":[{"name":"from","type":"string"},{"name":"to","type":"string"},{"name":"replace","type":"bool"},{"name":"mode","type":7}],"result":14},
+                  "random-bytes":{"kind":"freestanding","params":[{"name":"length","type":"u32"}],"result":13},
+                  "monotonic-time-ns":{"kind":"freestanding","params":[],"result":15},
+                  "wall-time-ms":{"kind":"freestanding","params":[],"result":15}
                 }
               }
             ]) and
@@ -413,20 +410,18 @@ jobs:
               {"name":null,"kind":{"result":{"ok":null,"err":0}},"owner":null},
               {"name":"open-flags","kind":{"flags":{"flags":[{"name":"read"},{"name":"write"},{"name":"create"},{"name":"create-new"},{"name":"delete-on-close"}]}},"owner":{"interface":1}},
               {"name":"durability","kind":{"enum":{"cases":[{"name":"data"},{"name":"data-and-metadata"},{"name":"full"}]}},"owner":{"interface":1}},
-              {"name":"lock-level","kind":{"enum":{"cases":[{"name":"none"},{"name":"shared"},{"name":"reserved"},{"name":"pending"},{"name":"exclusive"}]}},"owner":{"interface":1}},
               {"name":"storage-error","kind":{"enum":{"cases":errors}},"owner":{"interface":1}},
               {"name":"file-stat","kind":{"record":{"fields":[{"name":"size","type":"u64"},{"name":"identity","type":"u64"}]}},"owner":{"interface":1}},
               {"name":"file","kind":"resource","owner":{"interface":1}},
-              {"name":null,"kind":{"handle":{"borrow":11}},"owner":null},
+              {"name":null,"kind":{"handle":{"borrow":10}},"owner":null},
               {"name":null,"kind":{"list":"u8"},"owner":null},
-              {"name":null,"kind":{"result":{"ok":13,"err":9}},"owner":null},
-              {"name":null,"kind":{"result":{"ok":null,"err":9}},"owner":null},
-              {"name":null,"kind":{"result":{"ok":"u64","err":9}},"owner":null},
-              {"name":null,"kind":{"result":{"ok":"bool","err":9}},"owner":null},
-              {"name":null,"kind":{"handle":{"own":11}},"owner":null},
-              {"name":null,"kind":{"result":{"ok":18,"err":9}},"owner":null},
-              {"name":null,"kind":{"option":10},"owner":null},
-              {"name":null,"kind":{"result":{"ok":20,"err":9}},"owner":null}
+              {"name":null,"kind":{"result":{"ok":12,"err":8}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":null,"err":8}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":"u64","err":8}},"owner":null},
+              {"name":null,"kind":{"handle":{"own":10}},"owner":null},
+              {"name":null,"kind":{"result":{"ok":16,"err":8}},"owner":null},
+              {"name":null,"kind":{"option":9},"owner":null},
+              {"name":null,"kind":{"result":{"ok":18,"err":8}},"owner":null}
             ])
           ' target/wit-package/dekopon-storage.json
 
@@ -494,11 +489,13 @@ jobs:
             wasm-tools validate "$component"
             wasm-tools component wit --json "$component" > "$description"
             expected=jsonl
+            package=dekopon:storage@0.1.0
             if [ "$name" = storage-probe ]; then
               expected=durable-files
+              package="$STORAGE_WIT_PACKAGE"
             fi
-            jq --exit-status --arg interface "$expected" '
-              (.packages | map(.name) == ["dekopon:storage@0.1.0", "root:component"]) and
+            jq --exit-status --arg interface "$expected" --arg package "$package" '
+              (.packages | map(.name) == [$package, "root:component"]) and
               (.worlds | length == 1) and
               (.worlds[0].name == "root") and
               (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and

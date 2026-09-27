@@ -383,9 +383,7 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
         }),
         ("lockTimeoutMs", |v| v.lock_timeout_ms += 1),
         ("finalizationBudgetMs", |v| v.finalization_budget_ms += 1),
-        ("maxPendingTransactions", |v| {
-            v.max_pending_transactions += 1
-        }),
+        ("maxActiveInvocations", |v| v.max_active_invocations += 1),
         ("startupMaxEntries", |v| v.startup_max_entries += 1),
     ];
     assert_rotations(&storage, storage_mutations, encoded_storage);
