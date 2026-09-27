@@ -55,7 +55,10 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   `with_progress_notes()` appends the builtin's guidance to the bash tool description; without
   it that description is unchanged. Enable it alongside `BrokerLeg::with_progress_notes()`.
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
-  offers no tool. `suggest_improvement` needs no opt-in: every session offers it.
+  offers no tool. `suggest_improvement` needs no opt-in: every session offers it. `with_agent(&str)`
+  is independent of `with_agent_config`: it names the calling agent on every `accounting.model.turn`
+  record, whether or not the route also offers `inspect_agent_config`; an embedder that never calls
+  it gets no `agent` field on the record rather than a guessed one.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
