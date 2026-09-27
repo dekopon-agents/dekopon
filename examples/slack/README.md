@@ -121,7 +121,6 @@ liveness:
   mode: native
   classicFallback: reaction
   progress: off
-  stream: false
   statusText: true
 ```
 

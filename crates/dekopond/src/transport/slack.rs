@@ -31,10 +31,9 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
         NativeStatus, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, Status, StatusText, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
-        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
-        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
-        record_conversation, reserve_for_chunk,
+        SeenIds, Status, StatusText, SteerAck, ThreadClaim, ThreadContinuation, ThreadOwnership,
+        TransportError, TransportEvent, TransportIdentity, asset_buffer, bound_inbound,
+        credential_client, floor_boundary, receive_span, record_conversation, reserve_for_chunk,
     },
 };
 
@@ -54,15 +53,11 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
 const LIVENESS_REACTION: &str = "tangerine";
 const PROGRESS_MAX_CHARS: usize = 4_000;
 const PROGRESS_MIN_EDIT_INTERVAL: Duration = Duration::from_secs(3);
-const STREAM_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const STREAM_MAX_CHARS: usize = 12_000;
 const MAX_PROGRESS_COOLDOWN: Duration = Duration::from_secs(60);
 const DEFAULT_PROGRESS_COOLDOWN: Duration = Duration::from_secs(5);
 const CANCEL_ACTION_ID: &str = "dekopon-cancel";
 const MAX_TRACKED_REACTIONS: usize = 256;
 const MAX_TRACKED_CHANNEL_KINDS: usize = 512;
-const MAX_TRACKED_STREAMS: usize = 64;
-const STREAM_TRUNCATION_MARKER: &str = "…";
 const HISTORY_PAGE_LIMIT: usize = 200;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -113,7 +108,6 @@ impl SlackTransport {
                 reaction_available: AtomicBool::new(true),
                 added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
                 progress_cooldown_until: Mutex::new(None),
-                streams: Mutex::new(Tracked::new(MAX_TRACKED_STREAMS)),
                 bot_user: OnceLock::new(),
             }),
             socket: None,
@@ -687,7 +681,6 @@ pub(crate) struct SlackReplier {
     reaction_available: AtomicBool,
     added_reactions: Mutex<Tracked<()>>,
     progress_cooldown_until: Mutex<Option<Instant>>,
-    streams: Mutex<Tracked<StreamState>>,
     bot_user: OnceLock<String>,
 }
 
@@ -772,10 +765,6 @@ impl ChatDriver for SlackReplier {
     }
 
     fn progress(&self) -> Option<&dyn ProgressMessage> {
-        Some(self)
-    }
-
-    fn stream(&self) -> Option<&dyn TextStream> {
         Some(self)
     }
 
@@ -1135,192 +1124,6 @@ impl ProgressMessage for SlackReplier {
 }
 
 #[async_trait]
-impl TextStream for SlackReplier {
-    fn limits(&self) -> StreamLimits {
-        StreamLimits {
-            min_interval: STREAM_MIN_INTERVAL,
-            max_chars: STREAM_MAX_CHARS,
-        }
-    }
-
-    async fn show(
-        &self,
-        target: &LivenessTarget,
-        message: Option<&MessageRef>,
-        text: &StreamedText,
-        _cancel: bool,
-    ) -> Result<MessageRef, TransportError> {
-        let LivenessTarget::Slack {
-            channel_id,
-            thread_ts,
-            initiator_user_id,
-            ..
-        } = target
-        else {
-            return Err(TransportError::Response);
-        };
-        let whole = text.text.as_str();
-        let Some(message) = message else {
-            let body = json!({
-                "channel": channel_id,
-                "thread_ts": thread_ts,
-                "recipient_user_id": initiator_user_id,
-                "markdown_text": streamed_markdown(whole, text.truncated),
-            });
-            let body = self.liveness_call("chat.startStream", &body).await?;
-            let Some(timestamp) = body["ts"].as_str() else {
-                return Err(TransportError::Response);
-            };
-            if !canonical_timestamp(timestamp) {
-                return Err(TransportError::Response);
-            }
-            self.streams.lock().expect("Slack stream registry").insert(
-                timestamp.to_owned(),
-                StreamState {
-                    generation: text.generation,
-                    appended: whole.len(),
-                    marked: text.truncated,
-                    replacing: false,
-                },
-            );
-            return Ok(MessageRef {
-                target: target.clone(),
-                id: timestamp.to_owned(),
-            });
-        };
-        let state = self
-            .streams
-            .lock()
-            .expect("Slack stream registry")
-            .get(&message.id)
-            .copied()
-            .ok_or(TransportError::Response)?;
-        if state.replacing || state.generation != text.generation {
-            if !state.replacing {
-                TextStream::discard(self, message).await?;
-                self.streams.lock().expect("Slack stream registry").insert(
-                    message.id.clone(),
-                    StreamState {
-                        replacing: true,
-                        ..state
-                    },
-                );
-            }
-            self.update_stream(message, &streamed_markdown(whole, text.truncated))
-                .await?;
-            return Ok(message.clone());
-        }
-        let appended = state.appended;
-        let delta = if appended <= whole.len() && whole.is_char_boundary(appended) {
-            &whole[appended..]
-        } else {
-            whole
-        };
-        let mark = text.truncated && !state.marked;
-        if delta.is_empty() && !mark {
-            return Ok(message.clone());
-        }
-        let body = json!({
-            "channel": channel_id,
-            "ts": message.id,
-            "markdown_text": streamed_markdown(delta, mark),
-        });
-        self.liveness_call("chat.appendStream", &body).await?;
-        self.streams.lock().expect("Slack stream registry").insert(
-            message.id.clone(),
-            StreamState {
-                appended: whole.len(),
-                marked: state.marked || text.truncated,
-                ..state
-            },
-        );
-        Ok(message.clone())
-    }
-
-    async fn finalize(
-        &self,
-        message: &MessageRef,
-        reply: &OutboundReply,
-        generation: u64,
-    ) -> Result<(), TransportError> {
-        let LivenessTarget::Slack { channel_id, .. } = &message.target else {
-            return Err(TransportError::Response);
-        };
-        if !reply.images.is_empty() {
-            return Err(TransportError::Service {
-                code: "answer-has-attachments".to_owned(),
-            });
-        }
-        let state = self
-            .streams
-            .lock()
-            .expect("Slack stream registry")
-            .get(&message.id)
-            .copied()
-            .ok_or(TransportError::Response)?;
-        if state.replacing || state.generation != generation {
-            if !state.replacing {
-                TextStream::discard(self, message).await?;
-                self.streams.lock().expect("Slack stream registry").insert(
-                    message.id.clone(),
-                    StreamState {
-                        replacing: true,
-                        ..StreamState::default()
-                    },
-                );
-            }
-            self.update_stream(message, &reply.text).await?;
-            let _state = self
-                .streams
-                .lock()
-                .expect("Slack stream registry")
-                .take(&message.id);
-            return Ok(());
-        }
-        let mut body = json!({
-            "channel": channel_id,
-            "ts": message.id,
-            "markdown_text": reply.text,
-        });
-        if self.experience == SlackExperience::Agent {
-            body["session_status"] = Value::String("active".to_owned());
-        }
-        let result = self
-            .liveness_call("chat.stopStream", &body)
-            .await
-            .map(|_| ());
-        let _state = self
-            .streams
-            .lock()
-            .expect("Slack stream registry")
-            .take(&message.id);
-        result
-    }
-
-    async fn discard(&self, message: &MessageRef) -> Result<(), TransportError> {
-        let LivenessTarget::Slack { channel_id, .. } = &message.target else {
-            return Err(TransportError::Response);
-        };
-        let state = self
-            .streams
-            .lock()
-            .expect("Slack stream registry")
-            .take(&message.id);
-        if state.is_some_and(|state| !state.replacing) {
-            self.liveness_call(
-                "chat.stopStream",
-                &json!({
-                    "channel": channel_id,
-                    "ts": message.id,
-                }),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
 impl CancelButton for SlackReplier {
     async fn ack(&self, press: &CancelPress) -> Result<(), TransportError> {
         let AckToken::Slack { envelope_id } = &press.ack else {
@@ -1334,23 +1137,6 @@ impl CancelButton for SlackReplier {
 }
 
 impl SlackReplier {
-    async fn update_stream(&self, message: &MessageRef, text: &str) -> Result<(), TransportError> {
-        let LivenessTarget::Slack { channel_id, .. } = &message.target else {
-            return Err(TransportError::Response);
-        };
-        self.liveness_call(
-            "chat.update",
-            &json!({
-                "channel": channel_id,
-                "ts": message.id,
-                "text": text,
-                "blocks": [{ "type": "markdown", "text": text }],
-            }),
-        )
-        .await
-        .map(|_| ())
-    }
-
     async fn upload_attachments(
         &self,
         channel: String,
@@ -1668,22 +1454,6 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_PROGRESS_COOLDOWN, Duration::from_secs);
     seconds.min(MAX_PROGRESS_COOLDOWN)
-}
-
-fn streamed_markdown(text: &str, mark: bool) -> String {
-    if mark {
-        format!("{text}{STREAM_TRUNCATION_MARKER}")
-    } else {
-        text.to_owned()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StreamState {
-    generation: u64,
-    appended: usize,
-    marked: bool,
-    replacing: bool,
 }
 
 struct Tracked<T> {
@@ -2098,16 +1868,15 @@ mod driver_tests {
     use dekopon_agent::{CancelVia, attachment::GeneratedImage};
     use dekopon_broker_protocol::ChatTransportKind;
     use dekopon_core::Redacted;
-    use dekopon_model::ModelText;
-    use dekopon_test_support::{CaptureLayer, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
+    use dekopon_test_support::CaptureLayer;
     use serde_json::{Value, json};
     use tracing::{Instrument as _, Span};
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
         CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
-        MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS, OnceLock, PROGRESS_MAX_CHARS,
-        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
+        MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier,
+        SlackTransport, Tracked,
     };
     use crate::{
         config::{LivenessSettings, SlackExperience, SlackLivenessFallback, TemplateOverrides},
@@ -2115,8 +1884,7 @@ mod driver_tests {
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
             LivenessTarget, MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status,
-            StatusText, SteerAck, StreamedText, TextStream, TransportError, TransportEvent,
-            credential_client, receive_span,
+            StatusText, SteerAck, TransportError, TransportEvent, credential_client, receive_span,
         },
     };
 
@@ -2172,7 +1940,6 @@ mod driver_tests {
             reaction_available: AtomicBool::new(true),
             added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
             progress_cooldown_until: Mutex::new(None),
-            streams: Mutex::new(Tracked::new(MAX_TRACKED_STREAMS)),
             bot_user: OnceLock::from(BOT_USER.to_owned()),
         }
     }
@@ -2208,35 +1975,6 @@ mod driver_tests {
         )
     }
 
-    fn recorded_text() -> ModelText {
-        let events = dekopon_model::events_from_transcript(OPENAI_CHAT_COMPLETIONS_TWO_DELTAS)
-            .expect("the recorded transcript parses");
-        dekopon_test_support::scripted_text(&events)
-    }
-
-    fn streamed(text: ModelText) -> StreamedText {
-        StreamedText {
-            text,
-            ..StreamedText::default()
-        }
-    }
-
-    fn cut(text: ModelText) -> StreamedText {
-        StreamedText {
-            text,
-            truncated: true,
-            ..StreamedText::default()
-        }
-    }
-
-    fn bodies(mock: &SlackMock, path: &str) -> Vec<Value> {
-        mock.calls()
-            .into_iter()
-            .filter(|(candidate, _)| candidate == path)
-            .map(|(_, body)| body)
-            .collect()
-    }
-
     fn png() -> GeneratedImage {
         GeneratedImage::from_png(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
             .expect("a PNG signature is a PNG")
@@ -2259,10 +1997,6 @@ mod driver_tests {
             "/api/chat.postMessage" => (
                 200,
                 json!({ "ok": true, "channel": body["channel"], "ts": POSTED_TS }),
-            ),
-            "/api/chat.startStream" => (
-                200,
-                json!({ "ok": true, "channel": body["channel"], "ts": STREAM_TS }),
             ),
             _ => (200, json!({ "ok": true })),
         }
@@ -2422,7 +2156,7 @@ mod driver_tests {
         assert!(ChatDriver::reaction(&classic).is_some());
         assert!(ChatDriver::cancel_button(&classic).is_some());
         assert!(ChatDriver::progress(&classic).is_some());
-        assert!(ChatDriver::stream(&classic).is_some());
+        assert!(ChatDriver::stream(&classic).is_none());
         let limits = ProgressMessage::limits(&classic);
         assert_eq!(
             limits.max_chars, 4_000,
@@ -2775,338 +2509,6 @@ mod driver_tests {
         assert!(
             mock.calls().is_empty(),
             "both refusals are decided here, so the policy deletes and replies without a round trip"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stream_opens_in_the_thread_and_appends_only_what_is_new() {
-        let mock = spawn_slack_mock(accepting);
-        let replier = replier(&mock.base, SlackExperience::Agent);
-        let whole = recorded_text();
-        let first_delta = whole.truncated(7);
-        let second_delta = whole.as_str()[first_delta.len()..].to_owned();
-
-        let stream = TextStream::show(
-            &replier,
-            &target(),
-            None,
-            &streamed(first_delta.clone()),
-            false,
-        )
-        .await
-        .expect("Slack opens the stream");
-        let same = TextStream::show(
-            &replier,
-            &target(),
-            Some(&stream),
-            &streamed(whole.clone()),
-            false,
-        )
-        .await
-        .expect("Slack accepts the append");
-        TextStream::show(
-            &replier,
-            &target(),
-            Some(&stream),
-            &streamed(whole.clone()),
-            false,
-        )
-        .await
-        .expect("unchanged text is not an append");
-        TextStream::finalize(&replier, &stream, &OutboundReply::text(whole.as_str()), 0)
-            .await
-            .expect("Slack closes the stream");
-
-        assert!(
-            !second_delta.is_empty(),
-            "the recorded transcript carries more than the opening delta"
-        );
-        assert_eq!(stream.id, STREAM_TS);
-        assert_eq!(
-            same, stream,
-            "one stream is one message for the whole session"
-        );
-        assert_eq!(
-            mock.body("/api/chat.startStream"),
-            json!({
-                "channel": CHANNEL,
-                "thread_ts": INBOUND_TS,
-                "recipient_user_id": USER,
-                "markdown_text": first_delta.as_str(),
-            })
-        );
-        assert_eq!(
-            mock.body("/api/chat.appendStream"),
-            json!({ "channel": CHANNEL, "ts": STREAM_TS, "markdown_text": second_delta }),
-            "Slack appends, so the driver sends only the new part of cumulative text"
-        );
-        assert_eq!(
-            mock.body("/api/chat.stopStream"),
-            json!({
-                "channel": CHANNEL,
-                "ts": STREAM_TS,
-                "markdown_text": whole.as_str(),
-                "session_status": "active",
-            }),
-            "the answer lands in the streamed message rather than beside it"
-        );
-        assert_eq!(mock.calls().len(), 3, "{:?}", mock.calls());
-    }
-
-    fn streaming_policy(
-        mock: &SlackMock,
-    ) -> (
-        crate::progress::ProgressPolicy,
-        Arc<dyn dekopon_agent::ProgressSink>,
-    ) {
-        use crate::{
-            config::{LivenessMode, ProgressSurface, ResolvedLiveness},
-            progress::{ProgressInputs, ProgressPolicy},
-        };
-        let liveness = Arc::new(ResolvedLiveness {
-            settings: LivenessSettings {
-                mode: LivenessMode::Native,
-                stream: true,
-                progress: ProgressSurface::Off,
-                ..LivenessSettings::default()
-            },
-            ..ResolvedLiveness::default()
-        });
-        let (policy, sink) = ProgressPolicy::start(ProgressInputs {
-            driver: Arc::new(replier(&mock.base, SlackExperience::Agent)),
-            target: Some(target()),
-            reply: crate::transport::ReplyTarget::Slack {
-                channel: CHANNEL.to_owned(),
-                thread_ts: Some(INBOUND_TS.to_owned()),
-            },
-            transport: "slack".to_owned(),
-            detail: ProgressDetail::Off,
-            settings: liveness.settings,
-            keep_alive: liveness.keep_alive.clone(),
-            liveness,
-            cancellation: crate::session::SessionCancellation::new(),
-            max_duration: None,
-        });
-        (policy, sink)
-    }
-
-    fn delta(text: &str) -> dekopon_agent::ProgressEvent {
-        let body = json!({"choices": [{"delta": {"content": text}}]});
-        let events =
-            dekopon_model::events_from_transcript(&format!("data: {body}\n\ndata: [DONE]\n\n"))
-                .expect("delta");
-        dekopon_agent::ProgressEvent::TextDelta {
-            turn: 1,
-            text: dekopon_test_support::scripted_text(&events),
-            cumulative_chars: text.chars().count(),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_steer_replaces_equal_length_text_in_the_same_slack_message() {
-        use crate::progress::Terminal;
-        use dekopon_agent::ProgressEvent;
-        for terminal_first in [false, true] {
-            let (sent, mut received) = tokio::sync::mpsc::channel(8);
-            let mock = spawn_slack_mock(move |path, body| {
-                sent.try_send(path.to_owned()).expect("bounded calls");
-                accepting(path, body)
-            });
-            let (mut policy, sink) = streaming_policy(&mock);
-            sink.emit(delta("abc"));
-            assert_eq!(
-                received.recv().await.as_deref(),
-                Some("/api/chat.startStream")
-            );
-            sink.emit(ProgressEvent::Steered { turn: 1 });
-            sink.emit(delta("XYZ"));
-            if !terminal_first {
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
-                        .await
-                        .expect("replacement stops the old stream")
-                        .as_deref(),
-                    Some("/api/chat.stopStream")
-                );
-                assert_eq!(received.recv().await.as_deref(), Some("/api/chat.update"));
-            }
-            assert!(
-                policy
-                    .terminal(Terminal::Answered(OutboundReply::text("XYZ")))
-                    .await
-            );
-            let calls = mock.calls();
-            assert_eq!(
-                calls
-                    .iter()
-                    .map(|(path, _)| path.as_str())
-                    .collect::<Vec<_>>(),
-                if terminal_first {
-                    vec![
-                        "/api/chat.startStream",
-                        "/api/chat.stopStream",
-                        "/api/chat.update",
-                    ]
-                } else {
-                    vec![
-                        "/api/chat.startStream",
-                        "/api/chat.stopStream",
-                        "/api/chat.update",
-                        "/api/chat.update",
-                    ]
-                }
-            );
-            for (_, body) in &calls[2..] {
-                assert_eq!(body["ts"], STREAM_TS);
-                assert_eq!(body["text"], "XYZ");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_silent_terminal_after_a_steer_stops_the_slack_stream_without_an_empty_edit() {
-        use crate::progress::Terminal;
-        use dekopon_agent::ProgressEvent;
-        let (sent, mut received) = tokio::sync::mpsc::channel(8);
-        let mock = spawn_slack_mock(move |path, body| {
-            sent.try_send(path.to_owned()).expect("bounded calls");
-            accepting(path, body)
-        });
-        let (mut policy, sink) = streaming_policy(&mock);
-        sink.emit(delta("abc"));
-        assert_eq!(
-            received.recv().await.as_deref(),
-            Some("/api/chat.startStream")
-        );
-        sink.emit(ProgressEvent::Steered { turn: 1 });
-        assert!(!policy.terminal(Terminal::Silent).await);
-        assert_eq!(
-            mock.calls()
-                .iter()
-                .map(|(path, _)| path.as_str())
-                .collect::<Vec<_>>(),
-            ["/api/chat.startStream", "/api/chat.stopStream",]
-        );
-        assert_eq!(
-            mock.body("/api/chat.stopStream"),
-            json!({"channel": CHANNEL, "ts": STREAM_TS})
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_stream_stop_is_not_retried_by_terminal_cleanup() {
-        use crate::progress::Terminal;
-        use dekopon_agent::ProgressEvent;
-        for (generation_reset, render_reset) in [(false, false), (true, false), (true, true)] {
-            let (sent, mut received) = tokio::sync::mpsc::channel(8);
-            let mock = spawn_slack_mock(move |path, body| {
-                sent.try_send(path.to_owned()).expect("bounded calls");
-                if path == "/api/chat.stopStream" {
-                    (200, json!({"ok": false, "error": "internal_error"}))
-                } else {
-                    accepting(path, body)
-                }
-            });
-            let (mut policy, sink) = streaming_policy(&mock);
-            sink.emit(delta("abc"));
-            assert_eq!(
-                received.recv().await.as_deref(),
-                Some("/api/chat.startStream")
-            );
-            if generation_reset {
-                sink.emit(ProgressEvent::Steered { turn: 1 });
-                sink.emit(delta("XYZ"));
-            }
-            if render_reset {
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
-                        .await
-                        .expect("reset attempts one stop")
-                        .as_deref(),
-                    Some("/api/chat.stopStream"),
-                );
-            }
-            assert!(
-                policy
-                    .terminal(Terminal::Answered(OutboundReply::text("XYZ")))
-                    .await
-            );
-            assert_eq!(
-                mock.calls()
-                    .iter()
-                    .map(|(path, _)| path.as_str())
-                    .collect::<Vec<_>>(),
-                [
-                    "/api/chat.startStream",
-                    "/api/chat.stopStream",
-                    "/api/chat.postMessage",
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cut_stream_appends_the_marker_once() {
-        let mock = spawn_slack_mock(accepting);
-        let replier = replier(&mock.base, SlackExperience::Agent);
-        let whole = recorded_text();
-        let opening = whole.truncated(7);
-        let rest = whole.as_str()[opening.len()..].to_owned();
-
-        let stream = TextStream::show(&replier, &target(), None, &streamed(opening), false)
-            .await
-            .expect("Slack opens the stream");
-        TextStream::show(
-            &replier,
-            &target(),
-            Some(&stream),
-            &cut(whole.clone()),
-            false,
-        )
-        .await
-        .expect("Slack takes the append that reached the ceiling");
-        TextStream::show(&replier, &target(), Some(&stream), &cut(whole), false)
-            .await
-            .expect("a bounded prefix that has not grown is not an append");
-
-        assert_eq!(
-            bodies(&mock, "/api/chat.appendStream"),
-            vec![json!({
-                "channel": CHANNEL,
-                "ts": STREAM_TS,
-                "markdown_text": format!("{rest}…"),
-            })],
-            "the ellipsis arrives with the text that hit the ceiling and is not repeated after it"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stream_that_opens_past_the_ceiling_says_so_in_the_opening_call() {
-        let mock = spawn_slack_mock(accepting);
-        let replier = replier(&mock.base, SlackExperience::Agent);
-        let whole = recorded_text();
-
-        let stream = TextStream::show(&replier, &target(), None, &cut(whole.clone()), false)
-            .await
-            .expect("Slack opens the stream");
-        TextStream::show(
-            &replier,
-            &target(),
-            Some(&stream),
-            &cut(whole.clone()),
-            false,
-        )
-        .await
-        .expect("the same bounded prefix is not an append");
-
-        assert_eq!(
-            mock.body("/api/chat.startStream")["markdown_text"],
-            json!(format!("{}…", whole.as_str())),
-            "a first show already past the ceiling wears the marker from the start"
-        );
-        assert!(
-            bodies(&mock, "/api/chat.appendStream").is_empty(),
-            "nothing is appended, marker included, once the opening call carried it"
         );
     }
 

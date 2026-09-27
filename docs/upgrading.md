@@ -50,6 +50,15 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
 See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
+## Slack no longer streams the answer (unreleased)
+
+`liveness.stream: true` is refused on every `slackSocketMode` transport, at the top level and in
+every `conversations.<kind>` override; the earlier `stream: false` default is now the only accepted
+value, and the key can simply be deleted. `chat.startStream`/`appendStream`/`stopStream` are gone
+from the Slack driver. Progress on Slack now shows through the progress message or, on Agent
+installations, `liveness.statusText`; Discord, Telegram and the local transport keep streaming
+unchanged.
+
 ## Chat steering (0.24.0)
 
 Steering is enabled on every route by default. A same-sender message during a running turn now

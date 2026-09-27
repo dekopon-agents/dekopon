@@ -46,8 +46,8 @@ is cooperative, at the next boundary, and never rolls back. Streaming moves that
 
 | Surface | Liveness | Edit in place | Streamed text | Cancel affordance |
 |---|---|---|---|---|
-| Slack agent experience | native session status and Stop; opt-in status text via `assistant.threads.setStatus` | `chat.update`, 4,000 characters | `chat.startStream` / `appendStream` / `stopStream`, thread replies only | the service's Stop |
-| Slack classic | reaction on the inbound message | `chat.update` | the same streaming methods, in a thread | a Block Kit button, acknowledged over the socket |
+| Slack agent experience | native session status and Stop; opt-in status text via `assistant.threads.setStatus` | `chat.update`, 4,000 characters | none — Agent status text or the progress message carries it instead | the service's Stop |
+| Slack classic | reaction on the inbound message | `chat.update` | none | a Block Kit button, acknowledged over the socket |
 | Discord | typing lease, renewed inside 10 s; bot reactions | message edit, 2,000 characters | cumulative edits on a 2 s floor | a button, acknowledged within 3 s |
 | Telegram | chat action, renewed inside 5 s; bot reactions | `editMessageText`, 4,096 UTF-16 units | cumulative edits on a 3 s floor | an inline keyboard, answered within the query's deadline |
 | WhatsApp Cloud | typing indicator fused onto mark-as-read, auto-dismissed at 25 s | none exists | none | none native; the stop word only |
@@ -392,10 +392,6 @@ Reasoning summaries in chat; a second progress surface alongside the stream; kee
 and buttons on a transport with no edit surface; multi-message progress threads and checklists; a
 "finish the current step" cancel mode or any rollback; and streaming tool-call arguments or
 reasoning to a person, which the `ModelText` type makes structurally impossible.
-
-*Exploration:* Slack `chat.startStream`/`appendStream` `task_update` chunks could show a timeline,
-but they are a streamed message, which Slack Agent transports deliberately do not post. They are
-not an exception to the native-first policy and are not proposed.
 
 ## Testing
 

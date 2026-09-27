@@ -63,8 +63,7 @@ transports:
       mode: native                            # off | native
       classicFallback: reaction               # none (default) | reaction; slackSocketMode only
       progress: auto                          # auto (default) | off | message
-      stream: true                            # default false; refused on whatsappCloudApi
-      statusText: false                       # Agent only; true requires stream: false, progress: off or auto
+      statusText: false                       # Agent only; true requires progress: off or auto
       cancelButton: false                     # default false; refused on whatsappCloudApi and experience: agent
       keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }   # optional; defaults shown
       templates:                              # optional; defaults ship in the binary
@@ -271,10 +270,12 @@ A gateway that starts and then refuses everything is worse than one that does no
 - `liveness.progress: message`, `liveness.stream: true`, `liveness.statusText: true`, or `liveness.cancelButton: true` while `liveness.mode` is
   `off`, where none of them could ever take effect; each one is named;
 - `liveness.stream` or `liveness.cancelButton` on `whatsappCloudApi`, which can neither edit a
-  message nor carry an interactive component, and `liveness.cancelButton` on a Slack transport with
-  `experience: agent`, which renders its own Stop control;
+  message nor carry an interactive component; `liveness.stream` on any Slack transport, since Slack
+  progress now streams through Agent status text or the progress message instead of
+  `chat.appendStream`; and `liveness.cancelButton` on a Slack transport with `experience: agent`,
+  which renders its own Stop control;
 - `liveness.statusText: true` on anything except Slack's Agent experience, or effective
-  `statusText` alongside `progress: message` or `stream: true`, including conversation overrides;
+  `statusText` alongside `progress: message`, including conversation overrides;
 - `liveness.classicFallback` on a transport that is not `slackSocketMode`;
 - a `liveness.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of zero is a render
   loop rather than a keep-alive;
@@ -504,7 +505,7 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
   are also unavailable. It never guesses the workspace plan.
 
 An Agent transport may opt into `liveness.statusText: true` (default false, also overridable per
-conversation kind), with `progress: off` or `auto` and `stream: false`. Where no progress message is
+conversation kind), with `progress: off` or `auto`. Where no progress message is
 being written, the first opted-in note returns the native session to `active` and shows the existing
 rendered line through `assistant.threads.setStatus`. The handover is one-way for the run: subsequent
 note, tool, working and keep-alive lines use that status surface and the same coalescing/60-edit budget.
