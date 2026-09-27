@@ -101,6 +101,8 @@ Two `u64`s that mean different things must not be swappable.
 
 - Yes: `struct AssetId(u64); struct DescriptorIndex(u32);`
 - No: `fn admit(id: u64, descriptor: u64, bytes: u64)`
+- Yes: a size limit is private to the type whose constructor enforces it, like `DeliveredTurnRequest::new` fitting the user text to the record.
+- No: a bare `pub const` limit that another module compares against different content, like a delivered-turn bound reused on an encoded journal line.
 
 ### Panics
 

@@ -4008,8 +4008,8 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
         panic!("expected hidden record operation: {record:?}");
     };
-    assert_eq!(turn.user, "the exact sender text");
-    assert_eq!(turn.assistant, "The exact accepted answer.");
+    assert_eq!(turn.user(), "the exact sender text");
+    assert_eq!(turn.assistant().as_str(), "The exact accepted answer.");
     assert_eq!(
         turn.delivery,
         dekopon_broker_protocol::DeliveryIdentity::Local {

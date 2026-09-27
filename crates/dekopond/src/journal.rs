@@ -9,7 +9,6 @@ use std::{
 };
 
 use dekopon_agent::prompt::{ConversationTurn, History};
-use dekopon_broker_protocol::MAX_DELIVERED_TURN_TEXT_BYTES;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -23,6 +22,8 @@ const FORMAT_VERSION: u32 = 1;
 const EXTENSION: &str = "jsonl";
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
+// The journal's own bound on the JSON-encoded user field; the raw answer is never cut.
+const MAX_USER_FIELD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum JournalError {
@@ -506,10 +507,10 @@ fn encode_line(mut line: Line) -> Result<Vec<u8>, JournalError> {
     if serde_json::to_vec(&line.user)
         .map_err(io::Error::from)?
         .len()
-        > MAX_DELIVERED_TURN_TEXT_BYTES
+        > MAX_USER_FIELD_BYTES
     {
         let marker = "[…]";
-        let mut remaining = (MAX_DELIVERED_TURN_TEXT_BYTES - marker.len() - 2) as u64;
+        let mut remaining = (MAX_USER_FIELD_BYTES - marker.len() - 2) as u64;
         let mut end = 0;
         for (index, ch) in line.user.char_indices() {
             let mut utf8 = [0; 4];
@@ -789,7 +790,7 @@ mod tests {
             serde_json::to_vec(recorded.user())
                 .expect("encoded user")
                 .len()
-                <= MAX_DELIVERED_TURN_TEXT_BYTES
+                <= MAX_USER_FIELD_BYTES
         );
     }
 
@@ -809,7 +810,7 @@ mod tests {
                     &Entry {
                         at: now,
                         grant: GRANT,
-                        turn: &ConversationTurn::completed("question", &answer),
+                        turn: &ConversationTurn::completed("question", answer.as_str()),
                         inventory: &[],
                     },
                     window,

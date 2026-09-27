@@ -52,7 +52,8 @@ use dekopon_broker_host::{
 pub use dekopon_broker_protocol::{
     Attestation, AvailableCapability, ChatMemorySurface, ChatScopeClaim, ChatTransportKind,
     Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest, Trigger,
+    ConversationMatchProblem, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity,
+    InvocationRequest, Trigger,
 };
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
@@ -2218,16 +2219,17 @@ where
                 },
                 |(capability, _)| capability.clone(),
             );
+        let input = serde_json::json!({
+            "delivery": turn.delivery,
+            "user": turn.user(),
+            "assistant": turn.assistant(),
+        });
         let request = InvocationRequest {
             id: turn.id,
             capability,
             trace_parent: turn.trace_parent,
             secret_use: None,
-            input: serde_json::json!({
-                "delivery": turn.delivery,
-                "user": turn.user,
-                "assistant": turn.assistant,
-            }),
+            input,
         };
         self.invoke_inner(
             &context,

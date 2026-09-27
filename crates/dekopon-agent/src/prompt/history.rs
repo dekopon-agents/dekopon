@@ -19,17 +19,39 @@ impl Default for HistoryLimits {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawAnswer(String);
+
+impl RawAnswer {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RawAnswer {
+    fn from(answer: String) -> Self {
+        Self(answer)
+    }
+}
+
+impl From<&str> for RawAnswer {
+    fn from(answer: &str) -> Self {
+        Self(answer.to_owned())
+    }
+}
+
 /// Stored as plain text, not ModelMessages, because a remembered system message, an orphaned tool
 /// result, or provider-specific replay state would each corrupt a later request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationTurn {
     user: String,
-    answer: Option<String>,
+    answer: Option<RawAnswer>,
 }
 
 impl ConversationTurn {
     #[must_use]
-    pub fn completed(user: impl Into<String>, answer: impl Into<String>) -> Self {
+    pub fn completed(user: impl Into<String>, answer: impl Into<RawAnswer>) -> Self {
         Self {
             user: user.into(),
             answer: Some(answer.into()),
@@ -51,7 +73,7 @@ impl ConversationTurn {
 
     #[must_use]
     pub fn answer(&self) -> Option<&str> {
-        self.answer.as_deref()
+        self.answer.as_ref().map(RawAnswer::as_str)
     }
 
     #[must_use]
@@ -63,14 +85,14 @@ impl ConversationTurn {
     pub fn bytes(&self) -> usize {
         self.user
             .len()
-            .saturating_add(self.answer.as_ref().map_or(0, String::len))
+            .saturating_add(self.answer.as_ref().map_or(0, |answer| answer.0.len()))
     }
 
     fn replay_into(&self, messages: &mut Vec<ModelMessage>) {
         messages.push(ModelMessage::user(&self.user));
         if let Some(answer) = &self.answer {
             messages.push(assistant_message(&AssistantTurn::new(
-                Some(answer.clone()),
+                Some(answer.0.clone()),
                 Vec::new(),
                 None,
             )));
@@ -143,7 +165,7 @@ impl History {
             && let Some(prefix_bytes) = self
                 .limits
                 .max_bytes
-                .checked_sub(turn.answer.as_ref().map_or(0, String::len))
+                .checked_sub(turn.answer.as_ref().map_or(0, |answer| answer.0.len()))
                 .and_then(|remaining| remaining.checked_sub(MARKER.len()))
         {
             turn.user

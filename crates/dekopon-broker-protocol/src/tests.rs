@@ -8,7 +8,7 @@ use tokio::io::{AsyncWriteExt as _, duplex};
 use super::{
     Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind, CommandRunOutcome,
     ComponentFailure, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
+    ConversationMatchProblem, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
     InvocationOutcome, InvocationRequest, InvocationResult, PROTOCOL_VERSION, ProtocolError,
     ProtocolVersion, ProviderFailureDetail, RequestEnvelope, ResponseEnvelope, TraceParent,
     TraceParentError, Trigger, read_frame, write_frame,
@@ -666,7 +666,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
             timestamp: "1712345678.000100".to_owned(),
         },
         user: "private user sentinel".to_owned(),
-        assistant: "private assistant sentinel".to_owned(),
+        assistant: DeliveredAnswer("private assistant sentinel".to_owned()),
     };
     assert!(scope.is_bounded() && turn.is_bounded());
     for rendered in [
@@ -694,7 +694,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     assert!(!oversized.is_bounded());
     let oversized_turn = DeliveredTurnRequest {
         user: "x".repeat(64 * 1024),
-        assistant: "y".to_owned(),
+        assistant: DeliveredAnswer("y".to_owned()),
         ..turn
     };
     assert!(!oversized_turn.is_bounded());
@@ -1533,7 +1533,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
             timestamp: "1712345678.000100".to_owned(),
         },
         user: "hello".to_owned(),
-        assistant: "hi".to_owned(),
+        assistant: DeliveredAnswer("hi".to_owned()),
     };
     let unattested = Attestation::for_subject(subject(), agent());
     let chat = Attestation::for_chat(subject(), agent(), scope());

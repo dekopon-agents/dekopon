@@ -131,13 +131,13 @@ async fn oversized_steered_text_is_recorded_with_a_marked_prefix_and_the_exact_a
         panic!("expected delivered turn: {record:?}");
     };
     assert!(turn.is_bounded());
-    assert_eq!(turn.assistant, accepted);
+    assert_eq!(turn.assistant().as_str(), accepted);
     let aggregate = [first.as_str(), &steer, &steer, &steer].join("\n\n");
     let budget = 64 * 1024 - accepted.len() - "[…]".len();
     assert!(aggregate.len() > 64 * 1024);
     assert!(!aggregate.is_char_boundary(budget));
     let end = aggregate.floor_char_boundary(budget);
-    assert_eq!(turn.user, format!("{}[…]", &aggregate[..end]));
+    assert_eq!(turn.user(), format!("{}[…]", &aggregate[..end]));
     assert!(
         !capture
             .events_text()
