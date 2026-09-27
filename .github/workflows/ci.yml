@@ -537,7 +537,9 @@ jobs:
           # init container that hands that subtree to 65532; neither of the renders above reaches it.
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
-            --set broker.providerSet.enabled=true > "$RUNNER_TEMP/provider-set.yaml"
+            --set broker.providerSet.enabled=true \
+            --set broker.providerSync.enabled=true \
+            --set broker.providerSync.providerSet.configMap=dekopon-providers > "$RUNNER_TEMP/provider-set.yaml"
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
