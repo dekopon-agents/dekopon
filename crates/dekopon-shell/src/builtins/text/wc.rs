@@ -7,11 +7,17 @@ use crate::{
 
 /// With exactly one flag the result is a bare number so it composes with arithmetic and test; with
 /// no flag it returns an object holding all three counts instead of requiring column parsing.
+const HELP: &str = "-l -w -c";
+
 pub(crate) struct Wc;
 
 impl Builtin for Wc {
     fn name(&self) -> &'static str {
         "wc"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -30,7 +36,7 @@ impl Builtin for Wc {
                 "-w" | "--words" => words_flag = true,
                 "-c" | "--bytes" => bytes_flag = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("wc", flag));
+                    return Err(unsupported_flag("wc", flag, HELP));
                 }
                 other => {
                     return Err(CommandFailure::usage(format!(

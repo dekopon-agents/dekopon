@@ -5,11 +5,17 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
+const HELP: &str = "-r -n -u";
+
 pub(crate) struct Sort;
 
 impl Builtin for Sort {
     fn name(&self) -> &'static str {
         "sort"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -28,7 +34,7 @@ impl Builtin for Sort {
                 "-n" | "--numeric-sort" => numeric = true,
                 "-u" | "--unique" => unique = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("sort", flag));
+                    return Err(unsupported_flag("sort", flag, HELP));
                 }
                 other => {
                     return Err(CommandFailure::usage(format!(

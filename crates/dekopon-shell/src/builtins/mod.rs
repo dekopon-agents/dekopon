@@ -148,6 +148,10 @@ impl BuiltinContext<'_> {
 pub(crate) trait Builtin {
     fn name(&self) -> &'static str;
 
+    /// The flags this builtin accepts, exactly as `--help` prints them and `unsupported_flag`
+    /// echoes them back on a refusal; empty when it takes none.
+    fn help(&self) -> &'static str;
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -206,8 +210,23 @@ pub(crate) fn names() -> Vec<&'static str> {
     names
 }
 
-pub(crate) fn unsupported_flag(command: &str, flag: &str) -> CommandFailure {
-    CommandFailure::usage(format!("{command}: option not yet supported: {flag}"))
+pub(crate) fn unsupported_flag(command: &str, flag: &str, supported: &str) -> CommandFailure {
+    let suffix = if supported.is_empty() {
+        String::new()
+    } else {
+        format!(" (supported: {supported})")
+    };
+    CommandFailure::usage(format!(
+        "{command}: option not yet supported: {flag}{suffix}"
+    ))
+}
+
+/// `--help` renders the same way for every builtin: its name, then the constant `Builtin::help`
+/// reports, at exit 0. `help` stays `""` at the call site so `unsupported_flag`'s suffix keeps
+/// omitting itself for a flag-free builtin; this is the one place that reads as prose instead.
+pub(crate) fn help_result(name: &str, help: &str) -> CommandResult {
+    let help = if help.is_empty() { "no flags" } else { help };
+    CommandResult::value(Value::String(format!("{name}: {help}")))
 }
 
 #[cfg(test)]
@@ -294,11 +313,14 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use dekopon_core::SecretUseProposal;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
-    use super::{lookup, names, xargs};
+    use super::{
+        CommandFailure, lookup, names, test_support::NoCapabilities, test_support::run_builtin,
+        text::Grep, xargs,
+    };
 
     #[test]
     fn the_registry_covers_every_documented_builtin() {
@@ -330,6 +352,52 @@ mod tests {
             assert!(lookup(name).is_some(), "{name} must resolve");
         }
         assert!(lookup("definitely-not-a-builtin").is_none());
+    }
+
+    #[test]
+    fn every_builtin_answers_help_at_exit_zero_before_its_own_usage_rules_apply() {
+        for name in names() {
+            let outcome =
+                Interpreter::new(Limits::default()).run(&format!("{name} --help"), &NoCapabilities);
+            assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{name}: {outcome:?}");
+            assert!(
+                outcome.output.starts_with(&format!("{name}: ")),
+                "{name}: {}",
+                outcome.output
+            );
+        }
+    }
+
+    #[test]
+    fn help_names_the_exact_flags_a_few_representative_builtins_accept() {
+        let run = |script: &str| Interpreter::new(Limits::default()).run(script, &NoCapabilities);
+
+        assert_eq!(run("grep --help").output, "grep: -v -i -c -n -E");
+        assert_eq!(run("true --help").output, "true: no flags");
+        assert_eq!(run("cat --help").output, "cat: no flags");
+        assert_eq!(run("progress --help").output, "progress: --eta");
+        assert_eq!(
+            run(&format!("{} --help", xargs::NAME)).output,
+            "xargs: -I -n"
+        );
+        // A missing `]` would normally be a usage error; --help takes priority over it.
+        assert_eq!(
+            run("[ --help").output,
+            "[: -z -n = != < > -eq -ne -lt -le -gt -ge"
+        );
+    }
+
+    #[test]
+    fn unsupported_flag_names_the_accepted_subset() {
+        let failure =
+            run_builtin(&Grep, &["-q", "a"], Some(json!("a"))).expect_err("-q is not implemented");
+        let CommandFailure::Status { message, .. } = failure else {
+            panic!("a usage error must stay recoverable");
+        };
+        assert_eq!(
+            message,
+            "grep: option not yet supported: -q (supported: -v -i -c -n -E)"
+        );
     }
 
     struct HttpGranted;

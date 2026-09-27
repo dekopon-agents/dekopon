@@ -4,11 +4,17 @@ use serde_json::Value;
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::value::to_text;
 
+const HELP: &str = "-d";
+
 pub(crate) struct Base64;
 
 impl Builtin for Base64 {
     fn name(&self) -> &'static str {
         "base64"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -24,7 +30,7 @@ impl Builtin for Base64 {
             match argument.as_str() {
                 "-d" | "-D" | "--decode" => decode = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("base64", flag));
+                    return Err(unsupported_flag("base64", flag, HELP));
                 }
                 other => {
                     if literal.is_some() {

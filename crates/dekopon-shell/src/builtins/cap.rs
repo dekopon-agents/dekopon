@@ -12,6 +12,10 @@ impl Builtin for Cap {
         "cap"
     }
 
+    fn help(&self) -> &'static str {
+        USAGE
+    }
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,

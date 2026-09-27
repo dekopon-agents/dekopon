@@ -5,11 +5,17 @@ use serde_json::Value;
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::{ExitCode, ast::DEV_NULL};
 
+const ECHO_HELP: &str = "-n -e -E";
+
 pub(crate) struct Echo;
 
 impl Builtin for Echo {
     fn name(&self) -> &'static str {
         "echo"
+    }
+
+    fn help(&self) -> &'static str {
+        ECHO_HELP
     }
 
     fn run(
@@ -90,6 +96,10 @@ impl Builtin for Printf {
         "printf"
     }
 
+    fn help(&self) -> &'static str {
+        ""
+    }
+
     fn run(
         &self,
         _context: &mut BuiltinContext<'_>,
@@ -160,11 +170,17 @@ fn format_text(format: &str, values: &[String]) -> Result<String, CommandFailure
     Ok(output)
 }
 
+const TEST_HELP: &str = "-z -n = != < > -eq -ne -lt -le -gt -ge";
+
 pub(crate) struct Test;
 
 impl Builtin for Test {
     fn name(&self) -> &'static str {
         "test"
+    }
+
+    fn help(&self) -> &'static str {
+        TEST_HELP
     }
 
     fn run(
@@ -182,6 +198,10 @@ pub(crate) struct TestBracket;
 impl Builtin for TestBracket {
     fn name(&self) -> &'static str {
         "["
+    }
+
+    fn help(&self) -> &'static str {
+        TEST_HELP
     }
 
     fn run(
@@ -290,6 +310,10 @@ impl Builtin for True {
         "true"
     }
 
+    fn help(&self) -> &'static str {
+        ""
+    }
+
     fn run(
         &self,
         _context: &mut BuiltinContext<'_>,
@@ -307,6 +331,10 @@ impl Builtin for False {
         "false"
     }
 
+    fn help(&self) -> &'static str {
+        ""
+    }
+
     fn run(
         &self,
         _context: &mut BuiltinContext<'_>,
@@ -322,6 +350,10 @@ pub(crate) struct Progress;
 impl Builtin for Progress {
     fn name(&self) -> &'static str {
         "progress"
+    }
+
+    fn help(&self) -> &'static str {
+        "--eta"
     }
 
     fn run(
@@ -376,6 +408,10 @@ impl Builtin for Sleep {
         "sleep"
     }
 
+    fn help(&self) -> &'static str {
+        ""
+    }
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -420,6 +456,10 @@ impl Builtin for Cat {
         "cat"
     }
 
+    fn help(&self) -> &'static str {
+        ""
+    }
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -428,7 +468,7 @@ impl Builtin for Cat {
     ) -> Result<CommandResult, CommandFailure> {
         for argument in arguments {
             if argument.starts_with('-') && argument.len() > 1 {
-                return Err(unsupported_flag("cat", argument));
+                return Err(unsupported_flag("cat", argument, ""));
             }
         }
 

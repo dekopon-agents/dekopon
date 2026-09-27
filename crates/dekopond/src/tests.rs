@@ -2872,6 +2872,19 @@ fn probe_listing() -> ResponseEnvelope {
     )
 }
 
+/// A granted command word's session-start `--help` prefetch (crates/dekopon-agent's
+/// `provider_help_pages`) opens one more `RunCommand` connection than the pre-#274 fixtures here
+/// were written to expect, immediately after the surface listing and before any script the model
+/// runs. Every stub sequence for a route granting a command word needs one of these inserted right
+/// after its listing response.
+fn help_rendered(word: &str) -> ResponseEnvelope {
+    ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
+        stdout: format!("Usage: {word} <COMMAND>"),
+        stderr: String::new(),
+        status: 0,
+    })
+}
+
 fn upper_proposal(text: &str) -> ResponseEnvelope {
     ResponseEnvelope::command_run(
         serde_json::from_value(json!({
@@ -3504,6 +3517,7 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
         directory.path(),
         vec![
             plain_response(probe_listing()),
+            plain_response(help_rendered("probe")),
             plain_response(upper_proposal("kitty")),
             asset_response(b"\x89PNG\r\n\x1a\nkitty pixels", "image/png"),
             plain_response(upper_proposal("send")),
@@ -3566,6 +3580,7 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
         directory.path(),
         vec![
             plain_response(probe_listing()),
+            plain_response(help_rendered("probe")),
             plain_response(upper_proposal("kitty")),
             asset_response(&png, "image/png"),
             plain_response(upper_proposal("send")),
@@ -3613,6 +3628,7 @@ async fn a_retired_base64_result_envelope_is_refused_without_decoding() {
         directory.path(),
         vec![
             probe_listing(),
+            help_rendered("probe"),
             upper_proposal("kitty"),
             ResponseEnvelope::invocation(
                 record_output(json!({"attachments": [{
@@ -3766,6 +3782,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         directory.path(),
         vec![
             memory_surface_response(),
+            help_rendered("memory"),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
                 Vec::new(),
@@ -3849,6 +3866,11 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert!(matches!(
+        observed.recv().await.expect("help prefetch").request,
+        BrokerRequest::RunCommand { word, argv, .. }
+            if word == "memory" && argv == ["--help".to_owned()]
+    ));
     assert!(
         observed.try_recv().is_err(),
         "no Slack acceptance means no durable-memory record request"
@@ -3862,6 +3884,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
         directory.path(),
         vec![
             probe_listing(),
+            help_rendered("probe"),
             ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
                 stdout: "Usage: probe <COMMAND>\n".to_owned(),
                 stderr: String::new(),
@@ -3891,6 +3914,19 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
+    let prefetch = observed
+        .recv()
+        .await
+        .expect("the session-start help prefetch")
+        .request;
+    assert!(
+        matches!(
+            &prefetch,
+            BrokerRequest::RunCommand { word, argv, stdin: None, .. }
+                if word == "probe" && argv == &["--help".to_owned()]
+        ),
+        "{prefetch:?}"
+    );
     let run = observed.recv().await.expect("the command run").request;
     assert!(
         matches!(
@@ -3944,6 +3980,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
         directory.path(),
         vec![
             probe_listing(),
+            help_rendered("probe"),
             upper_proposal("maybe"),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
@@ -3979,6 +4016,19 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    let prefetch = observed
+        .recv()
+        .await
+        .expect("the session-start help prefetch")
+        .request;
+    assert!(
+        matches!(
+            &prefetch,
+            BrokerRequest::RunCommand { word, argv, .. }
+                if word == "probe" && argv == &["--help".to_owned()]
+        ),
+        "{prefetch:?}"
+    );
     let run = observed.recv().await.expect("the command run").request;
     assert!(
         matches!(
@@ -4012,6 +4062,7 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
         directory.path(),
         vec![
             memory_surface_response(),
+            help_rendered("memory"),
             ResponseEnvelope::error("outcome-unaudited", "do not retry"),
             ResponseEnvelope::error("outcome-unaudited", "still do not retry"),
         ],
@@ -4035,6 +4086,11 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
         BrokerRequest::Capabilities {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
+    ));
+    assert!(matches!(
+        observed.recv().await.expect("help prefetch").request,
+        BrokerRequest::RunCommand { word, argv, .. }
+            if word == "memory" && argv == ["--help".to_owned()]
     ));
     let record = observed.recv().await.expect("one record request");
     let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
@@ -4133,6 +4189,7 @@ async fn denied_failed_and_storage_record_results_are_terminal_without_retry() {
             directory.path(),
             vec![
                 memory_surface_response(),
+                help_rendered("memory"),
                 ResponseEnvelope::invocation(result.clone(), Vec::new(), Vec::new(), Vec::new()),
                 ResponseEnvelope::invocation(result, Vec::new(), Vec::new(), Vec::new()),
             ],
@@ -4160,6 +4217,11 @@ async fn denied_failed_and_storage_record_results_are_terminal_without_retry() {
             }
         ));
         assert!(matches!(
+            observed.recv().await.expect("help prefetch").request,
+            BrokerRequest::RunCommand { word, argv, .. }
+                if word == "memory" && argv == ["--help".to_owned()]
+        ));
+        assert!(matches!(
             observed.recv().await.expect("record request").request,
             BrokerRequest::RecordDeliveredTurn { .. }
         ));
@@ -4177,6 +4239,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         directory.path(),
         vec![
             memory_surface_response(),
+            help_rendered("memory"),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
                 Vec::new(),
@@ -4202,6 +4265,11 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert!(matches!(
+        observed.recv().await.expect("help prefetch").request,
+        BrokerRequest::RunCommand { word, argv, .. }
+            if word == "memory" && argv == ["--help".to_owned()]
+    ));
     assert!(
         observed.try_recv().is_err(),
         "the fixed gateway failure reply must not be recorded"
@@ -4212,6 +4280,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         directory.path(),
         vec![
             memory_surface_response(),
+            help_rendered("memory"),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
                 Vec::new(),
@@ -4234,6 +4303,11 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         BrokerRequest::Capabilities {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
+    ));
+    assert!(matches!(
+        observed.recv().await.expect("help prefetch").request,
+        BrokerRequest::RunCommand { word, argv, .. }
+            if word == "memory" && argv == ["--help".to_owned()]
     ));
     assert!(
         observed.try_recv().is_err(),
@@ -4472,6 +4546,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         directory.path(),
         vec![
             probe_listing(),
+            help_rendered("probe"),
             ResponseEnvelope::error(
                 "unexpected-invocation",
                 "tool work should have been cancelled",
@@ -4512,6 +4587,15 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         BrokerRequest::Capabilities {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
+    ));
+    let prefetch = observed
+        .recv()
+        .await
+        .expect("the session-start help prefetch");
+    assert!(matches!(
+        prefetch.request,
+        BrokerRequest::RunCommand { word, argv, .. }
+            if word == "probe" && argv == ["--help".to_owned()]
     ));
 
     session.abort();
@@ -13013,6 +13097,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         let directory = temporary();
         let (broker,mut observed)=stub_broker_assets(directory.path(), (0..3).flat_map(|edit| vec![
             plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()])),
+            plain_response(help_rendered("gpt-image")),
             plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).unwrap())),
             asset_response(&[PNG, &[edit as u8]].concat(), "image/png"),
             plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{}})).unwrap())),
@@ -13106,6 +13191,12 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert!(matches!(
                 listing.request,
                 BrokerRequest::Capabilities { .. }
+            ));
+            let help = observed.recv().await.expect("help prefetch");
+            assert!(matches!(
+                help.request,
+                BrokerRequest::RunCommand { word, argv, .. }
+                    if word == "gpt-image" && argv == ["--help".to_owned()]
             ));
             let _command = observed.recv().await.expect("command");
             let BrokerRequest::Invoke {
@@ -13868,6 +13959,7 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     let png = b"\x89PNG\r\n\x1a\nfirst generated image";
     let (broker, mut observed) = stub_broker_assets(directory.path(), vec![
         plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()])),
+        plain_response(help_rendered("gpt-image")),
         plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap())),
         asset_response(png, "image/png"),
         plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap())),
@@ -13915,7 +14007,7 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
             .contains(&"fetch_chat_asset".to_owned())
     );
     assert!(tool_message(&models, 1).contains("chat-asset:1"));
-    for _ in 0..4 {
+    for _ in 0..5 {
         observed.recv().await.unwrap();
     }
     let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
@@ -14015,6 +14107,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
             directory.path(),
             vec![
                 plain_response(probe_listing()),
+                plain_response(help_rendered("probe")),
                 plain_response(upper_proposal("create")),
                 asset_response(b"payload", "text/plain"),
                 plain_response(upper_proposal("send")),
@@ -14052,13 +14145,17 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
             directory.path(),
             vec![
                 plain_response(probe_listing()),
+                plain_response(help_rendered("probe")),
                 plain_response(upper_proposal("create")),
                 asset_response(b"payload", "text/plain"),
                 plain_response(upper_proposal("send")),
                 queued_response(1),
                 plain_response(probe_listing()),
+                plain_response(help_rendered("probe")),
                 plain_response(probe_listing()),
+                plain_response(help_rendered("probe")),
                 plain_response(probe_listing()),
+                plain_response(help_rendered("probe")),
             ],
         )
         .await;

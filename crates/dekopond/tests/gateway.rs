@@ -1363,11 +1363,19 @@ async fn keep_alive_ticks_edit_one_message_until_the_budget_stops_them() {
             .expect("the request completes");
 
     let posted = texts(&lines, "progress");
+    let first_tick = posted
+        .iter()
+        .position(|text| text.contains("Still working"));
     assert!(
-        posted
-            .first()
-            .is_some_and(|text| text.contains("Still working")),
-        "nothing is posted until the first tick, which is a slow first turn's only line: {posted:?}"
+        first_tick.is_some(),
+        "the operator's schedule reaches the surface while the model thinks: {posted:?}"
+    );
+    assert!(
+        posted[..first_tick.expect("checked above")]
+            .iter()
+            .all(|text| text.contains("Running") || text.contains("Working on it")),
+        "only the session-start help prefetch's own generic liveness (one granted word each) may \
+         precede the first tick; the slow first turn posts nothing else: {posted:?}"
     );
     let ticks = posted
         .iter()
@@ -1646,6 +1654,10 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
         kinds,
         [
             "started",
+            "tool_started",
+            "tool_finished",
+            "tool_started",
+            "tool_finished",
             "model_turn",
             "answered",
             "tool_started",
@@ -1655,7 +1667,8 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
             "finished",
             "terminal_answered",
         ],
-        "the run's events, one record each: {progress:#?}"
+        "the run's events, one record each: two session-start `--help` prefetches (memory, probe) \
+         precede the first model turn: {progress:#?}"
     );
     for (record, scope) in &progress {
         assert!(

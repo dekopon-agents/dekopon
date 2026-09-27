@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Every shell builtin answers `--help` on stdout at exit 0, naming the flags it accepts; the
+  interpreter intercepts it before the builtin's own argument parsing runs. `unsupported_flag`
+  appends the same accepted subset to a refusal (`grep: option not yet supported: -q (supported:
+  -v -i -c -n -E)`).
+- Each granted provider's top-level `--help` page is fetched once at session start and baked into
+  the `bash` tool description below the word listing, bounded at 2048 bytes per word, so a session
+  no longer spends a model turn on `<word> --help` before first use.
+
 ### Changed
 
 - **Breaking:** `sessions.journal.maxBytes` is removed and refused. Journal files not written for

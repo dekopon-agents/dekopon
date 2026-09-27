@@ -23,11 +23,17 @@ use crate::limits::Budget;
 /// any other way in this crate, so both are excluded from the filter set.
 const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 
+const HELP: &str = "-r -c";
+
 pub(crate) struct Jq;
 
 impl Builtin for Jq {
     fn name(&self) -> &'static str {
         "jq"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -41,7 +47,7 @@ impl Builtin for Jq {
             match argument.as_str() {
                 "-r" | "--raw-output" | "-c" | "--compact-output" => {}
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("jq", flag));
+                    return Err(unsupported_flag("jq", flag, HELP));
                 }
                 _ => {
                     if filter.is_some() {

@@ -6,11 +6,17 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
+const HELP: &str = "-e -E";
+
 pub(crate) struct Sed;
 
 impl Builtin for Sed {
     fn name(&self) -> &'static str {
         "sed"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -26,7 +32,7 @@ impl Builtin for Sed {
                 "-e" | "--expression" => {}
                 "-E" | "--regexp-extended" => extended = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("sed", flag));
+                    return Err(unsupported_flag("sed", flag, HELP));
                 }
                 literal => {
                     if script.is_some() {

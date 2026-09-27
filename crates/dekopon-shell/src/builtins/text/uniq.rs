@@ -5,11 +5,17 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
+const HELP: &str = "-c -d -u";
+
 pub(crate) struct Uniq;
 
 impl Builtin for Uniq {
     fn name(&self) -> &'static str {
         "uniq"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -28,7 +34,7 @@ impl Builtin for Uniq {
                 "-d" | "--repeated" => duplicates_only = true,
                 "-u" | "--unique" => unique_only = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("uniq", flag));
+                    return Err(unsupported_flag("uniq", flag, HELP));
                 }
                 other => {
                     return Err(CommandFailure::usage(format!(

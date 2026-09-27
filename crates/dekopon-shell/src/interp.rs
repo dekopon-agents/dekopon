@@ -1215,6 +1215,12 @@ impl Evaluator<'_> {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
             Resolution::Function => self.call_function(command, arguments, input, capture_output),
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
+                if arguments.iter().any(|argument| argument == "--help") {
+                    return Ok(Executed::Result(builtins::help_result(
+                        builtin.name(),
+                        builtin.help(),
+                    )));
+                }
                 let outcome = {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
@@ -1231,7 +1237,15 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
+            Resolution::Builtin(BuiltinKind::Xargs) => {
+                if arguments.iter().any(|argument| argument == "--help") {
+                    return Ok(Executed::Result(builtins::help_result(
+                        xargs::NAME,
+                        xargs::HELP,
+                    )));
+                }
+                self.run_xargs(arguments, input)
+            }
             Resolution::ProviderCommand => {
                 let stdin = input.as_deref().map(display);
                 self.budget.check_deadline()?;

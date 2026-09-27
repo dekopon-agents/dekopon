@@ -8,11 +8,17 @@ use crate::{
 
 use super::Pattern;
 
+const HELP: &str = "-v -i -c -n -E";
+
 pub(crate) struct Grep;
 
 impl Builtin for Grep {
     fn name(&self) -> &'static str {
         "grep"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -36,7 +42,7 @@ impl Builtin for Grep {
                 "-n" | "--line-number" => number = true,
                 "-E" | "--extended-regexp" => extended = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("grep", flag));
+                    return Err(unsupported_flag("grep", flag, HELP));
                 }
                 literal => {
                     if pattern.is_some() {
