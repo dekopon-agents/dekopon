@@ -12,6 +12,8 @@ All notable changes to Dekopon are documented here. The format is based on
 - Provider storage supports private-conversation, shared-conversation and agent scopes, with
   optional idle retention based on a broker-owned last-used marker. The broker sweeps expired
   resources at startup and every 12 hours, skipping active leases and retaining data by default.
+- Opt-in Slack Agent `liveness.statusText` shows progress notes on the thread status line, with
+  conversation-kind overrides, existing keep-alive/coalescing bounds and terminal cleanup.
 - Shell `progress "text" [--eta S]` builtin for optional invoker notes, silent without a note sink.
 - Opt-in route `progressNotes` enables cleaned, bounded progress notes and `gateway.progress`
   note telemetry, with per-script and per-session caps.

@@ -31,7 +31,7 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
         NativeStatus, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, Status, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        SeenIds, Status, StatusText, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
         ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
         asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
         record_conversation, reserve_for_chunk,
@@ -109,6 +109,7 @@ impl SlackTransport {
                 experience,
                 classic_reaction: liveness.classic_fallback == SlackLivenessFallback::Reaction,
                 agent_status_available: AtomicBool::new(true),
+                assistant_status_available: AtomicBool::new(true),
                 reaction_available: AtomicBool::new(true),
                 added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
                 progress_cooldown_until: Mutex::new(None),
@@ -682,6 +683,7 @@ pub(crate) struct SlackReplier {
     experience: SlackExperience,
     classic_reaction: bool,
     agent_status_available: AtomicBool,
+    assistant_status_available: AtomicBool,
     reaction_available: AtomicBool,
     added_reactions: Mutex<Tracked<()>>,
     progress_cooldown_until: Mutex<Option<Instant>>,
@@ -761,6 +763,12 @@ impl ChatDriver for SlackReplier {
         (self.experience == SlackExperience::Agent
             && self.agent_status_available.load(Ordering::Acquire))
         .then_some(self as &dyn NativeStatus)
+    }
+
+    fn status_text(&self) -> Option<&dyn StatusText> {
+        (self.experience == SlackExperience::Agent
+            && self.assistant_status_available.load(Ordering::Acquire))
+        .then_some(self as &dyn StatusText)
     }
 
     fn progress(&self) -> Option<&dyn ProgressMessage> {
@@ -902,6 +910,25 @@ impl NativeStatus for SlackReplier {
             );
         }
         result
+    }
+}
+
+#[async_trait]
+impl StatusText for SlackReplier {
+    fn min_interval(&self) -> Duration {
+        PROGRESS_MIN_EDIT_INTERVAL
+    }
+
+    async fn show(
+        &self,
+        target: &LivenessTarget,
+        text: &ProgressText,
+    ) -> Result<(), TransportError> {
+        self.set_assistant_status(target, text.as_str()).await
+    }
+
+    async fn clear(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        self.set_assistant_status(target, "").await
     }
 }
 
@@ -1443,6 +1470,50 @@ impl SlackReplier {
 }
 
 impl SlackReplier {
+    async fn set_assistant_status(
+        &self,
+        target: &LivenessTarget,
+        text: &str,
+    ) -> Result<(), TransportError> {
+        let LivenessTarget::Slack {
+            channel_id,
+            thread_ts,
+            ..
+        } = target
+        else {
+            return Err(TransportError::Response);
+        };
+        if !self.assistant_status_available.load(Ordering::Acquire) {
+            return Err(TransportError::Service {
+                code: "feature_disabled".to_owned(),
+            });
+        }
+        let result = self
+            .liveness_call(
+                "assistant.threads.setStatus",
+                &json!({
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "status": text,
+                }),
+            )
+            .await
+            .map(|_| ());
+        if let Err(error) = &result
+            && permanent_agent_error(error)
+            && self
+                .assistant_status_available
+                .swap(false, Ordering::AcqRel)
+        {
+            tracing::warn!(
+                event = "gateway_progress_degraded",
+                transport = "slack",
+                surface = "assistant-status"
+            );
+        }
+        result
+    }
+
     async fn set_agent_status(
         &self,
         channel_id: &str,
@@ -2044,8 +2115,8 @@ mod driver_tests {
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
             LivenessTarget, MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status,
-            SteerAck, StreamedText, TextStream, TransportError, TransportEvent, credential_client,
-            receive_span,
+            StatusText, SteerAck, StreamedText, TextStream, TransportError, TransportEvent,
+            credential_client, receive_span,
         },
     };
 
@@ -2097,6 +2168,7 @@ mod driver_tests {
             experience,
             classic_reaction,
             agent_status_available: AtomicBool::new(true),
+            assistant_status_available: AtomicBool::new(true),
             reaction_available: AtomicBool::new(true),
             added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
             progress_cooldown_until: Mutex::new(None),
@@ -2361,6 +2433,47 @@ mod driver_tests {
             std::time::Duration::from_secs(3),
             "Slack's documented floor between two edits"
         );
+    }
+
+    #[tokio::test]
+    async fn assistant_status_uses_the_thread_line_and_clears_with_an_empty_status() {
+        let mock = spawn_slack_mock(|_, _| (200, json!({"ok": true, "future": {"field": 1}})));
+        let replier = replier(&mock.base, SlackExperience::Agent);
+        let status = ChatDriver::status_text(&replier).unwrap();
+        assert_eq!(status.min_interval(), std::time::Duration::from_secs(3));
+        status.show(&target(), &rendered().0).await.unwrap();
+        status.clear(&target()).await.unwrap();
+        let calls = mock.calls();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "/api/assistant.threads.setStatus".to_owned(),
+                    json!({"channel_id": CHANNEL, "thread_ts": INBOUND_TS, "status": "Working on it…"})
+                ),
+                (
+                    "/api/assistant.threads.setStatus".to_owned(),
+                    json!({"channel_id": CHANNEL, "thread_ts": INBOUND_TS, "status": ""})
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_assistant_scope_disables_only_the_agent_status_text_surface() {
+        let mock = spawn_slack_mock(|_, _| (200, json!({"ok": false, "error": "missing_scope"})));
+        let classic = replier(&mock.base, SlackExperience::Classic);
+        assert!(ChatDriver::status_text(&classic).is_none());
+        let agent = replier(&mock.base, SlackExperience::Agent);
+        assert!(
+            matches!(StatusText::show(&agent, &target(), &rendered().0).await,
+            Err(TransportError::Service { code }) if code == "missing_scope")
+        );
+        assert!(ChatDriver::status_text(&agent).is_none());
+        assert!(ChatDriver::status(&agent).is_some());
+        assert!(matches!(StatusText::clear(&agent, &target()).await,
+            Err(TransportError::Service { code }) if code == "feature_disabled"));
+        assert_eq!(mock.calls().len(), 1);
     }
 
     #[tokio::test]

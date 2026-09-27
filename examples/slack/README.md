@@ -112,7 +112,7 @@ liveness:
   cancelButton: true
 ```
 
-Agent profile:
+Agent profile, optionally showing opted-in route notes on the thread status line:
 
 ```yaml
 kind: slackSocketMode
@@ -120,8 +120,15 @@ experience: agent
 liveness:
   mode: native
   classicFallback: reaction
-  progress: message
+  progress: off
+  stream: false
+  statusText: true
 ```
+
+The Agent manifest already requests `assistant:write`; no new scope is needed. This transport
+option needs a route with `progressNotes: true` to hand over. See the
+[Slack status-text contract](../../docs/dekopond.md#slack-socket-mode) for its lease and hidden Stop
+control. Omit `statusText` to retain the native-only default.
 
 `cancelButton` is refused on `experience: agent`: Slack renders its own Stop control there. On both
 profiles a reply of `stop` or `cancel` in the conversation stops the run — see

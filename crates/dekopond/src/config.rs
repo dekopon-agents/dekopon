@@ -139,6 +139,8 @@ pub struct LivenessConfig {
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
+    pub status_text: bool,
+    #[serde(default)]
     pub cancel_button: bool,
     #[serde(default)]
     pub keep_alive: KeepAliveConfig,
@@ -153,6 +155,7 @@ pub struct LivenessConfig {
 pub struct LivenessOverride {
     pub progress: Option<ProgressSurface>,
     pub stream: Option<bool>,
+    pub status_text: Option<bool>,
     pub cancel_button: Option<bool>,
     pub keep_alive: Option<KeepAliveConfig>,
 }
@@ -175,6 +178,7 @@ pub struct LivenessSettings {
     pub classic_fallback: SlackLivenessFallback,
     pub progress: ProgressSurface,
     pub stream: bool,
+    pub status_text: bool,
     pub cancel_button: bool,
 }
 
@@ -186,6 +190,7 @@ impl LivenessConfig {
             classic_fallback: self.classic_fallback,
             progress: self.progress,
             stream: self.stream,
+            status_text: self.status_text,
             cancel_button: self.cancel_button,
         }
     }
@@ -207,6 +212,9 @@ impl ResolvedLiveness {
         let settings = LivenessSettings {
             progress: override_for_kind.progress.unwrap_or(self.settings.progress),
             stream: override_for_kind.stream.unwrap_or(self.settings.stream),
+            status_text: override_for_kind
+                .status_text
+                .unwrap_or(self.settings.status_text),
             cancel_button: override_for_kind
                 .cancel_button
                 .unwrap_or(self.settings.cancel_button),
@@ -1594,6 +1602,7 @@ fn resolve_liveness(
         for surface in [
             (liveness.progress == ProgressSurface::Message).then_some("progress"),
             liveness.stream.then_some("stream"),
+            liveness.status_text.then_some("statusText"),
             liveness.cancel_button.then_some("cancelButton"),
         ]
         .into_iter()
@@ -1613,13 +1622,19 @@ fn resolve_liveness(
         transport: &str,
         whatsapp: bool,
         slack_agent: bool,
-        stream: bool,
-        cancel_button: bool,
+        settings: LivenessSettings,
     ) {
+        if settings.status_text && !slack_agent {
+            problems.push(ConfigProblem::UnsupportedLivenessSurface {
+                transport: transport.to_owned(),
+                surface: "statusText",
+                reason: "only Slack's Agent experience has a thread status line",
+            });
+        }
         if whatsapp {
             for surface in [
-                stream.then_some("stream"),
-                cancel_button.then_some("cancelButton"),
+                settings.stream.then_some("stream"),
+                settings.cancel_button.then_some("cancelButton"),
             ]
             .into_iter()
             .flatten()
@@ -1632,7 +1647,7 @@ fn resolve_liveness(
                 });
             }
         }
-        if slack_agent && cancel_button {
+        if slack_agent && settings.cancel_button {
             problems.push(ConfigProblem::UnsupportedLivenessSurface {
                 transport: transport.to_owned(),
                 surface: "cancelButton",
@@ -1640,14 +1655,7 @@ fn resolve_liveness(
             });
         }
     }
-    unsupported_surfaces(
-        problems,
-        &name,
-        whatsapp,
-        slack_agent,
-        liveness.stream,
-        liveness.cancel_button,
-    );
+    unsupported_surfaces(problems, &name, whatsapp, slack_agent, liveness.settings());
     let chat_kind = transport.chat_kind();
     for (kind, overlay) in &liveness.conversations {
         if !chat_kind.produces(*kind) {
@@ -1661,8 +1669,12 @@ fn resolve_liveness(
             &name,
             whatsapp,
             slack_agent,
-            overlay.stream == Some(true),
-            overlay.cancel_button == Some(true),
+            LivenessSettings {
+                stream: overlay.stream.unwrap_or_default(),
+                cancel_button: overlay.cancel_button.unwrap_or_default(),
+                status_text: overlay.status_text.unwrap_or_default(),
+                ..LivenessSettings::default()
+            },
         );
         if let Some(keep_alive) = &overlay.keep_alive
             && (keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0))
@@ -1718,7 +1730,7 @@ fn resolve_liveness(
         templates,
         conversations: liveness.conversations.clone(),
     };
-    if [
+    let mut settings = [
         ConversationKind::DirectMessage,
         ConversationKind::GroupDirectMessage,
         ConversationKind::Channel,
@@ -1726,14 +1738,23 @@ fn resolve_liveness(
     ]
     .into_iter()
     .filter(|kind| chat_kind.produces(*kind))
-    .any(|kind| {
-        let (settings, _) = resolved.for_kind(kind);
+    .map(|kind| resolved.for_kind(kind).0);
+    if settings.clone().any(|settings| {
         settings.cancel_button && !settings.stream && settings.progress == ProgressSurface::Off
     }) {
         problems.push(ConfigProblem::UnsupportedLivenessSurface {
-            transport: name,
+            transport: name.clone(),
             surface: "cancelButton",
             reason: "a message-backed Stop control requires progress or streaming",
+        });
+    }
+    if settings.any(|settings| {
+        settings.status_text && (settings.stream || settings.progress == ProgressSurface::Message)
+    }) {
+        problems.push(ConfigProblem::UnsupportedLivenessSurface {
+            transport: name,
+            surface: "statusText",
+            reason: "statusText replaces the progress message and the stream; use progress: off or auto and stream: false",
         });
     }
     resolved
@@ -2160,6 +2181,106 @@ mod tests {
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
         )
+    }
+
+    #[test]
+    fn status_text_defaults_off_and_resolves_slack_agent_conversation_overrides() {
+        use dekopon_broker_protocol::ConversationKind;
+        for (block, direct, channel) in [
+            ("{}", false, false),
+            (
+                "{ mode: native, progress: off, statusText: true }",
+                true,
+                true,
+            ),
+            (
+                "{ mode: native, statusText: true, conversations: { channel: { statusText: false } } }",
+                true,
+                false,
+            ),
+            (
+                "{ mode: native, progress: off, conversations: { channel: { statusText: true } } }",
+                false,
+                true,
+            ),
+        ] {
+            let config = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {block}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap();
+            assert_eq!(
+                config.liveness["slack"]
+                    .for_kind(ConversationKind::DirectMessage)
+                    .0
+                    .status_text,
+                direct
+            );
+            assert_eq!(
+                config.liveness["slack"]
+                    .for_kind(ConversationKind::Channel)
+                    .0
+                    .status_text,
+                channel
+            );
+        }
+    }
+
+    #[test]
+    fn status_text_collects_disabled_mode_unsupported_transport_and_surface_conflicts() {
+        let error = resolved("transports:
+  - name: disabled
+    kind: slackSocketMode
+    appTokenEnv: A
+    botTokenEnv: B
+    experience: agent
+    liveness: { statusText: true }
+  - name: classic
+    kind: slackSocketMode
+    appTokenEnv: C
+    botTokenEnv: D
+    liveness: { mode: native, classicFallback: reaction, statusText: true }
+  - name: local
+    kind: local
+    socketPath: dev.sock
+    liveness: { mode: native, conversations: { directMessage: { statusText: true } } }
+  - name: conflicting
+    kind: slackSocketMode
+    appTokenEnv: E
+    botTokenEnv: F
+    experience: agent
+    liveness: { mode: native, statusText: true, progress: off, conversations: { channel: { progress: message }, thread: { stream: true } } }
+routes:
+  - transport: disabled
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+").unwrap_err();
+        let ConfigError::Invalid { problems, .. } = error else {
+            panic!("expected semantic refusals")
+        };
+        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::LivenessSurfaceWithoutMode { transport, surface: "statusText" } if transport == "disabled")));
+        for name in ["classic", "local"] {
+            assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "only Slack's Agent experience has a thread status line" } if transport == name)));
+        }
+        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "statusText replaces the progress message and the stream; use progress: off or auto and stream: false" } if transport == "conflicting")));
+    }
+
+    #[test]
+    fn status_text_rejects_each_message_surface_after_resolving_overrides() {
+        for surface in ["progress: message", "stream: true"] {
+            for block in [
+                surface.to_owned(),
+                format!("conversations: {{ channel: {{ {surface} }} }}"),
+            ] {
+                let error = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {{ mode: native, statusText: true, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap_err();
+                let ConfigError::Invalid { problems, .. } = error else {
+                    panic!("expected a semantic refusal")
+                };
+                assert!(problems.iter().any(|problem| matches!(
+                    problem,
+                    super::ConfigProblem::UnsupportedLivenessSurface {
+                        surface: "statusText",
+                        ..
+                    }
+                )));
+            }
+        }
     }
 
     #[test]

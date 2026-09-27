@@ -274,7 +274,7 @@ pub struct BrokerLeg {
     attachments: Option<Arc<ReplyAttachments>>,
     asset_inputs: Option<ChatAssetInputs>,
     progress: Option<Arc<dyn ProgressSink>>,
-    progress_notes: bool,
+    notes_enabled: bool,
     notes: AtomicU32,
     calls_max: u32,
     calls_used: AtomicU32,
@@ -319,7 +319,7 @@ impl BrokerLeg {
             attachments: None,
             asset_inputs: None,
             progress: None,
-            progress_notes: false,
+            notes_enabled: false,
             notes: AtomicU32::new(0),
             calls_max: 0,
             calls_used: AtomicU32::new(0),
@@ -354,7 +354,7 @@ impl BrokerLeg {
 
     #[must_use]
     pub fn with_progress_notes(mut self) -> Self {
-        self.progress_notes = true;
+        self.notes_enabled = true;
         self
     }
 
@@ -631,7 +631,7 @@ impl CapabilityInvoker for BrokerLeg {
 
     fn note(&self, text: &str, eta: Option<Duration>) {
         const MAX_NOTES_PER_SCRIPT: u32 = 8;
-        if !self.progress_notes || self.progress.is_none() {
+        if !self.notes_enabled || self.progress.is_none() {
             return;
         }
         let Some(text) = ProgressNote::new(text) else {
@@ -1398,7 +1398,7 @@ mod tests {
                 attachments: None,
                 asset_inputs: None,
                 progress: None,
-                progress_notes: false,
+                notes_enabled: false,
                 notes: AtomicU32::new(0),
                 calls_max: 0,
                 calls_used: AtomicU32::new(0),

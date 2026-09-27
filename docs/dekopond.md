@@ -64,6 +64,7 @@ transports:
       classicFallback: reaction               # none (default) | reaction; slackSocketMode only
       progress: auto                          # auto (default) | off | message
       stream: true                            # default false; refused on whatsappCloudApi
+      statusText: false                       # Agent only; true requires stream: false, progress: off or auto
       cancelButton: false                     # default false; refused on whatsappCloudApi and experience: agent
       keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }   # optional; defaults shown
       templates:                              # optional; defaults ship in the binary
@@ -268,11 +269,13 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
   Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
   fallback, is also refused because the configured fallback could never take effect;
-- `liveness.progress: message`, `liveness.stream: true`, or `liveness.cancelButton: true` while `liveness.mode` is
+- `liveness.progress: message`, `liveness.stream: true`, `liveness.statusText: true`, or `liveness.cancelButton: true` while `liveness.mode` is
   `off`, where none of them could ever take effect; each one is named;
 - `liveness.stream` or `liveness.cancelButton` on `whatsappCloudApi`, which can neither edit a
   message nor carry an interactive component, and `liveness.cancelButton` on a Slack transport with
   `experience: agent`, which renders its own Stop control;
+- `liveness.statusText: true` on anything except Slack's Agent experience, or effective
+  `statusText` alongside `progress: message` or `stream: true`, including conversation overrides;
 - `liveness.classicFallback` on a transport that is not `slackSocketMode`;
 - a `liveness.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of zero is a render
   loop rather than a keep-alive;
@@ -500,6 +503,18 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
   `feature_disabled`, `missing_scope`, and equivalent permanent installation errors disable Agent
   status for that transport and select the configured reaction fallback, then no-op if reactions
   are also unavailable. It never guesses the workspace plan.
+
+An Agent transport may opt into `liveness.statusText: true` (default false, also overridable per
+conversation kind), with `progress: off` or `auto` and `stream: false`. Where no progress message is
+being written, the first opted-in note returns the native session to `active` and shows the existing
+rendered line through `assistant.threads.setStatus`. The handover is one-way for the run: subsequent
+note, tool, working and keep-alive lines use that status surface and the same coalescing/60-edit budget.
+Slack hides its native Stop while custom status text shows; configured stop words still work.
+Only the existing keep-alive schedule refreshes it; Slack drops the text after two minutes without
+a refresh. Exhausting keep-alives, spending the 60-edit budget or tripping the status-text breaker
+attempts to restore native Working once. Terminal handling clears text before delivering the answer or stopped reply, then
+returns native status to `active`. Permanent installation errors disable the custom surface for the
+transport. This legacy assistant method sunsets with Slack's assistant bridge in February 2027.
 
 Slack's native `processing` state includes a Stop button. The transport acknowledges
 `agent_session_stopped` before handling it, derives its user and thread only from Slack's envelope,
