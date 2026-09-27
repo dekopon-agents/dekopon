@@ -539,7 +539,9 @@ In-flight presentation is metadata-minimal. Every event a running session produc
 `class`, `by`, `edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has.
 `turn` is the turn a `model_turn`, `answered` or `steered` record is about; `turns` counts completed
 model calls on `kind = finished`. There is no field on
-it a prompt, a capability argument, a provider result, or model text could be written into. A text
+it a prompt, a capability argument, a provider result, or model text could be written into.
+*Committed direction:* an opted-in route's `kind = note` record will carry the bounded note
+specified by the [security model's liveness rule](security-model.md#current-gateway-posture). A text
 delta is the one event with no record of its own: it is the newest rendering of one value, it
 arrives hundreds of times per turn, and what a reader needs is the count — which rides
 `stream.deltas` on the terminal record and on `prompt.model_turn`. That span also carries

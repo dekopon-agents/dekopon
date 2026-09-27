@@ -201,6 +201,9 @@ notify on initial creation and may not notify on final edits. Their trade-off mu
 Native Working/Idle is not rich tool progress. Arbitrary phase text or provider-call descriptions
 would require a separately demonstrated native API capability, not a new Status string or a fake
 message adapter. No such capability is proposed here.
+*Committed direction:* a bounded model-authored progress note is now accepted under the
+[security model's liveness rule](security-model.md#current-gateway-posture), without promoting
+this document's other explorations to committed work.
 
 ## Telegram, Discord, and WhatsApp styles
 

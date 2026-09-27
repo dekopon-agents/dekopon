@@ -117,9 +117,12 @@ loop reports it as `Cancelled { by }` instead.
   because it is rendered to a person.
 - `ProgressText`, the gateway's own type, is built only from operator-authored templates plus
   numeric state, and drivers see nothing else.
+- *Committed direction:* `ProgressNote` will carry a bounded model-authored note on an opted-in
+  route, under the [security model's liveness rule](security-model.md#current-gateway-posture).
 
-A prompt, a shell argument, a provider result, and attachment bytes have no field anywhere in this
-vocabulary. That is goal 1 enforced by the type system rather than by review.
+A prompt, a shell argument, a provider result, and attachment bytes currently have no field anywhere
+in this vocabulary. That is goal 1 enforced by the type system rather than by review;
+*Committed direction:* the progress note will be the one opt-in exception.
 
 ## The driver
 
@@ -370,6 +373,10 @@ Reasoning summaries in chat; a second progress surface alongside the stream; kee
 and buttons on a transport with no edit surface; multi-message progress threads and checklists; a
 "finish the current step" cancel mode or any rollback; and streaming tool-call arguments or
 reasoning to a person, which the `ModelText` type makes structurally impossible.
+
+*Exploration:* Slack `chat.startStream`/`appendStream` `task_update` chunks could show a timeline,
+but they are a streamed message, which Slack Agent transports deliberately do not post. They are
+not an exception to the native-first policy and are not proposed.
 
 ## Testing
 
