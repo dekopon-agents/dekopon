@@ -172,7 +172,6 @@ impl InferenceHttp {
                     InferenceError::Protocol(_) => ("protocol", None),
                     InferenceError::Attachment(_) => ("attachment", None),
                     InferenceError::InvalidRequest(_) => ("invalid-request", None),
-                    InferenceError::Unsupported(_) => ("unsupported", None),
                     InferenceError::Cancelled => ("cancelled", None),
                     InferenceError::DeadlineExceeded => ("deadline-exceeded", None),
                 };

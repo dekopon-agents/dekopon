@@ -490,16 +490,21 @@ impl RouterStream {
             return Err(ProtocolFailure::NoChoices.into());
         }
         let mut calls = Vec::with_capacity(self.replay.calls.len());
-        for value in &mut self.replay.calls {
+        let mut kept = Vec::with_capacity(self.replay.calls.len());
+        for mut value in std::mem::take(&mut self.replay.calls) {
             let object = value
                 .as_object_mut()
                 .ok_or_else(|| protocol("tool call must be an object", secrets))?;
             object.remove("index");
-            let call = WireToolCall::deserialize(&*value)
+            if let Some(call) = WireToolCall::deserialize(&value)
                 .map_err(|error| secrets.decode_failure(error))?
-                .into_model(secrets)?;
-            calls.push(call);
+                .into_model(secrets)?
+            {
+                calls.push(call);
+                kept.push(value);
+            }
         }
+        self.replay.calls = kept;
         Ok(complete_turn(
             (!self.content.is_empty()).then_some(self.content),
             calls,

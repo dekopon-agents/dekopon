@@ -559,7 +559,7 @@ async fn malformed_missing_terminal_and_incomplete_calls_are_protocol_errors() {
 }
 
 #[tokio::test]
-async fn finish_reasons_keep_complete_text_but_refuse_filtering_and_unexecutable_tools() {
+async fn finish_reasons_keep_complete_text_and_skip_unknown_tools_but_refuse_filtering() {
     for reason in ["stop", "length", "extension", "content_filter"] {
         let body = format!(
             "data: {}\n\n",
@@ -574,13 +574,40 @@ async fn finish_reasons_keep_complete_text_but_refuse_filtering_and_unexecutable
         }
         requests_have_only_the_authored_headers(&server);
     }
-    let server = MockServer::start(vec![MockResponse::sse(
-        &TOOL.replace("\"type\":\"function\"", "\"type\":\"computer\""),
-    )]);
-    assert!(matches!(
-        generate(&client(&server, Settings::default()), &[]).await,
-        Err(InferenceError::Unsupported(_))
-    ));
+    let body = format!(
+        "data: {}\n\n",
+        json!({"choices":[{
+            "delta":{
+                "content":"answer",
+                "tool_calls":[{"index":0,"id":"call-1","type":"computer"}]
+            },
+            "finish_reason":"stop"
+        }]})
+    );
+    let server = MockServer::start(vec![
+        MockResponse::sse(&body),
+        MockResponse::sse(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+        )),
+    ]);
+    let client = client(&server, Settings::default());
+    let mut messages = vec![ModelMessage::user("go")];
+    let turn = generate(&client, &messages)
+        .await
+        .expect("an unknown tool item is skipped, not rejected");
+    assert_eq!(turn.content.as_deref(), Some("answer"));
+    assert!(turn.tool_calls.is_empty());
+
+    messages.push(assistant_message(&turn));
+    messages.push(ModelMessage::user("continue"));
+    generate(&client, &messages)
+        .await
+        .expect("the follow-up turn completes");
+
+    let second_request = request_json(&server.requests()[1]).to_string();
+    assert!(!second_request.contains("computer"));
+    assert!(!second_request.contains("call-1"));
     requests_have_only_the_authored_headers(&server);
 }
 
