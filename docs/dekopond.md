@@ -308,8 +308,10 @@ The `memory:` block adds three more:
 
 Every adapter — Slack, Discord, Telegram, WhatsApp and local — uses the same private composable
 recovery extension. It wraps only connection establishment and receiving, never reply drivers,
-provider invocations, or outbound message effects. Existing clients, deduplication state, Telegram
-offsets, Slack thread ownership and Discord resume/identify state survive recovery.
+provider invocations, or outbound message effects. Existing clients, Slack's dedup ring, Telegram
+offsets, Slack thread ownership and Discord resume/identify state survive recovery. Discord and
+WhatsApp keep no dedup ring, so a gateway resume or a Meta webhook retry redelivers a message the
+gateway already accepted.
 
 The fixed policy requires no configuration:
 

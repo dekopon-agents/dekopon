@@ -32,6 +32,13 @@ All notable changes to Dekopon are documented here. The format is based on
   `chat.startStream`/`appendStream`/`stopStream` path is gone from the Slack driver. Progress on
   Slack now shows through the progress message or, on Agent installations, `liveness.statusText`;
   other transports keep streaming unchanged.
+- **Breaking:** the Discord `SeenIds` dedup ring and the WhatsApp `ClaimedIds` dedup ring are gone.
+  Exactly-once delivery is not a goal; a Discord gateway resume or a Meta webhook retry now
+  redelivers the message and produces a second reply instead of being silently dropped. The Slack
+  dedup ring is unchanged.
+- `dedup-conflict` and `dedup-capacity` are no longer distinct chat-memory failure
+  classifications in `record_delivered_turn`'s routed error and telemetry category; both now
+  classify as the generic `provider-failure`.
 
 ### Fixed
 

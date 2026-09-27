@@ -334,8 +334,8 @@ memory search --query TEXT
 Recent returns whole chronological turns. Search examines the bounded newest lookback with Unicode
 lowercase plus literal substring matching and returns whole turns chronologically. Compaction has a
 lower target and higher threshold for hysteresis; dedup records are never compacted. The same ID and
-content succeeds without mutation, a changed commitment is `dedup-conflict`, malformed complete
-records are `memory-corrupt`, and finite dedup exhaustion is `dedup-capacity` while reads continue.
+content succeeds without mutation. A changed commitment or finite dedup exhaustion now classifies as
+the generic `provider-failure`; malformed complete records remain `memory-corrupt`.
 
 Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
 files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage

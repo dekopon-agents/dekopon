@@ -328,7 +328,8 @@ invocation success promises cross-file atomicity or crash recovery ([`design.md`
 
 Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
 automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte
-cap, new recording returns `dedup-capacity` while reads remain available.
+cap, new recording fails, classified as the generic `provider-failure`, while reads remain
+available.
 
 ## Mapped compiled-provider trust
 

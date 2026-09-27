@@ -1829,8 +1829,6 @@ pub(crate) fn memory_record_outcome_category(result: &InvocationResult) -> Optio
         InvocationOutcome::Succeeded => None,
         InvocationOutcome::Denied => Some("denied"),
         InvocationOutcome::Failed => Some(match result.error.as_deref() {
-            Some("dedup-capacity") => "dedup-capacity",
-            Some("dedup-conflict") => "dedup-conflict",
             Some("memory-corrupt") => "memory-corrupt",
             Some("result-too-large") => "result-too-large",
             Some("storage-quota") => "storage-quota",
