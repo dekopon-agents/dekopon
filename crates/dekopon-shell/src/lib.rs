@@ -131,7 +131,7 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
 
@@ -231,6 +231,10 @@ pub trait CapabilityInvoker {
         None
     }
 
+    fn note(&self, text: &str, eta: Option<Duration>) {
+        let _ = (text, eta);
+    }
+
     fn script_finished(&self) {}
 
     fn invoke(
@@ -271,6 +275,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.as_ref().describe(capability)
+    }
+
+    fn note(&self, text: &str, eta: Option<Duration>) {
+        self.as_ref().note(text, eta);
     }
 
     fn script_finished(&self) {

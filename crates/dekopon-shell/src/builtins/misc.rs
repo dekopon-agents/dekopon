@@ -317,6 +317,58 @@ impl Builtin for False {
     }
 }
 
+pub(crate) struct Progress;
+
+impl Builtin for Progress {
+    fn name(&self) -> &'static str {
+        "progress"
+    }
+
+    fn run(
+        &self,
+        context: &mut BuiltinContext<'_>,
+        arguments: &[String],
+        _input: Option<Value>,
+    ) -> Result<CommandResult, CommandFailure> {
+        let mut text = None;
+        let mut eta = None;
+        let mut has_eta = false;
+        let mut arguments = arguments.iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--eta" {
+                if has_eta {
+                    return Err(CommandFailure::usage(
+                        "progress: --eta may appear only once",
+                    ));
+                }
+                has_eta = true;
+                let seconds = arguments
+                    .next()
+                    .ok_or_else(|| CommandFailure::usage("progress: --eta requires seconds"))?;
+                if seconds == "--eta" {
+                    return Err(CommandFailure::usage(
+                        "progress: --eta may appear only once",
+                    ));
+                }
+                eta = seconds
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|seconds| (1..=3600).contains(seconds))
+                    .map(|seconds| Duration::from_secs(u64::from(seconds)));
+            } else if text.replace(argument.as_str()).is_some() {
+                return Err(CommandFailure::usage(
+                    "progress: exactly one text operand is required; quote the text",
+                ));
+            }
+        }
+        let text = text.ok_or_else(|| {
+            CommandFailure::usage("progress: exactly one text operand is required; quote the text")
+        })?;
+        context.invoker.note(text, eta);
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+}
+
 pub(crate) struct Sleep;
 
 impl Builtin for Sleep {
@@ -407,20 +459,104 @@ impl Builtin for Cat {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use serde_json::{Value, json};
 
     use crate::{
-        ExitCode,
+        CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter,
         builtins::{
             CommandFailure,
-            test_support::{run_builtin, run_builtin_with},
+            test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},
         },
         limits::Limits,
     };
 
-    use super::{Cat, Echo, False, Printf, Sleep, Test, TestBracket, True};
+    use super::{Cat, Echo, False, Printf, Progress, Sleep, Test, TestBracket, True};
+
+    #[derive(Default)]
+    struct Notes(Mutex<Vec<(String, Option<Duration>)>>);
+
+    impl CapabilityInvoker for Notes {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            _secret_use: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            panic!("progress must not invoke a capability")
+        }
+
+        fn note(&self, text: &str, eta: Option<Duration>) {
+            self.0.lock().unwrap().push((text.to_owned(), eta));
+        }
+    }
+
+    #[test]
+    fn progress_passes_raw_text_and_eta_in_either_order_through_an_arc() {
+        let notes = Arc::new(Notes::default());
+        for arguments in [
+            vec![" <@rendering> ", "--eta", "40"],
+            vec!["--eta", "40", " <@rendering> "],
+        ] {
+            let result = run_builtin_with_invoker(&Progress, &arguments, &notes).unwrap();
+            assert_eq!(result.status, ExitCode::SUCCESS);
+            assert_eq!(result.value, Value::Null);
+        }
+        assert_eq!(
+            *notes.0.lock().unwrap(),
+            vec![(" <@rendering> ".to_owned(), Some(Duration::from_secs(40))); 2]
+        );
+    }
+
+    #[test]
+    fn progress_ignores_invalid_eta_without_rejecting_the_note() {
+        let notes = Notes::default();
+        for seconds in ["0", "3601", "-5", "4.5", "soon"] {
+            let result =
+                run_builtin_with_invoker(&Progress, &["x", "--eta", seconds], &notes).unwrap();
+            assert_eq!(result.status, ExitCode::SUCCESS);
+        }
+        assert_eq!(*notes.0.lock().unwrap(), vec![("x".to_owned(), None); 5]);
+    }
+
+    #[test]
+    fn malformed_progress_never_reaches_the_invoker() {
+        let notes = Notes::default();
+        for arguments in [
+            vec![],
+            vec!["two", "words"],
+            vec!["x", "--eta"],
+            vec!["--eta", "--eta", "x"],
+            vec!["--eta", "1", "x", "--eta", "2"],
+        ] {
+            assert!(matches!(
+                run_builtin_with_invoker(&Progress, &arguments, &notes),
+                Err(CommandFailure::Status {
+                    status: ExitCode::SYNTAX,
+                    ..
+                })
+            ));
+        }
+        assert!(notes.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_adds_no_script_output() {
+        let notes = Notes::default();
+        let result = Interpreter::new(Limits::default()).run("progress \"x\"; echo done", &notes);
+        assert_eq!(result.exit_code, ExitCode::SUCCESS);
+        assert_eq!(result.output, "done");
+        assert_eq!(result.capability_calls, 0);
+        assert_eq!(*notes.0.lock().unwrap(), vec![("x".to_owned(), None)]);
+    }
 
     #[test]
     fn echo_joins_arguments_with_spaces() {
