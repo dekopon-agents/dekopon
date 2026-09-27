@@ -283,10 +283,11 @@ spec:
 {{- end }}
 {{- if include "dekopon.providerSetEnabled" . }}
 
-              # The managed provider set's directory on the claim. The chart writes nothing into
-              # it: `dekopon-brokerd provider sync` — an operator-owned step outside this chart,
-              # which has to have run before this pod rolls — writes the lock and the blob store
-              # here, and the broker reads them at startup. What only the pod can do is ownership.
+              # The managed provider set's directory on the claim. This pod writes nothing into
+              # it: `dekopon-brokerd provider sync` (broker.providerSync, or the operator's own
+              # step), which has to have run before this pod rolls, writes the lock and the blob
+              # store here, and the broker reads them at startup. What only the pod can do is
+              # ownership.
               # The broker refuses a lock or a store that is not owned by its own UID, and refuses
               # any ancestor that is group- or world-writable without the sticky bit; a fresh
               # local-path volume arrives root-owned and 0777, so a first start without this

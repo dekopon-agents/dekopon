@@ -780,9 +780,9 @@ Arguments: dict "ctx" $ "sidecar" bool
 {{- end }}
 {{- if include "dekopon.providerSetEnabled" $ }}
     # The managed provider set, and only it: the generated lock and the content-addressed blob
-    # store an operator-owned `dekopon-brokerd provider sync` wrote onto the claim before this pod
-    # rolled. A second subPath view of the same claim, a sibling of the credential directory rather
-    # than a child of it, so the claim root stays unmounted here and unreachable from the gateway.
+    # store `dekopon-brokerd provider sync` wrote onto the claim before this pod rolled. A second
+    # subPath view of the same claim, a sibling of the credential directory rather than a child of
+    # it, so the claim root stays unmounted here and unreachable from the gateway.
     # The broker only reads these: it checks every blob's length and SHA-256 against the lock on the
     # same read it hands to Wasmtime.
     - name: state

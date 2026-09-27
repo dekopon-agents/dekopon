@@ -31,6 +31,9 @@ routing; it is disabled by default. The broker never receives a TCP surface.
 | `broker` | native sidecar (`restartPolicy: Always`) when the gateway is enabled, otherwise the pod's only regular container | `dekopon-brokerd --config /etc/dekopon/broker.yaml` |
 | `gateway` | regular container, only when `gateway.enabled` | `dekopond --config /etc/dekopon/dekopond.yaml` |
 
+`broker.providerSync.enabled` adds a hook `Job` that runs `dekopon-brokerd provider sync`; see
+[Syncing the set with the chart's hook Job](#syncing-the-set-with-the-charts-hook-job).
+
 The chart enforces the [current local process boundary](../../docs/security-model.md#current-local-process-boundary).
 Pod defaults and broker stay `65532:65532`; the gateway container is `65533:65533`.
 Supplementary group `65534` reaches only the broker's `0660` socket in its `0710` IPC
@@ -444,10 +447,9 @@ claim is not the path the daemon reads. The broker mounts that subdirectory by `
 of its ChatGPT credential mount rather than a child of it. The gateway gets no mount for it, which
 is the same boundary the two credential directories have.
 
-**The chart does not write the lock or the store, and does not run `provider sync`.** That is an
-operator-owned step outside this chart — on the Raspberry Pi deployment, an Argo `Sync` hook Job in
-an earlier wave running `dekopon-brokerd provider sync` against the same claim — and it has to have
-completed before the pod rolls. The chart does the one thing only the pod can do: the init container
+**The pod does not write the lock or the store.** `dekopon-brokerd provider sync` does, and it has
+to have completed before the pod rolls: either `broker.providerSync` below, or your own step against
+the same claim. The pod does the one thing only it can do: the init container
 creates the subdirectory if it is absent and hands it to `65532` as `0700`. Both halves are
 load-bearing, because the broker refuses a lock or a store that is not owned by its own UID and
 refuses any ancestor that is group- or world-writable without the sticky bit, and a fresh
@@ -460,6 +462,52 @@ rendered before, and a release that enables it must also stop naming `providers`
 `broker.yaml`. The chart refuses to render when `subdir` is not one non-dot path segment, when it
 collides with either ChatGPT subdirectory, or when `mountPath` is not canonical absolute or would
 overlap another of the broker's own mounts.
+
+### Syncing the set with the chart's hook Job
+
+`broker.providerSync.enabled` renders a hook Job that runs `dekopon-brokerd provider sync` with the
+image the Deployment runs — the same `image.digest` or `image.tag`, through the same helper — so the
+package manager and the broker that consumes its lock cannot drift apart. It needs
+`broker.providerSet.enabled` and a ConfigMap whose `providers.yaml` key holds the desired set:
+
+```yaml
+broker:
+  providerSync:
+    enabled: true
+    configMap: dekopon-config
+```
+
+The Job mounts the claim's `providerSet.subdir` at `providerSet.mountPath`, exactly as the broker
+does, and writes `providers.yaml`, `providers.lock.yaml` and `store/` there. Point `broker.yaml` at
+`<mountPath>/providers.lock.yaml` and `<mountPath>/store`. A root init container reclaims the claim
+root as `0:0` `0700`, creates the subdirectory and hands it to `65532` as `0700`, the Deployment's
+own step, because the Job runs before the first pod exists; a `65532` init container copies the ConfigMap key in as a `0600`
+regular file. The fetch runs as `65532` with no ServiceAccount token. `backoffLimit: 2`,
+`activeDeadlineSeconds: 600`, and the Job is removed a day after it finishes. A failed hook fails
+the release and the old pod keeps serving. Every sync re-runs it; with the lock unchanged and the blobs present it fetches nothing. The broker reads the
+lock at startup, so a changed lock takes effect when the pod next rolls; the chart cannot checksum an
+existing ConfigMap to roll it for you.
+
+The hook runs before the release's ordinary objects exist, so the claim and the ConfigMap must
+already be there. The chart-created state claim is not, on a first install, so the default Helm hook
+refuses to render without `state.existingClaim`.
+
+`broker.providerSync.annotations` replaces the hook annotations entirely. Empty means
+`helm.sh/hook: pre-install,pre-upgrade` with `before-hook-creation`. **Argo CD** maps those Helm
+hooks to `PreSync`, which runs before every sync wave — before a ConfigMap or claim in an earlier
+wave exists — so Argo users set:
+
+```yaml
+broker:
+  providerSync:
+    annotations:
+      argocd.argoproj.io/hook: Sync
+      argocd.argoproj.io/sync-wave: "-2"
+      argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+with the ConfigMap in an earlier wave and the claim in the same wave, so a `WaitForFirstConsumer`
+claim binds to the hook's pod.
 
 ## Operator console
 
@@ -838,6 +886,10 @@ exported as an audit log record over OTLP. It may post one review comment and ha
   token through it. What was exercised is the file-level contract (`0600`, one link, a `0700`
   writable directory, temp sibling plus rename) as each family's own daemon UID — `65533` for the
   gateway's, `65532` for the broker's — not a live refresh against OpenAI.
+- The provider-sync hook Job has not run in a cluster. Its rendered init and sync commands have run
+  in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume and
+  a `65532`-owned `0700` claim root, mounted by `subPath` as the Job mounts it: the sync fetched every
+  provider, and a second run fetched nothing.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 

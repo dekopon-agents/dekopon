@@ -231,16 +231,15 @@ broker:
   # the image, or a generated lock plus a content-addressed blob store that
   # `dekopon-brokerd provider sync` resolved from digest-pinned OCI artifacts.
   #
-  # The chart neither runs that sync nor writes anything into this directory. It does the two things
-  # only the pod can do: the claim's `subdir` is mounted into the BROKER container at `mountPath`,
-  # and the init container creates that subdirectory and hands it to 65532 as `0700`. Both are
-  # load-bearing. The broker refuses a lock or a store it does not own, and refuses any ancestor
-  # that is group- or world-writable without the sticky bit; a fresh `local-path` volume arrives
-  # root-owned and `0777`, so a first start without the chown refuses.
+  # The pod never writes into this directory. The claim's `subdir` is mounted into the BROKER
+  # container at `mountPath`, and the init container creates that subdirectory and hands it to 65532
+  # as `0700`. Both are load-bearing. The broker refuses a lock or a store it does not own, and
+  # refuses any ancestor that is group- or world-writable without the sticky bit; a fresh
+  # `local-path` volume arrives root-owned and `0777`, so a first start without the chown refuses.
   #
-  # Writing the lock and the store is an operator-owned step outside this chart, and it has to have
-  # run before the pod rolls — on a Raspberry Pi deployment, an Argo `Sync` hook Job in an earlier
-  # wave that runs `dekopon-brokerd provider sync`. The gateway never receives this mount.
+  # The lock and the store have to exist before the pod rolls: `broker.providerSync` below renders
+  # the hook Job that writes them, or run `dekopon-brokerd provider sync` yourself. The gateway never
+  # receives this mount.
   providerSet:
     enabled: false
     # Single path segment, joined onto paths.stateDir. It is not a free path for the same reason the
@@ -252,6 +251,22 @@ broker:
     # broker.yaml's `providerSet.lockPath` and `providerSet.storePath` must be under this prefix;
     # the chart places the directory, it does not rewrite configuration.
     mountPath: /var/lib/dekopon/providers
+
+  # A hook Job that runs `dekopon-brokerd provider sync` with the Deployment's own image, writing
+  # `<mountPath>/providers.lock.yaml` and `<mountPath>/store` from the `providers.yaml` key of
+  # `configMap`. Requires providerSet.enabled. A failed sync fails the release before the pod rolls,
+  # and the old pod keeps serving. The claim and the ConfigMap must exist before the hook runs, so
+  # the default Helm hook requires state.existingClaim.
+  providerSync:
+    enabled: false
+    configMap: ""
+    # Empty means Helm's pre-install,pre-upgrade hook with before-hook-creation. Any entry replaces
+    # that set entirely. Argo CD maps Helm's pre-install/pre-upgrade to PreSync, which runs before
+    # every sync wave, so Argo users set:
+    #   argocd.argoproj.io/hook: Sync
+    #   argocd.argoproj.io/sync-wave: "-2"
+    #   argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    annotations: {}
 
   # Optional owner-only public-DRN/private-source map. The map contains no values but does contain
   # sensitive physical inventory. Prefer an existing Secret. The init container copies it into the

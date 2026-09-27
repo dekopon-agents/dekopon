@@ -7,6 +7,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.17.0] - 2026-09-27
+
+### Added
+
+- Optional `broker.providerSync` hook Job runs `dekopon-brokerd provider sync` into the
+  `broker.providerSet` directory from a ConfigMap's `providers.yaml`, using the Deployment's image.
+  Its hook annotations are replaceable; Argo CD needs `Sync` in an early wave, not Helm's
+  pre-install/pre-upgrade.
+
 ## [0.25.0] - 2026-09-27
 
 ### Added

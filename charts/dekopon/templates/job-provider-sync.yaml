@@ -1,0 +1,144 @@
+{{- if .Values.broker.providerSync.enabled }}
+{{- if not .Values.broker.providerSet.enabled }}
+{{- fail "broker.providerSync.enabled requires broker.providerSet.enabled; the sync writes the lock and store the broker reads from that directory" }}
+{{- end }}
+{{- if and (not .Values.broker.providerSync.annotations) (not .Values.state.existingClaim) }}
+{{- fail "broker.providerSync.enabled with Helm's default pre-install hook requires state.existingClaim; the chart-created claim does not exist yet when the hook runs" }}
+{{- end }}
+{{- $uid := .Values.podSecurityContext.runAsUser | int -}}
+{{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
+{{- $providerSetDir := include "dekopon.providerSetDir" . -}}
+{{- $mount := .Values.broker.providerSet.mountPath -}}
+{{- $runtimeSecurityContext := mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" $uid "runAsGroup" $gid) -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dekopon.fullname" . }}-provider-sync
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provider-sync
+  annotations:
+    {{- with .Values.broker.providerSync.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- else }}
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- end }}
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      # Not the Deployment's selector labels: a running sync pod would otherwise join the gateway
+      # Service's endpoints.
+      labels:
+        app.kubernetes.io/name: {{ include "dekopon.name" . }}
+        app.kubernetes.io/component: provider-sync
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # The Deployment init's providerSet step, run before the first pod exists. The claim root
+        # is reclaimed first: a 65532-owned 0700 root blocks root without CAP_DAC_OVERRIDE.
+        - name: claim-provider-set
+          image: {{ include "dekopon.initImage" . }}
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.initSecurityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              chown 0:0 "{{ .Values.paths.stateDir }}"
+              chmod 0700 "{{ .Values.paths.stateDir }}"
+              [ -d "{{ $providerSetDir }}" ] || mkdir -p "{{ $providerSetDir }}"
+              chown "{{ $uid }}:{{ $gid }}" "{{ $providerSetDir }}"
+              chmod 0700 "{{ $providerSetDir }}"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.paths.stateDir }}
+        # The manager reads the desired set with the hygiene the broker applies to its lock: a
+        # regular 0600 file owned by 65532, not a symlink into a ConfigMap.
+        - name: prepare-provider-set
+          image: {{ include "dekopon.initImage" . }}
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml $runtimeSecurityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              umask 077
+              install -m 0600 /provider-source/providers.yaml {{ $mount }}/providers.yaml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: provider-source
+              mountPath: /provider-source
+              readOnly: true
+            - name: state
+              mountPath: {{ $mount }}
+              subPath: {{ .Values.broker.providerSet.subdir }}
+      containers:
+        - name: sync
+          image: {{ include "dekopon.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["dekopon-brokerd"]
+          args:
+            - provider
+            - --provider-set={{ $mount }}/providers.yaml
+            - --lock-file={{ $mount }}/providers.lock.yaml
+            - --store={{ $mount }}/store
+            - --output=json
+            - sync
+          securityContext:
+            {{- toYaml $runtimeSecurityContext | nindent 12 }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: state
+              mountPath: {{ $mount }}
+              subPath: {{ .Values.broker.providerSet.subdir }}
+      volumes:
+        - name: provider-source
+          configMap:
+            name: {{ required "broker.providerSync.configMap is required with broker.providerSync.enabled" .Values.broker.providerSync.configMap }}
+            items:
+              - key: providers.yaml
+                path: providers.yaml
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ include "dekopon.stateClaimName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
