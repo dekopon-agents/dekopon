@@ -19,6 +19,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - `dekopon-model`'s `InferenceError::Unsupported` and `UnsupportedFeature` are gone now that
   nothing constructs them; a pre-1.0 break to `dekopon-model`'s public error API.
+- Slack no longer streams the answer: `liveness.stream: true` is refused on every
+  `slackSocketMode` transport (top level and per conversation kind), and the
+  `chat.startStream`/`appendStream`/`stopStream` path is gone from the Slack driver. Progress on
+  Slack now shows through the progress message or, on Agent installations, `liveness.statusText`;
+  other transports keep streaming unchanged.
 
 ### Fixed
 
@@ -31,14 +36,6 @@ All notable changes to Dekopon are documented here. The format is based on
 - A finished run's terminal cleanup no longer overwrites the next turn's Working status: cleanup
   now runs to completion, including the native Idle write, before the acknowledgment that lets the
   same thread's next turn start.
-
-### Removed
-
-- Slack no longer streams the answer: `liveness.stream: true` is refused on every
-  `slackSocketMode` transport (top level and per conversation kind), and the
-  `chat.startStream`/`appendStream`/`stopStream` path is gone from the Slack driver. Progress on
-  Slack now shows through the progress message or, on Agent installations, `liveness.statusText`;
-  other transports keep streaming unchanged.
 
 ## [dekopon-chart-0.17.0] - 2026-09-27
 

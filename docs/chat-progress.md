@@ -393,10 +393,6 @@ and buttons on a transport with no edit surface; multi-message progress threads 
 "finish the current step" cancel mode or any rollback; and streaming tool-call arguments or
 reasoning to a person, which the `ModelText` type makes structurally impossible.
 
-*Exploration:* Slack `chat.startStream`/`appendStream` `task_update` chunks could show a timeline,
-but they are a streamed message, which Slack Agent transports deliberately do not post. They are
-not an exception to the native-first policy and are not proposed.
-
 ## Testing
 
 The local transport is the reference driver: it implements every capability object and its line

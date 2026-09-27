@@ -1772,13 +1772,13 @@ fn resolve_liveness(
             reason: "a message-backed Stop control requires progress or streaming",
         });
     }
-    if settings.any(|settings| {
-        settings.status_text && (settings.stream || settings.progress == ProgressSurface::Message)
-    }) {
+    if settings
+        .any(|settings| settings.status_text && settings.progress == ProgressSurface::Message)
+    {
         problems.push(ConfigProblem::UnsupportedLivenessSurface {
             transport: name,
             surface: "statusText",
-            reason: "statusText replaces the progress message and the stream; use progress: off or auto and stream: false",
+            reason: "statusText replaces the progress message; use progress: off or auto",
         });
     }
     resolved
@@ -2265,7 +2265,7 @@ mod tests {
     appTokenEnv: E
     botTokenEnv: F
     experience: agent
-    liveness: { mode: native, statusText: true, progress: off, conversations: { channel: { progress: message }, thread: { stream: true } } }
+    liveness: { mode: native, statusText: true, progress: off, conversations: { channel: { progress: message } } }
 routes:
   - transport: disabled
     conversation: { kind: [directMessage] }
@@ -2278,28 +2278,26 @@ routes:
         for name in ["classic", "local"] {
             assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "only Slack's Agent experience has a thread status line" } if transport == name)));
         }
-        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "statusText replaces the progress message and the stream; use progress: off or auto and stream: false" } if transport == "conflicting")));
+        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "statusText replaces the progress message; use progress: off or auto" } if transport == "conflicting")));
     }
 
     #[test]
     fn status_text_rejects_each_message_surface_after_resolving_overrides() {
-        for surface in ["progress: message", "stream: true"] {
-            for block in [
-                surface.to_owned(),
-                format!("conversations: {{ channel: {{ {surface} }} }}"),
-            ] {
-                let error = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {{ mode: native, statusText: true, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap_err();
-                let ConfigError::Invalid { problems, .. } = error else {
-                    panic!("expected a semantic refusal")
-                };
-                assert!(problems.iter().any(|problem| matches!(
-                    problem,
-                    super::ConfigProblem::UnsupportedLivenessSurface {
-                        surface: "statusText",
-                        ..
-                    }
-                )));
-            }
+        for block in [
+            "progress: message".to_owned(),
+            "conversations: { channel: { progress: message } }".to_owned(),
+        ] {
+            let error = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {{ mode: native, statusText: true, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap_err();
+            let ConfigError::Invalid { problems, .. } = error else {
+                panic!("expected a semantic refusal")
+            };
+            assert!(problems.iter().any(|problem| matches!(
+                problem,
+                super::ConfigProblem::UnsupportedLivenessSurface {
+                    surface: "statusText",
+                    ..
+                }
+            )));
         }
     }
 
