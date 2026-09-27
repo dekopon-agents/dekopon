@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-27
+
 ### Added
 
 - Provider storage supports private-conversation, shared-conversation and agent scopes, with
@@ -22,7 +24,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Storage constraints replace `namespace: chat` with `scope: private-conversation`; shared scopes
+  keep stable data across authorized callers without sharing gateway conversation history.
 - `progress` is a reserved command word; a provider declaring it is refused at load.
+
+## [dekopon-chart-0.16.0] - 2026-09-27
+
+### Changed
+
+- Default application version is now 0.25.0.
 
 ## [0.24.0] - 2026-09-26
 
@@ -74,8 +84,6 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
-- Storage constraints replace `namespace: chat` with `scope: private-conversation`; shared scopes
-  keep stable data across authorized callers without sharing gateway conversation history.
 - `dekopon-telemetry`'s exporter stack (OTLP, tonic, the OpenTelemetry SDK, the log bridge and the
   blocking reqwest client) sits behind a new default-off `exporter` feature that `dekopond` and
   `dekopon-brokerd` enable. `dekopon-http-host`, and through it `dekopon-broker-host` and the
