@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use dekopon_agent::attachment::GeneratedImage;
@@ -21,6 +21,7 @@ use dekopon_agent::{
 };
 use dekopon_broker_protocol::{AssetEncoding, AssetRow, NewAsset};
 use dekopon_model::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
@@ -38,6 +39,7 @@ pub(crate) struct AssetRef {
     pub mime: String,
     pub size: Option<u64>,
     pub source: Option<AssetSourceRef>,
+    pub arrived: SystemTime,
     fetched: bool,
     encoding: AssetEncoding,
     sent: bool,
@@ -54,7 +56,12 @@ impl fmt::Debug for AssetRef {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum AssetSourceRef {
     Generated {
         capability: String,
@@ -170,6 +177,12 @@ impl AssetAccess {
             },
             fence: Some(fence),
         }
+    }
+
+    pub fn next_asset_id(&self) -> u64 {
+        self.fence
+            .as_ref()
+            .map_or(1, |fence| fence.next_asset_id.load(Ordering::Acquire))
     }
 
     fn with_active<T>(&self, operation: impl FnOnce(&AssetStateKey) -> T) -> Option<T> {
@@ -288,6 +301,7 @@ impl AssetStore {
                             mime: pending.mime,
                             size: pending.size,
                             source: pending.source,
+                            arrived: SystemTime::now(),
                             fetched: false,
                             encoding: AssetEncoding::Identity,
                             sent: false,
@@ -358,6 +372,7 @@ impl AssetStore {
                     mime: recalled.asset.mime,
                     size: recalled.asset.size,
                     source: recalled.asset.source,
+                    arrived: recalled.arrived,
                     fetched: false,
                     encoding: AssetEncoding::Identity,
                     sent: false,
@@ -457,6 +472,7 @@ pub(crate) struct PendingAsset {
 pub(crate) struct RecalledAsset {
     pub id: u64,
     pub asset: PendingAsset,
+    pub arrived: SystemTime,
 }
 
 const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -1119,7 +1135,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             entry.touched = Instant::now();
             entry.assets.push(AssetRef { id, name: format!("asset-{id}"), mime: metadata.content_type.clone(), size: Some(metadata.bytes),
                 source: Some(AssetSourceRef::Generated { capability: capability.to_owned(), invocation: invocation.to_owned() }),
-                fetched: true, encoding: metadata.encoding, sent: false,
+                arrived: SystemTime::now(), fetched: true, encoding: metadata.encoding, sent: false,
             });
             while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
                 let evicted = entry.assets.remove(0);

@@ -610,8 +610,8 @@ async fn native_liveness_is_off_unless_a_transport_opts_in() {
 async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_path() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 1024}});
-    document["routes"][0]["memory"] = json!({"mode": "persistent"});
+    document["sessions"] = json!({"journal": {"path": "journal"}});
+    document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 86_400_000});
     let resolved = load(directory.path(), &document)
         .await
         .expect("a journaled persistent route resolves");
@@ -619,7 +619,7 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
     let window = resolved.routes[0].memory.window().expect("persistent");
     assert_eq!(window.recall, RecallSource::Journal);
     let journal = resolved.journal.expect("journal");
-    assert_eq!(journal.max_bytes, 1024);
+    assert_eq!(journal.retention, Duration::from_secs(86_400));
     assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
 }
 
@@ -915,7 +915,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             "a zero recall horizon",
             mutate(|document| {
-                document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 1024}});
+                document["sessions"] = json!({"journal": {"path": "journal"}});
                 document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 0});
             }),
             |error| {
@@ -960,17 +960,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
                         problem,
                         ConfigProblem::WakeIntervalWithinScriptTimeout { .. }
                     )
-                })
-            },
-        ),
-        (
-            "a zero journal byte cap",
-            mutate(|document| {
-                document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 0}});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidJournalBytes)
                 })
             },
         ),
@@ -14240,7 +14229,7 @@ fn journaled_runner(
         reply_on_busy: true,
         conversations: ConversationStore::new(1024),
         journal: Some(Arc::new(
-            crate::journal::Journal::open(journal, 1 << 20).expect("journal"),
+            crate::journal::Journal::open(journal, Duration::from_secs(3600)).expect("journal"),
         )),
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
         asset_fetchers: HashMap::new(),

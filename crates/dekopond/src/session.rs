@@ -865,6 +865,7 @@ fn platform_window(
             assets.push(RecalledAsset {
                 id: next_asset_id,
                 asset,
+                arrived: message.at,
             });
             next_asset_id += 1;
         }
@@ -906,6 +907,7 @@ async fn append_journal(
     window: MemoryWindow,
     turn: ConversationTurn,
     inventory: Vec<asset::AssetRef>,
+    next_asset_id: u64,
 ) {
     let journal = Arc::clone(journal);
     let stem = key.journal_stem();
@@ -918,6 +920,7 @@ async fn append_journal(
                 grant: &grant,
                 turn: &turn,
                 inventory: &inventory,
+                next_asset_id,
             },
             window,
         )
@@ -1512,7 +1515,17 @@ async fn session(
             && let Some(journal) = runner.journal.as_ref()
         {
             let inventory = runner.assets.inventory(&journal_access);
-            append_journal(journal, &key, &granted, window, turn, inventory).await;
+            let next_asset_id = journal_access.next_asset_id();
+            append_journal(
+                journal,
+                &key,
+                &granted,
+                window,
+                turn,
+                inventory,
+                next_asset_id,
+            )
+            .await;
         }
     }
 

@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Conversation journal (0.26.0)
+
+Delete `sessions.journal.maxBytes` from `dekopond.yaml`; the 0.26.0 gateway refuses the key. Disk is
+bounded by time instead: a journal file not written for longer than the longest `forgetAfterMs` of
+any `recall: journal` route is deleted at startup and on each recall.
+
+The line format changed. The first recall of each conversation deletes its old file and starts
+empty, with one `gateway_recall_failed` warning (`reason: corrupt`); nothing needs migrating.
+
 ## Storage scopes and idle retention (0.25.0)
 
 Every broker storage constraint needs one edit before the 0.25.0 broker will start: replace
