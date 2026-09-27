@@ -33,7 +33,9 @@ mod history;
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
-pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
+pub use history::{
+    ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits, RawAnswer,
+};
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";
 
