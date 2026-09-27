@@ -19,6 +19,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - A journaled answer whose escaped JSON exceeded the compaction read limit no longer drops the
   photos and asset counter recorded before it (#358).
+- OpenAI and OpenRouter chat completion parsing skips a tool item whose `type` is not
+  `function` instead of failing the whole turn, so an answer beside an additive tool type still
+  reaches the caller.
 
 ## [dekopon-chart-0.17.0] - 2026-09-27
 

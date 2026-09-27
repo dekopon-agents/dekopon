@@ -495,10 +495,12 @@ impl RouterStream {
                 .as_object_mut()
                 .ok_or_else(|| protocol("tool call must be an object", secrets))?;
             object.remove("index");
-            let call = WireToolCall::deserialize(&*value)
+            if let Some(call) = WireToolCall::deserialize(&*value)
                 .map_err(|error| secrets.decode_failure(error))?
-                .into_model(secrets)?;
-            calls.push(call);
+                .into_model(secrets)?
+            {
+                calls.push(call);
+            }
         }
         Ok(complete_turn(
             (!self.content.is_empty()).then_some(self.content),

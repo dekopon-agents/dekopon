@@ -1,10 +1,7 @@
 use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
-    error::{
-        InferenceError, ProtocolFailure, ProviderFailure, RequestError, TransportFailure,
-        UnsupportedFeature,
-    },
+    error::{InferenceError, ProtocolFailure, ProviderFailure, RequestError, TransportFailure},
     http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{
@@ -298,7 +295,10 @@ fn turn_from_response(
         .tool_calls
         .into_iter()
         .map(|call| call.into_model(secrets))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     Ok(complete_turn(
         choice.message.content,
         tool_calls,
@@ -561,7 +561,8 @@ pub(crate) struct WireToolCall {
     id: String,
     #[serde(rename = "type")]
     kind: String,
-    function: WireFunctionCall,
+    #[serde(default)]
+    function: Option<WireFunctionCall>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -574,43 +575,46 @@ impl WireToolCall {
     pub(crate) fn into_model(
         self,
         secrets: crate::diagnostic::DiagnosticSecrets<'_>,
-    ) -> Result<ModelToolCall, InferenceError> {
+    ) -> Result<Option<ModelToolCall>, InferenceError> {
         let call = self;
         if call.kind != "function" {
-            return Err(UnsupportedFeature::ToolKind(secrets.sanitize(&call.kind)).into());
+            return Ok(None);
         }
-        let arguments = match call.function.arguments {
+        let function = call
+            .function
+            .ok_or_else(|| InferenceError::from(ProtocolFailure::IncompleteToolCall))?;
+        let arguments = match function.arguments {
             Value::String(arguments) => arguments,
             arguments @ Value::Object(_) => {
                 serde_json::to_string(&arguments).map_err(ProtocolFailure::Decode)?
             }
             _ => {
                 return Err(ProtocolFailure::InvalidToolArguments {
-                    name: secrets.sanitize(&call.function.name),
+                    name: secrets.sanitize(&function.name),
                 }
                 .into());
             }
         };
 
-        if call.id.is_empty() || call.function.name.is_empty() {
+        if call.id.is_empty() || function.name.is_empty() {
             return Err(ProtocolFailure::IncompleteToolCall.into());
         }
         let parsed: Value =
             serde_json::from_str(&arguments).map_err(|error| secrets.decode_failure(error))?;
         if !parsed.is_object() {
             return Err(ProtocolFailure::InvalidToolArguments {
-                name: secrets.sanitize(&call.function.name),
+                name: secrets.sanitize(&function.name),
             }
             .into());
         }
-        Ok(ModelToolCall {
+        Ok(Some(ModelToolCall {
             id: call.id.into(),
             kind: call.kind,
             function: ModelFunctionCall {
-                name: call.function.name,
+                name: function.name,
                 arguments,
             },
-        })
+        }))
     }
 }
 
@@ -814,14 +818,17 @@ impl ChatStream {
                     } else {
                         call.kind
                     },
-                    function: WireFunctionCall {
+                    function: Some(WireFunctionCall {
                         name: call.name,
                         arguments: Value::String(call.arguments),
-                    },
+                    }),
                 }
                 .into_model(secrets)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(complete_turn(
             (!self.content.is_empty()).then_some(self.content),
             tool_calls,
@@ -1738,13 +1745,14 @@ mod tests {
         let call = WireToolCall {
             id: "call-1".to_owned(),
             kind: "function".to_owned(),
-            function: WireFunctionCall {
+            function: Some(WireFunctionCall {
                 name: "echo_echo".to_owned(),
                 arguments: json!({"message": "hi"}),
-            },
+            }),
         }
         .into_model(crate::diagnostic::DiagnosticSecrets::default())
-        .expect("object arguments normalize");
+        .expect("object arguments normalize")
+        .expect("function tool call is kept");
 
         assert_eq!(call.function.arguments, r#"{"message":"hi"}"#);
     }
@@ -1944,21 +1952,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_function_tool_calls() {
-        let error = WireToolCall {
-            id: "call-1".to_owned(),
-            kind: "computer".to_owned(),
-            function: WireFunctionCall {
-                name: "click".to_owned(),
-                arguments: json!({}),
-            },
-        }
-        .into_model(crate::diagnostic::DiagnosticSecrets::default())
-        .expect_err("only function tools are supported");
+    async fn an_unknown_tool_item_is_skipped_and_the_answer_survives() {
+        let response: ChatResponse = serde_json::from_value(json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "answer",
+                    "tool_calls": [{"id": "call-1", "type": "computer", "action": {"type": "click"}}]
+                }
+            }]
+        }))
+        .expect("a response carrying an unknown tool item deserializes");
 
-        assert!(
-            matches!(error, InferenceError::Unsupported(crate::error::UnsupportedFeature::ToolKind(kind)) if kind == "computer")
-        );
+        let turn = turn_from_response(crate::diagnostic::DiagnosticSecrets::default(), response)
+            .expect("an unknown tool item is skipped, not rejected");
+
+        assert_eq!(turn.content.as_deref(), Some("answer"));
+        assert!(turn.tool_calls.is_empty());
     }
 
     async fn wire(message: &ModelMessage) -> Value {
