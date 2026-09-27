@@ -1077,10 +1077,14 @@ async fn run(
                 let Ok(request) = request else { break };
                 let latest = text.borrow_and_update().clone();
                 let delivered = surface.terminal(request.terminal, latest).await;
+                // Cleanup's Idle write must land before the caller can admit this thread's next
+                // turn, since Slack never reverts native status on its own when the reply posts.
+                surface.cleanup().await;
+                coordination.finish();
                 if request.done.send(delivered).is_err() {
                     tracing::debug!(event = "gateway_progress_terminal_unobserved");
                 }
-                break;
+                return;
             }
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);

@@ -28,6 +28,9 @@ All notable changes to Dekopon are documented here. The format is based on
   `function` instead of failing the whole turn, so an answer beside an additive tool type still
   reaches the caller. OpenRouter's native replay no longer carries a skipped item into the next
   request, where it left a tool call with no answering tool message and the next request failed.
+- A finished run's terminal cleanup no longer overwrites the next turn's Working status: cleanup
+  now runs to completion, including the native Idle write, before the acknowledgment that lets the
+  same thread's next turn start.
 
 ## [dekopon-chart-0.17.0] - 2026-09-27
 
