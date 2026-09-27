@@ -25,8 +25,6 @@ All notable changes to Dekopon are documented here. The format is based on
   guests that never imported the ladder, such as memory-chat. A component importing it is refused
   at load; upgrade turso-sql to 0.5.0 first.
 
-### Removed
-
 - `dekopon-model`'s `InferenceError::Unsupported` and `UnsupportedFeature` are gone now that
   nothing constructs them; a pre-1.0 break to `dekopon-model`'s public error API.
 - Slack no longer streams the answer: `liveness.stream: true` is refused on every
