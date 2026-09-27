@@ -747,8 +747,7 @@ Every read of the `dekopon:clock/wall@1.0.0` import emits `provider_clock_read` 
 host handed the guest. A provider's output can depend on the time it read, so the reading is a
 host-supplied input to the run and belongs in the trace beside the proposal's `input`. It is one
 event per read with nothing else attached, and it is not an `audit.event`: audit is one record per
-broker decision, and a clock read is not a decision. Reads outside an invocation emit nothing; they
-trap, and the operation fails as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
+broker decision, and a clock read is not a decision. Legacy wall reads outside an invocation emit nothing; they trap, and the operation fails as `DescribeUsedHostImport` or `RunCommandUsedHostImport`. The `monotonic@1.1.0` read instead emits `provider_monotonic_read` with elapsed nanoseconds from the invocation origin. `provider_random_read` records requested byte count and status (`succeeded`, `refused-phase`, `refused-size`, or `entropy-failed`), never entropy bytes or seeds. OS entropy diagnostics appear only on the broker-side failure event. The ordinary script/provider output trace still records intentionally returned random values.
 
 A `policy-denied` outcome the policy engine never evaluated additionally emits
 `audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The

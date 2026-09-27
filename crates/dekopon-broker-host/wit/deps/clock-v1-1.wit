@@ -1,0 +1,9 @@
+package dekopon:clock@1.1.0;
+
+interface wall {
+    now-unix-millis: func() -> u64;
+}
+
+interface monotonic {
+    now-nanos: func() -> u64;
+}

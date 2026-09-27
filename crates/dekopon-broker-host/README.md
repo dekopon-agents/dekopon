@@ -2,7 +2,7 @@
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
 `dekopon:http@1.1.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.0`, or
-`dekopon:clock@1.0.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
+`dekopon:clock@1.0.0` and `@1.1.0`, or `dekopon:random@0.1.0` interfaces. Buffered HTTP `@1.0.0` and wall clock `@1.0.0` remain linked for older components.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
 `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a
@@ -71,7 +71,8 @@ The linker exposes only these imports; generic WASI and unknown imports fail bef
 | `dekopon:http/client@1.1.0` (`send` and `stream`), buffered `client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
 | `dekopon:asset/asset@0.1.0` | invocation-scoped inputs and exact attach/send grants | typed `denied`, then the tripwire |
 | `dekopon:storage/jsonl@0.1.0`, `dekopon:storage/durable-files@0.1.0` | an invocation carrying an exact storage grant of that interface | typed `permission-denied`, then the tripwire |
-| `dekopon:clock/wall@1.0.0` | every invocation; no grant | traps, then the tripwire |
+| `dekopon:clock/wall@1.0.0`, `wall@1.1.0`, `monotonic@1.1.0` | every invocation; no separate grant | traps, then the tripwire |
+| `dekopon:random/source@0.1.0` | every invocation; no separate grant | traps, then the tripwire |
 
 Provider description is linked so an importing component can instantiate, but any host call during
 `describe` rejects the component. Invocation requires an `AuthorizedInvocation`; its provider must
@@ -92,6 +93,12 @@ the trace.
 A component importing the clock does not load on a host older than this import: instantiation
 fails with `component imports instance \`dekopon:clock/wall@1.0.0\`, but a matching implementation
 was not found in the linker`.
+
+## Monotonic time and OS entropy
+
+`monotonic.now-nanos` reports elapsed nanoseconds from an `Instant` captured when the invocation store is created, before invocation-owned instantiation. The value cannot regress within that store and has no Unix epoch meaning or guaranteed nanosecond resolution. An overflow traps rather than wrapping; `provider_monotonic_read` records the returned elapsed reading.
+
+`random.source.get-random-bytes` uses `getrandom` 0.4.3 to fill exactly the requested number of bytes from the OS CSPRNG. Calls outside invoke are refused before consulting the source; requests above 4096 bytes are refused before allocation or source access. Zero-length calls inside invoke return empty. An OS failure never returns partial or fallback bytes; oversize and entropy failures become typed terminal host refusals even if guest code catches the trap. Each call emits `provider_random_read` with only requested length, outcome, and broker-side error cause if the OS fails—never entropy or seeds. Existing invocation fuel, deadline, and store admission bound guest loops without a new permission or semaphore.
 
 ## Buffered and asset-streamed HTTP enforcement
 

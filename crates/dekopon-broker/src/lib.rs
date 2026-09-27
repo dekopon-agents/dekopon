@@ -4100,7 +4100,9 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         | BrokerHostError::RunCommandUsedHostImport { .. }
         | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
-        BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
+        BrokerHostError::HostCallRejected { .. } | BrokerHostError::RandomCallRejected { .. } => {
+            "host-call-rejected"
+        }
         BrokerHostError::StorageCallRejected {
             reason: "quota", ..
         } => "storage-quota",
