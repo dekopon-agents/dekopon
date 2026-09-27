@@ -19,7 +19,7 @@ empty, with one `gateway_recall_failed` warning (`reason: corrupt`); nothing nee
 
 ## Durable-files lock ladder removed (0.26.0)
 
-Upgrade `turso-sql` to a release built without the lock ladder **before** this broker. The
+Upgrade `turso-sql` to 0.5.0 or later **before** this broker. The
 `dekopon:storage@0.1.1` host no longer links `file.lock`, `file.unlock` or
 `file.check-reserved-lock`, and a component importing any of them is refused at load, taking the
 broker's provider set with it. `turso-sql` v0.4.0 imports `lock` and `unlock`; memory-chat imports
@@ -31,10 +31,6 @@ without a rebuild; `0.2.0` would have refused them all.
 
 Rename `storage.maxPendingTransactions` to `storage.maxActiveInvocations` in the broker
 configuration; the old key is refused. The value keeps its meaning and default of 64.
-
-Authority-bound (`private-conversation`) durable-files namespaces start a new generation on their
-first grant after the upgrade. Stable scopes (`shared-conversation`, `agent`, as turso-sql uses),
-JSONL and chat-memory stores keep their data.
 
 ## Storage scopes and idle retention (0.25.0)
 

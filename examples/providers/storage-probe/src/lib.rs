@@ -122,9 +122,6 @@ fn run() -> Result<Value, ProviderError> {
         first.sync(mode).map_err(map)?;
     }
 
-    let second =
-        storage::open("probe.db", OpenOptions::new().read(true).write(true)).map_err(map)?;
-
     expect(
         storage::rename_atomic("probe.db", "renamed.db", false, Durability::Full),
         StorageError::Busy,
@@ -133,7 +130,6 @@ fn run() -> Result<Value, ProviderError> {
         storage::remove("probe.db", Durability::Full),
         StorageError::Busy,
     )?;
-    drop(second);
     drop(first);
     storage::rename_atomic("probe.db", "renamed.db", false, Durability::Full).map_err(map)?;
     let identity = storage::stat("renamed.db")
