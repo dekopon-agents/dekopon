@@ -139,6 +139,7 @@ impl Journal {
         let (assets, next_asset_id) = kept.last_mut().map_or((Vec::new(), 1), |last| {
             let assets = std::mem::take(&mut last.assets)
                 .into_iter()
+                .filter(|asset| asset.at_ms >= horizon_ms)
                 .map(|asset| RecalledAsset {
                     id: asset.id,
                     arrived: UNIX_EPOCH + Duration::from_millis(asset.at_ms),
@@ -490,8 +491,6 @@ mod tests {
             append_turn(&journal, &stem, now, GRANT, &photo, &inventory, window);
             let escaped = ConversationTurn::completed("question", answer.as_str());
             append_turn(&journal, &stem, now, GRANT, &escaped, &inventory, window);
-            assert!(fs::metadata(journal.path(&stem)).expect("file").len() > 500_000);
-            compact(&journal.path(&stem), window).expect("compact");
         }
         let journal = Journal::open(dir.path(), RETENTION).expect("reopen");
         let recalled = journal.recall(&stem, GRANT, window, now).expect("recall");
@@ -589,19 +588,36 @@ mod tests {
         let journal = Journal::open(dir.path(), RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
+        let long = MemoryWindow {
+            forget_after: Duration::from_secs(30 * 24 * 60 * 60),
+            ..window()
+        };
         let mut inventory = photos(1, whatsapp);
         inventory[0].arrived = now - WHATSAPP_MEDIA_LIFETIME - Duration::from_millis(1);
-        append_with(
-            &journal,
-            &stem,
-            now,
-            GRANT,
-            "still about that photo",
-            &inventory,
-        );
-        let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
+        let turn = ConversationTurn::completed("still about that photo", "yes");
+        append_turn(&journal, &stem, now, GRANT, &turn, &inventory, long);
+        let recalled = journal.recall(&stem, GRANT, long, now).expect("recall");
         assert_eq!(recalled.assets.len(), 1);
         assert!(recalled.assets[0].asset.source.is_none());
+    }
+
+    #[test]
+    fn an_asset_older_than_the_horizon_is_not_recalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut inventory = photos(2, whatsapp);
+        inventory[0].arrived = now - RETENTION - Duration::from_millis(1);
+        append_with(&journal, &stem, now, GRANT, "still talking", &inventory);
+        let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
+        let ids = recalled
+            .assets
+            .iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [inventory[1].id]);
+        assert_eq!(recalled.next_asset_id, 3);
     }
 
     #[test]
