@@ -57,7 +57,17 @@ impl Builtin for Jq {
             return Err(CommandFailure::usage("jq: a filter argument is required"));
         };
 
-        evaluate(&filter, input.unwrap_or(Value::Null), context.budget).map(CommandResult::value)
+        evaluate(&filter, parse_string_input(input), context.budget).map(CommandResult::value)
+    }
+}
+
+/// `$(cmd)` hands jq the provider's JSON as a captured string rather than the parsed value;
+/// parse it when possible and keep today's string-indexing behaviour when it is not JSON.
+fn parse_string_input(input: Option<Value>) -> Value {
+    match input {
+        Some(Value::String(text)) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        Some(other) => other,
+        None => Value::Null,
     }
 }
 
@@ -757,6 +767,30 @@ mod tests {
             assert_eq!(result.value, json!("x"), "{flags:?}");
         }
         assert!(run_builtin(&super::Jq, &["--slurp", "."], Some(json!(1))).is_err());
+    }
+
+    #[test]
+    fn a_piped_string_holding_json_text_is_parsed_before_filtering() {
+        use crate::builtins::test_support::run_builtin;
+
+        // `result=$(gh pr list …); echo "$result" | jq …` hands the builtin the provider's
+        // JSON captured as a string, not the parsed value.
+        let captured = json!({"page": 2, "pullRequests": [{"author": "xrl"}]}).to_string();
+        let result = run_builtin(
+            &super::Jq,
+            &[".pullRequests[0].author"],
+            Some(json!(captured)),
+        )
+        .expect("the captured JSON text is parsed, not indexed as a string");
+        assert_eq!(result.value, json!("xrl"));
+
+        // Text that isn't JSON keeps today's behaviour: indexed as a string value.
+        assert_eq!(
+            run_builtin(&super::Jq, &["ltrimstr(\"a\")"], Some(json!("abc")))
+                .expect("non-JSON text still indexes as a string")
+                .value,
+            json!("bc")
+        );
     }
 
     #[test]
