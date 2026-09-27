@@ -126,13 +126,13 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "memory-chat": {
                 "constraints": {
                     "timeoutMs": 30_000, "maxOutputBytes": 131_072,
-                    "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
+                    "storage": {"interface":"jsonl","access":"read-only","scope":"private-conversation"}
                 },
                 "capabilities": {
                     "memory.chat.record": {
                         "route": "chatMemoryRecord",
                         "constraints": {
-                            "storage": {"interface":"jsonl","access":"read-write","namespace":"chat"}
+                            "storage": {"interface":"jsonl","access":"read-write","scope":"private-conversation"}
                         }
                     },
                     "memory.chat.recent": {"route": "chatMemoryRecent"},

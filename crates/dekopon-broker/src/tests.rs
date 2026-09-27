@@ -4,7 +4,7 @@ use dekopon_broker_host::BrokerHostError;
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
     ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageNamespace,
+    StorageScope,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, MAX_FAILURE_MESSAGE_BYTES, PrincipalId,
@@ -596,10 +596,22 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         storage: Some(StorageConstraints {
             interface: StorageInterface::Jsonl,
             access: StorageAccess::ReadOnly,
-            namespace: StorageNamespace::Chat,
+            scope: StorageScope::PrivateConversation,
+            retention: Default::default(),
         }),
         ..ExecutionConstraints::default()
     };
+    let mut retained = storage.clone();
+    retained.storage.as_mut().expect("storage").retention =
+        dekopon_capability::StorageRetention::IdleTtl(std::time::Duration::from_secs(30));
+    assert_eq!(
+        bytes(&storage),
+        bytes(&retained),
+        "retention changes must not rotate private authority generations"
+    );
+    let mut shared = storage.clone();
+    shared.storage.as_mut().expect("storage").scope = StorageScope::SharedConversation;
+    assert_ne!(bytes(&storage), bytes(&shared));
     let mut durable = storage.clone();
     durable.storage.as_mut().expect("storage").interface = StorageInterface::DurableFiles;
     assert_ne!(bytes(&storage), bytes(&durable));
@@ -965,7 +977,7 @@ fn a_host_failure_no_provider_reported_carries_no_detail() {
 fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
     use dekopon_capability::{
         AssetConstraints, EffectKind, StorageAccess, StorageConstraints, StorageInterface,
-        StorageNamespace,
+        StorageScope,
     };
     let mut set = ConstraintSet {
         route: CapabilityRoute::Generic,
@@ -986,7 +998,8 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
     set.constraints.storage = Some(StorageConstraints {
         interface: StorageInterface::DurableFiles,
         access: StorageAccess::ReadWrite,
-        namespace: StorageNamespace::Chat,
+        scope: StorageScope::PrivateConversation,
+        retention: Default::default(),
     });
     assert!(super::validate_set_constraints(&set).is_ok());
     set.constraints.http = Some(dekopon_capability::HttpConstraints {
@@ -1015,5 +1028,49 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
     assert!(matches!(
         super::validate_set_constraints(&set),
         Err(super::BrokerBuildError::InvalidPolicyConstraints)
+    ));
+}
+
+#[test]
+fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
+    use super::{BrokerBuildError, ConstraintCatalog};
+    use dekopon_capability::{EffectKind, StorageRetention};
+    let make = |retention| ConstraintSet {
+        route: CapabilityRoute::Generic,
+        provider: "storage-probe".parse().unwrap(),
+        effect: EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints {
+            storage: Some(StorageConstraints {
+                interface: StorageInterface::DurableFiles,
+                access: StorageAccess::ReadOnly,
+                scope: StorageScope::Agent,
+                retention,
+            }),
+            ..Default::default()
+        },
+    };
+    let keep = make(StorageRetention::Keep);
+    let ttl = make(StorageRetention::IdleTtl(std::time::Duration::from_secs(
+        20,
+    )));
+    let catalog = ConstraintCatalog::new([
+        ("probe.vfs".parse().unwrap(), keep),
+        ("probe.jsonl".parse().unwrap(), ttl),
+    ])
+    .unwrap();
+    assert!(matches!(
+        catalog.retention_policies(),
+        Err(BrokerBuildError::ConflictingStorageRetention { .. })
+    ));
+    let zero = ConstraintCatalog::new([(
+        "probe.vfs".parse().unwrap(),
+        make(StorageRetention::IdleTtl(std::time::Duration::ZERO)),
+    )])
+    .unwrap();
+    assert!(matches!(
+        zero.retention_policies(),
+        Err(BrokerBuildError::InvalidStorageRetention)
     ));
 }

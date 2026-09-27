@@ -19,6 +19,7 @@ const BROKER_PRINCIPAL: &str = "dekopon-broker";
 mod config;
 mod credentials;
 mod provider_manager;
+mod reaper;
 mod secrets;
 mod server;
 mod socket;
@@ -161,7 +162,7 @@ where
         Runtime {
             credentials,
             secrets,
-            storage,
+            storage: storage.clone(),
             assets,
         },
         &mut warnings,
@@ -171,10 +172,11 @@ where
         warning.log();
     }
     let Ready { broker, identities } = prepared.map_err(BrokerdError::from_problems)?;
+    let retention = broker.storage_retention_policies();
     let server = BrokerServer::new(Arc::new(broker), identities, limits)?;
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
-    let result = server.serve(listener, shutdown).await;
+    let result = reaper::serve(server.serve(listener, shutdown), storage, retention).await;
 
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
@@ -792,6 +794,8 @@ pub enum BrokerdError {
     Secrets(#[from] SecretMapError),
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),
+    #[error("broker storage reaper task failed")]
+    StorageReaper(#[source] tokio::task::JoinError),
     #[error("broker assets could not start")]
     Assets(#[source] assets::AssetsStartupError),
     #[error("broker provider host could not start")]

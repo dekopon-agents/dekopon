@@ -518,7 +518,7 @@ fn terminal(error: &StorageHostError) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
     use dekopon_storage_host::{
         ContinuityPolicy, StorageGrantRequest, StorageHost, StorageHostError, StorageLimits,
     };
@@ -532,7 +532,7 @@ mod tests {
             "storage-probe".parse().expect("provider"),
             StorageInterface::DurableFiles,
             StorageAccess::ReadWrite,
-            StorageNamespace::Chat,
+            StorageScope::PrivateConversation,
             "provider-test".parse().expect("agent"),
             "slack.t0123abc.u9xyz".parse().expect("subject"),
             "slack",
@@ -551,7 +551,7 @@ mod tests {
             "memory-chat".parse().expect("provider"),
             StorageInterface::Jsonl,
             access,
-            StorageNamespace::Chat,
+            StorageScope::PrivateConversation,
             "provider-test".parse().expect("agent"),
             "slack.t0123abc.u9xyz".parse().expect("subject"),
             "slack",

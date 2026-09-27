@@ -9,6 +9,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Provider storage supports private-conversation, shared-conversation and agent scopes, with
+  optional idle retention based on a broker-owned last-used marker. The broker sweeps expired
+  resources at startup and every 12 hours, skipping active leases and retaining data by default.
 - Shell `progress "text" [--eta S]` builtin for optional invoker notes, silent without a note sink.
 - Opt-in route `progressNotes` enables cleaned, bounded progress notes and `gateway.progress`
   note telemetry, with per-script and per-session caps.
@@ -69,6 +72,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Storage constraints replace `namespace: chat` with `scope: private-conversation`; shared scopes
+  keep stable data across authorized callers without sharing gateway conversation history.
 - `dekopon-telemetry`'s exporter stack (OTLP, tonic, the OpenTelemetry SDK, the log bridge and the
   blocking reqwest client) sits behind a new default-off `exporter` feature that `dekopond` and
   `dekopon-brokerd` enable. `dekopon-http-host`, and through it `dekopon-broker-host` and the

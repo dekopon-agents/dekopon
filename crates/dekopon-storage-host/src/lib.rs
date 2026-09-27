@@ -54,7 +54,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -66,11 +66,13 @@ mod key;
 mod layout;
 mod namespace;
 mod quota;
+mod sweep;
 mod vfs;
 
 pub use config::{StorageConfigError, StorageLimits};
 pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
+pub use sweep::{RetentionPolicies, SweepSummary};
 pub use vfs::{Durability, FileStat, LockLevel, OpenOptions};
 
 use key::{
@@ -127,7 +129,7 @@ pub struct StorageGrantRequest {
     provider: ProviderId,
     interface: StorageInterface,
     access: StorageAccess,
-    namespace: StorageNamespace,
+    scope: StorageScope,
     agent: AgentId,
     subject: ExternalSubject,
     transport_kind: String,
@@ -152,7 +154,7 @@ impl StorageGrantRequest {
         provider: ProviderId,
         interface: StorageInterface,
         access: StorageAccess,
-        namespace: StorageNamespace,
+        scope: StorageScope,
         agent: AgentId,
         subject: ExternalSubject,
         transport_kind: impl Into<String>,
@@ -168,7 +170,7 @@ impl StorageGrantRequest {
             provider,
             interface,
             access,
-            namespace,
+            scope,
             agent,
             subject,
             transport_kind: transport_kind.into(),
@@ -180,16 +182,33 @@ impl StorageGrantRequest {
         }
     }
 
-    pub(crate) fn scope_values(&self) -> [String; 7] {
-        [
-            self.provider.to_string(),
-            self.agent.to_string(),
-            self.subject.canonical(),
-            self.transport_kind.clone(),
-            self.transport.clone(),
-            self.channel.clone(),
-            self.conversation.clone(),
-        ]
+    pub(crate) fn scope_values(&self) -> Vec<String> {
+        let provider = self.provider.to_string();
+        let agent = self.agent.to_string();
+        match self.scope {
+            StorageScope::PrivateConversation => vec![
+                provider,
+                agent,
+                self.subject.canonical(),
+                self.transport_kind.clone(),
+                self.transport.clone(),
+                self.channel.clone(),
+                self.conversation.clone(),
+            ],
+            StorageScope::SharedConversation => vec![
+                "shared-conversation-v1".to_owned(),
+                provider,
+                agent,
+                self.transport_kind.clone(),
+                self.transport.clone(),
+                self.channel.clone(),
+                self.conversation.clone(),
+            ],
+            StorageScope::Agent => vec!["agent-v1".to_owned(), provider, agent],
+        }
+    }
+    pub(crate) fn scope(&self) -> StorageScope {
+        self.scope
     }
     pub(crate) fn continuity_policy(&self) -> ContinuityPolicy {
         self.continuity_policy
@@ -253,7 +272,7 @@ pub struct StorageGrant {
     provider: ProviderId,
     interface: StorageInterface,
     access: StorageAccess,
-    namespace_kind: StorageNamespace,
+    scope_kind: StorageScope,
     namespace: Namespace,
     limits: StorageLimits,
 }
@@ -286,8 +305,8 @@ impl StorageGrant {
         self.access
     }
     #[must_use]
-    pub const fn namespace(&self) -> StorageNamespace {
-        self.namespace_kind
+    pub const fn scope(&self) -> StorageScope {
+        self.scope_kind
     }
     #[must_use]
     pub fn scope_commitment(&self) -> StorageScopeCommitment {
@@ -393,9 +412,6 @@ impl StorageHost {
         &self,
         request: StorageGrantRequest,
     ) -> Result<StorageGrantPreparation, StorageHostError> {
-        if request.namespace != StorageNamespace::Chat {
-            return Err(StorageHostError::PermissionDenied);
-        }
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
         Ok(StorageGrantPreparation {
@@ -549,7 +565,7 @@ impl StorageHost {
             provider: request.provider,
             interface: request.interface,
             access: request.access,
-            namespace_kind: request.namespace,
+            scope_kind: request.scope,
             namespace,
             limits: self.inner.limits.clone(),
         })

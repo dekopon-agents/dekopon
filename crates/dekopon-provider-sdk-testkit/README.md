@@ -55,9 +55,7 @@ loop.
   namespace instead of silently starting over.
 - **A grant is minted per invocation and consumed by it.** Successive calls get fresh invocation
   ids and identical scope material, which is what keeps them addressing one namespace.
-- **`StorageNamespace::Chat` is the only namespace the storage host will grant.** A provider with
-  nothing to do with chat needs a transport, channel, and conversation anyway; those are
-  pre-filled.
+- **The harness grants `StorageScope::PrivateConversation`.** Its transport, channel, conversation, and subject are pre-filled; production broker configuration may instead select shared-conversation or agent scope.
 - **The storage root lives in a `TempDir` the `FakeBroker` owns.** It is deleted when the broker is
   dropped.
 

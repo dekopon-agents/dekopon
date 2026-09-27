@@ -58,7 +58,7 @@ pub use dekopon_broker_protocol::{
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
     HttpConstraintsError, InvocationOutcome, InvocationResult, ProposedInvocation, SecretUseGrant,
-    StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
+    StorageAccess, StorageInterface, StorageRetention, StorageScope, broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
@@ -70,8 +70,8 @@ use dekopon_policy::{
     PolicyContext, PolicyConversation, PolicyDecision, PolicyRequest, PolicyTarget,
 };
 use dekopon_storage_host::{
-    ContinuityPolicy, StorageEvidence, StorageGrantPreparation, StorageGrantRequest,
-    StorageScopeCommitment,
+    ContinuityPolicy, RetentionPolicies, StorageEvidence, StorageGrantPreparation,
+    StorageGrantRequest, StorageScopeCommitment,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -648,6 +648,7 @@ impl ConstraintCatalog {
             });
         }
         self.validate_routes()?;
+        self.retention_policies()?;
         for (capability_id, set) in &self.sets {
             validate_set_constraints(set)?;
             validate_set_credential(
@@ -668,6 +669,30 @@ impl ConstraintCatalog {
             validate_trusted_metadata(capability_id, set, provider, capability)?;
         }
         Ok(())
+    }
+
+    fn retention_policies(&self) -> Result<RetentionPolicies, BrokerBuildError> {
+        let mut policies = RetentionPolicies::new();
+        for set in self.sets.values() {
+            let Some(storage) = &set.constraints.storage else {
+                continue;
+            };
+            if let StorageRetention::IdleTtl(ttl) = storage.retention
+                && (ttl.as_millis() == 0 || ttl.as_millis() > u128::from(u64::MAX))
+            {
+                return Err(BrokerBuildError::InvalidStorageRetention);
+            }
+            let key = (set.provider.clone(), storage.scope);
+            if let Some(previous) = policies.insert(key.clone(), storage.retention)
+                && previous != storage.retention
+            {
+                return Err(BrokerBuildError::ConflictingStorageRetention {
+                    provider: key.0,
+                    scope: key.1,
+                });
+            }
+        }
+        Ok(policies)
     }
 
     fn validate_routes(&self) -> Result<(), BrokerBuildError> {
@@ -703,7 +728,7 @@ impl ConstraintCatalog {
             };
             let declared = set.constraints.storage.as_ref().filter(|storage| {
                 storage.interface == StorageInterface::Jsonl
-                    && storage.namespace == StorageNamespace::Chat
+                    && storage.scope == StorageScope::PrivateConversation
                     && storage.access == access
             });
             if declared.is_none() {
@@ -1408,6 +1433,13 @@ pub enum BrokerBuildError {
     },
     #[error("execution constraints are incomplete or overbroad")]
     InvalidPolicyConstraints,
+    #[error("storage idle TTL must be a positive whole number of milliseconds fitting in u64")]
+    InvalidStorageRetention,
+    #[error("storage retention conflicts for provider {provider} and scope {scope:?}")]
+    ConflictingStorageRetention {
+        provider: ProviderId,
+        scope: StorageScope,
+    },
     #[error("http execution constraints are invalid")]
     InvalidHttpConstraints {
         #[source]
@@ -1771,6 +1803,13 @@ where
     #[must_use]
     pub fn policy_digest(&self) -> &str {
         &self.policy_digest
+    }
+
+    #[must_use]
+    pub fn storage_retention_policies(&self) -> RetentionPolicies {
+        self.constraints
+            .retention_policies()
+            .expect("validated storage retention policy")
     }
 
     pub fn with_chat_memory(mut self, config: ChatMemoryConfig) -> Result<Self, BrokerBuildError> {
@@ -2523,7 +2562,7 @@ where
             set.provider.clone(),
             storage.interface,
             storage.access,
-            storage.namespace,
+            storage.scope,
             agent,
             subject.clone(),
             scope.kind.to_string(),
@@ -2536,8 +2575,10 @@ where
                     .map_or(ContinuityPolicy::AuthorityBound, |config| {
                         config.continuity_policy
                     })
-            } else {
+            } else if storage.scope == StorageScope::PrivateConversation {
                 ContinuityPolicy::AuthorityBound
+            } else {
+                ContinuityPolicy::Stable
             },
             authority,
         );
@@ -3565,8 +3606,10 @@ fn encode_execution_constraints(
         );
         encoded.byte(
             "execution.storage.namespace",
-            match storage.namespace {
-                StorageNamespace::Chat => 0,
+            match storage.scope {
+                StorageScope::PrivateConversation => 0,
+                StorageScope::SharedConversation => 1,
+                StorageScope::Agent => 2,
             },
         );
     } else {

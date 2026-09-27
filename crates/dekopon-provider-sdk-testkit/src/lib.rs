@@ -68,7 +68,7 @@ pub use dekopon_broker_host::{
 };
 pub use dekopon_capability::{
     AuthorizationError, ExecutionConstraints, ProposedInvocation, StorageAccess,
-    StorageConstraints, StorageInterface, StorageNamespace,
+    StorageConstraints, StorageInterface, StorageScope,
 };
 pub use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, IdentifierError, InvocationId, PrincipalId,
@@ -423,7 +423,7 @@ impl FakeBroker {
                     self.provider.clone(),
                     interface,
                     access,
-                    StorageNamespace::Chat,
+                    StorageScope::PrivateConversation,
                     self.agent.clone(),
                     self.subject.clone(),
                     self.transport_kind.clone(),
@@ -499,7 +499,8 @@ impl FakeBroker {
                 .map(|(interface, access)| StorageConstraints {
                     interface,
                     access,
-                    namespace: StorageNamespace::Chat,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
                 }),
             secret_use: None,
         }

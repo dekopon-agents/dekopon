@@ -143,6 +143,43 @@ impl QuotaLedger {
         })
     }
 
+    pub(crate) fn account_sweep(
+        &self,
+        namespace: &str,
+        before: Usage,
+        after: Usage,
+        removed: bool,
+    ) -> Result<(), StorageHostError> {
+        let bytes = before
+            .bytes
+            .checked_sub(after.bytes)
+            .ok_or(StorageHostError::Arithmetic)?;
+        let entries = before
+            .entries
+            .checked_sub(after.entries)
+            .ok_or(StorageHostError::Arithmetic)?;
+        let mut state = self.state.lock().expect("storage quota ledger");
+        state.root_used = state
+            .root_used
+            .checked_sub(bytes)
+            .ok_or(StorageHostError::Arithmetic)?;
+        state.root_entries = state
+            .root_entries
+            .checked_sub(entries)
+            .ok_or(StorageHostError::Arithmetic)?;
+        let generation_prefix = format!("{namespace}/");
+        state
+            .namespace_used
+            .retain(|key, _| !key.starts_with(&generation_prefix));
+        state
+            .namespace_entries
+            .retain(|key, _| !key.starts_with(&generation_prefix));
+        if removed {
+            state.namespace_slots.remove(namespace);
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire_handle(&self) -> Result<(), StorageHostError> {
         let mut state = self.state.lock().expect("storage quota ledger");
         if state.open_handles >= self.limits.max_open_handles {

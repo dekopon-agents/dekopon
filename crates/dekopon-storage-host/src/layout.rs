@@ -539,6 +539,12 @@ impl Directory {
             .map_err(|source| self.io_error(std::io::Error::from(source)))
     }
 
+    pub(crate) fn remove_directory(&self, name: &str) -> Result<(), StorageHostError> {
+        validate_component(name)?;
+        rustix::fs::unlinkat(self.file.as_ref(), name, AtFlags::REMOVEDIR)
+            .map_err(|source| self.io_error(std::io::Error::from(source)))
+    }
+
     pub(crate) fn remove_file(&self, name: &str) -> Result<(), StorageHostError> {
         validate_component(name)?;
         rustix::fs::unlinkat(self.file.as_ref(), name, AtFlags::empty())
