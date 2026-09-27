@@ -163,6 +163,8 @@ pub struct TemplateOverrides {
     pub working: Option<String>,
     pub tool: Option<String>,
     pub keep_alive: Option<String>,
+    pub note: Option<String>,
+    pub note_eta: Option<String>,
     pub stopped: Option<String>,
     pub failed: Option<String>,
 }

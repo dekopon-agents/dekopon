@@ -12124,6 +12124,85 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     assert_trace_opens_at_receipt(&capture, "local", &message_id);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opted_in_script_note_uses_the_local_progress_frame() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let directory = temporary();
+    let (broker, reached, release) = parked_broker(
+        directory.path(),
+        vec![probe_listing(), upper_proposal("hi")],
+        ResponseEnvelope::invocation(
+            record_result(InvocationOutcome::Succeeded, None),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("progress \"rendering the image\" --eta 40; probe upper --text hi"),
+        answer("done"),
+    ]);
+    let mut runner = runner(broker, models, 4);
+    let settings = LivenessSettings {
+        mode: LivenessMode::Native,
+        progress: ProgressSurface::Message,
+        ..LivenessSettings::default()
+    };
+    Arc::get_mut(&mut runner).unwrap().liveness.insert(
+        "dev".to_owned(),
+        Arc::new(ResolvedLiveness {
+            settings,
+            ..ResolvedLiveness::default()
+        }),
+    );
+    let mut route = route(model_config());
+    route.progress_notes = true;
+    let socket_path = directory.path().join("notes.sock");
+    let mut transport = crate::transport::local::LocalTransport::new(
+        "dev".to_owned(),
+        socket_path.clone(),
+        settings,
+    );
+    transport.connect().await.unwrap();
+    let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"subject": SUBJECT, "text": "render an image"})
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let inbound = next_message(&mut transport).await;
+    let session = tokio::spawn(run_session(runner, route, inbound, transport.driver()));
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(client).lines();
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = lines.next_line().await.unwrap().expect("a local frame");
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            assert!(frame.get("note").is_none());
+            if frame["progress"]["text"] == "rendering the image (~40 s)…" {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(frame["progress"]["id"].is_string());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 async fn parked_broker(
     directory: &Path,
     answer_first: Vec<ResponseEnvelope>,

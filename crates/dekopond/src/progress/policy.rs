@@ -19,9 +19,9 @@ use crate::{
     config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
     progress::{
         KeepAlive,
-        adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, record},
+        adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, QueuedEvent, record},
         cancel_label,
-        text::{ProgressDetail, ProgressText, RenderState},
+        text::{LiveNote, ProgressDetail, ProgressText, RenderState},
     },
     session::SessionCancellation,
     transport::{
@@ -355,7 +355,22 @@ impl Surface {
         .min()
     }
 
-    async fn on_event(&mut self, event: ProgressEvent) {
+    fn clear_obsolete_note(&mut self) -> bool {
+        if self.state.note.as_ref().is_some_and(|note| {
+            note.generation != self.counters.note_generation.load(Ordering::Acquire)
+        }) {
+            self.state.note = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn on_event(&mut self, queued: QueuedEvent) {
+        let QueuedEvent {
+            event,
+            note_generation,
+        } = queued;
         match event {
             ProgressEvent::Started { max_steps, .. } => {
                 self.state.of = max_steps;
@@ -366,6 +381,7 @@ impl Surface {
                 self.open().await;
             }
             ProgressEvent::ModelTurn { turn, of } => {
+                self.state.note = None;
                 self.state.turn = turn;
                 self.state.of = of;
                 self.render(Line::Status, false).await;
@@ -390,9 +406,23 @@ impl Surface {
                 self.render(Line::Status, false).await;
             }
             ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
-            ProgressEvent::Steered { .. }
-            | ProgressEvent::Note { .. }
-            | ProgressEvent::TextDelta { .. }
+            ProgressEvent::Note { text, eta } => {
+                if note_generation != self.counters.note_generation.load(Ordering::Acquire) {
+                    return;
+                }
+                self.state.note = Some(LiveNote {
+                    text,
+                    eta,
+                    arrived: Instant::now(),
+                    generation: note_generation,
+                });
+                self.render(Line::Status, true).await;
+            }
+            ProgressEvent::Steered { .. } => {
+                self.state.note = None;
+                self.render(Line::Status, false).await;
+            }
+            ProgressEvent::TextDelta { .. }
             | ProgressEvent::KeepAlive { .. }
             | ProgressEvent::Cancelled { .. }
             | ProgressEvent::Failed { .. }
@@ -496,6 +526,14 @@ impl Surface {
                 elapsed,
                 count: self.keep_alives,
             });
+            if self.state.note.as_ref().is_some_and(|note| {
+                now.saturating_duration_since(note.arrived)
+                    > note
+                        .eta
+                        .map_or(Duration::from_secs(120), |eta| eta.saturating_mul(2))
+            }) {
+                self.state.note = None;
+            }
             self.render(Line::KeepAlive, true).await;
         }
         // Cleared before attempting the render, not after, so a declined render does not leave a
@@ -563,6 +601,7 @@ impl Surface {
     }
 
     async fn render(&mut self, line: Line, allow_post: bool) {
+        self.clear_obsolete_note();
         if !self.writes_progress() || !self.coordination.running() {
             return;
         }
@@ -640,6 +679,13 @@ impl Surface {
 
     fn line(&self, line: Line) -> ProgressText {
         let templates = &self.liveness.templates;
+        if let Some(note) = &self.state.note {
+            return if note.eta.is_some() {
+                templates.note_eta(self.detail, &self.state)
+            } else {
+                templates.note(self.detail, &self.state)
+            };
+        }
         match line {
             Line::KeepAlive => templates.keep_alive(self.detail, &self.state),
             Line::Status if self.state.word.is_some() => templates.tool(self.detail, &self.state),
@@ -708,6 +754,7 @@ impl Surface {
     }
 
     async fn terminal(&mut self, terminal: Terminal, text: StreamedText) -> bool {
+        self.state.note = None;
         let generation = text.generation;
         self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
         self.stream_pending = false;
@@ -914,7 +961,7 @@ fn ended(partial: &str, ending: &str) -> String {
 /// call, since a dropped HTTP future cannot retract bytes already sent.
 async fn run(
     mut surface: Surface,
-    mut events: mpsc::Receiver<ProgressEvent>,
+    mut events: mpsc::Receiver<QueuedEvent>,
     mut text: watch::Receiver<StreamedText>,
     mut terminal: oneshot::Receiver<TerminalRequest>,
     cancellation: SessionCancellation,
@@ -960,6 +1007,9 @@ async fn run(
                 Err(_) => text_open = false,
             },
             () = timer => surface.on_timer().await,
+        }
+        if surface.clear_obsolete_note() {
+            surface.render(Line::Status, false).await;
         }
     }
     surface.cleanup().await;

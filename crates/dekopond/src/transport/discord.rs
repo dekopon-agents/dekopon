@@ -28,12 +28,12 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
-        OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds,
-        SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
-        floor_boundary, jitter_below, receive_span, record_conversation, reserve_for_chunk,
-        retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LinkPreviews, LivenessTarget, MessageId,
+        MessageRef, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
+        SeenIds, SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, TypingLease, asset_buffer, bound_inbound,
+        credential_client, floor_boundary, jitter_below, receive_span, record_conversation,
+        reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -1149,7 +1149,8 @@ impl ProgressMessage for DiscordDriver {
         cancel: bool,
     ) -> Result<MessageRef, TransportError> {
         let content = one_message(text.as_str()).ok_or(TransportError::Response)?;
-        self.post_liveness_message(target, &content, cancel).await
+        self.post_liveness_message(target, &content, cancel, LinkPreviews::Disabled)
+            .await
     }
 
     async fn edit(
@@ -1159,7 +1160,8 @@ impl ProgressMessage for DiscordDriver {
         cancel: bool,
     ) -> Result<(), TransportError> {
         let content = one_message(text.as_str()).ok_or(TransportError::Response)?;
-        self.edit_liveness_message(message, &content, cancel).await
+        self.edit_liveness_message(message, &content, cancel, LinkPreviews::Disabled)
+            .await
     }
 
     async fn delete(&self, message: &MessageRef) -> Result<(), TransportError> {
@@ -1179,7 +1181,8 @@ impl ProgressMessage for DiscordDriver {
         message: &MessageRef,
         reply: &OutboundReply,
     ) -> Result<(), TransportError> {
-        self.finalize_in_place(message, reply).await
+        self.finalize_in_place(message, reply, LinkPreviews::Enabled)
+            .await
     }
 }
 
@@ -1202,11 +1205,14 @@ impl TextStream for DiscordDriver {
         let content = one_message(&shown_text(text)).ok_or(TransportError::Response)?;
         match message {
             Some(message) => {
-                self.edit_liveness_message(message, &content, cancel)
+                self.edit_liveness_message(message, &content, cancel, LinkPreviews::Default)
                     .await?;
                 Ok(message.clone())
             }
-            None => self.post_liveness_message(target, &content, cancel).await,
+            None => {
+                self.post_liveness_message(target, &content, cancel, LinkPreviews::Default)
+                    .await
+            }
         }
     }
 
@@ -1216,7 +1222,8 @@ impl TextStream for DiscordDriver {
         reply: &OutboundReply,
         _generation: u64,
     ) -> Result<(), TransportError> {
-        self.finalize_in_place(message, reply).await
+        self.finalize_in_place(message, reply, LinkPreviews::Default)
+            .await
     }
 }
 
@@ -1331,9 +1338,13 @@ impl DiscordDriver {
         target: &LivenessTarget,
         content: &str,
         cancel: bool,
+        previews: LinkPreviews,
     ) -> Result<MessageRef, TransportError> {
         let (channel_id, inbound_message_id, conversation_id) = discord_coordinates(target)?;
         let mut body = liveness_body(content, cancel, conversation_id);
+        if let LinkPreviews::Disabled = previews {
+            body["flags"] = json!(4);
+        }
         body["message_reference"] = json!({
             "message_id": inbound_message_id,
             "fail_if_not_exists": false,
@@ -1369,12 +1380,18 @@ impl DiscordDriver {
         message: &MessageRef,
         content: &str,
         cancel: bool,
+        previews: LinkPreviews,
     ) -> Result<(), TransportError> {
         let (channel_id, _, conversation_id) = discord_coordinates(&message.target)?;
         if !is_snowflake(&message.id) {
             return Err(TransportError::Response);
         }
-        let body = liveness_body(content, cancel, conversation_id);
+        let mut body = liveness_body(content, cancel, conversation_id);
+        match previews {
+            LinkPreviews::Default => {}
+            LinkPreviews::Disabled => body["flags"] = json!(4),
+            LinkPreviews::Enabled => body["flags"] = json!(0),
+        }
         self.liveness_empty(
             self.http
                 .patch(format!(
@@ -1391,6 +1408,7 @@ impl DiscordDriver {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        previews: LinkPreviews,
     ) -> Result<(), TransportError> {
         if !reply.images.is_empty() {
             return Err(TransportError::Service {
@@ -1403,7 +1421,8 @@ impl DiscordDriver {
                 code: "answer-too-long".to_owned(),
             });
         };
-        self.edit_liveness_message(message, content, false).await
+        self.edit_liveness_message(message, content, false, previews)
+            .await
     }
 
     async fn create_message(&self, channel_id: &str, body: &Value) -> Result<(), TransportError> {
@@ -2004,6 +2023,13 @@ mod unit_tests {
     }
 
     fn loopback(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<Vec<Recorded>>) {
+        loopback_observed(replies, |_| {})
+    }
+
+    fn loopback_observed(
+        replies: Vec<(u16, String)>,
+        mut observe: impl FnMut(&Recorded) + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<Recorded>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in");
         let address = listener.local_addr().expect("the bound address");
         listener
@@ -2046,12 +2072,14 @@ mod unit_tests {
                         serde_json::from_slice(&request[head_end..head_end + length])
                             .expect("a JSON request body")
                     };
-                    recorded.push(Recorded {
+                    let request = Recorded {
                         method,
                         path,
                         head,
                         body,
-                    });
+                    };
+                    observe(&request);
+                    recorded.push(request);
                     break;
                 }
                 let response = format!(
@@ -2300,9 +2328,47 @@ mod unit_tests {
     }
 
     #[tokio::test]
+    async fn progress_finalization_clears_the_stored_suppression_flag() {
+        use std::sync::{Arc, Mutex};
+
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&states);
+        let mut flags = 0;
+        let (endpoint, server) = loopback_observed(
+            vec![
+                (200, json!({"id": "555", "channel_id": "100"}).to_string()),
+                (200, "{}".to_owned()),
+                (200, "{}".to_owned()),
+            ],
+            move |request| {
+                if let Some(updated) = request.body["flags"].as_u64() {
+                    flags = updated;
+                }
+                observed.lock().unwrap().push(flags);
+            },
+        );
+        let driver = driver(&endpoint);
+        let progress = driver.progress().unwrap();
+        let text = progress_text("https://example.com…");
+        let message = progress.post(&target(), &text, false).await.unwrap();
+        progress.edit(&message, &text, false).await.unwrap();
+        progress
+            .finalize(&message, &OutboundReply::text("https://example.com"))
+            .await
+            .unwrap();
+        let recorded = server.await.unwrap();
+        for request in &recorded[..2] {
+            assert_eq!(request.body["flags"], 4);
+            assert_eq!(request.body["allowed_mentions"]["parse"], json!([]));
+        }
+        assert_eq!(*states.lock().unwrap(), [4, 4, 0]);
+    }
+
+    #[tokio::test]
     async fn a_streamed_answer_grows_in_one_message() {
         let (endpoint, server) = loopback(vec![
             (200, json!({ "id": "555", "channel_id": "100" }).to_string()),
+            (200, "{}".to_owned()),
             (200, "{}".to_owned()),
         ]);
         let driver = driver(&endpoint);
@@ -2320,18 +2386,22 @@ mod unit_tests {
             .await
             .expect("a later delta edits the same message");
         assert_eq!(again, message, "the answer stays in one message");
+        stream
+            .finalize(&message, &OutboundReply::text("the answer"), 0)
+            .await
+            .unwrap();
 
         let recorded = server.await.expect("the stand-in joins");
         assert_eq!(recorded[0].method, "POST");
         assert_eq!(recorded[1].method, "PATCH");
         assert_eq!(recorded[1].path, "/api/v10/channels/100/messages/555");
+        for request in &recorded[..2] {
+            assert_eq!(request.body["content"], text.text.as_str());
+        }
+        assert_eq!(recorded[2].body["content"], "the answer");
         for request in &recorded {
-            assert_eq!(
-                request.body["content"],
-                text.text.as_str(),
-                "the cumulative text is what is on screen"
-            );
             assert_eq!(request.body["allowed_mentions"]["parse"], json!([]));
+            assert!(request.body.get("flags").is_none());
         }
     }
 
