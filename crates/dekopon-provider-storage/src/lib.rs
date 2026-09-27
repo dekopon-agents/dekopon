@@ -225,15 +225,6 @@ pub mod durable_files {
         Full,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    pub enum LockLevel {
-        None,
-        Shared,
-        Reserved,
-        Pending,
-        Exclusive,
-    }
-
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct FileStat {
         pub size: u64,
@@ -279,7 +270,6 @@ pub mod durable_files {
 
     impl Error for StorageError {}
 
-    /// One guest handle. Dropping it closes the host resource and releases its locks.
     pub struct File(wit::File);
 
     impl File {
@@ -297,15 +287,6 @@ pub mod durable_files {
         }
         pub fn sync(&self, mode: Durability) -> Result<(), StorageError> {
             self.0.sync(map_durability(mode)).map_err(map_error)
-        }
-        pub fn lock(&self, level: LockLevel) -> Result<(), StorageError> {
-            self.0.lock(map_lock(level)).map_err(map_error)
-        }
-        pub fn unlock(&self, to: LockLevel) -> Result<(), StorageError> {
-            self.0.unlock(map_lock(to)).map_err(map_error)
-        }
-        pub fn check_reserved_lock(&self) -> Result<bool, StorageError> {
-            self.0.check_reserved_lock().map_err(map_error)
         }
     }
 
@@ -358,15 +339,6 @@ pub mod durable_files {
             Durability::Data => wit::Durability::Data,
             Durability::DataAndMetadata => wit::Durability::DataAndMetadata,
             Durability::Full => wit::Durability::Full,
-        }
-    }
-    fn map_lock(value: LockLevel) -> wit::LockLevel {
-        match value {
-            LockLevel::None => wit::LockLevel::None,
-            LockLevel::Shared => wit::LockLevel::Shared,
-            LockLevel::Reserved => wit::LockLevel::Reserved,
-            LockLevel::Pending => wit::LockLevel::Pending,
-            LockLevel::Exclusive => wit::LockLevel::Exclusive,
         }
     }
     fn map_error(error: wit::StorageError) -> StorageError {

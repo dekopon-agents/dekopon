@@ -24,8 +24,7 @@ pub struct StorageLimits {
     pub max_entropy_bytes_per_invocation: u64,
     pub lock_timeout_ms: u64,
     pub finalization_budget_ms: u64,
-    /// Despite its name, this bounds concurrently active invocation handles, not transactions.
-    pub max_pending_transactions: u64,
+    pub max_active_invocations: u64,
     pub startup_max_entries: u64,
 }
 
@@ -48,7 +47,7 @@ impl Default for StorageLimits {
             max_entropy_bytes_per_invocation: 4_096,
             lock_timeout_ms: 5_000,
             finalization_budget_ms: 5_000,
-            max_pending_transactions: 64,
+            max_active_invocations: 64,
             startup_max_entries: 100_000,
         }
     }
@@ -85,7 +84,7 @@ impl StorageLimits {
             ),
             ("lockTimeoutMs", self.lock_timeout_ms),
             ("finalizationBudgetMs", self.finalization_budget_ms),
-            ("maxPendingTransactions", self.max_pending_transactions),
+            ("maxActiveInvocations", self.max_active_invocations),
             ("startupMaxEntries", self.startup_max_entries),
         ];
         if let Some((field, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
@@ -141,11 +140,7 @@ impl StorageLimits {
             ),
             ("lockTimeoutMs", self.lock_timeout_ms, 60_000),
             ("finalizationBudgetMs", self.finalization_budget_ms, 60_000),
-            (
-                "maxPendingTransactions",
-                self.max_pending_transactions,
-                1_024,
-            ),
+            ("maxActiveInvocations", self.max_active_invocations, 1_024),
             ("startupMaxEntries", self.startup_max_entries, 1_000_000),
         ];
         if let Some((field, value, maximum)) = ceilings

@@ -1,4 +1,4 @@
-package dekopon:storage@0.1.0;
+package dekopon:storage@0.1.1;
 
 interface jsonl {
     enum storage-error {
@@ -50,14 +50,6 @@ interface durable-files {
         full,
     }
 
-    enum lock-level {
-        none,
-        shared,
-        reserved,
-        pending,
-        exclusive,
-    }
-
     enum storage-error {
         not-found,
         already-exists,
@@ -85,9 +77,6 @@ interface durable-files {
         size: func() -> result<u64, storage-error>;
         truncate: func(size: u64) -> result<_, storage-error>;
         sync: func(mode: durability) -> result<_, storage-error>;
-        lock: func(level: lock-level) -> result<_, storage-error>;
-        unlock: func(to: lock-level) -> result<_, storage-error>;
-        check-reserved-lock: func() -> result<bool, storage-error>;
     }
 
     open: func(name: string, %flags: open-flags)

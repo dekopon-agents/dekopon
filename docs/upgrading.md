@@ -17,6 +17,25 @@ any `recall: journal` route is deleted at startup and on each recall.
 The line format changed. The first recall of each conversation deletes its old file and starts
 empty, with one `gateway_recall_failed` warning (`reason: corrupt`); nothing needs migrating.
 
+## Durable-files lock ladder removed (0.26.0)
+
+Upgrade `turso-sql` to a release built without the lock ladder **before** this broker. The
+`dekopon:storage@0.1.1` host no longer links `file.lock`, `file.unlock` or
+`file.check-reserved-lock`, and a component importing any of them is refused at load, taking the
+broker's provider set with it. `turso-sql` v0.4.0 imports `lock` and `unlock`; memory-chat imports
+only `jsonl` and loads unchanged.
+
+The package version is a patch bump although removing functions is a breaking change. Wasmtime links
+a `0.1.0` import to a `0.1.1` host, so every guest that never imported the ladder keeps loading
+without a rebuild; `0.2.0` would have refused them all.
+
+Rename `storage.maxPendingTransactions` to `storage.maxActiveInvocations` in the broker
+configuration; the old key is refused. The value keeps its meaning and default of 64.
+
+Authority-bound (`private-conversation`) durable-files namespaces start a new generation on their
+first grant after the upgrade. Stable scopes (`shared-conversation`, `agent`, as turso-sql uses),
+JSONL and chat-memory stores keep their data.
+
 ## Storage scopes and idle retention (0.25.0)
 
 Every broker storage constraint needs one edit before the 0.25.0 broker will start: replace
@@ -723,8 +742,7 @@ cross-file commit, or crash recovery. Inactive generations remain charged to the
 
 The strict storage limits object accepts only live bounds. Configure the complete object using
 `StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
-settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
-handle admission. Retained stores with
+settings. Retained stores with
 unknown root or generation entries are refused; there is no automatic migration,
 recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts

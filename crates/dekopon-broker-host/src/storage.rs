@@ -4,7 +4,7 @@ use std::{
 };
 
 use dekopon_storage_host::{
-    Durability, FileStat, LockLevel, OpenOptions, StorageEvidence, StorageHandle, StorageHostError,
+    Durability, FileStat, OpenOptions, StorageEvidence, StorageHandle, StorageHostError,
 };
 use wasmtime::component::{Resource, ResourceTable};
 
@@ -289,44 +289,6 @@ impl durable::HostFile for StoreState {
             .map_err(map_durable_error))
     }
 
-    async fn lock(
-        &mut self,
-        file: Resource<FileResource>,
-        level: durable::LockLevel,
-    ) -> wasmtime::Result<Result<(), durable::StorageError>> {
-        let handle = self.table.get(&file)?.handle;
-        Ok(self
-            .storage
-            .call(move |tx| tx.vfs_lock(handle, map_lock(level)))
-            .await
-            .map_err(map_durable_error))
-    }
-
-    async fn unlock(
-        &mut self,
-        file: Resource<FileResource>,
-        to: durable::LockLevel,
-    ) -> wasmtime::Result<Result<(), durable::StorageError>> {
-        let handle = self.table.get(&file)?.handle;
-        Ok(self
-            .storage
-            .call(move |tx| tx.vfs_unlock(handle, map_lock(to)))
-            .await
-            .map_err(map_durable_error))
-    }
-
-    async fn check_reserved_lock(
-        &mut self,
-        file: Resource<FileResource>,
-    ) -> wasmtime::Result<Result<bool, durable::StorageError>> {
-        let handle = self.table.get(&file)?.handle;
-        Ok(self
-            .storage
-            .call(move |tx| tx.vfs_check_reserved_lock(handle))
-            .await
-            .map_err(map_durable_error))
-    }
-
     async fn drop(&mut self, file: Resource<FileResource>) -> wasmtime::Result<()> {
         let resource = self.table.delete(file)?;
         self.storage
@@ -451,16 +413,6 @@ fn map_durability(value: durable::Durability) -> Durability {
         durable::Durability::Full => Durability::Full,
     }
 }
-fn map_lock(value: durable::LockLevel) -> LockLevel {
-    match value {
-        durable::LockLevel::None => LockLevel::None,
-        durable::LockLevel::Shared => LockLevel::Shared,
-        durable::LockLevel::Reserved => LockLevel::Reserved,
-        durable::LockLevel::Pending => LockLevel::Pending,
-        durable::LockLevel::Exclusive => LockLevel::Exclusive,
-    }
-}
-
 fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
     match error {
         StorageHostError::NotFound => jsonl::StorageError::NotFound,

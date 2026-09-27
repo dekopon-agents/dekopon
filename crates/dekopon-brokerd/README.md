@@ -854,7 +854,7 @@ storage:
   maxEntropyBytesPerInvocation: 4096
   lockTimeoutMs: 5000
   finalizationBudgetMs: 5000
-  maxPendingTransactions: 64
+  maxActiveInvocations: 64
   startupMaxEntries: 100000
 
 chatMemory:

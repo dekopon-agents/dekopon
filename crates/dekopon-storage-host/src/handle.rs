@@ -6,7 +6,6 @@ use crate::{
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     namespace::{Namespace, deadline_after, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
-    vfs::LockLevel,
 };
 use dekopon_capability::{StorageAccess, StorageInterface};
 use std::{
@@ -64,7 +63,6 @@ pub(crate) struct HandleState {
     pub(crate) read: bool,
     pub(crate) write: bool,
     pub(crate) delete_on_close: bool,
-    pub(crate) lock: LockLevel,
 }
 
 #[derive(Debug)]

@@ -3,7 +3,7 @@ use dekopon_provider_sdk::{
     ProviderError, ProviderManifest, RiskLevel,
 };
 use dekopon_provider_storage::durable_files::{
-    self as storage, Durability, LockLevel, OpenOptions, StorageError,
+    self as storage, Durability, OpenOptions, StorageError,
 };
 use serde_json::{Value, json};
 
@@ -124,22 +124,6 @@ fn run() -> Result<Value, ProviderError> {
 
     let second =
         storage::open("probe.db", OpenOptions::new().read(true).write(true)).map_err(map)?;
-    let third =
-        storage::open("probe.db", OpenOptions::new().read(true).write(true)).map_err(map)?;
-    first.lock(LockLevel::Shared).map_err(map)?;
-    second.lock(LockLevel::Shared).map_err(map)?;
-    first.lock(LockLevel::Reserved).map_err(map)?;
-    expect(second.lock(LockLevel::Reserved), StorageError::Busy)?;
-    if !second.check_reserved_lock().map_err(map)? {
-        return Err(failure("reserved-check"));
-    }
-    first.lock(LockLevel::Pending).map_err(map)?;
-    expect(third.lock(LockLevel::Shared), StorageError::Busy)?;
-    expect(first.lock(LockLevel::Exclusive), StorageError::Busy)?;
-    second.unlock(LockLevel::None).map_err(map)?;
-    first.lock(LockLevel::Exclusive).map_err(map)?;
-    first.unlock(LockLevel::None).map_err(map)?;
-    drop(third);
 
     expect(
         storage::rename_atomic("probe.db", "renamed.db", false, Durability::Full),

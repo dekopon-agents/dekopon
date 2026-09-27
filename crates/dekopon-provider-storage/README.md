@@ -1,9 +1,9 @@
 # dekopon-provider-storage
 
-Feature-gated Rust guest bindings for `dekopon:storage@0.1.0`.
+Feature-gated Rust guest bindings for `dekopon:storage@0.1.1`.
 
 - `jsonl` exposes bounded size/chunk reads and per-call append/replace.
-- `durable-files` exposes namespace-bound positional files, rollback-journal lock levels,
+- `durable-files` exposes namespace-bound positional files,
   durability modes, entropy, and clocks.
 - the default feature set emits no storage import.
 

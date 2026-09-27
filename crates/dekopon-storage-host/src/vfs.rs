@@ -22,16 +22,6 @@ pub enum Durability {
     Full,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub enum LockLevel {
-    #[default]
-    None,
-    Shared,
-    Reserved,
-    Pending,
-    Exclusive,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileStat {
     pub size: u64,
@@ -84,7 +74,6 @@ impl StorageHandle {
                     read: options.read,
                     write: options.write,
                     delete_on_close: options.delete_on_close,
-                    lock: LockLevel::None,
                 },
             );
             self.next_handle = next_handle;
@@ -343,73 +332,6 @@ impl StorageHandle {
         Ok(())
     }
 
-    pub fn vfs_lock(&mut self, handle: u64, level: LockLevel) -> Result<(), StorageHostError> {
-        self.require_vfs()?;
-        self.note_call()?;
-        let current = self
-            .handles
-            .get(&handle)
-            .ok_or(StorageHostError::InvalidArgument)?
-            .lock;
-        if level == current {
-            return Ok(());
-        }
-        if next_lock(current) != Some(level) {
-            return Err(StorageHostError::InvalidArgument);
-        }
-        let token = self.handles[&handle].token.clone();
-        let others = self
-            .handles
-            .iter()
-            .filter(|(id, state)| **id != handle && state.token == token);
-        let conflict = match level {
-            LockLevel::None => false,
-            LockLevel::Shared => others
-                .clone()
-                .any(|(_, state)| state.lock >= LockLevel::Pending),
-            LockLevel::Reserved | LockLevel::Pending => others
-                .clone()
-                .any(|(_, state)| state.lock >= LockLevel::Reserved),
-            LockLevel::Exclusive => others
-                .clone()
-                .any(|(_, state)| state.lock != LockLevel::None),
-        };
-        if conflict {
-            return Err(StorageHostError::Busy);
-        }
-        self.handles.get_mut(&handle).expect("existing handle").lock = level;
-        Ok(())
-    }
-
-    pub fn vfs_unlock(&mut self, handle: u64, to: LockLevel) -> Result<(), StorageHostError> {
-        self.require_vfs()?;
-        self.note_call()?;
-        let state = self
-            .handles
-            .get_mut(&handle)
-            .ok_or(StorageHostError::InvalidArgument)?;
-        if to > state.lock {
-            return Err(StorageHostError::InvalidArgument);
-        }
-        state.lock = to;
-        Ok(())
-    }
-
-    pub fn vfs_check_reserved_lock(&mut self, handle: u64) -> Result<bool, StorageHostError> {
-        self.require_vfs()?;
-        self.note_call()?;
-        let token = self
-            .handles
-            .get(&handle)
-            .ok_or(StorageHostError::InvalidArgument)?
-            .token
-            .clone();
-        Ok(self
-            .handles
-            .values()
-            .any(|state| state.token == token && state.lock >= LockLevel::Reserved))
-    }
-
     pub fn vfs_random_bytes(&mut self, length: u32) -> Result<Vec<u8>, StorageHostError> {
         self.require_vfs()?;
         self.note_call()?;
@@ -435,15 +357,5 @@ impl StorageHandle {
         } else {
             Err(StorageHostError::PermissionDenied)
         }
-    }
-}
-
-fn next_lock(level: LockLevel) -> Option<LockLevel> {
-    match level {
-        LockLevel::None => Some(LockLevel::Shared),
-        LockLevel::Shared => Some(LockLevel::Reserved),
-        LockLevel::Reserved => Some(LockLevel::Pending),
-        LockLevel::Pending => Some(LockLevel::Exclusive),
-        LockLevel::Exclusive => None,
     }
 }

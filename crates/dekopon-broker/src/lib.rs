@@ -2403,7 +2403,7 @@ where
             } else {
                 match interface {
                     StorageInterface::Jsonl => "jsonl@0.1.0",
-                    StorageInterface::DurableFiles => "durable-files@0.1.0/rollback-journal-v1",
+                    StorageInterface::DurableFiles => "durable-files@0.1.1",
                 }
             },
         );
@@ -3740,9 +3740,10 @@ fn encode_storage_limits(
             "storage.finalizationBudgetMs",
             limits.finalization_budget_ms,
         ),
+        // The label keeps the key's old name: renaming it would rotate every namespace generation.
         (
             "storage.maxPendingTransactions",
-            limits.max_pending_transactions,
+            limits.max_active_invocations,
         ),
         ("storage.startupMaxEntries", limits.startup_max_entries),
     ] {
