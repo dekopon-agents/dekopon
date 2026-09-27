@@ -309,9 +309,12 @@ The `memory:` block adds three more:
 Every adapter — Slack, Discord, Telegram, WhatsApp and local — uses the same private composable
 recovery extension. It wraps only connection establishment and receiving, never reply drivers,
 provider invocations, or outbound message effects. Existing clients, Slack's dedup ring, Telegram
-offsets, Slack thread ownership and Discord resume/identify state survive recovery. Discord and
-WhatsApp keep no dedup ring, so a gateway resume or a Meta webhook retry redelivers a message the
-gateway already accepted.
+offsets, Slack thread ownership and Discord resume/identify state survive recovery. WhatsApp keeps
+no dedup ring, so a Meta webhook retry — which happens only when its HTTP 200 is lost in the
+network — either joins an in-flight turn as a steer or starts a fresh one and gets a second reply.
+Discord's own resume sequence-number tracking already prevented a resumed connection from replaying
+an event the client had already received, so deleting its now-redundant `SeenIds` ring changes
+nothing about resume.
 
 The fixed policy requires no configuration:
 
@@ -704,12 +707,15 @@ rather than answered as though the group were a person, each dropped message rec
 Canonical subject is `whatsapp.<wa_id>`. The WABA, receiving phone number, and sender remain in the
 transport-derived chat scope as `<waba>:<phone-number-id>:<wa_id>`.
 
-The handler claims signed `messages[].id` values in a 4,096-entry process-local set and atomically
-enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text/image
-messages, and the queue admits at most 512 messages across 64 delivery slots. Duplicates seen by
-that running process are acknowledged without another session. Restart forgets the claims, and a
-crash after the 200 but before queue drain loses the accepted work. Queue saturation returns 503 and
-rolls back new claims so Meta can redeliver.
+The handler enqueues one bounded delivery before returning HTTP 200. One delivery carries at most
+128 text/image messages, and the queue admits at most 512 messages across 64 delivery slots. The
+200 returns before the turn starts, so Meta only retries a delivery whose 200 was lost in the
+network, not one that is merely slow to answer; with no other application subscribed to the WABA,
+that is the only remaining duplicate source. A redelivered message that arrives while the original
+turn is still running is admitted as a steer on that running session rather than a second one; one
+that arrives after the original turn has completed starts a fresh session and gets a second reply,
+the accepted cost of deleting the WhatsApp dedup ring. A crash after the 200 but before queue drain
+loses the accepted work. Queue saturation returns 503 so Meta can redeliver.
 
 PNG/JPEG photos carry one lazy media-ID reference; webhook URLs are ignored. Captions become the
 bounded user text, including an absent/empty caption (the session then receives the reference note).

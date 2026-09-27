@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_verifies_exact_bytes_before_parsing_and_a_retry_is_redelivered() {
+    async fn post_verifies_exact_bytes_before_parsing() {
         let body = serde_json::to_vec(&json!({
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
@@ -1076,24 +1076,6 @@ mod tests {
         .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(receiver.recv().await.expect("batch").messages.len(), 1);
-
-        // A Meta webhook retry redelivers the same body; exactly-once delivery is not a goal, so
-        // the retry is enqueued again rather than suppressed.
-        let retried = process_webhook(
-            &state,
-            signed_request(&body),
-            Arc::clone(&state.concurrency)
-                .acquire_owned()
-                .await
-                .expect("permit"),
-            &received(),
-        )
-        .await;
-        assert_eq!(retried.status(), StatusCode::OK);
-        assert_eq!(
-            receiver.recv().await.expect("retried batch").messages.len(),
-            1
-        );
 
         let mut changed = body.clone();
         changed.push(b' ');

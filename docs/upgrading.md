@@ -65,14 +65,21 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
 See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
-## Discord and WhatsApp no longer dedup redeliveries (unreleased)
+## WhatsApp no longer dedups redeliveries; the Discord ring is deleted as redundant (unreleased)
 
-The Discord `SeenIds` ring and the WhatsApp `ClaimedIds` ring are gone; no configuration key
-changes. Exactly-once delivery was never a goal, so a Discord gateway resume or a Meta webhook
-retry that redelivers a message the gateway already accepted now gets a second reply instead of
-being silently dropped. The Slack dedup ring is unchanged. A chat-memory record that fails with
-what used to be `dedup-conflict` or `dedup-capacity` now classifies as the generic
-`provider-failure`; nothing consumes those two codes specially anymore.
+The WhatsApp `ClaimedIds` ring is gone; no configuration key changes. WhatsApp's HTTP 200 already
+returns before the turn starts, so Meta only retries a delivery whose 200 was lost in the network —
+never because the answer is slow. A retried delivery that arrives while the original turn is still
+running joins it as a steer; one that arrives after the turn has completed starts a fresh turn and
+gets a second reply, the accepted cost.
+
+The Discord `SeenIds` ring is also gone, but this is a no-op for behavior: Discord's own gateway
+resume sequence-number tracking already prevented a resumed connection from replaying an event the
+client had already received, so the ring never had a real duplicate to catch on that path. The
+Slack dedup ring is unchanged.
+
+A chat-memory record that fails with what used to be `dedup-conflict` or `dedup-capacity` now
+classifies as the generic `provider-failure`; nothing consumes those two codes specially anymore.
 
 ## Slack no longer streams the answer (unreleased)
 

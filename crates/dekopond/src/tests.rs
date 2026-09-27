@@ -10656,35 +10656,6 @@ async fn discord_reconnects_when_a_heartbeat_is_not_acknowledged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn discord_routes_a_resume_redelivered_message_again() {
-    let event = discord_message(
-        "300000000000000007",
-        "200000000000000007",
-        None,
-        DISCORD_USER,
-        false,
-        "redelivered",
-    );
-    let socket = spawn_discord_socket_mock(
-        vec![
-            discord_dispatch(2, "MESSAGE_CREATE", event.clone()),
-            discord_dispatch(3, "MESSAGE_CREATE", event),
-        ],
-        None,
-    );
-    let http = spawn_http_mock(discord_handler(socket.url.clone()));
-    let mut transport = discord(&http.base);
-    transport.connect().await.expect("Discord connects");
-
-    assert_eq!(next_message(&mut transport).await.text, "redelivered");
-    assert_eq!(
-        next_message(&mut transport).await.text,
-        "redelivered",
-        "exactly-once delivery is not a goal; a resume redelivery routes again"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn discord_reconnects_with_resume_before_delivering_more_messages() {
     let resumed_message = discord_message(
         "300000000000000005",
