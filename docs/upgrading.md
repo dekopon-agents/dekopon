@@ -8,12 +8,38 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Reserved command word progress (unreleased)
+## Storage scopes and idle retention (0.25.0)
+
+Every broker storage constraint needs one edit before the 0.25.0 broker will start: replace
+`namespace: chat` with `scope: private-conversation`. The old key is refused, not translated.
+Private conversation storage keeps its key and authority-bound continuity, so existing chat-memory
+data is found unchanged. `shared-conversation` (transport and conversation, no subject) and
+`agent` (provider and agent) are new scopes with stable continuity; each caller is still
+authorized individually by Cedar.
+
+Retention defaults to `retention: {mode: keep}`, so no existing data gains a TTL. Opting a
+provider/scope into `retention: {mode: idle-ttl, idleTtlMs: <ms>}` makes resources idle for longer
+than that eligible for deletion. The broker sweeps at startup and every 12 hours, so the first
+start after adding or shortening a TTL can delete data at once. A zero or conflicting TTL for
+the same provider and scope refuses startup. Shutdown now waits for a running sweep. See
+[provider storage](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory).
+
+## Progress notes (0.25.0)
 
 - **The shell `progress` builtin.** `progress` now belongs to
   `dekopon_core::RESERVED_COMMAND_WORDS`; a provider declaring that command word is refused at
   load. Rename a colliding provider word before upgrading. The builtin sends an optional note
   through the invoker and is a no-op without a progress-note sink.
+- **Route `progressNotes: true`** (default false) offers the builtin to the model and admits its
+  notes to chat and `gateway.progress` telemetry: setting it is consent for model-authored text to
+  reach both. Such a route with `progressDetail: off` refuses startup.
+- **Slack Agent `liveness.statusText: true`** (default false, overridable per conversation kind)
+  shows notes as the thread status line. It needs `experience: agent`, `stream: false` and
+  `progress: off` or `auto`; any other combination refuses startup. Slack hides its native Stop
+  while the text shows; stop words still work.
+
+See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
+[chat progress](chat-progress.md).
 
 ## Chat steering (0.24.0)
 
