@@ -2,7 +2,7 @@
 //! an empty grant ends it before any model token is spent, whatever the message text says.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -16,13 +16,14 @@ use dekopon_agent::{
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, ConversationTurn, History, PromptError, ReplyDisposition, SessionInputs,
-        run_prompt_session,
+        SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
-    ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
-    ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
+    Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
+    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
+    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
+    InvocationResult,
 };
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
@@ -40,9 +41,10 @@ use tracing::Instrument as _;
 
 use crate::{
     asset::{self, AssetAccess, AssetStore, RecalledAsset, SessionAssets},
+    collection::Dispositions,
     config::{
         MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, RecallSource, ResolvedBroker,
-        ResolvedLiveness,
+        ResolvedLiveness, Steering,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     journal::{self, Journal},
@@ -285,35 +287,214 @@ impl ModelCache {
     }
 }
 
+pub(crate) const MAILBOX_CAPACITY: usize = 8;
+
+#[derive(Clone)]
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
-    late_permits: Arc<Semaphore>,
     refusals: Arc<Semaphore>,
-    in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
+    in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
+}
+
+enum Holder {
+    Probe,
+    Session(Box<Running>),
+}
+
+struct Running {
+    subject: dekopon_core::ExternalSubject,
+    cancellation: SessionCancellation,
+    steering: Steering,
+    aborts: u8,
+    received_at: tokio::time::Instant,
+    steers: VecDeque<InboundMessage>,
+    follow_ups: VecDeque<FollowUp>,
+}
+
+impl Running {
+    fn new(route: &BoundRoute, message: &InboundMessage) -> Self {
+        Self {
+            subject: message.subject.clone(),
+            cancellation: SessionCancellation::new(),
+            steering: route.steering,
+            aborts: 0,
+            received_at: message.received_at,
+            steers: VecDeque::new(),
+            follow_ups: VecDeque::new(),
+        }
+    }
+}
+
+pub(crate) struct FollowUp {
+    pub route: BoundRoute,
+    pub message: InboundMessage,
+    pub receipts: Dispositions,
+}
+
+pub(crate) enum Admit {
+    Admitted(SessionAdmission, InboundMessage, Dispositions),
+    Steered(Dispositions),
+    Queued,
+    Full(InboundMessage, Dispositions),
+    Saturated(InboundMessage, Dispositions),
+}
+
+pub(crate) struct StopOutcome {
+    pub running: CancelOutcome,
+    pub dropped: bool,
+}
+
+fn record_admission(message: &InboundMessage, outcome: &str, depth: usize, cause: Option<&str>) {
+    if let Some(cause) = cause {
+        tracing::Span::current().record("busy.cause", cause);
+    }
+    tracing::info!(
+        target: "dekopond::audit",
+        { audit.event = "gateway.admission", outcome, busy.cause = cause,
+          transport = %message.transport, conversation.id = %message.conversation.key(),
+          queue.depth = depth },
+        "gateway admission"
+    );
 }
 
 impl SessionGate {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent)),
-            late_permits: Arc::new(Semaphore::new(max_concurrent)),
             refusals: Arc::new(Semaphore::new(max_concurrent)),
-            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+            in_flight: Arc::default(),
         }
     }
 
-    pub fn admit(&self, key: AdmissionKey) -> Option<SessionAdmission> {
-        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
-        let mut in_flight = self.in_flight.lock().expect("session in-flight registry");
-        if !in_flight.insert(key.clone()) {
+    pub(crate) fn admit(
+        &self,
+        route: &BoundRoute,
+        message: InboundMessage,
+        receipts: Dispositions,
+    ) -> Admit {
+        let key = (message.transport.clone(), message.conversation.key());
+        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        if let Some(holder) = entries.get_mut(&key) {
+            let Holder::Session(running) = holder else {
+                record_admission(&message, "busy", 0, Some("saturated"));
+                return Admit::Saturated(message, receipts);
+            };
+            let depth = running.steers.len() + running.follow_ups.len();
+            if depth == MAILBOX_CAPACITY {
+                record_admission(&message, "busy", depth, Some("same-conversation"));
+                tracing::info!(event = "gateway_steer_refused", reason = "mailbox-full");
+                return Admit::Full(message, receipts);
+            }
+            if message.subject == running.subject
+                && !matches!(message.message_id, MessageId::Wake { .. })
+                && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
+            {
+                record_admission(&message, "steered", depth + 1, None);
+                running.steers.push_back(message);
+                if running.steering == Steering::Abort
+                    && usize::from(running.aborts) < MAILBOX_CAPACITY
+                {
+                    running.aborts += 1;
+                    running.cancellation.interrupt_model();
+                }
+                return Admit::Steered(receipts);
+            }
+            record_admission(&message, "queued", depth + 1, None);
+            running.follow_ups.push_back(FollowUp {
+                route: route.clone(),
+                message,
+                receipts,
+            });
+            return Admit::Queued;
+        }
+        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            record_admission(&message, "busy", 0, Some("saturated"));
+            return Admit::Saturated(message, receipts);
+        };
+        let running = Running::new(route, &message);
+        let cancellation = running.cancellation.clone();
+        entries.insert(key.clone(), Holder::Session(Box::new(running)));
+        Admit::Admitted(
+            SessionAdmission {
+                _permit: permit,
+                key,
+                in_flight: Arc::clone(&self.in_flight),
+                cancellation,
+                route: Box::new(route.clone()),
+            },
+            message,
+            receipts,
+        )
+    }
+
+    pub(crate) fn admit_probe(&self, key: AdmissionKey) -> Option<ProbeAdmission> {
+        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        if entries.contains_key(&key) {
             return None;
         }
-        drop(in_flight);
-        Some(SessionAdmission {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        entries.insert(key.clone(), Holder::Probe);
+        Some(ProbeAdmission {
             _permit: permit,
             key,
             in_flight: Arc::clone(&self.in_flight),
         })
+    }
+
+    pub(crate) fn take_steers(&self, key: &AdmissionKey) -> Vec<InboundMessage> {
+        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let Some(Holder::Session(running)) = entries.get_mut(key) else {
+            return Vec::new();
+        };
+        running.cancellation.rearm_model();
+        running.steers.drain(..).collect()
+    }
+
+    pub(crate) fn cancel(&self, request: &CancelRequest) -> StopOutcome {
+        let key = (request.transport.clone(), request.conversation_id.clone());
+        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let Some(Holder::Session(running)) = entries.get_mut(&key) else {
+            return StopOutcome {
+                running: CancelOutcome::NoSession,
+                dropped: false,
+            };
+        };
+        let before = running.steers.len() + running.follow_ups.len();
+        running.steers.retain(|message| {
+            let keep = message.subject.canonical() != request.subject;
+            if !keep {
+                for receipt in &message.constituents {
+                    crate::collection::disposition(receipt, "stopped");
+                }
+            }
+            keep
+        });
+        running.follow_ups.retain_mut(|followup| {
+            let keep = followup.message.subject.canonical() != request.subject;
+            if !keep {
+                for receipt in followup.receipts.0.drain(..) {
+                    crate::collection::disposition(&receipt, "stopped");
+                }
+            }
+            keep
+        });
+        let dropped = before != running.steers.len() + running.follow_ups.len();
+        let outcome = if running.subject.canonical() != request.subject {
+            CancelOutcome::OtherSubject
+        } else if running
+            .cancellation
+            .cancel(CancelSource::User { via: request.via })
+        {
+            CancelOutcome::Cancelled
+        } else if running.cancellation.is_cancelled() {
+            CancelOutcome::AlreadyCancelled
+        } else {
+            CancelOutcome::Completing
+        };
+        StopOutcome {
+            running: outcome,
+            dropped,
+        }
     }
 }
 
@@ -333,10 +514,75 @@ impl SessionGate {
 pub(crate) struct SessionAdmission {
     _permit: OwnedSemaphorePermit,
     key: AdmissionKey,
-    in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
+    in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
+    cancellation: SessionCancellation,
+    route: Box<BoundRoute>,
+}
+
+impl SessionAdmission {
+    pub(crate) fn cancellation(&self) -> SessionCancellation {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn next_or_release(mut self) -> Option<(Self, FollowUp)> {
+        let next = {
+            let mut entries = self.in_flight.lock().expect("session in-flight registry");
+            let Some(Holder::Session(running)) = entries.get_mut(&self.key) else {
+                return None;
+            };
+            // Fold before changing subject: leftover steers must never drain into another sender's run.
+            if let Some(mut message) = running.steers.pop_front() {
+                let text = bound_inbound(&crate::collection::combined_text(
+                    std::iter::once(&message).chain(running.steers.iter()),
+                ));
+                for next in running.steers.drain(..) {
+                    message.assets.extend(next.assets);
+                    message.constituents.extend(next.constituents);
+                    message.receive_span = next.receive_span;
+                }
+                message.text = text;
+                running.follow_ups.push_back(FollowUp {
+                    route: (*self.route).clone(),
+                    receipts: crate::collection::Dispositions(message.constituents.clone()),
+                    message,
+                });
+            }
+            if let Some(next) = running.follow_ups.pop_front() {
+                running.subject = next.message.subject.clone();
+                running.cancellation = SessionCancellation::new();
+                running.steering = next.route.steering;
+                running.aborts = 0;
+                running.received_at = next.message.received_at;
+                self.cancellation = running.cancellation.clone();
+                *self.route = next.route.clone();
+                Some(next)
+            } else {
+                entries.remove(&self.key);
+                None
+            }
+        };
+        next.map(|next| (self, next))
+    }
 }
 
 impl Drop for SessionAdmission {
+    fn drop(&mut self) {
+        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        if matches!(entries.get(&self.key), Some(Holder::Session(running))
+            if Arc::ptr_eq(&running.cancellation.state, &self.cancellation.state))
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) struct ProbeAdmission {
+    _permit: OwnedSemaphorePermit,
+    key: AdmissionKey,
+    in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
+}
+
+impl Drop for ProbeAdmission {
     fn drop(&mut self) {
         self.in_flight
             .lock()
@@ -352,6 +598,7 @@ pub(crate) struct SessionCancellation {
     woken: Arc<Notify>,
     handle: CancelHandle,
     signal: CancelSignal,
+    model: tokio::sync::watch::Sender<bool>,
 }
 
 impl SessionCancellation {
@@ -363,6 +610,23 @@ impl SessionCancellation {
             woken: Arc::new(Notify::new()),
             handle,
             signal,
+            model: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    pub(crate) fn model_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.model.subscribe()
+    }
+
+    pub(crate) fn interrupt_model(&self) {
+        self.model.send_replace(true);
+    }
+
+    pub(crate) fn rearm_model(&self) {
+        // Serialize with session cancellation so draining can never clear a stop.
+        let _source = self.source.lock().expect("session cancellation source");
+        if self.state.load(Ordering::Acquire) != SESSION_CANCELLED {
+            self.model.send_replace(false);
         }
     }
 
@@ -404,6 +668,7 @@ impl SessionCancellation {
         };
         if cancelled {
             self.handle.cancel();
+            self.model.send_replace(true);
             self.woken.notify_waiters();
         }
         cancelled
@@ -453,19 +718,6 @@ impl Drop for CancellationOnDrop {
     }
 }
 
-mod late_photos;
-pub(crate) use late_photos::{LatePhotoReceipt, LatePhotos};
-
-type ActiveSessionKey = (String, String);
-
-#[derive(Clone)]
-struct ActiveSession {
-    started_at: tokio::time::Instant,
-    late_photos: LatePhotos,
-    subject: dekopon_core::ExternalSubject,
-    cancellation: SessionCancellation,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancelOutcome {
     Cancelled,
@@ -486,120 +738,6 @@ impl CancelOutcome {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct ActiveSessions {
-    entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
-    recent: Arc<Mutex<late_photos::RecentSessions>>,
-    intakes: late_photos::LateIntakes,
-}
-
-impl ActiveSessions {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            entries: Arc::default(),
-            intakes: late_photos::LateIntakes::default(),
-            recent: Arc::new(Mutex::new(late_photos::RecentSessions::new(capacity))),
-        }
-    }
-
-    fn register(
-        &self,
-        message: &InboundMessage,
-        route: &BoundRoute,
-        cancellation: SessionCancellation,
-    ) -> ActiveRegistration {
-        let key = (message.transport.clone(), message.conversation.key());
-        let late_photos = LatePhotos::new(route, message, cancellation.clone());
-        let session = ActiveSession {
-            started_at: tokio::time::Instant::now(),
-            late_photos: late_photos.clone(),
-            subject: message.subject.clone(),
-            cancellation: cancellation.clone(),
-        };
-        let registered = match self
-            .entries
-            .lock()
-            .expect("active session registry")
-            .entry(key.clone())
-        {
-            Entry::Vacant(entry) => {
-                entry.insert(session);
-                true
-            }
-            Entry::Occupied(_) => {
-                tracing::error!(event = "gateway_session_registry_conflict");
-                false
-            }
-        };
-        ActiveRegistration {
-            recent: Arc::clone(&self.recent),
-            late_photos,
-            entries: Arc::clone(&self.entries),
-            key,
-            cancellation,
-            registered,
-        }
-    }
-
-    pub(crate) fn cancel(&self, request: &CancelRequest) -> CancelOutcome {
-        let execution = self.cancel_execution(request);
-        self.intakes.cancel(request, execution)
-    }
-
-    fn cancel_execution(&self, request: &CancelRequest) -> CancelOutcome {
-        let key = (request.transport.clone(), request.conversation_id.clone());
-        let Some(session) = self
-            .entries
-            .lock()
-            .expect("active session registry")
-            .get(&key)
-            .cloned()
-        else {
-            return CancelOutcome::NoSession;
-        };
-        if session.subject.canonical() != request.subject {
-            return CancelOutcome::OtherSubject;
-        }
-        if session
-            .cancellation
-            .cancel(CancelSource::User { via: request.via })
-        {
-            CancelOutcome::Cancelled
-        } else if session.cancellation.is_cancelled() {
-            CancelOutcome::AlreadyCancelled
-        } else {
-            CancelOutcome::Completing
-        }
-    }
-}
-
-struct ActiveRegistration {
-    recent: Arc<Mutex<late_photos::RecentSessions>>,
-    late_photos: LatePhotos,
-    entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
-    key: ActiveSessionKey,
-    cancellation: SessionCancellation,
-    registered: bool,
-}
-
-impl Drop for ActiveRegistration {
-    fn drop(&mut self) {
-        if !self.registered {
-            return;
-        }
-        let mut entries = self.entries.lock().expect("active session registry");
-        if entries.get(&self.key).is_some_and(|session| {
-            Arc::ptr_eq(&session.cancellation.state, &self.cancellation.state)
-        }) && let Some(session) = entries.remove(&self.key)
-        {
-            self.recent
-                .lock()
-                .expect("recent session registry")
-                .complete(self.key.clone(), session);
-        }
-    }
-}
-
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
     pub models: Arc<ModelCache>,
@@ -611,7 +749,6 @@ pub(crate) struct SessionRunner {
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
-    pub active_sessions: ActiveSessions,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
 }
 
@@ -824,96 +961,120 @@ fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> Str
     ))
 }
 
-pub(crate) fn run_session(
-    runner: Arc<SessionRunner>,
-    route: BoundRoute,
-    mut message: InboundMessage,
-    driver: Arc<dyn ChatDriver>,
-) -> impl std::future::Future<Output = ()> + Send {
-    let receipts = crate::collection::Dispositions(message.constituents.clone());
-    let intake = message.late_photos.as_ref().and_then(|_| {
-        runner
-            .active_sessions
-            .intakes
-            .register(&runner.gate, &message)
-    });
-    async move {
-        let span = {
-            let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
-            tracing::info_span!(
-                parent: &received,
-                "gateway.message",
-                transport = %message.transport,
-                agent = %route.agent,
-                outcome = tracing::field::Empty,
-                batch.members = tracing::field::Empty
-            )
-        };
-        span.record("batch.members", receipts.0.len());
-        for receipt in &receipts.0 {
-            dekopon_telemetry::link_span(&span, receipt);
-        }
-        let outcome = execute(runner, route, message, driver, intake)
-            .instrument(span.clone())
-            .await;
-        span.record("outcome", outcome);
-        receipts.finish(outcome);
+fn message_span(
+    route: &BoundRoute,
+    message: &InboundMessage,
+    receipts: &Dispositions,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: &message.receive_span,
+        "gateway.message",
+        transport = %message.transport,
+        agent = %route.agent,
+        outcome = tracing::field::Empty,
+        busy.cause = tracing::field::Empty,
+        batch.members = receipts.0.len(),
+    );
+    for receipt in &receipts.0 {
+        dekopon_telemetry::link_span(&span, receipt);
     }
+    span
 }
 
-async fn execute(
+pub(crate) fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    intake: Option<late_photos::LateIntake>,
-) -> &'static str {
+) -> impl std::future::Future<Output = ()> + Send {
+    let receipts = Dispositions(message.constituents.clone());
+    async move {
+        let span = message_span(&route, &message, &receipts);
+        let mut admission = execute(&runner, &route, message, &driver, receipts)
+            .instrument(span)
+            .await;
+        while let Some((next, followup)) = admission.and_then(SessionAdmission::next_or_release) {
+            let span = message_span(&followup.route, &followup.message, &followup.receipts);
+            admission = Some(
+                run_admitted(
+                    &runner,
+                    &followup.route,
+                    followup.message,
+                    &driver,
+                    followup.receipts,
+                    next,
+                )
+                .instrument(span)
+                .await,
+            );
+        }
+    }
+}
+
+async fn execute(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    message: InboundMessage,
+    driver: &Arc<dyn ChatDriver>,
+    receipts: Dispositions,
+) -> Option<SessionAdmission> {
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
     }
-
-    if let Some(late) = &message.late_photos {
-        let Some(intake) = intake else {
-            if late.is_stopped() {
-                return "stopped";
+    let liveness = message.liveness.clone();
+    let is_wake = matches!(message.message_id, MessageId::Wake { .. });
+    match runner.gate.admit(route, message, receipts) {
+        Admit::Admitted(admission, message, receipts) => {
+            Some(run_admitted(runner, route, message, driver, receipts, admission).await)
+        }
+        Admit::Steered(receipts) => {
+            tracing::Span::current().record("outcome", "steered");
+            receipts.finish("steered");
+            acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
+            None
+        }
+        Admit::Queued => {
+            tracing::Span::current().record("outcome", "queued");
+            if !is_wake {
+                acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             }
-            if let Some(_reply) = runner.gate.refusal() {
-                answer(&driver, &message, late_photos::REFUSED_REPLY).await;
+            None
+        }
+        Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
+            tracing::info!(event = "gateway_session_rejected", reason = "busy");
+            if (runner.reply_on_busy || !message.constituents.is_empty())
+                && let Some(_reply) = runner.gate.refusal()
+            {
+                answer(driver, &message, BUSY_REPLY).await;
             }
-            return "late-busy";
-        };
-        return late
-            .retain(&runner, &route, &message, &driver, &intake)
-            .await;
+            tracing::Span::current().record("outcome", "busy");
+            receipts.finish("busy");
+            None
+        }
     }
+}
 
-    // The admission slot, the active-session registry, the cancel request, and the memory key are
-    // all keyed on the same conversation key, so a stop can never be filed apart from its session.
-    let key = (message.transport.clone(), message.conversation.key());
-    let Some(admission) = runner.gate.admit(key) else {
-        if let MessageId::Wake { id, notice } = &message.message_id {
-            tracing::info!(event = "gateway_wake_busy", wake.id = %id);
-            answer(&driver, &message, notice).await;
-            return "wake-busy";
-        }
-        tracing::info!(event = "gateway_session_rejected", reason = "busy");
-        if (runner.reply_on_busy || !message.constituents.is_empty())
-            && let Some(_reply) = runner.gate.refusal()
-        {
-            answer(&driver, &message, BUSY_REPLY).await;
-        }
-        return "busy";
-    };
-
-    if message.transport_kind == dekopon_broker_protocol::ChatTransportKind::Whatsapp
-        && route.memory.window().is_some()
+async fn acknowledge_steer(
+    driver: &dyn ChatDriver,
+    target: Option<&crate::transport::LivenessTarget>,
+    transport: &str,
+) {
+    if let (Some(ack), Some(target)) = (driver.steer_ack(), target)
+        && let Err(error) = crate::progress::bounded(ack.seen(target)).await
     {
-        runner
-            .conversations
-            .invalidate_late_input(&conversation_key(&route, &message));
+        tracing::debug!(event = "gateway_steer_ack_failed", transport, error = %error);
     }
+}
 
-    let outcome = session(&runner, &route, &message, &driver)
+async fn run_admitted(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    message: InboundMessage,
+    driver: &Arc<dyn ChatDriver>,
+    receipts: Dispositions,
+    admission: SessionAdmission,
+) -> SessionAdmission {
+    let outcome = session(runner, route, &message, driver, admission.cancellation())
         .instrument(tracing::info_span!(
             "gateway.session",
             agent = %route.agent,
@@ -930,8 +1091,69 @@ async fn execute(
             conversation.carried_assets = tracing::field::Empty,
         ))
         .await;
-    drop(admission);
-    outcome
+    tracing::Span::current().record("outcome", outcome);
+    receipts.finish(outcome);
+    admission
+}
+
+struct SessionSteers {
+    gate: SessionGate,
+    key: AdmissionKey,
+    store: Arc<AssetStore>,
+    access: AssetAccess,
+    images_supported: bool,
+    scope: Option<MemoryScope>,
+    assets: Arc<SessionAssets>,
+    received_at: tokio::time::Instant,
+    raw_texts: Mutex<Vec<String>>,
+}
+
+impl SteerSource for SessionSteers {
+    fn drain(&self) -> Vec<String> {
+        self.gate
+            .take_steers(&self.key)
+            .into_iter()
+            .map(|steer| {
+                let seconds = steer
+                    .received_at
+                    .saturating_duration_since(self.received_at)
+                    .as_secs();
+                let mut text = bound_inbound(&format!(
+                    "[gateway: sent while you were working, +{seconds}s]\n{}",
+                    steer.text
+                ));
+                let registered = self.store.assets_for_access(
+                    &self.access,
+                    steer.assets,
+                    self.images_supported,
+                    Instant::now(),
+                );
+                self.assets.arrived(registered.fetchable);
+                if let Some(note) = asset::reference_note(&registered, self.images_supported) {
+                    text = bound_inbound(&format!("{text}\n\n{note}"));
+                }
+                if self.scope == Some(MemoryScope::SharedConversation) {
+                    text = attributed_prompt(&steer.subject, &text);
+                }
+                self.raw_texts
+                    .lock()
+                    .expect("consumed steers")
+                    .push(steer.text);
+                text
+            })
+            .collect()
+    }
+}
+
+impl SessionSteers {
+    fn user_text(&self, prompt: &str) -> String {
+        let mut text = prompt.to_owned();
+        for steer in self.raw_texts.lock().expect("consumed steers").iter() {
+            text.push_str("\n\n");
+            text.push_str(steer);
+        }
+        text
+    }
 }
 
 async fn session(
@@ -939,12 +1161,8 @@ async fn session(
     route: &BoundRoute,
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
+    cancellation: SessionCancellation,
 ) -> &'static str {
-    let cancellation = SessionCancellation::new();
-    let _active_registration =
-        runner
-            .active_sessions
-            .register(message, route, cancellation.clone());
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
@@ -968,8 +1186,7 @@ async fn session(
             return "failed";
         }
     };
-    // Never cached and never remembered as a permission: this is a fresh answer from the broker
-    // about what this subject may reach through this agent, for this message alone.
+    // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
@@ -1002,7 +1219,7 @@ async fn session(
     );
 
     let window = route.memory.window();
-    let (seeded, cache_key, conversation_lease, asset_access, gateway_notice) = match window {
+    let (seeded, cache_key, conversation_lease, asset_access) = match window {
         Some(window) => {
             let recalled = if runner
                 .conversations
@@ -1025,8 +1242,6 @@ async fn session(
                 cache_key,
                 assets,
                 lease,
-                input,
-                gateway_notice,
                 created,
             } = runner.conversations.begin(
                 &key,
@@ -1043,17 +1258,13 @@ async fn session(
                     .assets
                     .restore(&assets, recalled_assets, next_asset_id, Instant::now());
             }
-            _active_registration
-                .late_photos
-                .authorized(input, assets.clone(), cache_key.clone());
-            (history, cache_key, Some(lease), assets, gateway_notice)
+            (history, cache_key, Some(lease), assets)
         }
         None => (
             History::default(),
             route.cache_key.clone(),
             None,
             AssetAccess::one_shot(key.clone()),
-            None,
         ),
     };
     let span = tracing::Span::current();
@@ -1108,24 +1319,30 @@ async fn session(
         Some(note) => bound_inbound(&format!("{note}\n{text}")),
         None => text,
     };
-    let text = match gateway_notice {
-        Some(notice) => bound_inbound(&format!(
-            "[Gateway follow-up previously delivered: {notice}]\n{text}"
-        )),
-        None => text,
-    };
     let text = match window.map(|window| window.scope) {
         Some(MemoryScope::SharedConversation) => attributed_prompt(&message.subject, &text),
         Some(MemoryScope::PrivateConversation) | None => text,
     };
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
-        asset_access,
+        asset_access.clone(),
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,
         registered.fetchable,
     ));
+    let steers = Arc::new(SessionSteers {
+        gate: runner.gate.clone(),
+        key: (message.transport.clone(), message.conversation.key()),
+        store: Arc::clone(&runner.assets),
+        access: asset_access,
+        images_supported,
+        scope: window.map(|window| window.scope),
+        assets: Arc::clone(&assets),
+        received_at: message.received_at,
+        raw_texts: Mutex::new(Vec::new()),
+    });
+    let session_steers = Arc::clone(&steers);
     let shell = ShellLimits {
         max_capability_calls: limits.max_capability_calls,
         timeout: route.script_timeout,
@@ -1181,10 +1398,14 @@ async fn session(
         .is_some_and(|continuation| continuation.inherited);
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
+    let progress_notes = route.progress_notes;
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
-    let leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    let mut leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    if progress_notes {
+        leg = leg.with_progress_notes();
+    }
     drop(sink);
     let wakes = route
         .wakes
@@ -1201,7 +1422,7 @@ async fn session(
             )
         });
     let model_runtime = tokio::runtime::Handle::current();
-    let model_cancel = cancellation.signal().watch();
+    let model_cancel = cancellation.model_watch();
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         let model = match models.client(&model_config, model_runtime, model_cancel) {
@@ -1220,6 +1441,7 @@ async fn session(
             .with_assets(assets.as_ref())
             .with_reply_assets(&session_attachments)
             .with_cancellation(&prompt_cancellation)
+            .with_steering(session_steers.as_ref())
             .with_progress(Arc::clone(&progress_sink));
         // Withholding the agent-config view here removes the structured dump but not the underlying
         // instructions, which are still the system prompt, so this is not secrecy from a determined
@@ -1229,6 +1451,9 @@ async fn session(
         }
         if improvement_suggestions {
             inputs = inputs.with_improvement_suggestions();
+        }
+        if progress_notes {
+            inputs = inputs.with_progress_notes();
         }
         if reply_optional {
             inputs = inputs.with_optional_reply();
@@ -1259,20 +1484,11 @@ async fn session(
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
-            let notice = _active_registration
-                .late_photos
-                .finish(&runner.assets, false);
             let replied = progress
-                .terminal(Terminal::Failed(late_photos::append_notice(
+                .terminal(Terminal::Failed(bound_outbound(
                     liveness.templates.failed(),
-                    notice,
                 )))
                 .await;
-            if replied && let Some(notice) = notice {
-                _active_registration
-                    .late_photos
-                    .remember_notice(&runner.conversations, notice);
-            }
             return if replied { "failed" } else { "reply-failed" };
         }
     };
@@ -1308,9 +1524,6 @@ async fn session(
         return "declined";
     }
 
-    let late_notice = _active_registration
-        .late_photos
-        .finish(&runner.assets, outcome.is_ok());
     let (terminal, completed_outcome, delivered_answer) = match &outcome {
         Ok(outcome) => {
             let text = bound_outbound(if outcome.answer.is_empty() && images.is_empty() {
@@ -1318,7 +1531,6 @@ async fn session(
             } else {
                 outcome.answer.as_str()
             });
-            let text = late_photos::append_notice(&text, late_notice);
             let reply = if images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
@@ -1332,10 +1544,7 @@ async fn session(
                 category = "unreported-capability-work"
             );
             (
-                Terminal::Failed(late_photos::append_notice(
-                    UNREPORTED_WORK_REPLY,
-                    late_notice,
-                )),
+                Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned()),
                 "failed",
                 None,
             )
@@ -1347,10 +1556,7 @@ async fn session(
                 error = %error
             );
             (
-                Terminal::Failed(late_photos::append_notice(
-                    liveness.templates.failed(),
-                    late_notice,
-                )),
+                Terminal::Failed(bound_outbound(liveness.templates.failed())),
                 "failed",
                 None,
             )
@@ -1363,16 +1569,18 @@ async fn session(
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
-        if let Some(notice) = late_notice {
-            _active_registration
-                .late_photos
-                .remember_notice(&runner.conversations, notice);
-        }
         if memory_surface.is_some()
             && let Some(answer) = delivered_answer
             && let Some(claim) = chat_claim
         {
-            record_delivered_turn(runner, message, claim, answer).await;
+            record_delivered_turn(
+                runner,
+                message,
+                claim,
+                steers.user_text(&message.text),
+                DeliveredAnswer::accepted_by_transport(answer),
+            )
+            .await;
         }
         completed_outcome
     } else {
@@ -1504,7 +1712,8 @@ async fn record_delivered_turn(
     runner: &SessionRunner,
     message: &InboundMessage,
     claim: Attestation,
-    assistant: String,
+    user: String,
+    assistant: DeliveredAnswer,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
         tracing::debug!(event = "gateway_memory_record_skipped", reason = "wake");
@@ -1528,13 +1737,13 @@ async fn record_delivered_turn(
         let result = client
             .record_delivered_turn(
                 claim,
-                DeliveredTurnRequest {
-                    id: identifiers.next_invocation(),
-                    trace_parent: identifiers.trace_parent(),
+                DeliveredTurnRequest::new(
+                    identifiers.next_invocation(),
+                    identifiers.trace_parent(),
                     delivery,
-                    user: message.text.clone(),
+                    user,
                     assistant,
-                },
+                ),
             )
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;

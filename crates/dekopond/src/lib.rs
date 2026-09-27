@@ -170,7 +170,6 @@ where
         asset_fetchers,
         liveness: config.liveness.clone(),
         thread_ownership,
-        active_sessions: session::ActiveSessions::new(config.sessions.max_concurrent),
         wakes,
     });
 
@@ -480,9 +479,9 @@ fn dispatch(
     stop_words: &[String],
     sessions: &mut JoinSet<()>,
     collector: &mut collection::Collector,
-    mut message: InboundMessage,
+    message: InboundMessage,
 ) {
-    let Some((route_id, route)) = routes.route_index(&message) else {
+    let Some((route_id, _)) = routes.route_index(&message) else {
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
@@ -493,8 +492,8 @@ fn dispatch(
         return;
     };
     // Checked before the addressed filter, since a channel stop word like the bot mention plus stop
-    // would otherwise be dropped as unaddressed before the matcher ever saw it; it only fires for a
-    // session this sender started.
+    // would otherwise be dropped as unaddressed before the matcher saw it; only this sender's
+    // running or pending input may be stopped.
     if transport::is_stop_word(
         identities.get(&message.transport),
         &message.text,
@@ -506,8 +505,9 @@ fn dispatch(
             subject: message.subject.canonical(),
             via: dekopon_agent::CancelVia::StopReply,
         };
-        let pending_cancelled = collector.cancel(&request);
-        let active_outcome = runner.active_sessions.cancel(&request);
+        let stopped = runner.gate.cancel(&request);
+        let pending_cancelled = collector.cancel(&request) || stopped.dropped;
+        let active_outcome = stopped.running;
         if pending_cancelled {
             if matches!(
                 active_outcome,
@@ -567,7 +567,6 @@ fn dispatch(
         );
         return;
     }
-    message.late_photos = runner.active_sessions.late_photos(route, &message);
     match collector.offer(route_id, message) {
         collection::Offered::Pending => {}
         collection::Offered::Immediate(message) => {
@@ -582,8 +581,6 @@ fn dispatch(
                 sessions.spawn(async move {
                     let _permit = permit;
                     let reply = match reason {
-                        "late-instructions" => "Your instruction was not processed. Please send it after the current request completes; the earlier photos are still being collected.",
-                        "different-run" => "This input was not processed because another request's photos are still being collected. Please send it separately after that request completes.",
                         "collection-full" => "Busy collecting other requests. Please try again shortly.",
                         "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
                         "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
@@ -668,7 +665,7 @@ fn spawn_tick(
     // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
         .gate
-        .admit(("wake".to_owned(), tick.id().to_string()))
+        .admit_probe(("wake".to_owned(), tick.id().to_string()))
     else {
         tracing::info!(event = "gateway_wake_tick_skipped", wake.id = %tick.id(), reason = "busy");
         return;
@@ -689,7 +686,7 @@ fn spawn_tick(
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
-    match runner.active_sessions.cancel(request).ignored_reason() {
+    match runner.gate.cancel(request).running.ignored_reason() {
         None => tracing::info!(
             event = "gateway_session_stop_requested",
             transport = %request.transport,

@@ -10,7 +10,6 @@ use std::{
 };
 
 use dekopon_agent::{BudgetLimit, CancelSource, ProgressEvent};
-use dekopon_model::ModelText;
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
     time::Instant,
@@ -20,9 +19,9 @@ use crate::{
     config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
     progress::{
         KeepAlive,
-        adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, record},
+        adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, QueuedEvent, record},
         cancel_label,
-        text::{ProgressDetail, ProgressText, RenderState},
+        text::{LiveNote, ProgressDetail, ProgressText, RenderState},
     },
     session::SessionCancellation,
     transport::{
@@ -38,7 +37,7 @@ const MAX_EDITS: u32 = 60;
 pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(2);
 const DEADLINE_MISSED: &str = "deadline";
 
-async fn bounded<T>(
+pub(crate) async fn bounded<T>(
     call: impl std::future::Future<Output = Result<T, TransportError>>,
 ) -> Result<T, &'static str> {
     match tokio::time::timeout(CALL_DEADLINE, call).await {
@@ -127,7 +126,7 @@ impl ProgressPolicy {
         let coordination = Arc::new(Coordination::default());
         let counters = Arc::new(ProgressCounters::default());
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
-        let (text_tx, text_rx) = watch::channel(ModelText::default());
+        let (text_tx, text_rx) = watch::channel(StreamedText::default());
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let cancellation = inputs.cancellation.clone();
         let adapter = Arc::new(ProgressAdapter::new(
@@ -259,7 +258,7 @@ struct Surface {
     deadline: Option<Instant>,
     message: Option<MessageRef>,
     streaming: bool,
-    latest_text: Option<ModelText>,
+    latest_text: Option<StreamedText>,
     posted_on_text: bool,
     next_typing: Option<Instant>,
     next_keep_alive: Option<Instant>,
@@ -356,7 +355,22 @@ impl Surface {
         .min()
     }
 
-    async fn on_event(&mut self, event: ProgressEvent) {
+    fn clear_obsolete_note(&mut self) -> bool {
+        if self.state.note.as_ref().is_some_and(|note| {
+            note.generation != self.counters.note_generation.load(Ordering::Acquire)
+        }) {
+            self.state.note = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn on_event(&mut self, queued: QueuedEvent) {
+        let QueuedEvent {
+            event,
+            note_generation,
+        } = queued;
         match event {
             ProgressEvent::Started { max_steps, .. } => {
                 self.state.of = max_steps;
@@ -367,6 +381,7 @@ impl Surface {
                 self.open().await;
             }
             ProgressEvent::ModelTurn { turn, of } => {
+                self.state.note = None;
                 self.state.turn = turn;
                 self.state.of = of;
                 self.render(Line::Status, false).await;
@@ -391,6 +406,22 @@ impl Surface {
                 self.render(Line::Status, false).await;
             }
             ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
+            ProgressEvent::Note { text, eta } => {
+                if note_generation != self.counters.note_generation.load(Ordering::Acquire) {
+                    return;
+                }
+                self.state.note = Some(LiveNote {
+                    text,
+                    eta,
+                    arrived: Instant::now(),
+                    generation: note_generation,
+                });
+                self.render(Line::Status, true).await;
+            }
+            ProgressEvent::Steered { .. } => {
+                self.state.note = None;
+                self.render(Line::Status, false).await;
+            }
             ProgressEvent::TextDelta { .. }
             | ProgressEvent::KeepAlive { .. }
             | ProgressEvent::Cancelled { .. }
@@ -443,15 +474,19 @@ impl Surface {
         }
     }
 
-    async fn on_text(&mut self, text: ModelText) {
-        let empty = text.as_str().is_empty();
+    async fn on_text(&mut self, text: StreamedText) {
+        if text.text.as_str().is_empty() {
+            self.latest_text = None;
+            self.stream_pending = false;
+            return;
+        }
         self.latest_text = Some(text);
         if self.streams() {
             self.stream_pending = true;
             self.flush_stream().await;
             return;
         }
-        if !self.posted_on_text && !empty {
+        if !self.posted_on_text {
             self.posted_on_text = true;
             if self.message.is_none() {
                 self.render(Line::Status, true).await;
@@ -491,6 +526,14 @@ impl Surface {
                 elapsed,
                 count: self.keep_alives,
             });
+            if self.state.note.as_ref().is_some_and(|note| {
+                now.saturating_duration_since(note.arrived)
+                    > note
+                        .eta
+                        .map_or(Duration::from_secs(120), |eta| eta.saturating_mul(2))
+            }) {
+                self.state.note = None;
+            }
             self.render(Line::KeepAlive, true).await;
         }
         // Cleared before attempting the render, not after, so a declined render does not leave a
@@ -558,6 +601,7 @@ impl Surface {
     }
 
     async fn render(&mut self, line: Line, allow_post: bool) {
+        self.clear_obsolete_note();
         if !self.writes_progress() || !self.coordination.running() {
             return;
         }
@@ -635,6 +679,13 @@ impl Surface {
 
     fn line(&self, line: Line) -> ProgressText {
         let templates = &self.liveness.templates;
+        if let Some(note) = &self.state.note {
+            return if note.eta.is_some() {
+                templates.note_eta(self.detail, &self.state)
+            } else {
+                templates.note(self.detail, &self.state)
+            };
+        }
         match line {
             Line::KeepAlive => templates.keep_alive(self.detail, &self.state),
             Line::Status if self.state.word.is_some() => templates.tool(self.detail, &self.state),
@@ -663,12 +714,13 @@ impl Surface {
             return;
         };
         let limits = stream.limits();
-        let truncated = latest.as_str().chars().count() > limits.max_chars;
+        let truncated = latest.text.as_str().chars().count() > limits.max_chars;
         let text = StreamedText {
+            generation: latest.generation,
             text: if truncated {
-                latest.truncated(limits.max_chars)
+                latest.text.truncated(limits.max_chars)
             } else {
-                latest
+                latest.text
             },
             truncated,
         };
@@ -701,15 +753,19 @@ impl Surface {
         }
     }
 
-    async fn terminal(&mut self, terminal: Terminal) -> bool {
+    async fn terminal(&mut self, terminal: Terminal, text: StreamedText) -> bool {
+        self.state.note = None;
+        let generation = text.generation;
+        self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
+        self.stream_pending = false;
         self.coordination.seal();
         self.record_terminal(&terminal);
         let streamed = self.streamed_text();
         match terminal {
-            Terminal::Answered(reply) => self.finalize(reply).await,
+            Terminal::Answered(reply) => self.finalize(reply, generation).await,
             Terminal::Failed(line) => match streamed {
                 Some(partial) => {
-                    self.finalize(OutboundReply::text(ended(&partial, &line)))
+                    self.finalize(OutboundReply::text(ended(&partial, &line)), generation)
                         .await
                 }
                 None => {
@@ -723,12 +779,13 @@ impl Surface {
                     Some(partial) => ended(&partial, &stopped),
                     None => stopped,
                 };
-                self.finalize(OutboundReply::text(reply)).await
+                self.finalize(OutboundReply::text(reply), generation).await
             }
             Terminal::Silent => {
-                match streamed {
+                match streamed.filter(|partial| !partial.is_empty()) {
                     Some(partial) => {
-                        self.finalize(OutboundReply::text(partial)).await;
+                        self.finalize(OutboundReply::text(partial), generation)
+                            .await;
                     }
                     None => self.discard().await,
                 }
@@ -741,18 +798,20 @@ impl Surface {
         self.streaming.then(|| {
             self.latest_text
                 .as_ref()
-                .map(ModelText::as_str)
+                .map(|text| text.text.as_str())
                 .unwrap_or_default()
                 .to_owned()
         })
     }
 
-    async fn finalize(&mut self, reply: OutboundReply) -> bool {
+    async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> bool {
         if let Some(message) = self.message.clone() {
             let driver = Arc::clone(&self.driver);
             let finalized = if self.streaming {
                 match driver.stream() {
-                    Some(stream) => Some(bounded(stream.finalize(&message, &reply)).await),
+                    Some(stream) => {
+                        Some(bounded(stream.finalize(&message, &reply, generation)).await)
+                    }
                     None => None,
                 }
             } else {
@@ -796,10 +855,14 @@ impl Surface {
         let Some(message) = self.message.take() else {
             return;
         };
+        let driver = Arc::clone(&self.driver);
         if self.streaming {
+            if let Some(stream) = driver.stream() {
+                let outcome = bounded(stream.discard(&message)).await;
+                self.observe(outcome, "stream-discard");
+            }
             return;
         }
-        let driver = Arc::clone(&self.driver);
         let Some(progress) = driver.progress() else {
             return;
         };
@@ -837,6 +900,7 @@ impl Surface {
                 keep_alives = self.keep_alives,
                 stream.deltas = self.counters.deltas.load(Ordering::Relaxed),
                 progress.dropped = self.counters.dropped.load(Ordering::Relaxed),
+                progress.notes_dropped = self.counters.notes_dropped.load(Ordering::Relaxed),
             },
             "gateway progress"
         );
@@ -897,8 +961,8 @@ fn ended(partial: &str, ending: &str) -> String {
 /// call, since a dropped HTTP future cannot retract bytes already sent.
 async fn run(
     mut surface: Surface,
-    mut events: mpsc::Receiver<ProgressEvent>,
-    mut text: watch::Receiver<ModelText>,
+    mut events: mpsc::Receiver<QueuedEvent>,
+    mut text: watch::Receiver<StreamedText>,
     mut terminal: oneshot::Receiver<TerminalRequest>,
     cancellation: SessionCancellation,
 ) {
@@ -917,7 +981,8 @@ async fn run(
             biased;
             request = &mut terminal => {
                 let Ok(request) = request else { break };
-                let delivered = surface.terminal(request.terminal).await;
+                let latest = text.borrow_and_update().clone();
+                let delivered = surface.terminal(request.terminal, latest).await;
                 if request.done.send(delivered).is_err() {
                     tracing::debug!(event = "gateway_progress_terminal_unobserved");
                 }
@@ -925,7 +990,8 @@ async fn run(
             }
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
-                surface.terminal(Terminal::Cancelled { by }).await;
+                let latest = text.borrow_and_update().clone();
+                surface.terminal(Terminal::Cancelled { by }, latest).await;
                 break;
             }
             () = coordination.finished() => break,
@@ -941,6 +1007,9 @@ async fn run(
                 Err(_) => text_open = false,
             },
             () = timer => surface.on_timer().await,
+        }
+        if surface.clear_obsolete_note() {
+            surface.render(Line::Status, false).await;
         }
     }
     surface.cleanup().await;

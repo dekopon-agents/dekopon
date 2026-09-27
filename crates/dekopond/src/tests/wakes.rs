@@ -449,9 +449,16 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wake_that_finds_its_conversation_busy_delivers_its_note() {
+async fn a_wake_queues_until_the_running_conversation_finishes() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
+            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
+        ],
+    )
+    .await;
     let store = wake_store(directory.path());
     let now = SystemTime::now();
     once(&store, "stop", now);
@@ -462,12 +469,16 @@ async fn a_wake_that_finds_its_conversation_busy_delivers_its_note() {
         .pop()
         .expect("due")
         .into_inbound();
-    let runner = runner_with_wakes(broker, ModelScript::forbidden(), &store);
-    let _live = runner
-        .gate
-        .admit((inbound.transport.clone(), inbound.conversation.key()))
-        .expect("a live session holds the conversation");
+    let models = BlockedModel::new("finished");
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 4);
     let driver = Arc::new(RecordingDriver::default());
+    let held = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        wake_route(),
+        slack_message("first"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    models.wait_until_entered().await;
 
     run_session(
         Arc::clone(&runner),
@@ -477,9 +488,12 @@ async fn a_wake_that_finds_its_conversation_busy_delivers_its_note() {
     )
     .await;
 
-    assert_eq!(
-        driver.replies(),
-        ["stop"],
-        "the person reads their note, not the model's prompt"
+    assert!(
+        driver.replies().is_empty(),
+        "queueing sends no note-only reply"
     );
+    models.release();
+    held.await.expect("holder and follow-up finish");
+    assert_eq!(driver.replies(), ["finished", "finished"]);
+    assert_eq!(triggers(&mut observed), [Trigger::Message, Trigger::Wake]);
 }

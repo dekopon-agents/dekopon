@@ -40,7 +40,8 @@ use dekopon_model::{
 };
 use dekopon_test_support::{
     FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver, RecordingProgress,
-    RecordingReaction, RecordingStatus, RecordingStream, RecordingTyping, StreamCall,
+    RecordingReaction, RecordingStatus, RecordingSteerAck, RecordingStream, RecordingTyping,
+    StreamCall,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -67,7 +68,7 @@ use crate::{
         AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, InboundMessage,
         InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
         MessageId, MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage,
-        ReplyTarget, Status, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        ReplyTarget, Status, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
         ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
         TypingLease, bound_inbound, bound_outbound, credential_value,
     },
@@ -188,6 +189,80 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
         resolved.routes[0].memory,
         MemoryPolicy::Persistent(_)
     ));
+}
+
+#[tokio::test]
+async fn steering_defaults_to_abort_and_boundary_survives_route_binding() {
+    let directory = temporary();
+    for (value, expected) in [
+        (None, crate::config::Steering::Abort),
+        (Some("boundary"), crate::config::Steering::Boundary),
+    ] {
+        let mut document = document(directory.path());
+        if let Some(value) = value {
+            document["routes"][0]["steering"] = json!(value);
+        }
+        let resolved = load(directory.path(), &document)
+            .await
+            .expect("steering configuration");
+        assert_eq!(resolved.routes[0].steering, expected);
+        let routes =
+            RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).expect("routes");
+        assert_eq!(
+            routes.route(&message("hello")).expect("route").steering,
+            expected
+        );
+    }
+    for value in ["Abort", "queue"] {
+        let mut document = document(directory.path());
+        document["routes"][0]["steering"] = json!(value);
+        assert!(matches!(
+            load(directory.path(), &document).await,
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn progress_notes_default_off_and_bind_only_when_enabled() {
+    let directory = temporary();
+    for enabled in [false, true] {
+        let mut document = document(directory.path());
+        if enabled {
+            document["routes"][0]["progressNotes"] = json!(true);
+        }
+        let resolved = load(directory.path(), &document).await.unwrap();
+        assert_eq!(resolved.routes[0].progress_notes, enabled);
+        let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).unwrap();
+        assert_eq!(
+            routes.route(&message("hello")).unwrap().progress_notes,
+            enabled
+        );
+    }
+    let mut document = document(directory.path());
+    document["routes"][0]["progressNotes"] = json!("yes");
+    assert!(matches!(
+        load(directory.path(), &document).await,
+        Err(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
+async fn progress_notes_without_detail_reports_every_conflicting_route() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["progressNotes"] = json!(true);
+    document["routes"][0]["progressDetail"] = json!("off");
+    let route = document["routes"][0].clone();
+    document["routes"].as_array_mut().unwrap().push(route);
+    let Err(ConfigError::Invalid { problems, .. }) = load(directory.path(), &document).await else {
+        panic!("both note/detail conflicts must be refused");
+    };
+    for index in 0..2 {
+        assert!(problems.iter().any(|problem| matches!(
+            problem, crate::config::ConfigProblem::ProgressNotesWithoutDetail { route } if *route == index
+        )));
+    }
 }
 
 #[tokio::test]
@@ -2483,6 +2558,11 @@ impl ChatDriver for RecordingDriver {
             .map(|object| object as &dyn InboundReaction)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        self.steer_ack_object()
+            .map(|object| object as &dyn SteerAck)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         self.cancel_button_object()
             .map(|object| object as &dyn CancelButton)
@@ -2505,7 +2585,6 @@ impl TypingLease for RecordingTyping {
 #[async_trait]
 impl NativeStatus for RecordingStatus {
     async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
-        let failure = self.charge();
         self.record(
             rendered_target(target),
             match status {
@@ -2513,6 +2592,7 @@ impl NativeStatus for RecordingStatus {
                 Status::Idle => "idle",
             },
         );
+        let failure = self.charge();
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
@@ -2621,6 +2701,7 @@ impl TextStream for RecordingStream {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         let failure = self.charge();
         self.record(StreamCall::Finalize {
@@ -2637,6 +2718,14 @@ impl InboundReaction for RecordingReaction {
         let failure = self.charge();
         self.record(rendered_target(target), present);
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl SteerAck for RecordingSteerAck {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        self.record(rendered_target(target));
+        Ok(())
     }
 }
 
@@ -2892,6 +2981,8 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         max_duration: None,
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
+        steering: crate::config::Steering::Abort,
+        progress_notes: false,
         memory: MemoryPolicy::OneShot,
         wakes: false,
         cache_key: cache_key::for_route(),
@@ -2967,7 +3058,6 @@ fn message(text: &str) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
-        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3050,7 +3140,6 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
-        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3124,9 +3213,149 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::new(max_concurrent),
         wakes: None,
     })
+}
+
+struct InterruptibleModel {
+    turns: Mutex<VecDeque<AssistantTurn>>,
+    prompts: Mutex<Vec<Vec<ModelMessage>>>,
+    tools: Mutex<Vec<Vec<String>>>,
+    entered: tokio::sync::Notify,
+    release: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_signal: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    interrupted: AtomicUsize,
+}
+
+impl InterruptibleModel {
+    fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Arc<Self> {
+        let (release, release_signal) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            turns: Mutex::new(turns.into_iter().collect()),
+            prompts: Mutex::new(Vec::new()),
+            tools: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: Mutex::new(Some(release)),
+            release_signal: Mutex::new(Some(release_signal)),
+            interrupted: AtomicUsize::new(0),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
+            .await
+            .expect("model entered");
+    }
+
+    fn release(&self) {
+        self.release
+            .lock()
+            .expect("release")
+            .take()
+            .expect("one release")
+            .send(())
+            .expect("model still waiting");
+    }
+
+    fn prompt(&self, index: usize) -> Vec<(String, String)> {
+        self.prompts.lock().expect("prompts")[index]
+            .iter()
+            .map(|message| {
+                let value = serde_json::to_value(message).expect("message");
+                (
+                    value["role"].as_str().unwrap_or_default().to_owned(),
+                    value["content"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> usize {
+        self.prompts.lock().expect("prompts").len()
+    }
+
+    fn tool_names(&self, index: usize) -> Vec<String> {
+        self.tools.lock().expect("tools")[index].clone()
+    }
+}
+
+impl ModelFactory for Arc<InterruptibleModel> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(InterruptibleHandle {
+            model: Arc::clone(self),
+            runtime,
+            cancel,
+        }))
+    }
+}
+
+struct InterruptibleHandle {
+    model: Arc<InterruptibleModel>,
+    runtime: tokio::runtime::Handle,
+    cancel: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ChatModel for InterruptibleHandle {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        _options: &CompletionOptions,
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        self.model
+            .prompts
+            .lock()
+            .expect("prompts")
+            .push(messages.to_vec());
+        self.model
+            .tools
+            .lock()
+            .expect("tools")
+            .push(tools.iter().map(|tool| tool.name.clone()).collect());
+        let release = self
+            .model
+            .release_signal
+            .lock()
+            .expect("release receiver")
+            .take();
+        if let Some(release) = release {
+            let mut cancel = self.cancel.clone();
+            self.model.entered.notify_one();
+            let interrupted = self.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        stopped = cancel.wait_for(|stopped| *stopped) => {
+                            assert!(stopped.is_ok(), "model cancellation stays open");
+                            true
+                        }
+                        released = release => {
+                            released.expect("test releases the model");
+                            false
+                        }
+                    }
+                })
+                .await
+                .expect("model released or cancelled")
+            });
+            if interrupted {
+                self.model.interrupted.fetch_add(1, Ordering::SeqCst);
+                return Err(InferenceError::Cancelled);
+            }
+        }
+        Ok(self
+            .model
+            .turns
+            .lock()
+            .expect("turns")
+            .pop_front()
+            .expect("scripted turn"))
+    }
 }
 
 struct BlockedModel {
@@ -3822,8 +4051,8 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
         panic!("expected hidden record operation: {record:?}");
     };
-    assert_eq!(turn.user, "the exact sender text");
-    assert_eq!(turn.assistant, "The exact accepted answer.");
+    assert_eq!(turn.user(), "the exact sender text");
+    assert_eq!(turn.assistant().as_str(), "The exact accepted answer.");
     assert_eq!(
         turn.delivery,
         dekopon_broker_protocol::DeliveryIdentity::Local {
@@ -4204,23 +4433,26 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
 
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel("tel.999", CancelVia::Button)),
+            .gate
+            .cancel(&cancel("tel.999", CancelVia::Button))
+            .running,
         CancelOutcome::OtherSubject,
         "another chat user cannot stop the initiator's work"
     );
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::NativeStop)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
         CancelOutcome::Cancelled
     );
     // A second cancel attempt while the first is still draining must be a no-op, or the policy
     // would write the stopped reply twice.
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+            .running,
         CancelOutcome::AlreadyCancelled
     );
     model.release();
@@ -4708,7 +4940,7 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     let runner = runner(broker, Arc::clone(&models), 1);
     let _held = runner
         .gate
-        .admit(("other".to_owned(), "other".to_owned()))
+        .admit_probe(("other".to_owned(), "other".to_owned()))
         .expect("the first session is admitted");
     let driver = Arc::new(RecordingDriver::default());
 
@@ -4730,17 +4962,17 @@ async fn one_conversation_runs_one_session_at_a_time() {
     let key = ("slack".to_owned(), "c0123abc:1.0".to_owned());
 
     let first = gate
-        .admit(key.clone())
+        .admit_probe(key.clone())
         .expect("the first message is admitted");
-    assert!(gate.admit(key.clone()).is_none());
+    assert!(gate.admit_probe(key.clone()).is_none());
     assert!(
-        gate.admit(("slack".to_owned(), "c0123abc:2.0".to_owned()))
+        gate.admit_probe(("slack".to_owned(), "c0123abc:2.0".to_owned()))
             .is_some()
     );
 
     drop(first);
     assert!(
-        gate.admit(key).is_some(),
+        gate.admit_probe(key).is_some(),
         "a finished session releases its conversation"
     );
 }
@@ -4748,14 +4980,16 @@ async fn one_conversation_runs_one_session_at_a_time() {
 #[tokio::test]
 async fn concurrency_is_bounded_across_every_conversation() {
     let gate = SessionGate::new(2);
-    let first = gate.admit(("a".to_owned(), "a".to_owned())).expect("first");
+    let first = gate
+        .admit_probe(("a".to_owned(), "a".to_owned()))
+        .expect("first");
     let second = gate
-        .admit(("b".to_owned(), "b".to_owned()))
+        .admit_probe(("b".to_owned(), "b".to_owned()))
         .expect("second");
-    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_none());
+    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_none());
 
     drop(first);
-    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_some());
+    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_some());
     drop(second);
 }
 
@@ -4766,7 +5000,7 @@ async fn refusal_replies_waiting_on_a_chat_service_are_bounded_apart_from_sessio
     let _second = gate.refusal().expect("second refusal reply");
     assert!(gate.refusal().is_none(), "one past the ceiling is skipped");
     assert!(
-        gate.admit(("a".to_owned(), "a".to_owned())).is_some(),
+        gate.admit_probe(("a".to_owned(), "a".to_owned())).is_some(),
         "pending refusals leave session admission alone"
     );
 
@@ -4825,6 +5059,54 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
 
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_failure_template_is_bounded_before_delivery() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([]);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut runner = runner(broker, models, 4);
+    let (templates, problems) = crate::progress::Templates::resolve(
+        &crate::config::TemplateOverrides {
+            failed: Some("x".repeat(MAX_OUTBOUND_TEXT_BYTES * 2)),
+            ..Default::default()
+        },
+        crate::session::STOPPED_REPLY,
+        FAILURE_REPLY,
+    );
+    assert!(problems.is_empty());
+    Arc::get_mut(&mut runner)
+        .expect("unshared runner")
+        .liveness
+        .insert(
+            "dev".to_owned(),
+            Arc::new(ResolvedLiveness {
+                templates,
+                ..ResolvedLiveness::default()
+            }),
+        );
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("fail"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let replies = driver.replies();
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].len() <= MAX_OUTBOUND_TEXT_BYTES);
+    assert!(replies[0].contains("[...truncated by the gateway...]"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5265,12 +5547,14 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
         models.prompt(1),
         transcript(&[
             ("system", &expected_asset_instructions()),
+            ("user", "[gateway:[…]"),
+            ("assistant", "ok"),
             (
                 "user",
                 &format!("[gateway: authenticated participant: {SUBJECT}]\nfollow up"),
             ),
         ]),
-        "an attributed turn too large for the window is not replayed without its label"
+        "the attribution counts against the retained user prefix's byte budget"
     );
 }
 
@@ -11252,7 +11536,7 @@ fn capture_spans() -> (
 }
 
 #[test]
-fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
+fn spool_spans_never_record_payload_or_paths() {
     use dekopon_model::asset::DiskBlob;
     let (capture, _guard) = capture_spans();
     let session = tracing::info_span!("gateway.session");
@@ -11276,14 +11560,54 @@ fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
         !text.contains("secret pixel sentinel") && !text.contains("dekopon-assets-"),
         "{text}"
     );
-    assert!(
-        capture
-            .span_parents()
-            .iter()
-            .filter(|(name, _)| *name == "asset.spool")
-            .all(|(_, parent)| parent.as_deref() == Some("gateway.session")),
-        "{text}"
-    );
+}
+
+#[test]
+fn retained_asset_does_not_hold_its_session_span_open() {
+    use dekopon_model::asset::DiskBlob;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("asset-retention-test")))
+        .set_default();
+
+    let message = tracing::info_span!("gateway.message");
+    let session = tracing::info_span!(parent: &message, "gateway.session");
+    let retained = session.in_scope(|| DiskBlob::from_bytes(b"retained pixels").expect("spool"));
+    drop(session);
+    drop(message);
+    provider.force_flush().unwrap();
+
+    {
+        let spans = exported.0.lock().unwrap();
+        for name in ["gateway.message", "gateway.session"] {
+            assert!(
+                spans.iter().any(|span| span.name == name),
+                "{name} waited on the retained asset"
+            );
+        }
+    }
+    drop(retained);
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
@@ -11800,6 +12124,85 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     assert_trace_opens_at_receipt(&capture, "local", &message_id);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opted_in_script_note_uses_the_local_progress_frame() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let directory = temporary();
+    let (broker, reached, release) = parked_broker(
+        directory.path(),
+        vec![probe_listing(), upper_proposal("hi")],
+        ResponseEnvelope::invocation(
+            record_result(InvocationOutcome::Succeeded, None),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("progress \"rendering the image\" --eta 40; probe upper --text hi"),
+        answer("done"),
+    ]);
+    let mut runner = runner(broker, models, 4);
+    let settings = LivenessSettings {
+        mode: LivenessMode::Native,
+        progress: ProgressSurface::Message,
+        ..LivenessSettings::default()
+    };
+    Arc::get_mut(&mut runner).unwrap().liveness.insert(
+        "dev".to_owned(),
+        Arc::new(ResolvedLiveness {
+            settings,
+            ..ResolvedLiveness::default()
+        }),
+    );
+    let mut route = route(model_config());
+    route.progress_notes = true;
+    let socket_path = directory.path().join("notes.sock");
+    let mut transport = crate::transport::local::LocalTransport::new(
+        "dev".to_owned(),
+        socket_path.clone(),
+        settings,
+    );
+    transport.connect().await.unwrap();
+    let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"subject": SUBJECT, "text": "render an image"})
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let inbound = next_message(&mut transport).await;
+    let session = tokio::spawn(run_session(runner, route, inbound, transport.driver()));
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(client).lines();
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = lines.next_line().await.unwrap().expect("a local frame");
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            assert!(frame.get("note").is_none());
+            if frame["progress"]["text"] == "rendering the image (~40 s)…" {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(frame["progress"]["id"].is_string());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 async fn parked_broker(
     directory: &Path,
     answer_first: Vec<ResponseEnvelope>,
@@ -11939,7 +12342,7 @@ impl CancelOrigin {
         session: &tokio::task::JoinHandle<()>,
     ) -> Option<CancelOutcome> {
         match self {
-            Self::User(via) => Some(runner.active_sessions.cancel(&cancel(SUBJECT, via))),
+            Self::User(via) => Some(runner.gate.cancel(&cancel(SUBJECT, via)).running),
             Self::Operator => {
                 session.abort();
                 None
@@ -12101,7 +12504,7 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
             .expect("the session parks on its capability listing");
 
         assert_eq!(
-            runner.active_sessions.cancel(&cancel(SUBJECT, via)),
+            runner.gate.cancel(&cancel(SUBJECT, via)).running,
             CancelOutcome::Cancelled,
             "{via:?} found no session to stop"
         );
@@ -12417,8 +12820,9 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
         .expect("a bystander's press is still acknowledged");
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel("tel.16035550100", CancelVia::Button)),
+            .gate
+            .cancel(&cancel("tel.16035550100", CancelVia::Button))
+            .running,
         CancelOutcome::OtherSubject,
         "a bystander cannot stop this session"
     );
@@ -12471,8 +12875,9 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
 
     assert_eq!(
         runner
-            .active_sessions
-            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+            .running,
         CancelOutcome::Cancelled,
         "a session with no liveness surface is registered like any other"
     );
@@ -13051,43 +13456,6 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn photo_burst_busy_at_collection_deadline_is_disposed_even_when_busy_replies_disabled() {
-    let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
-    let models = ModelScript::forbidden();
-    let mut runner = runner(broker, Arc::clone(&models), 1);
-    Arc::get_mut(&mut runner).unwrap().reply_on_busy = false;
-    let photo = burst_photo("");
-    let active = runner
-        .gate
-        .admit((photo.transport.clone(), photo.conversation.key()))
-        .expect("active run");
-    let mut collector = burst_collector(None);
-    assert!(matches!(
-        collector.offer(0, photo),
-        crate::collection::Offered::Pending
-    ));
-    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
-    let driver = Arc::new(RecordingDriver::default());
-    run_session(
-        Arc::clone(&runner),
-        route(model_config()),
-        ready,
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
-    )
-    .await;
-    assert_eq!(driver.replies(), [BUSY_REPLY]);
-    drop(active);
-    assert!(
-        collector
-            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
-            .is_empty()
-    );
-    assert_eq!(models.requests(), 0);
-    assert!(observed.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refused_assets() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -13277,8 +13645,9 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
         if already_cancelled {
             assert_eq!(
                 runner
-                    .active_sessions
-                    .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+                    .gate
+                    .cancel(&cancel(SUBJECT, CancelVia::StopReply))
+                    .running,
                 CancelOutcome::Cancelled
             );
         } else {
@@ -13846,8 +14215,10 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
-#[path = "tests/late_photos.rs"]
-mod late_photos;
+#[path = "tests/steering.rs"]
+mod steering;
+#[path = "tests/steering_e2e.rs"]
+mod steering_e2e;
 #[path = "tests/wakes.rs"]
 mod wakes;
 
@@ -13873,7 +14244,6 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: crate::session::ActiveSessions::new(4),
         wakes: None,
     })
 }

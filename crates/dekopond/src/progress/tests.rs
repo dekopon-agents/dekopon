@@ -18,7 +18,7 @@ use crate::{
     },
     progress::{
         KeepAlive, ProgressDetail, ProgressInputs, ProgressPolicy, Templates, Terminal,
-        adapter::ProgressAdapter,
+        adapter::{EVENT_QUEUE, ProgressAdapter, QueuedEvent},
         cancel_label,
         policy::CALL_DEADLINE,
         text::{RenderState, TemplateField},
@@ -262,6 +262,7 @@ impl TextStream for Surfaces {
         &self,
         _message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         if self.recorder.counted(&self.recorder.refuse_finalize) {
             return Err(TransportError::Response);
@@ -448,6 +449,330 @@ fn recorded_delta() -> ModelText {
     )
     .expect("the recorded transcript parses");
     dekopon_test_support::scripted_text(&events)
+}
+
+async fn note_event(text: &str, eta: Option<Duration>) -> ProgressEvent {
+    producer_events(text, eta, None).await.pop().unwrap()
+}
+
+async fn producer_events(
+    text: &str,
+    eta: Option<Duration>,
+    command: Option<&str>,
+) -> Vec<ProgressEvent> {
+    use dekopon_agent::BrokerLeg;
+    use dekopon_broker_protocol::{
+        BrokerClient, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    };
+    use dekopon_shell::CapabilityInvoker;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Default)]
+    struct Notes(Mutex<Vec<ProgressEvent>>);
+    impl ProgressSink for Notes {
+        fn emit(&self, event: ProgressEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let client = BrokerClient::new(&socket, crate::current_uid(), FrameLimits::default()).unwrap();
+    let server = async {
+        let mut responses = vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            command.into_iter().map(str::to_owned).collect(),
+        )];
+        if command.is_some() {
+            responses.push(ResponseEnvelope::error("denied", "fixture refusal"));
+        }
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+                .await
+                .unwrap();
+            write_frame(&mut stream, &response, FrameLimits::default())
+                .await
+                .unwrap();
+        }
+    };
+    let notes = Arc::new(Notes::default());
+    let sink = Arc::clone(&notes) as Arc<dyn ProgressSink>;
+    let producer = async {
+        let leg = BrokerLeg::connect(client, None)
+            .await
+            .unwrap()
+            .with_progress(sink, 1)
+            .with_progress_notes();
+        leg.note(text, eta);
+        if let Some(word) = command {
+            let word = word.to_owned();
+            tokio::task::spawn_blocking(move || {
+                assert!(leg.run_command(&word, &[], None).is_some());
+            })
+            .await
+            .unwrap();
+        }
+    };
+    tokio::join!(producer, server);
+    std::mem::take(&mut *notes.0.lock().unwrap())
+}
+
+#[tokio::test]
+async fn a_note_masks_tool_events_until_the_next_model_turn() {
+    let events = producer_events(
+        "rendering the image",
+        Some(Duration::from_secs(40)),
+        Some("probe"),
+    )
+    .await;
+    assert!(matches!(
+        &events[..],
+        [
+            ProgressEvent::Note { .. },
+            ProgressEvent::ToolStarted { .. },
+            ProgressEvent::ToolFinished { .. }
+        ]
+    ));
+    tokio::time::pause();
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    settle().await;
+    for event in events {
+        harness.sink.emit(event);
+        settle().await;
+        advance(Duration::from_secs(3)).await;
+    }
+    assert_eq!(
+        harness.recorder.texts(),
+        vec!["rendering the image (~40 s)…"; 3]
+    );
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 2, of: 8 });
+    settle().await;
+    assert_eq!(harness.recorder.texts().last().unwrap(), "Working on it…");
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn a_later_note_replaces_the_line_and_steering_clears_it() {
+    let first = note_event("first", None).await;
+    let second = note_event("second", None).await;
+    tokio::time::pause();
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    harness.sink.emit(first);
+    settle().await;
+    harness.sink.emit(second);
+    settle().await;
+    assert_eq!(harness.recorder.texts(), ["first…"]);
+    advance(Duration::from_secs(4)).await;
+    assert_eq!(harness.recorder.texts(), ["first…", "second…"]);
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    settle().await;
+    advance(Duration::from_secs(4)).await;
+    assert_eq!(harness.recorder.texts().last().unwrap(), "Working on it…");
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+#[tokio::test]
+async fn notes_expire_only_at_a_keep_alive_tick_without_counting_down() {
+    let eta_note = note_event("rendering the image", Some(Duration::from_secs(10))).await;
+    let plain_note = note_event("rendering the image", None).await;
+    tokio::time::pause();
+    for (note, ticks, live) in [
+        (eta_note, vec![15, 45], "rendering the image (~10 s)…"),
+        (plain_note, vec![15, 45, 105, 165], "rendering the image…"),
+    ] {
+        let mut harness = start(Offers::default(), ProgressDetail::Plain, ticking());
+        harness.sink.emit(started());
+        harness.sink.emit(note);
+        settle().await;
+        let mut previous = 0;
+        for &tick in &ticks {
+            advance(Duration::from_secs(tick - previous)).await;
+            previous = tick;
+            let expected = if Some(&tick) == ticks.last() {
+                format!("Still working ({tick} s)…")
+            } else {
+                live.to_owned()
+            };
+            assert_eq!(harness.recorder.texts().last().unwrap(), &expected);
+        }
+        harness.policy.terminal(Terminal::Silent).await;
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_invalidation_clears_the_live_note_and_rejects_queued_old_notes() {
+    let live = note_event("live old note", None).await;
+    let queued = note_event("queued old note", None).await;
+    let fresh = note_event("new generation", None).await;
+    tokio::time::pause();
+    for invalidation in [
+        ProgressEvent::ModelTurn { turn: 2, of: 8 },
+        ProgressEvent::Steered { turn: 1 },
+    ] {
+        let (capture, _guard) = capture();
+        let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+        harness.sink.emit(started());
+        harness.sink.emit(live.clone());
+        settle().await;
+        assert_eq!(harness.recorder.texts(), ["live old note…"]);
+        harness.sink.emit(queued.clone());
+        for _ in 1..EVENT_QUEUE {
+            harness.sink.emit(ProgressEvent::KeepAlive {
+                elapsed: Duration::ZERO,
+                count: 1,
+            });
+        }
+        harness.sink.emit(invalidation);
+        let drops = events_named(&capture, "gateway_progress_dropped");
+        assert_eq!(drops.len(), 1);
+        assert!(drops[0].contains("reason=\"full\""));
+        settle().await;
+        advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            harness.recorder.texts(),
+            ["live old note…", "Working on it…"]
+        );
+        harness.sink.emit(fresh.clone());
+        settle().await;
+        advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            harness.recorder.texts(),
+            ["live old note…", "Working on it…", "new generation…"]
+        );
+        harness.policy.terminal(Terminal::Silent).await;
+    }
+}
+
+#[tokio::test]
+async fn every_terminal_outcome_removes_or_replaces_the_note_surface() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    for (terminal, ending) in [
+        (
+            Terminal::Answered(OutboundReply::text("done")),
+            vec![Call::Finalize("done".to_owned())],
+        ),
+        (
+            Terminal::Failed(FAILURE_REPLY.to_owned()),
+            vec![Call::Delete, Call::Reply(FAILURE_REPLY.to_owned())],
+        ),
+        (
+            Terminal::Cancelled {
+                by: CancelSource::Budget {
+                    limit: BudgetLimit::WallClock,
+                },
+            },
+            vec![Call::Finalize(STOPPED_REPLY.to_owned())],
+        ),
+        (Terminal::Silent, vec![Call::Delete]),
+    ] {
+        let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+        harness.sink.emit(started());
+        harness.sink.emit(note.clone());
+        settle().await;
+        harness.policy.terminal(terminal).await;
+        let mut expected = vec![Call::Post("waiting…".to_owned())];
+        expected.extend(ending);
+        assert_eq!(harness.recorder.writes(), expected);
+    }
+}
+
+#[tokio::test]
+async fn note_placeholders_remain_literal_and_detailed_counters_still_append() {
+    let note = note_event("rendering {elapsed_s}", None).await;
+    tokio::time::pause();
+    let mut harness = start(Offers::default(), ProgressDetail::Detailed, liveness(false));
+    harness.sink.emit(started());
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 1, of: 8 });
+    harness.sink.emit(note);
+    settle().await;
+    assert_eq!(
+        harness.recorder.texts(),
+        ["rendering {elapsed_s}… · turn 1 of 8 · 0 of 0 calls · 0 s"]
+    );
+    harness.policy.terminal(Terminal::Silent).await;
+}
+
+fn note_adapter() -> (
+    ProgressAdapter,
+    tokio::sync::mpsc::Receiver<QueuedEvent>,
+    Arc<super::adapter::ProgressCounters>,
+) {
+    let (events, receiver) = tokio::sync::mpsc::channel(super::adapter::EVENT_QUEUE);
+    let (text, _receiver) = tokio::sync::watch::channel(StreamedText::default());
+    let counters = Arc::new(super::adapter::ProgressCounters::default());
+    (
+        ProgressAdapter::new(
+            "local".to_owned(),
+            events,
+            text,
+            Arc::clone(&counters),
+            SessionCancellation::new(),
+        ),
+        receiver,
+        counters,
+    )
+}
+
+#[tokio::test]
+async fn a_note_record_has_each_payload_field_exactly_once() {
+    let note = note_event("rendering the image", Some(Duration::from_secs(40))).await;
+    let (capture, _guard) = capture();
+    let (adapter, mut events, _) = note_adapter();
+    adapter.emit(note);
+    assert!(matches!(
+        events.try_recv().unwrap().event,
+        ProgressEvent::Note { .. }
+    ));
+    let records = events_named(&capture, "gateway.progress");
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    for field in [" kind=", " note=", " note.eta_s="] {
+        assert_eq!(record.matches(field).count(), 1, "{record}");
+    }
+    assert!(record.contains(" kind=\"note\""));
+    assert!(record.contains(" note=\"rendering the image\""));
+    assert!(record.contains(" note.eta_s=40"));
+}
+
+#[tokio::test]
+async fn the_twenty_fifth_note_is_neither_recorded_nor_queued() {
+    let note = note_event("working", None).await;
+    let (capture, _guard) = capture();
+    let (adapter, mut events, counters) = note_adapter();
+    for _ in 0..25 {
+        adapter.emit(note.clone());
+    }
+    let mut queued = 0;
+    while events.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(queued, 24);
+    assert_eq!(events_named(&capture, "gateway.progress").len(), 24);
+    assert_eq!(counters.notes_dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.dropped.load(Ordering::Relaxed), 0);
+
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    for _ in 0..25 {
+        harness.sink.emit(note.clone());
+    }
+    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    let terminals = events_named(&capture, "gateway.progress")
+        .into_iter()
+        .filter(|record| record.contains(" kind=\"terminal_silent\""))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].matches(" progress.notes_dropped=").count(), 1);
+    assert!(terminals[0].contains(" progress.notes_dropped=1"));
 }
 
 fn started() -> ProgressEvent {
@@ -715,15 +1040,16 @@ async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
         harness.recorder.calls()
     );
 
+    let text = recorded_delta();
     harness.sink.emit(ProgressEvent::TextDelta {
         turn: 1,
-        text: ModelText::default(),
-        cumulative_chars: 0,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
     });
     settle().await;
     assert_eq!(
         harness.recorder.texts(),
-        vec![String::new()],
+        vec![text.as_str().to_owned()],
         "the stream is the one surface: {:?}",
         harness.recorder.calls()
     );
@@ -872,6 +1198,80 @@ async fn answer_streaming_is_independent_of_progress_and_detail_off() {
             Some(&Call::StreamFinalize("done".to_owned()))
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn steering_clears_pending_text_and_restarts_the_same_numbered_turn() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    let delta = || ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    };
+    harness.sink.emit(delta());
+    settle().await;
+    harness.sink.emit(delta());
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    settle().await;
+    advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Stream(text.as_str().to_owned())]
+    );
+    harness
+        .sink
+        .emit(ProgressEvent::ModelTurn { turn: 1, of: 1 });
+    harness.sink.emit(delta());
+    settle().await;
+    assert_eq!(
+        harness.recorder.writes(),
+        [
+            Call::Stream(text.as_str().to_owned()),
+            Call::Stream(text.as_str().to_owned())
+        ]
+    );
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_terminal_after_steering_never_sends_an_empty_edit() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    });
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    assert_eq!(
+        harness.recorder.writes(),
+        [Call::Stream(text.as_str().to_owned())]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1325,6 +1725,7 @@ fn detail_levels_differ_only_by_the_counters_they_append() {
         calls_max: 16,
         elapsed: Duration::from_secs(41),
         word: None,
+        note: None,
     };
     state.set_word("gpt-image");
 
@@ -1354,8 +1755,10 @@ fn a_long_command_word_is_shortened_before_it_is_rendered() {
 fn every_unrenderable_template_placeholder_is_reported_together() {
     let overrides = TemplateOverrides {
         working: Some("Busy with {word}".to_owned()),
-        tool: Some("Running {word} for {someone}".to_owned()),
-        keep_alive: None,
+        tool: Some("Running {word} for {someone} {note}".to_owned()),
+        keep_alive: Some("{note} {eta_s}".to_owned()),
+        note: Some("{word} {eta_s}".to_owned()),
+        note_eta: Some("{word}".to_owned()),
         stopped: Some("Stopped after {elapsed_s} s".to_owned()),
         failed: None,
     };
@@ -1369,9 +1772,15 @@ fn every_unrenderable_template_placeholder_is_reported_together() {
         vec![
             (TemplateField::Working, "word".to_owned()),
             (TemplateField::Tool, "someone".to_owned()),
+            (TemplateField::Tool, "note".to_owned()),
+            (TemplateField::KeepAlive, "note".to_owned()),
+            (TemplateField::KeepAlive, "eta_s".to_owned()),
+            (TemplateField::Note, "word".to_owned()),
+            (TemplateField::Note, "eta_s".to_owned()),
+            (TemplateField::NoteEta, "word".to_owned()),
             (TemplateField::Stopped, "elapsed_s".to_owned()),
         ],
-        "three mistakes are three refusals in one pass"
+        "every mistake is reported in one pass"
     );
 }
 

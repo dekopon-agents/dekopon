@@ -1,29 +1,38 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use dekopon_agent::{ProgressEvent, ProgressSink};
 use dekopon_model::ModelText;
 use tokio::sync::{mpsc, watch};
 
-use crate::session::SessionCancellation;
+use crate::{session::SessionCancellation, transport::StreamedText};
 
 pub(crate) const EVENT_QUEUE: usize = 64;
 
 const NO_TURN: u32 = 0;
+const MAX_NOTES_PER_SESSION: u32 = 24;
 
 #[derive(Debug, Default)]
 pub(crate) struct ProgressCounters {
     pub dropped: AtomicU32,
+    pub notes_dropped: AtomicU32,
     pub deltas: AtomicU32,
+    pub note_generation: AtomicU64,
+}
+
+pub(crate) struct QueuedEvent {
+    pub event: ProgressEvent,
+    pub note_generation: u64,
 }
 
 pub(crate) struct ProgressAdapter {
     transport: String,
-    events: mpsc::Sender<ProgressEvent>,
-    text: watch::Sender<ModelText>,
+    events: mpsc::Sender<QueuedEvent>,
+    text: watch::Sender<StreamedText>,
     turn: AtomicU32,
+    notes: AtomicU32,
     counters: Arc<ProgressCounters>,
     cancellation: SessionCancellation,
 }
@@ -31,8 +40,8 @@ pub(crate) struct ProgressAdapter {
 impl ProgressAdapter {
     pub(crate) fn new(
         transport: String,
-        events: mpsc::Sender<ProgressEvent>,
-        text: watch::Sender<ModelText>,
+        events: mpsc::Sender<QueuedEvent>,
+        text: watch::Sender<StreamedText>,
         counters: Arc<ProgressCounters>,
         cancellation: SessionCancellation,
     ) -> Self {
@@ -41,6 +50,7 @@ impl ProgressAdapter {
             events,
             text,
             turn: AtomicU32::new(NO_TURN),
+            notes: AtomicU32::new(0),
             counters,
             cancellation,
         }
@@ -49,16 +59,46 @@ impl ProgressAdapter {
 
 impl ProgressSink for ProgressAdapter {
     fn emit(&self, event: ProgressEvent) {
+        if matches!(event, ProgressEvent::Note { .. })
+            && self
+                .notes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_NOTES_PER_SESSION).then_some(count + 1)
+                })
+                .is_err()
+        {
+            self.counters.notes_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let ProgressEvent::TextDelta { turn, text, .. } = &event {
             self.counters.deltas.fetch_add(1, Ordering::Relaxed);
             let restart = self.turn.swap(*turn, Ordering::Relaxed) != *turn;
             self.text.send_modify(|cumulative| {
                 if restart {
-                    *cumulative = ModelText::default();
+                    cumulative.text = ModelText::default();
+                    cumulative.generation += 1;
                 }
-                cumulative.push(text);
+                cumulative.text.push(text);
             });
             return;
+        }
+        let note_generation = if matches!(
+            event,
+            ProgressEvent::ModelTurn { .. } | ProgressEvent::Steered { .. }
+        ) {
+            self.counters
+                .note_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
+        } else {
+            self.counters.note_generation.load(Ordering::Acquire)
+        };
+        if matches!(event, ProgressEvent::Steered { .. }) {
+            self.text.send_modify(|cumulative| {
+                cumulative.text = ModelText::default();
+                cumulative.generation += 1;
+            });
+            self.turn.store(NO_TURN, Ordering::Relaxed);
         }
         // Claimed synchronously here, on the loop's own thread, so a stop word arriving while the
         // session unwinds loses the race instead of overwriting the finished answer with the
@@ -73,7 +113,10 @@ impl ProgressSink for ProgressAdapter {
             let _ = self.cancellation.claim_completion();
         }
         record(&event);
-        if let Err(error) = self.events.try_send(event) {
+        if let Err(error) = self.events.try_send(QueuedEvent {
+            event,
+            note_generation,
+        }) {
             let dropped = self.counters.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 event = "gateway_progress_dropped",
@@ -88,9 +131,6 @@ impl ProgressSink for ProgressAdapter {
     }
 }
 
-/// Metadata only, by construction: every field here is a counter, duration, or fixed operator word,
-/// with none that a prompt, capability argument, provider result, or model text could be written
-/// into.
 pub(crate) fn record(event: &ProgressEvent) {
     match event {
         ProgressEvent::Started { agent, max_steps } => tracing::info!(
@@ -101,6 +141,16 @@ pub(crate) fn record(event: &ProgressEvent) {
         ProgressEvent::ModelTurn { turn, of } => tracing::info!(
             target: "dekopond::audit",
             { audit.event = "gateway.progress", kind = "model_turn", turn = *turn, of = *of },
+            "gateway progress"
+        ),
+        ProgressEvent::Steered { turn } => tracing::info!(
+            target: "dekopond::audit",
+            { audit.event = "gateway.progress", kind = "steered", turn = *turn },
+            "gateway progress"
+        ),
+        ProgressEvent::Note { text, eta } => tracing::info!(
+            target: "dekopond::audit",
+            { audit.event = "gateway.progress", kind = "note", note = text.as_str(), note.eta_s = eta.map(|eta| eta.as_secs()) },
             "gateway progress"
         ),
         ProgressEvent::TextDelta { .. } => {}

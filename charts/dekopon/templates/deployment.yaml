@@ -77,6 +77,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      serviceAccountName: {{ include "dekopon.serviceAccountName" . | quote }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.priorityClassName }}

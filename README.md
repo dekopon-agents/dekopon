@@ -16,7 +16,7 @@ Ordered by the goals it serves. Credentials stay inside the broker:
 - One capability presents a different credential per acting agent through `credential`/`agents.<id>.credentials`. *Committed direction:* these bindings will be replaced by public DRNs ([migration requirements](docs/design.md#legacy-credential-bindings)).
 - Credential-free self-inspection: an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 
-One complete trace per message:
+Correlated tracing from receipt to execution:
 
 - Correlated OpenTelemetry traces and logs across transport receipt, agent session, model turn, shell command, broker decision, provider invocation, and native HTTP egress. [`examples/otel-traces`](examples/otel-traces/README.md) runs an OpenObserve receiver and a real gateway/broker smoke test.
 - Broker audit as one structured log record per decision and per outcome, inside the same trace.
@@ -41,7 +41,7 @@ The operator surface on top:
 - A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed Meta WhatsApp Cloud API webhook with bounded PNG/JPEG photo inputs, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Both daemons export OTLP to a receiver on a private CA: the standard `OTEL_EXPORTER_OTLP_CERTIFICATE` adds its PEM roots beside WebPKI, and chart 0.11.0 wires it through `otlp.caBundle`. See [upgrading to 0.21.0](docs/upgrading.md#otlp-private-ca-0210).
 - Provider HTTPS can add CA roots independently of exact-authority non-public egress, and the broker supplies per-provider owner settings only during authorized invocation. A URL-free, bounded OpenObserve provider can now be installed separately; it is **not** bundled or granted by this release. See [upgrading to 0.20.0](docs/upgrading.md#provider-https-and-owner-settings-0200).
-- Persistent WhatsApp routes retain freshly authorized late photo references without restarting a busy model/provider or starting a delayed run. A completion notice or separate acknowledgment asks whether another version is wanted; photos download only on demand. Upgrade both daemons together for nullable asset inventory lengths; see [upgrading to 0.19.0](docs/upgrading.md#whatsapp-burst-collection-and-unknown-lengths-0190).
+- Messages and photos from the same sender steer their running turn: routes choose model-only interruption (`abort`, default) or the next step boundary. Other senders and wakes queue follow-ups under their own broker legs; eight pending items fit per conversation. Accepted steers and queued non-wake follow-ups get a best-effort 👀 acknowledgment when a liveness target exists. Photos still download only on demand. See [chat steering](docs/dekopond.md#sessions).
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.
 - Opt-in native liveness after fresh authorization: automatic progress prefers native status or a typing/reaction indicator over redundant progress messages; explicit editable progress and optional answer streaming remain available, driven by one per-session policy task, with Slack Agent Working/Stop sessions and a classic `:tangerine:` reaction fallback. A liveness failure never changes the answer, and a stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a wall-clock bound — is cooperative rather than rollback.
 - Slack Agent channel threads owned per authenticated sender after fresh authorization: that sender continues without repeating the mention, and the optional `decline_chat_reply` decision lets the agent post nothing when a reply would only take the last word. Ambient channel history never reaches routing or inference.
@@ -49,7 +49,7 @@ The operator surface on top:
 
 ## What does not work yet
 
-Automatic memory replay, semantic or vector memory, cross-agent sharing, task memory, deletion and export UX, and encryption at rest do not exist. Durable chat turns carry across broker and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope, and are read on demand with `memory recent` or `memory search`; JSONL deduplication is permanent but finite, so recording stops with `dedup-capacity` while reads continue. SQL reaches providers only as the optional out-of-tree component, and no shipped memory path uses it.
+Semantic or vector memory, cross-agent sharing, task memory, deletion and export UX, and encryption at rest do not exist. Durable chat turns carry across broker and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope, and are read on demand with `memory recent` or `memory search`; JSONL deduplication is permanent but finite, so recording stops with `dedup-capacity` while reads continue. SQL reaches providers only as the optional out-of-tree component, and no shipped memory path uses it.
 
 There is no catalog operator CLI and no general invocation CLI. Secret sources need explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains and IRSA, GCP ADC and WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, and caching or stale fallback do not exist. Catalog provider and status resources are declarations only. The broker's provider manager has exact-reference `sync`, `list`, and `verify` only: no SemVer ranges, private-registry credentials or custom roots, publisher-provenance verification, install/update/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so image staging keeps its separate GitHub attestation checks. Only the broker can execute the provider effects the catalog example represents.
 
@@ -76,12 +76,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.22.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.22.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.22.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.24.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.24.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.24.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.22.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.22.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.24.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.24.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io

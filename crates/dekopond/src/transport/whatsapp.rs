@@ -2,7 +2,6 @@
 //! atomically, and only acknowledges once a whole delivery is enqueued.
 
 mod media;
-pub(crate) use media::MAX_IMAGE_BYTES;
 #[cfg(test)]
 pub(crate) mod tests_media;
 
@@ -37,7 +36,7 @@ use crate::{
     config::{LivenessMode, LivenessSettings},
     transport::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
-        OutboundReply, ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent,
+        OutboundReply, ReplyTarget, SeenIds, SteerAck, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
         record_conversation, split_message,
     },
@@ -671,7 +670,6 @@ fn parse_delivery(
                     received_at: tokio::time::Instant::now(),
                     native_group: None,
                     constituents: Vec::new(),
-                    late_photos: None,
                     asset_overflow: false,
                 });
             }
@@ -811,19 +809,23 @@ impl WhatsappDriver {
     }
 
     async fn send_text(&self, recipient: &str, body: &str) -> Result<(), TransportError> {
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
-                      and serde_json::Number rejects non-finite floats"
-        )]
-        let payload = serde_json::to_vec(&json!({
+        self.send_message(&json!({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": recipient,
             "type": "text",
             "text": { "preview_url": false, "body": body }
         }))
-        .map_err(|_| TransportError::Response)?;
+        .await
+    }
+
+    async fn send_message(&self, body: &Value) -> Result<(), TransportError> {
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
+        let payload = serde_json::to_vec(body).map_err(|_| TransportError::Response)?;
         let response = self
             .http
             .post(self.messages_url())
@@ -908,6 +910,27 @@ impl TypingLease for WhatsappDriver {
 }
 
 #[async_trait]
+impl SteerAck for WhatsappDriver {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        let LivenessTarget::WhatsApp {
+            recipient,
+            inbound_message_id,
+        } = target
+        else {
+            return Err(TransportError::Response);
+        };
+        self.send_message(&json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "reaction",
+            "reaction": { "message_id": inbound_message_id, "emoji": "👀" }
+        }))
+        .await
+    }
+}
+
+#[async_trait]
 impl ChatDriver for WhatsappDriver {
     async fn reply(
         &self,
@@ -954,6 +977,10 @@ impl ChatDriver for WhatsappDriver {
     }
 
     fn typing(&self) -> Option<&dyn TypingLease> {
+        Some(self)
+    }
+
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
         Some(self)
     }
 }
@@ -1888,6 +1915,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_ack_sends_eyes_and_accepts_extra_response_fields() {
+        let (endpoint, server) = graph_mock(
+            1,
+            200,
+            r#"{"messaging_product":"whatsapp","messages":[{"id":"wamid.eyes","extra":true}],"extra":{}}"#,
+        );
+        driver(endpoint)
+            .steer_ack()
+            .expect("steering ack")
+            .seen(&typing_target())
+            .await
+            .expect("eyes accepted");
+        let requests = server.await.expect("server joins");
+        assert!(requests[0].starts_with("POST /v23.0/456/messages HTTP/1.1\r\n"));
+        assert_eq!(
+            body(&requests[0]),
+            json!({
+                "messaging_product": "whatsapp", "recipient_type": "individual", "to": "1603",
+                "type": "reaction", "reaction": { "message_id": "wamid.inbound", "emoji": "👀" }
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn typing_is_the_read_receipt_and_the_indicator_in_one_call() {
         let (endpoint, server) = graph_mock(1, 200, r#"{"success":true}"#);
         let driver = driver(endpoint);
@@ -1964,7 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whatsapp_offers_typing_and_nothing_else() {
+    async fn whatsapp_offers_typing_and_steering_ack_but_no_mutable_progress() {
         let driver = driver("http://127.0.0.1:1".to_owned());
         assert!(driver.typing().is_some());
         assert!(
@@ -1982,5 +2033,6 @@ mod tests {
         );
         assert!(driver.status().is_none());
         assert!(driver.reaction().is_none());
+        assert!(driver.steer_ack().is_some());
     }
 }

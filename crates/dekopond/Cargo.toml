@@ -26,7 +26,7 @@ dekopon-model.workspace = true
 # The cancel handle a native Stop fires into the broker leg's in-flight command run.
 dekopon-process.workspace = true
 dekopon-shell.workspace = true
-dekopon-telemetry.workspace = true
+dekopon-telemetry = { workspace = true, features = ["exporter"] }
 form_urlencoded.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true

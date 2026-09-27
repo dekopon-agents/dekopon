@@ -23,8 +23,8 @@ mod transcripts;
 pub use capture::{CaptureLayer, Record};
 pub use driver::{
     DriverCall, FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver,
-    RecordingProgress, RecordingReaction, RecordingStatus, RecordingStream, RecordingTyping,
-    StreamCall,
+    RecordingProgress, RecordingReaction, RecordingStatus, RecordingSteerAck, RecordingStream,
+    RecordingTyping, StreamCall,
 };
 pub use model::{ScriptedStreamModel, scripted_text};
 #[cfg(feature = "agent-runtime")]

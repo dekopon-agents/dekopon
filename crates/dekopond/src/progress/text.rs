@@ -1,9 +1,8 @@
-//! This text carries only operator templates and session counters; a provider-authored command word
-//! is the sole outside input, and it is bounded and marker-terminated before use.
-
 use std::time::Duration;
 
+use dekopon_agent::ProgressNote;
 use serde::Deserialize;
+use tokio::time::Instant;
 
 use crate::config::TemplateOverrides;
 
@@ -15,9 +14,9 @@ const WORD_MARKER: char = '…';
 pub(crate) const DEFAULT_WORKING: &str = "Working on it…";
 pub(crate) const DEFAULT_TOOL: &str = "Running {word}…";
 pub(crate) const DEFAULT_KEEP_ALIVE: &str = "Still working ({elapsed_s} s)…";
+const DEFAULT_NOTE: &str = "{note}…";
+const DEFAULT_NOTE_ETA: &str = "{note} (~{eta_s} s)…";
 
-/// The private field makes it a property of the type, not a rule to remember, that no model text
-/// ever reaches a progress message; the test-only escape hatch is compiled out of shipped builds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProgressText(String);
 
@@ -50,6 +49,8 @@ pub(crate) enum TemplateField {
     Working,
     Tool,
     KeepAlive,
+    Note,
+    NoteEta,
     Stopped,
     Failed,
 }
@@ -60,6 +61,8 @@ impl TemplateField {
             Self::Working => "working",
             Self::Tool => "tool",
             Self::KeepAlive => "keepAlive",
+            Self::Note => "note",
+            Self::NoteEta => "noteEta",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
         }
@@ -71,6 +74,16 @@ impl TemplateField {
         match self {
             Self::Working | Self::KeepAlive => IN_FLIGHT,
             Self::Tool => WITH_WORD,
+            Self::Note => &["note", "turn", "of", "calls", "calls_max", "elapsed_s"],
+            Self::NoteEta => &[
+                "note",
+                "eta_s",
+                "turn",
+                "of",
+                "calls",
+                "calls_max",
+                "elapsed_s",
+            ],
             Self::Stopped | Self::Failed => &[],
         }
     }
@@ -82,6 +95,14 @@ pub(crate) struct TemplateProblem {
     pub placeholder: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LiveNote {
+    pub text: ProgressNote,
+    pub eta: Option<Duration>,
+    pub arrived: Instant,
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RenderState {
     pub turn: u32,
@@ -90,6 +111,7 @@ pub(crate) struct RenderState {
     pub calls_max: u32,
     pub elapsed: Duration,
     pub word: Option<String>,
+    pub note: Option<LiveNote>,
 }
 
 impl RenderState {
@@ -103,6 +125,8 @@ impl RenderState {
 
     fn value(&self, placeholder: &str) -> Option<String> {
         Some(match placeholder {
+            "note" => self.note.as_ref()?.text.as_str().to_owned(),
+            "eta_s" => self.note.as_ref()?.eta?.as_secs().to_string(),
             "word" => self.word.clone().unwrap_or_default(),
             "turn" => self.turn.to_string(),
             "of" => self.of.to_string(),
@@ -119,6 +143,8 @@ pub(crate) struct Templates {
     working: String,
     tool: String,
     keep_alive: String,
+    note: String,
+    note_eta: String,
     stopped: String,
     failed: String,
 }
@@ -149,6 +175,18 @@ impl Templates {
                 DEFAULT_KEEP_ALIVE,
                 &mut problems,
             ),
+            note: checked(
+                TemplateField::Note,
+                overrides.note.as_deref(),
+                DEFAULT_NOTE,
+                &mut problems,
+            ),
+            note_eta: checked(
+                TemplateField::NoteEta,
+                overrides.note_eta.as_deref(),
+                DEFAULT_NOTE_ETA,
+                &mut problems,
+            ),
             stopped: checked(
                 TemplateField::Stopped,
                 overrides.stopped.as_deref(),
@@ -175,6 +213,14 @@ impl Templates {
 
     pub(crate) fn keep_alive(&self, detail: ProgressDetail, state: &RenderState) -> ProgressText {
         self.render(&self.keep_alive, detail, state)
+    }
+
+    pub(crate) fn note(&self, detail: ProgressDetail, state: &RenderState) -> ProgressText {
+        self.render(&self.note, detail, state)
+    }
+
+    pub(crate) fn note_eta(&self, detail: ProgressDetail, state: &RenderState) -> ProgressText {
+        self.render(&self.note_eta, detail, state)
     }
 
     pub(crate) fn stopped(&self) -> &str {

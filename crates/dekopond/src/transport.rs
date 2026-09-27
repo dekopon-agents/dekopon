@@ -70,7 +70,6 @@ pub(crate) struct InboundMessage {
     pub received_at: tokio::time::Instant,
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
-    pub late_photos: Option<crate::session::LatePhotoReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,8 +190,9 @@ pub(crate) struct MessageRef {
     pub id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct StreamedText {
+    pub generation: u64,
     pub text: ModelText,
     pub truncated: bool,
 }
@@ -399,6 +399,13 @@ pub(crate) trait NativeStatus: Send + Sync {
     async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError>;
 }
 
+#[derive(Debug)]
+pub(crate) enum LinkPreviews {
+    Default,
+    Disabled,
+    Enabled,
+}
+
 #[async_trait]
 pub(crate) trait ProgressMessage: Send + Sync {
     fn limits(&self) -> ProgressLimits;
@@ -425,6 +432,9 @@ pub(crate) trait ProgressMessage: Send + Sync {
 #[async_trait]
 pub(crate) trait TextStream: Send + Sync {
     fn limits(&self) -> StreamLimits;
+    async fn discard(&self, _message: &MessageRef) -> Result<(), TransportError> {
+        Ok(())
+    }
     async fn show(
         &self,
         target: &LivenessTarget,
@@ -436,12 +446,18 @@ pub(crate) trait TextStream: Send + Sync {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        generation: u64,
     ) -> Result<(), TransportError>;
 }
 
 #[async_trait]
 pub(crate) trait InboundReaction: Send + Sync {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError>;
+}
+
+#[async_trait]
+pub(crate) trait SteerAck: Send + Sync {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError>;
 }
 
 /// Implementations must acknowledge before the event reaches the bounded inbound channel, since
@@ -473,6 +489,10 @@ pub(crate) trait ChatDriver: Send + Sync {
     }
 
     fn reaction(&self) -> Option<&dyn InboundReaction> {
+        None
+    }
+
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
         None
     }
 

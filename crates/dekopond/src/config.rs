@@ -71,6 +71,14 @@ pub enum SlackExperience {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) enum Steering {
+    #[default]
+    Abort,
+    Boundary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum SlackLivenessFallback {
     #[default]
     None,
@@ -155,6 +163,8 @@ pub struct TemplateOverrides {
     pub working: Option<String>,
     pub tool: Option<String>,
     pub keep_alive: Option<String>,
+    pub note: Option<String>,
+    pub note_eta: Option<String>,
     pub stopped: Option<String>,
     pub failed: Option<String>,
 }
@@ -660,6 +670,10 @@ pub struct RouteConfig {
     #[serde(default)]
     pub(crate) progress_detail: ProgressDetail,
     #[serde(default)]
+    pub(crate) steering: Steering,
+    #[serde(default)]
+    pub(crate) progress_notes: bool,
+    #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub wakes: bool,
@@ -705,6 +719,8 @@ pub struct ResolvedRoute {
     pub inspect_agent_config: bool,
     pub limits: RouteLimits,
     pub(crate) progress_detail: ProgressDetail,
+    pub(crate) steering: Steering,
+    pub(crate) progress_notes: bool,
     pub memory: MemoryPolicy,
     pub wakes: bool,
 }
@@ -1249,6 +1265,9 @@ pub(crate) fn resolve(
                 });
             }
         }
+        if route.progress_notes && route.progress_detail == ProgressDetail::Off {
+            problems.push(ConfigProblem::ProgressNotesWithoutDetail { route: index });
+        }
         if route.progress_detail == ProgressDetail::Off
             && let (Some(liveness), Some(chat_kind)) = (
                 liveness_settings.get(&route.transport),
@@ -1418,6 +1437,8 @@ pub(crate) fn resolve(
             inspect_agent_config: route.inspect_agent_config,
             limits: route.limits,
             progress_detail: route.progress_detail,
+            steering: route.steering,
+            progress_notes: route.progress_notes,
             memory,
             wakes: route.wakes,
         });
@@ -1949,6 +1970,10 @@ pub enum ConfigProblem {
         "stopWords must not be empty and no word may be blank; omit the key to keep the default list"
     )]
     InvalidStopWords,
+    #[error(
+        "routes[{route}]: `progressNotes: true` needs a progress line, and `progressDetail: off` has none"
+    )]
+    ProgressNotesWithoutDetail { route: usize },
     #[error(
         "route for agent {agent:?} sets limits.maxDurationMs to 0, which cancels every session the instant it starts; omit it for no wall-clock bound"
     )]

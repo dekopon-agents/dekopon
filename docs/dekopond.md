@@ -70,6 +70,8 @@ transports:
         working: "Working on it…"
         tool: "Running {word}…"
         keepAlive: "Still working ({elapsed_s} s)…"
+        note: "{note}…"
+        noteEta: "{note} (~{eta_s} s)…"
         stopped: "Stopped."
         failed: "The agent could not complete this request."
   - name: community-discord
@@ -150,6 +152,8 @@ routes:                                       # first match wins; order matters
     improvementSuggestions: true              # optional; offers suggest_improvement, recorded to telemetry
     inspectAgentConfig: false                 # optional, default true; withholds inspect_agent_config
     progressDetail: plain                     # optional: off | plain (default) | detailed
+    progressNotes: false                      # optional; true lets the model write one bounded note on the progress line
+    steering: abort                           # optional: abort (default) | boundary
     limits:                                   # maxDurationMs and scriptTimeoutMs are optional
       maxSteps: 8
       maxCapabilityCalls: 16
@@ -167,7 +171,7 @@ routes:                                       # first match wins; order matters
 
 sessions:
   maxConcurrent: 4                            # optional, default 4
-  replyOnBusy: true                           # optional, default true
+  replyOnBusy: true                           # default true; saturation or a full mailbox only
   maxConversations: 1024                      # optional, default 1024 tracked
   assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
   journal:                                    # optional; absent, no conversation text is written to disk
@@ -197,6 +201,15 @@ The route's `conversation:` block is the **match**: `kind` is the word `any` or 
 The `memory:` block — which was called `conversation:` before 0.14.0 — is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
 
 `improvementSuggestions: true` offers that route's sessions the `suggest_improvement` tool: a bounded channel for the model to tell the operator how the agent could be improved — an instruction that was wrong, a skill or capability it lacked, a limit it hit — at most three times per session. It is off by default because each recorded suggestion is model-authored text written to the telemetry sink as `agent.improvement.suggested`; setting the flag is the consent that puts it there. A suggestion is advisory by construction: no instruction, skill, limit, or grant moves because a model asked, and nothing it records is relayed to chat.
+
+`progressNotes: true` offers the shell's `progress` builtin in the bash tool description and
+admits its bounded, model-authored notes to `gateway.progress` telemetry. It defaults to false:
+turning it on is consent for this text to reach telemetry and chat under the
+[security model's liveness rule](security-model.md#current-gateway-posture). A live note owns an
+active progress message until another note replaces it, the next model turn or steering clears it,
+or the session ends; individual tool completions do not clear it. At a keep-alive tick, a note older
+than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts down.
+A transport with liveness off or no active progress message still records an opted-in note.
 
 ### OpenRouter model settings
 
@@ -265,9 +278,11 @@ A gateway that starts and then refuses everything is worse than one that does no
   loop rather than a keep-alive;
 - a `liveness.templates` line using a placeholder that field cannot render. The known placeholders
   are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
-  `{elapsed_s}`; `stopped` and `failed` are written after the session ended and render none. Every
+  `{elapsed_s}`, plus `{note}` only in `note`/`noteEta` and `{eta_s}` only in `noteEta`;
+  neither note field permits `{word}`. `stopped` and `failed` render none. Every
   offending placeholder in the block is named, not the first;
 - an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
+- a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
 - a route with `limits.maxDurationMs: 0`, which would cancel every session the instant it started;
 - a route with `limits.scriptTimeoutMs: 0`, which would end every script the instant it started, or one whose `scriptTimeoutMs` is greater than its `maxDurationMs`, where the session bound is reached first and the script deadline could never take effect; that refusal names both numbers;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
@@ -358,8 +373,7 @@ The shared gateway collects **media-first** inputs after routing/address checks 
 session admission. WhatsApp `debounceMs` is the quiet interval (default **5000ms**), and
 `debounceMaxWaitMs` is the hard maximum from the first media receipt (default **15000ms**).
 Both are unsigned 32-bit millisecond durations (`0..=4294967295`). `debounceMs: 0` disables
-collection entirely; the maximum is then unused. Idle inputs use immediate admission, while
-photo-only receipts associated with a persistent WhatsApp run use the late-photo path below.
+collection entirely; the maximum is then unused. Idle inputs use immediate admission.
 When enabled, the maximum must be at least the quiet interval. Invalid types, negative/out-of-range
 integers, incompatible enabled combinations and unrepresentable timer deadlines are refused at
 configuration load. Accepted later photos, captions and standalone text extend that actor's quiet
@@ -387,68 +401,27 @@ envelope, visibly and with a traced cause; already collected members remain inta
 are never split. There is at most one collecting batch per compatible actor key and globally at
 most `sessions.maxConcurrent` batches, independently of execution permits.
 
-Except for the persistent WhatsApp late-photo path below, at quiet expiry or the hard deadline,
-whichever comes first, the batch attempts normal admission immediately. An active conversation or
-exhausted execution capacity produces a visible busy reply (also when `replyOnBusy` is false for
-ordinary messages) and disposes the batch. There is **no execution queue**, no waiting for an
-active session, no replay and no cancellation of paid effects. Late media starts a new bounded
-collection; late standalone text has ordinary immediate/busy behavior. Neither heuristic bursts
-nor native groups guarantee completion when members arrive after dispatch. WhatsApp collection
-waits at most its configured maximum (15 seconds by default); Telegram waits its fixed 3 seconds.
-Normal inference and transport time remain additional, with no admission waiting.
+At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission.
+For a running conversation with mailbox room, the same sender's batch becomes a steer; another
+sender's batch queues as a follow-up. After cancellation or completion is claimed, both queue.
+Steers and follow-ups share an eight-item mailbox. A full mailbox or exhausted execution capacity
+makes a batch eligible for a busy reply even when `replyOnBusy` is false, subject to the bounded
+refusal-reply capacity and transport delivery.
+Later media starts another bounded collection; standalone text follows ordinary steering/admission.
+There is no replay or rollback of paid effects. WhatsApp collection waits at most its configured
+maximum (15 seconds by default); Telegram waits its fixed 3 seconds. Queueing, inference and
+transport time remain additional; collection does not guarantee that every group member joins one turn.
 
-For ordinary requests, fresh broker authorization and generation selection happen only after
-admission; collection does
+New turns receive fresh broker authorization and generation selection after admission; a same-sender
+steer joins the running turn's existing leg and asset access. Collection itself does
 not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
 reply target and native delivery identity; other message IDs are not fabricated into an album ID.
 An authenticated stop removes only that actor's pending work and preserves the existing ownership
 rules for active sessions. Shutdown discards pending batches without starting them. Original
-receipt traces retain their input and terminal disposition; the lead-parented execution exports
-causal links to every constituent (see [observability](observability.md)). Asset leases, history
+receipt traces retain their input and terminal disposition. Ordinary collected executions export
+causal links to every constituent; consumed steers link their constituents only to the admission
+span, not the running execution (see [observability](observability.md)). Asset leases, history
 scope, generation fences and on-demand fetch budgets are unchanged.
-
-### Late photos on persistent WhatsApp routes
-
-Photo-only receipts arriving during a run are associated with that exact run before debounce.
-At flush they open a fresh, chat-scoped broker capability listing, not another model session.
-The gateway requires the same authenticated sender, configured route/agent, complete conversation,
-reply audience, unchanged grant set and live conversation generation. A later normal request
-invalidates an older receipt's intake permission immediately on admission, before its broker
-listing, even if the conversation generation is unchanged. Existing references are not deleted.
-No provider call, asset download, automatic retry or regeneration happens during this intake.
-
-Accepted references join the existing bounded temporary asset inventory. A gateway-authored
-completion notice asks whether the user wants another version including additional photos;
-it does not assert which photos a provider used, that bytes were downloaded, or permanent storage.
-If debounce or authorization finishes after the completion snapshot, that batch receives a separate
-acknowledgment instead, never both notices. Only after successful transport acceptance, one bounded
-gateway follow-up context is saved for the next authorized prompt, so a reply such as “yes” includes
-the question being answered alongside retained asset references. Asset intake closes at admission;
-a previously admitted notice may still finish delivery during that request's authorization, until
-its prompt is seeded. Seeding or generation replacement fences further old notice context. Failed delivery records no such
-question. Failed requests get neutral failure wording. Expired
-references are not described as retained. Normal next requests see still-retained references.
-
-Captioned photos retain ordinary admission/busy handling. Text or a caption trying to join an
-already late-only batch is explicitly refused with instructions to send it after the current
-request completes; previously collected photos remain intact. Cancellation discards pending late
-input and suppresses added notices, but does not delete references already registered solely
-because of the stop. A flushed intake owns authenticated Stop handling from dispatch through its
-broker listing and acknowledgment, even after the original execution completes. One intake owns
-the stopped acknowledgment when no execution does; Stop does not become a model request. Intake
-completion and cancellation arbitrate atomically before registration is released; a completing
-intake cannot claim the stopped acknowledgment for another removed collection. Saturated intake
-also suppresses its refusal when its originating run has already stopped. An
-already transmitted transport operation cannot be rolled back. Shutdown still discards pending collection. One-shot routes and other
-transports keep their existing behavior.
-
-Registration uses the existing eight-reference inventory and lazy byte limits; zero
-`assetRetentionBytes` refuses late retention. Late authorization operations and recent completed-run
-intervals are each independently capped by `sessions.maxConcurrent`. The recent intervals cover
-signed receipts enqueued before completion but dispatched afterwards. Once an interval is evicted,
-a conservative receipt-time watermark refuses ambiguous old photos instead of treating missing
-history as permission to start paid work. Actual newer idle receipts keep normal behavior.
-These handles contain no image bytes, pin no image files, and confer no provider authority.
 
 ## Asset handles and delivery
 
@@ -546,8 +519,8 @@ mention. This is **owned-thread continuation**, not ambient activation:
 - an explicitly addressed channel message proposes an exact authenticated
   `(workspace, channel, root thread, sender)` claim;
 - only a fresh non-empty broker capability surface installs or refreshes that claim;
-- a later unmentioned event must match every coordinate and is freshly authorized again before
-  liveness or inference; another sender and another thread remain ambient;
+- a later unmentioned event must match every coordinate; a new turn is freshly authorized, while
+  a same-sender steer joins the running leg; another sender and another thread remain ambient;
 - a definitive authorization refusal removes the claim; the 1,024-entry LRU and every claim vanish
   on process restart; and
 - all unmatched channel-history events are discarded inside the Slack transport before routing,
@@ -818,7 +791,7 @@ Unmatched messages are ignored with a debug-level `gateway_message_ignored { rea
 
 **Declaration order is the whole precedence rule.** Routes are consulted top to bottom, so a named-channel route written above a catch-all keeps that channel for itself while the catch-all takes everything else — special handling in `#incidents`, the default everywhere else. Nothing sorts by specificity: a hidden ranking is how an operator ends up unable to say which route answered.
 
-Every kind but `directMessage` — a group DM and a thread included — initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Discord and Telegram retain that rule on every message. Slack classic does too. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. Every continuation is authorized again and may decline to post; all non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
+Every kind but `directMessage` — a group DM and a thread included — initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Discord and Telegram retain that rule on every message. Slack classic does too. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. A continuation starting a new turn is authorized again and may decline to post; a same-sender steer joins the running leg. All non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
 
 ### Being available in a channel is not authority
 
@@ -877,6 +850,14 @@ Discord typing cooldowns can report success without a wire send, temporarily sup
 message fallback even when no typing is visible. Lease visibility and actual notifications are not
 verified by loopback tests; no cooldown or reaction-ownership redesign is included.
 
+**Steering acknowledgment.** Accepted steers and queued non-wake follow-ups get a best-effort 👀 on their own
+inbound message when it has a liveness target. Slack uses `eyes` independently of `classicFallback`
+but honors reaction-scope availability; Discord, Telegram and WhatsApp send 👀. Local keeps its
+`{"reaction": true}` frame. Slack does not track eyes for progress cleanup. Acknowledgment calls run
+outside the admission lock with a two-second bound; failure is debug-only
+(`gateway_steer_ack_failed`, with `error = deadline` when the bound expires), never a reply.
+Wakes and messages without a liveness target receive none.
+
 **Keep-alive.** `keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }` is the default: two
 early ticks that answer "did it hear me", then one a minute, ten times, then silence. Each tick is
 an edit of the one message. Each tick is also scheduled from the one before it, so a task that woke
@@ -891,13 +872,18 @@ call that creates the surface — the first `post`, or the first stream render �
 first deadline miss instead: the transport may still land it, and a second attempt would post a
 second message beside one this session holds no reference to.
 
-**Templates.** Five operator strings, each overridable per transport, all defaulting to the
-sentences this daemon ships. `tool` may use `{word}`; `working`, `tool`, and `keepAlive` may also
-use `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`; `stopped` and `failed` are
-written after the session ended and use none. A placeholder a field cannot render is a startup
-refusal naming it. The rendered command word is a provider manifest's own, bounded to 32 characters;
-no prompt, capability argument, provider result, or model text can reach a progress line, because
-the type the drivers receive is built only from these templates and the session's numbers.
+**Templates.** Seven operator strings, each overridable per transport, default to the sentences
+this daemon ships. `tool` permits `{word}`; `working`, `tool`, `keepAlive`, `note`, and `noteEta`
+permit `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`. Only `note`/`noteEta` permit
+`{note}`, and only `noteEta` permits `{eta_s}`; neither permits `{word}`. `stopped` and `failed`
+render no placeholders. A placeholder a field cannot render is a startup refusal naming it.
+The command word comes from a provider manifest and is bounded to 32 characters. A bounded note
+on a route with `progressNotes: true` is the one model-authored text admitted to a progress line;
+no prompt, other capability argument, or provider result is admitted. Note text is inserted as a
+literal value, never expanded as a template: a note containing `{elapsed_s}` shows those characters.
+Slack, Discord and Telegram progress posts and edits disable link previews/unfurls. Discord
+explicitly restores previews when the progress message becomes the answer; Telegram's edit defaults
+already restore them. Ordinary answer and stream paths keep their existing behavior.
 
 **Streaming.** With enabled liveness, `stream: true` and a driver that implements it, the model's answer appears as it
 is written, cut to the transport's own character ceiling with a trailing `…` where it was cut, and
@@ -907,10 +893,10 @@ instead of waiting out `timeoutMs`. Turning it off is for the endpoint that clai
 chat-completions compatibility and gets streaming wrong — a proxy that buffers the whole body, a
 server that drops `usage` — and costs that model both properties; `kind: chatgptSubscription`
 always streams and refuses the field.
-During a reasoning phase the model sends nothing at all — 10 to 60 seconds on a `gpt-5`-class model
-— so the streamed text does not move and a stop pressed then takes effect at the model timeout
-rather than at the next event. The person still sees `Stopped.` immediately, because the policy
-renders on the decision rather than on the model returning.
+During a reasoning phase the model may send no visible text. Model HTTP sends and reads observe
+cancellation even then; remote work already accepted is not rolled back. A model-only steering
+interrupt resets the local streamed partial, but text already visible in chat remains until the
+next delta replaces it.
 
 **Stopping a run.** Three ways, all of them authenticated, and all of them reaching the same
 single decision:
@@ -919,38 +905,61 @@ single decision:
   list because the people talking to a deployment do not all speak English. A message matches only
   if it is *exactly* one of those words after the bot mention and any trailing punctuation are
   stripped, case-insensitively — so `<@U0123> stop.` in a channel matches and "we should stop doing
-  that" does not. It fires only when that conversation has a session this same sender started;
-  said to an idle agent, "stop" is an ordinary question the agent answers;
+  that" does not. It stops that sender's running turn or removes their pending collected/queued
+  input. With no matching session or pending input, "stop" follows ordinary routing; an already
+  cancelled session ignores a repeat stop rather than starting another turn;
 - a **cancel button** on the progress message, where `cancelButton: true` and the service has
   interactive components. Slack's Agent experience renders its own Stop instead, which is why the
   flag is refused there. The value on a Slack button and the `custom_id` on a Discord one are the
   conversation key the transport minted when the message arrived, carried on the liveness target
-  rather than re-derived at press time — a second spelling of that key is a press the session
-  registry does not recognise. A Discord thread's key is `parent:thread`, and because a thread is
+  rather than re-derived at press time — a second spelling of that key is a press the admission
+  map does not recognise. A Discord thread's key is `parent:thread`, and because a thread is
   itself a channel the press arrives in the thread: it is matched against the key's last segment;
 - `limits.maxDurationMs`, counted from the moment the agent starts working rather than from
-  receipt, because waiting for an admission slot is not the agent taking too long.
+  receipt, because waiting behind another turn is not the agent taking too long.
 
-Only the subject who started a session may stop it; another person's press is acknowledged by the
-transport and then ignored, recorded as `gateway_session_stop_ignored`. A stop is cooperative, not a
-rollback: a model request or a provider effect already in flight finishes and its result is
-suppressed. Whatever the answer had already streamed stays on screen with the `stopped` line after
-it; nothing else replies. A stop is too late once the loop has an answer: the session is claimed as
-finished the instant the loop reports one, so a word or a press that lands while it is still being
-delivered is ignored with reason `already-ended` rather than writing `Stopped.` underneath the
-answer the person is already reading.
+Only the subject who started a run may stop it. User stops also discard that subject's queued
+steers and follow-ups, leaving other senders' work intact; budget or operator cancellation does not
+clear the mailbox. Another person's press cannot stop the running turn and is recorded as
+`gateway_session_stop_ignored`, though it can remove their own pending input. A stop is cooperative,
+not rollback: local model I/O is cancelled, while remote inference or provider effects already
+accepted may still finish and their result is suppressed. Cancellation suppresses that turn's model
+answer. Once the loop claims completion, a stop cannot cancel that answer, even during delivery. It still removes that sender's
+pending input. A stop word that removes pending input can receive `Stopped.` through the bounded
+refusal-reply path; buttons/native Stop acknowledge through their transport. With nothing pending,
+a stop during completion is ignored with reason `already-ended`.
 
 ## Sessions
 
-Each routed message runs one session. On a `oneShot` route (`memory: { mode: oneShot }`) that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
+Each admitted turn runs one session; same-sender messages can steer that turn, while other senders
+and wakes get their own follow-up sessions. On a `oneShot` route (`memory: { mode: oneShot }`) each
+session starts without prior history; the `persistent` clauses in steps 4 and 5 describe replay:
 
-1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, conversation)` in-flight set, keyed on the same conversation identity the session registry and the memory key use, stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
-2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
-3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+1. **Admission.** A process-wide semaphore bounds concurrent work. The per-`(transport, conversation)` map is checked first: the same sender steers a running turn; other senders, wakes, and input arriving after cancellation or completion is claimed queue as follow-ups. Together steers and follow-ups hold at most eight items. Only a full mailbox (`busy.cause = same-conversation`) or lack of a permit for a new conversation (`saturated`) refuses admission. A refusal is eligible for `I'm busy — try again shortly.` when `replyOnBusy` is set; a collected batch is eligible regardless. Sending still requires a free refusal-reply permit and successful transport delivery. Follow-ups run inline under the existing permit, with their own route, subject, fresh cancellation, broker leg and receipt trace. A conversation with a steady stream of messages keeps its permit until its mailbox is empty.
+2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or session progress starts**. Queued or steered input may already have received its admission acknowledgment, which does not signify authorization.
+3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
+`steering: abort` is the route default: a same-sender message interrupts only the in-flight model
+call, never a tool, script or provider call. `boundary` waits for the current step to finish. Both
+read steers before the next model call, and replace a draft answer when another step remains.
+An interrupted call does not spend `maxSteps`. Each run requests at most eight model interrupts;
+after that, steers wait for the next boundary. A follow-up starts with a fresh interrupt budget.
+Session duration and per-call timeouts still apply.
+Steers left at the last step, decline or failure fold into a follow-up under their original sender.
+Consumed steer text joins the turn's user text in history and the journal, without a format change.
+When the newest turn alone exceeds the in-process byte window, its user text is shortened to a
+UTF-8-safe prefix ending in `[…]` if the intact answer and marker fit; otherwise whole-turn eviction
+still applies.
+Journal writes cap only the JSON-encoded user string at 64 KiB. If needed, the user text is
+shortened to a UTF-8-safe prefix ending in `[…]`; the raw answer, metadata and assets remain
+intact. The complete line can exceed 64 KiB and is not rejected for its size.
+
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
+
+Follow-ups are memory-only and continue inline during shutdown grace. When `abort_all` ends that
+grace, queued receipts become `abandoned`; queued wakes are lost and are not replayed.
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
 
@@ -1042,9 +1051,9 @@ Neither eviction runs on a timer. There is no sweeper task and no shutdown hook:
 
 ### Authorization is never cached
 
-Every message opens a fresh attested broker leg and gets a fresh chat-scoped `capabilities` answer, exactly as step 2 already describes. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
+Every new turn opens a fresh attested broker leg and gets a fresh chat-scoped `capabilities` answer, exactly as step 2 describes; same-sender steers use the running turn's leg. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
 
-The granted capability set is additionally **stored with the conversation** and compared on every message. Any difference drops the history and attachment generation and starts a fresh conversation; an empty grant removes the entry outright and closes the same asset fence. The reason is narrow and specific: output and attachment references from a session with a broad grant are sitting in the retained state, and if the owner then narrows what that subject may reach, an unchecked entry would keep replaying or fetching them after the capability that produced them was taken away. Invalidation costs a cache miss on the first message after any policy change, which is the right price — a narrowed grant is precisely when replaying old output is wrong. This comparison remains conservative on a shared route: if two participants receive different capability identifier sets, moving between them resets the shared transcript and inventory rather than carrying state produced under the other set. Sharing never promotes either participant to the other's grant.
+The granted capability set is additionally **stored with the conversation** and compared at each new turn. Any difference drops the history and attachment generation and starts a fresh conversation; an empty grant removes the entry outright and closes the same asset fence. The reason is narrow and specific: output and attachment references from a session with a broad grant are sitting in the retained state, and if the owner then narrows what that subject may reach, an unchecked entry would keep replaying or fetching them after the capability that produced them was taken away. Invalidation costs a cache miss on the first new turn after a policy change, which is the right price — a narrowed grant is precisely when replaying old output is wrong. This comparison remains conservative on a shared route: if two participants receive different capability identifier sets, moving between them resets the shared transcript and inventory rather than carrying state produced under the other set. Sharing never promotes either participant to the other's grant.
 
 Its reach is exactly the granted capability *identifiers*, which is less than it sounds like. A policy edit that keeps the same capability list but tightens its owner-authored constraint set — a narrower allowed host, a smaller output ceiling, a different credential — produces an identical grant set and does not drop the history. Text fetched under the older constraints stays in the prompt until the window or the idle timeout removes it.
 
@@ -1058,7 +1067,7 @@ The default is 15 minutes, which resolves toward the person because the user-vis
 
 ### The prompt cache key
 
-Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Two requests sharing a key share nothing else: authorization is asked per message, on a fresh attested leg.
+Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Sharing a key grants nothing: each new session opens a fresh attested leg; steers share only their running session's leg.
 
 **It carries nothing about the private subject or shared conversation identifier.** The key is an opaque identifier *minted* when the thing it names is created — not either audience coordinate, not a hash of one, not a salted one. A canonical subject can be a phone number, so sending it would hand a model provider the sender's identity in exchange for routing that happens anyway; hashing it does not fix that, because a hash of a stable subject is a stable pseudonym. A configured salt is worse again: a new secret to manage whose only purchase is a pseudonym that survives restarts.
 
@@ -1109,9 +1118,11 @@ not queued, when none is free. A line that does not parse refuses startup; delet
 resets every pending wake. On WhatsApp a wake cannot be scheduled past 24 hours after the message
 that asked for it, because Meta refuses free-form messages outside that window.
 
-A wake bypasses stop words, the addressed filter and media collection. If its conversation is
-busy, or its route no longer answers there as the same agent with `wakes: true`, the gateway posts
-the note, followed by any probe output, instead of starting a session. The local development
+A wake bypasses stop words, the addressed filter and media collection. Behind a running
+conversation it queues as a follow-up if there is mailbox room, never as a steer; an idle conversation
+starts its turn directly if a permit is free. Wakes receive no acknowledgment. The same mailbox
+and saturation refusals apply. Only when its route no longer answers there as
+the same agent with `wakes: true` does the gateway post the note and any probe output without a session. The local development
 transport cannot schedule wakes: its reply target is a connection number a restart reuses. Provider chat memory does not record wake turns;
 the resident window and the journal do. Platform recall for a wake reads the history up to now.
 
@@ -1136,8 +1147,13 @@ memory search --query TEXT
 It cannot resolve or invoke record. After model success, the gateway bounds the final answer once
 (empty output uses the fixed normal answer), asks the transport to accept those exact bytes, and
 only then opens one fresh broker client for one `recordDeliveredTurn` carrying the session's chat
-attestation. The recorded user text is the original bounded sender text, excluding generated
-attachment reference notes; assistant text is exactly what the transport accepted. No response,
+attestation. The recorded user text is the original bounded sender text followed by each consumed
+steer's raw text, joined by blank lines, excluding gateway timing and attachment reference notes.
+If the combined user and assistant text exceeds the existing 64-KiB recording ceiling, only the
+recorded user text is shortened to a UTF-8-safe prefix ending in `[…]`; space is reserved for that
+marker and the entire accepted assistant text. This recording bound leaves prompt history
+unchanged; journal writes apply their own encoded-user bound.
+Assistant text is exactly what the transport accepted. No response,
 denial, timeout, EOF, partial Discord delivery, or outcome-unaudited is retried, and none changes
 the already delivered `answered` outcome.
 
@@ -1183,7 +1199,7 @@ Spans follow [`observability.md`](observability.md):
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`, and the late-photo outcomes below) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below. A receipt the transport declines to route records `drop.reason` instead — one word for why, such as `self-authored`, `content-withheld`, or `duplicate` — so a message that produced no reply says so in its own trace.
@@ -1194,7 +1210,7 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_busy`, `gateway_wake_cancelled`,
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_steer_refused` (`mailbox-full`), `gateway_steer_ack_failed` (debug); `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_cancelled`,
 `gateway_wake_tick_failed`, `gateway_wake_tick_skipped`, `gateway_wake_probe_unavailable`, and
 `gateway_wake_task_failed`, `gateway_wake_store_failed` (a failed write refuses that one change; a
 failed write while firing or leasing stops wake firing until restart), `gateway_memory_record_skipped`

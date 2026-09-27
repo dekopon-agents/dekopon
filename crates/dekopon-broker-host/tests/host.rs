@@ -1421,7 +1421,7 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
         .expect("held grant");
 
     let competing_host = storage.clone();
-    let competing = tokio::task::spawn_blocking(move || {
+    let mut competing = tokio::task::spawn_blocking(move || {
         competing_host.grant(probe_storage_grant(
             "lease-competing",
             "slack.t0123abc.uone",
@@ -1438,11 +1438,21 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
     let distinct = tokio::task::spawn_blocking(move || {
         distinct_host.grant(probe_storage_grant("lease-distinct", "slack.t0123abc.utwo"))
     });
-    let distinct = tokio::time::timeout(std::time::Duration::from_millis(200), distinct)
-        .await
-        .expect("a distinct namespace was not serialized behind the blocked base")
-        .expect("blocking task")
-        .expect("distinct grant");
+    // Racing `distinct` against `competing` proves the invariant without an absolute wall-clock
+    // cutoff that shrinks under CI scheduling noise; `competing` cannot hang past its own
+    // `lock_timeout_ms` deadline, so the race settles even if the invariant is broken. The 5 s
+    // outer bound only guards against an unrelated deadlock.
+    let distinct = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            result = distinct => result.expect("blocking task").expect("distinct grant"),
+            joined = &mut competing => {
+                panic!("a distinct namespace was serialized behind the blocked base: {joined:?}")
+            }
+        }
+    })
+    .await
+    .expect("distinct grant deadlocked entirely");
     drop(distinct);
 
     competing.abort();

@@ -12,7 +12,60 @@ All notable changes to Dekopon are documented here. The format is based on
 - Provider storage supports private-conversation, shared-conversation and agent scopes, with
   optional idle retention based on a broker-owned last-used marker. The broker sweeps expired
   resources at startup and every 12 hours, skipping active leases and retaining data by default.
+- Shell `progress "text" [--eta S]` builtin for optional invoker notes, silent without a note sink.
+- Opt-in route `progressNotes` enables cleaned, bounded progress notes and `gateway.progress`
+  note telemetry, with per-script and per-session caps.
+- Progress-note rendering on the existing progress message, with `note`/`noteEta` templates,
+  literal note insertion, keep-alive staleness and progress-only link-preview suppression.
 
+### Changed
+
+- `progress` is a reserved command word; a provider declaring it is refused at load.
+
+## [0.24.0] - 2026-09-26
+
+### Added
+
+- Same-sender messages and photos steer a running chat turn with per-route `steering: abort`
+  (default) or `boundary`. Model-only interruptions do not spend a completed model step or cancel
+  tool, script or provider work. After eight interrupt requests in a run, steers wait for the next
+  boundary. Other senders and wakes queue follow-ups under their own broker legs.
+- Best-effort 👀 acknowledgments for accepted steers and queued non-wake messages with liveness
+  targets, plus admission telemetry distinguishing queueing from bounded refusals.
+
+### Changed
+
+- Busy replies now mean process-wide saturation for a new conversation or a full eight-item
+  conversation mailbox. `sessions.replyOnBusy` remains; collected batches are eligible for a busy
+  reply regardless, subject to the bounded refusal-reply capacity and transport delivery.
+- Photos arriving during their sender's turn use ordinary steering and the running asset access.
+  Consumed steer text joins history and delivered-turn memory without changing the journal format.
+  An oversized newest history turn keeps a marked user prefix when its intact answer and marker
+  fit the byte window.
+
+### Fixed
+
+- A retained chat asset no longer holds the `gateway.session` span that spooled it. The span, with
+  `gateway.message` and `transport.receive` above it, closed only when retention dropped the asset:
+  exported hours late, or never when the process exited first. `asset.spool` read and cleanup spans
+  now parent to the span active where they run.
+
+### Removed
+
+- The separate late-photo intake, retained/expired/refused paths and completion notices.
+
+## [dekopon-chart-0.15.0] - 2026-09-26
+
+### Changed
+
+- Default application version is now 0.24.0.
+
+## [0.23.0] - 2026-09-26
+
+### Added
+
+- Private `kubernetesProjection` secret sources accept `declaredOrigin: serviceAccountToken`
+  without a non-secret acknowledgement and read the current kubelet-projected token per invocation.
 - HTTP constraint sets accept `propagateTrace: true` to send a broker-owned W3C `traceparent`
   to first-party destinations inside the operator's trust boundary. Buffered and streaming
   requests parent downstream work on the HTTP egress span without charging guest byte budgets.
@@ -21,9 +74,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Storage constraints replace `namespace: chat` with `scope: private-conversation`; shared scopes
   keep stable data across authorized callers without sharing gateway conversation history.
-
+- `dekopon-telemetry`'s exporter stack (OTLP, tonic, the OpenTelemetry SDK, the log bridge and the
+  blocking reqwest client) sits behind a new default-off `exporter` feature that `dekopond` and
+  `dekopon-brokerd` enable. `dekopon-http-host`, and through it `dekopon-broker-host` and the
+  provider SDK testkit, now link only the trace-context surface. Embedders that call the install API must enable
+  `exporter` when re-pinning (see `docs/upgrading.md`).
 - Provider-supplied `traceparent` and `tracestate` request headers are refused with `InvalidHeader`
   on every HTTP grant, including grants that do not opt into trace propagation.
+
+## [dekopon-chart-0.14.0] - 2026-09-26
+
+### Added
+
+- Optional `serviceAccount.create`, `serviceAccount.name`, and `serviceAccount.annotations`
+  select or create the pod's ServiceAccount while keeping automatic token mounting disabled.
+- Projected ServiceAccount token examples use the existing broker-only `secretSourceVolumes`
+  mounts to preserve live token rotation without exposing tokens to the gateway.
+
+### Changed
+
+- Default application version is now 0.23.0.
 
 ## [0.22.0] - 2026-09-25
 

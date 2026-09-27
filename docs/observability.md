@@ -6,8 +6,8 @@ its bounded agent/script session. Broker coverage is component loading and decod
 from mapped peers. Neither collects telemetry from Kubernetes nodes or other processes.
 
 The two daemons export **independently**: the broker cannot observe gateway model or script spans.
-Their records meet in the backend, correlated by trace context. One complete trace per message is
-the goal this document serves; [the constitution](design.md#constitution) states it.
+Their records meet in the backend, correlated by trace context. Receipt traces show admission;
+execution follows the running session's trace. See [the constitution](design.md#constitution).
 
 ## Which signal carries what
 
@@ -400,7 +400,7 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 `gateway.session` is the agent invocation span. Its canonical OpenTelemetry GenAI attributes use
@@ -481,10 +481,10 @@ the ordinary `broker.decision` and `broker.execution` records, not a separate au
 Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
 `duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
 changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
-path, payload, URL or base64. Reads inherit their active consumption span; final cleanup and reads
-outside an active scope retain the originating message span so they do not create disconnected
-roots. Synchronous IO never holds a span guard across an await. WhatsApp's final media boundaries
-emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
+path, payload, URL or base64. Reads and cleanup parent to whatever span is active when they run,
+or start a root span outside one. A retained asset never holds the span that created it, so
+retention cannot keep `gateway.session` and its ancestors from closing and exporting. Synchronous
+IO never holds a span guard across an await. WhatsApp's final media boundaries emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
 `outcome=accepted|failed` and the stable transport error category in `reason`. Upload acceptance
 alone is not delivery; only validated message acceptance completes the send. Cancelled futures can
 close these spans without a terminal outcome. Broker/provider W3C propagation is unchanged.
@@ -493,13 +493,28 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
-`unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or
-liveness call was made, `busy` means admission control refused the message, `cancelled` means a
-stop won the race against terminal delivery, and `failed` names a category and the `error` that
+`unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model call or
+session progress starts. Queued or steered input may already carry its admission 👀 acknowledgment;
+that does not mean it was authorized. `steered` joins the sender's running turn, and `queued` waits
+for a new turn.
+`busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
+all process-wide permits are taken for a new conversation (`busy.cause = saturated`). `cancelled`
+means cancellation won before completion was claimed, and `failed` names a category and the `error` that
 produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
+
+Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopond::audit`, with `outcome`
+(`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
+plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
+Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with
+`reason = mailbox-full`. An interrupted model call records `accounting.model.turn` with
+`outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains
+the steer text and reuses the interrupted call's `model.turn` index. Aborted calls remain observable
+but do not count toward completed steps. These records remain useful without a `gateway.session` wrapper span.
+Admission acknowledgment failures emit debug-only `gateway_steer_ack_failed`, with `transport` and
+`error`; expiration of the two-second bound is `error = deadline`.
 
 Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
 `gateway_transport_recovering` carries the configured `transport`, stable error `category`,
@@ -517,14 +532,21 @@ when a non-exporting session's minted trace falls back to the hasher constructio
 `gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
 minted from something predictable.
 
-In-flight presentation is metadata-minimal. Every event a running session produces is one
+In-flight presentation is metadata-minimal apart from opted-in progress notes. Each admitted event a running session produces is one
 `gateway.progress` record on the message's own trace, carrying `kind` and whichever of `agent`,
 `turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,
 `calls_max`, `index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`,
-`class`, `by`, `edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has.
-`turn` is the turn a `model_turn` or `answered` record is about; `turns` is how many the session
-spent, on `kind = finished`. There is no field on
-it a prompt, a capability argument, a provider result, or model text could be written into. A text
+`class`, `by`, `edits`, `keep_alives`, `stream.deltas`, `progress.dropped`, and
+`progress.notes_dropped` that kind has.
+`turn` is the turn a `model_turn`, `answered` or `steered` record is about; `turns` counts completed
+model calls on `kind = finished`. The model-text exception is `kind = note`, carrying `note`
+and optional `note.eta_s` (whole seconds) on a route with `progressNotes: true`; its bounds are
+specified by the [security model's liveness rule](security-model.md#current-gateway-posture).
+Notes beyond the session cap are neither recorded nor queued, and the terminal record's
+`progress.notes_dropped` counts only those session-cap drops. Empty notes and per-script cap
+drops instead emit `agent_progress_note_dropped` at debug level with `reason = empty` or
+`script-cap`, never the text. No other prompt, capability argument, or provider result has a
+field in this record. A text
 delta is the one event with no record of its own: it is the newest rendering of one value, it
 arrives hundreds of times per turn, and what a reader needs is the count — which rides
 `stream.deltas` on the terminal record and on `prompt.model_turn`. That span also carries
@@ -582,12 +604,12 @@ carries a phone number, a WABA identifier, a message ID, or message text.
 ### What conversation history changes
 
 A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —
-changes the meaning of a field that already exists. A route left on the `oneShot` default changes
-nothing here.
+is the default and changes the meaning of a field that already exists. A route explicitly set to
+`oneShot` replays no history.
 
 **`message.count` is the field.** It appears on the `prompt.model_turn` span and on the
 `accounting.model.turn` record, and it counts one exchange: the system prompt, the message a person
-sent, and whatever the model and its tool have said back within this session. A session seeded with
+sent, consumed steers, and whatever the model and its tool have said back within this session. A session seeded with
 history counts the replayed window *plus* this exchange, so the same field on the same span means
 something different depending on a route's `memory.mode`. A panel plotting it across the
 switchover shows a step change that is not a regression, and averaging across both averages two
@@ -1136,22 +1158,19 @@ guarantee.
 ### Collected media inputs
 
 `gateway.message.received` records every routed constituent in its original receipt trace, before
-collection. A collected `gateway.message` is parented by the lead receipt and carries exported
-OpenTelemetry links to all original receipts (including the lead), with `batch.members` bounded
-at eight. Each receipt gets `gateway_input_disposition` with the shared terminal outcome, or a
-local refusal, stop, shutdown or abandonment. No service album ID or synthetic delivery identity
-is invented. Following a constituent's causal link reaches the one model/provider/progress and
-reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
-membership while original text stays on its own input audit event. Delivery failures remain
-in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.
+collection. An ordinary collected admission's `gateway.message` is parented by the lead receipt
+and carries exported OpenTelemetry links to its original receipts (including the lead), with
+`batch.members` bounded at eight. Those links reach that admission's model/provider/progress and
+reply execution. A consumed collected steer instead links to its admission-only `gateway.message`,
+not to the holder's execution; consuming it adds no holder span link. Leftover steers folded into
+a follow-up carry the last steer's receipt parent and the merged constituents, so that follow-up's
+`batch.members` can exceed eight.
 
-Persistent WhatsApp late-photo intake has its own `gateway.message`, linked to its collected
-receipts as above, with no `gateway.session` or model/provider work. Its outcomes are `late-retained`
-(waiting for the running request's completion notice), `late-acknowledged` (separate acknowledgment),
-`late-reply-failed`, `late-refused`, `late-unauthorized`, `late-busy`, `late-history-unavailable`,
-or `stopped`. `gateway_late_photos_retained` records the bounded new `asset.ids`; a
-`gateway_late_photos_refused` record names the authorization, scope, generation or limit reason.
-Each constituent still receives its own terminal `gateway_input_disposition`.
+Receipts record `gateway_input_disposition` for steering, execution, local refusal, stop, shutdown
+or abandonment. No service album ID or synthetic delivery identity is invented. Non-payload
+counts/outcomes describe membership while original text stays on its own input audit event;
+delivery failures belong to the executing turn's trace. A single-message, uncollected admission
+keeps its ordinary trace.
 
 Gateway assets are recorded by reference, declared content type, stored byte count and SHA-256,
 never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.decode` spans as

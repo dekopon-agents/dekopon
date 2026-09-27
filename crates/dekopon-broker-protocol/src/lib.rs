@@ -629,6 +629,24 @@ where
     deserializer.deserialize_option(OptionalServiceDecimal)
 }
 
+const MAX_DELIVERED_TURN_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct DeliveredAnswer(String);
+
+impl DeliveredAnswer {
+    #[must_use]
+    pub fn accepted_by_transport(text: String) -> Self {
+        Self(text)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DeliveredTurnRequest {
@@ -636,9 +654,9 @@ pub struct DeliveredTurnRequest {
     pub trace_parent: TraceParent,
     pub delivery: DeliveryIdentity,
     #[serde(deserialize_with = "deserialize_turn_text")]
-    pub user: String,
-    #[serde(deserialize_with = "deserialize_turn_text")]
-    pub assistant: String,
+    user: String,
+    #[serde(deserialize_with = "deserialize_delivered_answer")]
+    assistant: DeliveredAnswer,
 }
 
 impl fmt::Debug for DeliveredTurnRequest {
@@ -649,11 +667,44 @@ impl fmt::Debug for DeliveredTurnRequest {
 
 impl DeliveredTurnRequest {
     #[must_use]
+    pub fn new(
+        id: InvocationId,
+        trace_parent: TraceParent,
+        delivery: DeliveryIdentity,
+        mut user: String,
+        assistant: DeliveredAnswer,
+    ) -> Self {
+        let budget = MAX_DELIVERED_TURN_TEXT_BYTES.saturating_sub(assistant.0.len());
+        if user.len() > budget {
+            const MARKER: &str = "[…]";
+            user.truncate(user.floor_char_boundary(budget.saturating_sub(MARKER.len())));
+            user.push_str(MARKER);
+        }
+        Self {
+            id,
+            trace_parent,
+            delivery,
+            user,
+            assistant,
+        }
+    }
+
+    #[must_use]
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    #[must_use]
+    pub fn assistant(&self) -> &DeliveredAnswer {
+        &self.assistant
+    }
+
+    #[must_use]
     pub fn is_bounded(&self) -> bool {
         self.user
             .len()
-            .checked_add(self.assistant.len())
-            .is_some_and(|bytes| bytes <= 64 * 1024)
+            .checked_add(self.assistant.0.len())
+            .is_some_and(|bytes| bytes <= MAX_DELIVERED_TURN_TEXT_BYTES)
     }
 }
 
@@ -661,7 +712,14 @@ fn deserialize_turn_text<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<D, { 64 * 1024 }>(deserializer)
+    deserialize_bounded_string::<D, MAX_DELIVERED_TURN_TEXT_BYTES>(deserializer)
+}
+
+fn deserialize_delivered_answer<'de, D>(deserializer: D) -> Result<DeliveredAnswer, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_turn_text(deserializer).map(DeliveredAnswer)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

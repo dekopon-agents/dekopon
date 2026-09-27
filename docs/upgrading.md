@@ -8,7 +8,39 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Broker-owned HTTP trace headers (next release)
+## Reserved command word progress (unreleased)
+
+- **The shell `progress` builtin.** `progress` now belongs to
+  `dekopon_core::RESERVED_COMMAND_WORDS`; a provider declaring that command word is refused at
+  load. Rename a colliding provider word before upgrading. The builtin sends an optional note
+  through the invoker and is a no-op without a progress-note sink.
+
+## Chat steering (0.24.0)
+
+Steering is enabled on every route by default. A same-sender message during a running turn now
+interrupts only the model call and joins that turn; it never interrupts a tool, script or provider
+call. To wait for the current step instead, add this key to the route:
+
+```yaml
+steering: boundary  # abort is the default
+```
+
+Other senders and fired wakes wait as follow-up turns with fresh broker legs. The conversation
+mailbox holds eight pending items, counting steers and follow-ups together. Busy replies now mean
+that mailbox is full or all process-wide permits are taken for a new conversation.
+`sessions.replyOnBusy` is unchanged and gates those replies; a collected batch is eligible regardless.
+Sending still requires refusal-reply capacity and successful transport delivery.
+
+Later photos use ordinary steering, not the retired special intake or its completion notices.
+Accepted steers and queued non-wake messages get best-effort 👀 acknowledgments when a liveness
+target exists. A user stop drops only that sender's queued input and stops their run if it is still
+cancellable; a completed answer cannot be cancelled while it is being delivered.
+Queues are memory-only: shutdown grace lets them finish, but aborting the owner loses pending
+follow-ups, including wakes. Consumed steers join recorded user text; no journal migration is needed.
+
+See [session behavior](dekopond.md#sessions) and [admission telemetry](observability.md#gateway-spans).
+
+## Broker-owned HTTP trace headers (0.23.0)
 
 Remove provider-supplied `traceparent` and `tracestate` request headers before upgrading: the
 native HTTP host now refuses either with `InvalidHeader`, even when propagation is disabled.
@@ -16,6 +48,15 @@ To propagate a trace to a first-party destination inside your trust boundary, gi
 HTTP constraint set with `propagateTrace: true`; omission remains off. The broker supplies the
 egress span's `traceparent`, never `tracestate`. See the
 [broker configuration example](../crates/dekopon-brokerd/README.md#trace-propagation-to-first-party-destinations).
+
+## Embedders: `dekopon-telemetry` exporter feature (0.23.0)
+
+The OTLP install API (`Install`, `ExporterSettings`, `Transport`, `TelemetryGuard`,
+`TelemetryError`, `CA_CERTIFICATE_ENV`) is now behind `dekopon-telemetry`'s default-off `exporter`
+feature. A crate that installs telemetry — a gateway, console or test harness embedding Dekopon —
+must enable it when re-pinning: `dekopon-telemetry = { version = "=X.Y.Z", features = ["exporter"] }`.
+Without it the build fails with `E0432` on those imports. Crates that only read trace context
+(`current_trace_context`, `remote_context`, the link helpers) need no change.
 
 ## Principals, groups and capability blocks (0.22.0)
 

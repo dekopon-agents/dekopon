@@ -37,7 +37,7 @@ use crate::{
         AckToken, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatTransport,
         InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES, MessageId,
         MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
-        Status, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
+        Status, SteerAck, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, receive_span, record_conversation,
     },
 };
@@ -236,7 +236,6 @@ impl LocalTransport {
                     received_at: tokio::time::Instant::now(),
                     native_group: None,
                     constituents: Vec::new(),
-                    late_photos: None,
                     asset_overflow: false,
                 };
                 if inbound
@@ -511,6 +510,10 @@ impl ChatDriver for LocalDriver {
         Some(self)
     }
 
+    fn steer_ack(&self) -> Option<&dyn SteerAck> {
+        Some(self)
+    }
+
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         Some(self)
     }
@@ -636,6 +639,7 @@ impl TextStream for LocalDriver {
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
+        _generation: u64,
     ) -> Result<(), TransportError> {
         self.finalize_in_place(message, reply).await
     }
@@ -646,6 +650,13 @@ impl InboundReaction for LocalDriver {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
         self.emit(Self::connection(target)?, &json!({ "reaction": present }))
             .await
+    }
+}
+
+#[async_trait]
+impl SteerAck for LocalDriver {
+    async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        InboundReaction::set(self, target, true).await
     }
 }
 
@@ -820,7 +831,7 @@ mod unit_tests {
         .expect("the recorded transcript parses");
         StreamedText {
             text: dekopon_test_support::scripted_text(&events),
-            truncated: false,
+            ..StreamedText::default()
         }
     }
 
@@ -844,6 +855,22 @@ mod unit_tests {
             }
         });
         lines
+    }
+
+    #[tokio::test]
+    async fn steering_ack_preserves_the_local_reaction_frame() {
+        let driver = LocalDriver::default();
+        let lines = connect(&driver, 7);
+        driver
+            .steer_ack()
+            .expect("steering ack")
+            .seen(&LivenessTarget::Local { connection: 7 })
+            .await
+            .expect("line written");
+        assert_eq!(
+            *lines.lock().expect("recorded lines"),
+            [json!({ "reaction": true })]
+        );
     }
 
     #[tokio::test]
@@ -894,7 +921,7 @@ mod unit_tests {
             .expect("a later delta re-emits the same message");
         assert_eq!(again, streaming, "cumulative text stays in one message");
         stream
-            .finalize(&streaming, &OutboundReply::text("the answer"))
+            .finalize(&streaming, &OutboundReply::text("the answer"), 0)
             .await
             .expect("the line is written");
         driver

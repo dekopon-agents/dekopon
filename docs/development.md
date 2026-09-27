@@ -22,7 +22,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
 | Config discovery and validation | `crates/dekopon-config/src/`; skill-directory loading (`SKILL.md` front matter, resources, and size/depth/count bounds) in `crates/dekopon-config/src/skill.rs` | `crates/dekopon-config/src/tests.rs`, including catalog-relative skill loading and one-refusal reporting of every unmountable skill; inline front-matter, bound, and symlink-refusal tests in `skill.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/catalog/dekopon.yaml`, which mounts `examples/catalog/skills/pull-request-review/`, and `examples/conditional-write/dekopon.yaml` |
-| OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
+| Trace context (always built) and OTLP exporter settings and subscriber wiring (`exporter` feature) | `crates/dekopon-telemetry/src/lib.rs`; `crates/dekopon-telemetry/src/exporter.rs` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
 | Isolated model auth commands | `crates/dekopond/src/{cli,auth,auth_result,auth_render,auth_output}.rs` | `crates/dekopond/tests/auth.rs` and inline parser/renderer/export-guard tests |
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |

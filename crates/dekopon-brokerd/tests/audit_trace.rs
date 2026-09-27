@@ -20,7 +20,8 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, CommandRunOutcome, Conversation,
-    ConversationKind, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, TraceParent,
+    ConversationKind, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
+    TraceParent,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
@@ -442,16 +443,16 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
         .client
         .record_delivered_turn(
             chat_claim(),
-            DeliveredTurnRequest {
-                id: "record-traced".parse::<InvocationId>().expect("invocation"),
-                trace_parent: trace_parent(),
-                delivery: DeliveryIdentity::Slack {
+            DeliveredTurnRequest::new(
+                "record-traced".parse::<InvocationId>().expect("invocation"),
+                trace_parent(),
+                DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: "1712345678.000100".to_owned(),
                 },
-                user: "a question".to_owned(),
-                assistant: "an answer".to_owned(),
-            },
+                "a question".to_owned(),
+                DeliveredAnswer::accepted_by_transport("an answer".to_owned()),
+            ),
         )
         .await
         .expect("a refused turn is still an accounted decision");

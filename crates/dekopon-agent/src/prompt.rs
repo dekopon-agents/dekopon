@@ -33,7 +33,9 @@ mod history;
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
-pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
+pub use history::{
+    ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits, RawAnswer,
+};
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";
 
@@ -102,6 +104,11 @@ pub trait CancellationProbe: Send + Sync {
     fn cancel_source(&self) -> Option<CancelSource> {
         None
     }
+}
+
+pub trait SteerSource: Send + Sync {
+    /// Moves every queued steer out, oldest first, as finished user text. Empty when none.
+    fn drain(&self) -> Vec<String>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,10 +204,12 @@ pub struct SessionInputs<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    steering: Option<&'a dyn SteerSource>,
     progress: Option<Arc<dyn ProgressSink>>,
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
 
@@ -217,10 +226,12 @@ impl<'a> SessionInputs<'a> {
             usage_observer: None,
             agent_config: None,
             cancellation: None,
+            steering: None,
             progress: None,
             optional_reply: false,
             skills: &[],
             improvement_suggestions: false,
+            progress_notes: false,
             wakes: None,
         }
     }
@@ -249,6 +260,12 @@ impl<'a> SessionInputs<'a> {
     #[must_use]
     pub const fn with_improvement_suggestions(mut self) -> Self {
         self.improvement_suggestions = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_progress_notes(mut self) -> Self {
+        self.progress_notes = true;
         self
     }
 
@@ -289,6 +306,12 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_steering(mut self, steering: &'a dyn SteerSource) -> Self {
+        self.steering = Some(steering);
+        self
+    }
+
+    #[must_use]
     pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>) -> Self {
         self.progress = Some(sink);
         self
@@ -309,10 +332,12 @@ struct SessionExtensions<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    steering: Option<&'a dyn SteerSource>,
     progress: Option<&'a dyn ProgressSink>,
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
+    progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
 
@@ -336,10 +361,12 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        steering,
         progress,
         optional_reply,
         skills,
         improvement_suggestions,
+        progress_notes,
         wakes,
     } = inputs;
     let fallback = CompletionOptions::default();
@@ -366,7 +393,7 @@ where
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
-    let result = run_session(
+    let (result, steers) = run_session(
         model,
         runtime,
         messages,
@@ -378,18 +405,25 @@ where
             usage_observer,
             agent_config,
             cancellation,
+            steering,
             progress,
             optional_reply,
             skills,
             improvement_suggestions,
+            progress_notes,
             wakes,
         },
     );
+    let mut user = prompt.to_owned();
+    for steer in steers {
+        user.push_str("\n\n");
+        user.push_str(&steer);
+    }
     history.record(match &result {
         Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
-            ConversationTurn::completed(prompt, outcome.answer.as_str())
+            ConversationTurn::completed(user, outcome.answer.as_str())
         }
-        Ok(_) | Err(_) => ConversationTurn::unanswered(prompt),
+        Ok(_) | Err(_) => ConversationTurn::unanswered(user),
     });
     result
 }
@@ -400,16 +434,17 @@ fn run_session<M, R>(
     messages: Vec<ModelMessage>,
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
-) -> Result<PromptOutcome, PromptError>
+) -> (Result<PromptOutcome, PromptError>, Vec<String>)
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
-    let result = run_turns(model, runtime, messages, limits, extensions);
+    let mut steers = Vec::new();
+    let result = run_turns(model, runtime, messages, limits, extensions, &mut steers);
     if let Err(error) = &result {
         report_end(extensions.progress, extensions.cancellation, error);
     }
-    result
+    (result, steers)
 }
 
 fn report_end(
@@ -436,12 +471,27 @@ fn emit(progress: Option<&dyn ProgressSink>, event: ProgressEvent) {
     }
 }
 
+fn drain_steers(
+    steering: Option<&dyn SteerSource>,
+    messages: &mut Vec<ModelMessage>,
+    consumed: &mut Vec<String>,
+) -> bool {
+    let steers = steering.map(SteerSource::drain).unwrap_or_default();
+    let any = !steers.is_empty();
+    for steer in steers {
+        messages.push(ModelMessage::user(&steer));
+        consumed.push(steer);
+    }
+    any
+}
+
 fn run_turns<M, R>(
     model: &M,
     runtime: &R,
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
+    steers: &mut Vec<String>,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
@@ -454,13 +504,19 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        steering,
         progress,
         optional_reply,
         skills,
         improvement_suggestions,
+        progress_notes,
         wakes,
     } = extensions;
-    let mut model_tools = vec![script_tool(&runtime.command_words())];
+    let mut script = script_tool(&runtime.command_words());
+    if progress_notes {
+        script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+    }
+    let mut model_tools = vec![script];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
     }
@@ -492,8 +548,16 @@ where
     let mut skill_reads = SkillReads::default();
     let mut suggestions = Vec::new();
 
-    for model_turns in 1..=limits.max_steps {
+    let mut completed_turns = 0;
+    loop {
+        if completed_turns == limits.max_steps {
+            return Err(PromptError::MaxSteps {
+                maximum: limits.max_steps,
+            });
+        }
+        let model_turns = completed_turns + 1;
         check_cancelled(cancellation)?;
+        drain_steers(steering, &mut messages, steers);
         model_tools.retain(|tool| tool.name != ASSET_TOOL_NAME);
         if assets.is_some_and(|source| !source.is_empty()) {
             model_tools.push(asset_tool());
@@ -541,6 +605,8 @@ where
         let turn = match completion {
             Ok(turn) => turn,
             Err(InferenceError::Cancelled) => {
+                let steered = steering.is_some()
+                    && !cancellation.is_some_and(CancellationProbe::is_cancelled);
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -548,7 +614,7 @@ where
                         model.turn = model_turns,
                         duration_ms = milliseconds(model_started.elapsed()),
                         message.count = messages.len(),
-                        outcome = "interrupted",
+                        outcome = if steered { "steered" } else { "interrupted" },
                     },
                     "model turn interrupted"
                 );
@@ -564,6 +630,10 @@ where
                     "model turn answer"
                 );
                 drop(model_entered);
+                if steered {
+                    emit(progress, ProgressEvent::Steered { turn: model_turns });
+                    continue;
+                }
                 return Err(PromptError::Cancelled);
             }
             Err(error) => {
@@ -581,6 +651,7 @@ where
                 return Err(error.into());
             }
         };
+        completed_turns = model_turns;
         if let Some(observer) = usage_observer {
             observer.observe(turn.usage);
         }
@@ -636,6 +707,10 @@ where
 
         if turn.tool_calls.is_empty() {
             check_cancelled(cancellation)?;
+            if model_turns < limits.max_steps && drain_steers(steering, &mut messages, steers) {
+                emit(progress, ProgressEvent::Steered { turn: model_turns });
+                continue;
+            }
             let answer = turn
                 .content
                 .filter(|content| !content.trim().is_empty())
@@ -856,10 +931,6 @@ where
             messages.push(ModelMessage::tool(call.id, format_script_outcome(&outcome)));
         }
     }
-
-    Err(PromptError::MaxSteps {
-        maximum: limits.max_steps,
-    })
 }
 
 fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), PromptError> {
@@ -1530,9 +1601,9 @@ mod tests {
         DEFAULT_MAX_TURNS, FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
-        ScriptRuntime, SessionInputs, agent_config_tool, format_script_outcome, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_tool,
+        ScriptRuntime, SessionInputs, SteerSource, agent_config_tool, format_script_outcome,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     struct ScriptedModel {
@@ -1612,6 +1683,7 @@ mod tests {
     struct RecordingRuntime {
         scripts: Mutex<Vec<(String, u32)>>,
         capability_calls_per_script: u32,
+        steers: Option<Arc<QueuedSteers>>,
     }
 
     impl RecordingRuntime {
@@ -1619,6 +1691,7 @@ mod tests {
             Self {
                 scripts: Mutex::new(Vec::new()),
                 capability_calls_per_script,
+                steers: None,
             }
         }
     }
@@ -1629,6 +1702,9 @@ mod tests {
                 .lock()
                 .expect("script lock")
                 .push((script.to_owned(), max_capability_calls));
+            if let Some(steers) = &self.steers {
+                steers.push("msg2");
+            }
             let capability_calls = self.capability_calls_per_script.min(max_capability_calls);
             ScriptOutcome {
                 output: format!("ran {} bytes", script.len()),
@@ -1766,6 +1842,8 @@ mod tests {
                 format!("started {agent} of {max_steps}")
             }
             ProgressEvent::ModelTurn { turn, of } => format!("model-turn {turn}/{of}"),
+            ProgressEvent::Steered { turn } => format!("steered {turn}"),
+            ProgressEvent::Note { text, eta } => format!("note {:?} {eta:?}", text.as_str()),
             ProgressEvent::TextDelta {
                 turn,
                 text,
@@ -1887,6 +1965,341 @@ mod tests {
                 via: CancelVia::NativeStop,
             })
         }
+    }
+
+    #[derive(Default)]
+    struct QueuedSteers(Mutex<VecDeque<String>>);
+
+    impl QueuedSteers {
+        fn push(&self, text: &str) {
+            self.0.lock().expect("steers").push_back(text.to_owned());
+        }
+    }
+
+    impl SteerSource for QueuedSteers {
+        fn drain(&self) -> Vec<String> {
+            self.0.lock().expect("steers").drain(..).collect()
+        }
+    }
+
+    enum SteerMode {
+        Abort,
+        Boundary,
+    }
+
+    struct SteeringModel {
+        scripted: ScriptedModel,
+        steers: Arc<QueuedSteers>,
+        mode: SteerMode,
+    }
+
+    impl SteeringModel {
+        fn new(turns: impl IntoIterator<Item = AssistantTurn>, mode: SteerMode) -> Self {
+            Self {
+                scripted: ScriptedModel::new(turns),
+                steers: Arc::default(),
+                mode,
+            }
+        }
+
+        fn request(&self, index: usize) -> Vec<(String, String)> {
+            self.scripted.observed_messages.lock().expect("messages")[index]
+                .iter()
+                .map(|message| {
+                    (
+                        message.role().to_owned(),
+                        message.content().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    impl ChatModel for SteeringModel {
+        fn complete(
+            &self,
+            messages: &[ModelMessage],
+            tools: &[ModelTool],
+            options: &CompletionOptions,
+            on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
+            let first = self
+                .scripted
+                .observed_messages
+                .lock()
+                .expect("messages")
+                .is_empty();
+            let turn = self.scripted.complete(messages, tools, options, on_event);
+            if first {
+                self.steers.push("msg2");
+                if matches!(self.mode, SteerMode::Abort) {
+                    return Err(InferenceError::Cancelled);
+                }
+            }
+            turn
+        }
+    }
+
+    #[test]
+    fn an_aborted_call_keeps_its_step_number_and_finishes_once() {
+        let model = SteeringModel::new([answer("discarded"), answer("done")], SteerMode::Abort);
+        let (sink, progress) = recording_sink();
+        let mut history = History::default();
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(1, 4))
+                .with_steering(model.steers.as_ref())
+                .with_progress(progress),
+            &mut history,
+        )
+        .expect("abort does not spend the only step");
+        assert_eq!(outcome.answer, "done");
+        assert_eq!(outcome.model_turns, 1);
+        assert_eq!(
+            model.request(1),
+            [
+                ("user".into(), "msg1".into()),
+                ("user".into(), "msg2".into())
+            ]
+        );
+        assert_eq!(
+            sink.labels(),
+            [
+                "model-turn 1/1",
+                "steered 1",
+                "model-turn 1/1",
+                "answered 1 calls=0",
+                "finished Answered turns=1 calls=0"
+            ]
+        );
+        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+    }
+
+    #[test]
+    fn a_boundary_steer_follows_the_draft_before_the_only_finished_event() {
+        let model = SteeringModel::new([answer("draft"), answer("done")], SteerMode::Boundary);
+        let (sink, progress) = recording_sink();
+        let mut history = History::default();
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(2, 4))
+                .with_steering(model.steers.as_ref())
+                .with_progress(progress),
+            &mut history,
+        )
+        .expect("the queued steer prevents the draft from finishing");
+        assert_eq!(outcome.answer, "done");
+        assert_eq!(outcome.model_turns, 2);
+        assert_eq!(
+            model.request(1),
+            [
+                ("user".into(), "msg1".into()),
+                ("assistant".into(), "draft".into()),
+                ("user".into(), "msg2".into())
+            ]
+        );
+        assert_eq!(
+            sink.labels(),
+            [
+                "model-turn 1/2",
+                "answered 1 calls=0",
+                "steered 1",
+                "model-turn 2/2",
+                "answered 2 calls=0",
+                "finished Answered turns=2 calls=0"
+            ]
+        );
+        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+        assert_eq!(history.turns()[0].answer(), Some("done"));
+    }
+
+    #[test]
+    fn an_aborted_tool_proposal_never_runs_before_the_steer() {
+        let model = SteeringModel::new(
+            [script_call("call-1", "echo one"), answer("done")],
+            SteerMode::Abort,
+        );
+        let runtime = RecordingRuntime::new(1);
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("msg1", limits(2, 4)).with_steering(model.steers.as_ref()),
+            &mut History::default(),
+        )
+        .expect("the cancelled proposal is discarded");
+        assert_eq!(outcome.script_calls, 0);
+        assert!(runtime.scripts.lock().expect("scripts").is_empty());
+        assert_eq!(
+            model.request(1),
+            [
+                ("user".into(), "msg1".into()),
+                ("user".into(), "msg2".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_steer_during_a_script_follows_its_intact_result() {
+        let model = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
+        let steers = Arc::new(QueuedSteers::default());
+        let mut runtime = RecordingRuntime::new(1);
+        runtime.steers = Some(Arc::clone(&steers));
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("msg1", limits(2, 4)).with_steering(steers.as_ref()),
+            &mut History::default(),
+        )
+        .expect("script work is not interrupted");
+        assert_eq!(outcome.script_calls, 1);
+        assert_eq!(outcome.capability_invocations, 1);
+        let messages = model.observed_messages.lock().expect("messages");
+        let second = &messages[1];
+        assert_eq!(
+            second.iter().map(ModelMessage::role).collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "user"]
+        );
+        assert_eq!(
+            second[2].content(),
+            Some(
+                format_script_outcome(&ScriptOutcome {
+                    output: "ran 8 bytes".into(),
+                    exit_code: ExitCode::SUCCESS,
+                    truncated: false,
+                    capability_calls: 1,
+                    steps: 1,
+                })
+                .as_str()
+            )
+        );
+        assert_eq!(second[3].content(), Some("msg2"));
+    }
+
+    #[test]
+    fn a_stop_wins_over_a_queued_steer() {
+        let model = SteeringModel::new([answer("discarded")], SteerMode::Abort);
+        let probe = StopsDuringTheTurn {
+            reads: AtomicUsize::new(0),
+            after: 1,
+        };
+        let (sink, progress) = recording_sink();
+        let error = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(2, 4))
+                .with_steering(model.steers.as_ref())
+                .with_cancellation(&probe)
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect_err("a session stop is not a model interruption");
+        assert!(matches!(error, PromptError::Cancelled));
+        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert!(
+            !sink
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn the_last_answer_leaves_pending_steers_for_a_follow_up() {
+        let model = SteeringModel::new([answer("done")], SteerMode::Boundary);
+        let mut history = History::default();
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(1, 4)).with_steering(model.steers.as_ref()),
+            &mut history,
+        )
+        .expect("the final step answers");
+        assert_eq!(outcome.answer, "done");
+        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(history.turns()[0].user(), "msg1");
+    }
+
+    #[test]
+    fn a_boundary_draft_is_reset_before_the_replacement_declines() {
+        struct StreamingDraft(SteeringModel);
+        impl ChatModel for StreamingDraft {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                tools: &[ModelTool],
+                options: &CompletionOptions,
+                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+            ) -> Result<AssistantTurn, InferenceError> {
+                if self
+                    .0
+                    .scripted
+                    .observed_messages
+                    .lock()
+                    .expect("messages")
+                    .is_empty()
+                {
+                    let events = dekopon_model::events_from_transcript(
+                        dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                    )
+                    .expect("streamed draft");
+                    for event in events {
+                        if on_event(event).is_break() {
+                            return Err(InferenceError::Cancelled);
+                        }
+                    }
+                }
+                self.0.complete(messages, tools, options, on_event)
+            }
+        }
+        let model = StreamingDraft(SteeringModel::new(
+            [answer("draft"), decline(json!({}))],
+            SteerMode::Boundary,
+        ));
+        let (sink, progress) = recording_sink();
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(2, 4))
+                .with_steering(model.0.steers.as_ref())
+                .with_optional_reply()
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("replacement declines");
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        let mut text = dekopon_model::ModelText::default();
+        assert!(!sink.forwarded_chars().is_empty());
+        for event in sink.events.lock().expect("progress").iter() {
+            match event {
+                ProgressEvent::TextDelta { text: delta, .. } => text.push(delta),
+                ProgressEvent::Steered { .. } => text = dekopon_model::ModelText::default(),
+                ProgressEvent::Finished { .. } => assert!(text.as_str().is_empty()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_decline_leaves_pending_steers_for_a_follow_up() {
+        let model = SteeringModel::new([decline(json!({}))], SteerMode::Boundary);
+        let outcome = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(2, 4))
+                .with_steering(model.steers.as_ref())
+                .with_optional_reply(),
+            &mut History::default(),
+        )
+        .expect("decline does not drain a pending steer");
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert_eq!(model.steers.drain(), ["msg2"]);
     }
 
     #[test]
@@ -2427,6 +2840,27 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_user_keeps_the_newest_turn_with_a_marked_prefix() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 8,
+            max_bytes: 65536,
+        });
+        history.record(ConversationTurn::completed("earlier", "answer"));
+        let user = "é".repeat(35000);
+        assert_eq!(user.len(), 70000);
+
+        history.record(ConversationTurn::completed(&user, "answer"));
+
+        assert_eq!(history.len(), 1);
+        let turn = &history.turns()[0];
+        let prefix = turn.user().strip_suffix("[…]").expect("truncation marker");
+        assert!(user.starts_with(prefix));
+        assert_eq!(prefix.len(), 65524);
+        assert_eq!(turn.answer(), Some("answer"));
+        assert!(history.bytes() <= history.limits().max_bytes);
+    }
+
+    #[test]
     fn an_exchange_too_large_for_the_window_leaves_it_empty_rather_than_half_present() {
         let mut history = History::new(HistoryLimits {
             max_turns: 8,
@@ -2704,6 +3138,29 @@ mod tests {
             tool.description
         );
         assert_no_doubled_spaces(&tool.description);
+    }
+
+    #[test]
+    fn the_progress_description_is_offered_only_by_the_session_opt_in() {
+        for enabled in [false, true] {
+            let model = ScriptedModel::new([answer("done")]);
+            let runtime = RecordingRuntime::new(0);
+            let mut inputs = SessionInputs::new("work", limits(1, 1));
+            if enabled {
+                inputs = inputs.with_progress_notes();
+            }
+            run_prompt_session(&model, &runtime, inputs, &mut History::default()).unwrap();
+            let tools = model.observed_tools.lock().unwrap();
+            let script = tools[0]
+                .iter()
+                .find(|tool| tool.name == SCRIPT_TOOL_NAME)
+                .unwrap();
+            let mut expected = script_tool(&runtime.command_words()).description;
+            if enabled {
+                expected.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+            }
+            assert_eq!(script.description, expected);
+        }
     }
 
     fn assert_no_doubled_spaces(description: &str) {

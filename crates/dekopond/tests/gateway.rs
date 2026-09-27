@@ -284,7 +284,19 @@ fn spawn_model(
                     hold.wait();
                 }
             }
-            respond(stream, &response);
+            if let Err(error) = respond(stream, &response) {
+                assert!(
+                    index == 0
+                        && first_answer_hold.is_some()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                    "only an interrupted held response may disconnect: {error}"
+                );
+            }
         }
     });
     (format!("http://{address}/v1"), requests, bodies)
@@ -326,20 +338,17 @@ fn read_request(stream: &mut TcpStream) -> Option<Value> {
     serde_json::from_slice(&bytes[header_end..]).ok()
 }
 
-fn respond(mut stream: TcpStream, body: &Value) {
+fn respond(mut stream: TcpStream, body: &Value) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
-    )
-    .expect("response headers write");
+    )?;
     for chunk in chunks(body) {
-        write!(stream, "data: {chunk}\n\n").expect("chunk writes");
-        stream.flush().expect("chunk flushes");
+        write!(stream, "data: {chunk}\n\n")?;
+        stream.flush()?;
     }
-    stream
-        .write_all(b"data: [DONE]\n\n")
-        .expect("sentinel writes");
-    stream.flush().expect("response flushes");
+    stream.write_all(b"data: [DONE]\n\n")?;
+    stream.flush()
 }
 
 fn chunks(body: &Value) -> Vec<Value> {
@@ -694,23 +703,34 @@ async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture
 /// Timing this race is unreliable, since an instant answer can finish before a second caller's line
 /// is written; the hold makes mid-run a fact, not a bet on scheduling.
 #[derive(Clone)]
-struct ModelHold(Arc<(Mutex<bool>, Condvar)>);
+struct ModelHold(Arc<(Mutex<bool>, Condvar, tokio::sync::Notify)>);
 
 impl ModelHold {
     fn new() -> Self {
-        Self(Arc::new((Mutex::new(false), Condvar::new())))
+        Self(Arc::new((
+            Mutex::new(false),
+            Condvar::new(),
+            tokio::sync::Notify::new(),
+        )))
     }
 
     fn wait(&self) {
-        let (released, ready) = &*self.0;
+        let (released, ready, entered) = &*self.0;
+        entered.notify_one();
         let mut released = released.lock().expect("the model hold locks");
         while !*released {
             released = ready.wait(released).expect("the model hold locks");
         }
     }
 
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.0.2.notified())
+            .await
+            .expect("model entered");
+    }
+
     fn release(&self) {
-        let (released, ready) = &*self.0;
+        let (released, ready, _) = &*self.0;
         *released.lock().expect("the model hold locks") = true;
         ready.notify_all();
     }
@@ -1097,18 +1117,23 @@ fn ask_lines(socket: &Path, subject: &str, text: &str) -> Vec<Value> {
     let request = json!({"subject": subject, "text": text}).to_string();
     writeln!(stream, "{request}").expect("request writes");
     stream.flush().expect("request flushes");
-    read_lines(stream)
+    read_lines(stream, |value| value.get("reply").is_some())
 }
 
-fn ask_lines_on(stream: UnixStream, subject: &str, text: &str) -> Vec<Value> {
+fn ask_lines_on(
+    stream: UnixStream,
+    subject: &str,
+    text: &str,
+    finished: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
     let mut writer = stream.try_clone().expect("the connection clones");
     let request = json!({"subject": subject, "text": text}).to_string();
     writeln!(writer, "{request}").expect("request writes");
     writer.flush().expect("request flushes");
-    read_lines(stream)
+    read_lines(stream, finished)
 }
 
-fn read_lines(stream: UnixStream) -> Vec<Value> {
+fn read_lines(stream: UnixStream, finished: impl Fn(&Value) -> bool) -> Vec<Value> {
     let mut reader = BufReader::new(stream);
     let mut lines = Vec::new();
     loop {
@@ -1119,7 +1144,7 @@ fn read_lines(stream: UnixStream) -> Vec<Value> {
             "the connection closed before the answer: {lines:?}"
         );
         let value = serde_json::from_str::<Value>(&line).expect("every line is JSON");
-        let answered = value.get("reply").is_some();
+        let answered = finished(&value);
         lines.push(value);
         if answered {
             return lines;
@@ -1397,6 +1422,76 @@ async fn keep_alive_ticks_edit_one_message_until_the_budget_stops_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_second_local_message_steers_one_run_and_reaches_its_second_model_request() {
+    let audit = Audit::exclusive().await;
+    let hold = ModelHold::new();
+    let fixture = boot_held(
+        vec![
+            final_answer("discarded draft"),
+            final_answer("Both received."),
+        ],
+        &hold,
+    )
+    .await;
+    let socket = fixture.socket();
+    let stream = UnixStream::connect(&socket).expect("first connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read bound");
+    let asking = tokio::task::spawn_blocking(move || {
+        ask_lines_on(stream, MAPPED_SUBJECT, "first input", |value| {
+            value.get("reply").is_some()
+        })
+    });
+    hold.wait_until_entered().await;
+    let stream = UnixStream::connect(&socket).expect("steering connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read bound");
+    let seen = tokio::task::spawn_blocking(move || {
+        ask_lines_on(stream, MAPPED_SUBJECT, "second input", |value| {
+            value["reaction"] == true
+        })
+    })
+    .await
+    .expect("steer acknowledged");
+    assert_eq!(seen, [json!({"reaction": true})]);
+    hold.release();
+    let lines = asking.await.expect("answer received");
+    let replies: Vec<_> = lines
+        .iter()
+        .filter_map(|value| value["reply"].as_str())
+        .collect();
+    assert_eq!(replies, ["Both received."]);
+    assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
+    let prompt = fixture.prompt(1);
+    for text in ["first input", "second input"] {
+        assert!(
+            prompt
+                .iter()
+                .any(|(role, body)| role == "user" && body.contains(text)),
+            "{prompt:?}"
+        );
+    }
+    fixture.shutdown().await;
+    assert!(
+        audit
+            .find("gateway.admission", &[("outcome", "\"steered\"")])
+            .is_some()
+    );
+    assert_eq!(
+        audit
+            .capture
+            .spans()
+            .iter()
+            .filter(|(name, fields)| *name == "gateway.session"
+                && fields.contains("gen_ai.operation.name=\"invoke_agent\""))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stop_word_cancels_the_session_running_in_that_conversation() {
     let audit = Audit::exclusive().await;
     let hold = ModelHold::new();
@@ -1409,7 +1504,11 @@ async fn a_stop_word_cancels_the_session_running_in_that_conversation() {
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
             .expect("read timeout configures");
-        tokio::task::spawn_blocking(move || ask_lines_on(stream, MAPPED_SUBJECT, "say hi"))
+        tokio::task::spawn_blocking(move || {
+            ask_lines_on(stream, MAPPED_SUBJECT, "say hi", |value| {
+                value.get("reply").is_some()
+            })
+        })
     };
     for _ in 0..6_000 {
         if fixture.model_requests.load(Ordering::SeqCst) > 0 {

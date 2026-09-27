@@ -12,8 +12,8 @@ use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
     BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatTransportKind,
     ConstraintCatalog, ConstraintSet, Conversation, ConversationKind, CredentialStore,
-    DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
-    PolicyWorld, RouteConflict,
+    DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog,
+    PolicyEngine, PolicyWorld, RouteConflict,
 };
 
 const MEMORY_RECORD: &str = "memory.chat.record";
@@ -433,16 +433,16 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
             &gateway(),
             Some(&attestor),
             &session.bound_to(id.clone()),
-            DeliveredTurnRequest {
+            DeliveredTurnRequest::new(
                 id,
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                delivery: DeliveryIdentity::Slack {
+                TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: "1712345678.000101".to_owned(),
                 },
-                user: "must remain unmaterialized".to_owned(),
-                assistant: "audit failed".to_owned(),
-            },
+                "must remain unmaterialized".to_owned(),
+                DeliveredAnswer::accepted_by_transport("audit failed".to_owned()),
+            ),
         )
         .await
         .expect_err("full authorization audit refuses before storage materialization");
@@ -1273,16 +1273,16 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             &gateway(),
             Some(&grant),
             &claim.bound_to(record_id.clone()),
-            DeliveredTurnRequest {
-                id: record_id,
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                delivery: DeliveryIdentity::Slack {
+            DeliveredTurnRequest::new(
+                record_id,
+                TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: "1712345678.000100".to_owned(),
                 },
-                user: "What shipped?".to_owned(),
-                assistant: "Durable memory shipped.".to_owned(),
-            },
+                "What shipped?".to_owned(),
+                DeliveredAnswer::accepted_by_transport("Durable memory shipped.".to_owned()),
+            ),
         )
         .await
         .expect("record accounted");
@@ -1708,16 +1708,16 @@ async fn record_turn_in(
             &gateway(),
             Some(grant),
             &claim.bound_to(id.clone()),
-            DeliveredTurnRequest {
+            DeliveredTurnRequest::new(
                 id,
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                delivery: DeliveryIdentity::Slack {
+                TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: timestamp.to_owned(),
                 },
-                user: user.to_owned(),
-                assistant: assistant.to_owned(),
-            },
+                user.to_owned(),
+                DeliveredAnswer::accepted_by_transport(assistant.to_owned()),
+            ),
         )
         .await
         .expect("record accounted")

@@ -24,11 +24,12 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
 - **WhatsApp photo bursts** — collect until 5000ms of quiet, bounded by 15000ms from the first
-  receipt by default. Persistent routes retain freshly authorized late photo references without
-  restarting busy work or launching a delayed run; completion text or a separate acknowledgment
-  asks whether another version is wanted. Captions keep the ordinary message path, and Stop
-  cancels late intake. References download only on demand. Upgrade both daemons together for
-  nullable inventory lengths; see [0.19.0 upgrading](../../docs/upgrading.md#whatsapp-burst-collection-and-unknown-lengths-0190).
+  receipt by default. Photos arriving during the sender's run become ordinary steers after
+  collection, using that run's asset access; downloads remain on demand.
+- **Steering** — same-sender input interrupts only the model (`steering: abort`, default) or waits
+  for the step boundary (`boundary`). Other senders and wakes queue their own turns. The shared
+  mailbox holds eight items; busy replies mean a full mailbox or process-wide saturation, not an
+  ordinary follow-up. User stops drop only that sender's queued input.
 - **Asset handles** — exact proposal references carry read-only descriptors, never expanded bytes.
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
@@ -39,7 +40,9 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits
   that surface for an explicit Stop button or when no indicator works. `progressDetail` controls
   prose only: explicitly requested `stream` remains independent of progress/detail Off. WhatsApp
-  stays typing-only. See [presentation limits](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
+  session progress stays typing-only. Separate best-effort 👀 acknowledgments cover accepted steers and queued
+  non-wake messages with liveness targets, independent of Slack's classic fallback.
+  See [presentation limits](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
   A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
@@ -49,9 +52,9 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   no-work session without sending anything to chat instead of making the agent take the last word.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
-- **Conversations** — one independent session per message unless a route sets
-  `mode: persistent`, whose `privateConversation` default keeps per-subject history and whose
-  explicit `sharedConversation` scope shares one exact agent/transport/conversation window.
+- **Conversations** — `persistent` is the route default, with per-subject history under
+  `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
+  window. `memory: { mode: oneShot }` starts each session without prior history.
   Shared turns carry gateway-authored canonical participant labels, and those identifiers reach
   the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
@@ -117,10 +120,6 @@ WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
 `debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
 an enabled maximum must be at least the quiet interval. See the
 [multi-message contract](../../docs/dekopond.md#multi-message-media-inputs) for bounds and isolation.
-Persistent WhatsApp routes retain freshly authorized late photo references without starting another
-model run, then ask whether another version is wanted. See
-[late photos](../../docs/dekopond.md#late-photos-on-persistent-whatsapp-routes) for completion races,
-caption refusals, cancellation and temporary-retention limits.
 
 ## Run
 
@@ -137,7 +136,8 @@ boundaries this daemon sits outside of.
 When the broker returns an effective all-three memory surface, the prompt notes only the on-demand
 `memory recent` and `memory search` forms. After model success, the gateway bounds the answer once,
 requires complete service/kernel transport acceptance, and sends exactly one fresh hidden record
-request containing the original bounded sender text and exact accepted answer. It never retries;
+request containing the original bounded sender text plus consumed raw steer texts and the exact
+accepted answer. Gateway timing/asset notes are excluded. It never retries;
 record failure cannot change an already delivered answer. Receipts do not prove human receipt.
 
 ## Isolated model authentication

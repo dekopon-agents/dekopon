@@ -22,6 +22,8 @@ const FORMAT_VERSION: u32 = 1;
 const EXTENSION: &str = "jsonl";
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
+// The journal's own bound on the JSON-encoded user field; the raw answer is never cut.
+const MAX_USER_FIELD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum JournalError {
@@ -415,8 +417,7 @@ impl Journal {
             assets,
             last_asset_id: max_asset_id,
         };
-        let mut encoded = serde_json::to_vec(&line).map_err(io::Error::from)?;
-        encoded.push(b'\n');
+        let encoded = encode_line(line)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -502,6 +503,34 @@ fn read_limit(window: MemoryWindow) -> u64 {
     compaction_threshold(window).saturating_mul(2)
 }
 
+fn encode_line(mut line: Line) -> Result<Vec<u8>, JournalError> {
+    if serde_json::to_vec(&line.user)
+        .map_err(io::Error::from)?
+        .len()
+        > MAX_USER_FIELD_BYTES
+    {
+        let marker = "[…]";
+        let mut remaining = (MAX_USER_FIELD_BYTES - marker.len() - 2) as u64;
+        let mut end = 0;
+        for (index, ch) in line.user.char_indices() {
+            let mut utf8 = [0; 4];
+            let mut escaped = io::Cursor::new([0; 8]);
+            serde_json::to_writer(&mut escaped, ch.encode_utf8(&mut utf8))
+                .map_err(io::Error::from)?;
+            let Some(rest) = remaining.checked_sub(escaped.position() - 2) else {
+                break;
+            };
+            remaining = rest;
+            end = index + ch.len_utf8();
+        }
+        line.user.truncate(end);
+        line.user.push_str(marker);
+    }
+    let mut encoded = serde_json::to_vec(&line).map_err(io::Error::from)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
 fn millis(at: SystemTime) -> u64 {
     duration_millis(at.duration_since(UNIX_EPOCH).unwrap_or_default())
 }
@@ -575,10 +604,8 @@ fn compact(path: &Path, window: MemoryWindow, limit: u64) -> Result<u64, Journal
         .truncate(true)
         .mode(0o600)
         .open(&temporary)?;
-    for line in &lines {
-        let mut encoded = serde_json::to_vec(line).map_err(io::Error::from)?;
-        encoded.push(b'\n');
-        file.write_all(&encoded)?;
+    for line in lines {
+        file.write_all(&encode_line(line)?)?;
     }
     drop(file);
     fs::rename(&temporary, path)?;
@@ -695,6 +722,106 @@ mod tests {
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(users(&recalled), ["one", "two"]);
         assert_eq!(recalled.history.turns()[1].answer(), Some("re: two"));
+    }
+
+    #[test]
+    fn an_oversized_escaped_steer_preserves_previously_journaled_photos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut window = window();
+        window.limits.max_bytes = 100_000;
+        window.limits.max_turns = 1;
+        let user = format!("{}🦀", "\u{1}".repeat(40)).repeat(2_200);
+        let turn = ConversationTurn::completed(&user, "delivered 🦀");
+        let inventory = photos(1, whatsapp);
+        {
+            let journal = Journal::open(dir.path(), 1 << 20).expect("open");
+            journal
+                .append(
+                    &stem,
+                    &Entry {
+                        at: now,
+                        grant: GRANT,
+                        turn: &ConversationTurn::completed("photo", "seen photo"),
+                        inventory: &inventory,
+                    },
+                    window,
+                )
+                .expect("append photo first");
+            journal
+                .append(
+                    &stem,
+                    &Entry {
+                        at: now,
+                        grant: GRANT,
+                        turn: &turn,
+                        inventory: &inventory,
+                    },
+                    window,
+                )
+                .expect("append escaped input");
+            compact(&journal.path(&stem), window, read_limit(window)).expect("compact");
+            let lines = read_lines(&journal.path(&stem), read_limit(window)).expect("read");
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].grant, GRANT);
+            assert_eq!(lines[0].at_ms, millis(now));
+            assert_eq!(lines[0].last_asset_id, 1);
+        }
+        let journal = Journal::open(dir.path(), 1 << 20).expect("reopen");
+        let recalled = journal.recall(&stem, GRANT, window, now).expect("recall");
+        assert_eq!(recalled.history.turns().len(), 1);
+        let recorded = &recalled.history.turns()[0];
+        let prefix = recorded
+            .user()
+            .strip_suffix("[…]")
+            .expect("marked truncation");
+        assert!(user.starts_with(prefix));
+        assert!(!prefix.is_empty());
+        assert_eq!(recorded.answer(), Some("delivered 🦀"));
+        assert_eq!(recalled.assets.len(), 1);
+        assert_eq!(recalled.assets[0].id, inventory[0].id);
+        assert_eq!(recalled.assets[0].asset.name, inventory[0].name);
+        assert!(
+            matches!(recalled.assets[0].asset.source.as_ref(), Some(AssetSourceRef::WhatsApp { media_id, .. }) if media_id == "media-0")
+        );
+        assert_eq!(recalled.next_asset_id, 2);
+        assert!(
+            serde_json::to_vec(recorded.user())
+                .expect("encoded user")
+                .len()
+                <= MAX_USER_FIELD_BYTES
+        );
+    }
+
+    #[test]
+    fn an_ordinary_turn_with_a_large_answer_survives_journal_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut window = window();
+        window.limits.max_bytes = 100_000;
+        let answer = "a".repeat(70_000);
+        {
+            let journal = Journal::open(dir.path(), 1 << 20).expect("open");
+            journal
+                .append(
+                    &stem,
+                    &Entry {
+                        at: now,
+                        grant: GRANT,
+                        turn: &ConversationTurn::completed("question", answer.as_str()),
+                        inventory: &[],
+                    },
+                    window,
+                )
+                .expect("append ordinary turn");
+        }
+        let journal = Journal::open(dir.path(), 1 << 20).expect("reopen");
+        let recalled = journal.recall(&stem, GRANT, window, now).expect("recall");
+        assert_eq!(recalled.history.turns().len(), 1);
+        assert_eq!(recalled.history.turns()[0].user(), "question");
+        assert_eq!(recalled.history.turns()[0].answer(), Some(answer.as_str()));
     }
 
     #[test]
