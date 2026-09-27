@@ -5504,12 +5504,14 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
         models.prompt(1),
         transcript(&[
             ("system", &expected_asset_instructions()),
+            ("user", "[gateway:[…]"),
+            ("assistant", "ok"),
             (
                 "user",
                 &format!("[gateway: authenticated participant: {SUBJECT}]\nfollow up"),
             ),
         ]),
-        "an attributed turn too large for the window is not replayed without its label"
+        "the attribution counts against the retained user prefix's byte budget"
     );
 }
 

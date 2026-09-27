@@ -137,7 +137,19 @@ impl History {
 
     /// Only the prompt and answer are kept, not the tool calls between them, so trimming can never
     /// orphan half of a remembered exchange.
-    pub fn record(&mut self, turn: ConversationTurn) {
+    pub fn record(&mut self, mut turn: ConversationTurn) {
+        const MARKER: &str = "[…]";
+        if turn.bytes() > self.limits.max_bytes
+            && let Some(prefix_bytes) = self
+                .limits
+                .max_bytes
+                .checked_sub(turn.answer.as_ref().map_or(0, String::len))
+                .and_then(|remaining| remaining.checked_sub(MARKER.len()))
+        {
+            turn.user
+                .truncate(turn.user.floor_char_boundary(prefix_bytes));
+            turn.user.push_str(MARKER);
+        }
         self.turns.push(turn);
         self.trim();
     }

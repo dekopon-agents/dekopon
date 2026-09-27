@@ -513,6 +513,8 @@ Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refus
 `outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains
 the steer text and reuses the interrupted call's `model.turn` index. Aborted calls remain observable
 but do not count toward completed steps. These records remain useful without a `gateway.session` wrapper span.
+Admission acknowledgment failures emit debug-only `gateway_steer_ack_failed`, with `transport` and
+`error`; expiration of the two-second bound is `error = deadline`.
 
 Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
 `gateway_transport_recovering` carries the configured `transport`, stable error `category`,
