@@ -36,10 +36,11 @@ All notable changes to Dekopon are documented here. The format is based on
 - A finished run's terminal cleanup no longer overwrites the next turn's Working status: cleanup
   now runs to completion, including the native Idle write, before the acknowledgment that lets the
   same thread's next turn start.
-- Shell `jq` builtin parses a piped string as JSON before filtering, falling back to indexing it
-  as a string only when it does not parse. Fixes the common `result=$(cmd); echo "$result" | jq`
-  shape, which previously handed `jq` the provider's JSON captured as a string rather than the
-  parsed value ([#279](https://github.com/dekopon-agents/dekopon/issues/279)).
+- Shell `jq` builtin parses a piped string as its JSON object or array before filtering, keeping
+  a string that holds a scalar or non-JSON text as a string. Fixes the common
+  `result=$(cmd); echo "$result" | jq` shape, where `echo "$result"` stringifies the captured
+  object into display text and `jq` previously indexed that text as a string rather than parsing
+  it back ([#279](https://github.com/dekopon-agents/dekopon/issues/279)).
 
 ## [dekopon-chart-0.17.0] - 2026-09-27
 

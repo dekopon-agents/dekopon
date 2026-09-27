@@ -846,6 +846,16 @@ fn a_here_document_becomes_the_commands_input_as_one_string() {
 }
 
 #[test]
+fn a_captured_object_reaches_jq_through_an_echo_pipe() {
+    // `r=$(cmd)` captures the object; `echo "$r"` is what stringifies it into display text,
+    // and jq parses that text back rather than indexing it as a string.
+    assert_eq!(
+        output(r#"r=$(probe object --a 1 --b 2); echo "$r" | jq '.a + .b'"#),
+        "3"
+    );
+}
+
+#[test]
 fn a_here_document_interpolates_unless_its_delimiter_is_quoted() {
     assert_eq!(output("id=7\ncat <<EOF\nid=$id\nEOF"), "id=7");
     assert_eq!(output("id=7\ncat <<'EOF'\nid=$id\nEOF"), "id=$id");

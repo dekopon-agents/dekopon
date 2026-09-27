@@ -1431,8 +1431,8 @@ the metacharacter rather than a search that quietly finds nothing. Under `-E`, a
 mean what they mean in any regex, but the replacement half of `sed` is still literal text, so \
 groups select and do not substitute. `${#NAME}` counts characters of a string but elements of an \
 array and keys of an object, because values here are real JSON. Use `jq` when the thing you want \
-is structure rather than lines: a piped or here-document string that parses as JSON is filtered \
-as that value, not indexed as text.
+is structure rather than lines: a piped or here-document string that parses to an object or \
+array is filtered as that value, and a string holding a scalar is still indexed as text.
 
 Reading the result. The tool result is your only evidence: what a script printed is what you \
 know, and what it did not print you do not know, so never guess what a capability returned, what \
