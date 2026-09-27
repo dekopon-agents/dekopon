@@ -139,9 +139,11 @@ impl ProgressPolicy {
         let surface = Surface::new(inputs, Arc::clone(&coordination), counters);
         #[expect(
             clippy::disallowed_methods,
-            reason = "detached on purpose: post-answer cleanup outlives the session so its \
-                      admission permit frees now; bounded by EVENT_QUEUE and each driver call's \
-                      timeout, and it ends once the terminal request and event queue are done"
+            reason = "detached on purpose: cleanup now finishes before the terminal \
+                      acknowledgment that frees the session's admission permit, but cancellation \
+                      and coordination-end exits still run this after their caller stops \
+                      watching; bounded by EVENT_QUEUE and each driver call's timeout, and it \
+                      ends once the terminal request and event queue are done"
         )]
         drop(tokio::spawn(tracing::Instrument::instrument(
             run(surface, events_rx, text_rx, terminal_rx, cancellation),
@@ -1080,7 +1082,6 @@ async fn run(
                 // Cleanup's Idle write must land before the caller can admit this thread's next
                 // turn, since Slack never reverts native status on its own when the reply posts.
                 surface.cleanup().await;
-                coordination.finish();
                 if request.done.send(delivered).is_err() {
                     tracing::debug!(event = "gateway_progress_terminal_unobserved");
                 }

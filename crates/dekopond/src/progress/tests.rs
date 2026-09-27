@@ -884,9 +884,9 @@ async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() 
         })
         .collect();
     assert_eq!(
-        statuses.last(),
-        Some(&Status::Working),
-        "run A's delayed idle cleanup must not overwrite run B's working status: {statuses:?}"
+        statuses,
+        [Status::Working, Status::Idle, Status::Working],
+        "run A's delayed idle cleanup must land before, not after, run B's working status"
     );
     run_b.terminal(Terminal::Silent).await;
 }
