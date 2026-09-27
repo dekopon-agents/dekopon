@@ -539,7 +539,8 @@ jobs:
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set broker.providerSet.enabled=true \
             --set broker.providerSync.enabled=true \
-            --set broker.providerSync.providerSet.configMap=dekopon-providers > "$RUNNER_TEMP/provider-set.yaml"
+            --set broker.providerSync.configMap=dekopon-providers \
+            --set state.existingClaim=dekopon-state > "$RUNNER_TEMP/provider-set.yaml"
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"

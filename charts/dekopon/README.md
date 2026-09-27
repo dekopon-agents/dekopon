@@ -468,34 +468,29 @@ overlap another of the broker's own mounts.
 `broker.providerSync.enabled` renders a hook Job that runs `dekopon-brokerd provider sync` with the
 image the Deployment runs — the same `image.digest` or `image.tag`, through the same helper — so the
 package manager and the broker that consumes its lock cannot drift apart. It needs
-`broker.providerSet.enabled` and a ConfigMap holding the desired `providers.yaml`:
+`broker.providerSet.enabled` and a ConfigMap whose `providers.yaml` key holds the desired set:
 
 ```yaml
 broker:
   providerSync:
     enabled: true
-    providerSet:
-      configMap: dekopon-config
-      key: providers.yaml
+    configMap: dekopon-config
 ```
 
 The Job mounts the claim's `providerSet.subdir` at `providerSet.mountPath`, exactly as the broker
 does, and writes `providers.yaml`, `providers.lock.yaml` and `store/` there. Point `broker.yaml` at
-`<mountPath>/providers.lock.yaml` and `<mountPath>/store`. A root init container creates the
-subdirectory and hands it to `65532` as `0700`, the Deployment's own step, because the Job runs
-before the first pod exists; a `65532` init container copies the ConfigMap key in as a `0600`
+`<mountPath>/providers.lock.yaml` and `<mountPath>/store`. A root init container reclaims the claim
+root as `0:0` `0700`, creates the subdirectory and hands it to `65532` as `0700`, the Deployment's
+own step, because the Job runs before the first pod exists; a `65532` init container copies the ConfigMap key in as a `0600`
 regular file. The fetch runs as `65532` with no ServiceAccount token. `backoffLimit: 2`,
-`activeDeadlineSeconds: 600`, and the Job is removed a day after it finishes.
-
-It is a hook and not an init container of the pod: under `Recreate`, a fetch failing inside the new
-pod is an outage, while a failed hook fails the release and the old pod keeps serving. Every sync
-re-runs it; with the lock unchanged and the blobs present it fetches nothing. The broker reads the
+`activeDeadlineSeconds: 600`, and the Job is removed a day after it finishes. A failed hook fails
+the release and the old pod keeps serving. Every sync re-runs it; with the lock unchanged and the blobs present it fetches nothing. The broker reads the
 lock at startup, so a changed lock takes effect when the pod next rolls; the chart cannot checksum an
 existing ConfigMap to roll it for you.
 
 The hook runs before the release's ordinary objects exist, so the claim and the ConfigMap must
-already be there. The chart-created state claim is not, on a first install: use `state.existingClaim`
-with a claim you create earlier.
+already be there. The chart-created state claim is not, on a first install, so the default Helm hook
+refuses to render without `state.existingClaim`.
 
 `broker.providerSync.annotations` replaces the hook annotations entirely. Empty means
 `helm.sh/hook: pre-install,pre-upgrade` with `before-hook-creation`. **Argo CD** maps those Helm
@@ -892,9 +887,9 @@ exported as an audit log record over OTLP. It may post one review comment and ha
   writable directory, temp sibling plus rename) as each family's own daemon UID — `65533` for the
   gateway's, `65532` for the broker's — not a live refresh against OpenAI.
 - The provider-sync hook Job has not run in a cluster. Its rendered init and sync commands have run
-  in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume
-  mounted by `subPath` as the Job mounts it: the sync fetched every provider, and a second run
-  fetched nothing.
+  in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume and
+  a `65532`-owned `0700` claim root, mounted by `subPath` as the Job mounts it: the sync fetched every
+  provider, and a second run fetched nothing.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 

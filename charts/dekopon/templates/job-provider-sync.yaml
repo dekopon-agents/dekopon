@@ -2,6 +2,9 @@
 {{- if not .Values.broker.providerSet.enabled }}
 {{- fail "broker.providerSync.enabled requires broker.providerSet.enabled; the sync writes the lock and store the broker reads from that directory" }}
 {{- end }}
+{{- if and (not .Values.broker.providerSync.annotations) (not .Values.state.existingClaim) }}
+{{- fail "broker.providerSync.enabled with Helm's default pre-install hook requires state.existingClaim; the chart-created claim does not exist yet when the hook runs" }}
+{{- end }}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
 {{- $providerSetDir := include "dekopon.providerSetDir" . -}}
@@ -38,8 +41,8 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
-        # A fresh claim has no provider directory yet; this is the Deployment init's providerSet
-        # step, run before the first pod exists. Root never writes into the directory.
+        # The Deployment init's providerSet step, run before the first pod exists. The claim root
+        # is reclaimed first: a 65532-owned 0700 root blocks root without CAP_DAC_OVERRIDE.
         - name: claim-provider-set
           image: {{ include "dekopon.initImage" . }}
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
@@ -49,6 +52,8 @@ spec:
           args:
             - |
               set -eu
+              chown 0:0 "{{ .Values.paths.stateDir }}"
+              chmod 0700 "{{ .Values.paths.stateDir }}"
               [ -d "{{ $providerSetDir }}" ] || mkdir -p "{{ $providerSetDir }}"
               chown "{{ $uid }}:{{ $gid }}" "{{ $providerSetDir }}"
               chmod 0700 "{{ $providerSetDir }}"
@@ -104,7 +109,12 @@ spec:
           securityContext:
             {{- toYaml $runtimeSecurityContext | nindent 12 }}
           resources:
-            {{- toYaml .Values.broker.providerSync.resources | nindent 12 }}
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
           volumeMounts:
             - name: state
               mountPath: {{ $mount }}
@@ -112,9 +122,9 @@ spec:
       volumes:
         - name: provider-source
           configMap:
-            name: {{ required "broker.providerSync.providerSet.configMap is required with broker.providerSync.enabled" .Values.broker.providerSync.providerSet.configMap }}
+            name: {{ required "broker.providerSync.configMap is required with broker.providerSync.enabled" .Values.broker.providerSync.configMap }}
             items:
-              - key: {{ required "broker.providerSync.providerSet.key is required with broker.providerSync.enabled" .Values.broker.providerSync.providerSet.key }}
+              - key: providers.yaml
                 path: providers.yaml
         - name: state
           persistentVolumeClaim:
