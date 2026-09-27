@@ -57,6 +57,7 @@ struct Recorder {
     refuse_finalize: AtomicU32,
     stall_progress: AtomicU32,
     stall_finalize: AtomicU32,
+    stall_status: AtomicU32,
     post_attempts: AtomicU32,
     posts: AtomicU32,
 }
@@ -89,8 +90,13 @@ impl Recorder {
     }
 
     async fn stalled(&self, counter: &AtomicU32) {
+        self.stalled_for(counter, STALL).await;
+    }
+
+    // Shorter than STALL so the call still lands inside CALL_DEADLINE instead of timing out.
+    async fn stalled_for(&self, counter: &AtomicU32, duration: Duration) {
         if self.counted(counter) {
-            tokio::time::sleep(STALL).await;
+            tokio::time::sleep(duration).await;
         }
     }
 
@@ -148,6 +154,9 @@ impl TypingLease for Surfaces {
 #[async_trait]
 impl NativeStatus for Surfaces {
     async fn set(&self, _target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
+        self.recorder
+            .stalled_for(&self.recorder.stall_status, Duration::from_millis(500))
+            .await;
         self.recorder.push(Call::Status(status));
         Ok(())
     }
@@ -819,6 +828,67 @@ async fn every_terminal_clears_status_text_before_delivery_and_native_cleanup() 
         expected.push(Call::Status(Status::Idle));
         assert_eq!(harness.recorder.calls(), expected);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() {
+    let recorder = Arc::new(Recorder::default());
+    let driver: Arc<dyn ChatDriver> = Arc::new(TestDriver {
+        recorder: Arc::clone(&recorder),
+        surfaces: Surfaces {
+            recorder: Arc::clone(&recorder),
+            min_edit_interval: Duration::from_secs(3),
+            min_stream_interval: Duration::from_secs(2),
+        },
+        offers: Offers::default(),
+    });
+    let target = LivenessTarget::Local { connection: 1 };
+    let reply = ReplyTarget::Local { connection: 1 };
+    let liveness = liveness(false);
+    let inputs = |driver: Arc<dyn ChatDriver>| ProgressInputs {
+        driver,
+        target: Some(target.clone()),
+        reply: reply.clone(),
+        transport: "local".to_owned(),
+        detail: ProgressDetail::Plain,
+        settings: liveness.settings,
+        keep_alive: liveness.keep_alive.clone(),
+        liveness: Arc::clone(&liveness),
+        cancellation: SessionCancellation::new(),
+        max_duration: None,
+    };
+
+    // Run A starts and then finishes; its cleanup's Idle write is delayed, standing in for a
+    // real Slack round trip.
+    let (mut run_a, sink_a) = ProgressPolicy::start(inputs(Arc::clone(&driver)));
+    sink_a.emit(started());
+    settle().await;
+    recorder.stall_status.store(1, Ordering::Relaxed);
+    let delivered = run_a
+        .terminal(Terminal::Answered(OutboundReply::text("done")))
+        .await;
+    assert!(delivered, "the answer still reaches the person");
+
+    // Run B is the next turn admitted in the same thread, right after run A's acknowledgment.
+    let (mut run_b, sink_b) = ProgressPolicy::start(inputs(Arc::clone(&driver)));
+    sink_b.emit(started());
+    settle().await;
+    advance(Duration::from_secs(1)).await;
+
+    let statuses: Vec<Status> = recorder
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Status(status) => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [Status::Working, Status::Idle, Status::Working],
+        "run A's delayed idle cleanup must land before, not after, run B's working status"
+    );
+    run_b.terminal(Terminal::Silent).await;
 }
 
 #[tokio::test]
