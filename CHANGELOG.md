@@ -7,6 +7,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Shell `progress "text" [--eta S]` builtin for optional invoker notes, silent without a note sink.
+
+### Changed
+
+- `progress` is a reserved command word; a provider declaring it is refused at load.
+
 ## [0.24.0] - 2026-09-26
 
 ### Added

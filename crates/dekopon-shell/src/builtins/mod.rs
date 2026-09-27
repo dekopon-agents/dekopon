@@ -165,6 +165,7 @@ pub(crate) enum BuiltinKind {
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &misc::Sleep,
+    &misc::Progress,
     &text::Grep,
     &text::Sed,
     &text::Cut,
@@ -312,6 +313,7 @@ mod tests {
             "grep",
             "jq",
             "printf",
+            "progress",
             "sed",
             "sleep",
             "sort",

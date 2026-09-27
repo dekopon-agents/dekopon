@@ -168,6 +168,12 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
             .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
     }
 
+    fn note(&self, text: &str, eta: Option<Duration>) {
+        if let Some(broker) = &self.broker {
+            broker.note(text, eta);
+        }
+    }
+
     fn script_finished(&self) {
         self.direct.script_finished();
         if let Some(broker) = &self.broker {

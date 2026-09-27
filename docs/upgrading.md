@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Reserved command word progress (unreleased)
+
+- **The shell `progress` builtin.** `progress` now belongs to
+  `dekopon_core::RESERVED_COMMAND_WORDS`; a provider declaring that command word is refused at
+  load. Rename a colliding provider word before upgrading. The builtin sends an optional note
+  through the invoker and is a no-op without a progress-note sink.
+
 ## Chat steering (0.24.0)
 
 Steering is enabled on every route by default. A same-sender message during a running turn now
