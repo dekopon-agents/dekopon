@@ -4071,16 +4071,6 @@ fn record_outcomes_have_a_stable_content_free_failure_vocabulary() {
         ),
         (
             InvocationOutcome::Failed,
-            Some("dedup-capacity"),
-            Some("dedup-capacity"),
-        ),
-        (
-            InvocationOutcome::Failed,
-            Some("dedup-conflict"),
-            Some("dedup-conflict"),
-        ),
-        (
-            InvocationOutcome::Failed,
             Some("memory-corrupt"),
             Some("memory-corrupt"),
         ),
@@ -4128,12 +4118,10 @@ fn record_outcomes_have_a_stable_content_free_failure_vocabulary() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_retry() {
+async fn denied_failed_and_storage_record_results_are_terminal_without_retry() {
     for (outcome, error) in [
         (InvocationOutcome::Denied, Some("policy-denied")),
         (InvocationOutcome::Failed, Some("provider-failure")),
-        (InvocationOutcome::Failed, Some("dedup-capacity")),
-        (InvocationOutcome::Failed, Some("dedup-conflict")),
         (InvocationOutcome::Failed, Some("storage-quota")),
         (InvocationOutcome::Failed, Some("storage-busy")),
         (InvocationOutcome::Failed, Some("storage-timeout")),
@@ -10665,36 +10653,6 @@ async fn discord_reconnects_when_a_heartbeat_is_not_acknowledged() {
         .expect("Resume arrives")
         .expect("the second Gateway recorded Resume");
     assert_eq!(resume["op"], 6);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn discord_routes_a_redelivered_message_only_once() {
-    let event = discord_message(
-        "300000000000000007",
-        "200000000000000007",
-        None,
-        DISCORD_USER,
-        false,
-        "only once",
-    );
-    let socket = spawn_discord_socket_mock(
-        vec![
-            discord_dispatch(2, "MESSAGE_CREATE", event.clone()),
-            discord_dispatch(3, "MESSAGE_CREATE", event),
-        ],
-        None,
-    );
-    let http = spawn_http_mock(discord_handler(socket.url.clone()));
-    let mut transport = discord(&http.base);
-    transport.connect().await.expect("Discord connects");
-
-    assert_eq!(next_message(&mut transport).await.text, "only once");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), transport.next())
-            .await
-            .is_err(),
-        "a resume redelivery must not create a second session"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

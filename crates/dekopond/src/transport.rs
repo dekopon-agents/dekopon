@@ -837,12 +837,6 @@ impl SeenIds {
         }
         true
     }
-
-    pub(crate) fn remove(&mut self, key: &str) {
-        if self.seen.remove(key) {
-            self.order.retain(|candidate| candidate != key);
-        }
-    }
 }
 
 pub(crate) fn floor_boundary(text: &str, index: usize) -> usize {
@@ -975,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn seen_identifiers_evict_oldest_first_and_can_be_released() {
+    fn seen_identifiers_evict_oldest_first() {
         let mut seen = SeenIds::new(2);
         assert!(seen.insert("a".to_owned()));
         assert!(seen.insert("b".to_owned()));
@@ -984,12 +978,6 @@ mod tests {
         assert!(seen.insert("c".to_owned()), "the ring accepts a third");
         assert!(seen.insert("a".to_owned()), "the oldest was evicted");
         assert!(!seen.insert("c".to_owned()), "the newest was retained");
-
-        seen.remove("c");
-        assert!(
-            seen.insert("c".to_owned()),
-            "a released claim is accepted again"
-        );
     }
 
     #[test]

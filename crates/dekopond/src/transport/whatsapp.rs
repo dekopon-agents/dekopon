@@ -1,5 +1,6 @@
-//! The webhook verifies Meta's signature over the raw body before parsing, claims message IDs
-//! atomically, and only acknowledges once a whole delivery is enqueued.
+//! The webhook verifies Meta's signature over the raw body before parsing, and only acknowledges
+//! once a whole delivery is enqueued. A Meta webhook retry redelivers a message the gateway
+//! already accepted; exactly-once delivery is not a goal, so the retry gets a second reply.
 
 mod media;
 #[cfg(test)]
@@ -36,7 +37,7 @@ use crate::{
     config::{LivenessMode, LivenessSettings},
     transport::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
-        OutboundReply, ReplyTarget, SeenIds, SteerAck, TextUnit, TransportError, TransportEvent,
+        OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
         record_conversation, split_message,
     },
@@ -49,9 +50,6 @@ const MAX_CONNECTION_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_QUERY_BYTES: usize = 2 * 1024;
 const MAX_QUERY_VALUE_BYTES: usize = 512;
 const MAX_MESSAGES_PER_DELIVERY: usize = 128;
-/// This ring is four times the socket transports' capacity because it is the whole replay defense
-/// against Meta's webhook retries, not just a bridge across one reconnect.
-const MAX_DEDUP_IDS: usize = 4096;
 const MAX_QUEUED_MESSAGES: usize = 512;
 const WEBHOOK_QUEUE: usize = 64;
 const MAX_WEBHOOK_CONCURRENCY: usize = 16;
@@ -83,7 +81,6 @@ struct WebhookState {
     phone_number_id: String,
     native: bool,
     sender: mpsc::Sender<QueuedDelivery>,
-    dedup: Arc<Mutex<ClaimedIds>>,
     refusals: Arc<Mutex<RefusalLog>>,
     queue_capacity: Arc<Semaphore>,
     concurrency: Arc<Semaphore>,
@@ -98,11 +95,10 @@ enum Refusal {
     Saturated,
     Timeout,
     Verification,
-    Unavailable,
 }
 
 impl Refusal {
-    const COUNT: usize = 8;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         match self {
@@ -113,7 +109,6 @@ impl Refusal {
             Self::Saturated => 4,
             Self::Timeout => 5,
             Self::Verification => 6,
-            Self::Unavailable => 7,
         }
     }
 
@@ -126,7 +121,6 @@ impl Refusal {
             Self::Saturated => "saturated",
             Self::Timeout => "timeout",
             Self::Verification => "verification",
-            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -182,30 +176,6 @@ struct QueuedDelivery {
     _capacity: OwnedSemaphorePermit,
 }
 
-struct ClaimedIds(SeenIds);
-
-impl ClaimedIds {
-    fn new() -> Self {
-        Self(SeenIds::new(MAX_DEDUP_IDS))
-    }
-
-    fn claim(&mut self, messages: Vec<InboundMessage>) -> Vec<InboundMessage> {
-        let mut accepted = Vec::with_capacity(messages.len());
-        for message in messages {
-            if self.0.insert(message.message_id.to_string()) {
-                accepted.push(message);
-            }
-        }
-        accepted
-    }
-
-    fn release(&mut self, claimed: &[String]) {
-        for id in claimed {
-            self.0.remove(id);
-        }
-    }
-}
-
 impl WhatsappTransport {
     /// An empty app secret would be an HMAC key anyone can guess, so every credential must arrive
     /// non-empty.
@@ -248,7 +218,6 @@ impl WhatsappTransport {
                 phone_number_id,
                 native: liveness.mode == LivenessMode::Native,
                 sender,
-                dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
@@ -497,36 +466,19 @@ async fn process_webhook(
         Ok(messages) => messages,
         Err(()) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
-    let mut dedup = match state.dedup.lock() {
-        Ok(dedup) => dedup,
-        Err(_) => {
-            return refuse(
-                state,
-                Refusal::Unavailable,
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
-    };
-    let accepted = dedup.claim(messages);
-    if accepted.is_empty() {
+    if messages.is_empty() {
         return content_free(StatusCode::OK);
     }
-    let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
-    let claimed: Vec<String> = accepted
-        .iter()
-        .map(|message| message.message_id.to_string())
-        .collect();
+    let permit_count = u32::try_from(messages.len()).expect("delivery bound fits u32");
     let Ok(capacity) = Arc::clone(&state.queue_capacity).try_acquire_many_owned(permit_count)
     else {
-        dedup.release(&claimed);
         return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
     let delivery = QueuedDelivery {
-        messages: accepted.into(),
+        messages: messages.into(),
         _capacity: capacity,
     };
     if state.sender.try_send(delivery).is_err() {
-        dedup.release(&claimed);
         return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     }
     content_free(StatusCode::OK)
@@ -1026,7 +978,6 @@ mod tests {
                 phone_number_id: "456".to_owned(),
                 native: true,
                 sender,
-                dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(1)),
@@ -1102,7 +1053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_verifies_exact_bytes_before_parsing_and_deduplicates() {
+    async fn post_verifies_exact_bytes_before_parsing() {
         let body = serde_json::to_vec(&json!({
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
@@ -1125,19 +1076,6 @@ mod tests {
         .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(receiver.recv().await.expect("batch").messages.len(), 1);
-
-        let duplicate = process_webhook(
-            &state,
-            signed_request(&body),
-            Arc::clone(&state.concurrency)
-                .acquire_owned()
-                .await
-                .expect("permit"),
-            &received(),
-        )
-        .await;
-        assert_eq!(duplicate.status(), StatusCode::OK);
-        assert!(receiver.try_recv().is_err());
 
         let mut changed = body.clone();
         changed.push(b' ');
@@ -1199,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_message_capacity_returns_retryable_and_rolls_back_the_claim() {
+    async fn saturated_message_capacity_returns_retryable_and_a_retry_succeeds() {
         let body = serde_json::to_vec(&json!({
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
@@ -1351,26 +1289,6 @@ mod tests {
         let messages = parse_delivery(&state, &payload, &received()).expect("delivery");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].liveness.is_none());
-    }
-
-    #[test]
-    fn dedup_claims_once_and_is_bounded() {
-        let messages = parse_delivery(
-            &state(),
-            &json!({
-                "object":"whatsapp_business_account",
-                "entry":[{"id":"123","changes":[{"field":"messages","value":{
-                    "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
-                    "contacts":[{"wa_id":"1603"}],
-                    "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello"}}]
-                }}]}]
-            }),
-            &received(),
-        )
-        .expect("delivery");
-        let mut dedup = ClaimedIds::new();
-        assert_eq!(dedup.claim(messages.clone()).len(), 1);
-        assert!(dedup.claim(messages).is_empty());
     }
 
     #[tokio::test]
@@ -1786,7 +1704,6 @@ mod tests {
             Refusal::Saturated,
             Refusal::Timeout,
             Refusal::Verification,
-            Refusal::Unavailable,
         ]
         .iter()
         .map(|refusal| refusal.reason())

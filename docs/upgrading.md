@@ -65,6 +65,22 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
 See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
+## WhatsApp no longer dedups redeliveries; the Discord ring is deleted as redundant (unreleased)
+
+The WhatsApp `ClaimedIds` ring is gone; no configuration key changes. WhatsApp's HTTP 200 already
+returns before the turn starts, so Meta only retries a delivery whose 200 was lost in the network —
+never because the answer is slow. A retried delivery that arrives while the original turn is still
+running joins it as a steer; one that arrives after the turn has completed starts a fresh turn and
+gets a second reply, the accepted cost.
+
+The Discord `SeenIds` ring is also gone, but this is a no-op for behavior: Discord's own gateway
+resume sequence-number tracking already prevented a resumed connection from replaying an event the
+client had already received, so the ring never had a real duplicate to catch on that path. The
+Slack dedup ring is unchanged.
+
+A chat-memory record that fails with what used to be `dedup-conflict` or `dedup-capacity` now
+classifies as the generic `provider-failure`; nothing consumes those two codes specially anymore.
+
 ## Slack no longer streams the answer (unreleased)
 
 `liveness.stream: true` is refused on every `slackSocketMode` transport, at the top level and in

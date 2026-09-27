@@ -173,7 +173,7 @@ correlating client-side state. A denied or failed *invocation* is not a failure 
 returns a normal result carrying its outcome and decision linkage.
 
 Only on a chat-memory-routed capability may a provider-reported failure retain one of
-`memory-corrupt`, `result-too-large`, `dedup-conflict`, or `dedup-capacity` as its classification.
+`memory-corrupt` or `result-too-large` as its classification.
 Every other provider-reported failure classifies as `provider-failure`, and carries the provider's
 own answer beside it: a failed `InvocationResult` sets `detail` to the component's `{ code, message }`
 whenever the classification came from a typed `ComponentResponse::Failed`, and omits it for every

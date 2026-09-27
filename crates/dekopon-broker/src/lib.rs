@@ -4171,16 +4171,11 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         BrokerHostError::Invoke { .. } => "provider-trap",
         BrokerHostError::ProviderFailure { code, .. }
             if route.is_chat_memory()
-                && matches!(
-                    code.as_str(),
-                    "memory-corrupt" | "result-too-large" | "dedup-conflict" | "dedup-capacity"
-                ) =>
+                && matches!(code.as_str(), "memory-corrupt" | "result-too-large") =>
         {
             match code.as_str() {
                 "memory-corrupt" => "memory-corrupt",
                 "result-too-large" => "result-too-large",
-                "dedup-conflict" => "dedup-conflict",
-                "dedup-capacity" => "dedup-capacity",
                 _ => "provider-failure",
             }
         }

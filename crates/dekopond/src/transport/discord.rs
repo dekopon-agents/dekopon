@@ -30,16 +30,15 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LinkPreviews, LivenessTarget, MessageId,
         MessageRef, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError,
-        TransportEvent, TransportIdentity, TypingLease, asset_buffer, bound_inbound,
-        credential_client, floor_boundary, jitter_below, receive_span, record_conversation,
-        reserve_for_chunk, retry_after_from_body, split_message,
+        SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
+        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
+        floor_boundary, jitter_below, receive_span, record_conversation, reserve_for_chunk,
+        retry_after_from_body, split_message,
     },
 };
 
 const API_VERSION: u8 = 10;
 const INTENTS: u64 = (1 << 9) | (1 << 12);
-const DEDUP_CAPACITY: usize = 1024;
 const CHANNEL_SHAPE_CAPACITY: usize = 512;
 const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ATTACHMENTS: usize = 10;
@@ -84,7 +83,6 @@ pub(crate) struct DiscordTransport {
     next_heartbeat: Option<Instant>,
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
-    seen: SeenIds,
     channels: ChannelShapes,
     pending: VecDeque<TransportEvent>,
     native: bool,
@@ -138,7 +136,6 @@ impl DiscordTransport {
             next_heartbeat: None,
             heartbeat_acked: true,
             last_identify: None,
-            seen: SeenIds::new(DEDUP_CAPACITY),
             channels: ChannelShapes::new(CHANNEL_SHAPE_CAPACITY),
             pending: VecDeque::new(),
             native: liveness.mode == LivenessMode::Native,
@@ -533,10 +530,6 @@ impl DiscordTransport {
         );
         if text.trim().is_empty() && assets.is_empty() {
             received.record("drop.reason", "content-withheld");
-            return Ok(None);
-        }
-        if !self.seen.insert(message_id.to_owned()) {
-            received.record("drop.reason", "duplicate");
             return Ok(None);
         }
 
@@ -2754,19 +2747,6 @@ mod unit_tests {
             "an ordinary message routes"
         );
         drop(span);
-        capture.clear();
-        let span = receive_span(ChatTransportKind::Discord);
-        assert!(
-            transport
-                .routable(&message(json!({})), &span)
-                .instrument(span.clone())
-                .await
-                .expect("a routable message")
-                .is_none(),
-            "the same identifier twice is the redelivery a resume replays"
-        );
-        drop(span);
-        assert_reason(&capture, "duplicate");
     }
 
     #[tokio::test]
