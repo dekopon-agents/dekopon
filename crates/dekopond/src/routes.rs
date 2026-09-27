@@ -32,6 +32,7 @@ pub(crate) struct BoundRoute {
     pub script_timeout: Duration,
     pub progress_detail: ProgressDetail,
     pub steering: Steering,
+    pub progress_notes: bool,
     pub memory: MemoryPolicy,
     pub wakes: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
@@ -117,6 +118,7 @@ impl RoutingTable {
                 script_timeout: route.limits.script_timeout(),
                 progress_detail: route.progress_detail,
                 steering: route.steering,
+                progress_notes: route.progress_notes,
                 memory: route.memory,
                 wakes: route.wakes,
                 cache_key: cache_key::for_route(),

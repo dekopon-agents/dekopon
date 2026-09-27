@@ -55,8 +55,8 @@ pub mod skills;
 pub mod wake;
 
 pub use crate::progress::{
-    BudgetLimit, CancelSource, CancelVia, CommandWord, FailureClass, ProgressEvent, ProgressSink,
-    SessionOutcome, ToolOutcome,
+    BudgetLimit, CancelSource, CancelVia, CommandWord, FailureClass, ProgressEvent, ProgressNote,
+    ProgressSink, SessionOutcome, ToolOutcome,
 };
 
 pub struct ShellRuntime<I> {
@@ -274,6 +274,8 @@ pub struct BrokerLeg {
     attachments: Option<Arc<ReplyAttachments>>,
     asset_inputs: Option<ChatAssetInputs>,
     progress: Option<Arc<dyn ProgressSink>>,
+    progress_notes: bool,
+    notes: AtomicU32,
     calls_max: u32,
     calls_used: AtomicU32,
     pending_report: Mutex<Option<(CommandWord, Instant)>>,
@@ -317,6 +319,8 @@ impl BrokerLeg {
             attachments: None,
             asset_inputs: None,
             progress: None,
+            progress_notes: false,
+            notes: AtomicU32::new(0),
             calls_max: 0,
             calls_used: AtomicU32::new(0),
             pending_report: Mutex::new(None),
@@ -345,6 +349,12 @@ impl BrokerLeg {
     pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, max_capability_calls: u32) -> Self {
         self.progress = Some(sink);
         self.calls_max = max_capability_calls;
+        self
+    }
+
+    #[must_use]
+    pub fn with_progress_notes(mut self) -> Self {
+        self.progress_notes = true;
         self
     }
 
@@ -619,8 +629,31 @@ impl CapabilityInvoker for BrokerLeg {
         result
     }
 
+    fn note(&self, text: &str, eta: Option<Duration>) {
+        const MAX_NOTES_PER_SCRIPT: u32 = 8;
+        if !self.progress_notes || self.progress.is_none() {
+            return;
+        }
+        let Some(text) = ProgressNote::new(text) else {
+            tracing::debug!(event = "agent_progress_note_dropped", reason = "empty");
+            return;
+        };
+        if self
+            .notes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_NOTES_PER_SCRIPT).then_some(count + 1)
+            })
+            .is_err()
+        {
+            tracing::debug!(event = "agent_progress_note_dropped", reason = "script-cap");
+            return;
+        }
+        self.emit(ProgressEvent::Note { text, eta });
+    }
+
     fn script_finished(&self) {
         self.settle_pending_report();
+        self.notes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1365,6 +1398,8 @@ mod tests {
                 attachments: None,
                 asset_inputs: None,
                 progress: None,
+                progress_notes: false,
+                notes: AtomicU32::new(0),
                 calls_max: 0,
                 calls_used: AtomicU32::new(0),
                 pending_report: Mutex::new(None),
@@ -1892,8 +1927,77 @@ mod tests {
                     media_type,
                     bytes,
                 } => format!("attachment {index} {media_type} {bytes}"),
+                ProgressEvent::Note { text, eta } => format!("note {:?} {eta:?}", text.as_str()),
                 other => format!("unexpected {other:?}"),
             }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_opted_in_note_leaves_the_pending_tool_report_in_order() {
+            let directory = private_broker_directory();
+            let (leg, sink) =
+                reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
+            let leg = leg.with_progress_notes();
+            tokio::task::spawn_blocking(move || {
+                assert!(matches!(
+                    leg.run_command("probe", &[], None),
+                    Some(CommandRun::Proposed { .. })
+                ));
+                leg.note(
+                    " rendering the image ",
+                    Some(std::time::Duration::from_secs(40)),
+                );
+                leg.script_finished();
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=0 calls=0/4",
+                    "note \"rendering the image\" Some(40s)",
+                    "finished probe Failed",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn notes_without_the_broker_opt_in_emit_nothing() {
+            let directory = private_broker_directory();
+            let (sink, progress) = recording_sink();
+            let leg = leg_for(&directory.path().join("absent.sock")).with_progress(progress, 4);
+            leg.note("not enabled", None);
+            assert!(sink.labels().is_empty());
+        }
+
+        #[tokio::test]
+        async fn the_ninth_note_is_dropped_and_the_next_script_starts_fresh() {
+            let directory = private_broker_directory();
+            let (sink, progress) = recording_sink();
+            let leg = leg_for(&directory.path().join("absent.sock"))
+                .with_progress(progress, 4)
+                .with_progress_notes();
+            let runtime = ShellRuntime {
+                invoker: crate::SessionInvoker {
+                    direct: super::FakeLeg::new("cli-probe.upper", "direct"),
+                    broker: Some(Box::new(leg)),
+                },
+                limits: Limits::default(),
+            };
+            let script = (1..=9)
+                .map(|index| format!("progress note-{index}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert_eq!(runtime.run_script(&script, 4).exit_code, ExitCode::SUCCESS);
+            assert_eq!(
+                runtime.run_script("progress fresh", 4).exit_code,
+                ExitCode::SUCCESS
+            );
+            let mut expected = (1..=8)
+                .map(|index| format!("note \"note-{index}\" None"))
+                .collect::<Vec<_>>();
+            expected.push("note \"fresh\" None".to_owned());
+            assert_eq!(sink.labels(), expected);
         }
 
         #[tokio::test(flavor = "multi_thread")]

@@ -451,6 +451,120 @@ fn recorded_delta() -> ModelText {
     dekopon_test_support::scripted_text(&events)
 }
 
+async fn note_event(text: &str, eta: Option<Duration>) -> ProgressEvent {
+    use dekopon_agent::BrokerLeg;
+    use dekopon_broker_protocol::{
+        BrokerClient, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    };
+    use dekopon_shell::CapabilityInvoker;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Default)]
+    struct Notes(Mutex<Vec<ProgressEvent>>);
+    impl ProgressSink for Notes {
+        fn emit(&self, event: ProgressEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let client = BrokerClient::new(&socket, crate::current_uid(), FrameLimits::default()).unwrap();
+    let server = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+            .await
+            .unwrap();
+        write_frame(
+            &mut stream,
+            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            FrameLimits::default(),
+        )
+        .await
+        .unwrap();
+    };
+    let (leg, ()) = tokio::join!(BrokerLeg::connect(client, None), server);
+    let notes = Arc::new(Notes::default());
+    let sink = Arc::clone(&notes) as Arc<dyn ProgressSink>;
+    leg.unwrap()
+        .with_progress(sink, 1)
+        .with_progress_notes()
+        .note(text, eta);
+    notes.0.lock().unwrap().pop().unwrap()
+}
+
+fn note_adapter() -> (
+    ProgressAdapter,
+    tokio::sync::mpsc::Receiver<ProgressEvent>,
+    Arc<super::adapter::ProgressCounters>,
+) {
+    let (events, receiver) = tokio::sync::mpsc::channel(super::adapter::EVENT_QUEUE);
+    let (text, _receiver) = tokio::sync::watch::channel(StreamedText::default());
+    let counters = Arc::new(super::adapter::ProgressCounters::default());
+    (
+        ProgressAdapter::new(
+            "local".to_owned(),
+            events,
+            text,
+            Arc::clone(&counters),
+            SessionCancellation::new(),
+        ),
+        receiver,
+        counters,
+    )
+}
+
+#[tokio::test]
+async fn a_note_record_has_each_payload_field_exactly_once() {
+    let note = note_event("rendering the image", Some(Duration::from_secs(40))).await;
+    let (capture, _guard) = capture();
+    let (adapter, mut events, _) = note_adapter();
+    adapter.emit(note);
+    assert!(matches!(events.try_recv(), Ok(ProgressEvent::Note { .. })));
+    let records = events_named(&capture, "gateway.progress");
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    for field in [" kind=", " note=", " note.eta_s="] {
+        assert_eq!(record.matches(field).count(), 1, "{record}");
+    }
+    assert!(record.contains(" kind=\"note\""));
+    assert!(record.contains(" note=\"rendering the image\""));
+    assert!(record.contains(" note.eta_s=40"));
+}
+
+#[tokio::test]
+async fn the_twenty_fifth_note_is_neither_recorded_nor_queued() {
+    let note = note_event("working", None).await;
+    let (capture, _guard) = capture();
+    let (adapter, mut events, counters) = note_adapter();
+    for _ in 0..25 {
+        adapter.emit(note.clone());
+    }
+    let mut queued = 0;
+    while events.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(queued, 24);
+    assert_eq!(events_named(&capture, "gateway.progress").len(), 24);
+    assert_eq!(counters.notes_dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.dropped.load(Ordering::Relaxed), 0);
+
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    for _ in 0..25 {
+        harness.sink.emit(note.clone());
+    }
+    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    let terminals = events_named(&capture, "gateway.progress")
+        .into_iter()
+        .filter(|record| record.contains(" kind=\"terminal_silent\""))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].matches(" progress.notes_dropped=").count(), 1);
+    assert!(terminals[0].contains(" progress.notes_dropped=1"));
+}
+
 fn started() -> ProgressEvent {
     ProgressEvent::Started {
         agent: "tester".to_owned(),

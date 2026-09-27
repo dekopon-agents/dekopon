@@ -106,7 +106,7 @@ loop reports it as `Cancelled { by }` instead.
 
 ### Nothing else can travel
 
-`ProgressEvent` carries metadata, with one deliberate exception and one bounded string:
+`ProgressEvent` carries metadata, with visible answer text and opted-in notes as deliberate exceptions:
 
 - `TextDelta` carries `dekopon_model::ModelText`, which only the model client can build from bytes.
   A consumer may concatenate, measure, and shorten a value it already holds; it cannot manufacture
@@ -117,12 +117,14 @@ loop reports it as `Cancelled { by }` instead.
   because it is rendered to a person.
 - `ProgressText`, the gateway's own type, is built only from operator-authored templates plus
   numeric state, and drivers see nothing else.
-- *Committed direction:* `ProgressNote` will carry a bounded model-authored note on an opted-in
-  route, under the [security model's liveness rule](security-model.md#current-gateway-posture).
+- `ProgressNote` carries a cleaned, bounded model-authored note under the
+  [security model's liveness rule](security-model.md#current-gateway-posture).
+  `BrokerLeg` emits it only with `with_progress_notes()`; the route opt-in is `progressNotes: true`.
+  The adapter records the note now; rendering remains committed direction.
 
-A prompt, a shell argument, a provider result, and attachment bytes currently have no field anywhere
-in this vocabulary. That is goal 1 enforced by the type system rather than by review;
-*Committed direction:* the progress note will be the one opt-in exception.
+A prompt, a provider result, and attachment bytes have no field anywhere in this vocabulary.
+The shell's progress-note operand is the one opt-in exception: it enters only through
+`ProgressNote`'s cleaning and bounds, never as authority.
 
 ## The driver
 
