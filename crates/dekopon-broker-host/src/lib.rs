@@ -49,6 +49,7 @@ mod cwasm;
 mod http;
 mod memory;
 mod metadata;
+mod random;
 mod settings;
 mod storage;
 use clock::ClockState;
@@ -78,6 +79,10 @@ pub(crate) mod bindings {
 pub const PROVIDER_WIT: &str = include_str!("../wit/deps/provider.wit");
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
+pub const CLOCK_V1_1_WIT: &str = include_str!("../wit/deps/clock-v1-1.wit");
+pub const RANDOM_WIT: &str = include_str!("../wit/deps/random.wit");
+pub use random::RandomFailure;
+use random::RandomState;
 
 pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_HTTP_REQUESTS: u32 = 32;
@@ -404,6 +409,7 @@ impl Runtime {
         http: HttpState,
         storage: storage::StorageState,
         clock: ClockState,
+        random: RandomState,
         settings: SettingsState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
         let reserved = match &self.memory_budget {
@@ -422,6 +428,7 @@ impl Runtime {
                 http,
                 storage,
                 clock,
+                random,
                 settings,
                 assets: asset::AssetState::disabled(),
                 table: storage::new_table(),
@@ -461,6 +468,7 @@ struct StoreState {
     storage: storage::StorageState,
     /// Granted only in an invocation's store; descriptions and command runs are pure.
     clock: ClockState,
+    random: RandomState,
     settings: SettingsState,
     table: wasmtime::component::ResourceTable,
     instantiations: u64,
@@ -904,6 +912,7 @@ impl BrokerWasmProvider {
             http,
             storage::StorageState::disabled(),
             ClockState::describe(),
+            RandomState::describe(),
             SettingsState::describe(),
         )?;
         let argv = argv.to_vec();
@@ -955,7 +964,10 @@ impl BrokerWasmProvider {
         record_store_outcome(&mut store, self.runtime.limits.fuel);
         // Check for a refused clock or settings read before the trap surfaces, or the real cause is
         // lost.
-        if store.data().clock.attempted() || store.data().settings.attempted() {
+        if store.data().clock.attempted()
+            || store.data().random.attempted()
+            || store.data().settings.attempted()
+        {
             return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
             });
@@ -1042,6 +1054,7 @@ impl BrokerWasmProvider {
             http,
             storage_state,
             ClockState::invoke(),
+            RandomState::invoke(),
             SettingsState::invoke(
                 self.runtime
                     .provider_settings
@@ -1175,6 +1188,9 @@ impl BrokerWasmProvider {
                 })?;
         // Host policy violations win even if the guest catches the error or a failing destructor
         // turns it into a trap; check policy before trusting the guest's result.
+        if let Some(reason) = store.data().random.failure() {
+            return Err(BrokerHostError::RandomCallRejected { reason });
+        }
         if let Some(reason) = store.data().http.policy_violation() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
@@ -1663,6 +1679,7 @@ async fn describe_component(
         http,
         storage::StorageState::disabled(),
         ClockState::describe(),
+        RandomState::describe(),
         SettingsState::describe(),
     )?;
     let operation = async {
@@ -1696,7 +1713,10 @@ async fn describe_component(
     record_store_outcome(&mut store, runtime.limits.fuel);
     // During describe, check for a refused clock or settings read before the trap surfaces, or the
     // cause is lost.
-    if store.data().clock.attempted() || store.data().settings.attempted() {
+    if store.data().clock.attempted()
+        || store.data().random.attempted()
+        || store.data().settings.attempted()
+    {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });
@@ -1814,6 +1834,8 @@ fn invalid_manifest(source: &Path, message: impl Into<String>) -> BrokerHostErro
 
 #[derive(Debug, Error)]
 pub enum BrokerHostError {
+    #[error("random host call refused: {reason:?}")]
+    RandomCallRejected { reason: RandomFailure },
     #[error("over-budget: broker asset disk capacity exhausted")]
     AssetOverBudget,
     #[error("invalid invocation assets")]

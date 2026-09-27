@@ -34,6 +34,22 @@ async fn memory_chat() -> FakeBroker {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn legacy_wall_clock_component_still_runs_through_the_testkit() {
+    let broker = FakeBroker::builder()
+        .component(provider_fixture("clock-probe-provider.wasm"))
+        .provider("clock-probe")
+        .build()
+        .await
+        .expect("legacy wall-clock component loads");
+    let output = broker
+        .invoke("clock.now", json!({}))
+        .await
+        .expect("wall clock runs");
+    assert!(output["unixMillis"].as_u64().expect("wall milliseconds") > 0);
+    assert!(output["rfc3339"].as_str().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     let broker = FakeBroker::builder()
         .component(provider_fixture("storage-probe-provider.wasm"))

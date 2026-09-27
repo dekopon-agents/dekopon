@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-provider-clock"
-description = "Rust guest bindings for the Dekopon broker host's wall clock interface"
+description = "Rust guest bindings for the Dekopon broker host's wall and monotonic clocks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["agents", "wasm", "components", "clock", "sdk"]
 categories = ["wasm", "api-bindings", "date-and-time"]
 include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[features]
+monotonic = []
 
 [dependencies]
 wit-bindgen.workspace = true

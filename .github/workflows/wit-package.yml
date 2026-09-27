@@ -46,6 +46,8 @@ env:
   HTTP_WIT_PACKAGE: dekopon:http@1.1.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
+  CLOCK_V1_1_WIT_PACKAGE: dekopon:clock@1.1.0
+  RANDOM_WIT_PACKAGE: dekopon:random@0.1.0
 
 jobs:
   validate:
@@ -198,6 +200,18 @@ jobs:
             cmp wit/clock/clock.wit "$mirror"
           done
           for mirror in \
+            crates/dekopon-provider-clock/wit/monotonic/deps/clock.wit \
+            crates/dekopon-broker-host/wit/deps/clock-v1-1.wit
+          do
+            cmp wit/clock-v1-1/clock.wit "$mirror"
+          done
+          for mirror in \
+            crates/dekopon-provider-random/wit/deps/random.wit \
+            crates/dekopon-broker-host/wit/deps/random.wit
+          do
+            cmp wit/random/random.wit "$mirror"
+          done
+          for mirror in \
             crates/dekopon-provider-storage/wit/deps/storage.wit \
             crates/dekopon-broker-host/wit/deps/storage.wit \
             examples/providers/storage-probe/wit/deps/storage.wit
@@ -236,7 +250,9 @@ jobs:
               --config ../../wkg/config.toml \
               --cache "$RUNNER_TEMP/wkg-build-cache"
           )
-          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock
+          (cd wit/clock-v1-1 && wkg build --wit-dir . --output ../../target/wit-package/dekopon-clock-v1-1.wasm --config ../../wkg/config.toml --cache "$RUNNER_TEMP/wkg-build-cache")
+          (cd wit/random && wkg build --wit-dir . --output ../../target/wit-package/dekopon-random.wasm --config ../../wkg/config.toml --cache "$RUNNER_TEMP/wkg-build-cache")
+          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock wit/clock-v1-1/wkg.lock wit/random/wkg.lock
 
       - name: Verify provider exports and import-free boundary
         shell: bash
@@ -448,6 +464,32 @@ jobs:
             })
           ' target/wit-package/dekopon-clock.json
 
+      - name: Verify the new clock and random interfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in dekopon-clock-v1-1 dekopon-random; do
+            wasm-tools validate "target/wit-package/$artifact.wasm"
+            wasm-tools component wit --json "target/wit-package/$artifact.wasm" > "target/wit-package/$artifact.json"
+          done
+          jq --exit-status --arg package "$CLOCK_V1_1_WIT_PACKAGE" '
+            (.packages == [{"name": $package, "interfaces": {"wall": 0, "monotonic": 1}, "worlds": {}}]) and
+            (.worlds == []) and
+            (.types == []) and
+            ((.interfaces | map({name, functions: (.functions | with_entries(.value |= {kind, params, result}))})) == [
+              {"name": "wall", "functions": {"now-unix-millis": {"kind": "freestanding", "params": [], "result": "u64"}}},
+              {"name": "monotonic", "functions": {"now-nanos": {"kind": "freestanding", "params": [], "result": "u64"}}}
+            ])
+          ' target/wit-package/dekopon-clock-v1-1.json
+          jq --exit-status --arg package "$RANDOM_WIT_PACKAGE" '
+            (.packages == [{"name": $package, "interfaces": {"source": 0}, "worlds": {}}]) and
+            (.worlds == []) and
+            (.types == [{"name": null, "kind": {"list": "u8"}, "owner": null}]) and
+            ((.interfaces[0].functions | with_entries(.value |= {kind, params, result})) == {
+              "get-random-bytes": {"kind": "freestanding", "params": [{"name": "length", "type": "u32"}], "result": 0}
+            })
+          ' target/wit-package/dekopon-random.json
+
       - name: Verify the command-line provider fixture is import-free
         shell: bash
         run: |
@@ -598,7 +640,7 @@ jobs:
           [registry."local.test".local]
           root = "$registry/packages"
           EOF
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-clock-v1-1 dekopon-random; do
             wkg publish \
               --config "$registry/config.toml" \
               --cache "$registry/publish-cache" \
@@ -628,6 +670,10 @@ jobs:
           cmp target/wit-package/dekopon-http.wasm "$registry/fetched-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$registry/fetched-storage.wasm"
           cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
+          wkg get --config "$registry/config.toml" --cache "$registry/fetch-cache" --output "$registry/fetched-clock-v1-1.wasm" "$CLOCK_V1_1_WIT_PACKAGE"
+          wkg get --config "$registry/config.toml" --cache "$registry/fetch-cache" --output "$registry/fetched-random.wasm" "$RANDOM_WIT_PACKAGE"
+          cmp target/wit-package/dekopon-clock-v1-1.wasm "$registry/fetched-clock-v1-1.wasm"
+          cmp target/wit-package/dekopon-random.wasm "$registry/fetched-random.wasm"
 
       - name: Upload the verified packages
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -639,6 +685,8 @@ jobs:
             target/wit-package/dekopon-http.wasm
             target/wit-package/dekopon-storage.wasm
             target/wit-package/dekopon-clock.wasm
+            target/wit-package/dekopon-clock-v1-1.wasm
+            target/wit-package/dekopon-random.wasm
           if-no-files-found: error
           retention-days: 1
 
@@ -684,7 +732,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-clock-v1-1 dekopon-random; do
             wkg publish \
               --skip-dupes \
               --config wkg/config.toml \
@@ -720,6 +768,10 @@ jobs:
           cmp target/wit-package/dekopon-http.wasm "$RUNNER_TEMP/published-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$RUNNER_TEMP/published-storage.wasm"
           cmp target/wit-package/dekopon-clock.wasm "$RUNNER_TEMP/published-clock.wasm"
+          wkg get --config wkg/config.toml --cache "$RUNNER_TEMP/wkg-verify-cache" --output "$RUNNER_TEMP/published-clock-v1-1.wasm" "$CLOCK_V1_1_WIT_PACKAGE"
+          wkg get --config wkg/config.toml --cache "$RUNNER_TEMP/wkg-verify-cache" --output "$RUNNER_TEMP/published-random.wasm" "$RANDOM_WIT_PACKAGE"
+          cmp target/wit-package/dekopon-clock-v1-1.wasm "$RUNNER_TEMP/published-clock-v1-1.wasm"
+          cmp target/wit-package/dekopon-random.wasm "$RUNNER_TEMP/published-random.wasm"
 
       - name: Log out of GHCR
         if: always()

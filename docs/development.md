@@ -28,7 +28,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
 | Provider storage WIT and guest facade | `wit/storage/`, `crates/dekopon-provider-storage/` | Feature/import inspection, mirror comparisons, package workflow |
-| Host wall clock WIT and guest facade | `wit/clock/`, `crates/dekopon-provider-clock/` | Mirror comparison, `clock-probe` import inspection, package workflow |
+| Host wall/monotonic clock and random WIT and guest facades | `wit/{clock,clock-v1-1,random}/`, `crates/dekopon-provider-{clock,random}/` | Mirror comparisons, legacy `clock-probe` import inspection, Wasmtime service tests, package workflow |
 | Native provider storage | `crates/dekopon-storage-host/src/{config,key,layout,namespace,quota,handle,jsonl,vfs,metrics}.rs` | Path/key/quota/direct-write/startup/continuity tests plus broker-host component integration |
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, clock-refusal, and loopback tests, and `crates/dekopon-broker-host/tests/spans.rs` for store, instantiation, fuel, and `provider_clock_read` telemetry |
@@ -103,12 +103,14 @@ The storage package is mirrored byte-for-byte at:
 - `crates/dekopon-broker-host/wit/deps/storage.wit`
 - `examples/providers/storage-probe/wit/deps/storage.wit`
 
-The wall clock package is mirrored byte-for-byte at:
+The immutable legacy wall clock package is mirrored byte-for-byte at:
 
 - `wit/clock/clock.wit`
 - `crates/dekopon-provider-clock/wit/deps/clock.wit`
 - `crates/dekopon-broker-host/wit/deps/clock.wit`
 - `examples/providers/clock-probe/wit/deps/clock.wit`
+
+The new `clock@1.1.0` package is mirrored between `wit/clock-v1-1/clock.wit`, `crates/dekopon-provider-clock/wit/monotonic/deps/clock.wit`, and `crates/dekopon-broker-host/wit/deps/clock-v1-1.wit`. The `random@0.1.0` package is mirrored between `wit/random/random.wit`, `crates/dekopon-provider-random/wit/deps/random.wit`, and `crates/dekopon-broker-host/wit/deps/random.wit`. The legacy clock fixture and its binary retain `wall@1.0.0`.
 
 The broker host and imported guests also mirror the provider package:
 
@@ -126,13 +128,12 @@ the WIT interface versions they import; a broker host crate may register adapter
 for multiple supported WIT versions. Compatible native HTTP-library upgrades do not
 require provider rebuilds.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), and [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), independently define the HTTP, storage, and clock packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.3.0` worlds and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.0`, and `dekopon:clock@1.0.0` packages independently. The broker host's own `dekopon:broker-provider@0.3.0` world is not published, so widening it with an import leaves its version unchanged. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), [`../wit/clock-v1-1/wkg.toml`](../wit/clock-v1-1/wkg.toml) plus [`../wit/clock-v1-1/wkg.lock`](../wit/clock-v1-1/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock) independently define the HTTP, storage, legacy/new clock, and random packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.3.0` worlds and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.0`, `dekopon:clock@1.0.0`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0` packages independently. The broker host's own `dekopon:broker-provider@0.3.0` world is not published, so widening it with an import leaves its version unchanged. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
 `dekopon-broker-host` links only project-owned HTTP (current `@1.1.0` plus buffered `@1.0.0` compatibility),
-asset `@0.1.0`, storage, and wall clock interfaces, consumes `AuthorizedInvocation` and an exact optional storage
+asset `@0.1.0`, storage, both clock versions and random interfaces, consumes `AuthorizedInvocation` and an exact optional storage
 grant, and maps WIT values to native engines enforcing exact grants beneath independent ceilings.
-The clock is readable only in an invocation's store; a read during a description or command run
-traps.
+Clocks and random bytes are readable only in an invocation's store, including its instantiation; reads during a description or command run trap and trip the pure-phase failure.
 The host does not authenticate callers, evaluate policy, or construct authorization.
 
 The SDK's optional `host` feature retains manifest validation, complete conflicting-provider-set
@@ -273,6 +274,8 @@ rustup target add wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-sdk --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-sdk --features clap --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-clock --target wasm32-unknown-unknown
+cargo check --locked -p dekopon-provider-clock --features monotonic --target wasm32-unknown-unknown
+cargo check --locked -p dekopon-provider-random --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-storage --no-default-features --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown
@@ -427,13 +430,27 @@ wasm-tools validate target/wit-package/dekopon-storage.wasm
     --config ../../wkg/config.toml
 )
 wasm-tools validate target/wit-package/dekopon-clock.wasm
+(
+  cd wit/clock-v1-1
+  wkg build --wit-dir . --output ../../target/wit-package/dekopon-clock-v1-1.wasm \
+    --config ../../wkg/config.toml
+)
+(
+  cd wit/random
+  wkg build --wit-dir . --output ../../target/wit-package/dekopon-random.wasm \
+    --config ../../wkg/config.toml
+)
+wasm-tools validate target/wit-package/dekopon-clock-v1-1.wasm
+wasm-tools validate target/wit-package/dekopon-random.wasm
 wasm-tools component wit target/wit-package/dekopon-provider.wasm
 wasm-tools component wit target/wit-package/dekopon-http.wasm
 wasm-tools component wit target/wit-package/dekopon-storage.wasm
 wasm-tools component wit target/wit-package/dekopon-clock.wasm
+wasm-tools component wit target/wit-package/dekopon-clock-v1-1.wasm
+wasm-tools component wit target/wit-package/dekopon-random.wasm
 ```
 
-The builds must leave all four `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.3.0` with three import-free worlds: `provider` with two exports, the retired `provider-commands` adding `resolve-command` (`argv: list<string>`), and `provider-cli` adding `run-command` (`argv: list<string>`, `stdin: option<string>`), every function returning `string`. That package version is published and immutable, so its text does not change when a world stops being used. The HTTP package must identify `dekopon:http@1.1.0`, its `client` interface with unchanged buffered `send` plus additive `stream`, the `dekopon:asset@0.1.0` dependency with its `asset` interface, and no worlds. Validation pins the buffered signatures and the streamed request parts, borrowed handles, owned response handle, and error types. The storage package must identify `dekopon:storage@0.1.0`, the complete pinned JSONL and durable-files signatures/types, and no worlds. The clock package must identify `dekopon:clock@1.0.0`, one `wall` interface with a single `now-unix-millis` function returning `u64`, and no worlds. Exercise the configured fetch path with:
+The builds must leave all six `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.3.0` with three import-free worlds: `provider` with two exports, the retired `provider-commands` adding `resolve-command` (`argv: list<string>`), and `provider-cli` adding `run-command` (`argv: list<string>`, `stdin: option<string>`), every function returning `string`. That package version is published and immutable, so its text does not change when a world stops being used. The HTTP package must identify `dekopon:http@1.1.0`, its `client` interface with unchanged buffered `send` plus additive `stream`, the `dekopon:asset@0.1.0` dependency with its `asset` interface, and no worlds. Validation pins the buffered signatures and the streamed request parts, borrowed handles, owned response handle, and error types. The storage package must identify `dekopon:storage@0.1.0`, the complete pinned JSONL and durable-files signatures/types, and no worlds. The immutable legacy clock package must identify `dekopon:clock@1.0.0`, one `wall` interface with a single `now-unix-millis` function returning `u64`, and no worlds. The new `dekopon:clock@1.1.0` package contains both `wall.now-unix-millis` and `monotonic.now-nanos`, each returning `u64`; `dekopon:random@0.1.0` contains `source.get-random-bytes(length: u32) -> list<u8>`. Neither new package defines a world. Exercise the configured fetch path with:
 
 ```console
 wkg get \

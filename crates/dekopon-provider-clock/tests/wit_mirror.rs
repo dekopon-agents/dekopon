@@ -6,4 +6,8 @@ fn vendored_clock_contract_matches_the_published_package() {
         include_str!("../wit/deps/clock.wit"),
         include_str!("../../../wit/clock/clock.wit")
     );
+    assert_eq!(
+        include_str!("../wit/monotonic/deps/clock.wit"),
+        include_str!("../../../wit/clock-v1-1/clock.wit")
+    );
 }

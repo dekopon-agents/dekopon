@@ -7,6 +7,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- The broker links `dekopon:clock/monotonic@1.1.0` and `dekopon:random/source@0.1.0` during
+  authorized invocations, including invocation-owned instantiation. The legacy `wall@1.0.0`
+  contract and fixture remain unchanged; the new clock package also links `wall@1.1.0`.
+  Monotonic elapsed nanoseconds share an invocation origin; OS-backed entropy is capped at
+  4096 bytes per call and never falls back on failure. Optional clock and new random guest facades
+  expose the imports without forcing new imports onto existing wall-only callers.
+
 ### Fixed
 
 - A retained chat asset no longer holds the `gateway.session` span that spooled it. The span, with

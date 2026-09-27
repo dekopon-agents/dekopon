@@ -863,10 +863,12 @@ dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-http-host",
+ "dekopon-provider-random",
  "dekopon-provider-sdk",
  "dekopon-provider-sdk-testkit",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "getrandom 0.4.3",
  "rustix",
  "serde",
  "serde_json",
@@ -1061,6 +1063,13 @@ name = "dekopon-provider-http"
 version = "0.23.0"
 dependencies = [
  "dekopon-provider-sdk",
+ "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "dekopon-provider-random"
+version = "0.23.0"
+dependencies = [
  "wit-bindgen 0.62.0",
 ]
 

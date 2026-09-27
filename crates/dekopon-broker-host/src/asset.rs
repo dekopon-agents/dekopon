@@ -927,6 +927,7 @@ mod tests {
                 http,
                 StorageState::disabled(),
                 ClockState::invoke(),
+                crate::RandomState::invoke(),
                 SettingsState::invoke(None),
             )
             .unwrap()
@@ -1751,6 +1752,7 @@ mod tests {
                 http,
                 StorageState::disabled(),
                 ClockState::invoke(),
+                crate::RandomState::invoke(),
                 SettingsState::invoke(None),
             )
             .unwrap();

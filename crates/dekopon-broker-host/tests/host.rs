@@ -13,9 +13,9 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CLOCK_V1_1_WIT,
     CommandRunOutcome, HARD_MAX_PROVIDER_COMPONENT_BYTES, HTTP_WIT, LockedProviderSource,
-    PROVIDER_WIT, STORAGE_WIT,
+    PROVIDER_WIT, RANDOM_WIT, STORAGE_WIT,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation, StorageAccess,
@@ -627,6 +627,11 @@ fn broker_bindings_mirror_the_immutable_packages() {
         include_str!("../wit/deps/clock.wit"),
         include_str!("../../../wit/clock/clock.wit")
     );
+    assert_eq!(
+        CLOCK_V1_1_WIT,
+        include_str!("../../../wit/clock-v1-1/clock.wit")
+    );
+    assert_eq!(RANDOM_WIT, include_str!("../../../wit/random/random.wit"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1694,6 +1699,134 @@ fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
     file.write_all(wat.as_bytes())
         .expect("write component text");
     file
+}
+
+fn service_provider(
+    invoke_length: u32,
+    describe_reads_random: bool,
+    command_reads_random: bool,
+) -> tempfile::NamedTempFile {
+    use std::io::Write as _;
+
+    let base = post_return_component("");
+    let wat = std::fs::read_to_string(base.path()).expect("base component text");
+    let wat = wat.replace(
+        "(component\n",
+        r#"(component
+            (import "dekopon:clock/monotonic@1.1.0" (instance $mono
+                (export "now-nanos" (func (result u64)))))
+            (import "dekopon:random/source@0.1.0" (instance $random
+                (export "get-random-bytes" (func (param "length" u32) (result (list u8))))))
+            (core module $heap-module
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+            (core instance $heap (instantiate $heap-module))
+            (core func $mono-lowered (canon lower (func $mono "now-nanos")))
+            (core func $random-lowered (canon lower (func $random "get-random-bytes")
+                (memory (core memory $heap "memory")) (realloc (core func $heap "realloc"))))
+"#,
+    );
+    let wat = wat.replace(
+        "(core module $m\n",
+        "(core module $m\n                (import \"host\" \"mono\" (func $mono (result i64)))\n                (import \"host\" \"random\" (func $random (param i32 i32)))\n",
+    );
+    let describe_call = if describe_reads_random {
+        "i32.const 0 i32.const 16 call $random "
+    } else {
+        ""
+    };
+    let wat = wat.replace(
+        "(func (export \"describe\") (result i32) i32.const 0)",
+        &format!("(func (export \"describe\") (result i32) {describe_call}i32.const 0)"),
+    );
+    let command_call = if command_reads_random {
+        "i32.const 0 i32.const 16 call $random "
+    } else {
+        ""
+    };
+    let wat = wat.replace(
+        "(func (export \"command\") (param i32 i32 i32 i32 i32) (result i32) i32.const 8)",
+        &format!("(func (export \"command\") (param i32 i32 i32 i32 i32) (result i32) {command_call}i32.const 8)"),
+    );
+    let wat = wat.replace(
+        "(func (export \"invoke\") (param i32 i32 i32 i32) (result i32) i32.const 8)",
+        &format!("(func (export \"invoke\") (param i32 i32 i32 i32) (result i32) call $mono drop i32.const {invoke_length} i32.const 16 call $random i32.const 8)"),
+    );
+    let wat = wat.replace(
+        "(core instance $i (instantiate $m))",
+        "(core instance $i (instantiate $m\n                (with \"host\" (instance (export \"mono\" (func $mono-lowered)) (export \"random\" (func $random-lowered))))))",
+    );
+    let mut file = tempfile::NamedTempFile::new().expect("temporary service component");
+    file.write_all(wat.as_bytes())
+        .expect("write service component");
+    file
+}
+
+#[tokio::test]
+async fn wasmtime_service_provider_classifies_oversize_and_pure_phase_reads() {
+    let pure_phase = service_provider(0, true, false);
+    let error = BrokerProviderRegistry::load([pure_phase.path()], BrokerHostLimits::default())
+        .await
+        .expect_err("describe cannot read entropy");
+    assert!(matches!(
+        error,
+        BrokerHostError::DescribeUsedHostImport { .. }
+    ));
+
+    let command_phase = service_provider(0, false, true);
+    let registry =
+        BrokerProviderRegistry::load([command_phase.path()], BrokerHostLimits::default())
+            .await
+            .expect("pure describe loads");
+    let error = registry
+        .run_command("cleanup", &[], None)
+        .await
+        .expect_err("command cannot read entropy");
+    assert!(matches!(
+        error,
+        BrokerHostError::RunCommandUsedHostImport { .. }
+    ));
+
+    let oversized = service_provider(4097, false, false);
+    let registry = BrokerProviderRegistry::load([oversized.path()], BrokerHostLimits::default())
+        .await
+        .expect("pure metadata can load the service provider");
+    let error = registry
+        .invoke(
+            authorized(
+                "cleanup-probe.noop".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("oversize random calls reject the invocation");
+    assert!(matches!(
+        *error.error,
+        BrokerHostError::RandomCallRejected {
+            reason: dekopon_broker_host::RandomFailure::TooLarge
+        }
+    ));
+
+    let valid = service_provider(32, false, false);
+    let registry = BrokerProviderRegistry::load([valid.path()], BrokerHostLimits::default())
+        .await
+        .expect("valid service provider loads");
+    let result = registry
+        .invoke(
+            authorized(
+                "cleanup-probe.noop".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("monotonic and OS entropy calls succeed");
+    assert_eq!(result.output, json!({}));
 }
 
 #[tokio::test]

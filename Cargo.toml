@@ -12,6 +12,7 @@ members = [
     "crates/dekopon-http-host",
     "crates/dekopon-policy",
     "crates/dekopon-provider-clock",
+    "crates/dekopon-provider-random",
     "crates/dekopon-provider-http",
     "crates/dekopon-provider-sdk",
     "crates/dekopon-provider-sdk-testkit",
@@ -113,6 +114,7 @@ dekopon-http-host = { version = "0.23.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.23.0", path = "crates/dekopon-model" }
 dekopon-policy = { version = "0.23.0", path = "crates/dekopon-policy" }
 dekopon-provider-clock = { version = "0.23.0", path = "crates/dekopon-provider-clock" }
+dekopon-provider-random = { version = "0.23.0", path = "crates/dekopon-provider-random" }
 dekopon-provider-http = { version = "0.23.0", path = "crates/dekopon-provider-http" }
 dekopon-provider-sdk = { version = "0.23.0", path = "crates/dekopon-provider-sdk" }
 dekopon-provider-sdk-testkit = { version = "0.23.0", path = "crates/dekopon-provider-sdk-testkit" }

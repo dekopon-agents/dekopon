@@ -16,6 +16,21 @@ mod bindings {
     });
 }
 
+#[cfg(feature = "monotonic")]
+mod monotonic_bindings {
+    wit_bindgen::generate!({
+        path: "wit/monotonic",
+        world: "monotonic-client",
+        generate_all,
+    });
+}
+
+#[cfg(feature = "monotonic")]
+#[must_use]
+pub fn now_nanos() -> u64 {
+    monotonic_bindings::dekopon::clock::monotonic::now_nanos()
+}
+
 /// Call only from invoke; the broker host traps a component that reads the clock from describe or
 /// run-command, which must stay pure.
 #[must_use]

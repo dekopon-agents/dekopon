@@ -21,6 +21,7 @@ rustix.workspace = true
 dekopon-http-host.workspace = true
 dekopon-provider-sdk = { workspace = true, features = ["host"] }
 dekopon-storage-host.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -34,6 +35,7 @@ wasmtime = { workspace = true, features = ["async"] }
 # Inline adversarial components exercise post-return traps and fuel cancellation, not guest builds.
 wasmtime = { workspace = true, features = ["wat"] }
 dekopon-test-support = { path = "../dekopon-test-support" }
+dekopon-provider-random.workspace = true
 # Path-only, deliberately: the testkit depends on this crate, so a version requirement here would
 # be a package cycle crates.io cannot order. Cargo strips a dev-dependency carrying no version at
 # package time, so the cycle exists only inside the workspace.
