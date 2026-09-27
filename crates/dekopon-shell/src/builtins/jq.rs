@@ -57,7 +57,23 @@ impl Builtin for Jq {
             return Err(CommandFailure::usage("jq: a filter argument is required"));
         };
 
-        evaluate(&filter, input.unwrap_or(Value::Null), context.budget).map(CommandResult::value)
+        evaluate(&filter, parse_string_input(input), context.budget).map(CommandResult::value)
+    }
+}
+
+/// `echo "$r"` stringifies a captured value's structure into display text; parsing that text
+/// back into an object or array here makes filtering it match filtering the original value. A
+/// scalar stays a string: this crate parses without `arbitrary_precision`, so a decimal-seconds
+/// timestamp like `1727400000.123450` would come back a rounded `f64`, and a filter built for a
+/// string (`test("^[0-9]+$")`) would see a number instead.
+fn parse_string_input(input: Option<Value>) -> Value {
+    match input {
+        Some(Value::String(text)) => match serde_json::from_str(&text) {
+            Ok(parsed @ (Value::Object(_) | Value::Array(_))) => parsed,
+            _ => Value::String(text),
+        },
+        Some(other) => other,
+        None => Value::Null,
     }
 }
 
@@ -757,6 +773,46 @@ mod tests {
             assert_eq!(result.value, json!("x"), "{flags:?}");
         }
         assert!(run_builtin(&super::Jq, &["--slurp", "."], Some(json!(1))).is_err());
+    }
+
+    #[test]
+    fn a_piped_string_holding_json_text_is_parsed_before_filtering() {
+        use crate::builtins::test_support::run_builtin;
+
+        // `result=$(gh pr list …)` captures the object; `echo "$result" | jq …` is what
+        // stringifies it into display text, and the builtin should parse that text back
+        // rather than index it as a string.
+        let captured = json!({"page": 2, "pullRequests": [{"author": "xrl"}]}).to_string();
+        let result = run_builtin(
+            &super::Jq,
+            &[".pullRequests[0].author"],
+            Some(json!(captured)),
+        )
+        .expect("the captured JSON text is parsed, not indexed as a string");
+        assert_eq!(result.value, json!("xrl"));
+
+        // Text that isn't JSON is still indexed as a string value.
+        assert_eq!(
+            run_builtin(&super::Jq, &["ltrimstr(\"a\")"], Some(json!("abc")))
+                .expect("non-JSON text still indexes as a string")
+                .value,
+            json!("bc")
+        );
+    }
+
+    #[test]
+    fn a_piped_string_holding_a_json_scalar_is_still_indexed_as_a_string() {
+        use crate::builtins::test_support::run_builtin;
+
+        // Only an object or array is substituted for its parse: this crate parses without
+        // `arbitrary_precision`, so promoting a scalar would round a decimal-seconds Slack
+        // timestamp like the last case to a lossy f64, and would break a string-only filter
+        // (`test(...)`, `ltrimstr`, ...) built for what stays a string.
+        for source in ["123", "true", "null", "1727400000.123450"] {
+            let result = run_builtin(&super::Jq, &["."], Some(json!(source)))
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(result.value, json!(source), "{source}");
+        }
     }
 
     #[test]

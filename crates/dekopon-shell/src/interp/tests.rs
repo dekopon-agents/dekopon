@@ -830,16 +830,28 @@ fn case_charges_the_step_budget_like_every_other_construct() {
 fn a_here_document_becomes_the_commands_input_as_one_string() {
     assert_eq!(output("cat <<EOF\nalpha\nbeta\nEOF"), "alpha\nbeta");
 
+    // jq parses the heredoc's JSON text before filtering, the same as a filter reading the
+    // same text from a real pipe.
     assert_eq!(
-        output("jq -r 'fromjson.name' <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
+        output("jq -r .name <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
         "dekopon"
     );
-    let unparsed = run("jq -r .name <<EOF\n{\"name\": \"dekopon\"}\nEOF");
+    let unparsed = run("jq -r .name <<EOF\nnot json\nEOF");
     assert_eq!(unparsed.exit_code, ExitCode::FAILURE);
     assert!(
         unparsed.output.contains("cannot index"),
         "{}",
         unparsed.output
+    );
+}
+
+#[test]
+fn a_captured_object_reaches_jq_through_an_echo_pipe() {
+    // `r=$(cmd)` captures the object; `echo "$r"` is what stringifies it into display text,
+    // and jq parses that text back rather than indexing it as a string.
+    assert_eq!(
+        output(r#"r=$(probe object --a 1 --b 2); echo "$r" | jq '.a + .b'"#),
+        "3"
     );
 }
 
