@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-26
+
 ### Added
 
 - Same-sender messages and photos steer a running chat turn with per-route `steering: abort`
@@ -36,6 +38,12 @@ All notable changes to Dekopon are documented here. The format is based on
 ### Removed
 
 - The separate late-photo intake, retained/expired/refused paths and completion notices.
+
+## [dekopon-chart-0.15.0] - 2026-09-26
+
+### Changed
+
+- Default application version is now 0.24.0.
 
 ## [0.23.0] - 2026-09-26
 

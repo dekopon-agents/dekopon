@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Chat steering (unreleased)
+## Chat steering (0.24.0)
 
 Steering is enabled on every route by default. A same-sender message during a running turn now
 interrupts only the model call and joins that turn; it never interrupts a tool, script or provider
