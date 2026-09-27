@@ -305,6 +305,7 @@ struct Running {
     subject: dekopon_core::ExternalSubject,
     cancellation: SessionCancellation,
     steering: Steering,
+    aborts: u8,
     received_at: tokio::time::Instant,
     steers: VecDeque<InboundMessage>,
     follow_ups: VecDeque<FollowUp>,
@@ -316,6 +317,7 @@ impl Running {
             subject: message.subject.clone(),
             cancellation: SessionCancellation::new(),
             steering: route.steering,
+            aborts: 0,
             received_at: message.received_at,
             steers: VecDeque::new(),
             follow_ups: VecDeque::new(),
@@ -389,7 +391,10 @@ impl SessionGate {
             {
                 record_admission(&message, "steered", depth + 1, None);
                 running.steers.push_back(message);
-                if running.steering == Steering::Abort {
+                if running.steering == Steering::Abort
+                    && usize::from(running.aborts) < MAILBOX_CAPACITY
+                {
+                    running.aborts += 1;
                     running.cancellation.interrupt_model();
                 }
                 return Admit::Steered(receipts);
@@ -546,6 +551,7 @@ impl SessionAdmission {
                 running.subject = next.message.subject.clone();
                 running.cancellation = SessionCancellation::new();
                 running.steering = next.route.steering;
+                running.aborts = 0;
                 running.received_at = next.message.received_at;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
@@ -1056,11 +1062,6 @@ async fn acknowledge_steer(
     if let (Some(ack), Some(target)) = (driver.steer_ack(), target)
         && let Err(error) = crate::progress::bounded(ack.seen(target)).await
     {
-        let error = if error == "deadline" {
-            "timeout"
-        } else {
-            error
-        };
         tracing::debug!(event = "gateway_steer_ack_failed", transport, error = %error);
     }
 }

@@ -2821,6 +2821,27 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_user_keeps_the_newest_turn_with_a_marked_prefix() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 8,
+            max_bytes: 65536,
+        });
+        history.record(ConversationTurn::completed("earlier", "answer"));
+        let user = "é".repeat(35000);
+        assert_eq!(user.len(), 70000);
+
+        history.record(ConversationTurn::completed(&user, "answer"));
+
+        assert_eq!(history.len(), 1);
+        let turn = &history.turns()[0];
+        let prefix = turn.user().strip_suffix("[…]").expect("truncation marker");
+        assert!(user.starts_with(prefix));
+        assert_eq!(prefix.len(), 65524);
+        assert_eq!(turn.answer(), Some("answer"));
+        assert!(history.bytes() <= history.limits().max_bytes);
+    }
+
+    #[test]
     fn an_exchange_too_large_for_the_window_leaves_it_empty_rather_than_half_present() {
         let mut history = History::new(HistoryLimits {
             max_turns: 8,

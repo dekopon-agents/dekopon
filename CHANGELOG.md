@@ -11,7 +11,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Same-sender messages and photos steer a running chat turn with per-route `steering: abort`
   (default) or `boundary`. Model-only interruptions do not spend a completed model step or cancel
-  tool, script or provider work. Other senders and wakes queue follow-ups under their own broker legs.
+  tool, script or provider work. After eight interrupt requests in a run, steers wait for the next
+  boundary. Other senders and wakes queue follow-ups under their own broker legs.
 - Best-effort 👀 acknowledgments for accepted steers and queued non-wake messages with liveness
   targets, plus admission telemetry distinguishing queueing from bounded refusals.
 
@@ -22,6 +23,8 @@ All notable changes to Dekopon are documented here. The format is based on
   reply regardless, subject to the bounded refusal-reply capacity and transport delivery.
 - Photos arriving during their sender's turn use ordinary steering and the running asset access.
   Consumed steer text joins history and delivered-turn memory without changing the journal format.
+  An oversized newest history turn keeps a marked user prefix when its intact answer and marker
+  fit the byte window.
 
 ### Fixed
 

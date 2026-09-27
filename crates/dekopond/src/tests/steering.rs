@@ -54,6 +54,41 @@ fn same_conversation_steers_even_when_every_permit_is_taken() {
 }
 
 #[test]
+fn drained_steers_exhaust_the_abort_budget_but_a_followup_gets_a_fresh_budget() {
+    let gate = SessionGate::new(1);
+    let route = route(model_config());
+    let admission = held(&gate, &route);
+    let cancellation = admission.cancellation();
+    let model = cancellation.model_watch();
+    let key = (message("").transport, message("").conversation.key());
+
+    for index in 0..MAILBOX_CAPACITY + 2 {
+        assert!(matches!(
+            admit(&gate, &route, message("steer")),
+            Admit::Steered(_)
+        ));
+        assert_eq!(*model.borrow(), index < MAILBOX_CAPACITY);
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(gate.take_steers(&key)[0].text, "steer");
+        assert!(!*model.borrow());
+    }
+
+    assert!(matches!(
+        admit(&gate, &route, message_from("tel.999", "followup")),
+        Admit::Queued
+    ));
+    let (admission, _) = admission.next_or_release().expect("queued followup");
+    let model = admission.cancellation().model_watch();
+    assert!(matches!(
+        admit(&gate, &route, message_from("tel.999", "new steer")),
+        Admit::Steered(_)
+    ));
+    assert!(*model.borrow());
+    assert_eq!(gate.take_steers(&key)[0].text, "new steer");
+    assert!(admission.next_or_release().is_none());
+}
+
+#[test]
 fn the_ninth_item_is_full_counting_steers_and_followups_together() {
     let gate = SessionGate::new(1);
     let route = route(model_config());
