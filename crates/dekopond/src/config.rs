@@ -774,13 +774,12 @@ pub struct ResolvedWakes {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JournalConfig {
     pub path: PathBuf,
-    pub max_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct ResolvedJournal {
     pub dir: PathBuf,
-    pub max_bytes: u64,
+    pub retention: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1486,15 +1485,23 @@ pub(crate) fn resolve(
             },
         }
     });
-    let journal = config.sessions.journal.as_ref().map(|journal| {
-        if journal.max_bytes == 0 {
-            problems.push(ConfigProblem::InvalidJournalBytes);
-        }
-        ResolvedJournal {
+    let journal = config
+        .sessions
+        .journal
+        .as_ref()
+        .map(|journal| ResolvedJournal {
             dir: resolve_path(journal.path.clone()),
-            max_bytes: journal.max_bytes,
-        }
-    });
+            retention: routes
+                .iter()
+                .filter_map(|route| match route.memory {
+                    MemoryPolicy::Persistent(window) if window.recall == RecallSource::Journal => {
+                        Some(window.forget_after)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(DEFAULT_FORGET_AFTER),
+        });
     let shutdown_grace = match config.shutdown_grace_ms {
         Some(0) => {
             problems.push(ConfigProblem::InvalidSessionLimits);
@@ -2063,10 +2070,6 @@ pub enum ConfigProblem {
         "sessions.maxConversations must be greater than zero; a zero ceiling evicts every conversation immediately and turns a persistent route into an expensive one-shot one"
     )]
     InvalidMaxConversations,
-    #[error(
-        "sessions.journal.maxBytes must be greater than zero; omit sessions.journal to keep nothing on disk"
-    )]
-    InvalidJournalBytes,
     #[error("routes[{route}]: `wakes: true` needs `sessions.wakes`")]
     WakesWithoutStore { route: usize },
     #[error(

@@ -58,7 +58,7 @@ impl ConversationKey {
         }
     }
 
-    /// A digest, so a journal directory listing names no subject or native conversation id.
+    /// A digest, so any subject or native conversation id encodes to a safe file name.
     pub fn journal_stem(&self) -> String {
         let mut digest = Sha256::new();
         for part in [self.agent.as_str(), &self.transport, &self.conversation] {

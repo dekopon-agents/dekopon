@@ -134,7 +134,7 @@ where
     let journal = match config.journal.clone() {
         Some(journal) => Some(Arc::new(
             tokio::task::spawn_blocking(move || {
-                journal::Journal::open(&journal.dir, journal.max_bytes)
+                journal::Journal::open(&journal.dir, journal.retention)
             })
             .await
             .map_err(DekopondError::TransportTask)?

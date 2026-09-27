@@ -7,6 +7,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `sessions.journal.maxBytes` is removed and refused. Journal files not written for
+  longer than the longest journal route `forgetAfterMs` are deleted at startup and on recall.
+- Each journal line carries the conversation's whole attachment inventory and next asset number,
+  and compaction reads the whole file. Files from earlier releases are deleted on first recall.
+- Journal lines no longer cap the encoded user text at 64 KiB.
+
+### Fixed
+
+- A journaled answer whose escaped JSON exceeded the compaction read limit no longer drops the
+  photos and asset counter recorded before it (#358).
+
 ## [dekopon-chart-0.17.0] - 2026-09-27
 
 ### Added

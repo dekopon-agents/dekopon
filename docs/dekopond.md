@@ -176,8 +176,7 @@ sessions:
   maxConversations: 1024                      # optional, default 1024 tracked
   assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
   journal:                                    # optional; absent, no conversation text is written to disk
-    path: /var/lib/dekopond/journal           # relative paths resolve against this file
-    maxBytes: 67108864                        # every journal file together; least recently touched evicted
+    path: /var/lib/dekopond/journal           # relative paths resolve against this file; files idle past the longest journal-route forgetAfterMs are deleted
   wakes:                                      # optional; absent, no route may schedule a wake
     path: /var/lib/dekopond/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
@@ -963,13 +962,10 @@ An interrupted call does not spend `maxSteps`. Each run requests at most eight m
 after that, steers wait for the next boundary. A follow-up starts with a fresh interrupt budget.
 Session duration and per-call timeouts still apply.
 Steers left at the last step, decline or failure fold into a follow-up under their original sender.
-Consumed steer text joins the turn's user text in history and the journal, without a format change.
+Consumed steer text joins the turn's user text in history and the journal.
 When the newest turn alone exceeds the in-process byte window, its user text is shortened to a
 UTF-8-safe prefix ending in `[…]` if the intact answer and marker fit; otherwise whole-turn eviction
 still applies.
-Journal writes cap only the JSON-encoded user string at 64 KiB. If needed, the user text is
-shortened to a UTF-8-safe prefix ending in `[…]`; the raw answer, metadata and assets remain
-intact. The complete line can exceed 64 KiB and is not rejected for its size.
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -998,10 +994,10 @@ This subsection describes the automatic replay window, not the separate on-deman
 `idleTimeoutMs` is how long a window stays in memory, not how long it is remembered. When a message finds no window in memory (first contact, idle expiry, capacity eviction, or a restart), the route's `recall` rebuilds one before the model runs:
 
 - `none` starts empty. It is the default without `sessions.journal`, and it is the only behaviour older releases had.
-- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, every committed exchange on a journal route is appended to one JSONL file per state key, named by a SHA-256 of that key: directory `0700`, files `0600`, no fsync. Only the trailing run of exchanges recorded under the message's current grant is recalled, so a narrowed grant never replays output from a wider one. Exchanges older than `forgetAfterMs` are skipped. A file past twice `maxBytes` is rewritten to the window. The oldest files go first once `sessions.journal.maxBytes` is reached. A file that does not parse is deleted, and that message starts empty.
+- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, every committed exchange on a journal route is appended to one JSONL file per state key, named by a SHA-256 of that key: directory `0700`, files `0600`, no fsync. Each line carries the conversation's attachment inventory at that moment and its next `Chat Asset` number; recall uses the newest line's. Only the trailing run of exchanges recorded under the message's current grant is recalled, so a narrowed grant never replays output from a wider one. Exchanges older than `forgetAfterMs` are skipped. A file past twice the route's `maxBytes` plus 64 KiB is rewritten to the window. At startup and on every recall, files not written for longer than the longest `forgetAfterMs` of any journal route are deleted. A file that does not parse, including one from an older release's format, is deleted, and that message starts empty.
 - `platform` asks the chat service for the conversation's recent messages (Slack `conversations.replies` or `conversations.history`, Discord `GET /channels/{id}/messages`), so the model sees what the person sees, other participants included. It reads at most `min(2 × maxTurns, 100)` messages, waits at most 5 s, and a read that fails answers from an empty window. Only Slack and Discord have a history API; startup refuses `platform` on WhatsApp, Telegram, and local routes. Discord returns other people's text only when the application has the Message Content intent enabled in the Developer Portal; without it, those messages are skipped. Authors are labelled `[gateway: chat history, from <service user id>]`, which is service-reported and not broker-authenticated.
 
-A recalled window brings its attachments with it, under the same `Chat Asset #N` numbers the replayed turns use, and bytes are still fetched only on demand. WhatsApp media ids expire after 7 days, so an older photo is still named but can no longer be opened.
+A recalled window brings its attachments with it, under the same `Chat Asset #N` numbers the replayed turns use, and bytes are still fetched only on demand. An attachment that arrived before `forgetAfterMs` is not recalled. WhatsApp media ids expire after 7 days, so with a longer `forgetAfterMs` an older WhatsApp photo is named for that one recall but can no longer be opened, and the next journal line drops it.
 
 ### Scope selects the replay audience
 
@@ -1055,7 +1051,6 @@ The loss is real and worth naming: the model cannot re-read a command it ran thr
 | `maxBytes` | persistent route | Bytes the window replays; default 65536 |
 | `recall` | persistent route | Where a window not in memory is rebuilt from: `none`, `journal`, or `platform` |
 | `forgetAfterMs` | persistent route | Oldest exchange or chat message `recall` may bring back; default 604800000 |
-| `journal.maxBytes` | `sessions:` | Disk every journal file may hold together |
 | `maxConversations` | `sessions:` | Conversations the process tracks at once; default 1024 |
 
 `maxTurns` and `maxBytes` both apply, oldest turns dropping first until both hold. Two bounds because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the same number of turns and very different prompts.
@@ -1167,7 +1162,7 @@ steer's raw text, joined by blank lines, excluding gateway timing and attachment
 If the combined user and assistant text exceeds the existing 64-KiB recording ceiling, only the
 recorded user text is shortened to a UTF-8-safe prefix ending in `[…]`; space is reserved for that
 marker and the entire accepted assistant text. This recording bound leaves prompt history
-unchanged; journal writes apply their own encoded-user bound.
+unchanged.
 Assistant text is exactly what the transport accepted. No response,
 denial, timeout, EOF, partial Discord delivery, or outcome-unaudited is retried, and none changes
 the already delivered `answered` outcome.
