@@ -85,6 +85,6 @@ Each of these is a decision, not a gap. Every artifact of the loop is either in 
 
 - [`dekopond.md`](dekopond.md#sessions) — how a route mounts its agent's catalog skills, and why nothing a suggestion records reaches chat.
 - [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) — the `spec.skills` field, the `SKILL.md` front matter, every bound, and what the loader refuses.
-- [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`; transcript payloads remain opt-in.
+- [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`, all emitted regardless of payload telemetry; only the separate prompt/answer transcript stream remains opt-in.
 - [`inference.md`](inference.md) — the prompt-cache prefix a stable skills listing preserves, and the conversation memory that is not an improvement mechanism.
 - [`security-model.md`](security-model.md) — why operator-authored text handed to a model shapes answers and grants nothing.

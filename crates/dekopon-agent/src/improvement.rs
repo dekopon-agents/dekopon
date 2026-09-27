@@ -205,8 +205,6 @@ pub(crate) fn suggest_improvement_into(
         }
     };
     let index = suggestions.len() + 1;
-    // This record always includes the model-authored text regardless of the telemetry setting,
-    // since offering the tool is itself the opt-in, but never the chat text or the subject.
     tracing::info!(
         target: "dekopon_agent::audit",
         {

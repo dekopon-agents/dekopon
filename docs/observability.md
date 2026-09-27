@@ -199,10 +199,11 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
-reduced to a category — because a suggestion nobody can read is not a suggestion. `suggest_improvement`
-is offered on every session, and that text reaches telemetry like any other model-authored record
-(goal 2): the record carries no chat text the gateway holds and no subject, only what the model
-wrote into those fields.
+reduced to a category — because a suggestion nobody can read is not a suggestion. Unlike a model's
+own prompt and answer text, which rides the log stream only when the embedding binary opts into
+payload telemetry, this record is unconditional: offering `suggest_improvement` is itself what puts
+the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
+the model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
