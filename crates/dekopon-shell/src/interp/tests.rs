@@ -615,6 +615,10 @@ fn help_interception_decides_on_the_unexpanded_word_not_the_expanded_string() {
         output(r#"printf 'a\n--help\n' | xargs echo"#),
         r#"["a","--help"]"#
     );
+    assert_eq!(
+        output(r#"f() { "$@" --help; }; f grep -v"#),
+        "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
+    );
 }
 
 #[test]

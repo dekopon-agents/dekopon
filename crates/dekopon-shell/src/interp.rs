@@ -920,15 +920,12 @@ impl Evaluator<'_> {
             }
         }
 
-        // `--help` wins only when the script wrote it as a single bare, unquoted word: never when
-        // it arrives through expansion (`x=--help; echo "$x"`, `grep "$pat"`) or through xargs's
-        // own constructed argv, both of which reach `run_argv` as ordinary strings indistinguishable
-        // from a script author's intent. Deciding on the AST word here, before expansion, is what
-        // tells them apart; `run_xargs` calls `run_argv` directly and never computes this.
-        let literal_help = matches!(
-            command.words.as_slice(),
-            [_, Word { parts }] if matches!(parts.as_slice(), [WordPart::Literal(only)] if only == "--help")
-        );
+        // `--help` wins only when the script wrote it as the command's one bare, unquoted word.
+        let literal_help = argv.len() == 2
+            && matches!(
+                command.words.as_slice(),
+                [_, Word { parts }] if matches!(parts.as_slice(), [WordPart::Literal(only)] if only == "--help")
+            );
 
         let transient = !argv.is_empty();
         let mut restore = Vec::new();

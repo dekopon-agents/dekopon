@@ -11,9 +11,9 @@ do not understand rather than guessing.
 ## Provider `--help` baked into the tool description (unreleased)
 
 Roll `dekopon-brokerd` and `dekopond` together. The `Capabilities` response frame gains an optional
-`command_word_help` field; an unrolled `dekopond` still decodes it with `deny_unknown_fields`, so a
-session that reaches even one word with a rendered page refuses the frame outright. No configuration
-changes.
+`command_word_help` field, and a `dekopond` still on the previous release decodes it with
+`deny_unknown_fields`, so a session that reaches even one word with a rendered page refuses the
+frame outright. No configuration changes.
 
 ## Conversation journal (0.26.0)
 

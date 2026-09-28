@@ -1964,8 +1964,6 @@ where
         self.command_word_help_for(&words)
     }
 
-    /// The registry's help map, filtered down to a word list a call site already computed —
-    /// `command_words`/`chat_memory_words`'s reachability, or none at all for the ceiling.
     fn command_word_help_for(&self, words: &[String]) -> BTreeMap<String, String> {
         let all = self.registry.command_word_help();
         words

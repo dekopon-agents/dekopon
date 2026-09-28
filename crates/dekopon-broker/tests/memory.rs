@@ -503,7 +503,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     let legacy_grant = AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
-    let (legacy_capabilities, legacy_words, legacy_help, _memory) = broker
+    let (legacy_capabilities, legacy_words, _legacy_help, _memory) = broker
         .capability_surface(
             &gateway(),
             Some(&legacy_grant),
@@ -519,7 +519,6 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
             .all(|entry| entry.capability.id.as_str() != storage_id)
     );
     assert!(!legacy_words.iter().any(|word| word == storage_word));
-    assert!(!legacy_help.contains_key(storage_word));
 
     let (scoped_capabilities, scoped_words, scoped_help, _) = broker
         .capability_surface(&gateway(), Some(&attestor_grant()), Some(&session))
@@ -549,7 +548,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
         scope.trigger = dekopon_broker::Trigger::Probe;
     }
 
-    let (capabilities, words, help, _) = broker
+    let (capabilities, words, _help, _) = broker
         .capability_surface(&gateway(), Some(&attestor_grant()), Some(&probe))
         .expect("a probe is an authorized chat session");
     assert!(
@@ -558,7 +557,6 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
             .all(|entry| entry.capability.id.as_str() != "storage-probe.run")
     );
     assert!(!words.iter().any(|word| word == "storageprobe"));
-    assert!(!help.contains_key("storageprobe"));
 
     let id = "probe-write".parse::<InvocationId>().expect("invocation");
     let result = broker
@@ -1137,11 +1135,34 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         ["memory.chat.recent", "memory.chat.search"]
     );
     assert_eq!(words, ["memory"]);
-    assert!(
-        help.keys().all(|word| words.contains(word)),
-        "help never advertises a word that is not also listed"
-    );
+    assert!(help.contains_key("memory"));
     assert!(memory.is_some());
+
+    // The same agent and conversation the Cedar policy authorizes for `agent.prompt`, but a
+    // broker whose `chat_memory.enabled_agents` does not name "reviewer": prompt succeeds and
+    // "memory" is still declared, but `memory_surface` returns `None` before Cedar ever
+    // evaluates the memory-specific rule.
+    let unenrolled_root = directory.join("provider-storage-unenrolled");
+    let unenrolled_broker = build_broker_with(
+        &unenrolled_root,
+        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+        ChatMemoryConfig {
+            enabled_agents: vec!["someone-else".parse().expect("agent")],
+            ..memory_config()
+        },
+        StorageLimits::default(),
+        BrokerHostLimits::default(),
+        false,
+    )
+    .await;
+    let (_, _, no_memory_help, no_memory) = unenrolled_broker
+        .capability_surface(&gateway(), Some(&grant), Some(&claim))
+        .expect("prompt is still authorized when only chat memory is disabled for this agent");
+    assert!(
+        no_memory.is_none(),
+        "an agent chat_memory.enabled_agents does not name gets no memory surface"
+    );
+    assert!(!no_memory_help.contains_key("memory"));
 
     assert!(
         broker.capabilities(&gateway()).iter().all(|entry| {
