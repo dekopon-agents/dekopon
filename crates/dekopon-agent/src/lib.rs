@@ -8,12 +8,13 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::{
+    collections::BTreeSet,
     collections::hash_map::RandomState,
-    collections::{BTreeMap, BTreeSet},
     hash::{BuildHasher as _, Hasher as _},
     sync::atomic::{AtomicU32, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -82,6 +83,10 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
 
     fn command_words(&self) -> Vec<String> {
         self.invoker.command_words()
+    }
+
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        self.invoker.command_word_help()
     }
 }
 
@@ -160,6 +165,14 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         words.sort_unstable();
         words.dedup();
         words
+    }
+
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        let mut pages = self.direct.command_word_help();
+        if let Some(broker) = &self.broker {
+            pages.extend(broker.command_word_help());
+        }
+        pages
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
@@ -267,6 +280,7 @@ pub struct BrokerLeg {
     capabilities: BTreeMap<String, CapabilityDescription>,
     effective_capabilities: Vec<EffectiveCapabilityView>,
     command_words: BTreeSet<String>,
+    command_word_help: BTreeMap<String, String>,
     identifiers: IdSequence,
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
@@ -287,12 +301,13 @@ impl BrokerLeg {
         client: BrokerClient,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
-        let (capabilities, command_words, chat_memory) =
+        let (capabilities, command_words, command_word_help, chat_memory) =
             client.session_surface(attestation.clone()).await?;
         Self::build(
             client,
             capabilities,
             command_words,
+            command_word_help,
             attestation,
             chat_memory,
         )
@@ -302,6 +317,7 @@ impl BrokerLeg {
         client: BrokerClient,
         available: Vec<dekopon_broker_protocol::AvailableCapability>,
         command_words: Vec<String>,
+        command_word_help: BTreeMap<String, String>,
         attestation: Option<Attestation>,
         chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
@@ -312,6 +328,7 @@ impl BrokerLeg {
             capabilities,
             effective_capabilities,
             command_words: command_words.into_iter().collect(),
+            command_word_help,
             identifiers: IdSequence::for_session(),
             attestation,
             chat_memory,
@@ -506,6 +523,10 @@ impl CapabilityInvoker for BrokerLeg {
 
     fn command_words(&self) -> Vec<String> {
         self.command_words.iter().cloned().collect()
+    }
+
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        self.command_word_help.clone()
     }
 
     fn has_command_word(&self, word: &str) -> bool {
@@ -1391,6 +1412,7 @@ mod tests {
                     risk: "Low".to_owned(),
                 }],
                 command_words: BTreeSet::new(),
+                command_word_help: BTreeMap::new(),
                 identifiers: IdSequence::for_session(),
                 attestation,
                 chat_memory: None,

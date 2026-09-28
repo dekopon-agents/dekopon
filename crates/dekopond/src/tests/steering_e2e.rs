@@ -83,7 +83,6 @@ async fn oversized_steered_text_is_recorded_with_a_marked_prefix_and_the_exact_a
         directory.path(),
         vec![
             memory_surface_response(),
-            help_rendered("memory"),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
                 Vec::new(),
@@ -126,11 +125,6 @@ async fn oversized_steered_text_is_recorded_with_a_marked_prefix_and_the_exact_a
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities { .. }
-    ));
-    assert!(matches!(
-        observed.recv().await.expect("help prefetch").request,
-        BrokerRequest::RunCommand { word, argv, .. }
-            if word == "memory" && argv == ["--help".to_owned()]
     ));
     let record = observed.recv().await.expect("bounded record request");
     let BrokerRequest::RecordDeliveredTurn { turn, .. } = record.request else {

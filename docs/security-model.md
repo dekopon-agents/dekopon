@@ -288,7 +288,10 @@ the run whatever word produced it. The piped value is bounded by the client's fr
 it leaves the process and by the host's `maxInputBytes` before a store exists; the broker reports
 the second only in its own `command.resolve.failed` record, and the caller sees the opaque
 `provider-error` reply. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
-carries the wire detail.
+carries the wire detail. The same provider-authored `--help` text is also rendered once per word at
+broker load and baked into the bash tool description, so a reachable word's help reads as part of
+the tool surface without a per-session round trip; a page that fails to render is omitted rather
+than blocking startup.
 
 Recording is **model-hidden, gateway-attested transport acceptance**, not broker-proven delivery or
 human receipt. Slack/Telegram/Discord receipts prove complete service acceptance; local `flush`

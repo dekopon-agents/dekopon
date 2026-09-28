@@ -245,6 +245,10 @@ impl From<LockedProviderSource> for ProviderSource {
 /// executor often enough for the wall-clock deadline to fire.
 const MAX_FUEL_YIELD_INTERVAL: u64 = 10_000;
 
+// Bounds one word's cached `--help` page: enough for a top-level usage/subcommand listing, not
+// enough for a runaway component to bloat every session's baked-in prompt prefix.
+const MAX_COMMAND_WORD_HELP_BYTES: usize = 2048;
+
 impl BrokerHostLimits {
     #[must_use]
     pub const fn fuel_yield_interval(&self) -> u64 {
@@ -602,6 +606,7 @@ pub struct BrokerWasmProvider {
     artifact_sha256: String,
     manifest: ProviderManifest,
     command_export: CommandExport,
+    command_word_help: BTreeMap<String, String>,
 }
 
 impl fmt::Debug for BrokerWasmProvider {
@@ -855,7 +860,7 @@ impl BrokerWasmProvider {
             command_export = command_export_name(&command_export),
             "loaded broker provider"
         );
-        Ok(Self {
+        let mut provider = Self {
             runtime,
             pre,
             source,
@@ -863,7 +868,10 @@ impl BrokerWasmProvider {
             artifact_sha256,
             manifest,
             command_export,
-        })
+            command_word_help: BTreeMap::new(),
+        };
+        provider.command_word_help = provider.render_command_word_help().await;
+        Ok(provider)
     }
 
     /// Runs before authorization, so a host-import attempt here is refused rather than trusted; it
@@ -977,6 +985,62 @@ impl BrokerWasmProvider {
             });
         }
         Ok(output)
+    }
+
+    /// One `--help` render per declared command word, once at load: `run_command` takes no host
+    /// import here, so the page is a pure function of the component bytes and stays valid for the
+    /// registry's lifetime. A refusal, a malformed answer, a non-`Rendered` outcome, or a non-zero
+    /// status omits that word's page and logs one warning rather than failing the load.
+    async fn render_command_word_help(&self) -> BTreeMap<String, String> {
+        let mut pages = BTreeMap::new();
+        for word in &self.manifest.command_words {
+            if let Some(page) = self.render_one_command_word_help(word).await {
+                pages.insert(word.clone(), page);
+            }
+        }
+        pages
+    }
+
+    async fn render_one_command_word_help(&self, word: &str) -> Option<String> {
+        let json = match self.run_command(&["--help".to_owned()], None).await {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.manifest.id,
+                    word,
+                    error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(&error)),
+                    "command word --help render failed at load"
+                );
+                return None;
+            }
+        };
+        let outcome = match serde_json::from_str::<CommandRunOutcome>(&json) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.manifest.id,
+                    word,
+                    error = %error,
+                    "command word --help answer did not decode at load"
+                );
+                return None;
+            }
+        };
+        match outcome {
+            CommandRunOutcome::Rendered { stdout, status, .. }
+                if status == 0 && !stdout.is_empty() =>
+            {
+                Some(bounded_command_word_help(stdout))
+            }
+            _ => {
+                tracing::warn!(
+                    provider = %self.manifest.id,
+                    word,
+                    "command word --help did not render successfully at load"
+                );
+                None
+            }
+        }
     }
 
     #[allow(
@@ -1372,6 +1436,17 @@ impl BrokerProviderRegistry {
             .collect()
     }
 
+    /// The `--help` pages rendered at load, by the provider that owns each word; a provider whose
+    /// render failed for every word is simply absent, not an empty entry.
+    #[must_use]
+    pub fn command_word_help_by_provider(&self) -> Vec<(&ProviderId, &BTreeMap<String, String>)> {
+        self.providers
+            .iter()
+            .filter(|provider| !provider.command_word_help.is_empty())
+            .map(|provider| (&provider.manifest.id, &provider.command_word_help))
+            .collect()
+    }
+
     #[must_use]
     pub fn command_words(&self) -> Vec<String> {
         let mut words = self
@@ -1649,6 +1724,19 @@ const fn command_export_name(export: &CommandExport) -> &'static str {
         CommandExport::Present => RUN_COMMAND_EXPORT,
         CommandExport::Absent | CommandExport::Mismatched { .. } => "none",
     }
+}
+
+fn bounded_command_word_help(mut page: String) -> String {
+    if page.len() <= MAX_COMMAND_WORD_HELP_BYTES {
+        return page;
+    }
+    let mut end = MAX_COMMAND_WORD_HELP_BYTES;
+    while !page.is_char_boundary(end) {
+        end -= 1;
+    }
+    page.truncate(end);
+    page.push_str(&format!("\n[--help truncated at {end} bytes]"));
+    page
 }
 
 async fn describe_component(

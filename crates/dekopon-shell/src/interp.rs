@@ -1215,7 +1215,9 @@ impl Evaluator<'_> {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
             Resolution::Function => self.call_function(command, arguments, input, capture_output),
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
-                if arguments.iter().any(|argument| argument == "--help") {
+                if let [only] = arguments
+                    && only == "--help"
+                {
                     return Ok(Executed::Result(builtins::help_result(
                         builtin.name(),
                         builtin.help(),
@@ -1238,7 +1240,9 @@ impl Evaluator<'_> {
                 }
             }
             Resolution::Builtin(BuiltinKind::Xargs) => {
-                if arguments.iter().any(|argument| argument == "--help") {
+                if let [only] = arguments
+                    && only == "--help"
+                {
                     return Ok(Executed::Result(builtins::help_result(
                         xargs::NAME,
                         xargs::HELP,

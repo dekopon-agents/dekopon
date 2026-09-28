@@ -727,8 +727,10 @@ fn validate_capability_responses<A: AuditLog>(
     maximum: usize,
 ) -> Result<(), BrokerdError> {
     for peer in identities.values() {
-        let (capabilities, command_words) = broker.capability_view(&peer.context);
-        let response = ResponseEnvelope::capabilities(capabilities, command_words);
+        let (capabilities, command_words, command_word_help) =
+            broker.capability_view(&peer.context);
+        let response =
+            ResponseEnvelope::capabilities(capabilities, command_words, command_word_help);
         let length = encoded_capability_response(&response)?;
         if length > maximum {
             return Err(BrokerdError::CapabilityResponseTooLarge { length, maximum });
@@ -737,10 +739,11 @@ fn validate_capability_responses<A: AuditLog>(
     // Direct peers are granted almost nothing in a gateway deployment; the real capability sets are
     // reachable only through attested sessions that can't be enumerated at startup, so the broker
     // bounds their worst case instead.
-    let (capabilities, command_words) = broker.capability_ceiling();
+    let (capabilities, command_words, command_word_help) = broker.capability_ceiling();
     let response = ResponseEnvelope::chat_capabilities(
         capabilities,
         command_words,
+        command_word_help,
         broker.chat_memory_ceiling(),
     );
     let length = encoded_capability_response(&response)?;

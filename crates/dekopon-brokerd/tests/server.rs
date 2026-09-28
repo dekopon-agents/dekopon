@@ -247,7 +247,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let (_, words, _) = client
+    let (_, words, _, _) = client
         .session_surface(Some(session()))
         .await
         .expect("inspect the surface");
@@ -363,7 +363,7 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
             .expect("inspect capabilities")
             .is_empty()
     );
-    let (capabilities, words, _) = client
+    let (capabilities, words, _, _) = client
         .session_surface(None)
         .await
         .expect("inspect the surface");
@@ -376,7 +376,7 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
     assert_eq!(result.result.error.as_deref(), Some("policy-error"));
     assert_eq!(audit.records().len(), 1);
 
-    let (capabilities, _, _) = client
+    let (capabilities, _, _, _) = client
         .session_surface(Some(session()))
         .await
         .expect("the same peer may still attest a session");
@@ -845,7 +845,7 @@ async fn attested_capabilities_over_the_socket() {
     let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let (capabilities, _, _) = client
+    let (capabilities, _, _, _) = client
         .session_surface(Some(session()))
         .await
         .expect("an attestor peer may inspect the attested context");

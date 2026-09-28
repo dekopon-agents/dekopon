@@ -69,6 +69,12 @@ pub trait ScriptRuntime {
     fn command_words(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Rendered once by whoever loaded the provider, not fetched here: a word missing from the
+    /// map has no page, not an empty one.
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -519,12 +525,8 @@ where
         prompt.max_capability_calls = limits.max_capability_calls
     );
     let _session = session_span.enter();
-    // Fetched inside the session span, not before it: each `--help` is a real broker round trip
-    // and Wasm instantiation, and its `gateway.progress` tool_started/tool_finished pair belongs to
-    // this session's trace like any other command word run.
     let command_words = runtime.command_words();
-    let help_pages = provider_help_pages(runtime, &command_words);
-    let mut script = script_tool(&command_words, &help_pages);
+    let mut script = script_tool(&command_words, &runtime.command_word_help());
     if progress_notes {
         script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
     }
@@ -1057,11 +1059,6 @@ pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_ty
     );
 }
 
-/// A word's `--help` page costs one broker round trip and a Wasm instantiation, paid once here at
-/// session start instead of once per session in a model turn; a word missing from `help` (refused,
-/// empty, or non-zero exit) is listed with no page rather than none of them.
-const MAX_PROVIDER_HELP_PAGE_BYTES: usize = 2048;
-
 fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> ModelTool {
     let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
     if !command_words.is_empty() {
@@ -1093,40 +1090,6 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
             "additionalProperties": false
         }),
     }
-}
-
-/// Runs `<word> --help` for every granted provider word once, at session start, so the model never
-/// spends a turn on it. A refusal, a non-zero exit, or empty output just omits that word's page;
-/// the word is still listed, and the model can still run `<word> --help` itself.
-fn provider_help_pages<R: ScriptRuntime + ?Sized>(
-    runtime: &R,
-    command_words: &[String],
-) -> BTreeMap<String, String> {
-    let mut words = command_words.to_vec();
-    words.sort();
-    words.dedup();
-    words
-        .into_iter()
-        .filter_map(|word| {
-            let outcome = runtime.run_script(&format!("{word} --help"), 0);
-            (outcome.exit_code == dekopon_shell::ExitCode::SUCCESS && !outcome.output.is_empty())
-                .then(|| (word, clamp_help_page(outcome.output)))
-        })
-        .collect()
-}
-
-fn clamp_help_page(mut page: String) -> String {
-    let total = page.len();
-    if total <= MAX_PROVIDER_HELP_PAGE_BYTES {
-        return page;
-    }
-    let mut end = MAX_PROVIDER_HELP_PAGE_BYTES;
-    while !page.is_char_boundary(end) {
-        end -= 1;
-    }
-    page.truncate(end);
-    page.push_str(&format!("\n[--help truncated at {end} bytes of {total}]"));
-    page
 }
 
 fn decline_reply_tool() -> ModelTool {
@@ -1651,11 +1614,11 @@ mod tests {
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
         CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES,
         DEFAULT_MAX_TURNS, FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
-        MAX_PROVIDER_HELP_PAGE_BYTES, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
-        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION,
-        SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs, SteerSource,
-        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
+        PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
+        ScriptRuntime, SessionInputs, SteerSource, agent_config_tool, format_script_outcome,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     struct ScriptedModel {
@@ -3261,63 +3224,35 @@ mod tests {
         );
     }
 
-    /// Keyed by command word (not by the `<word> --help` script), so `command_words` and the
-    /// script this fixture answers to always agree.
-    struct HelpRuntime {
-        pages: BTreeMap<&'static str, ScriptOutcome>,
-        fetched: Mutex<Vec<String>>,
+    struct StaticHelpRuntime {
+        words: Vec<String>,
+        help: BTreeMap<String, String>,
     }
 
-    impl ScriptRuntime for HelpRuntime {
+    impl ScriptRuntime for StaticHelpRuntime {
         fn run_script(&self, script: &str, _max_capability_calls: u32) -> ScriptOutcome {
-            self.fetched
-                .lock()
-                .expect("fetched lock")
-                .push(script.to_owned());
-            self.pages
-                .iter()
-                .find(|(word, _)| format!("{word} --help") == script)
-                .map(|(_, outcome)| outcome.clone())
-                .unwrap_or(ScriptOutcome {
-                    output: String::new(),
-                    exit_code: ExitCode::SUCCESS,
-                    truncated: false,
-                    capability_calls: 0,
-                    steps: 0,
-                })
+            panic!("this fixture's runtime never runs a script: {script}")
         }
 
         fn command_words(&self) -> Vec<String> {
-            self.pages.keys().map(|word| (*word).to_owned()).collect()
+            self.words.clone()
+        }
+
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            self.help.clone()
         }
     }
 
     #[test]
-    fn provider_help_pages_are_fetched_once_at_session_start_and_baked_in() {
-        let runtime = HelpRuntime {
-            pages: BTreeMap::from([(
-                "gh",
-                ScriptOutcome {
-                    output: "Usage: gh <command>".to_owned(),
-                    exit_code: ExitCode::SUCCESS,
-                    truncated: false,
-                    capability_calls: 0,
-                    steps: 0,
-                },
-            )]),
-            fetched: Mutex::new(Vec::new()),
+    fn run_turns_bakes_in_whatever_command_word_help_the_runtime_reports() {
+        let runtime = StaticHelpRuntime {
+            words: vec!["gh".to_owned()],
+            help: BTreeMap::from([("gh".to_owned(), "Usage: gh <command>".to_owned())]),
         };
-        let model = ScriptedModel::new([answer("done"), answer("done again")]);
+        let model = ScriptedModel::new([answer("done")]);
 
-        run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("first session succeeds");
-        run_prompt(&model, &runtime, "go again", None, limits(1, 1))
-            .expect("second session succeeds");
+        run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("prompt succeeds");
 
-        assert_eq!(
-            *runtime.fetched.lock().expect("fetched lock"),
-            vec!["gh --help".to_owned(), "gh --help".to_owned()],
-            "fetched exactly once per session, not per turn, and no caching across sessions"
-        );
         let tools = model.observed_tools.lock().expect("tool observations lock");
         let script = tools[0]
             .iter()
@@ -3327,90 +3262,6 @@ mod tests {
             script
                 .description
                 .contains("`gh --help`:\nUsage: gh <command>"),
-            "{}",
-            script.description
-        );
-    }
-
-    #[test]
-    fn a_refused_or_empty_help_page_is_omitted_rather_than_baked_in_empty() {
-        let runtime = HelpRuntime {
-            pages: BTreeMap::from([
-                (
-                    "empty",
-                    ScriptOutcome {
-                        output: String::new(),
-                        exit_code: ExitCode::SUCCESS,
-                        truncated: false,
-                        capability_calls: 0,
-                        steps: 0,
-                    },
-                ),
-                (
-                    "refused",
-                    ScriptOutcome {
-                        output: "refused: not allowed for you here".to_owned(),
-                        exit_code: ExitCode::DENIED,
-                        truncated: false,
-                        capability_calls: 0,
-                        steps: 0,
-                    },
-                ),
-            ]),
-            fetched: Mutex::new(Vec::new()),
-        };
-        let model = ScriptedModel::new([answer("done")]);
-
-        run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("prompt succeeds");
-
-        let tools = model.observed_tools.lock().expect("tool observations lock");
-        let script = tools[0]
-            .iter()
-            .find(|tool| tool.name == SCRIPT_TOOL_NAME)
-            .expect("bash tool offered");
-        assert!(
-            script
-                .description
-                .contains("command words: empty, refused."),
-            "the word is still listed: {}",
-            script.description
-        );
-        assert!(
-            !script.description.contains("--help`:"),
-            "{}",
-            script.description
-        );
-    }
-
-    #[test]
-    fn an_oversized_help_page_is_truncated_with_a_marker() {
-        let page = "x".repeat(MAX_PROVIDER_HELP_PAGE_BYTES + 500);
-        let runtime = HelpRuntime {
-            pages: BTreeMap::from([(
-                "big",
-                ScriptOutcome {
-                    output: page,
-                    exit_code: ExitCode::SUCCESS,
-                    truncated: false,
-                    capability_calls: 0,
-                    steps: 0,
-                },
-            )]),
-            fetched: Mutex::new(Vec::new()),
-        };
-        let model = ScriptedModel::new([answer("done")]);
-
-        run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("prompt succeeds");
-
-        let tools = model.observed_tools.lock().expect("tool observations lock");
-        let script = tools[0]
-            .iter()
-            .find(|tool| tool.name == SCRIPT_TOOL_NAME)
-            .expect("bash tool offered");
-        assert!(
-            script.description.contains(&format!(
-                "[--help truncated at {MAX_PROVIDER_HELP_PAGE_BYTES} bytes"
-            )),
             "{}",
             script.description
         );

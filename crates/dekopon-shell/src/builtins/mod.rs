@@ -148,8 +148,6 @@ impl BuiltinContext<'_> {
 pub(crate) trait Builtin {
     fn name(&self) -> &'static str;
 
-    /// The flags this builtin accepts, exactly as `--help` prints them and `unsupported_flag`
-    /// echoes them back on a refusal; empty when it takes none.
     fn help(&self) -> &'static str;
 
     fn run(
@@ -221,9 +219,8 @@ pub(crate) fn unsupported_flag(command: &str, flag: &str, supported: &str) -> Co
     ))
 }
 
-/// `--help` renders the same way for every builtin: its name, then the constant `Builtin::help`
-/// reports, at exit 0. `help` stays `""` at the call site so `unsupported_flag`'s suffix keeps
-/// omitting itself for a flag-free builtin; this is the one place that reads as prose instead.
+/// `help` stays `""` at the call site so `unsupported_flag`'s suffix keeps omitting itself for a
+/// flag-free builtin.
 pub(crate) fn help_result(name: &str, help: &str) -> CommandResult {
     let help = if help.is_empty() { "no flags" } else { help };
     CommandResult::value(Value::String(format!("{name}: {help}")))

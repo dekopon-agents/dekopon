@@ -276,7 +276,8 @@ fn typed_rows_and_response_indexes_are_exact() {
         validate_response_descriptors(&response.response, 1),
         Err(ProtocolError::DescriptorIndex)
     ));
-    let response = ResponseEnvelope::capabilities(vec![], vec![]);
+    let response =
+        ResponseEnvelope::capabilities(vec![], vec![], std::collections::BTreeMap::new());
     assert!(matches!(
         validate_response_descriptors(&response.response, 1),
         Err(ProtocolError::UnexpectedDescriptors)
@@ -345,7 +346,8 @@ fn rejected_frames_close_every_received_descriptor() {
                 Err(ProtocolError::TooManyDescriptors)
             ));
             assert_eq!(count(), before);
-            let response = ResponseEnvelope::capabilities(vec![], vec![]);
+            let response =
+                ResponseEnvelope::capabilities(vec![], vec![], std::collections::BTreeMap::new());
             let mut writer = DescriptorStream::new(writer);
             let descriptors: Vec<_> = files.iter().map(|file| file.as_fd()).collect();
             writer

@@ -1936,7 +1936,7 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
         assert_eq!(direct.result.error.as_deref(), Some("policy-error"), "{id}");
         assert_eq!(
             broker.capability_view(&peer),
-            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new(), BTreeMap::new()),
             "{id}"
         );
     }
@@ -2503,9 +2503,10 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
             broker.capability_view(&session(name, "provider-test")),
             (
                 broker.capabilities(&session(name, "provider-test")),
-                broker.command_words(&session(name, "provider-test"))
+                broker.command_words(&session(name, "provider-test")),
+                broker.command_word_help(&session(name, "provider-test"))
             ),
-            "the combined view must be the same answer as the two listings it replaces"
+            "the combined view must be the same answer as the three listings it replaces"
         );
     }
 

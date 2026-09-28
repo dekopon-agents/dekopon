@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -530,6 +531,7 @@ async fn producer_events(
         let mut responses = vec![ResponseEnvelope::capabilities(
             Vec::new(),
             command.into_iter().map(str::to_owned).collect(),
+            BTreeMap::new(),
         )];
         if command.is_some() {
             responses.push(ResponseEnvelope::error("denied", "fixture refusal"));

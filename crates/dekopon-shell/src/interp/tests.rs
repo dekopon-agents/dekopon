@@ -592,6 +592,27 @@ fn xargs_maps_a_command_over_a_list() {
 }
 
 #[test]
+fn help_interception_requires_help_to_be_the_only_argument() {
+    // `[ "$x" = --help ]`: a literal comparison against the string "--help" must still run the
+    // comparison, not print `[`'s own help page just because "--help" is one of the operands.
+    assert_eq!(
+        output(r#"x="--help"; if [ "$x" = --help ]; then echo matched; else echo no; fi"#),
+        "matched"
+    );
+
+    // `echo try --help`: "--help" is the second of two words to echo, not a request for echo's
+    // own help.
+    assert_eq!(output("echo try --help"), "try --help");
+
+    // xargs's own "--help" belongs to the per-element template it maps, not to xargs itself: it
+    // must reach each expanded `echo` call rather than being swallowed as xargs's own help.
+    assert_eq!(
+        output(r#"printf 'one\ntwo' | xargs -I {} echo {} --help"#),
+        r#"["one --help","two --help"]"#
+    );
+}
+
+#[test]
 fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
     // A capability is only reachable through its provider's command word; a bare
     // capability-identifier-shaped word is not itself callable, even for a capability this session

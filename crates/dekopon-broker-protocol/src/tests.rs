@@ -513,7 +513,11 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
         ));
         write_frame(
             &mut stream,
-            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            &ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            ),
             limits,
         )
         .await
@@ -2106,7 +2110,11 @@ async fn shared_socket_requires_protected_matching_parent_and_preserves_server_p
         ));
         write_frame(
             &mut stream,
-            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            &ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            ),
             limits,
         )
         .await

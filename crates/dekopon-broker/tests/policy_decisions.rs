@@ -261,7 +261,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
             .is_some(),
         "the permitted agent may be driven"
     );
-    let (capabilities, _words, memory) = broker
+    let (capabilities, _words, _help, memory) = broker
         .capability_surface(
             &gateway,
             Some(&grant),
