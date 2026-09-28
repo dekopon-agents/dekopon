@@ -97,12 +97,12 @@ fetch_provider() {
     memory-chat)
       repository=dekopon-agents/dekopon-provider-memory-chat
       asset=memory-chat-provider.wasm
-      release=v0.2.0
-      expected_sha=417b9cd7a21f0cd5bf03f05ad159753f56463add6865860ecfeb33af8938776f
-      expected_size=253670
+      release=v0.5.0
+      expected_sha=42488b0970422ab58a69f0abdd95aafd12f08bf1f16feca9ff59dae7acd10dc3
+      expected_size=243968
       signer="$repository/.github/workflows/release.yml"
-      source_ref=refs/tags/v0.2.0
-      source_digest=5aa6eac2aa07b0691682a532cb16fc93144eb358
+      source_ref=refs/tags/v0.5.0
+      source_digest=f9df308b31a2a4f75b55c606cdb42fbe0c0fcc59
       ;;
     *)
       echo "error: unknown external provider: $provider" >&2
