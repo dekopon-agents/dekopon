@@ -168,27 +168,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker().await;
 
-    assert!(
-        broker
-            .capability_surface(
-                &gateway(),
-                None,
-                Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
-                    agent("some-agent")
-                )),
-            )
-            .is_none()
-    );
-    let ungranted = captured.take_events();
-    assert!(
-        ungranted.contains("broker_capabilities_refused"),
-        "{ungranted}"
-    );
-    assert!(ungranted.contains("attestation-denied"), "{ungranted}");
-    assert!(ungranted.contains(MAPPED_SUBJECT), "{ungranted}");
-    assert!(ungranted.contains("gateway"), "{ungranted}");
-
     let narrow = AttestorGrant {
         namespaces: Some(vec!["slack.tother".to_owned()]),
     };
@@ -205,70 +184,6 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             .is_none()
     );
     assert!(captured.take_events().contains("attestation-denied"));
-
-    assert!(
-        broker
-            .capability_surface(
-                &gateway(),
-                Some(&grant()),
-                Some(&Attestation::for_subject(
-                    subject(UNMAPPED_SUBJECT),
-                    agent("some-agent")
-                )),
-            )
-            .is_none()
-    );
-    let unmapped = captured.take_events();
-    assert!(unmapped.contains("unmapped-subject"), "{unmapped}");
-    assert!(unmapped.contains(UNMAPPED_SUBJECT), "{unmapped}");
-
-    assert!(
-        broker
-            .capability_surface(
-                &gateway(),
-                Some(&grant()),
-                Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
-                    agent("other-agent")
-                )),
-            )
-            .is_none()
-    );
-    let denied = captured.take_events();
-    assert!(denied.contains("agent-denied"), "{denied}");
-    assert!(denied.contains("other-agent"), "{denied}");
-
-    assert!(
-        broker
-            .capability_surface(
-                &gateway(),
-                Some(&grant()),
-                Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
-                    agent("broken-agent")
-                )),
-            )
-            .is_none()
-    );
-    let erroring = captured.take_events();
-    assert!(erroring.contains("policy-error"), "{erroring}");
-    assert!(!erroring.contains("agent-denied"), "{erroring}");
-
-    assert!(
-        broker
-            .capability_surface(
-                &gateway(),
-                Some(&grant()),
-                Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
-                    agent("forbidden-agent")
-                )),
-            )
-            .is_none()
-    );
-    let forbidden = captured.take_events();
-    assert!(forbidden.contains("agent-denied"), "{forbidden}");
-    assert!(forbidden.contains("forbidden-gate"), "{forbidden}");
 
     let denied = proposal("invoke-policy-error");
     let refused = broker
@@ -360,6 +275,39 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     .into_iter()
     .enumerate()
     {
+        captured.clear();
+        assert!(
+            broker
+                .capability_surface(
+                    &gateway(),
+                    attestor.as_ref(),
+                    Some(&Attestation::for_subject(
+                        subject(canonical),
+                        agent(agent_id)
+                    )),
+                )
+                .is_none()
+        );
+        let inspection = captured.take_events();
+        for expected in [
+            "broker_capabilities_refused",
+            reason,
+            canonical,
+            "gateway",
+            agent_id,
+        ] {
+            assert!(
+                inspection.contains(expected),
+                "{expected} missing: {inspection}"
+            );
+        }
+        for policy in policies {
+            assert!(inspection.contains(policy), "{inspection}");
+        }
+        if reason == "policy-error" {
+            assert!(!inspection.contains("agent-denied"), "{inspection}");
+        }
+
         let request = proposal(&format!("invoke-chat-{index}"));
         let identifier = request.id.clone();
         let refused = broker

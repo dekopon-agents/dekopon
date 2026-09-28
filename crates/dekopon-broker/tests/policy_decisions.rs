@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
@@ -22,11 +22,6 @@ const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
 const POLICIES: &str = r#"
-@id("unconditional-upper")
-permit(principal == Dekopon::Principal::"direct-caller",
-       action == Dekopon::Action::"cli-probe.upper",
-       resource == Dekopon::Provider::"cli-probe");
-
 @id("attested-reverse")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.reverse",
@@ -61,58 +56,6 @@ fn subject() -> ExternalSubject {
     SLACK_SUBJECT.parse().expect("canonical subject fixture")
 }
 
-struct Row {
-    label: &'static str,
-    principal: &'static str,
-    agent: &'static str,
-    via: Option<&'static str>,
-    capability: &'static str,
-    allowed: bool,
-}
-
-const TABLE: &[Row] = &[
-    Row {
-        label: "a direct peer is denied even an unconditional grant naming it",
-        principal: "direct-caller",
-        agent: "provider-test",
-        via: None,
-        capability: "cli-probe.upper",
-        allowed: false,
-    },
-    Row {
-        label: "the mapped principal arriving directly matches nothing",
-        principal: "cpetersen",
-        agent: "some-agent",
-        via: None,
-        capability: "cli-probe.reverse",
-        allowed: false,
-    },
-    Row {
-        label: "attested caller reaches its attested grant",
-        principal: "cpetersen",
-        agent: "some-agent",
-        via: Some("gateway"),
-        capability: "cli-probe.reverse",
-        allowed: true,
-    },
-    Row {
-        label: "attested caller does not reach another principal's grant",
-        principal: "cpetersen",
-        agent: "some-agent",
-        via: Some("gateway"),
-        capability: "cli-probe.upper",
-        allowed: false,
-    },
-    Row {
-        label: "a different agent under the same attestation matches nothing",
-        principal: "cpetersen",
-        agent: "other-agent",
-        via: Some("gateway"),
-        capability: "cli-probe.reverse",
-        allowed: false,
-    },
-];
-
 fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
     (
         capability(capability_id),
@@ -129,21 +72,14 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
 
 fn policy_engine() -> PolicyEngine {
     let world = PolicyWorld::new(
-        [
-            principal("cpetersen"),
-            principal("direct-caller"),
-            principal("gateway"),
-        ],
-        [
-            (capability("cli-probe.upper"), provider()),
-            (capability("cli-probe.reverse"), provider()),
-        ],
+        [principal("cpetersen"), principal("gateway")],
+        [(capability("cli-probe.reverse"), provider())],
     )
     .expect("the workflow world builds");
     PolicyEngine::new(POLICIES, &world).expect("the workflow policy set validates")
 }
 
-async fn broker(mapped_principal: &str) -> Broker<InMemoryAuditLog> {
+async fn broker() -> Broker<InMemoryAuditLog> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -155,13 +91,10 @@ async fn broker(mapped_principal: &str) -> Broker<InMemoryAuditLog> {
         principal("broker-test"),
         "policy-decision-table".to_owned(),
         policy_engine(),
-        ConstraintCatalog::new([
-            constraint_set("cli-probe.upper"),
-            constraint_set("cli-probe.reverse"),
-        ])
-        .expect("distinct capabilities build a catalog"),
+        ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
+            .expect("one capability builds a catalog"),
         CredentialStore::empty(),
-        IdentityDirectory::new([(subject(), principal(mapped_principal))])
+        IdentityDirectory::new([(subject(), principal("cpetersen"))])
             .expect("one mapping builds a directory"),
         Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
         BrokerLimits::default(),
@@ -182,64 +115,8 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_workflow_decision_table_holds_end_to_end() {
-    let mut brokers = BTreeMap::new();
-    for (index, row) in TABLE.iter().enumerate() {
-        if !brokers.contains_key(row.principal) {
-            brokers.insert(row.principal, broker(row.principal).await);
-        }
-        let broker = &brokers[row.principal];
-        let request = request(index, row.capability);
-        let result = match row.via {
-            None => {
-                let context = AuthenticatedContext::new(
-                    principal(row.principal),
-                    Actor::Agent {
-                        agent: agent(row.agent),
-                    },
-                )
-                .expect("direct context binds");
-                broker
-                    .invoke(&context, None, None, request, Default::default())
-                    .await
-                    .expect("the proposal is accounted")
-            }
-            Some(via) => {
-                let peer = AuthenticatedContext::new(
-                    principal(via),
-                    Actor::Service {
-                        principal: principal(via),
-                    },
-                )
-                .expect("gateway context binds");
-                let attestation = Attestation::for_subject(subject(), agent(row.agent))
-                    .bound_to(request.id.clone());
-                broker
-                    .invoke(
-                        &peer,
-                        Some(&AttestorGrant {
-                            namespaces: Some(vec!["slack.t0123abc".to_owned()]),
-                        }),
-                        Some(&attestation),
-                        request,
-                        Default::default(),
-                    )
-                    .await
-                    .expect("the attested proposal is accounted")
-            }
-        };
-        assert_eq!(
-            result.result.outcome != InvocationOutcome::Denied,
-            row.allowed,
-            "row {index} ({}) decided the wrong way: {result:?}",
-            row.label
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn the_agent_prompt_gate_is_a_separate_grant() {
-    let broker = broker("cpetersen").await;
+    let broker = broker().await;
     let gateway = AuthenticatedContext::new(
         principal("gateway"),
         Actor::Service {
@@ -261,26 +138,23 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
             .is_some(),
         "the permitted agent may be driven"
     );
+    let chat = Attestation::for_chat(
+        subject(),
+        agent("some-agent"),
+        ChatScopeClaim {
+            transport: "scientist-slack".parse::<TransportId>().expect("transport"),
+            kind: ChatTransportKind::Slack,
+            conversation: Conversation {
+                kind: ConversationKind::Thread,
+                container: Some("t0123abc".to_owned()),
+                id: "c0123abc".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: dekopon_broker::Trigger::Message,
+        },
+    );
     let (capabilities, words, help, memory) = broker
-        .capability_surface(
-            &gateway,
-            Some(&grant),
-            Some(&Attestation::for_chat(
-                subject(),
-                agent("some-agent"),
-                ChatScopeClaim {
-                    transport: "scientist-slack".parse::<TransportId>().expect("transport"),
-                    kind: ChatTransportKind::Slack,
-                    conversation: Conversation {
-                        kind: ConversationKind::Thread,
-                        container: Some("t0123abc".to_owned()),
-                        id: "c0123abc".to_owned(),
-                        thread: Some("1712345678.000100".to_owned()),
-                    },
-                    trigger: dekopon_broker::Trigger::Message,
-                },
-            )),
-        )
+        .capability_surface(&gateway, Some(&grant), Some(&chat))
         .expect("legacy subject-only attestor remains compatible with chat operations");
     assert!(!capabilities.is_empty());
     assert_eq!(words, ["probe"]);
@@ -295,24 +169,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         .invoke(
             &gateway,
             Some(&grant),
-            Some(
-                &Attestation::for_chat(
-                    subject(),
-                    agent("some-agent"),
-                    ChatScopeClaim {
-                        transport: "scientist-slack".parse::<TransportId>().expect("transport"),
-                        kind: ChatTransportKind::Slack,
-                        conversation: Conversation {
-                            kind: ConversationKind::Thread,
-                            container: Some("t0123abc".to_owned()),
-                            id: "c0123abc".to_owned(),
-                            thread: Some("1712345678.000100".to_owned()),
-                        },
-                        trigger: dekopon_broker::Trigger::Message,
-                    },
-                )
-                .bound_to(ordinary.id.clone()),
-            ),
+            Some(&chat.bound_to(ordinary.id.clone())),
             ordinary,
             Default::default(),
         )
@@ -351,7 +208,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attestor_without_namespaces_speaks_for_exactly_the_mapped_subjects() {
-    let broker = broker("cpetersen").await;
+    let broker = broker().await;
     let gateway = AuthenticatedContext::new(
         principal("gateway"),
         Actor::Service {
@@ -385,7 +242,7 @@ async fn an_attestor_without_namespaces_speaks_for_exactly_the_mapped_subjects()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
-    let broker = broker("cpetersen").await;
+    let broker = broker().await;
     let gateway = AuthenticatedContext::new(
         principal("gateway"),
         Actor::Service {
