@@ -240,3 +240,6 @@ a catalog that disagrees with it produces no error here and no error there.
 - [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml) — a complete authored catalog.
 - [`examples/catalog/skills/pull-request-review/SKILL.md`](../examples/catalog/skills/pull-request-review/SKILL.md)
   — the skill that catalog's `reviewer` agent mounts, with one resource file.
+- [`examples/catalog/skills/learned-skills/SKILL.md`](../examples/catalog/skills/learned-skills/SKILL.md)
+  — the skill `snooper` mounts: it tells the model to keep skills it writes in its agent-scoped
+  `turso` database ([`improvement.md`](improvement.md#skills-the-agent-writes)).

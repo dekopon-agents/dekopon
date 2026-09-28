@@ -199,6 +199,8 @@ With history it stays. The injected text — or the model's own answer restating
 
 The mitigations below shorten the dwell time. None of them detects the injection, because nothing in this project does. A route that selects `oneShot` keeps the one-session dwell time.
 
+The longest dwell is an [agent-written skill](improvement.md#skills-the-agent-writes): a row in agent-scoped storage that every later session of that agent reads, indefinitely and across users.
+
 ### Shared scope widens audience as well as duration
 
 `sharedConversation` lets a participant's prompt and the agent's answer survive into prompts initiated by other authenticated participants. Attachments follow the same complete key and live generation, so their numbered references and fetchability are shared too. This is disclosure within an owner-selected route, not a policy bypass, and disclosure is a security effect. A participant can seed prompt injection that persists for everyone using that conversation, ask the model to repeat prior text, or cause another participant's canonical identifier to be sent again on replay.
