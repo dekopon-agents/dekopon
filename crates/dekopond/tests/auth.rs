@@ -18,26 +18,6 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
 }
 
-#[test]
-fn chatgpt_auth_status_does_not_require_configuration() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = directory.path().join("missing-auth.json");
-    let output = binary()
-        .current_dir(directory.path())
-        .args(["auth", "chatgpt", "status", "--auth-file"])
-        .arg(&auth_file)
-        .args(["--output", "json"])
-        .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let status: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("auth status JSON parses");
-    assert_eq!(status["account"], "chatgpt");
-    assert_eq!(status["signedIn"], false);
-    assert_eq!(status["credentialFile"], auth_file.display().to_string());
-}
-
 const CREDENTIAL_FIXTURE: &str = concat!(
     r#"{"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","#,
     r#""expiresAt":1700000000,"accountId":"acct-fixture"}"#,
@@ -66,7 +46,7 @@ fn export(auth_file: &std::path::Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
-fn chatgpt_export_emits_an_exact_secret_manifest() {
+fn chatgpt_export_emits_secret_manifests_and_raw_credentials() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
 
@@ -95,12 +75,6 @@ fn chatgpt_export_emits_an_exact_secret_manifest() {
                chatgpt-auth.json: {CREDENTIAL_FIXTURE_BASE64}\n"
         )
     );
-}
-
-#[test]
-fn chatgpt_export_places_the_secret_in_a_namespace() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
 
     let output = export(
         &auth_file,
@@ -115,26 +89,11 @@ fn chatgpt_export_places_the_secret_in_a_namespace() {
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(stdout(&output).contains("  name: chatgpt-seed\n  namespace: dekopon\n"));
-}
-
-#[test]
-fn chatgpt_export_emits_the_exact_credential_document() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
 
     let output = export(&auth_file, &["--expose-credential", "--format", "raw"]);
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output), CREDENTIAL_FIXTURE);
-}
-
-#[test]
-fn chatgpt_export_warns_that_the_exported_copy_rotates() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
-
-    let output = export(&auth_file, &["--expose-credential", "--format", "raw"]);
-
     let diagnostics = stderr(&output);
     assert!(diagnostics.contains("rotates"), "{diagnostics}");
     assert!(diagnostics.contains("in the clear"), "{diagnostics}");
@@ -142,66 +101,42 @@ fn chatgpt_export_warns_that_the_exported_copy_rotates() {
 }
 
 #[test]
-fn chatgpt_export_requires_the_credential_acknowledgement() {
+fn chatgpt_export_rejects_unusable_credentials() {
+    for (contents, diagnostic) in [
+        (None, "not logged in to ChatGPT"),
+        (Some("{ not json"), "could not parse ChatGPT credentials"),
+        (
+            Some(r#"{"version":1,"access":"","refresh":"","expiresAt":0,"accountId":""}"#),
+            "incomplete",
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let auth_file = match contents {
+            Some(contents) => credential_fixture(directory.path(), contents),
+            None => directory.path().join("missing-auth.json"),
+        };
+        let output = export(&auth_file, &["--expose-credential"]);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains(diagnostic));
+        assert!(stdout(&output).is_empty());
+    }
+}
+
+#[test]
+fn chatgpt_export_requires_acknowledgement_and_refuses_quiet() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+    for (arguments, diagnostic) in [
+        (&[][..], "--expose-credential"),
+        (&["--expose-credential", "--quiet"][..], "--quiet"),
+    ] {
+        let output = export(&auth_file, arguments);
 
-    let output = export(&auth_file, &[]);
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("--expose-credential"));
-    assert!(stdout(&output).is_empty());
-}
-
-#[test]
-fn chatgpt_export_without_a_credential_fails() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = directory.path().join("missing-auth.json");
-
-    let output = export(&auth_file, &["--expose-credential"]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("not logged in to ChatGPT"));
-    assert!(stdout(&output).is_empty());
-}
-
-#[test]
-fn chatgpt_export_rejects_a_malformed_credential_file() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(directory.path(), "{ not json");
-
-    let output = export(&auth_file, &["--expose-credential"]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("could not parse ChatGPT credentials"));
-    assert!(stdout(&output).is_empty());
-}
-
-#[test]
-fn chatgpt_export_rejects_an_incomplete_credential_file() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(
-        directory.path(),
-        r#"{"version":1,"access":"","refresh":"","expiresAt":0,"accountId":""}"#,
-    );
-
-    let output = export(&auth_file, &["--expose-credential"]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("incomplete"));
-    assert!(stdout(&output).is_empty());
-}
-
-#[test]
-fn chatgpt_export_refuses_to_be_quiet() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
-
-    let output = export(&auth_file, &["--expose-credential", "--quiet"]);
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("--quiet"));
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains(diagnostic));
+        assert!(stdout(&output).is_empty());
+    }
 }
 
 #[test]
@@ -225,21 +160,6 @@ fn chatgpt_export_rejects_an_invalid_secret_name() {
 }
 
 #[test]
-fn chatgpt_export_help_states_that_it_prints_a_credential() {
-    let output = binary()
-        .args(["auth", "chatgpt", "export", "--help"])
-        .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(0));
-    let help = stdout(&output);
-    assert!(
-        help.contains("prints real credential material in the clear"),
-        "{help}"
-    );
-    assert!(help.contains("--expose-credential"), "{help}");
-}
-#[test]
 fn auth_isolated_from_gateway_config_transport_and_telemetry_discovery() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let auth_file = directory.path().join("missing-auth.json");
@@ -262,6 +182,8 @@ fn auth_isolated_from_gateway_config_transport_and_telemetry_discovery() {
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
     let status: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("only status JSON");
+    assert_eq!(status["account"], "chatgpt");
+    assert_eq!(status["credentialFile"], auth_file.display().to_string());
     assert_eq!(status["signedIn"], false);
     assert_eq!(status["expired"], false);
     assert!(!auth_file.exists());
@@ -354,6 +276,14 @@ fn serving_requires_config_and_auth_flags_do_not_change_daemon_logging() {
         assert_eq!(output.status.code(), Some(0));
         assert!(stdout(&output).contains("--auth-file"));
         assert!(stderr(&output).is_empty());
+        if operation == "export" {
+            let help = stdout(&output);
+            assert!(
+                help.contains("prints real credential material in the clear"),
+                "{help}"
+            );
+            assert!(help.contains("--expose-credential"), "{help}");
+        }
     }
 }
 
