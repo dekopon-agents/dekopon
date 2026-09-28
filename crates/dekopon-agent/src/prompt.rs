@@ -208,7 +208,6 @@ pub struct SessionInputs<'a> {
     progress: Option<Arc<dyn ProgressSink>>,
     optional_reply: bool,
     skills: &'a [Skill],
-    improvement_suggestions: bool,
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
@@ -230,7 +229,6 @@ impl<'a> SessionInputs<'a> {
             progress: None,
             optional_reply: false,
             skills: &[],
-            improvement_suggestions: false,
             progress_notes: false,
             wakes: None,
         }
@@ -254,12 +252,6 @@ impl<'a> SessionInputs<'a> {
     #[must_use]
     pub const fn with_skills(mut self, skills: &'a [Skill]) -> Self {
         self.skills = skills;
-        self
-    }
-
-    #[must_use]
-    pub const fn with_improvement_suggestions(mut self) -> Self {
-        self.improvement_suggestions = true;
         self
     }
 
@@ -336,7 +328,6 @@ struct SessionExtensions<'a> {
     progress: Option<&'a dyn ProgressSink>,
     optional_reply: bool,
     skills: &'a [Skill],
-    improvement_suggestions: bool,
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
 }
@@ -365,7 +356,6 @@ where
         progress,
         optional_reply,
         skills,
-        improvement_suggestions,
         progress_notes,
         wakes,
     } = inputs;
@@ -409,7 +399,6 @@ where
             progress,
             optional_reply,
             skills,
-            improvement_suggestions,
             progress_notes,
             wakes,
         },
@@ -508,7 +497,6 @@ where
         progress,
         optional_reply,
         skills,
-        improvement_suggestions,
         progress_notes,
         wakes,
     } = extensions;
@@ -516,15 +504,12 @@ where
     if progress_notes {
         script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
     }
-    let mut model_tools = vec![script];
+    let mut model_tools = vec![script, improvement::improvement_tool()];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
     }
     if !skills.is_empty() {
         model_tools.push(skills::skill_tool());
-    }
-    if improvement_suggestions {
-        model_tools.push(improvement::improvement_tool());
     }
     if optional_reply {
         model_tools.push(decline_reply_tool());
@@ -844,7 +829,7 @@ where
                 )?;
                 continue;
             }
-            if call.function.name == IMPROVEMENT_TOOL_NAME && improvement_suggestions {
+            if call.function.name == IMPROVEMENT_TOOL_NAME {
                 improvement::suggest_improvement_into(
                     &mut messages,
                     &mut suggestions,
@@ -3497,9 +3482,10 @@ mod tests {
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
 
         let observed = model.observed_tools.lock().expect("tool observations lock");
-        assert_eq!(observed[0].len(), 2);
+        assert_eq!(observed[0].len(), 3);
         assert_eq!(observed[0][0].name, SCRIPT_TOOL_NAME);
-        assert_eq!(observed[0][1].name, AGENT_CONFIG_TOOL_NAME);
+        assert_eq!(observed[0][1].name, IMPROVEMENT_TOOL_NAME);
+        assert_eq!(observed[0][2].name, AGENT_CONFIG_TOOL_NAME);
         drop(observed);
 
         let messages = model.tool_messages();
@@ -3912,8 +3898,9 @@ mod tests {
 
         let observed = model.observed_tools.lock().expect("tool observations lock");
         assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].len(), 1);
+        assert_eq!(observed[0].len(), 2);
         assert_eq!(observed[0][0].name, SCRIPT_TOOL_NAME);
+        assert_eq!(observed[0][1].name, IMPROVEMENT_TOOL_NAME);
     }
 
     #[test]
@@ -4483,7 +4470,7 @@ mod tests {
         let outcome = run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("do the thing", limits(6, 2)).with_improvement_suggestions(),
+            SessionInputs::new("do the thing", limits(6, 2)),
             &mut history,
         )
         .expect("suggestions never fail a session");
@@ -4538,7 +4525,7 @@ mod tests {
         let outcome = run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("do the thing", limits(3, 2)).with_improvement_suggestions(),
+            SessionInputs::new("do the thing", limits(3, 2)),
             &mut history,
         )
         .expect("a refused suggestion is a tool result");
@@ -4555,23 +4542,24 @@ mod tests {
     }
 
     #[test]
-    fn the_suggestion_tool_is_absent_unless_the_embedder_offers_it() {
-        let model = ScriptedModel::new([suggestion("s-1", "gh.pull-request.read")]);
+    fn the_suggestion_tool_is_offered_on_every_session() {
+        let model =
+            ScriptedModel::new([suggestion("s-1", "gh.pull-request.read"), answer("Done.")]);
         let runtime = RecordingRuntime::new(0);
 
-        let error = run_prompt(&model, &runtime, "do the thing", None, limits(2, 2))
-            .expect_err("a tool that was never offered is unknown");
+        let outcome = run_prompt(&model, &runtime, "do the thing", None, limits(2, 2))
+            .expect("the tool needs no per-route opt-in");
 
-        assert!(matches!(error, PromptError::UnknownTool(name) if name == IMPROVEMENT_TOOL_NAME));
+        assert_eq!(outcome.suggestions.len(), 1);
         let tools = model.observed_tools.lock().expect("tool observations lock");
         assert!(
             tools[0]
                 .iter()
-                .all(|tool| tool.name != IMPROVEMENT_TOOL_NAME)
+                .any(|tool| tool.name == IMPROVEMENT_TOOL_NAME)
         );
         assert!(
             tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME),
-            "no skill tool either: the default session is exactly the pre-skills session"
+            "no skill tool: the default session mounts none"
         );
     }
 }

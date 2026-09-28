@@ -9,7 +9,7 @@ This document follows one agent from a session that went badly to a catalog chan
 | Question | Current answer |
 |---|---|
 | How does an agent get knowledge it did not have? | An operator writes a skill — a directory holding a `SKILL.md` — and mounts it in the catalog. The model sees the skill's name and one-line description in every prompt and reads the rest on demand through `read_skill`. |
-| How does an operator learn what the agent lacked? | With `suggest_improvement` enabled, the model records at most three bounded, typed notes per session, written to telemetry as `agent.improvement.suggested`. They are advice: nothing moves because a model asked. |
+| How does an operator learn what the agent lacked, or what cost it an awkward extra step even on a task that succeeded? | The model records at most three bounded, typed notes per session with `suggest_improvement`, written to telemetry as `agent.improvement.suggested`. They are advice: nothing moves because a model asked. |
 | Does anything improve itself? | **No.** No prompt is rewritten, no skill is generated, no suggestion is applied, and nothing a session learned outlives it except as a telemetry record a person reads. |
 | Where do the artifacts live? | Skills and instructions in the catalog; accounting, transcripts, and suggestions in the telemetry backend. |
 
@@ -18,7 +18,7 @@ This document follows one agent from a session that went badly to a catalog chan
 | Mechanism | Where it lives | What the model can do with it | What it never does |
 |---|---|---|---|
 | Skills | The catalog's `spec.skills` directories and the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
-| `suggest_improvement` | The session, when the embedder opted in; the record in the telemetry backend | Record a typed, bounded note for the operator | Change an instruction, skill, limit, or grant; reach the person in chat |
+| `suggest_improvement` | Every session; the record in the telemetry backend | Record a typed, bounded note for the operator | Change an instruction, skill, limit, or grant; reach the person in chat |
 
 ### Skills: progressive disclosure of operator-authored knowledge
 
@@ -42,15 +42,15 @@ A skill shapes an answer and grants nothing. Authority is only what the broker a
 
 ### Tap the glass: `suggest_improvement`
 
-An agent that hit a limit, reached for a capability it was never granted, or found its standing instructions wrong has learned something its operator would pay to know — and can otherwise say so only in chat, to a person who may not be the operator. `suggest_improvement` gives that observation a typed shape and a tagged telemetry record, so an operator can aggregate a month of sessions by category and target instead of reading transcripts.
+An agent that hit a limit, reached for a capability it was never granted, or found its standing instructions wrong has learned something its operator would pay to know — and can otherwise say so only in chat, to a person who may not be the operator. So has an agent that succeeded the long way: a workaround it built, a retry loop, a multi-step dance one capability or command word would have collapsed, output it reshaped by hand every time. Succeeding is no reason to stay quiet about that. `suggest_improvement` gives either observation a typed shape and a tagged telemetry record, so an operator can aggregate a month of sessions by category and target instead of reading transcripts.
 
-**It is opt-in everywhere, and the opt-in is consent.** The tool is never offered unless the embedder asked for it: `improvementSuggestions: true` on a `dekopond` route ([`dekopond.md`](dekopond.md#configuration)). The record carries model-authored text — a suggestion nobody can read is not a suggestion — so offering the tool is what declares the telemetry sink in scope for that text. Nothing else widens with it: the record carries no chat text the gateway holds and no subject, only what the model chose to write into six bounded fields.
+**It is offered on every session.** The record carries model-authored text — a suggestion nobody can read is not a suggestion — but that text goes to telemetry like every other model-authored record ([goal 2](design.md#constitution)): there is no separate opt-in to gate it behind. The record carries no chat text the gateway holds and no subject, only what the model chose to write into six bounded fields.
 
 The tool's own description tells the model when to call it: after the task is done or when it is genuinely blocked, at most three times per session, never instead of answering, and that the note goes to the operator's telemetry rather than to the person it is talking with. A call is a JSON object of six strings:
 
 | Field | Bound | Meaning |
 |---|---|---|
-| `category` | `instructions`, `skill`, `capability`, `tool`, `limits`, or `other` | What kind of operator-owned thing the note is about |
+| `category` | `instructions`, `skill`, `capability`, `tool`, `limits`, `efficiency`, or `other` | What kind of operator-owned thing the note is about |
 | `target` | 128 bytes | The specific thing: a skill name, a capability identifier, `instructions`, a limit name |
 | `summary` | 512 bytes | One sentence: what was wrong or could be better |
 | `evidence` | 2048 bytes | What the session observed that supports it — an exit code, a refusal, a missing fact |
@@ -70,7 +70,7 @@ Reading them back is one query against the stream the exporters wrote to. OpenOb
 SELECT * FROM "dekopon" WHERE audit_event = 'agent.improvement.suggested'
 ```
 
-Group by `suggestion_category` and `suggestion_target` to see what a fleet keeps asking for; `trace_id` joins a suggestion to the session that made it. What comes back is advice from an untrusted model about its own configuration. A `capability` suggestion is a request for authority and gets the policy review any other would; an `instructions` or `skill` suggestion is a draft an operator turns into a catalog edit. Nothing reads these records but a person.
+Group by `suggestion_category` and `suggestion_target` to see what a fleet keeps asking for; `trace_id` joins a suggestion to the session that made it. `suggestion_category = 'efficiency'` separates what worked but cost extra turns from the five defect categories, so the two do not blur together in one count. What comes back is advice from an untrusted model about its own configuration. A `capability` suggestion is a request for authority and gets the policy review any other would; an `instructions` or `skill` suggestion is a draft an operator turns into a catalog edit. Nothing reads these records but a person.
 
 ## What is absent by decision
 
@@ -83,8 +83,8 @@ Each of these is a decision, not a gap. Every artifact of the loop is either in 
 
 ## Related documents
 
-- [`dekopond.md`](dekopond.md#sessions) — how a route mounts its agent's catalog skills and opts into `improvementSuggestions`, and why nothing a suggestion records reaches chat.
+- [`dekopond.md`](dekopond.md#sessions) — how a route mounts its agent's catalog skills, and why nothing a suggestion records reaches chat.
 - [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) — the `spec.skills` field, the `SKILL.md` front matter, every bound, and what the loader refuses.
-- [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`; transcript payloads remain opt-in.
+- [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`, all emitted regardless of payload telemetry; only the separate prompt/answer transcript stream remains opt-in.
 - [`inference.md`](inference.md) — the prompt-cache prefix a stable skills listing preserves, and the conversation memory that is not an improvement mechanism.
 - [`security-model.md`](security-model.md) — why operator-authored text handed to a model shapes answers and grants nothing.

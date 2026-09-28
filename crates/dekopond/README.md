@@ -68,12 +68,12 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   earlier result. An unknown name or resource path is a refusal the model reads, naming the
   mounted skills or the skill's resource paths, and the session continues. Skill text is
   untrusted model text exactly like `instructions`: it shapes answers and grants nothing.
-- **Improvement suggestions** — a route with `improvementSuggestions: true` (default `false`)
-  also offers `suggest_improvement`, a bounded channel for the model to tell the operator what
-  to fix, at most three notes per session. Each note is written to telemetry as
-  `agent.improvement.suggested`, which is why the route flag is off by default: the record
-  carries model-authored text, and setting the flag is that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
-  moves because a model asked — and the gateway never relays it to chat.
+- **Improvement suggestions** — every session offers `suggest_improvement`, a bounded channel
+  for the model to tell the operator what to fix, or what cost it an awkward extra step even on
+  a task that succeeded, at most three notes per session. Each note is written to telemetry as
+  `agent.improvement.suggested` like every other model-authored record. A suggestion is advisory
+  by construction — no instruction, skill, limit, or grant moves because a model asked — and the
+  gateway never relays it to chat.
 - **Self-inspection** — every authorized session on a route that has not written
   `inspectAgentConfig: false` offers `inspect_agent_config`, returning its
   standing prompt, mounted skills by name, description, and resource file paths (never their

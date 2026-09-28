@@ -234,7 +234,7 @@ a catalog that disagrees with it produces no error here and no error there.
 - [`cli.md`](cli.md) — model-auth formats and exit codes.
 - [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
-- [`improvement.md`](improvement.md) — catalog-mounted skills and opt-in suggestions.
+- [`improvement.md`](improvement.md) — catalog-mounted skills and suggestions.
 - [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries) —
   `capabilities`, Cedar policy, and the separate broker configuration that decides authority.
 - [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml) — a complete authored catalog.
