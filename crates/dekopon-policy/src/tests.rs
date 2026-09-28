@@ -9,22 +9,13 @@ use super::{
 
 fn world() -> PolicyWorld {
     PolicyWorld::new(
-        [
-            "cpetersen".parse().expect("valid principal fixture"),
-            "direct-caller".parse().expect("valid principal fixture"),
-        ],
-        [
+        ["cpetersen", "direct-caller"].map(|name| name.parse().expect("valid principal fixture")),
+        ["cli-probe.upper", "cli-probe.reverse"].map(|name| {
             (
-                "cli-probe.upper".parse().expect("valid capability fixture"),
+                name.parse().expect("valid capability fixture"),
                 "cli-probe".parse().expect("valid provider fixture"),
-            ),
-            (
-                "cli-probe.reverse"
-                    .parse()
-                    .expect("valid capability fixture"),
-                "cli-probe".parse().expect("valid provider fixture"),
-            ),
-        ],
+            )
+        }),
     )
     .expect("distinct fixtures build a world")
 }
@@ -104,18 +95,23 @@ fn empty_policy_text_is_valid_and_permits_nothing() {
 
 #[test]
 fn undeclared_names_refuse_construction() {
-    let unknown_principal = PolicyEngine::new(
-        r#"@id("names-nobody")
-           permit(principal == Dekopon::Principal::"nobody",
-                  action == Dekopon::Action::"cli-probe.upper",
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world(),
-    )
-    .expect_err("an undeclared principal must refuse startup");
-    assert!(matches!(
-        unknown_principal,
-        PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"
-    ));
+    let source = r#"@id("names-nobody")
+        permit(principal == Dekopon::Principal::"nobody",
+               action == Dekopon::Action::"cli-probe.upper",
+               resource == Dekopon::Provider::"cli-probe");"#;
+    for error in [
+        PolicyEngine::new(source, &world()).expect_err("strict refuses an undeclared principal"),
+        PolicyEngine::new_lenient(source, &world())
+            .expect_err("lenient refuses an undeclared principal"),
+    ] {
+        assert!(
+            matches!(
+                error,
+                PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"
+            ),
+            "{error:?}"
+        );
+    }
 
     let unknown_provider = PolicyEngine::new(
         r#"@id("names-github")
@@ -158,30 +154,6 @@ fn undeclared_names_refuse_construction() {
 }
 
 #[test]
-fn strict_validation_rejects_attributes_an_action_never_carries() {
-    let error = PolicyEngine::new(
-        r#"@id("prompt-checks-effect")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action == Dekopon::Action::"agent.prompt",
-                  resource == Dekopon::Agent::"reviewer")
-           when { context.effect == "read-only" };"#,
-        &world(),
-    )
-    .expect_err("agent.prompt carries no effect attribute");
-    assert!(matches!(error, PolicyBuildError::Validation { .. }));
-
-    PolicyEngine::new(
-        r#"@id("upper-checks-effect")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action == Dekopon::Action::"cli-probe.upper",
-                  resource == Dekopon::Provider::"cli-probe")
-           when { context.effect == "read-only" };"#,
-        &world(),
-    )
-    .expect("a capability action always carries its classification");
-}
-
-#[test]
 fn a_direct_peer_is_refused_every_action_and_an_attested_session_meets_policy() {
     let engine = PolicyEngine::new(
         r#"
@@ -205,6 +177,11 @@ fn a_direct_peer_is_refused_every_action_and_an_attested_session_meets_policy() 
     ));
     assert!(attested.allowed);
     assert_eq!(attested.determining_policy_ids, ["attested-upper"]);
+    assert!(
+        !engine
+            .authorize(secret_request("cpetersen", session()))
+            .allowed
+    );
     assert!(
         !engine
             .authorize(capability_request(
@@ -251,33 +228,17 @@ fn agent_prompt_matches_the_named_agent_only() {
     )
     .expect("the agent gate validates");
 
-    let allowed = engine.authorize(prompt_request(
-        "cpetersen",
-        "pr-summarizer-linter",
-        via("dekopond-gateway"),
-    ));
-    assert!(allowed.allowed);
-    assert_eq!(allowed.determining_policy_ids, ["prompt-gate"]);
-
-    assert!(
-        !engine
-            .authorize(prompt_request(
-                "cpetersen",
-                "some-other-agent",
-                via("dekopond-gateway"),
-            ))
-            .allowed,
-        "an agent the policy does not name is a different resource"
-    );
-    assert!(
-        !engine
-            .authorize(prompt_request(
-                "direct-caller",
-                "pr-summarizer-linter",
-                via("dekopond-gateway"),
-            ))
-            .allowed
-    );
+    for (principal, agent, allowed) in [
+        ("cpetersen", "pr-summarizer-linter", true),
+        ("cpetersen", "some-other-agent", false),
+        ("direct-caller", "pr-summarizer-linter", false),
+    ] {
+        let decision = engine.authorize(prompt_request(principal, agent, session()));
+        assert_eq!(decision.allowed, allowed, "{principal}: {agent}");
+        if allowed {
+            assert_eq!(decision.determining_policy_ids, ["prompt-gate"]);
+        }
+    }
     assert_eq!(
         engine.referenced_capabilities().count(),
         0,
@@ -287,56 +248,50 @@ fn agent_prompt_matches_the_named_agent_only() {
 
 #[test]
 fn forbid_overrides_permit_and_is_reported_as_the_reason() {
-    let engine = PolicyEngine::new(
-        r#"
+    let source = r#"
         @id("broad-permit")
         permit(principal == Dekopon::Principal::"cpetersen",
                action in [Dekopon::Action::"cli-probe.upper", Dekopon::Action::"cli-probe.reverse"],
-               resource == Dekopon::Provider::"cli-probe");
-
-        @id("no-reverse")
-        forbid(principal == Dekopon::Principal::"cpetersen",
-               action == Dekopon::Action::"cli-probe.reverse",
-               resource == Dekopon::Provider::"cli-probe");
-        "#,
-        &world(),
-    )
-    .expect("permit and forbid coexist");
-
-    let permitted = engine.authorize(capability_request(
-        "cpetersen",
-        "cli-probe.upper",
-        session(),
-    ));
-    assert!(permitted.allowed);
-    assert_eq!(permitted.determining_policy_ids, ["broad-permit"]);
-
-    let forbidden = engine.authorize(capability_request(
-        "cpetersen",
-        "cli-probe.reverse",
-        session(),
-    ));
-    assert!(!forbidden.allowed);
-    assert_eq!(forbidden.determining_policy_ids, ["no-reverse"]);
-}
-
-#[test]
-fn referenced_capabilities_cover_every_action_a_policy_names() {
-    let engine = PolicyEngine::new(
-        r#"@id("upper-and-reverse")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action in [Dekopon::Action::"cli-probe.upper", Dekopon::Action::"cli-probe.reverse"],
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world(),
-    )
-    .expect("an action list validates");
+               resource == Dekopon::Provider::"cli-probe");"#;
     assert_eq!(
-        engine
+        PolicyEngine::new(source, &world())
+            .expect("an action list validates")
             .referenced_capabilities()
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>(),
         ["cli-probe.reverse", "cli-probe.upper"]
     );
+    let source = format!(
+        r#"{source}
+        @id("no-reverse")
+        forbid(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"cli-probe.reverse",
+               resource == Dekopon::Provider::"cli-probe");
+        "#
+    );
+    let (lenient, unresolved) =
+        PolicyEngine::new_lenient(&source, &world()).expect("world declares all");
+    assert!(unresolved.is_empty(), "{unresolved:?}");
+    for engine in [
+        PolicyEngine::new(&source, &world()).expect("permit and forbid coexist"),
+        lenient,
+    ] {
+        let permitted = engine.authorize(capability_request(
+            "cpetersen",
+            "cli-probe.upper",
+            session(),
+        ));
+        assert!(permitted.allowed);
+        assert_eq!(permitted.determining_policy_ids, ["broad-permit"]);
+
+        let forbidden = engine.authorize(capability_request(
+            "cpetersen",
+            "cli-probe.reverse",
+            session(),
+        ));
+        assert!(!forbidden.allowed);
+        assert_eq!(forbidden.determining_policy_ids, ["no-reverse"]);
+    }
 }
 
 #[test]
@@ -447,6 +402,10 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     assert_eq!(baseline.digest(), reformatted.digest());
     assert!(baseline.digest().starts_with("sha256:"));
     assert_eq!(baseline.digest().len(), "sha256:".len() + 64);
+    let rendered = format!("{baseline:?}");
+    assert!(rendered.contains(baseline.digest()));
+    assert!(!rendered.contains("permit"));
+    assert!(!rendered.contains("cpetersen"));
 
     let different_policy = PolicyEngine::new(
         r#"@id("direct-caller-upper")
@@ -459,23 +418,9 @@ fn digest_is_stable_across_formatting_and_moves_with_meaning() {
     assert_ne!(baseline.digest(), different_policy.digest());
 
     let wider = PolicyWorld::new(
-        [
-            "cpetersen".parse().expect("valid principal fixture"),
-            "direct-caller".parse().expect("valid principal fixture"),
-            "someone-else".parse().expect("valid principal fixture"),
-        ],
-        [
-            (
-                "cli-probe.upper".parse().expect("valid capability fixture"),
-                "cli-probe".parse().expect("valid provider fixture"),
-            ),
-            (
-                "cli-probe.reverse"
-                    .parse()
-                    .expect("valid capability fixture"),
-                "cli-probe".parse().expect("valid provider fixture"),
-            ),
-        ],
+        ["cpetersen", "direct-caller", "someone-else"]
+            .map(|name| name.parse().expect("valid principal fixture")),
+        world().capabilities,
     )
     .expect("a wider world builds");
     assert_ne!(
@@ -618,30 +563,14 @@ permit(
         }
     }
 
-    assert!(
-        engine
-            .authorize(prompt_request(
-                "cpetersen",
-                "lange-family",
-                chat(
-                    "channel",
-                    Some("1153119165809434697"),
-                    "1153119166446981193",
-                    None
-                ),
-            ))
-            .allowed
-    );
-    assert!(
-        !engine
-            .authorize(prompt_request(
-                "cpetersen",
-                "lange-family",
-                chat("channel", None, "1153119166446981193", None),
-            ))
-            .allowed,
-        "a conversation with no container cannot satisfy a container gate"
-    );
+    for (container, allowed) in [(Some("1153119165809434697"), true), (None, false)] {
+        let decision = engine.authorize(prompt_request(
+            "cpetersen",
+            "lange-family",
+            chat("channel", container, "1153119166446981193", None),
+        ));
+        assert_eq!(decision.allowed, allowed, "{container:?}");
+    }
 }
 
 #[test]
@@ -655,36 +584,37 @@ permit(
 ) when { context has trigger && context.trigger == "message" };
 "#;
     let engine = PolicyEngine::new(source, &world()).expect("the trigger gate validates");
-    let context = |trigger: &str| PolicyContext {
-        via: Some("dekopond-gateway".to_owned()),
-        agent: Some("reviewer".to_owned()),
-        trigger: Some(trigger.to_owned()),
-        ..PolicyContext::default()
-    };
-
-    assert!(
-        engine
-            .authorize(capability_request(
-                "cpetersen",
-                "cli-probe.upper",
-                context("message")
-            ))
-            .allowed
-    );
-    assert!(
-        !engine
-            .authorize(capability_request(
-                "cpetersen",
-                "cli-probe.upper",
-                context("wake")
-            ))
-            .allowed
-    );
+    for (trigger, allowed) in [("message", true), ("wake", false)] {
+        let context = PolicyContext {
+            trigger: Some(trigger.to_owned()),
+            ..session()
+        };
+        let decision =
+            engine.authorize(capability_request("cpetersen", "cli-probe.upper", context));
+        assert_eq!(decision.allowed, allowed, "{trigger}");
+    }
 }
 
 #[test]
 fn a_retired_or_unguarded_context_attribute_fails_validation() {
+    PolicyEngine::new(
+        r#"@id("upper-checks-effect")
+           permit(principal == Dekopon::Principal::"cpetersen",
+                  action == Dekopon::Action::"cli-probe.upper",
+                  resource == Dekopon::Provider::"cli-probe")
+           when { context.effect == "read-only" };"#,
+        &world(),
+    )
+    .expect("a capability action always carries its classification");
     for (source, why) in [
+        (
+            r#"@id("prompt-checks-effect")
+               permit(principal == Dekopon::Principal::"cpetersen",
+                      action == Dekopon::Action::"agent.prompt",
+                      resource == Dekopon::Agent::"reviewer")
+               when { context.effect == "read-only" };"#,
+            "agent.prompt carries no effect attribute",
+        ),
         (
             r#"@id("guards-container")
                permit(principal, action == Dekopon::Action::"cli-probe.upper", resource) when {
@@ -759,29 +689,6 @@ fn every_action_declares_exactly_these_context_attributes() {
         serde_json::to_string_pretty(value).expect("a context record serializes")
     }
 
-    let capability_context = json!({
-        "type": "Record",
-        "attributes": {
-            "subject": { "type": "String", "required": false },
-            "transportKind": { "type": "String", "required": false },
-            "transport": { "type": "String", "required": false },
-            "trigger": { "type": "String", "required": false },
-            "conversation": {
-                "type": "Record",
-                "required": false,
-                "attributes": {
-                    "kind": { "type": "String" },
-                    "container": { "type": "String", "required": false },
-                    "id": { "type": "String" },
-                    "thread": { "type": "String", "required": false },
-                },
-            },
-            "via": { "type": "String" },
-            "agent": { "type": "String" },
-            "effect": { "type": "String" },
-            "risk": { "type": "String" },
-        }
-    });
     let prompt_context = json!({
         "type": "Record",
         "attributes": {
@@ -803,30 +710,14 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String" },
         }
     });
-    let secret_context = json!({
-        "type": "Record",
-        "attributes": {
-            "subject": { "type": "String", "required": false },
-            "transportKind": { "type": "String", "required": false },
-            "transport": { "type": "String", "required": false },
-            "trigger": { "type": "String", "required": false },
-            "conversation": {
-                "type": "Record",
-                "required": false,
-                "attributes": {
-                    "kind": { "type": "String" },
-                    "container": { "type": "String", "required": false },
-                    "id": { "type": "String" },
-                    "thread": { "type": "String", "required": false },
-                },
-            },
-            "via": { "type": "String" },
-            "agent": { "type": "String" },
-            "capability": { "type": "String" },
-            "provider": { "type": "String" },
-            "sink": { "type": "String" },
-        }
-    });
+    let mut capability_context = prompt_context.clone();
+    for name in ["effect", "risk"] {
+        capability_context["attributes"][name] = json!({ "type": "String" });
+    }
+    let mut secret_context = prompt_context.clone();
+    for name in ["capability", "provider", "sink"] {
+        secret_context["attributes"][name] = json!({ "type": "String" });
+    }
 
     let schema = world_with_secret().schema_json();
     let actions = schema["Dekopon"]["actions"]
@@ -861,22 +752,6 @@ fn every_action_declares_exactly_these_context_attributes() {
 }
 
 #[test]
-fn debug_output_carries_no_policy_source() {
-    let engine = PolicyEngine::new(
-        r#"@id("cpetersen-upper")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action == Dekopon::Action::"cli-probe.upper",
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world(),
-    )
-    .expect("the policy builds");
-    let rendered = format!("{engine:?}");
-    assert!(rendered.contains(engine.digest()));
-    assert!(!rendered.contains("permit"));
-    assert!(!rendered.contains("cpetersen"));
-}
-
-#[test]
 fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
     let text = r#"@id("workflow")
         permit(principal == Dekopon::Principal::"cpetersen",
@@ -891,6 +766,13 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
     assert_eq!(unresolved[0].name, "gh.pull-request.approve");
     assert_eq!(unresolved[0].kind, UnresolvedKind::Capability);
     assert_eq!(unresolved[0].policy, "workflow");
+    assert_eq!(
+        engine
+            .referenced_capabilities()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        ["cli-probe.upper"]
+    );
 
     assert!(
         engine
@@ -902,26 +784,6 @@ fn tolerating_an_unloaded_capability_leaves_the_rest_of_the_policy_granting() {
             .allowed,
         "the loaded capability in a tolerating policy must still be granted"
     );
-}
-
-#[test]
-fn a_tolerated_capability_is_never_reported_as_referenced() {
-    let (engine, unresolved) = PolicyEngine::new_lenient(
-        r#"@id("upper-and-unloaded-gh")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action in [Dekopon::Action::"cli-probe.upper",
-                             Dekopon::Action::"gh.pull-request.approve"],
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world(),
-    )
-    .expect("an unloaded capability is tolerated");
-
-    assert_eq!(unresolved.len(), 1);
-    let referenced = engine
-        .referenced_capabilities()
-        .map(|capability| capability.as_str().to_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(referenced, ["cli-probe.upper"]);
 }
 
 #[test]
@@ -942,6 +804,7 @@ fn strict_construction_refuses_precisely_what_lenient_tolerates() {
 
     let (_, unresolved) =
         PolicyEngine::new_lenient(text, &world()).expect("lenient mode tolerates");
+    assert_eq!(unresolved.len(), 2, "{unresolved:?}");
     let mut kinds = unresolved
         .iter()
         .map(|entry| entry.kind)
@@ -983,32 +846,6 @@ fn an_unparseable_name_gets_the_specific_error_even_when_lenient() {
             PolicyBuildError::UnknownProvider { ref provider, .. } if provider == "Not A Provider"
         ),
         "{provider:?}"
-    );
-
-    let (_, unresolved) = PolicyEngine::new_lenient(
-        r#"@id("cpetersen-gh-approve-2")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action == Dekopon::Action::"gh.pull-request.approve",
-                  resource == Dekopon::Provider::"gh");"#,
-        &world(),
-    )
-    .expect("a well-formed absent name is still tolerated");
-    assert_eq!(unresolved.len(), 2, "{unresolved:?}");
-}
-
-#[test]
-fn an_undeclared_principal_stays_fatal_under_leniency() {
-    let error = PolicyEngine::new_lenient(
-        r#"@id("names-nobody-leniently")
-           permit(principal == Dekopon::Principal::"nobody",
-                  action == Dekopon::Action::"cli-probe.upper",
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world(),
-    )
-    .expect_err("an undeclared principal refuses startup even when lenient");
-    assert!(
-        matches!(error, PolicyBuildError::UnknownPrincipal { ref principal, .. } if principal == "nobody"),
-        "{error:?}"
     );
 }
 
@@ -1072,59 +909,6 @@ fn a_request_the_schema_cannot_express_says_so() {
             ))
             .refusal
             .is_none()
-    );
-}
-
-#[test]
-fn a_forbid_naming_an_unloaded_capability_applies_once_it_loads() {
-    let text = r#"@id("cpetersen-upper-and-reverse")
-                  permit(principal == Dekopon::Principal::"cpetersen",
-                          action in [Dekopon::Action::"cli-probe.upper",
-                                     Dekopon::Action::"cli-probe.reverse"],
-                          resource == Dekopon::Provider::"cli-probe");
-                  @id("cpetersen-no-reverse")
-                  forbid(principal == Dekopon::Principal::"cpetersen",
-                         action == Dekopon::Action::"cli-probe.reverse",
-                         resource == Dekopon::Provider::"cli-probe");"#;
-
-    let (engine, unresolved) =
-        PolicyEngine::new_lenient(text, &world()).expect("world declares all");
-    assert!(unresolved.is_empty(), "{unresolved:?}");
-    assert!(
-        !engine
-            .authorize(capability_request(
-                "cpetersen",
-                "cli-probe.reverse",
-                session()
-            ))
-            .allowed,
-        "a forbid must override the permit it overlaps"
-    );
-}
-
-#[test]
-fn capability_permission_does_not_imply_secret_use() {
-    let engine = PolicyEngine::new(
-        r#"@id("cpetersen-upper")
-           permit(principal == Dekopon::Principal::"cpetersen",
-                  action == Dekopon::Action::"cli-probe.upper",
-                  resource == Dekopon::Provider::"cli-probe");"#,
-        &world_with_secret(),
-    )
-    .expect("capability-only policy validates");
-    assert!(
-        engine
-            .authorize(capability_request(
-                "cpetersen",
-                "cli-probe.upper",
-                session()
-            ))
-            .allowed
-    );
-    assert!(
-        !engine
-            .authorize(secret_request("cpetersen", session()))
-            .allowed
     );
 }
 
