@@ -30,7 +30,7 @@ metadata:
 spec:
   description: Finds recurring tool gaps without making external changes
   enabled: false
-  # Needs a turso.exec grant with storage scope agent; see docs/improvement.md.
+  # Needs a turso.exec grant with storage scope agent; see docs/improvement.md#skills-the-agent-writes.
   skills:
     - skills/learned-skills
   modelClass: analysis

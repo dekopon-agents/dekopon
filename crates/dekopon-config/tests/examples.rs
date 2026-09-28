@@ -35,6 +35,15 @@ fn the_local_reviewer_example_mounts_its_pull_request_review_skill() {
 }
 
 #[test]
+fn the_disabled_snooper_example_mounts_the_learned_skills_skill() {
+    let catalog = load(&example("catalog/dekopon.yaml"));
+    let skills = catalog.agent_skills(&"snooper".parse().expect("valid agent id"));
+
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name().as_str(), "learned-skills");
+}
+
+#[test]
 fn the_conditional_write_example_gives_the_model_explicit_standing_orders() {
     let catalog = load(&example("conditional-write/dekopon.yaml"));
 
