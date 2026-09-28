@@ -34,7 +34,7 @@ Two events record calls that cost money or consume a rate limit:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `accounting.model.turn` | `dekopon-agent` | turn index, duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
+| `accounting.model.turn` | `dekopon-agent` | turn index, the calling agent (when the embedder supplied one), duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
 | `accounting.http.request` | `dekopon-http-host` | method, authority, status, accounted request/response bytes, outcome, and `error.code`/`error.message` on failure |
 
 Both duplicate span fields: the span answers "why was this request slow", the accounting record

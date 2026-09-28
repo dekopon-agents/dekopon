@@ -202,6 +202,7 @@ pub struct SessionInputs<'a> {
     assets: Option<&'a dyn AssetSource>,
     reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
+    agent: Option<&'a str>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
@@ -223,6 +224,7 @@ impl<'a> SessionInputs<'a> {
             assets: None,
             reply_assets: None,
             usage_observer: None,
+            agent: None,
             agent_config: None,
             cancellation: None,
             steering: None,
@@ -292,6 +294,12 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_agent(mut self, agent: &'a str) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    #[must_use]
     pub const fn with_cancellation(mut self, cancellation: &'a dyn CancellationProbe) -> Self {
         self.cancellation = Some(cancellation);
         self
@@ -322,6 +330,7 @@ struct SessionExtensions<'a> {
     assets: Option<&'a dyn AssetSource>,
     reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
+    agent: Option<&'a str>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
@@ -350,6 +359,7 @@ where
         assets,
         reply_assets,
         usage_observer,
+        agent,
         agent_config,
         cancellation,
         steering,
@@ -393,6 +403,7 @@ where
             assets,
             reply_assets,
             usage_observer,
+            agent,
             agent_config,
             cancellation,
             steering,
@@ -491,6 +502,7 @@ where
         assets,
         reply_assets,
         usage_observer,
+        agent,
         agent_config,
         cancellation,
         steering,
@@ -597,6 +609,7 @@ where
                     {
                         audit.event = "accounting.model.turn",
                         model.turn = model_turns,
+                        agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
                         message.count = messages.len(),
                         outcome = if steered { "steered" } else { "interrupted" },
@@ -627,6 +640,7 @@ where
                     {
                         audit.event = "accounting.model.turn",
                         model.turn = model_turns,
+                        agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
                         outcome = "failed",
                         error = %error,
@@ -648,6 +662,7 @@ where
             {
                 audit.event = "accounting.model.turn",
                 model.turn = model_turns,
+                agent = agent,
                 duration_ms = milliseconds(model_started.elapsed()),
                 message.count = messages.len(),
                 tool_call.count = turn.tool_calls.len(),
@@ -3106,6 +3121,53 @@ mod tests {
         .expect("prompt session succeeds");
 
         assert_eq!(*observer.observed.lock().expect("options lock"), vec![None]);
+    }
+
+    #[test]
+    fn accounting_model_turn_carries_the_calling_agent_when_the_embedder_supplied_one() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::workspace();
+        let model = ScriptedModel::new([answer("done")]);
+        let runtime = RecordingRuntime::new(0);
+        let with_agent = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                run_prompt_session(
+                    &model,
+                    &runtime,
+                    SessionInputs::new("go", limits(1, 1)).with_agent("reviewer"),
+                    &mut History::default(),
+                )
+            },
+        );
+        with_agent.expect("prompt session succeeds");
+        assert!(
+            capture.saw(r#"agent="reviewer""#),
+            "{}",
+            capture.events_text()
+        );
+
+        capture.clear();
+        let model = ScriptedModel::new([answer("done")]);
+        let without_agent = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                run_prompt_session(
+                    &model,
+                    &runtime,
+                    SessionInputs::new("go", limits(1, 1)),
+                    &mut History::default(),
+                )
+            },
+        );
+        without_agent.expect("prompt session succeeds");
+        assert!(
+            !capture.saw("agent="),
+            "no agent supplied should mean no field: {}",
+            capture.events_text()
+        );
     }
 
     #[test]
