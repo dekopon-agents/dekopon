@@ -219,8 +219,6 @@ pub(crate) fn unsupported_flag(command: &str, flag: &str, supported: &str) -> Co
     ))
 }
 
-/// `help` stays `""` at the call site so `unsupported_flag`'s suffix keeps omitting itself for a
-/// flag-free builtin.
 pub(crate) fn help_result(name: &str, help: &str) -> CommandResult {
     let help = if help.is_empty() { "no flags" } else { help };
     CommandResult::value(Value::String(format!("{name}: {help}")))
@@ -377,10 +375,9 @@ mod tests {
             run(&format!("{} --help", xargs::NAME)).output,
             "xargs: -I -n"
         );
-        // A missing `]` would normally be a usage error; --help takes priority over it.
         assert_eq!(
             run("[ --help").output,
-            "[: -z -n = != < > -eq -ne -lt -le -gt -ge"
+            "[: ! -z -n = == != < > -eq -ne -lt -le -gt -ge"
         );
     }
 

@@ -170,7 +170,7 @@ fn format_text(format: &str, values: &[String]) -> Result<String, CommandFailure
     Ok(output)
 }
 
-const TEST_HELP: &str = "-z -n = != < > -eq -ne -lt -le -gt -ge";
+const TEST_HELP: &str = "! -z -n = == != < > -eq -ne -lt -le -gt -ge";
 
 pub(crate) struct Test;
 

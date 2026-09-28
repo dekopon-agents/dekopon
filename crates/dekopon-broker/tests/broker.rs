@@ -2498,17 +2498,42 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
             .is_empty(),
         "the ungranted context reaches nothing, which is what makes its empty vocabulary meaningful"
     );
-    for name in ["caller", "stranger"] {
-        assert_eq!(
-            broker.capability_view(&session(name, "provider-test")),
-            (
-                broker.capabilities(&session(name, "provider-test")),
-                broker.command_words(&session(name, "provider-test")),
-                broker.command_word_help(&session(name, "provider-test"))
-            ),
-            "the combined view must be the same answer as the three listings it replaces"
-        );
-    }
+
+    let caller_help = broker.command_word_help(&session("caller", "provider-test"));
+    let probe_page = caller_help.get("probe").expect("caller reaches probe");
+    assert!(
+        probe_page.starts_with("Usage: probe <COMMAND>"),
+        "{probe_page}"
+    );
+    assert_eq!(
+        broker.command_word_help(&session("stranger", "provider-test")),
+        BTreeMap::new(),
+        "an ungranted context reaches no word, so it reaches no word's help either"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_command_word_is_refused_without_running_anything() {
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, _) = Broker::start(
+        probe_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        probe_engine(
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
+            ["caller"],
+        ),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Strict,
+    )
+    .expect("broker starts");
 
     let error = broker
         .run_command(

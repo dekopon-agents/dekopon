@@ -70,8 +70,6 @@ pub trait ScriptRuntime {
         Vec::new()
     }
 
-    /// Rendered once by whoever loaded the provider, not fetched here: a word missing from the
-    /// map has no page, not an empty one.
     fn command_word_help(&self) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
@@ -519,14 +517,7 @@ where
         progress_notes,
         wakes,
     } = extensions;
-    let session_span = tracing::info_span!(
-        "prompt.session",
-        prompt.max_steps = limits.max_steps,
-        prompt.max_capability_calls = limits.max_capability_calls
-    );
-    let _session = session_span.enter();
-    let command_words = runtime.command_words();
-    let mut script = script_tool(&command_words, &runtime.command_word_help());
+    let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
         script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
     }
@@ -544,6 +535,12 @@ where
         model_tools.push(wake::wake_tool());
     }
 
+    let session_span = tracing::info_span!(
+        "prompt.session",
+        prompt.max_steps = limits.max_steps,
+        prompt.max_capability_calls = limits.max_capability_calls
+    );
+    let _session = session_span.enter();
     let session_started = Instant::now();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
@@ -1414,10 +1411,11 @@ except through a capability. The capabilities you may invoke are exactly those t
 granted: no flag, retry, or rewording escalates past that set, and a refusal is a fact to report, \
 not an obstacle to work around.
 2. Provider command words are programs. A provider adds words of its own, and each behaves like a \
-command-line tool with subcommands and flags. Its top-level `--help` page for this session is \
-baked in below the word listing at the end of this description; run `<word> --help` yourself only \
-for a deeper subcommand's own page. Its subcommands call capabilities on your behalf, so a word \
-can do only what this session was granted, and `cap --list` shows those capability IDs.
+command-line tool with subcommands and flags. Its top-level `--help` page for this session, when \
+present, is baked in below the word listing at the end of this description; run `<word> --help` \
+yourself for that page when it is not, or for a deeper subcommand's own page. Its subcommands call \
+capabilities on your behalf, so a word can do only what this session was granted, and `cap --list` \
+shows those capability IDs.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
 in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
 `x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \

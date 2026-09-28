@@ -987,29 +987,32 @@ impl BrokerWasmProvider {
         Ok(output)
     }
 
-    /// One `--help` render per declared command word, once at load: `run_command` takes no host
-    /// import here, so the page is a pure function of the component bytes and stays valid for the
-    /// registry's lifetime. A refusal, a malformed answer, a non-`Rendered` outcome, or a non-zero
-    /// status omits that word's page and logs one warning rather than failing the load.
+    /// Rendered once per provider at load and mapped to every word it declares, since
+    /// `run-command` takes no word and no host import, so the page is a pure function of the
+    /// component bytes; a failed render omits them all rather than failing the load.
     async fn render_command_word_help(&self) -> BTreeMap<String, String> {
-        let mut pages = BTreeMap::new();
-        for word in &self.manifest.command_words {
-            if let Some(page) = self.render_one_command_word_help(word).await {
-                pages.insert(word.clone(), page);
-            }
+        if self.manifest.command_words.is_empty() {
+            return BTreeMap::new();
         }
-        pages
+        let Some(page) = self.render_provider_help().await else {
+            return BTreeMap::new();
+        };
+        self.manifest
+            .command_words
+            .iter()
+            .cloned()
+            .map(|word| (word, page.clone()))
+            .collect()
     }
 
-    async fn render_one_command_word_help(&self, word: &str) -> Option<String> {
+    async fn render_provider_help(&self) -> Option<String> {
         let json = match self.run_command(&["--help".to_owned()], None).await {
             Ok(json) => json,
             Err(error) => {
                 tracing::warn!(
                     provider = %self.manifest.id,
-                    word,
                     error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(&error)),
-                    "command word --help render failed at load"
+                    "provider --help render failed at load"
                 );
                 return None;
             }
@@ -1019,9 +1022,8 @@ impl BrokerWasmProvider {
             Err(error) => {
                 tracing::warn!(
                     provider = %self.manifest.id,
-                    word,
                     error = %error,
-                    "command word --help answer did not decode at load"
+                    "provider --help answer did not decode at load"
                 );
                 return None;
             }
@@ -1035,8 +1037,7 @@ impl BrokerWasmProvider {
             _ => {
                 tracing::warn!(
                     provider = %self.manifest.id,
-                    word,
-                    "command word --help did not render successfully at load"
+                    "provider --help did not render successfully at load"
                 );
                 None
             }
@@ -1436,15 +1437,18 @@ impl BrokerProviderRegistry {
             .collect()
     }
 
-    /// The `--help` pages rendered at load, by the provider that owns each word; a provider whose
-    /// render failed for every word is simply absent, not an empty entry.
     #[must_use]
-    pub fn command_word_help_by_provider(&self) -> Vec<(&ProviderId, &BTreeMap<String, String>)> {
-        self.providers
-            .iter()
-            .filter(|provider| !provider.command_word_help.is_empty())
-            .map(|provider| (&provider.manifest.id, &provider.command_word_help))
-            .collect()
+    pub fn command_word_help(&self) -> BTreeMap<String, String> {
+        let mut pages = BTreeMap::new();
+        for provider in &self.providers {
+            pages.extend(
+                provider
+                    .command_word_help
+                    .iter()
+                    .map(|(word, page)| (word.clone(), page.clone())),
+            );
+        }
+        pages
     }
 
     #[must_use]
@@ -2161,4 +2165,22 @@ pub enum BrokerHostError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_COMMAND_WORD_HELP_BYTES, bounded_command_word_help};
+
+    #[test]
+    fn a_page_is_passed_through_at_the_bound_and_cut_at_a_character_boundary_past_it() {
+        let at_bound = "x".repeat(MAX_COMMAND_WORD_HELP_BYTES);
+        assert_eq!(bounded_command_word_help(at_bound.clone()), at_bound);
+
+        // Each "€" is three bytes, so byte 2048 falls mid-character; the cut lands two bytes
+        // earlier, at the last complete character, rather than splitting one.
+        let past_bound = "€".repeat(700);
+        let bounded = bounded_command_word_help(past_bound.clone());
+        assert_eq!(&bounded[..2046], &past_bound[..2046]);
+        assert!(bounded[2046..].starts_with("\n[--help truncated at 2046 bytes]"));
+    }
 }

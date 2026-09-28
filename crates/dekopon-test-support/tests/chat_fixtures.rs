@@ -155,9 +155,7 @@ async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_dead
         turn("the answer nobody reads"),
         DEADLINE,
     ));
-    // No command word offered: a granted word would make session start fetch its `--help` page
-    // through this same blocking double, parking there instead of ever reaching the model.
-    let runtime = Arc::new(BlockedRuntime::new("no script runs"));
+    let runtime = Arc::new(BlockedRuntime::new("no script runs").offering(&["probe"]));
     let stop = Arc::new(Pressed(AtomicBool::new(false)));
     let session = {
         let (model, runtime, stop) = (Arc::clone(&model), Arc::clone(&runtime), Arc::clone(&stop));

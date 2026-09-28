@@ -5,10 +5,10 @@ use crate::{
     value::{to_lines, to_text},
 };
 
-/// With exactly one flag the result is a bare number so it composes with arithmetic and test; with
-/// no flag it returns an object holding all three counts instead of requiring column parsing.
 const HELP: &str = "-l -w -c";
 
+/// With exactly one flag the result is a bare number so it composes with arithmetic and test; with
+/// no flag it returns an object holding all three counts instead of requiring column parsing.
 pub(crate) struct Wc;
 
 impl Builtin for Wc {

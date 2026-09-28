@@ -261,7 +261,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
             .is_some(),
         "the permitted agent may be driven"
     );
-    let (capabilities, _words, _help, memory) = broker
+    let (capabilities, words, help, memory) = broker
         .capability_surface(
             &gateway,
             Some(&grant),
@@ -283,6 +283,8 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         )
         .expect("legacy subject-only attestor remains compatible with chat operations");
     assert!(!capabilities.is_empty());
+    assert_eq!(words, ["probe"]);
+    assert!(help.contains_key("probe"));
     assert!(
         memory.is_none(),
         "subject-only attestation grants no storage scope"

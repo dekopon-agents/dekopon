@@ -213,8 +213,6 @@ pub trait CapabilityInvoker {
         Vec::new()
     }
 
-    /// Rendered once, by whoever loaded the provider, and carried here rather than fetched: a
-    /// word missing from the map has no page, not an empty one.
     fn command_word_help(&self) -> BTreeMap<String, String> {
         BTreeMap::new()
     }

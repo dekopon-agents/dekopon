@@ -980,7 +980,7 @@ pub enum BrokerResponse {
         capabilities: Vec<AvailableCapability>,
         #[serde(default)]
         command_words: Vec<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         command_word_help: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_memory: Option<ChatMemorySurface>,

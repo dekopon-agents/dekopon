@@ -111,6 +111,13 @@ The published `0.3.0` package contains three worlds and no imports: `provider` e
 
 A provider's command words behave like the upstream command-line tool: `gh --help` renders a help page on stdout at status 0, `gh bogus` prints a usage error on stderr at status 2, `gh pr view 7` proposes `gh.pull-request.read`, and `echo '{…}' | gh api --input -` receives the piped value.
 
+The broker renders a provider's top-level `--help` once at load and bakes it into the tool
+description of every session where a granted word reaches that provider, so the exact contract
+above matters beyond a single invocation: the render must exit 0 with non-empty stdout, or the
+word is listed with no page rather than blocking the load. The rendered page is capped at 2 KiB;
+a longer one is truncated with a marker at the cut. Nothing here is a host import or a capability
+call, so it costs nothing to render early and reuse for the registry's lifetime.
+
 `run_command` returns one of three things. `CommandRun::Proposal` is a capability proposal and is authorized on the same path as any other; `CommandRun::Rendered` is text the guest produced by itself, with separate stdout and stderr and an exit status, so the shell's two streams map one to one (`$(gh bogus)` captures nothing while the error reaches the model); `Err(ProviderError)` is a decline, reported as a usage error. Two paths implement it, and the hand-rolled one is the contract the `clap` layer builds on.
 
 A proposal may also name one secret use: `CommandInvocation::secret_use` takes a `SecretUseProposal` (re-exported beside `SecretDrn`) — a public DRN and the native sink the broker renders it in, `httpBearer` or `httpBasic`. It crosses the boundary as `secretUse` beside `capability` and `input`, and is absent when `None`, so a proposal naming no secret keeps its earlier shape. The broker authorizes the secret use separately and matches an owner-authored binding exactly as for any other; the secret bytes never reach the component. `CommandRun::proposal` names none.

@@ -178,7 +178,7 @@ and each provider command word documents itself through `<word> --help`; argumen
 validation are provider-owned. Each provider's top-level `--help` page is rendered once, at broker
 load, next to `describe_component`, as a pure function of the component bytes; the broker carries
 the resulting `{word → page}` map in its `Capabilities` response alongside `reachable_command_words`,
-and `ScriptRuntime::command_word_help` bakes whatever the session's runtime reports into the `bash`
+and `script_tool` bakes whatever `ScriptRuntime::command_word_help` reports into the `bash`
 tool description below the word listing, bounded at 2048 bytes per word. No per-session round trip
 runs to fetch it. A word whose render failed, exited non-zero, or answered empty is still listed,
 just without a page, and the model can still run `<word> --help` itself for a deeper subcommand's

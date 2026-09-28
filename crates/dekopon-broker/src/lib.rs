@@ -1669,22 +1669,6 @@ pub struct Broker<A> {
     chat_memory: Option<ChatMemoryConfig>,
 }
 
-/// A session's reachable capabilities, command words, and each reachable word's `--help` page.
-type CapabilityView = (
-    Vec<AvailableCapability>,
-    Vec<String>,
-    BTreeMap<String, String>,
-);
-
-/// A [`CapabilityView`] plus the chat-memory surface it may carry; `None` means an unmapped or
-/// refused caller, distinct from an empty view.
-type CapabilitySurface = (
-    Vec<AvailableCapability>,
-    Vec<String>,
-    BTreeMap<String, String>,
-    Option<ChatMemorySurface>,
-);
-
 impl<A> Broker<A>
 where
     A: AuditLog,
@@ -1976,12 +1960,20 @@ where
     /// surface that was never offered.
     #[must_use]
     pub fn command_word_help(&self, context: &AuthenticatedContext) -> BTreeMap<String, String> {
-        self.reachable_command_word_help(context, &self.authorized_sets(context))
+        let words = self.command_words(context);
+        self.command_word_help_for(&words)
     }
 
-    /// Providers whose command words this context may see: authorized by at least one reachable
-    /// constraint set, not the reserved chat-memory provider, and not a storage provider withheld
-    /// from a peer with no chat scope.
+    /// The registry's help map, filtered down to a word list a call site already computed —
+    /// `command_words`/`chat_memory_words`'s reachability, or none at all for the ceiling.
+    fn command_word_help_for(&self, words: &[String]) -> BTreeMap<String, String> {
+        let all = self.registry.command_word_help();
+        words
+            .iter()
+            .filter_map(|word| all.get(word).map(|page| (word.clone(), page.clone())))
+            .collect()
+    }
+
     fn reachable_providers(
         &self,
         context: &AuthenticatedContext,
@@ -2024,26 +2016,6 @@ where
         words.sort();
         words.dedup();
         words
-    }
-
-    fn reachable_command_word_help(
-        &self,
-        context: &AuthenticatedContext,
-        authorized: &[(&CapabilityId, &ConstraintSet)],
-    ) -> BTreeMap<String, String> {
-        let reachable = self.reachable_providers(context, authorized);
-        let mut pages = BTreeMap::new();
-        for (provider, provider_pages) in self.registry.command_word_help_by_provider() {
-            if !reachable.contains(provider) {
-                continue;
-            }
-            pages.extend(
-                provider_pages
-                    .iter()
-                    .map(|(word, page)| (word.clone(), page.clone())),
-            );
-        }
-        pages
     }
 
     /// Ungated by design: running a word only produces a proposal or rendered text and authorizes
@@ -2101,13 +2073,24 @@ where
     }
 
     #[must_use]
-    pub fn capability_view(&self, context: &AuthenticatedContext) -> CapabilityView {
+    #[allow(
+        clippy::type_complexity,
+        reason = "a session's reachable capabilities, command words, and each reachable word's \
+                  --help page, in that order; a named struct would only rename what the three \
+                  call sites already destructure by position"
+    )]
+    pub fn capability_view(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> (
+        Vec<AvailableCapability>,
+        Vec<String>,
+        BTreeMap<String, String>,
+    ) {
         let authorized = self.authorized_sets(context);
-        (
-            self.available_capabilities(&authorized),
-            self.reachable_command_words(context, &authorized),
-            self.reachable_command_word_help(context, &authorized),
-        )
+        let words = self.reachable_command_words(context, &authorized);
+        let help = self.command_word_help_for(&words);
+        (self.available_capabilities(&authorized), words, help)
     }
 
     fn available_capabilities(
@@ -2135,29 +2118,22 @@ where
     }
 
     #[must_use]
-    pub fn capability_ceiling(&self) -> CapabilityView {
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
+    pub fn capability_ceiling(
+        &self,
+    ) -> (
+        Vec<AvailableCapability>,
+        Vec<String>,
+        BTreeMap<String, String>,
+    ) {
         let mut capabilities = self
             .constraints
             .iter()
             .filter_map(|(capability, _)| self.available_capability(capability))
             .collect::<Vec<_>>();
         capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
-        let mut words = self
-            .registry
-            .command_words_by_provider()
-            .into_iter()
-            .flat_map(|(_, words)| words.iter().cloned())
-            .collect::<Vec<_>>();
-        words.sort();
-        words.dedup();
-        let mut help = BTreeMap::new();
-        for (_, pages) in self.registry.command_word_help_by_provider() {
-            help.extend(
-                pages
-                    .iter()
-                    .map(|(word, page)| (word.clone(), page.clone())),
-            );
-        }
+        let words = self.registry.command_words();
+        let help = self.registry.command_word_help();
         (capabilities, words, help)
     }
 
@@ -2173,12 +2149,18 @@ where
     /// A refused caller's answer must stay None, distinct from Some with an empty list; answering
     /// either way with an empty list would tell an unmapped subject that it is unmapped.
     #[must_use]
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
     pub fn capability_surface(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         attestation: Option<&Attestation>,
-    ) -> Option<CapabilitySurface> {
+    ) -> Option<(
+        Vec<AvailableCapability>,
+        Vec<String>,
+        BTreeMap<String, String>,
+        Option<ChatMemorySurface>,
+    )> {
         let Some(claim) = attestation else {
             let (capabilities, words, help) = self.capability_view(peer);
             return Some((capabilities, words, help, None));
@@ -2199,10 +2181,11 @@ where
                 capabilities.push(self.available_capability(capability)?);
             }
             capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
-            words.extend(self.chat_memory_words());
+            let chat_memory_words = self.chat_memory_words();
+            help.extend(self.command_word_help_for(&chat_memory_words));
+            words.extend(chat_memory_words);
             words.sort();
             words.dedup();
-            help.extend(self.chat_memory_word_help());
         }
         Some((capabilities, words, help, memory))
     }
@@ -2389,22 +2372,6 @@ where
             .into_iter()
             .filter(|(candidate, _)| *candidate == provider)
             .flat_map(|(_, words)| words.iter().cloned())
-            .collect()
-    }
-
-    fn chat_memory_word_help(&self) -> BTreeMap<String, String> {
-        let Some(provider) = self.constraints.chat_memory_provider() else {
-            return BTreeMap::new();
-        };
-        self.registry
-            .command_word_help_by_provider()
-            .into_iter()
-            .filter(|(candidate, _)| *candidate == provider)
-            .flat_map(|(_, pages)| {
-                pages
-                    .iter()
-                    .map(|(word, page)| (word.clone(), page.clone()))
-            })
             .collect()
     }
 

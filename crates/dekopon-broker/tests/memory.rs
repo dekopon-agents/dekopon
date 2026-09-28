@@ -503,7 +503,7 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     let legacy_grant = AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
-    let (legacy_capabilities, legacy_words, _legacy_help, _memory) = broker
+    let (legacy_capabilities, legacy_words, legacy_help, _memory) = broker
         .capability_surface(
             &gateway(),
             Some(&legacy_grant),
@@ -519,8 +519,9 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
             .all(|entry| entry.capability.id.as_str() != storage_id)
     );
     assert!(!legacy_words.iter().any(|word| word == storage_word));
+    assert!(!legacy_help.contains_key(storage_word));
 
-    let (scoped_capabilities, scoped_words, _scoped_help, _) = broker
+    let (scoped_capabilities, scoped_words, scoped_help, _) = broker
         .capability_surface(&gateway(), Some(&attestor_grant()), Some(&session))
         .expect("scoped chat is authorized");
     assert!(
@@ -529,6 +530,10 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
             .any(|entry| entry.capability.id.as_str() == storage_id)
     );
     assert!(scoped_words.iter().any(|word| word == storage_word));
+    assert!(
+        scoped_help.keys().all(|word| scoped_words.contains(word)),
+        "help never advertises a word that is not also listed"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
@@ -544,7 +549,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
         scope.trigger = dekopon_broker::Trigger::Probe;
     }
 
-    let (capabilities, words, _help, _) = broker
+    let (capabilities, words, help, _) = broker
         .capability_surface(&gateway(), Some(&attestor_grant()), Some(&probe))
         .expect("a probe is an authorized chat session");
     assert!(
@@ -553,6 +558,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
             .all(|entry| entry.capability.id.as_str() != "storage-probe.run")
     );
     assert!(!words.iter().any(|word| word == "storageprobe"));
+    assert!(!help.contains_key("storageprobe"));
 
     let id = "probe-write".parse::<InvocationId>().expect("invocation");
     let result = broker
@@ -663,11 +669,12 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         ["memory.chat.export", "ordinary.escape"],
         "an undeclared route hides nothing, however the capability is spelled"
     );
-    let (listed, words, _help, memory) = broker
+    let (listed, words, help, memory) = broker
         .capability_surface(&gateway, Some(&grant), Some(&claim))
         .expect("ordinary chat remains available");
     assert_eq!(listed.len(), 2);
     assert_eq!(words, ["recall"]);
+    assert!(help.contains_key("recall"));
     assert!(memory.is_none(), "no route means no memory surface");
     broker
         .run_command(&gateway, Some(&grant), Some(&claim), "recall", &[], None)
@@ -989,7 +996,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     let gateway = gateway();
     let grant = attestor_grant();
     let claim = claim();
-    let (listed, words, _help, _memory) = broker
+    let (listed, words, help, _memory) = broker
         .capability_surface(
             &gateway,
             Some(&grant),
@@ -999,11 +1006,11 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             )),
         )
         .expect("legacy attestation is honored");
-    assert!(listed.is_empty() && words.is_empty());
-    let (listed, words, _help, memory) = broker
+    assert!(listed.is_empty() && words.is_empty() && help.is_empty());
+    let (listed, words, help, memory) = broker
         .capability_surface(&gateway, Some(&grant), Some(&claim))
         .expect("ordinary chat remains available");
-    assert!(listed.is_empty() && words.is_empty() && memory.is_none());
+    assert!(listed.is_empty() && words.is_empty() && help.is_empty() && memory.is_none());
     assert!(
         broker
             .run_command(
@@ -1119,7 +1126,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let broker = build_broker(&root, Arc::clone(&audit)).await;
     let claim = claim();
     let grant = attestor_grant();
-    let (capabilities, words, _help, memory) = broker
+    let (capabilities, words, help, memory) = broker
         .capability_surface(&gateway(), Some(&grant), Some(&claim))
         .expect("chat scope accepted");
     assert_eq!(
@@ -1130,6 +1137,10 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         ["memory.chat.recent", "memory.chat.search"]
     );
     assert_eq!(words, ["memory"]);
+    assert!(
+        help.keys().all(|word| words.contains(word)),
+        "help never advertises a word that is not also listed"
+    );
     assert!(memory.is_some());
 
     assert!(
