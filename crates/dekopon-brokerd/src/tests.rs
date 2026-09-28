@@ -151,6 +151,44 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     config::load(&path, uid)
         .await
         .expect("the restored policy file loads");
+
+    let mut document = provider_config(uid, json!(["cli-probe.wasm"]));
+    document["policiesPath"] = json!("policies.cedar");
+    document["capabilities"] = probe_capabilities();
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid).await.expect("strict config loads");
+    let canonical_directory =
+        fs::canonicalize(directory.path()).expect("canonical fixture directory");
+    assert_eq!(
+        resolved.socket_path,
+        canonical_directory.join("broker.sock")
+    );
+    assert_eq!(
+        resolved.providers,
+        [canonical_directory.join("cli-probe.wasm")]
+    );
+
+    let mut conflicting = document.clone();
+    conflicting["policiesPath"] = json!("broker.yaml");
+    write_config(&path, &conflicting);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::ConflictingPaths)
+    ));
+
+    let mut invalid = document;
+    invalid["principal"] = json!("payload-forgery");
+    fs::write(
+        &path,
+        serde_json::to_vec(&invalid).expect("invalid fixture serializes"),
+    )
+    .expect("replace config fixture");
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::Decode { source })
+            if source.to_string().contains("unknown field")
+                && source.to_string().contains("principal")
+    ));
 }
 
 #[tokio::test]
@@ -366,79 +404,13 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
 }
 
 #[tokio::test]
-async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    let document = json!({
-        "apiVersion": config::CONFIG_API_VERSION,
-        "socketPath": "broker.sock",
-        "providers": ["cli-probe.wasm"],
-        "identities": [{
-            "uid": uid,
-            "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
-        }],
-        "policiesPath": "policies.cedar",
-        "capabilities": probe_capabilities()
-    });
-    write_config(&path, &document);
-    fs::write(
-        directory.path().join("cli-probe.wasm"),
-        b"component fixture",
-    )
-    .expect("write provider path fixture");
-    write_owner_only(
-        &directory.path().join("policies.cedar"),
-        POLICIES.as_bytes(),
-    );
-    let resolved = config::load(&path, uid).await.expect("strict config loads");
-    let canonical_directory =
-        fs::canonicalize(directory.path()).expect("canonical fixture directory");
-    assert_eq!(
-        resolved.socket_path,
-        canonical_directory.join("broker.sock")
-    );
-    assert_eq!(
-        resolved.providers,
-        [canonical_directory.join("cli-probe.wasm")]
-    );
-
-    let mut conflicting = document.clone();
-    conflicting["policiesPath"] = json!("broker.yaml");
-    write_config(&path, &conflicting);
-    assert!(matches!(
-        config::load(&path, uid).await,
-        Err(config::ConfigError::ConflictingPaths)
-    ));
-
-    let mut invalid = document;
-    invalid["principal"] = json!("payload-forgery");
-    fs::write(
-        &path,
-        serde_json::to_vec(&invalid).expect("invalid fixture serializes"),
-    )
-    .expect("replace config fixture");
-    assert!(config::load(&path, uid).await.is_err());
-}
-
-#[tokio::test]
 async fn plaintext_hosts_are_validated_at_startup() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
-    let document = json!({
-        "apiVersion": config::CONFIG_API_VERSION,
-        "socketPath": "broker.sock",
-        "providers": ["cli-probe.wasm"],
-        "identities": [{
-            "uid": uid,
-            "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
-        }],
-        "policiesPath": "policies.cedar",
-        "capabilities": probe_capabilities()
-    });
+    let mut document = provider_config(uid, json!(["cli-probe.wasm"]));
+    document["policiesPath"] = json!("policies.cedar");
+    document["capabilities"] = probe_capabilities();
     fs::write(
         directory.path().join("cli-probe.wasm"),
         b"component fixture",
@@ -564,59 +536,13 @@ async fn plaintext_hosts_are_validated_at_startup() {
 }
 
 #[tokio::test]
-async fn an_audit_path_in_config_is_refused() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    fs::write(
-        directory.path().join("cli-probe.wasm"),
-        b"component fixture",
-    )
-    .expect("write provider path fixture");
-    let mut with_path = provider_config(uid, json!(["cli-probe.wasm"]));
-    with_path["auditPath"] = json!("audit.jsonl");
-    let mut with_line_bound = provider_config(uid, json!(["cli-probe.wasm"]));
-    with_line_bound["serverLimits"] = json!({
-        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
-        "ioTimeoutMs": 30_000,
-        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
-        "auditMaxLineBytes": 65_536,
-        "shutdownGraceMs": 120_000
-    });
-    for (document, field) in [
-        (with_path, "auditPath"),
-        (with_line_bound, "auditMaxLineBytes"),
-    ] {
-        write_config(&path, &document);
-        let error = config::load(&path, uid)
-            .await
-            .expect_err("an audit sink field is unknown");
-        assert!(
-            matches!(&error, config::ConfigError::Decode { source }
-                if source.to_string().contains("unknown field")
-                    && source.to_string().contains(field)),
-            "{field}: {error}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn telemetry_section_is_optional_and_strict() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
-    let base = json!({
-        "apiVersion": config::CONFIG_API_VERSION,
-        "socketPath": "broker.sock",
-        "providers": ["cli-probe.wasm"],
-        "identities": [{
-            "uid": uid,
-            "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
-        }],
-        "policiesPath": "policies.cedar",
-        "capabilities": probe_capabilities()
-    });
+    let mut base = provider_config(uid, json!(["cli-probe.wasm"]));
+    base["policiesPath"] = json!("policies.cedar");
+    base["capabilities"] = probe_capabilities();
     fs::write(
         directory.path().join("cli-probe.wasm"),
         b"component fixture",
@@ -806,34 +732,6 @@ async fn a_provider_directory_expands_in_filename_order() {
     );
 }
 
-#[tokio::test]
-async fn a_group_writable_provider_directory_refuses_to_load() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    let providers = directory.path().join("providers");
-    fs::create_dir(&providers).expect("create provider directory");
-    fs::write(providers.join("cli-probe.wasm"), b"component fixture")
-        .expect("write component fixture");
-    write_config(&path, &provider_config(uid, json!(["providers"])));
-
-    fs::set_permissions(&providers, fs::Permissions::from_mode(0o775))
-        .expect("loosen provider directory");
-    let error = config::load(&path, uid)
-        .await
-        .expect_err("a group-writable provider directory refuses to load");
-    assert!(
-        matches!(error, config::ConfigError::InsecureProviderDirectory { .. }),
-        "{error:?}"
-    );
-
-    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
-        .expect("secure provider directory");
-    config::load(&path, uid)
-        .await
-        .expect("a private provider directory loads");
-}
-
 fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Value {
     let defaults = dekopon_broker_host::BrokerHostLimits::default();
     let mut limits = json!({
@@ -859,7 +757,7 @@ fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Valu
 }
 
 #[tokio::test]
-async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
+async fn aggregate_memory_defaults_and_partial_limits_are_resolved_and_validated() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
@@ -902,20 +800,6 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
         .await
         .expect("an explicitly null aggregate ceiling loads");
     assert_eq!(resolved.host_options.max_total_memory_bytes, None);
-}
-
-#[tokio::test]
-async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    let policies = directory.path().join("policies.cedar");
-    fs::write(
-        directory.path().join("cli-probe.wasm"),
-        b"component fixture",
-    )
-    .expect("write provider path fixture");
-    write_owner_only(&policies, POLICIES.as_bytes());
 
     let mut document = attested_document(uid);
     document["compileOnLoad"] = json!(true);
@@ -947,20 +831,6 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
         matches!(error, config::ConfigError::InvalidHostLimits),
         "{error:?}"
     );
-}
-
-#[tokio::test]
-async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_validated() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    let policies = directory.path().join("policies.cedar");
-    fs::write(
-        directory.path().join("cli-probe.wasm"),
-        b"component fixture",
-    )
-    .expect("write provider path fixture");
-    write_owner_only(&policies, POLICIES.as_bytes());
 
     let defaults = dekopon_broker_host::BrokerHostLimits::default();
     let mut document = attested_document(uid);
@@ -996,10 +866,29 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
         matches!(error, config::ConfigError::Decode { .. }),
         "{error:?}"
     );
+
+    let mut document = attested_document(uid);
+    document["serverLimits"] = json!({"shutdownGraceMs": 420_000});
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid).await.expect("config resolves");
+    assert_eq!(
+        resolved.server_limits.max_connections,
+        config::DEFAULT_MAX_CONNECTIONS
+    );
+    assert_eq!(resolved.server_limits.shutdown_grace_ms, 420_000);
+
+    document["serverLimits"] = json!({"shutdownGraceMs": 420_000, "typo": 1});
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::Decode { source })
+            if source.to_string().contains("unknown field")
+                && source.to_string().contains("typo")
+    ));
 }
 
 #[tokio::test]
-async fn an_empty_provider_directory_is_named_in_its_own_error() {
+async fn provider_directories_refuse_empty_writable_and_duplicate_entries() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
@@ -1016,19 +905,23 @@ async fn an_empty_provider_directory_is_named_in_its_own_error() {
         matches!(error, config::ConfigError::EmptyProviderDirectory { .. }),
         "{error:?}"
     );
-}
 
-#[tokio::test]
-async fn file_and_directory_entries_mix_and_still_deduplicate() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    let providers = directory.path().join("providers");
-    fs::create_dir(&providers).expect("create provider directory");
-    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
-        .expect("secure provider directory");
     fs::write(providers.join("cli-probe.wasm"), b"component fixture")
         .expect("write component fixture");
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o775))
+        .expect("loosen provider directory");
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a group-writable provider directory refuses to load");
+    assert!(
+        matches!(error, config::ConfigError::InsecureProviderDirectory { .. }),
+        "{error:?}"
+    );
+    fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
+        .expect("secure provider directory");
+    config::load(&path, uid)
+        .await
+        .expect("a private provider directory loads");
     fs::write(directory.path().join("solo.wasm"), b"component fixture").expect("write solo");
 
     write_config(
@@ -1256,23 +1149,7 @@ async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() 
         compaction_threshold_bytes: 12_582_912,
     })
     .expect("memory config serializes");
-    let host = dekopon_broker_host::BrokerHostLimits::default();
-    document["hostLimits"] = json!({
-        "maxMemoryBytes": host.max_memory_bytes,
-        "maxTableElements": host.max_table_elements,
-        "maxInstances": host.max_instances,
-        "maxTables": host.max_tables,
-        "maxMemories": host.max_memories,
-        "maxInputBytes": host.max_input_bytes,
-        "maxOutputBytes": host.max_output_bytes,
-        "maxHttpRequests": host.max_http_requests,
-        "maxHttpRequestBytes": host.max_http_request_bytes,
-        "maxHttpResponseBytes": host.max_http_response_bytes,
-        "maxHttpHeaders": host.max_http_headers,
-        "maxHttpHeaderBytes": host.max_http_header_bytes,
-        "fuel": host.fuel,
-        "maxTimeoutMs": u64::try_from(host.max_timeout.as_millis()).expect("timeout")
-    });
+    document["hostLimits"] = host_limits_document(None);
     write_config(&path, &document);
     config::load(&path, uid)
         .await
@@ -1312,27 +1189,12 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
         .expect("storage object")
         .remove("maxRootBytes");
     assert!(
-        serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
+        serde_json::from_value::<config::BrokerdConfig>(document.clone()).is_err(),
         "presence requires every storage field"
     );
-}
 
-#[test]
-fn an_old_config_naming_namespace_key_path_is_refused() {
-    let mut document = attested_document(current_uid());
-    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
-        .expect("storage limits serialize");
-    storage.as_object_mut().expect("limits object").extend([
-        (
-            "rootPath".to_owned(),
-            json!("/var/lib/dekopon-provider-storage"),
-        ),
-        (
-            "namespaceKeyPath".to_owned(),
-            json!("/etc/dekopon-storage-key/storage-key.yaml"),
-        ),
-    ]);
     document["storage"] = storage;
+    document["storage"]["namespaceKeyPath"] = json!("/etc/dekopon-storage-key/storage-key.yaml");
     let refused = serde_json::from_value::<config::BrokerdConfig>(document)
         .expect_err("a retired storage field is refused");
     assert!(
@@ -1847,29 +1709,4 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )));
     assert!(!socket.parent().expect("socket parent").exists());
     assert!(!credentials.exists());
-}
-
-#[tokio::test]
-async fn a_partial_server_limits_block_keeps_the_other_defaults() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create configuration fixture");
-    let path = directory.path().join("broker.yaml");
-    fs::write(
-        directory.path().join("cli-probe.wasm"),
-        b"component fixture",
-    )
-    .expect("write provider path fixture");
-    write_owner_only(
-        &directory.path().join("policies.cedar"),
-        POLICIES.as_bytes(),
-    );
-    let mut document = attested_document(uid);
-    document["serverLimits"] = json!({"shutdownGraceMs": 420_000});
-    write_config(&path, &document);
-    let resolved = config::load(&path, uid).await.expect("config resolves");
-    assert_eq!(
-        resolved.server_limits.max_connections,
-        config::DEFAULT_MAX_CONNECTIONS
-    );
-    assert_eq!(resolved.server_limits.shutdown_grace_ms, 420_000);
 }
