@@ -677,375 +677,183 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_content() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("jsonplaceholder-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("JSONPlaceholder provider fixture loads");
-    let response_body = br#"{"userId":3,"id":101,"title":"private title","body":"private body"}"#;
-    let response = format!(
-        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response_body.len(),
-        String::from_utf8_lossy(response_body)
-    );
-    let server = LoopbackServer::once(response.as_bytes());
-    let authority = server.authority().to_owned();
-    let constraints = ExecutionConstraints {
-        asset: None,
-        timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
-        http: Some(HttpConstraints {
-            allowed_hosts: vec![authority.clone()],
-            allowed_methods: vec!["POST".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 64 * 1024,
-            max_response_bytes: 64 * 1024,
-            allow_plaintext_loopback: true,
-            propagate_trace: false,
-        }),
-        storage: None,
-        secret_use: None,
-    };
-    let read_constraints = ExecutionConstraints {
-        http: Some(HttpConstraints {
-            allowed_methods: vec!["GET".to_owned()],
-            ..constraints
-                .http
-                .clone()
-                .expect("the write constraints grant HTTP authority")
-        }),
-        ..constraints.clone()
-    };
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        "policy-jsonplaceholder".to_owned(),
-        jsonplaceholder_engine(&provider_policy(
-            "caller",
-            "provider-test",
-            "jsonplaceholder",
-            "jsonplaceholder.posts.create",
-        )),
-        catalog([
-            (
-                "jsonplaceholder.posts.get",
-                set("jsonplaceholder", read_constraints),
-            ),
-            (
-                "jsonplaceholder.posts.create",
-                set_with_metadata(
-                    "jsonplaceholder",
-                    EffectKind::ExternalWrite,
-                    RiskLevel::Medium,
-                    constraints,
-                ),
-            ),
-        ]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("the external-write constraint set exactly matches trusted provider metadata");
-    let available = broker.capabilities(&session("caller", "provider-test"));
-    assert_eq!(available.len(), 1);
-    assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
-    assert_eq!(available[0].capability.risk, RiskLevel::Medium);
-    let read = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-json-read-with-write-rule",
-            "jsonplaceholder.posts.get",
-            json!({
-                "postId": 7,
-                "endpoint": format!("http://{authority}")
-            }),
+async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails() {
+    use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
+
+    for (body, expected) in [
+        (
+            r#"{"userId":3,"id":101,"title":"private title","body":"private body"}"#,
+            Succeeded,
         ),
-    )
-    .await
-    .expect("ungranted read is denied and audited");
-    assert_eq!(
-        read.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(read.result.error.as_deref(), Some("policy-denied"));
-
-    let result = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-json-write",
-            "jsonplaceholder.posts.create",
-            json!({
-                "userId": 3,
-                "title": "private title",
-                "body": "private body",
-                "endpoint": format!("http://{authority}")
-            }),
-        ),
-    )
-    .await
-    .expect("authorized JSONPlaceholder write succeeds");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
-    );
-    assert_eq!(
-        result.result.output.as_ref().expect("write returns output")["post"]["id"],
-        101
-    );
-    let wire = server.request();
-    assert!(wire.starts_with(b"POST /posts HTTP/1.1\r\n"));
-    let body_offset = wire
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("POST headers terminate")
-        + 4;
-    assert_eq!(
-        serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
-        json!({"userId": 3, "title": "private title", "body": "private body"})
-    );
-    server.join();
-
-    let records = audit.records();
-    assert_eq!(records.len(), 3);
-    let serialized = serde_json::to_string(&records).expect("audit serializes");
-    assert!(serialized.contains(&authority));
-    assert!(serialized.contains("external-write"));
-    assert!(serialized.contains("POST"));
-    assert!(!serialized.contains("private title"));
-    assert!(!serialized.contains("private body"));
-    assert!(!serialized.contains("/posts"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_execution_audits_the_external_write_that_already_landed() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("jsonplaceholder-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("JSONPlaceholder provider fixture loads");
-    let server = LoopbackServer::once(
-        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
-    );
-    let authority = server.authority().to_owned();
-    let constraints = ExecutionConstraints {
-        asset: None,
-        timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
-        http: Some(HttpConstraints {
-            propagate_trace: false,
-            allowed_hosts: vec![authority.clone()],
-            allowed_methods: vec!["POST".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 64 * 1024,
-            max_response_bytes: 64 * 1024,
-            allow_plaintext_loopback: true,
-        }),
-        storage: None,
-        secret_use: None,
-    };
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        "policy-jsonplaceholder".to_owned(),
-        jsonplaceholder_engine(&provider_policy(
-            "caller",
-            "provider-test",
-            "jsonplaceholder",
-            "jsonplaceholder.posts.create",
-        )),
-        catalog([(
-            "jsonplaceholder.posts.create",
-            set_with_metadata(
-                "jsonplaceholder",
-                EffectKind::ExternalWrite,
-                RiskLevel::Medium,
-                constraints,
-            ),
-        )]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("the external-write constraint set exactly matches trusted provider metadata");
-
-    let result = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-json-write-failure",
-            "jsonplaceholder.posts.create",
-            json!({
-                "userId": 3,
-                "title": "private title",
-                "body": "private body",
-                "endpoint": format!("http://{authority}")
-            }),
-        ),
-    )
-    .await
-    .expect("a failing provider is still durably accounted");
-
-    let wire = server.request();
-    assert!(
-        wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
-        "the external write must have left the host before the failure"
-    );
-    server.join();
-
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Failed
-    );
-    assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
-    assert_eq!(
-        result.result.detail,
-        Some(ProviderFailureDetail::new(
-            "invalid-response",
-            "endpoint returned an invalid post"
-        )),
-        "a typed provider failure carries the provider's own code and message on the wire"
-    );
-    assert!(
-        result
-            .result
-            .evidence
-            .iter()
-            .any(|evidence| evidence.kind == "http-calls"),
-        "a failure that dispatched HTTP must return http-call evidence"
-    );
-
-    let records = audit.records();
-    assert_eq!(records.len(), 2);
-    let AuditEvent::Execution {
-        outcome,
-        error,
-        error_detail,
-        http_calls,
-        ..
-    } = &records[1]
-    else {
-        panic!("the terminal record is an execution event");
-    };
-    assert_eq!(*outcome, dekopon_capability::InvocationOutcome::Failed);
-    assert_eq!(error.as_deref(), Some("provider-failure"));
-    assert_eq!(
-        error_detail
-            .as_ref()
-            .map(|detail| (detail.code.as_str(), detail.message.as_str())),
-        Some(("invalid-response", "endpoint returned an invalid post"))
-    );
-    assert_eq!(
-        http_calls.len(),
-        1,
-        "the completed call must survive into the failed execution record"
-    );
-    assert_eq!(http_calls[0].method, "POST");
-    assert_eq!(http_calls[0].authority, authority);
-    assert_eq!(http_calls[0].status, Some(201));
-
-    let serialized = serde_json::to_string(&records).expect("audit serializes");
-    assert!(!serialized.contains("private title"));
-    assert!(!serialized.contains("private body"));
-    assert!(!serialized.contains("/posts"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them() {
-    const SECRET: &str = "audit-must-never-see-this";
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let server = LoopbackServer::once(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-    );
-    let authority = server.authority().to_owned();
-    let constraints = loopback_constraints(&authority);
-    let credentials = CredentialStore::new([(
-        "fetch-token".to_owned(),
-        BoundCredential::bearer(
-            "Bearer",
-            Redacted::new(SECRET.to_owned()),
-            vec![authority.clone()],
+        ("not-json", Failed),
+    ] {
+        let registry = BrokerProviderRegistry::load(
+            [provider_fixture("jsonplaceholder-provider.wasm")],
+            BrokerHostLimits::default(),
         )
-        .expect("valid credential fixture"),
-    )])
-    .expect("credential store builds");
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        "policy-test".to_owned(),
-        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
-        catalog([(
-            "http-probe.fetch",
-            ConstraintSet {
-                route: CapabilityRoute::Generic,
-                credential: Some("fetch-token".to_owned()),
-                ..set("http-probe", constraints)
-            },
-        )]),
-        credentials,
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("the credentialed constraint set matches store and destinations");
-
-    let result = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-credentialed",
-            "http-probe.fetch",
-            json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-        ),
-    )
-    .await
-    .expect("authorized credentialed request succeeds");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
-    );
-
-    let wire = server.request_text();
-    assert!(
-        wire.contains(&format!("authorization: Bearer {SECRET}")),
-        "{wire}"
-    );
-    server.join();
-
-    let records = audit.records();
-    let serialized = serde_json::to_string(&records).expect("audit serializes");
-    assert!(
-        serialized.contains("\"credentialInjected\":true"),
-        "{serialized}"
-    );
-    assert!(!serialized.contains(SECRET), "audit leaked the secret");
-    assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
-    let public = serde_json::to_string(&result.result).expect("result serializes");
-    assert!(!public.contains(SECRET), "result leaked the secret");
+        .await
+        .expect("JSONPlaceholder provider fixture loads");
+        let response = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = LoopbackServer::once(response.as_bytes());
+        let authority = server.authority().to_owned();
+        let mut constraints = loopback_constraints(&authority);
+        constraints
+            .http
+            .as_mut()
+            .expect("HTTP constraints")
+            .allowed_methods = vec!["POST".to_owned()];
+        let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+        let broker = Broker::new(
+            registry,
+            principal("broker-test"),
+            "policy-jsonplaceholder".to_owned(),
+            jsonplaceholder_engine(&provider_policy(
+                "caller",
+                "provider-test",
+                "jsonplaceholder",
+                "jsonplaceholder.posts.create",
+            )),
+            catalog([
+                (
+                    "jsonplaceholder.posts.get",
+                    set("jsonplaceholder", loopback_constraints(&authority)),
+                ),
+                (
+                    "jsonplaceholder.posts.create",
+                    set_with_metadata(
+                        "jsonplaceholder",
+                        EffectKind::ExternalWrite,
+                        RiskLevel::Medium,
+                        constraints,
+                    ),
+                ),
+            ]),
+            CredentialStore::empty(),
+            callers(["caller"]),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("the external-write constraint set exactly matches trusted provider metadata");
+        if expected == Succeeded {
+            let available = broker.capabilities(&session("caller", "provider-test"));
+            assert_eq!(available.len(), 1);
+            assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
+            assert_eq!(available[0].capability.risk, RiskLevel::Medium);
+            let read = invoke_as(
+                &broker,
+                "caller",
+                "provider-test",
+                request(
+                    "invoke-json-read-with-write-rule",
+                    "jsonplaceholder.posts.get",
+                    json!({
+                        "postId": 7, "endpoint": format!("http://{authority}")
+                    }),
+                ),
+            )
+            .await
+            .expect("ungranted read is denied and audited");
+            assert_eq!(
+                read.result.outcome,
+                dekopon_capability::InvocationOutcome::Denied
+            );
+            assert_eq!(read.result.error.as_deref(), Some("policy-denied"));
+        }
+        let result = invoke_as(
+            &broker,
+            "caller",
+            "provider-test",
+            request(
+                "invoke-json-write",
+                "jsonplaceholder.posts.create",
+                json!({
+                    "userId": 3, "title": "private title", "body": "private body",
+                    "endpoint": format!("http://{authority}")
+                }),
+            ),
+        )
+        .await
+        .expect("the authorized write is accounted");
+        assert_eq!(result.result.outcome, expected);
+        let wire = server.request();
+        assert!(
+            wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
+            "the external write must have left the host before the outcome"
+        );
+        let body_offset = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("POST headers terminate")
+            + 4;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
+            json!({"userId": 3, "title": "private title", "body": "private body"})
+        );
+        server.join();
+        let records = audit.records();
+        if expected == Succeeded {
+            assert_eq!(
+                result.result.output.as_ref().expect("write returns output")["post"]["id"],
+                101
+            );
+            assert_eq!(records.len(), 3);
+        } else {
+            assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
+            assert_eq!(
+                result.result.detail,
+                Some(ProviderFailureDetail::new(
+                    "invalid-response",
+                    "endpoint returned an invalid post"
+                )),
+                "a typed provider failure carries the provider's own code and message on the wire"
+            );
+            assert!(
+                result
+                    .result
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == "http-calls"),
+                "a failure that dispatched HTTP must return http-call evidence"
+            );
+            assert_eq!(records.len(), 2);
+            let AuditEvent::Execution {
+                outcome,
+                error,
+                error_detail,
+                http_calls,
+                ..
+            } = &records[1]
+            else {
+                panic!("the terminal record is an execution event");
+            };
+            assert_eq!(*outcome, Failed);
+            assert_eq!(error.as_deref(), Some("provider-failure"));
+            assert_eq!(
+                error_detail
+                    .as_ref()
+                    .map(|detail| (detail.code.as_str(), detail.message.as_str())),
+                Some(("invalid-response", "endpoint returned an invalid post"))
+            );
+            assert_eq!(
+                http_calls.len(),
+                1,
+                "the completed call must survive into the failed execution record"
+            );
+            assert_eq!(http_calls[0].method, "POST");
+            assert_eq!(http_calls[0].authority, authority);
+            assert_eq!(http_calls[0].status, Some(201));
+        }
+        let serialized = serde_json::to_string(&records).expect("audit serializes");
+        assert!(serialized.contains(&authority));
+        assert!(serialized.contains("external-write"));
+        assert!(serialized.contains("POST"));
+        assert!(!serialized.contains("private title"));
+        assert!(!serialized.contains("private body"));
+        assert!(!serialized.contains("/posts"));
+    }
 }
 
 #[derive(Debug)]
@@ -1408,68 +1216,105 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn capability_policy_alone_cannot_authorize_a_drn() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let constraints = loopback_constraints("127.0.0.1:9");
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
-    let broker = Broker::new(
-        registry,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        http_probe_secret_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
-        catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("broker")
-    .with_secret_catalog(
-        SecretCatalog::new(
-            vec![SecretUseBinding {
-                binding_id: "http-probe-token".to_owned(),
-                secret: secret_drn(),
-                capability: "http-probe.fetch".parse().expect("capability"),
-                sink: SecretSinkKind::HttpBearer,
-                basic_username: None,
-                allowed_hosts: vec!["127.0.0.1:9".to_owned()],
-                allowed_methods: vec!["GET".to_owned()],
-                allowed_paths: vec![HttpPathRule::Exact {
-                    path: "/".to_owned(),
-                }],
-                allow_query: false,
-                max_injections: 1,
-            }],
-            Arc::new(StaticSecretResolver(b"never-resolved")),
+async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes() {
+    use dekopon_capability::InvocationOutcome::{Denied, Failed};
+
+    for (policy, resolver, outcome, error) in [
+        (
+            "",
+            Arc::new(StaticSecretResolver(b"never-resolved")) as Arc<dyn SecretResolver>,
+            Denied,
+            "secret-denied",
+        ),
+        (
+            r#"@id("caller-secret-use")
+            permit(principal == Dekopon::Principal::"caller",
+                   action == Dekopon::Action::"secret.use",
+                   resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
+            Arc::new(MissingSecretResolver),
+            Failed,
+            "secret-resolution",
+        ),
+    ] {
+        let registry = BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
         )
-        .expect("catalog"),
-    )
-    .expect("binding");
-    let mut proposal = request(
-        "invoke-secret-denied",
-        "http-probe.fetch",
-        json!({"uri": "http://127.0.0.1:9/", "method": "GET"}),
-    );
-    proposal.secret_use = Some(SecretUseProposal::HttpBearer {
-        secret: secret_drn(),
-    });
-    let result = invoke_as(&broker, "caller", "provider-test", proposal)
         .await
-        .expect("denial audited");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(result.result.error.as_deref(), Some("secret-denied"));
-    let encoded = serde_json::to_string(&audit.records()).expect("audit serializes");
-    assert!(encoded.contains(secret_drn().as_str()), "{encoded}");
-    assert!(encoded.contains("secret_sink"), "{encoded}");
-    assert!(!encoded.contains("never-resolved"), "{encoded}");
+        .expect("HTTP provider fixture loads");
+        let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
+        let broker = Broker::new(
+            registry,
+            principal("broker-test"),
+            "policy-test".to_owned(),
+            http_probe_secret_engine(&format!(
+                "{}\n{policy}",
+                http_policy("caller", "provider-test", "http-probe.fetch")
+            )),
+            catalog([(
+                "http-probe.fetch",
+                set("http-probe", loopback_constraints("127.0.0.1:9")),
+            )]),
+            CredentialStore::empty(),
+            callers(["caller"]),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("broker")
+        .with_secret_catalog(
+            SecretCatalog::new(
+                vec![SecretUseBinding {
+                    binding_id: "http-probe-token".to_owned(),
+                    secret: secret_drn(),
+                    capability: "http-probe.fetch".parse().expect("capability"),
+                    sink: SecretSinkKind::HttpBearer,
+                    basic_username: None,
+                    allowed_hosts: vec!["127.0.0.1:9".to_owned()],
+                    allowed_methods: vec!["GET".to_owned()],
+                    allowed_paths: vec![HttpPathRule::Exact {
+                        path: "/".to_owned(),
+                    }],
+                    allow_query: false,
+                    max_injections: 1,
+                }],
+                resolver,
+            )
+            .expect("catalog"),
+        )
+        .expect("binding");
+        let mut proposal = request(
+            "invoke-secret-refused",
+            "http-probe.fetch",
+            json!({
+                "uri": "http://127.0.0.1:9/", "method": "GET"
+            }),
+        );
+        proposal.secret_use = Some(SecretUseProposal::HttpBearer {
+            secret: secret_drn(),
+        });
+        let result = invoke_as(&broker, "caller", "provider-test", proposal)
+            .await
+            .expect("refusal audited");
+        assert_eq!(result.result.outcome, outcome);
+        assert_eq!(result.result.error.as_deref(), Some(error));
+        let records = audit.records();
+        if outcome == Denied {
+            let encoded = serde_json::to_string(&records).expect("audit serializes");
+            assert!(encoded.contains(secret_drn().as_str()), "{encoded}");
+            assert!(encoded.contains("secret_sink"), "{encoded}");
+            assert!(!encoded.contains("never-resolved"), "{encoded}");
+        } else {
+            assert_eq!(records.len(), 2, "decision plus terminal failed execution");
+            let AuditEvent::Execution {
+                error, http_calls, ..
+            } = &records[1]
+            else {
+                panic!("terminal record is execution");
+            };
+            assert_eq!(error.as_deref(), Some("secret-resolution"));
+            assert!(http_calls.is_empty());
+        }
+    }
 }
 
 /// The secret [`basic_secret_broker`] resolves; at least the 16 bytes the native sink requires.
@@ -1482,8 +1327,6 @@ fn basic_fetch_argv(uri: &str) -> Vec<String> {
         .into()
 }
 
-/// Cedar's policy permits secret.use regardless of username; the binding, not the policy, is what
-/// restricts which name may present the secret.
 fn basic_secret_broker(
     registry: BrokerProviderRegistry,
     authority: &str,
@@ -1540,43 +1383,6 @@ fn basic_secret_broker(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
-    let broker = basic_secret_broker(registry, "127.0.0.1:9", "user-a", &audit);
-    let uri = "http://127.0.0.1:9/api/v1/thing";
-
-    let proposed = broker
-        .run_command(
-            &session("caller", "provider-test"),
-            None,
-            None,
-            "httpprobe",
-            &basic_fetch_argv(uri),
-            None,
-        )
-        .await
-        .expect("the word proposes");
-    assert_eq!(
-        proposed,
-        CommandRunOutcome::Proposed {
-            capability: "http-probe.fetch".parse().expect("capability"),
-            input: json!({"uri": uri}),
-            secret_use: Some(SecretUseProposal::HttpBasic {
-                secret: secret_drn(),
-                username: "user-a".to_owned(),
-            }),
-        }
-    );
-    assert!(audit.records().is_empty(), "running a word decides nothing");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username() {
     let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -1618,6 +1424,18 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
         )
         .await
         .expect("the word proposes");
+    assert_eq!(
+        proposed,
+        CommandRunOutcome::Proposed {
+            capability: "http-probe.fetch".parse().expect("capability"),
+            input: json!({"uri": uri}),
+            secret_use: Some(SecretUseProposal::HttpBasic {
+                secret: secret_drn(),
+                username: "user-a".to_owned(),
+            }),
+        }
+    );
+    assert!(audit.records().is_empty(), "running a word decides nothing");
     let CommandRunOutcome::Proposed {
         capability,
         input,
@@ -1664,7 +1482,6 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
         dekopon_capability::InvocationOutcome::Succeeded
     );
     let wire = server.request_text();
-    // base64("user-a:drn-secret-never-visible"): the bound username, then the resolved secret.
     assert!(
         wire.contains("authorization: Basic dXNlci1hOmRybi1zZWNyZXQtbmV2ZXItdmlzaWJsZQ=="),
         "{wire}"
@@ -1685,300 +1502,162 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguous_gap() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let authority = "127.0.0.1:9";
-    let policy = format!(
-        "{}\n{}",
-        http_policy("caller", "provider-test", "http-probe.fetch"),
-        r#"@id("caller-secret-use")
-           permit(principal == Dekopon::Principal::"caller",
-                  action == Dekopon::Action::"secret.use",
-                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
-    );
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
-    let broker = Broker::new(
-        registry,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        http_probe_secret_engine(&policy),
-        catalog([(
-            "http-probe.fetch",
-            set("http-probe", loopback_constraints(authority)),
-        )]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("broker")
-    .with_secret_catalog(
-        SecretCatalog::new(
-            vec![SecretUseBinding {
-                binding_id: "missing-token".to_owned(),
-                secret: secret_drn(),
-                capability: "http-probe.fetch".parse().expect("capability"),
-                sink: SecretSinkKind::HttpBearer,
-                basic_username: None,
-                allowed_hosts: vec![authority.to_owned()],
-                allowed_methods: vec!["GET".to_owned()],
-                allowed_paths: vec![HttpPathRule::Exact {
-                    path: "/".to_owned(),
-                }],
-                allow_query: false,
-                max_injections: 1,
-            }],
-            Arc::new(MissingSecretResolver),
-        )
-        .expect("catalog"),
-    )
-    .expect("binding");
-    let mut proposal = request(
-        "invoke-secret-missing",
-        "http-probe.fetch",
-        json!({"uri": "http://127.0.0.1:9/", "method": "GET"}),
-    );
-    proposal.secret_use = Some(SecretUseProposal::HttpBearer {
-        secret: secret_drn(),
-    });
-    let result = invoke_as(&broker, "caller", "provider-test", proposal)
-        .await
-        .expect("source failure is a normal audited result");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Failed
-    );
-    assert_eq!(result.result.error.as_deref(), Some("secret-resolution"));
-    let records = audit.records();
-    assert_eq!(records.len(), 2, "decision plus terminal failed execution");
-    let AuditEvent::Execution {
-        error, http_calls, ..
-    } = &records[1]
-    else {
-        panic!("terminal record is execution");
-    };
-    assert_eq!(error.as_deref(), Some("secret-resolution"));
-    assert!(http_calls.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
+async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_it() {
     const DEFAULT_SECRET: &str = "dekopon-agents-token";
     const OVERRIDE_SECRET: &str = "scientist-hq-token";
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let server = LoopbackServer::serving(
+    for credential in [Some("github-pat"), None] {
+        let registry = BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("HTTP provider fixture loads");
+        let server = LoopbackServer::serving(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
         2,
     );
-    let authority = server.authority().to_owned();
-    let credentials = CredentialStore::new([
-        (
-            "github-pat".to_owned(),
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new(DEFAULT_SECRET.to_owned()),
-                vec![authority.clone()],
-            )
-            .expect("valid credential fixture"),
-        ),
-        (
-            "github-pat-scientist-hq".to_owned(),
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new(OVERRIDE_SECRET.to_owned()),
-                vec![authority.clone()],
-            )
-            .expect("valid credential fixture"),
-        ),
-    ])
-    .expect("credential store builds");
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        engine(
-            &format!(
-                "{}\n{}",
-                http_policy("caller", "dekoponville-github", "http-probe.fetch"),
-                http_policy("caller", "nestedset-github", "http-probe.fetch"),
+        let authority = server.authority().to_owned();
+        let credentials = CredentialStore::new(
+            [
+                (
+                    "github-pat".to_owned(),
+                    BoundCredential::bearer(
+                        "Bearer",
+                        Redacted::new(DEFAULT_SECRET.to_owned()),
+                        vec![authority.clone()],
+                    )
+                    .expect("valid credential fixture"),
+                ),
+                (
+                    "github-pat-scientist-hq".to_owned(),
+                    BoundCredential::bearer(
+                        "Bearer",
+                        Redacted::new(OVERRIDE_SECRET.to_owned()),
+                        vec![authority.clone()],
+                    )
+                    .expect("valid credential fixture"),
+                ),
+            ]
+            .into_iter()
+            .filter(|(name, _)| credential.is_some() || name != "github-pat"),
+        )
+        .expect("credential store builds");
+        let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+        let broker = Broker::new(
+            registry,
+            principal("broker-test"),
+            "policy-test".to_owned(),
+            engine(
+                &format!(
+                    "{}\n{}",
+                    http_policy("caller", "dekoponville-github", "http-probe.fetch"),
+                    http_policy("caller", "nestedset-github", "http-probe.fetch"),
+                ),
+                ["caller"],
+                [("http-probe.fetch", "http-probe")],
             ),
-            ["caller"],
-            [("http-probe.fetch", "http-probe")],
-        ),
-        catalog([(
-            "http-probe.fetch",
-            ConstraintSet {
-                route: CapabilityRoute::Generic,
-                credential: Some("github-pat".to_owned()),
-                ..set("http-probe", loopback_constraints(&authority))
-            },
-        )])
-        .with_agent_credentials(rebind_for_nestedset(
-            "github-pat",
-            "github-pat-scientist-hq",
-        )),
-        credentials,
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("both the default and the override match the store and its destinations");
-
-    for (id, agent_name) in [
-        ("invoke-nestedset", "nestedset-github"),
-        ("invoke-dekoponville", "dekoponville-github"),
-    ] {
-        let result = invoke_as(
-            &broker,
-            "caller",
-            agent_name,
-            request(
-                id,
+            catalog([(
                 "http-probe.fetch",
-                json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-            ),
+                ConstraintSet {
+                    route: CapabilityRoute::Generic,
+                    credential: credential.map(str::to_owned),
+                    ..set("http-probe", loopback_constraints(&authority))
+                },
+            )])
+            .with_agent_credentials(rebind_for_nestedset(
+                "github-pat",
+                "github-pat-scientist-hq",
+            )),
+            credentials,
+            callers(["caller"]),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
         )
-        .await
-        .expect("the authorized request is accounted");
-        assert_eq!(
-            result.result.outcome,
-            dekopon_capability::InvocationOutcome::Succeeded
-        );
+        .expect("both the default and the override match the store and its destinations");
+
+        for (id, agent_name) in [
+            ("invoke-nestedset", "nestedset-github"),
+            ("invoke-dekoponville", "dekoponville-github"),
+        ] {
+            let result = invoke_as(
+                &broker,
+                "caller",
+                agent_name,
+                request(
+                    id,
+                    "http-probe.fetch",
+                    json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
+                ),
+            )
+            .await
+            .expect("the authorized request is accounted");
+            assert_eq!(
+                result.result.outcome,
+                dekopon_capability::InvocationOutcome::Succeeded
+            );
+            let public = serde_json::to_string(&result.result).expect("result serializes");
+            for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
+                assert!(!public.contains(secret), "result leaked the secret");
+            }
+        }
+
+        let wire = || server.request_text();
+        for (index, (present, absent)) in [
+            (OVERRIDE_SECRET, DEFAULT_SECRET),
+            (DEFAULT_SECRET, OVERRIDE_SECRET),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = wire();
+            if credential.is_some() {
+                assert!(
+                    request.contains(&format!("authorization: Bearer {present}")),
+                    "request {index} presented the wrong credential: {request}"
+                );
+                assert!(
+                    !request.contains(absent),
+                    "request {index} leaked the other organization's token: {request}"
+                );
+            } else {
+                assert!(
+                    !request.to_ascii_lowercase().contains("authorization"),
+                    "request {index} carried a credential its set never named: {request}"
+                );
+            }
+        }
+        server.join();
+
+        let records = audit.records();
+        let encoded = serde_json::to_value(&records).expect("audit serializes");
+        let selected = encoded
+            .as_array()
+            .expect("records serialize as an array")
+            .iter()
+            .filter_map(|record| record["credential"].as_str())
+            .collect::<Vec<_>>();
+        let serialized = serde_json::to_string(&records).expect("audit serializes");
+        if credential.is_some() {
+            assert_eq!(
+                selected,
+                ["github-pat-scientist-hq", "github-pat"],
+                "each terminal record names the credential its own invocation selected"
+            );
+            assert!(
+                serialized.contains("\"credentialInjected\":true"),
+                "{serialized}"
+            );
+        } else {
+            assert!(
+                !serialized.contains("\"credential\""),
+                "an invocation with no credential names none: {serialized}"
+            );
+        }
+        for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
+            assert!(!serialized.contains(secret), "audit leaked a secret");
+        }
+        assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
     }
-
-    let wire = || server.request_text();
-    for (index, (present, absent)) in [
-        (OVERRIDE_SECRET, DEFAULT_SECRET),
-        (DEFAULT_SECRET, OVERRIDE_SECRET),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let request = wire();
-        assert!(
-            request.contains(&format!("authorization: Bearer {present}")),
-            "request {index} presented the wrong credential: {request}"
-        );
-        assert!(
-            !request.contains(absent),
-            "request {index} leaked the other organization's token: {request}"
-        );
-    }
-    server.join();
-
-    let records = audit.records();
-    let encoded = serde_json::to_value(&records).expect("audit serializes");
-    let selected = encoded
-        .as_array()
-        .expect("records serialize as an array")
-        .iter()
-        .filter_map(|record| record["credential"].as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected,
-        ["github-pat-scientist-hq", "github-pat"],
-        "each terminal record names the credential its own invocation selected"
-    );
-    let serialized = serde_json::to_string(&records).expect("audit serializes");
-    for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
-        assert!(!serialized.contains(secret), "audit leaked a secret");
-    }
-    assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rebinding_never_adds_a_credential_to_a_set_that_names_none() {
-    const SECRET: &str = "scientist-hq-token";
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let server = LoopbackServer::serving(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-        2,
-    );
-    let authority = server.authority().to_owned();
-    let credentials = CredentialStore::new([(
-        "github-pat-scientist-hq".to_owned(),
-        BoundCredential::bearer(
-            "Bearer",
-            Redacted::new(SECRET.to_owned()),
-            vec![authority.clone()],
-        )
-        .expect("valid credential fixture"),
-    )])
-    .expect("credential store builds");
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        http_probe_engine(&format!(
-            "{}\n{}",
-            http_policy("caller", "dekoponville-github", "http-probe.fetch"),
-            http_policy("caller", "nestedset-github", "http-probe.fetch"),
-        )),
-        catalog([(
-            "http-probe.fetch",
-            set("http-probe", loopback_constraints(&authority)),
-        )])
-        .with_agent_credentials(rebind_for_nestedset(
-            "github-pat",
-            "github-pat-scientist-hq",
-        )),
-        credentials,
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("a rebinding of a name no set uses is inert");
-
-    for (id, agent_name) in [
-        ("invoke-nestedset", "nestedset-github"),
-        ("invoke-dekoponville", "dekoponville-github"),
-    ] {
-        invoke_as(
-            &broker,
-            "caller",
-            agent_name,
-            request(
-                id,
-                "http-probe.fetch",
-                json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-            ),
-        )
-        .await
-        .expect("the authorized request is accounted");
-    }
-
-    for index in 0..2 {
-        let request = server.request_text();
-        assert!(
-            !request.to_ascii_lowercase().contains("authorization"),
-            "request {index} carried a credential its set never named: {request}"
-        );
-    }
-    server.join();
-
-    let serialized = serde_json::to_string(&audit.records()).expect("audit serializes");
-    assert!(!serialized.contains(SECRET), "audit leaked a secret");
-    assert!(
-        !serialized.contains("\"credential\""),
-        "an invocation with no credential names none: {serialized}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2282,51 +1961,29 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     )
     .await;
 
-    let ungranted = broker
-        .invoke(
-            &gateway,
-            None,
-            Some(&attestation(&subject, "some-agent", "invoke-no-grant")),
-            request(
-                "invoke-no-grant",
-                "cli-probe.upper",
-                json!({"text": "claim"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("a refused attestation is accounted");
-    assert_eq!(
-        ungranted.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(
-        ungranted.result.error.as_deref(),
-        Some("attestation-denied")
-    );
-
-    let out_of_scope = broker
-        .invoke(
-            &gateway,
-            Some(&attestor_grant(["slack.t0999zzz"])),
-            Some(&attestation(&subject, "some-agent", "invoke-out-of-scope")),
-            request(
-                "invoke-out-of-scope",
-                "cli-probe.upper",
-                json!({"text": "claim"}),
-            ),
-            Default::default(),
-        )
-        .await
-        .expect("an out-of-scope attestation is accounted");
-    assert_eq!(
-        out_of_scope.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(
-        out_of_scope.result.error.as_deref(),
-        Some("attestation-denied")
-    );
+    for (id, grant) in [
+        ("invoke-no-grant", None),
+        (
+            "invoke-out-of-scope",
+            Some(attestor_grant(["slack.t0999zzz"])),
+        ),
+    ] {
+        let result = broker
+            .invoke(
+                &gateway,
+                grant.as_ref(),
+                Some(&attestation(&subject, "some-agent", id)),
+                request(id, "cli-probe.upper", json!({"text": "claim"})),
+                Default::default(),
+            )
+            .await
+            .expect("a refused attestation is accounted");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        assert_eq!(result.result.error.as_deref(), Some("attestation-denied"));
+    }
 
     let records = audit.records();
     assert_eq!(records.len(), 2);
@@ -2454,6 +2111,7 @@ async fn attested_success_audits_via_and_subject() {
         !serialized.contains("top-secret-payload"),
         "a subject is routing metadata; the message it arrived with is not audited"
     );
+    assert!(!serialized.contains("TOP-SECRET-PAYLOAD"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2589,52 +2247,68 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         BrokerBuildError::UnconstrainedCapability { capability } if capability.as_str() == "cli-probe.reverse"
     ));
 
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        probe_engine(
-            r#"@id("caller-unconstrained") permit(principal == Dekopon::Principal::"caller", action, resource);"#,
-            ["caller"],
+    let unscoped = r#"@id("caller-unconstrained")
+        permit(principal == Dekopon::Principal::"caller", action, resource);"#;
+    for (leniency, policy) in [
+        (Leniency::Strict, unscoped.to_owned()),
+        (
+            Leniency::Tolerant,
+            probe_policy("caller", "provider-test", "cli-probe.reverse"),
         ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("an unconstrained action scope names no capability, so startup has nothing to check");
-    let result = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-unconstrained",
-            "cli-probe.reverse",
-            json!({"text": "x"}),
-        ),
-    )
-    .await
-    .expect("the refusal is accounted");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(
-        result.result.error.as_deref(),
-        Some("unconstrained-capability")
-    );
-    assert!(
-        broker
-            .capabilities(&session("caller", "provider-test"))
-            .iter()
-            .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
-        "a capability with no constraint set is never listed"
-    );
+    ] {
+        let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+        let (broker, warnings) = Broker::start(
+            probe_registry(BrokerHostLimits::default()).await,
+            principal("broker-test"),
+            "policy-test".to_owned(),
+            probe_engine(&policy, ["caller"]),
+            catalog([(
+                "cli-probe.upper",
+                set("cli-probe", ExecutionConstraints::default()),
+            )]),
+            CredentialStore::empty(),
+            callers(["caller"]),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+            leniency,
+        )
+        .expect("an unnamed or tolerated unexecutable grant starts");
+        if leniency == Leniency::Tolerant {
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(matches!(
+                &warnings[0],
+                StartupWarning::UnconstrainedCapability { capability }
+                    if capability.as_str() == "cli-probe.reverse"
+            ));
+        }
+        let result = invoke_as(
+            &broker,
+            "caller",
+            "provider-test",
+            request(
+                "invoke-unconstrained",
+                "cli-probe.reverse",
+                json!({"text": "x"}),
+            ),
+        )
+        .await
+        .expect("the refusal is accounted");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        assert_eq!(
+            result.result.error.as_deref(),
+            Some("unconstrained-capability")
+        );
+        assert!(
+            broker
+                .capabilities(&session("caller", "provider-test"))
+                .iter()
+                .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
+            "a capability with no constraint set is never listed"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2665,7 +2339,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let digest = broker.policy_digest().to_owned();
     assert!(digest.starts_with("sha256:"));
 
-    invoke_as(
+    let result = invoke_as(
         &broker,
         "caller",
         "provider-test",
@@ -2673,7 +2347,9 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     )
     .await
     .expect("the allowed invocation is accounted");
-    invoke_as(
+    assert_eq!(result.result.decision.decision_id, "allow-invoke-explained");
+    assert_eq!(result.result.decision.policy_revision, "policy-test");
+    let result = invoke_as(
         &broker,
         "other-caller",
         "provider-test",
@@ -2685,6 +2361,11 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     )
     .await
     .expect("the denial is accounted");
+    assert_eq!(
+        result.result.decision.decision_id,
+        "deny-invoke-unexplained"
+    );
+    assert_eq!(result.result.decision.policy_revision, "policy-test");
 
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
@@ -2698,65 +2379,6 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     assert_eq!(encoded[2]["reason"], "policy-denied");
     assert!(encoded[2].get("policy_ids").is_none());
     assert_eq!(encoded[2]["policy_digest"], json!(digest));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, warnings) = Broker::start(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.reverse"),
-            ["caller"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Tolerant,
-    )
-    .expect("tolerating an unexecutable grant starts");
-
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(matches!(
-        &warnings[0],
-        StartupWarning::UnconstrainedCapability { capability }
-            if capability.as_str() == "cli-probe.reverse"
-    ));
-
-    let result = invoke_as(
-        &broker,
-        "caller",
-        "provider-test",
-        request(
-            "invoke-tolerated",
-            "cli-probe.reverse",
-            json!({"text": "x"}),
-        ),
-    )
-    .await
-    .expect("the refusal is accounted");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(
-        result.result.error.as_deref(),
-        Some("unconstrained-capability")
-    );
-    assert!(
-        broker
-            .capabilities(&session("caller", "provider-test"))
-            .iter()
-            .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
-        "a tolerated capability is still never listed"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2833,7 +2455,7 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn command_words_are_filtered_by_what_policy_allows() {
+async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let (broker, _) = Broker::start(
         probe_registry(BrokerHostLimits::default()).await,
@@ -2886,30 +2508,6 @@ async fn command_words_are_filtered_by_what_policy_allows() {
             "the combined view must be the same answer as the two listings it replaces"
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unknown_command_word_is_refused_without_running_anything() {
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, _) = Broker::start(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        "policy-test".to_owned(),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.upper"),
-            ["caller"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        CredentialStore::empty(),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Strict,
-    )
-    .expect("broker starts");
 
     let error = broker
         .run_command(
