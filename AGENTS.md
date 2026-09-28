@@ -40,7 +40,7 @@ The model proposes; a separate broker authorizes and executes provider effects.
 
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
-- Follow the change map for companion tests, documentation, examples and changelog.
+- Follow the change map for companion tests, documentation and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).
 - Add no comments or doc comments unless they meet [Comments](#comments); delete the ones your
   change makes stale instead of rewording them.
 - Keep [WIT mirrors](docs/development.md#provider-contract-or-host) byte-identical;
@@ -226,5 +226,5 @@ makes a new primitive redundant; "this could race" is not a finding until the in
 
 **The PR reviewer** reads the assembled change for what only the whole shows: one definition per
 fact across lanes, seams matching on both sides, deletions complete, docs describing only the new
-behaviour, CHANGELOG bullets present (`Fixed` only for bugs in released code), work that grows with
+behaviour, `Changelog:` commit lines present (`Fixed` only for bugs in released code), work that grows with
 a stream, wire parsers that refuse the unknown. It does not re-run the per-lane rubric.
