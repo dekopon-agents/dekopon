@@ -1955,14 +1955,31 @@ where
         self.reachable_command_words(context, &self.authorized_sets(context))
     }
 
-    fn reachable_command_words(
+    /// Same reachability as `command_words`: a word's `--help` page is visible only where the
+    /// word itself is, since a page naming a provider this sender cannot reach would describe a
+    /// surface that was never offered.
+    #[must_use]
+    pub fn command_word_help(&self, context: &AuthenticatedContext) -> BTreeMap<String, String> {
+        let words = self.command_words(context);
+        self.command_word_help_for(&words)
+    }
+
+    fn command_word_help_for(&self, words: &[String]) -> BTreeMap<String, String> {
+        let all = self.registry.command_word_help();
+        words
+            .iter()
+            .filter_map(|word| all.get(word).map(|page| (word.clone(), page.clone())))
+            .collect()
+    }
+
+    fn reachable_providers(
         &self,
         context: &AuthenticatedContext,
         authorized: &[(&CapabilityId, &ConstraintSet)],
-    ) -> Vec<String> {
+    ) -> BTreeSet<ProviderId> {
         let reachable = authorized
             .iter()
-            .map(|(_, set)| &set.provider)
+            .map(|(_, set)| set.provider.clone())
             .collect::<BTreeSet<_>>();
         let storage_providers = self
             .constraints
@@ -1971,16 +1988,27 @@ where
             .filter(|set| set.constraints.storage.is_some())
             .map(|set| set.provider.clone())
             .collect::<BTreeSet<_>>();
-        let reserved = self.constraints.chat_memory_provider();
+        let reserved = self.constraints.chat_memory_provider().cloned();
+        reachable
+            .into_iter()
+            .filter(|provider| {
+                Some(provider) != reserved.as_ref()
+                    && (context.chat_scope().is_some() || !storage_providers.contains(provider))
+            })
+            .collect()
+    }
+
+    fn reachable_command_words(
+        &self,
+        context: &AuthenticatedContext,
+        authorized: &[(&CapabilityId, &ConstraintSet)],
+    ) -> Vec<String> {
+        let reachable = self.reachable_providers(context, authorized);
         let mut words = self
             .registry
             .command_words_by_provider()
             .into_iter()
-            .filter(|(provider, _)| {
-                Some(*provider) != reserved
-                    && reachable.contains(provider)
-                    && (context.chat_scope().is_some() || !storage_providers.contains(*provider))
-            })
+            .filter(|(provider, _)| reachable.contains(*provider))
             .flat_map(|(_, words)| words.iter().cloned())
             .collect::<Vec<_>>();
         words.sort();
@@ -2043,15 +2071,24 @@ where
     }
 
     #[must_use]
+    #[allow(
+        clippy::type_complexity,
+        reason = "a session's reachable capabilities, command words, and each reachable word's \
+                  --help page, in that order; a named struct would only rename what the three \
+                  call sites already destructure by position"
+    )]
     pub fn capability_view(
         &self,
         context: &AuthenticatedContext,
-    ) -> (Vec<AvailableCapability>, Vec<String>) {
+    ) -> (
+        Vec<AvailableCapability>,
+        Vec<String>,
+        BTreeMap<String, String>,
+    ) {
         let authorized = self.authorized_sets(context);
-        (
-            self.available_capabilities(&authorized),
-            self.reachable_command_words(context, &authorized),
-        )
+        let words = self.reachable_command_words(context, &authorized);
+        let help = self.command_word_help_for(&words);
+        (self.available_capabilities(&authorized), words, help)
     }
 
     fn available_capabilities(
@@ -2079,22 +2116,23 @@ where
     }
 
     #[must_use]
-    pub fn capability_ceiling(&self) -> (Vec<AvailableCapability>, Vec<String>) {
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
+    pub fn capability_ceiling(
+        &self,
+    ) -> (
+        Vec<AvailableCapability>,
+        Vec<String>,
+        BTreeMap<String, String>,
+    ) {
         let mut capabilities = self
             .constraints
             .iter()
             .filter_map(|(capability, _)| self.available_capability(capability))
             .collect::<Vec<_>>();
         capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
-        let mut words = self
-            .registry
-            .command_words_by_provider()
-            .into_iter()
-            .flat_map(|(_, words)| words.iter().cloned())
-            .collect::<Vec<_>>();
-        words.sort();
-        words.dedup();
-        (capabilities, words)
+        let words = self.registry.command_words();
+        let help = self.registry.command_word_help();
+        (capabilities, words, help)
     }
 
     #[must_use]
@@ -2109,6 +2147,7 @@ where
     /// A refused caller's answer must stay None, distinct from Some with an empty list; answering
     /// either way with an empty list would tell an unmapped subject that it is unmapped.
     #[must_use]
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
     pub fn capability_surface(
         &self,
         peer: &AuthenticatedContext,
@@ -2117,18 +2156,19 @@ where
     ) -> Option<(
         Vec<AvailableCapability>,
         Vec<String>,
+        BTreeMap<String, String>,
         Option<ChatMemorySurface>,
     )> {
         let Some(claim) = attestation else {
-            let (capabilities, words) = self.capability_view(peer);
-            return Some((capabilities, words, None));
+            let (capabilities, words, help) = self.capability_view(peer);
+            return Some((capabilities, words, help, None));
         };
         let (context, refusal) = self.resolve_context(peer, grant, claim);
         if let Some(refusal) = refusal {
             report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
             return None;
         }
-        let (mut capabilities, mut words) = self.capability_view(&context);
+        let (mut capabilities, mut words, mut help) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
         if memory.is_some() {
             for route in [
@@ -2139,11 +2179,13 @@ where
                 capabilities.push(self.available_capability(capability)?);
             }
             capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
-            words.extend(self.chat_memory_words());
+            let chat_memory_words = self.chat_memory_words();
+            help.extend(self.command_word_help_for(&chat_memory_words));
+            words.extend(chat_memory_words);
             words.sort();
             words.dedup();
         }
-        Some((capabilities, words, memory))
+        Some((capabilities, words, help, memory))
     }
 
     pub async fn invoke(

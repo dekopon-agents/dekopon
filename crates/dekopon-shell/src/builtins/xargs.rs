@@ -8,6 +8,7 @@ use super::CommandFailure;
 use crate::value::{display, to_lines};
 
 pub(crate) const NAME: &str = "xargs";
+pub(crate) const HELP: &str = "-I -n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Plan {
@@ -46,7 +47,7 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
                 index += 2;
             }
             flag if flag.starts_with('-') && flag.len() > 1 => {
-                return Err(super::unsupported_flag("xargs", flag));
+                return Err(super::unsupported_flag("xargs", flag, HELP));
             }
             _ => break,
         }

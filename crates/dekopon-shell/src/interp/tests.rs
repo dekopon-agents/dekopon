@@ -592,6 +592,36 @@ fn xargs_maps_a_command_over_a_list() {
 }
 
 #[test]
+fn help_interception_requires_help_to_be_the_only_argument() {
+    assert_eq!(
+        output(r#"x="--help"; if [ "$x" = --help ]; then echo matched; else echo no; fi"#),
+        "matched"
+    );
+    assert_eq!(output("echo try --help"), "try --help");
+    assert_eq!(
+        output(r#"printf 'one\ntwo' | xargs -I {} echo {} --help"#),
+        r#"["one --help","two --help"]"#
+    );
+}
+
+#[test]
+fn help_interception_decides_on_the_unexpanded_word_not_the_expanded_string() {
+    assert_eq!(output(r#"x=--help; echo "$x""#), "--help");
+    assert_eq!(
+        output(r#"pat=--help; grep "$pat""#),
+        "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
+    );
+    assert_eq!(
+        output(r#"printf 'a\n--help\n' | xargs echo"#),
+        r#"["a","--help"]"#
+    );
+    assert_eq!(
+        output(r#"f() { "$@" --help; }; f grep -v"#),
+        "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
+    );
+}
+
+#[test]
 fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
     // A capability is only reachable through its provider's command word; a bare
     // capability-identifier-shaped word is not itself callable, even for a capability this session

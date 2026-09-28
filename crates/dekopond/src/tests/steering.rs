@@ -165,7 +165,11 @@ async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() 
             directory.path(),
             (0..listings)
                 .map(|_| {
-                    ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new())
+                    ResponseEnvelope::capabilities(
+                        vec![capability("cli-probe.upper")],
+                        Vec::new(),
+                        BTreeMap::new(),
+                    )
                 })
                 .collect(),
         )

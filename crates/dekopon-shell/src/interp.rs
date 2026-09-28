@@ -920,6 +920,13 @@ impl Evaluator<'_> {
             }
         }
 
+        // `--help` wins only when the script wrote it as the command's one bare, unquoted word.
+        let literal_help = argv.len() == 2
+            && matches!(
+                command.words.as_slice(),
+                [_, Word { parts }] if matches!(parts.as_slice(), [WordPart::Literal(only)] if only == "--help")
+            );
+
         let transient = !argv.is_empty();
         let mut restore = Vec::new();
         let mut assignment_status = ExitCode::SUCCESS;
@@ -986,7 +993,7 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        let executed = self.run_argv(&argv, input, capture_output, from_pipe);
+        let executed = self.run_argv(&argv, input, capture_output, from_pipe, literal_help);
         // The stderr capture is removed before the fallible step that follows can return early, so
         // a fatal error can never leave a capture installed that silently swallows the rest of the
         // script's diagnostics.
@@ -1140,6 +1147,7 @@ impl Evaluator<'_> {
         input: Option<Rc<Value>>,
         capture_output: bool,
         from_pipe: bool,
+        literal_help: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
@@ -1168,6 +1176,7 @@ impl Evaluator<'_> {
             input,
             capture_output,
             from_pipe,
+            literal_help,
         );
         let (status, outcome) = match &executed {
             Ok(Executed::Result(result)) => {
@@ -1194,6 +1203,11 @@ impl Evaluator<'_> {
         executed
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent piece of run_argv's execution context, not a \
+                  group that wants its own type"
+    )]
     fn dispatch_command(
         &mut self,
         command: &str,
@@ -1202,6 +1216,7 @@ impl Evaluator<'_> {
         input: Option<Rc<Value>>,
         capture_output: bool,
         from_pipe: bool,
+        literal_help: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
             if let Some(executed) = self.run_control_word(command, arguments, input, from_pipe)? {
@@ -1215,6 +1230,12 @@ impl Evaluator<'_> {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
             Resolution::Function => self.call_function(command, arguments, input, capture_output),
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
+                if literal_help {
+                    return Ok(Executed::Result(builtins::help_result(
+                        builtin.name(),
+                        builtin.help(),
+                    )));
+                }
                 let outcome = {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
@@ -1231,7 +1252,15 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
+            Resolution::Builtin(BuiltinKind::Xargs) => {
+                if literal_help {
+                    return Ok(Executed::Result(builtins::help_result(
+                        xargs::NAME,
+                        xargs::HELP,
+                    )));
+                }
+                self.run_xargs(arguments, input)
+            }
             Resolution::ProviderCommand => {
                 let stdin = input.as_deref().map(display);
                 self.budget.check_deadline()?;
@@ -1494,7 +1523,7 @@ impl Evaluator<'_> {
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
             self.budget.charge_step()?;
-            match self.run_argv(&invocation, None, true, false)? {
+            match self.run_argv(&invocation, None, true, false, false)? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
                     if result.status != ExitCode::SUCCESS {

@@ -332,8 +332,13 @@ fn pending_wakes_survive_a_restart_and_a_corrupt_store_refuses_to_start() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_carries_prev_between_read_only_ticks_and_fires_once() {
     let directory = temporary();
-    let listing =
-        || ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new());
+    let listing = || {
+        ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+    };
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![listing(), listing(), listing(), listing()],
@@ -418,6 +423,7 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -454,8 +460,16 @@ async fn a_wake_queues_until_the_running_conversation_finishes() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
-            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
         ],
     )
     .await;

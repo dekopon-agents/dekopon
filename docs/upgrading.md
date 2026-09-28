@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider `--help` baked into the tool description (unreleased)
+
+Roll `dekopon-brokerd` and `dekopond` together. The `Capabilities` response frame gains an optional
+`command_word_help` field, and a `dekopond` still on the previous release decodes it with
+`deny_unknown_fields`, so a session that reaches even one word with a rendered page refuses the
+frame outright. No configuration changes.
+
 ## Conversation journal (0.26.0)
 
 Delete `sessions.journal.maxBytes` from `dekopond.yaml`; the 0.26.0 gateway refuses the key. Disk is

@@ -1418,11 +1418,12 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let peer_bytes = serde_json::to_vec(&ResponseEnvelope::capabilities(
         broker.capabilities(&gateway),
         broker.command_words(&gateway),
+        broker.command_word_help(&gateway),
     ))
     .expect("peer response encodes")
     .len();
 
-    let (capabilities, words) = broker.capability_ceiling();
+    let (capabilities, words, command_word_help) = broker.capability_ceiling();
     assert!(
         !capabilities.is_empty(),
         "the ceiling must see what policy grants an attested principal"
@@ -1449,6 +1450,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let ceiling_bytes = serde_json::to_vec(&ResponseEnvelope::chat_capabilities(
         capabilities,
         words,
+        command_word_help,
         broker.chat_memory_ceiling(),
     ))
     .expect("ceiling response encodes")

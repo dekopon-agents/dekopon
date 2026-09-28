@@ -11,7 +11,7 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-use std::{fmt, io, time::Duration};
+use std::{collections::BTreeMap, fmt, io, time::Duration};
 
 #[cfg(unix)]
 use std::{
@@ -904,12 +904,14 @@ impl ResponseEnvelope {
     pub const fn capabilities(
         capabilities: Vec<AvailableCapability>,
         command_words: Vec<String>,
+        command_word_help: BTreeMap<String, String>,
     ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                command_word_help,
                 chat_memory: None,
             },
         }
@@ -919,6 +921,7 @@ impl ResponseEnvelope {
     pub const fn chat_capabilities(
         capabilities: Vec<AvailableCapability>,
         command_words: Vec<String>,
+        command_word_help: BTreeMap<String, String>,
         chat_memory: Option<ChatMemorySurface>,
     ) -> Self {
         Self {
@@ -926,6 +929,7 @@ impl ResponseEnvelope {
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                command_word_help,
                 chat_memory,
             },
         }
@@ -976,6 +980,8 @@ pub enum BrokerResponse {
         capabilities: Vec<AvailableCapability>,
         #[serde(default)]
         command_words: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        command_word_help: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_memory: Option<ChatMemorySurface>,
     },
@@ -1321,6 +1327,7 @@ impl BrokerClient {
         (
             Vec<AvailableCapability>,
             Vec<String>,
+            BTreeMap<String, String>,
             Option<ChatMemorySurface>,
         ),
         ClientError,
@@ -1332,8 +1339,9 @@ impl BrokerClient {
             BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
+                command_word_help,
                 chat_memory,
-            } => Ok((capabilities, command_words, chat_memory)),
+            } => Ok((capabilities, command_words, command_word_help, chat_memory)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::CommandRun { .. } | BrokerResponse::Invocation { .. } => {
                 Err(ClientError::UnexpectedResponse)

@@ -359,8 +359,13 @@ where
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
             match broker.capability_surface(context, peer.attestor.as_ref(), attestation.as_ref()) {
-                Some((capabilities, command_words, chat_memory)) => {
-                    ResponseEnvelope::chat_capabilities(capabilities, command_words, chat_memory)
+                Some((capabilities, command_words, command_word_help, chat_memory)) => {
+                    ResponseEnvelope::chat_capabilities(
+                        capabilities,
+                        command_words,
+                        command_word_help,
+                        chat_memory,
+                    )
                 }
                 // A refused attestation reveals nothing about the attested context, not even
                 // whether the subject is mapped.

@@ -2836,6 +2836,7 @@ fn memory_surface_response() -> ResponseEnvelope {
             capability("memory.chat.search"),
         ],
         vec!["memory".to_owned()],
+        BTreeMap::new(),
         Some(ChatMemorySurface {
             max_lookback_turns: 200,
             prompt_note: "Durable memory is available only on demand.".to_owned(),
@@ -2869,6 +2870,7 @@ fn probe_listing() -> ResponseEnvelope {
     ResponseEnvelope::capabilities(
         vec![capability("cli-probe.upper")],
         vec!["probe".to_owned()],
+        BTreeMap::new(),
     )
 }
 
@@ -3437,6 +3439,7 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -3659,6 +3662,7 @@ async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4249,6 +4253,7 @@ async fn authorized_work_publishes_status_until_after_the_durable_reply() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4295,6 +4300,7 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4338,7 +4344,11 @@ async fn unauthorized_work_never_publishes_liveness() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )],
     )
     .await;
     let driver = Arc::new(RecordingDriver::default().with_status().with_reaction());
@@ -4566,6 +4576,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4631,6 +4642,7 @@ async fn the_suggestion_tool_is_offered_on_every_route() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4687,6 +4699,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4776,6 +4789,7 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4818,6 +4832,7 @@ async fn a_session_delivers_the_model_answer() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -4839,7 +4854,11 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )],
     )
     .await;
     let models = ModelScript::forbidden();
@@ -4989,6 +5008,7 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -5037,6 +5057,7 @@ async fn an_oversized_failure_template_is_bounded_before_delivery() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -5085,6 +5106,7 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -5155,6 +5177,7 @@ fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
                     .map(|identifier| capability(identifier))
                     .collect(),
                 Vec::new(),
+                BTreeMap::new(),
             )
         })
         .collect()
@@ -5537,8 +5560,13 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
             ResponseEnvelope::capabilities(
                 vec![capability("cli-probe.upper"), capability("gh.pr_view")],
                 Vec::new(),
+                BTreeMap::new(),
             ),
-            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
         ],
     )
     .await;
@@ -5578,8 +5606,12 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
-            ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new()),
         ],
     )
     .await;
@@ -7488,6 +7520,7 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -8553,6 +8586,7 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -8622,6 +8656,7 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -11595,6 +11630,7 @@ async fn answer_once(message: InboundMessage) {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -11910,6 +11946,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -12425,7 +12462,11 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
         let (broker, reached, release) = parked_broker(
             directory.path(),
             Vec::new(),
-            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
         )
         .await;
         let models = ModelScript::forbidden();
@@ -12473,6 +12514,7 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
             vec![ResponseEnvelope::capabilities(
                 vec![capability("cli-probe.upper")],
                 Vec::new(),
+                BTreeMap::new(),
             )],
         )
         .await;
@@ -12524,6 +12566,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
             vec![ResponseEnvelope::capabilities(
                 vec![capability("cli-probe.upper")],
                 Vec::new(),
+                BTreeMap::new(),
             )],
         )
         .await;
@@ -12672,6 +12715,7 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
             vec![ResponseEnvelope::capabilities(
                 vec![capability("cli-probe.upper")],
                 Vec::new(),
+                BTreeMap::new(),
             )],
         )
         .await;
@@ -12727,6 +12771,7 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -12791,6 +12836,7 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -12962,6 +13008,7 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -13012,7 +13059,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         );
         let directory = temporary();
         let (broker,mut observed)=stub_broker_assets(directory.path(), (0..3).flat_map(|edit| vec![
-            plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()])),
+            plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()], BTreeMap::new())),
             plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).unwrap())),
             asset_response(&[PNG, &[edit as u8]].concat(), "image/png"),
             plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{}})).unwrap())),
@@ -13184,7 +13231,11 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
         let (broker, mut observed) = stub_broker(
             directory.path(),
             if routed {
-                vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())]
+                vec![ResponseEnvelope::capabilities(
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                )]
             } else {
                 Vec::new()
             },
@@ -13333,6 +13384,7 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -13399,7 +13451,11 @@ async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refus
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )],
     )
     .await;
     let models = ModelScript::forbidden();
@@ -13439,6 +13495,7 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("cli-probe.upper")],
             Vec::new(),
+            BTreeMap::new(),
         )],
     )
     .await;
@@ -13568,6 +13625,7 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
             vec![ResponseEnvelope::capabilities(
                 vec![capability("cli-probe.upper")],
                 Vec::new(),
+                BTreeMap::new(),
             )],
         )
         .await;
@@ -13867,7 +13925,7 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     let directory = temporary();
     let png = b"\x89PNG\r\n\x1a\nfirst generated image";
     let (broker, mut observed) = stub_broker_assets(directory.path(), vec![
-        plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()])),
+        plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()], BTreeMap::new())),
         plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap())),
         asset_response(png, "image/png"),
         plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap())),

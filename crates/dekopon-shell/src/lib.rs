@@ -131,7 +131,7 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
 
@@ -213,6 +213,10 @@ pub trait CapabilityInvoker {
         Vec::new()
     }
 
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
     fn has_command_word(&self, word: &str) -> bool {
         self.command_words()
             .iter()
@@ -263,6 +267,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn command_words(&self) -> Vec<String> {
         self.as_ref().command_words()
+    }
+
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        self.as_ref().command_word_help()
     }
 
     fn has_command_word(&self, word: &str) -> bool {
@@ -397,9 +405,12 @@ pub fn abandoned_filter_workers() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU32, Ordering},
+        },
     };
 
     use dekopon_core::{SecretDrn, SecretUseProposal};
@@ -427,6 +438,10 @@ mod tests {
 
         fn command_words(&self) -> Vec<String> {
             vec!["gh".to_owned()]
+        }
+
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            BTreeMap::from([("gh".to_owned(), "gh: recorded help".to_owned())])
         }
 
         fn has_command_word(&self, word: &str) -> bool {
@@ -511,6 +526,10 @@ mod tests {
         assert_eq!(shared.granted(), vec!["cli-probe.upper".to_owned()]);
         assert!(shared.is_granted("gh.pr-view"));
         assert_eq!(shared.command_words(), vec!["gh".to_owned()]);
+        assert_eq!(
+            shared.command_word_help(),
+            BTreeMap::from([("gh".to_owned(), "gh: recorded help".to_owned())])
+        );
         assert!(shared.has_command_word("gh-extra"));
         assert_eq!(
             shared.run_command("gh", &["pr".to_owned()], Some("piped")),

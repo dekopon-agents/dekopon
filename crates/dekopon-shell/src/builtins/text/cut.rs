@@ -5,11 +5,17 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
+const HELP: &str = "-d -f -c";
+
 pub(crate) struct Cut;
 
 impl Builtin for Cut {
     fn name(&self) -> &'static str {
         "cut"
+    }
+
+    fn help(&self) -> &'static str {
+        HELP
     }
 
     fn run(
@@ -48,7 +54,7 @@ impl Builtin for Cut {
                     characters = Some(Selection::parse("cut", &value)?);
                 }
                 flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("cut", flag));
+                    return Err(unsupported_flag("cut", flag, HELP));
                 }
                 other => {
                     return Err(CommandFailure::usage(format!(

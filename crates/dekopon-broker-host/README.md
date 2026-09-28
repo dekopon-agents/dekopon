@@ -39,6 +39,14 @@ The `RunCommandUsedHostImport` tripwire refuses a run that reached for any host 
 test-only `date --clock-in-run-command` is the checked-in path that drives it; the HTTP and storage
 halves share its code path with the describe-mode states and no fixture drives them directly.
 
+Each such provider also has its `--help` rendered once at load, right after `describe_component`:
+`run-command` is import-free there too, so the page is a pure function of the component bytes.
+`run-command` takes no word, so one render is mapped to every command word the provider declares
+rather than repeating the call per word. A refusal, a malformed answer, a non-`Rendered` outcome, or
+a non-zero status omits the provider's words from `command_word_help()` and logs one warning,
+rather than failing the load; a successful page is capped at 2048 bytes with a truncation marker
+beyond that.
+
 `BrokerHostOptions` carries operational settings that are not host ceilings and are not committed
 into the broker's authority surface:
 

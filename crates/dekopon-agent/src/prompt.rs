@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     ops::ControlFlow,
     sync::Arc,
@@ -67,6 +68,10 @@ pub trait ScriptRuntime {
 
     fn command_words(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    fn command_word_help(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 }
 
@@ -512,7 +517,7 @@ where
         progress_notes,
         wakes,
     } = extensions;
-    let mut script = script_tool(&runtime.command_words());
+    let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
         script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
     }
@@ -1051,7 +1056,7 @@ pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_ty
     );
 }
 
-fn script_tool(command_words: &[String]) -> ModelTool {
+fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> ModelTool {
     let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
     if !command_words.is_empty() {
         let mut words = command_words.to_vec();
@@ -1061,6 +1066,11 @@ fn script_tool(command_words: &[String]) -> ModelTool {
             "\n\nThis session's providers add these command words: {}.",
             words.join(", ")
         ));
+        for word in &words {
+            if let Some(page) = help.get(word) {
+                description.push_str(&format!("\n\n`{word} --help`:\n{page}"));
+            }
+        }
     }
     ModelTool {
         name: SCRIPT_TOOL_NAME.to_owned(),
@@ -1401,9 +1411,11 @@ except through a capability. The capabilities you may invoke are exactly those t
 granted: no flag, retry, or rewording escalates past that set, and a refusal is a fact to report, \
 not an obstacle to work around.
 2. Provider command words are programs. A provider adds words of its own, and each behaves like a \
-command-line tool with subcommands and flags: run `<word> --help` to learn one before using it. \
-Its subcommands call capabilities on your behalf, so a word can do only what this session was \
-granted, and `cap --list` shows those capability IDs.
+command-line tool with subcommands and flags. Its top-level `--help` page for this session, when \
+present, is baked in below the word listing at the end of this description; run `<word> --help` \
+yourself for that page when it is not, or for a deeper subcommand's own page. Its subcommands call \
+capabilities on your behalf, so a word can do only what this session was granted, and `cap --list` \
+shows those capability IDs.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
 in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
 `x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \
@@ -1454,8 +1466,9 @@ when the session offers a tool for one of them it is listed beside this one. The
 at all: `ls` and `cd` do not exist, and `cat` only passes along what is piped or here-documented \
 into it.
 
-There is no `help` builtin. Discover once, then prefer a single script that does the whole job \
-over many small ones — that is the entire point of this tool.";
+Every builtin answers its own `--help` on stdout at exit 0, naming the flags it accepts; there is \
+no separate `help` builtin. Prefer a single script that does the whole job over many small ones — \
+that is the entire point of this tool.";
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -1570,7 +1583,7 @@ fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         ops::ControlFlow,
         sync::Arc,
         sync::Mutex,
@@ -3172,7 +3185,10 @@ mod tests {
 
     #[test]
     fn provider_command_words_are_offered_to_the_model() {
-        let tool = script_tool(&["gh".to_owned(), "fly".to_owned(), "gh".to_owned()]);
+        let tool = script_tool(
+            &["gh".to_owned(), "fly".to_owned(), "gh".to_owned()],
+            &BTreeMap::new(),
+        );
         assert!(
             tool.description.contains("command words: fly, gh."),
             "{}",
@@ -3185,6 +3201,68 @@ mod tests {
             tool.description
         );
         assert_no_doubled_spaces(&tool.description);
+    }
+
+    #[test]
+    fn script_tool_bakes_in_the_pages_it_was_given_after_the_word_listing() {
+        let mut help = BTreeMap::new();
+        help.insert("gh".to_owned(), "Usage: gh <command>".to_owned());
+        let tool = script_tool(&["gh".to_owned(), "fly".to_owned()], &help);
+
+        assert!(
+            tool.description
+                .contains("command words: fly, gh.\n\n`gh --help`:\nUsage: gh <command>"),
+            "{}",
+            tool.description
+        );
+        assert!(
+            !tool.description.contains("`fly --help`:"),
+            "a word missing from help gets no page: {}",
+            tool.description
+        );
+    }
+
+    struct StaticHelpRuntime {
+        words: Vec<String>,
+        help: BTreeMap<String, String>,
+    }
+
+    impl ScriptRuntime for StaticHelpRuntime {
+        fn run_script(&self, script: &str, _max_capability_calls: u32) -> ScriptOutcome {
+            panic!("this fixture's runtime never runs a script: {script}")
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            self.words.clone()
+        }
+
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            self.help.clone()
+        }
+    }
+
+    #[test]
+    fn run_turns_bakes_in_whatever_command_word_help_the_runtime_reports() {
+        let runtime = StaticHelpRuntime {
+            words: vec!["gh".to_owned()],
+            help: BTreeMap::from([("gh".to_owned(), "Usage: gh <command>".to_owned())]),
+        };
+        let model = ScriptedModel::new([answer("done")]);
+
+        run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("prompt succeeds");
+
+        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let script = tools[0]
+            .iter()
+            .find(|tool| tool.name == SCRIPT_TOOL_NAME)
+            .expect("bash tool offered");
+        assert!(
+            script
+                .description
+                .contains("`gh --help`:\nUsage: gh <command>"),
+            "{}",
+            script.description
+        );
     }
 
     #[test]
@@ -3202,7 +3280,7 @@ mod tests {
                 .iter()
                 .find(|tool| tool.name == SCRIPT_TOOL_NAME)
                 .unwrap();
-            let mut expected = script_tool(&runtime.command_words()).description;
+            let mut expected = script_tool(&runtime.command_words(), &BTreeMap::new()).description;
             if enabled {
                 expected.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
             }
@@ -3468,7 +3546,7 @@ mod tests {
 
     #[test]
     fn offers_exactly_one_scripting_tool() {
-        let tool = script_tool(&[]);
+        let tool = script_tool(&[], &BTreeMap::new());
 
         assert_eq!(tool.name, "bash");
         assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
@@ -3499,7 +3577,10 @@ mod tests {
                 .description
                 .contains("providers add these command words")
         );
-        assert!(tool.description.contains("There is no `help`"));
+        assert!(
+            tool.description
+                .contains("there is no separate `help` builtin")
+        );
         assert_no_doubled_spaces(&tool.description);
     }
 

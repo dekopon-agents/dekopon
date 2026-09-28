@@ -288,7 +288,14 @@ the run whatever word produced it. The piped value is bounded by the client's fr
 it leaves the process and by the host's `maxInputBytes` before a store exists; the broker reports
 the second only in its own `command.resolve.failed` record, and the caller sees the opaque
 `provider-error` reply. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
-carries the wire detail.
+carries the wire detail. The same provider-authored `--help` text is also rendered once per
+provider at broker load — one render maps to every command word that provider declares, since
+`runCommand` takes no word — and baked into the bash tool description, so a reachable word's help
+reads as part of the tool surface without a per-session round trip. That baked text is exactly as
+untrusted as any other guest-rendered output and grants no authority: it lives inside the tool
+description a model reads as instructions because that is where the words are listed, not because
+the provider earned more trust than an ordinary `--help` call carries. A page that fails to render
+is omitted rather than blocking startup.
 
 Recording is **model-hidden, gateway-attested transport acceptance**, not broker-proven delivery or
 human receipt. Slack/Telegram/Discord receipts prove complete service acceptance; local `flush`
