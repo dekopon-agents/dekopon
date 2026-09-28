@@ -155,6 +155,8 @@ The workspace already carries the mature crate; wrapping it is one function, re-
 
 ### Tests
 
+Don't version-control bitrotting assets like certificates; generate them in the test suite instead.
+
 The name states the invariant and the primitives are real; one test per behaviour, not one per boundary.
 
 - Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
