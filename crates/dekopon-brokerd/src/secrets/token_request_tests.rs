@@ -12,7 +12,11 @@ use std::{
 use dekopon_broker::SecretResolver as _;
 use dekopon_core::SecretDrn;
 use dekopon_test_support::{CaptureLayer, content_length};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
+use rustls::pki_types::PrivatePkcs8KeyDer;
 use serde_json::{Value, json};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -22,11 +26,53 @@ use super::{
     SourceError, kubernetes_client, validate_map,
 };
 
-const CA: &[u8] = include_bytes!("../../tests/fixtures/token-request-ca.pem");
-const SERVER_CERT: &[u8] = include_bytes!("../../tests/fixtures/token-request-server.pem");
-const SERVER_KEY: &[u8] = include_bytes!("../../tests/fixtures/token-request-server.key");
 const BOOTSTRAP: &str = "bootstrap-private-fixture-one";
 const MINTED: &str = "minted-private-fixture-one";
+
+struct TestTls {
+    ca_pem: String,
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl TestTls {
+    fn new() -> Self {
+        let now = super::OffsetDateTime::now_utc();
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        ca_params.not_before = now - time::Duration::days(1);
+        ca_params.not_after = now + time::Duration::days(1);
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+                .expect("server names");
+        server_params.not_before = ca_params.not_before;
+        server_params.not_after = ca_params.not_after;
+        server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().expect("generate server key");
+        let server_cert = server_params
+            .signed_by(&server_key, &Issuer::from_params(&ca_params, &ca_key))
+            .expect("server certificate");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![server_cert.into()],
+            PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+        )
+        .expect("server configuration");
+        Self {
+            ca_pem: ca.pem(),
+            config: Arc::new(config),
+        }
+    }
+}
 
 struct TokenApi {
     endpoint: String,
@@ -35,19 +81,8 @@ struct TokenApi {
 }
 
 impl TokenApi {
-    fn serving(responses: Vec<Vec<u8>>) -> Self {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from_pem_slice(SERVER_CERT).expect("server certificate")],
-            PrivateKeyDer::from_pem_slice(SERVER_KEY).expect("synthetic test key"),
-        )
-        .expect("server configuration");
-        let config = Arc::new(config);
+    fn serving(tls: &TestTls, responses: Vec<Vec<u8>>) -> Self {
+        let config = Arc::clone(&tls.config);
         let listener = TcpListener::bind("127.0.0.1:0").expect("API listener");
         let endpoint = format!("https://{}", listener.local_addr().expect("address"));
         let (sender, requests) = mpsc::channel();
@@ -177,15 +212,19 @@ async fn resolver(root: &Path, endpoint: &str) -> MapResolver {
 #[tokio::test]
 async fn each_resolution_mints_the_fixed_subject_and_audience_with_the_current_bootstrap() {
     let root = tempfile::tempdir().expect("projection root");
-    projection(root.path(), "..one", BOOTSTRAP, CA);
-    let api = TokenApi::serving(vec![
-        response("201 Created", &issued(MINTED, 30).to_string()),
-        response(
-            "201 Created",
-            &issued("minted-private-fixture-two", 30).to_string(),
-        ),
-        response("403 Forbidden", MINTED),
-    ]);
+    let tls = TestTls::new();
+    projection(root.path(), "..one", BOOTSTRAP, tls.ca_pem.as_bytes());
+    let api = TokenApi::serving(
+        &tls,
+        vec![
+            response("201 Created", &issued(MINTED, 30).to_string()),
+            response(
+                "201 Created",
+                &issued("minted-private-fixture-two", 30).to_string(),
+            ),
+            response("403 Forbidden", MINTED),
+        ],
+    );
     let resolver = resolver(root.path(), &api.endpoint).await;
     let capture = CaptureLayer::workspace();
     async {
@@ -194,7 +233,12 @@ async fn each_resolution_mints_the_fixed_subject_and_audience_with_the_current_b
             .await
             .expect("shorter returned lifetime is valid");
         assert!(!format!("{first:?} {resolver:?}").contains(MINTED));
-        projection(root.path(), "..two", "bootstrap-private-fixture-two", CA);
+        projection(
+            root.path(),
+            "..two",
+            "bootstrap-private-fixture-two",
+            tls.ca_pem.as_bytes(),
+        );
         let entry = resolver.entries.get(&drn()).expect("configured entry");
         let second = resolver
             .resolve_source(&entry.source, &entry.client)
@@ -248,7 +292,8 @@ async fn each_resolution_mints_the_fixed_subject_and_audience_with_the_current_b
 #[tokio::test]
 async fn malformed_expired_or_reflected_issuance_fails_without_disclosing_response_bytes() {
     let root = tempfile::tempdir().expect("projection root");
-    projection(root.path(), "..one", BOOTSTRAP, CA);
+    let tls = TestTls::new();
+    projection(root.path(), "..one", BOOTSTRAP, tls.ca_pem.as_bytes());
     let cases = [
         ("201 Created", "not-json".to_owned(), "malformed"),
         (
@@ -271,6 +316,7 @@ async fn malformed_expired_or_reflected_issuance_fails_without_disclosing_respon
         ("401 Unauthorized", BOOTSTRAP.to_owned(), "rejected"),
     ];
     let api = TokenApi::serving(
+        &tls,
         cases
             .iter()
             .map(|(status, body, _)| response(status, body))
@@ -297,16 +343,17 @@ async fn malformed_expired_or_reflected_issuance_fails_without_disclosing_respon
 #[tokio::test]
 async fn the_configured_ca_is_required_and_redirects_cannot_forward_bootstrap_authorization() {
     let root = tempfile::tempdir().expect("projection root");
+    let tls = TestTls::new();
     projection(
         root.path(),
         "..one",
         BOOTSTRAP,
-        include_bytes!("../../../dekopon-http-host/tests/fixtures/private-root.pem"),
+        TestTls::new().ca_pem.as_bytes(),
     );
-    let api = TokenApi::serving(vec![response(
-        "201 Created",
-        &issued(MINTED, 30).to_string(),
-    )]);
+    let api = TokenApi::serving(
+        &tls,
+        vec![response("201 Created", &issued(MINTED, 30).to_string())],
+    );
     let resolver = resolver(root.path(), &api.endpoint).await;
     assert_eq!(
         resolver
@@ -322,9 +369,9 @@ async fn the_configured_ca_is_required_and_redirects_cannot_forward_bootstrap_au
     );
     drop(api);
 
-    projection(root.path(), "..two", BOOTSTRAP, CA);
-    let destination = TokenApi::serving(vec![response("200 OK", "{}")]);
-    let api = TokenApi::serving(vec![format!(
+    projection(root.path(), "..two", BOOTSTRAP, tls.ca_pem.as_bytes());
+    let destination = TokenApi::serving(&tls, vec![response("200 OK", "{}")]);
+    let api = TokenApi::serving(&tls, vec![format!(
         "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", destination.endpoint
     ).into_bytes()]);
     let resolver = self::resolver(root.path(), &api.endpoint).await;
@@ -345,7 +392,8 @@ async fn the_configured_ca_is_required_and_redirects_cannot_forward_bootstrap_au
 #[tokio::test]
 async fn missing_bootstrap_and_invalid_ca_fail_before_issuance() {
     let root = tempfile::tempdir().expect("projection root");
-    projection(root.path(), "..one", BOOTSTRAP, CA);
+    let tls = TestTls::new();
+    projection(root.path(), "..one", BOOTSTRAP, tls.ca_pem.as_bytes());
     let resolver = resolver(root.path(), "https://127.0.0.1:9").await;
     std::fs::remove_file(root.path().join("..one/token")).expect("remove bootstrap");
     let map_path = Path::new("/run/map.yaml");
