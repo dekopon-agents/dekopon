@@ -151,6 +151,8 @@ async fn two_turns_merge_native_reasoning_and_replay_the_exact_second_request() 
     assert_eq!(answer.usage.unwrap().cache_write_tokens, None);
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
+    assert!(request_json(&requests[0]).get("session_id").is_none());
+    assert_eq!(request_json(&requests[1])["session_id"], "conversation-7");
     assert_eq!(
         request_json(&requests[1]),
         serde_json::from_str::<Value>(include_str!("../fixtures/openrouter-replay.json")).unwrap()
@@ -339,50 +341,26 @@ async fn omitted_controls_stay_absent_and_authored_controls_map_exactly() {
 }
 
 #[tokio::test]
-async fn only_authored_routing_members_and_ttl_are_forwarded() {
-    for ttl in [
-        None,
-        Some(settings::Ttl::FiveMinutes),
-        Some(settings::Ttl::OneHour),
-    ] {
-        let settings = Settings {
-            routing: Some(settings::Routing {
-                require_parameters: Some(false),
-                ..Default::default()
-            }),
-            cache: Some(settings::Cache {
-                style: CacheStyle::ExplicitPrefix,
-                ttl,
-            }),
-            ..Default::default()
-        };
-        let server = MockServer::start(vec![MockResponse::sse(ANSWER)]);
-        generate(&client(&server, settings), &[ModelMessage::system("rules")])
-            .await
-            .unwrap();
-        let body = request_json(&server.requests()[0]);
-        assert_eq!(body["provider"], json!({"require_parameters":false}));
-        let marker = &body["messages"][0]["content"][0]["cache_control"];
-        let expected = match ttl {
-            None => json!({"type":"ephemeral"}),
-            Some(settings::Ttl::FiveMinutes) => json!({"type":"ephemeral","ttl":"5m"}),
-            Some(settings::Ttl::OneHour) => json!({"type":"ephemeral","ttl":"1h"}),
-        };
-        assert_eq!(marker, &expected);
-        requests_have_only_the_authored_headers(&server);
-    }
-}
-
-#[tokio::test]
 async fn explicit_cache_marks_only_the_last_of_one_two_or_three_leading_system_messages() {
-    for count in 1..=3 {
+    for (count, ttl, require_parameters) in [
+        (1, None, None),
+        (2, None, None),
+        (3, None, None),
+        (1, None, Some(false)),
+        (1, Some(settings::Ttl::FiveMinutes), Some(false)),
+        (1, Some(settings::Ttl::OneHour), Some(false)),
+    ] {
         let server = MockServer::start(vec![MockResponse::sse(ANSWER)]);
         let client = client(
             &server,
             Settings {
+                routing: require_parameters.map(|value| settings::Routing {
+                    require_parameters: Some(value),
+                    ..Default::default()
+                }),
                 cache: Some(settings::Cache {
                     style: CacheStyle::ExplicitPrefix,
-                    ttl: None,
+                    ttl,
                 }),
                 ..Default::default()
             },
@@ -394,11 +372,21 @@ async fn explicit_cache_marks_only_the_last_of_one_two_or_three_leading_system_m
         messages.push(ModelMessage::system("not-leading"));
         generate(&client, &messages).await.unwrap();
         let body = request_json(&server.requests()[0]);
+        if require_parameters.is_some() {
+            assert_eq!(body["provider"], json!({"require_parameters":false}));
+        } else {
+            assert!(body.get("provider").is_none());
+        }
+        let marker = match ttl {
+            None => json!({"type":"ephemeral"}),
+            Some(settings::Ttl::FiveMinutes) => json!({"type":"ephemeral","ttl":"5m"}),
+            Some(settings::Ttl::OneHour) => json!({"type":"ephemeral","ttl":"1h"}),
+        };
         for index in 0..count {
             if index + 1 == count {
                 assert_eq!(
                     body["messages"][index]["content"],
-                    json!([{"type":"text","text":format!("system-{index}"),"cache_control":{"type":"ephemeral"}}])
+                    json!([{"type":"text","text":format!("system-{index}"),"cache_control":marker}])
                 );
             } else {
                 assert_eq!(
@@ -465,28 +453,6 @@ async fn a_changed_provider_is_accepted_and_reasoning_is_still_forwarded() {
         );
     }
     requests_have_only_the_authored_headers(&server);
-}
-
-#[tokio::test]
-async fn session_id_is_sent_only_with_a_cache_key() {
-    let server = MockServer::start(vec![MockResponse::sse(ANSWER), MockResponse::sse(ANSWER)]);
-    let client = client(&server, Settings::default());
-    generate(&client, &[]).await.unwrap();
-    client
-        .generate(
-            GenerateRequest {
-                messages: &[],
-                tools: &[],
-                options: &CompletionOptions::default(),
-            },
-            &mut |_| ControlFlow::Continue(()),
-            &control(),
-        )
-        .await
-        .unwrap();
-    let requests = server.requests();
-    assert_eq!(request_json(&requests[0])["session_id"], "conversation-7");
-    assert!(request_json(&requests[1]).get("session_id").is_none());
 }
 
 #[tokio::test]
@@ -563,14 +529,16 @@ async fn finish_reasons_keep_complete_text_and_skip_unknown_tools_but_refuse_fil
     for reason in ["stop", "length", "extension", "content_filter"] {
         let body = format!(
             "data: {}\n\n",
-            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":reason}]})
+            json!({"choices":[{"delta":{"tool_calls":null,"reasoning_details":null,"content":"answer"},"finish_reason":reason}]})
         );
         let server = MockServer::start(vec![MockResponse::sse(&body)]);
         let result = generate(&client(&server, Settings::default()), &[]).await;
         if reason == "content_filter" {
             assert!(matches!(result, Err(InferenceError::Provider(_))));
         } else {
-            assert_eq!(result.unwrap().content.as_deref(), Some("answer"));
+            let turn = result.unwrap();
+            assert_eq!(turn.content.as_deref(), Some("answer"));
+            assert!(turn.usage.is_none());
         }
         requests_have_only_the_authored_headers(&server);
     }
@@ -635,57 +603,47 @@ async fn http_200_errors_keep_numeric_codes_and_exclude_credentials_from_diagnos
 }
 
 #[tokio::test]
-async fn a_silent_reasoning_body_cancels_without_waiting_for_the_deadline() {
-    let (reply, ready, release) = MockResponse::sse(ANSWER).stalled();
-    let server = MockServer::start(vec![reply]);
-    let client = client(&server, Settings::default());
-    let (cancel, watch) = tokio::sync::watch::channel(false);
-    let control = TurnControl::new(watch, Duration::from_secs(3)).unwrap();
-    let options = CompletionOptions::default();
-    let mut observe = |_| ControlFlow::Continue(());
-    let (result, ()) = tokio::join!(
-        client.generate(
-            GenerateRequest {
-                messages: &[],
-                tools: &[],
-                options: &options
-            },
-            &mut observe,
-            &control
-        ),
-        async {
-            ready.await.unwrap();
-            cancel.send(true).unwrap();
-        }
-    );
-    drop(release);
-    assert!(matches!(result, Err(InferenceError::Cancelled)));
-    assert_eq!(server.requests().len(), 1);
-    requests_have_only_the_authored_headers(&server);
-}
-
-#[tokio::test]
-async fn the_total_deadline_stops_a_silent_body_without_retry() {
-    let (reply, _ready, release) = MockResponse::sse(ANSWER).stalled();
-    let server = MockServer::start(vec![reply]);
-    let client = client(&server, Settings::default());
-    let control =
-        TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(1)).unwrap();
-    let result = client
-        .generate(
-            GenerateRequest {
-                messages: &[],
-                tools: &[],
-                options: &CompletionOptions::default(),
-            },
-            &mut |_| ControlFlow::Continue(()),
-            &control,
-        )
-        .await;
-    drop(release);
-    assert!(matches!(result, Err(InferenceError::DeadlineExceeded)));
-    assert_eq!(server.requests().len(), 1);
-    requests_have_only_the_authored_headers(&server);
+async fn cancellation_and_the_total_deadline_stop_a_silent_body_without_retry() {
+    for (timeout, expected) in [
+        (3, InferenceError::Cancelled),
+        (1, InferenceError::DeadlineExceeded),
+    ] {
+        let (reply, ready, release) = MockResponse::sse(ANSWER).stalled();
+        let server = MockServer::start(vec![reply]);
+        let client = client(&server, Settings::default());
+        let (cancel, watch) = tokio::sync::watch::channel(false);
+        let control = TurnControl::new(watch, Duration::from_secs(timeout)).unwrap();
+        let options = CompletionOptions::default();
+        let mut observe = |_| ControlFlow::Continue(());
+        let (result, ()) = tokio::join!(
+            client.generate(
+                GenerateRequest {
+                    messages: &[],
+                    tools: &[],
+                    options: &options
+                },
+                &mut observe,
+                &control
+            ),
+            async {
+                ready.await.unwrap();
+                if matches!(expected, InferenceError::Cancelled) {
+                    cancel.send(true).unwrap();
+                }
+            }
+        );
+        drop(release);
+        assert!(matches!(
+            (result, expected),
+            (Err(InferenceError::Cancelled), InferenceError::Cancelled)
+                | (
+                    Err(InferenceError::DeadlineExceeded),
+                    InferenceError::DeadlineExceeded
+                )
+        ));
+        assert_eq!(server.requests().len(), 1);
+        requests_have_only_the_authored_headers(&server);
+    }
 }
 
 #[test]
@@ -762,19 +720,6 @@ async fn socket_and_body_io_failures_stay_transport_errors_without_retry() {
         assert_eq!(server.requests().len(), 1);
         requests_have_only_the_authored_headers(&server);
     }
-}
-
-#[tokio::test]
-async fn a_null_optional_delta_and_absent_usage_are_not_invented_as_zero() {
-    let server = MockServer::start(vec![MockResponse::sse(
-        "data: {\"choices\":[{\"delta\":{\"tool_calls\":null,\"reasoning_details\":null,\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
-    )]);
-    let turn = generate(&client(&server, Settings::default()), &[])
-        .await
-        .unwrap();
-    assert_eq!(turn.content.as_deref(), Some("answer"));
-    assert!(turn.usage.is_none());
-    requests_have_only_the_authored_headers(&server);
 }
 
 #[test]
