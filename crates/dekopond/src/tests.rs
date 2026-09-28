@@ -145,7 +145,11 @@ async fn load(
     config::load(write_config(directory, document), crate::current_uid()).await
 }
 
-type RefusalCase = (&'static str, Value, fn(&ConfigError) -> bool);
+type RefusalCase = (
+    &'static str,
+    &'static [&'static str],
+    fn(&ConfigProblem) -> bool,
+);
 
 fn reports(error: &ConfigError, matcher: fn(&ConfigProblem) -> bool) -> bool {
     matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(matcher))
@@ -266,40 +270,49 @@ async fn progress_notes_without_detail_reports_every_conflicting_route() {
 }
 
 #[tokio::test]
-async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
+async fn persistent_memory_defaults_and_explicit_scopes_survive_route_binding() {
     let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["conversation"] = json!({"kind": "any"});
-    document["routes"][0]["memory"] = json!({
-        "mode": "persistent",
-        "scope": "sharedConversation"
-    });
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("the camel-case shared scope resolves");
-
-    let expected = MemoryPolicy::Persistent(MemoryWindow {
-        scope: MemoryScope::SharedConversation,
-        idle_timeout: Duration::from_secs(900),
-        limits: HistoryLimits {
-            max_turns: 12,
-            max_bytes: 64 * 1024,
-        },
-        recall: RecallSource::None,
-        forget_after: DEFAULT_FORGET_AFTER,
-    });
-    assert_eq!(resolved.routes[0].memory, expected);
-
-    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
-        .expect("the explicitly shared route binds");
-    assert_eq!(
-        routes
-            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-            .expect("route matches")
-            .memory,
-        expected,
-        "effective scope must survive into bound route state"
-    );
+    for (scope, expected_scope) in [
+        (None, MemoryScope::PrivateConversation),
+        (
+            Some("privateConversation"),
+            MemoryScope::PrivateConversation,
+        ),
+        (Some("sharedConversation"), MemoryScope::SharedConversation),
+    ] {
+        let mut document = document(directory.path());
+        document["routes"][0]["memory"] = json!({"mode": "persistent"});
+        if let Some(scope) = scope {
+            document["routes"][0]["memory"]["scope"] = json!(scope);
+        }
+        if expected_scope == MemoryScope::SharedConversation {
+            document["routes"][0]["conversation"] = json!({"kind": "any"});
+        }
+        let resolved = load(directory.path(), &document)
+            .await
+            .expect("persistent route");
+        let expected = MemoryPolicy::Persistent(MemoryWindow {
+            scope: expected_scope,
+            idle_timeout: Duration::from_secs(900),
+            limits: HistoryLimits {
+                max_turns: 12,
+                max_bytes: 64 * 1024,
+            },
+            recall: RecallSource::None,
+            forget_after: DEFAULT_FORGET_AFTER,
+        });
+        assert_eq!(resolved.routes[0].memory, expected);
+        let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
+            .expect("persistent route binds");
+        assert_eq!(
+            routes
+                .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+                .expect("route matches")
+                .memory,
+            expected,
+            "effective scope must survive into bound route state"
+        );
+    }
 }
 
 #[tokio::test]
@@ -507,73 +520,47 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
             && endpoint == config::WHATSAPP_GRAPH_ENDPOINT
     ));
 
-    let invalid: [RefusalCase; 11] = [
-        ("appSecretEnv", json!("pasted secret"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
-            })
+    let invalid: [RefusalCase; 6] = [
+        ("appSecretEnv", &["pasted secret"], |problem| {
+            matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
         }),
-        ("bind", json!("127.0.0.1:0"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappBind { .. })
-            })
+        ("bind", &["127.0.0.1:0"], |problem| {
+            matches!(problem, ConfigProblem::InvalidWhatsappBind { .. })
         }),
-        ("callbackPath", json!("relative"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
-            })
+        (
+            "callbackPath",
+            &[
+                "relative",
+                "/webhooks/{wildcard}",
+                "/webhooks//whatsapp",
+                "/webhooks/whatsapp/",
+            ],
+            |problem| matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. }),
+        ),
+        ("wabaId", &["0123"], |problem| {
+            matches!(problem, ConfigProblem::InvalidWhatsappScope { .. })
         }),
-        ("callbackPath", json!("/webhooks/{wildcard}"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
-            })
-        }),
-        ("callbackPath", json!("/webhooks//whatsapp"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
-            })
-        }),
-        ("callbackPath", json!("/webhooks/whatsapp/"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappCallback { .. })
-            })
-        }),
-        ("wabaId", json!("0123"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappScope { .. })
-            })
-        }),
-        ("graphApiVersion", json!("latest"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
-            })
-        }),
-        ("graphApiVersion", json!("v01.0"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
-            })
-        }),
-        ("graphApiVersion", json!("v23.1"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. })
-            })
-        }),
-        ("graphEndpoint", json!("https://evil.example"), |error| {
-            reports(error, |problem| {
-                matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
-            })
+        (
+            "graphApiVersion",
+            &["latest", "v01.0", "v23.1"],
+            |problem| matches!(problem, ConfigProblem::InvalidWhatsappGraphVersion { .. }),
+        ),
+        ("graphEndpoint", &["https://evil.example"], |problem| {
+            matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
         }),
     ];
-    for (field, value, expected) in invalid {
-        let mut invalid_document = document.clone();
-        invalid_document["transports"][0][field] = value;
-        let error = load(directory.path(), &invalid_document)
-            .await
-            .expect_err(&format!("invalid {field} must fail closed"));
-        assert!(
-            expected(&error),
-            "invalid {field} failed closed for the wrong reason: {error:?}"
-        );
+    for (field, values, expected) in invalid {
+        for value in values {
+            let mut invalid_document = document.clone();
+            invalid_document["transports"][0][field] = json!(value);
+            let error = load(directory.path(), &invalid_document)
+                .await
+                .expect_err(&format!("invalid {field} must fail closed"));
+            assert!(
+                reports(&error, expected),
+                "invalid {field}={value} failed closed for the wrong reason: {error:?}"
+            );
+        }
     }
 
     load(directory.path(), &document)
@@ -582,7 +569,7 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 }
 
 #[tokio::test]
-async fn native_liveness_is_off_unless_a_transport_opts_in() {
+async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
     let directory = temporary();
     let mut document = document(directory.path());
     document["transports"][0] = json!({
@@ -594,6 +581,11 @@ async fn native_liveness_is_off_unless_a_transport_opts_in() {
     let resolved = load(directory.path(), &document)
         .await
         .expect("the default remains reply-only");
+    assert!(matches!(
+        &resolved.transports[0],
+        config::TransportConfig::DiscordGateway { endpoint: Some(endpoint), .. }
+            if endpoint == config::DISCORD_ENDPOINT
+    ));
     assert!(matches!(
         resolved.transports.first(),
         Some(config::TransportConfig::DiscordGateway {
@@ -624,595 +616,206 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
 }
 
 #[tokio::test]
-async fn a_persistent_route_resolves_its_documented_window_defaults() {
-    let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["memory"] = json!({"mode": "persistent"});
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("a persistent route with no bounds resolves");
-
-    let expected = MemoryPolicy::Persistent(MemoryWindow {
-        scope: MemoryScope::PrivateConversation,
-        idle_timeout: Duration::from_secs(900),
-        limits: HistoryLimits {
-            max_turns: 12,
-            max_bytes: 64 * 1024,
-        },
-        recall: RecallSource::None,
-        forget_after: DEFAULT_FORGET_AFTER,
-    });
-    assert_eq!(resolved.routes[0].memory, expected);
-
-    document["routes"][0]["memory"]["scope"] = json!("privateConversation");
-    let explicit = load(directory.path(), &document)
-        .await
-        .expect("the explicit private scope resolves");
-    assert_eq!(
-        explicit.routes[0].memory, expected,
-        "omission and explicit private scope have exactly the same effective policy"
-    );
-}
-
-#[tokio::test]
 async fn invalid_configurations_fail_closed_at_startup() {
     let directory = temporary();
-    let mutate = |mutation: fn(&mut Value)| {
+    let mutate = |patch: &Value| {
         let mut document = document(directory.path());
-        mutation(&mut document);
+        for (pointer, value) in patch.as_object().expect("patch object") {
+            let (parent, key) = pointer.rsplit_once('/').expect("field pointer");
+            document.pointer_mut(parent).expect("fixture parent")[key] = value.clone();
+        }
         document
     };
-
-    let cases: Vec<RefusalCase> = vec![
-        (
-            "unknown top-level field",
-            mutate(|document| {
-                document["unexpected"] = json!(true);
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown field inside a transport",
-            mutate(|document| {
-                document["transports"][0]["socketpath"] = json!("/tmp/typo.sock");
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown transport kind",
-            mutate(|document| {
-                document["transports"][0]["kind"] = json!("carrierPigeon");
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown field inside a model",
-            mutate(|document| {
-                document["models"][0]["temperature"] = json!(0.7);
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "a retired imageGenerator gateway block",
-            mutate(|document| {
-                document["imageGenerator"] = json!({
-                    "model": "gpt-image-1",
-                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
-                    "timeoutMs": 120_000
-                });
-            }),
-            |error| {
-                matches!(error, ConfigError::Decode { source }
-                    if source.to_string().contains("imageGenerator"))
-            },
-        ),
-        (
-            "a retired imageGenerator route flag",
-            mutate(|document| {
-                document["routes"][0]["imageGenerator"] = json!(true);
-            }),
-            |error| {
-                matches!(error, ConfigError::Decode { source }
-                    if source.to_string().contains("imageGenerator"))
-            },
-        ),
-        (
-            "unknown field inside providerAttachments",
-            mutate(|document| {
-                document["routes"][0]["providerAttachments"] =
-                    json!({"maxPerReply": 1, "maxBytes": 8});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "providerAttachments that can never carry one",
-            mutate(|document| {
-                document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 0});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "a chat-asset input that is not a capability identifier",
-            mutate(|document| {
-                document["routes"][0]["chatAssetInputs"] = json!(["Not A Capability"]);
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown route match kind",
-            mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"kind": ["semaphore"]});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            // Serde's internally tagged unit variants silently accept and discard extra keys, so a
-            // channel field beside directMessage would decode cleanly while being ignored.
-            "a channel on a directMessage route",
-            mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"kind": ["directMessage"], "channel": "c0123abc"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "duplicate transport name",
-            mutate(|document| {
-                let duplicate = document["transports"][0].clone();
-                document["transports"]
-                    .as_array_mut()
-                    .expect("transports array")
-                    .push(duplicate);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::DuplicateTransport { .. })
-                })
-            },
-        ),
-        (
-            "duplicate model name",
-            mutate(|document| {
-                let duplicate = document["models"][0].clone();
-                document["models"]
-                    .as_array_mut()
-                    .expect("models array")
-                    .push(duplicate);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::DuplicateModel { .. })
-                })
-            },
-        ),
-        (
-            "route names an unknown transport",
-            mutate(|document| {
-                document["routes"][0]["transport"] = json!("nowhere");
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnknownRouteTransport { .. })
-                })
-            },
-        ),
-        (
-            "route names an unknown model",
-            mutate(|document| {
-                document["routes"][0]["model"] = json!("gpt-nonexistent");
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnknownRouteModel { .. })
-                })
-            },
-        ),
-        (
-            "zero step budget",
-            mutate(|document| {
-                document["routes"][0]["limits"] = json!({"maxSteps": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidRouteLimits { .. })
-                })
-            },
-        ),
-        (
-            "zero concurrency",
-            mutate(|document| {
-                document["sessions"] = json!({"maxConcurrent": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidSessionLimits)
-                })
-            },
-        ),
-        (
-            "a bare kind word instead of a list",
-            mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"kind": "channel"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "an empty ids list and an empty kind list together",
-            mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"kind": [], "ids": []});
-            }),
-            |error| {
-                let problems: Vec<_> = match error {
-                    ConfigError::Invalid { problems, .. } => problems.iter().collect(),
-                    _ => Vec::new(),
-                };
-                problems.len() >= 2
-                    && problems.iter().all(|problem| {
-                        matches!(problem, ConfigProblem::InvalidRouteConversation { .. })
-                    })
-            },
-        ),
-        (
-            "subjects beside a channel route",
-            mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
-                document["routes"][0]["subjects"] = json!(["tel.16034700182"]);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::SubjectsOnNonDmRoute { .. })
-                })
-            },
-        ),
-        (
-            "a shared memory window on a direct-message-only route",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "scope": "sharedConversation"});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::SharedMemoryOnDmRoute { .. })
-                })
-            },
-        ),
-        (
-            "platform recall on a transport with no history API",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "recall": "platform"});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::PlatformRecallUnsupported { .. })
-                })
-            },
-        ),
-        (
-            "journal recall with no journal configured",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "recall": "journal"});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::JournalRecallWithoutJournal { .. })
-                })
-            },
-        ),
-        (
-            "a recall horizon on a route that recalls nothing",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "forgetAfterMs": 60_000});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::ForgetAfterWithoutRecall { .. })
-                })
-            },
-        ),
-        (
-            "a zero recall horizon",
-            mutate(|document| {
-                document["sessions"] = json!({"journal": {"path": "journal"}});
-                document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
-                })
-            },
-        ),
-        (
-            "wakes on a route with no wake store",
-            mutate(|document| {
-                document["routes"][0]["wakes"] = json!(true);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::WakesWithoutStore { .. })
-                })
-            },
-        ),
-        (
-            "a zero wake bound",
-            mutate(|document| {
-                document["sessions"] =
-                    json!({"wakes": {"path": "wakes.jsonl", "maxPerSubject": 0}});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidWakeBounds)
-                })
-            },
-        ),
-        (
-            "a watch interval a probe could outlast",
-            mutate(|document| {
-                document["sessions"] =
-                    json!({"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}});
-                document["routes"][0]["wakes"] = json!(true);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(
-                        problem,
-                        ConfigProblem::WakeIntervalWithinScriptTimeout { .. }
-                    )
-                })
-            },
-        ),
-        (
-            "an unknown recall source",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "recall": "telepathy"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "a liveness override keyed on a kind that does not exist",
-            mutate(|document| {
-                document["transports"][0]["liveness"] =
-                    json!({"conversations": {"channelish": {"stream": true}}});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown conversation mode",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "amnesiac"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "wrong-case private conversation scope",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "scope": "private_conversation"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "unknown conversation scope",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "persistent", "scope": "teamMemory"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "null conversation scope",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "persistent", "scope": null});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "zero idle timeout on a persistent route",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "persistent", "idleTimeoutMs": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
-                })
-            },
-        ),
-        (
-            "zero turn window on a persistent route",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "persistent", "maxTurns": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
-                })
-            },
-        ),
-        (
-            "zero byte window on a persistent route",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "persistent", "maxBytes": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
-                })
-            },
-        ),
-        (
-            "a window bound on a oneShot route",
-            mutate(|document| {
-                document["routes"][0]["memory"] = json!({"mode": "oneShot", "maxTurns": 12});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "a scope on a oneShot route",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "oneShot", "scope": "privateConversation"});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "an idle timeout on a oneShot route",
-            mutate(|document| {
-                document["routes"][0]["memory"] =
-                    json!({"mode": "oneShot", "idleTimeoutMs": 900_000});
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "zero conversation ceiling",
-            mutate(|document| {
-                document["sessions"] = json!({"maxConversations": 0});
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidMaxConversations)
-                })
-            },
-        ),
-        (
-            "no transports at all",
-            mutate(|document| {
-                document["transports"] = json!([]);
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::NoTransports)
-                })
-            },
-        ),
-        (
-            // A secret placed where a variable name belongs is read as an unset variable name,
-            // hiding a plaintext credential inside the config file.
-            "credential value where a variable name belongs",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "telegramLongPoll",
-                    "botTokenEnv": "12345:AAH-actual-secret-value"
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
-                })
-            },
-        ),
-        (
-            "model API key variable that is not a variable name",
-            mutate(|document| {
-                document["models"][0]["apiKeyEnv"] = json!("sk-live-not-a-variable");
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
-                })
-            },
-        ),
-        (
-            "a Slack reaction fallback while liveness is off",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "slackSocketMode",
-                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
-                    "liveness": {"mode": "off", "classicFallback": "reaction"}
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidSlackLiveness { .. })
-                })
-            },
-        ),
-        (
-            "classic native Slack liveness with no visible fallback",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "slackSocketMode",
-                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
-                    "experience": "classic",
-                    "liveness": {"mode": "native", "classicFallback": "none"}
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidSlackLiveness { .. })
-                })
-            },
-        ),
-        (
-            "a Slack endpoint that is neither production nor loopback",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "slackSocketMode",
-                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
-                    "endpoint": "https://slack.evil.test"
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
-                })
-            },
-        ),
-        (
-            "a Discord endpoint that is neither production nor loopback",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "discordGateway",
-                    "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN",
-                    "endpoint": "https://discord.evil.test"
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
-                })
-            },
-        ),
-        (
-            // URL userinfo can make an authority read as loopback while the socket actually
-            // connects elsewhere.
-            "a loopback-looking endpoint that resolves elsewhere",
-            mutate(|document| {
-                document["transports"][0] = json!({
-                    "name": "dev",
-                    "kind": "slackSocketMode",
-                    "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-                    "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
-                    "endpoint": "http://127.0.0.1@slack.evil.test"
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnsupportedEndpoint { .. })
-                })
-            },
-        ),
-    ];
-
-    for (name, document, expected) in cases {
-        let error = load(directory.path(), &document)
+    for patch in [
+        json!({"/unexpected": true}),
+        json!({"/transports/0/socketpath": "/tmp/typo.sock"}),
+        json!({"/transports/0/kind": "carrierPigeon"}),
+        json!({"/models/0/temperature": 0.7}),
+        json!({"/routes/0/providerAttachments": {"maxPerReply": 1, "maxBytes": 8}}),
+        json!({"/routes/0/providerAttachments": {"maxPerReply": 0}}),
+        json!({"/routes/0/chatAssetInputs": ["Not A Capability"]}),
+        json!({"/routes/0/conversation": {"kind": ["semaphore"]}}),
+        // Serde's internally tagged unit variants silently accept and discard extra keys, so a
+        // channel field beside directMessage would decode cleanly while being ignored.
+        json!({"/routes/0/conversation": {"kind": ["directMessage"], "channel": "c0123abc"}}),
+        json!({"/routes/0/conversation": {"kind": "channel"}}),
+        json!({"/routes/0/memory": {"mode": "persistent", "recall": "telepathy"}}),
+        json!({"/transports/0/liveness": {"conversations": {"channelish": {"stream": true}}}}),
+        json!({"/routes/0/memory": {"mode": "amnesiac"}}),
+        json!({"/routes/0/memory": {"mode": "persistent", "scope": "private_conversation"}}),
+        json!({"/routes/0/memory": {"mode": "persistent", "scope": "teamMemory"}}),
+        json!({"/routes/0/memory": {"mode": "persistent", "scope": null}}),
+        json!({"/routes/0/memory": {"mode": "oneShot", "maxTurns": 12}}),
+        json!({"/routes/0/memory": {"mode": "oneShot", "scope": "privateConversation"}}),
+        json!({"/routes/0/memory": {"mode": "oneShot", "idleTimeoutMs": 900_000}}),
+    ] {
+        let error = load(directory.path(), &mutate(&patch))
             .await
-            .expect_err(&format!("{name} must fail closed"));
+            .expect_err("strict config");
         assert!(
-            expected(&error),
-            "{name} failed closed for the wrong reason: {error:?}"
+            matches!(error, ConfigError::Decode { .. }),
+            "{patch}: {error:?}"
         );
     }
+    for patch in [
+        json!({"/imageGenerator": {
+            "model": "gpt-image-1", "apiKeyEnv": "OPENAI_IMAGE_API_KEY", "timeoutMs": 120_000
+        }}),
+        json!({"/routes/0/imageGenerator": true}),
+    ] {
+        let error = load(directory.path(), &mutate(&patch))
+            .await
+            .expect_err("retired key");
+        assert!(matches!(error, ConfigError::Decode { source }
+            if source.to_string().contains("imageGenerator")));
+    }
+
+    let fixture = document(directory.path());
+    type InvalidCase = (Value, fn(&ConfigProblem) -> bool);
+    let cases: Vec<InvalidCase> = vec![
+        (
+            json!({"/transports": [fixture["transports"][0], fixture["transports"][0]]}),
+            |problem| matches!(problem, ConfigProblem::DuplicateTransport { .. }),
+        ),
+        (
+            json!({"/models": [fixture["models"][0], fixture["models"][0]]}),
+            |problem| matches!(problem, ConfigProblem::DuplicateModel { .. }),
+        ),
+        (json!({"/routes/0/transport": "nowhere"}), |problem| {
+            matches!(problem, ConfigProblem::UnknownRouteTransport { .. })
+        }),
+        (json!({"/routes/0/model": "gpt-nonexistent"}), |problem| {
+            matches!(problem, ConfigProblem::UnknownRouteModel { .. })
+        }),
+        (json!({"/routes/0/limits": {"maxSteps": 0}}), |problem| {
+            matches!(problem, ConfigProblem::InvalidRouteLimits { .. })
+        }),
+        (json!({"/sessions": {"maxConcurrent": 0}}), |problem| {
+            matches!(problem, ConfigProblem::InvalidSessionLimits)
+        }),
+        (
+            json!({"/routes/0/conversation": {"kind": ["channel"]},
+            "/routes/0/subjects": ["tel.16034700182"]}),
+            |problem| matches!(problem, ConfigProblem::SubjectsOnNonDmRoute { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "scope": "sharedConversation"}}),
+            |problem| matches!(problem, ConfigProblem::SharedMemoryOnDmRoute { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "recall": "platform"}}),
+            |problem| matches!(problem, ConfigProblem::PlatformRecallUnsupported { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "recall": "journal"}}),
+            |problem| matches!(problem, ConfigProblem::JournalRecallWithoutJournal { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "forgetAfterMs": 60_000}}),
+            |problem| matches!(problem, ConfigProblem::ForgetAfterWithoutRecall { .. }),
+        ),
+        (
+            json!({"/sessions": {"journal": {"path": "journal"}},
+            "/routes/0/memory": {"mode": "persistent", "forgetAfterMs": 0}}),
+            |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
+        ),
+        (json!({"/routes/0/wakes": true}), |problem| {
+            matches!(problem, ConfigProblem::WakesWithoutStore { .. })
+        }),
+        (
+            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "maxPerSubject": 0}}}),
+            |problem| matches!(problem, ConfigProblem::InvalidWakeBounds),
+        ),
+        (
+            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}},
+            "/routes/0/wakes": true}),
+            |problem| {
+                matches!(
+                    problem,
+                    ConfigProblem::WakeIntervalWithinScriptTimeout { .. }
+                )
+            },
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "idleTimeoutMs": 0}}),
+            |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "maxTurns": 0}}),
+            |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
+        ),
+        (
+            json!({"/routes/0/memory": {"mode": "persistent", "maxBytes": 0}}),
+            |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
+        ),
+        (json!({"/sessions": {"maxConversations": 0}}), |problem| {
+            matches!(problem, ConfigProblem::InvalidMaxConversations)
+        }),
+        (json!({"/transports": []}), |problem| {
+            matches!(problem, ConfigProblem::NoTransports)
+        }),
+        // A secret placed where a variable name belongs is read as an unset variable name,
+        // hiding a plaintext credential inside the config file.
+        (
+            json!({"/transports": [{"name": "dev", "kind": "telegramLongPoll",
+            "botTokenEnv": "12345:AAH-actual-secret-value"}]}),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+        ),
+        (
+            json!({"/models/0/apiKeyEnv": "sk-live-not-a-variable"}),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+        ),
+        (
+            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
+            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "liveness": {"mode": "off", "classicFallback": "reaction"}}]}),
+            |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
+        ),
+        (
+            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
+            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "experience": "classic", "liveness": {"mode": "native", "classicFallback": "none"}}]}),
+            |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
+        ),
+        (
+            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
+            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "endpoint": "https://slack.evil.test"}]}),
+            |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
+        ),
+        (
+            json!({"/transports": [{"name": "dev", "kind": "discordGateway",
+            "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN", "endpoint": "https://discord.evil.test"}]}),
+            |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
+        ),
+        // URL userinfo can make an authority read as loopback while the socket actually
+        // connects elsewhere.
+        (
+            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
+            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "endpoint": "http://127.0.0.1@slack.evil.test"}]}),
+            |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
+        ),
+    ];
+    for (patch, expected) in cases {
+        let error = load(directory.path(), &mutate(&patch))
+            .await
+            .expect_err("invalid config");
+        assert!(reports(&error, expected), "{patch}: {error:?}");
+    }
+    let invalid = mutate(&json!({"/routes/0/conversation": {"kind": [], "ids": []}}));
+    let error = load(directory.path(), &invalid)
+        .await
+        .expect_err("empty match lists");
+    let ConfigError::Invalid { problems, .. } = error else {
+        panic!("semantic refusal: {error:?}");
+    };
+    assert!(problems.len() >= 2);
+    assert!(
+        problems
+            .iter()
+            .all(|problem| matches!(problem, ConfigProblem::InvalidRouteConversation { .. }))
+    );
 }
 
 #[tokio::test]
@@ -1737,27 +1340,6 @@ async fn telegram_call_failures_never_render_bot_tokens() {
 }
 
 #[tokio::test]
-async fn a_discord_transport_resolves_its_pinned_rest_endpoint() {
-    let directory = temporary();
-    let mut document = document(directory.path());
-    document["transports"][0] = json!({
-        "name": "community-discord",
-        "kind": "discordGateway",
-        "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN"
-    });
-    document["routes"][0]["transport"] = json!("community-discord");
-
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("a Discord transport resolves");
-    assert!(matches!(
-        &resolved.transports[0],
-        config::TransportConfig::DiscordGateway { endpoint: Some(endpoint), .. }
-            if endpoint == config::DISCORD_ENDPOINT
-    ));
-}
-
-#[tokio::test]
 async fn a_loopback_endpoint_override_is_accepted_for_tests() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -2026,65 +1608,39 @@ async fn an_explicit_route_model_outranks_class_matching() {
 }
 
 #[tokio::test]
-async fn channel_routes_match_only_their_own_channel() {
+async fn channel_routes_match_their_transport_kind_and_optional_channel() {
     let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
-    let config = resolved(directory.path(), &document).await;
-    let table =
-        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
-
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
-            .is_some()
-    );
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
-            .is_none()
-    );
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-            .is_none()
-    );
-    assert!(
-        table
-            .route(&routed("other", ConversationKind::Channel, "c0123abc"))
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn a_channel_route_with_no_channel_matches_every_channel() {
-    let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
-    let config = resolved(directory.path(), &document).await;
-    let table =
-        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
-
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
-            .is_some()
-    );
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
-            .is_some()
-    );
-    assert!(
-        table
-            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-            .is_none()
-    );
-    assert!(
-        table
-            .route(&routed("other", ConversationKind::Channel, "c0123abc"))
-            .is_none()
-    );
+    for (conversation, matches_other_channel) in [
+        (json!({"kind": ["channel"], "ids": ["c0123abc"]}), false),
+        (json!({"kind": ["channel"]}), true),
+    ] {
+        let mut document = document(directory.path());
+        document["routes"][0]["conversation"] = conversation;
+        let config = resolved(directory.path(), &document).await;
+        let table =
+            RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
+        assert!(
+            table
+                .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
+                .is_some()
+        );
+        assert_eq!(
+            table
+                .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
+                .is_some(),
+            matches_other_channel
+        );
+        assert!(
+            table
+                .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+                .is_none()
+        );
+        assert!(
+            table
+                .route(&routed("other", ConversationKind::Channel, "c0123abc"))
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]
