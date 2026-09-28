@@ -65,6 +65,19 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
 See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
+## Chat-memory dedup config removed (unreleased)
+
+Delete `chatMemory.maxDedupRecords` and `chatMemory.maxDedupBytes` from `dekopond.yaml`; the broker
+refuses them as unknown fields. Pin the `memory-chat` provider to v0.5.0 or later, whose `record`
+input schema refuses the matching `maxDedupRecords`/`maxDedupBytes` keys the same way. `dedup.jsonl`
+is gone; only `turns.jsonl` remains, and existing namespaces keep their recorded turns unchanged.
+
+`memory.chat.record` no longer deduplicates: it appends every call as its own turn, whatever `id` or
+`commitment` it carries, instead of the old silent no-op on a repeated one (or, most recently, the
+generic `provider-failure` a changed commitment or exhausted dedup log used to raise). A redelivered
+message now becomes a second stored turn — the accepted cost, matching the WhatsApp and Discord
+rings below.
+
 ## WhatsApp no longer dedups redeliveries; the Discord ring is deleted as redundant (unreleased)
 
 The WhatsApp `ClaimedIds` ring is gone; no configuration key changes. WhatsApp's HTTP 200 already
@@ -76,10 +89,7 @@ gets a second reply, the accepted cost.
 The Discord `SeenIds` ring is also gone, but this is a no-op for behavior: Discord's own gateway
 resume sequence-number tracking already prevented a resumed connection from replaying an event the
 client had already received, so the ring never had a real duplicate to catch on that path. The
-Slack dedup ring is unchanged.
-
-A chat-memory record that fails with what used to be `dedup-conflict` or `dedup-capacity` now
-classifies as the generic `provider-failure`; nothing consumes those two codes specially anymore.
+Slack dedup ring is unchanged. Chat-memory's own dedup is gone too; see the entry above.
 
 ## Slack no longer streams the answer (unreleased)
 

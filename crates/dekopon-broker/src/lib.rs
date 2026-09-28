@@ -88,14 +88,13 @@ const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+js
 const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evidence+json";
 
 const UNROUTED_RECORD_CAPABILITY: &str = "memory.chat.record";
-const MEMORY_DEDUP_LINE_BYTES: u64 = 256;
 const MEMORY_MIN_TURN_LINE_BYTES: u64 = 241;
 const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
 const MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES: u64 = 4 * 1024;
 const MEMORY_QUERY_JSON_EXPANSION: u64 = 6;
 const MEMORY_WORKING_SET_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const MEMORY_MIN_RESULT_BYTES: u64 = 30;
-const MEMORY_LOGICAL_FILES: u64 = 2;
+const MEMORY_LOGICAL_FILES: u64 = 1;
 const MEMORY_RECORD_FIXED_HOST_CALLS: u64 = 5;
 const MEMORY_FUEL_BASE: u64 = 10_000_000;
 const MEMORY_FUEL_PER_WORK_BYTE: u64 = 256;
@@ -113,8 +112,6 @@ pub struct ChatMemoryConfig {
     pub max_query_bytes: u64,
     pub max_result_bytes: u64,
     pub max_turn_bytes: u64,
-    pub max_dedup_records: u64,
-    pub max_dedup_bytes: u64,
     pub compaction_target_bytes: u64,
     pub compaction_threshold_bytes: u64,
 }
@@ -131,8 +128,6 @@ impl ChatMemoryConfig {
             self.max_query_bytes,
             self.max_result_bytes,
             self.max_turn_bytes,
-            self.max_dedup_records,
-            self.max_dedup_bytes,
             self.compaction_target_bytes,
             self.compaction_threshold_bytes,
         ];
@@ -146,46 +141,33 @@ impl ChatMemoryConfig {
             || self.compaction_threshold_bytes > storage.max_file_bytes
             || self.max_turn_bytes < MEMORY_MIN_TURN_LINE_BYTES
             || self.max_result_bytes < MEMORY_MIN_RESULT_BYTES
-            || self.max_dedup_bytes < MEMORY_DEDUP_LINE_BYTES
         {
             return Err(BrokerBuildError::InvalidChatMemory);
         }
         let retained = u64::from(self.max_lookback_turns)
             .checked_mul(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        // read-file charges a full CHUNK even on a partial final call, so round each file's read
-        // budget independently rather than summing lengths first.
-        let dedup_read_budget = round_up(self.max_dedup_bytes, MEMORY_READ_CHUNK_BYTES)?;
-        let turns_read_budget = round_up(self.compaction_threshold_bytes, MEMORY_READ_CHUNK_BYTES)?;
-        let read_budget = dedup_read_budget
-            .checked_add(turns_read_budget)
-            .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        let host_calls = dedup_read_budget
+        // read-file charges a full CHUNK even on a partial final call.
+        let read_budget = round_up(self.compaction_threshold_bytes, MEMORY_READ_CHUNK_BYTES)?;
+        let host_calls = read_budget
             .checked_div(MEMORY_READ_CHUNK_BYTES)
-            .and_then(|value| {
-                value.checked_add(turns_read_budget.checked_div(MEMORY_READ_CHUNK_BYTES)?)
-            })
             .and_then(|value| value.checked_add(MEMORY_RECORD_FIXED_HOST_CALLS))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let write_budget = self
             .compaction_target_bytes
             .checked_add(self.max_turn_bytes)
-            .and_then(|value| value.checked_add(MEMORY_DEDUP_LINE_BYTES))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let threshold_with_append = self
             .compaction_threshold_bytes
             .checked_add(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let namespace_headroom = threshold_with_append
-            .checked_add(self.max_dedup_bytes)
-            .and_then(|value| value.checked_add(32 * 4_096))
+            .checked_add(32 * 4_096)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         if retained > self.compaction_target_bytes
             || MEMORY_READ_CHUNK_BYTES > storage.max_read_bytes_per_call
             || self.max_turn_bytes > storage.max_write_bytes_per_call
-            || MEMORY_DEDUP_LINE_BYTES > storage.max_write_bytes_per_call
             || self.compaction_target_bytes > storage.max_write_bytes_per_call
-            || self.max_dedup_bytes > storage.max_file_bytes
             || threshold_with_append > storage.max_file_bytes
             || read_budget > storage.max_read_bytes_per_invocation
             || write_budget > storage.max_write_bytes_per_invocation
@@ -216,7 +198,6 @@ impl ChatMemoryConfig {
     fn maximum_provider_working_set_bytes(&self) -> Result<u64, BrokerBuildError> {
         self.compaction_threshold_bytes
             .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(self.max_dedup_bytes.checked_mul(2)?))
             .and_then(|bytes| bytes.checked_add(self.compaction_target_bytes.checked_mul(2)?))
             .and_then(|bytes| bytes.checked_add(self.max_turn_bytes))
             .and_then(|bytes| bytes.checked_add(self.max_result_bytes))
@@ -226,9 +207,8 @@ impl ChatMemoryConfig {
 
     fn minimum_provider_fuel(&self) -> Result<u64, BrokerBuildError> {
         let record_work = self
-            .max_dedup_bytes
-            .checked_add(self.compaction_threshold_bytes)
-            .and_then(|value| value.checked_add(self.compaction_target_bytes))
+            .compaction_threshold_bytes
+            .checked_add(self.compaction_target_bytes)
             .and_then(|value| value.checked_add(self.max_turn_bytes))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let search_work = self
@@ -3044,8 +3024,6 @@ where
                 "assistant": assistant,
                 "maxTurnBytes": config.max_turn_bytes,
                 "maxLookbackTurns": config.max_lookback_turns,
-                "maxDedupRecords": config.max_dedup_records,
-                "maxDedupBytes": config.max_dedup_bytes,
                 "compactionTargetBytes": config.compaction_target_bytes,
                 "compactionThresholdBytes": config.compaction_threshold_bytes,
             });
@@ -3674,11 +3652,6 @@ fn encode_memory_config(encoded: &mut AuthorityEncoder, memory: &ChatMemoryConfi
     encoded.number("memory.maxQueryBytes", u128::from(memory.max_query_bytes));
     encoded.number("memory.maxResultBytes", u128::from(memory.max_result_bytes));
     encoded.number("memory.maxTurnBytes", u128::from(memory.max_turn_bytes));
-    encoded.number(
-        "memory.maxDedupRecords",
-        u128::from(memory.max_dedup_records),
-    );
-    encoded.number("memory.maxDedupBytes", u128::from(memory.max_dedup_bytes));
     encoded.number(
         "memory.compactionTargetBytes",
         u128::from(memory.compaction_target_bytes),

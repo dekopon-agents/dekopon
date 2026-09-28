@@ -327,9 +327,8 @@ Writes apply per host call. A trap can leave partial database/log changes; neith
 invocation success promises cross-file atomicity or crash recovery ([`design.md`](design.md#non-goals)).
 
 Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
-automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte
-cap, new recording fails, classified as the generic `provider-failure`, while reads remain
-available.
+automatically replayed. Recording never deduplicates: a redelivered message becomes a second stored
+turn.
 
 ## Mapped compiled-provider trust
 

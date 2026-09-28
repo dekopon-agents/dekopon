@@ -28,7 +28,7 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, Redacted, RiskLevel, TransportId,
 };
-use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
+use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageLimits};
 use dekopon_test_support::{CaptureLayer, Record, provider_fixture};
 use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -45,8 +45,6 @@ fn memory_config() -> ChatMemoryConfig {
         max_query_bytes: 256,
         max_result_bytes: 65_536,
         max_turn_bytes: 32_768,
-        max_dedup_records: 16_000,
-        max_dedup_bytes: 4_194_304,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
     }
@@ -1413,134 +1411,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let root = directory.join("provider-storage");
-    let mut config = memory_config();
-    config.continuity_policy = ContinuityPolicy::Stable;
-    config.max_lookback_turns = 1;
-    config.max_recent_turns = 1;
-    config.max_search_results = 1;
-    config.max_turn_bytes = 1_000;
-    config.max_dedup_records = 2_000;
-    config.max_dedup_bytes = 262_144;
-    config.compaction_target_bytes = 200_000;
-    config.compaction_threshold_bytes = 262_144;
-    let limits = StorageLimits {
-        max_read_bytes_per_invocation: 524_288,
-        ..StorageLimits::default()
-    };
-    let conversation = "c0123abc:1712345678.000430";
-    let turns = seed_turn_file(262_000, 1_000);
-    let mut dedup = Vec::new();
-    for index in 0..1_206 {
-        // Field order matches the checksum-pinned provider's canonical Dedup struct.
-        let line = format!(
-            "{{\"format\":\"dekopon.chat-memory.dedup\",\"version\":1,\"id\":\"sha256:{index:064x}\",\"commitment\":\"sha256:{}\"}}\n",
-            "0".repeat(64)
-        );
-        assert_eq!(line.len(), 217);
-        dedup.extend_from_slice(line.as_bytes());
-    }
-    assert_eq!(dedup.len(), 261_702);
-    let user = "B1 user";
-    let assistant = "x".repeat((1_000 - canonical_turn_line_bytes(user, "")) as usize);
-    assert_eq!(canonical_turn_line_bytes(user, &assistant), 1_000);
-    assert_eq!(turns.len() + dedup.len(), 523_702);
-    assert!(turns.len() + dedup.len() + 1_000 > 524_288);
-    let storage = StorageHost::open(&root, StorageLimits::default()).expect("seed host");
-    let grant = storage
-        .grant(StorageGrantRequest::new(
-            "b1-seed".parse().expect("invocation"),
-            MEMORY_RECORD.parse().expect("capability"),
-            "memory-chat".parse().expect("provider"),
-            StorageInterface::Jsonl,
-            StorageAccess::ReadWrite,
-            StorageScope::PrivateConversation,
-            "reviewer".parse().expect("agent"),
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            "slack",
-            "scientist-slack",
-            "c0123abc",
-            conversation,
-            ContinuityPolicy::Stable,
-            b"b1-seed-authority".to_vec(),
-        ))
-        .expect("seed grant");
-    let mut handle = storage.begin(grant).expect("seed handle");
-    handle
-        .jsonl_replace("turns.jsonl", 0, &turns)
-        .expect("seed turns");
-    handle
-        .jsonl_replace("dedup.jsonl", 0, &dedup)
-        .expect("seed dedup");
-    handle.commit().expect("seed finish");
-    drop(storage);
-    let broker = build_broker_with(
-        &root,
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-        config.clone(),
-        limits,
-        BrokerHostLimits::default(),
-        false,
-    )
-    .await;
-    let attestor = attestor_grant();
-    let session = claim_for(conversation);
-    let result = record_turn_in(
-        &broker,
-        &session,
-        &attestor,
-        "b1-record",
-        "1712345678.000530",
-        user,
-        &assistant,
-    )
-    .await;
-    assert_eq!(
-        result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded,
-        "B1: separately write-charged growth must not consume original-load budget: {result:?}"
-    );
-    let data = walk(&root)
-        .into_iter()
-        .filter(|path| path.parent().is_some_and(|parent| parent.ends_with("data")))
-        .map(|path| fs::read(path).expect("private data"))
-        .collect::<Vec<_>>();
-    let actual_dedup = data
-        .iter()
-        .find(|bytes| bytes.starts_with(&dedup))
-        .expect("dedup preserved");
-    assert_eq!(actual_dedup.len(), 261_702 + 217);
-    assert_eq!(
-        actual_dedup.iter().filter(|byte| **byte == b'\n').count(),
-        1_207
-    );
-    let compacted = data
-        .iter()
-        .find(|bytes| {
-            bytes
-                .windows(b"dekopon.chat-memory.turn".len())
-                .any(|window| window == b"dekopon.chat-memory.turn")
-        })
-        .expect("compacted turns");
-    assert!(compacted.len() <= config.compaction_target_bytes as usize);
-    assert!(compacted.len() < turns.len());
-    let recent = query_memory_in(
-        &broker,
-        &session,
-        &attestor,
-        "b1-recent",
-        MEMORY_RECENT,
-        json!({"last": 1}),
-    )
-    .await;
-    assert_eq!(recent["turns"][0]["user"], user);
-    assert_eq!(recent["turns"][0]["assistant"], assistant);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
     let capture = CaptureLayer::workspace();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
@@ -1691,7 +1561,7 @@ async fn record_turn(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the fixture exposes every dedup and namespace input independently"
+    reason = "the fixture exposes every delivery-identity and namespace input independently"
 )]
 async fn record_turn_in(
     broker: &Broker<InMemoryAuditLog>,
@@ -2312,80 +2182,6 @@ fn generation_count(root: &Path) -> usize {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .count()
-}
-
-#[derive(serde::Serialize)]
-struct SeedTurn<'a> {
-    format: &'static str,
-    version: u8,
-    id: String,
-    commitment: String,
-    user: &'a str,
-    assistant: String,
-}
-
-fn canonical_turn_line_bytes(user: &str, assistant: &str) -> u64 {
-    let commitment = format!("sha256:{}", "0".repeat(64));
-    serde_json::to_vec(&SeedTurn {
-        format: "dekopon.chat-memory.turn",
-        version: 1,
-        id: commitment.clone(),
-        commitment,
-        user,
-        assistant: assistant.to_owned(),
-    })
-    .expect("canonical turn")
-    .len() as u64
-        + 1
-}
-
-fn seed_turn_file(target: u64, maximum_line: u64) -> Vec<u8> {
-    const RECORDS: usize = 400;
-    let commitment = format!("sha256:{}", "0".repeat(64));
-    let minimum_lines = (0..RECORDS)
-        .map(|index| {
-            serde_json::to_vec(&SeedTurn {
-                format: "dekopon.chat-memory.turn",
-                version: 1,
-                id: format!("sha256:{index:064x}"),
-                commitment: commitment.clone(),
-                user: "seed",
-                assistant: String::new(),
-            })
-            .expect("minimum seed turn")
-            .len() as u64
-                + 1
-        })
-        .collect::<Vec<_>>();
-    assert!(minimum_lines.iter().all(|line| *line < maximum_line));
-    let mut remaining = target;
-    let mut output = Vec::with_capacity(target as usize);
-    for index in 0..RECORDS {
-        let minimum_after = minimum_lines[index + 1..].iter().sum::<u64>();
-        let line_target = maximum_line.min(
-            remaining
-                .checked_sub(minimum_after)
-                .expect("target fits remaining minimum lines"),
-        );
-        let filler = line_target
-            .checked_sub(minimum_lines[index])
-            .expect("line has filler headroom");
-        let line = serde_json::to_vec(&SeedTurn {
-            format: "dekopon.chat-memory.turn",
-            version: 1,
-            id: format!("sha256:{index:064x}"),
-            commitment: commitment.clone(),
-            user: "seed",
-            assistant: "x".repeat(filler as usize),
-        })
-        .expect("seed turn");
-        assert_eq!(line.len() as u64 + 1, line_target);
-        output.extend_from_slice(&line);
-        output.push(b'\n');
-        remaining -= line_target;
-    }
-    assert_eq!(remaining, 0);
-    output
 }
 
 fn snapshot_tree_bytes(path: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {

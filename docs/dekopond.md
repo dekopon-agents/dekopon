@@ -1183,8 +1183,8 @@ namespace creation, preventing cross-transport aliases. Local identities include
 OS-random boot nonce, connection, and sequence, so restarts do not collide.
 
 Durable retrieval is not conversation replay. It is never automatically inserted into a later
-prompt. JSONL deduplication is permanent but finite; at capacity recording stops while reads
-continue. There is no deletion/export UX or encryption-at-rest claim.
+prompt. Recording never deduplicates: a redelivered message becomes a second stored turn. There is
+no deletion/export UX or encryption-at-rest claim.
 
 ## Authorization flow
 

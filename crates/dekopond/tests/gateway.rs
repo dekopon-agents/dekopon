@@ -150,8 +150,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "maxQueryBytes": 256,
             "maxResultBytes": 65_536,
             "maxTurnBytes": 32_768,
-            "maxDedupRecords": 16_000,
-            "maxDedupBytes": 4_194_304,
             "compactionTargetBytes": 8_388_608,
             "compactionThresholdBytes": 12_582_912
         }

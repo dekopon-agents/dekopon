@@ -180,7 +180,8 @@ transport, channel, and conversation: `stable` survives semantic authority chang
 `authority-bound` persists an opaque pointer and random epoch so A→B→A creates three generations.
 Generic shared-conversation and agent-scoped storage deliberately omit the sender and use stable
 continuity; authenticated authorization remains individual for every caller.
-The store has finite permanent deduplication and no deletion/export UX or encryption-at-rest claim.
+The store deduplicates nothing: every recorded call appends its own turn. It has no deletion/export
+UX or encryption-at-rest claim.
 
 Slack Agent channel continuation is also current. One explicitly
 addressed, freshly authorized message claims an exact workspace/channel/thread/sender tuple in a
