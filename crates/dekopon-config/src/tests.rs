@@ -60,35 +60,8 @@ fn accepts_json_as_a_yaml_subset() {
 }
 
 #[test]
-fn rejects_duplicate_resources() {
-    let document = standalone_agent("reviewer");
-    let input = format!("{document}---\n{document}");
-    let error =
-        LocalCatalog::from_str("duplicate.yaml", &input).expect_err("duplicate agent must fail");
-
-    assert!(matches!(
-        problems(&error),
-        [CatalogProblem::DuplicateResource { .. }]
-    ));
-    assert!(error.to_string().contains("first declared"));
-}
-
-#[test]
 fn every_unsupported_kind_is_reported_by_name() {
-    let input = r#"apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: github
-spec:
-  description: Test provider
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: github.pull-request.read
-spec:
-  description: Test capability
-"#;
+    let input = "kind: Provider\n---\nkind: Capability\n";
     let error = LocalCatalog::from_str("unsupported.yaml", input)
         .expect_err("a catalog naming unsupported kinds must fail");
 
@@ -129,36 +102,23 @@ fn rejects_unknown_fields() {
 
 #[test]
 fn every_problem_in_a_catalog_is_reported_at_once() {
-    let input = r#"apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: reviewer
-spec:
-  description: Test agent
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: reviewer
-spec:
-  description: Duplicate agent
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: github.pull-request.read
-spec:
-  description: Test capability
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: Reviewer.Two
-spec:
-  description: Test agent
-"#;
-    let error = LocalCatalog::from_str("many.yaml", input).expect_err("three problems must fail");
+    let document = standalone_agent("reviewer");
+    let input = format!(
+        "{document}---\n{}---\nkind: Capability\n---\n{}",
+        document.replace("Test agent", "Duplicate agent"),
+        standalone_agent("Reviewer.Two")
+    );
+    let error = LocalCatalog::from_str("many.yaml", &input).expect_err("three problems must fail");
     let rendered = error.to_string();
+
+    assert!(matches!(
+        problems(&error),
+        [
+            CatalogProblem::DuplicateResource { .. },
+            CatalogProblem::UnsupportedKind { .. },
+            CatalogProblem::InvalidName { .. }
+        ]
+    ));
 
     assert!(
         rendered.contains("3 validation problems found:"),
@@ -300,17 +260,7 @@ fn agent_with_skills(skills: &[&str]) -> String {
         .iter()
         .map(|path| format!("    - {path}\n"))
         .collect::<String>();
-    format!(
-        r#"apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: reviewer
-spec:
-  description: Test agent
-  skills:
-{mounted}status: Ready
-"#
-    )
+    standalone_agent("reviewer").replace("status:", &format!("  skills:\n{mounted}status:"))
 }
 
 #[test]
