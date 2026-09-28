@@ -190,105 +190,64 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
         token(shared, a, "reviewer", "storage-probe", "thread-1"),
         cross_transport(shared)
     );
-    let mut first = host
-        .begin(
-            host.grant(request(
-                agent,
-                a,
+    for (scope, file, conversation) in [
+        (agent, "shared.jsonl", "thread-2"),
+        (shared, "conversation.jsonl", "thread-1"),
+    ] {
+        let make = |subject, conversation, surface: &[u8]| {
+            request(
+                scope,
+                subject,
                 "reviewer",
                 "storage-probe",
-                "thread-1",
-                b"broad",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    first
-        .jsonl_append("shared.jsonl", 0, br#"{"shared":true}"#)
-        .unwrap();
-    first.commit().unwrap();
-    let mut second = host
-        .begin(
-            host.grant(request(
-                agent,
-                b,
-                "reviewer",
-                "storage-probe",
-                "thread-2",
-                b"narrow",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(second.jsonl_size("shared.jsonl").unwrap() > 0);
-    second.commit().unwrap();
-    let mut third = host
-        .begin(
-            host.grant(request_at(
-                agent,
-                "discord.123456789012345678",
-                "reviewer",
-                "storage-probe",
-                "discord",
-                "discord-server",
-                "other-thread",
-                b"other-authority",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(third.jsonl_size("shared.jsonl").unwrap() > 0);
-    third.commit().unwrap();
-    let mut shared_writer = host
-        .begin(
-            host.grant(request(
-                shared,
-                a,
-                "reviewer",
-                "storage-probe",
-                "thread-1",
-                b"broad",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    shared_writer
-        .jsonl_append("conversation.jsonl", 0, br#"{"shared":true}"#)
-        .unwrap();
-    shared_writer.commit().unwrap();
-    let mut participant = host
-        .begin(
-            host.grant(request(
-                shared,
-                b,
-                "reviewer",
-                "storage-probe",
-                "thread-1",
-                b"narrow",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(participant.jsonl_size("conversation.jsonl").unwrap() > 0);
-    participant.finish_read().unwrap();
-    let mut elsewhere = host
-        .begin(
-            host.grant(request(
-                shared,
-                b,
-                "reviewer",
-                "storage-probe",
-                "thread-2",
-                b"narrow",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(matches!(
-        elsewhere.jsonl_size("conversation.jsonl"),
-        Err(dekopon_storage_host::StorageHostError::NotFound)
-    ));
-    elsewhere.finish_read().unwrap();
+                conversation,
+                surface,
+            )
+        };
+        let mut writer = host
+            .begin(host.grant(make(a, "thread-1", b"broad")).unwrap())
+            .unwrap();
+        writer.jsonl_append(file, 0, br#"{"shared":true}"#).unwrap();
+        writer.commit().unwrap();
+        let mut reader = host
+            .begin(host.grant(make(b, conversation, b"narrow")).unwrap())
+            .unwrap();
+        assert!(reader.jsonl_size(file).unwrap() > 0);
+        match scope {
+            StorageScope::Agent => {
+                reader.commit().unwrap();
+                let mut third = host
+                    .begin(
+                        host.grant(request_at(
+                            agent,
+                            "discord.123456789012345678",
+                            "reviewer",
+                            "storage-probe",
+                            "discord",
+                            "discord-server",
+                            "other-thread",
+                            b"other-authority",
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                assert!(third.jsonl_size(file).unwrap() > 0);
+                third.commit().unwrap();
+            }
+            StorageScope::SharedConversation => {
+                reader.finish_read().unwrap();
+                let mut elsewhere = host
+                    .begin(host.grant(make(b, "thread-2", b"narrow")).unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    elsewhere.jsonl_size(file),
+                    Err(dekopon_storage_host::StorageHostError::NotFound)
+                ));
+                elsewhere.finish_read().unwrap();
+            }
+            StorageScope::PrivateConversation => unreachable!(),
+        }
+    }
 }
 
 #[test]
@@ -544,110 +503,29 @@ fn concurrent_grant_and_sweep_never_recreate_a_path_behind_an_unlinked_lease() {
 }
 
 #[test]
-fn partial_sweep_error_preserves_identity_then_recovers_and_releases_quota() {
+fn partial_sweep_preserves_metadata_and_releases_quota() {
     use std::os::unix::fs::PermissionsExt as _;
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().canonicalize().unwrap().join("storage");
-    let limits = StorageLimits {
-        max_namespaces: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, limits).unwrap();
-    let make = |surface: &[u8]| {
-        request(
-            StorageScope::PrivateConversation,
-            "slack.t0123abc.u9xyz",
-            "reviewer",
-            "storage-probe",
-            "thread-1",
-            surface,
-        )
-    };
-    let token = host
-        .prepare_grant(make(b"a"))
-        .unwrap()
-        .namespace()
-        .to_owned();
-    let path = base(&root, &token);
-    let mut first_generation = None;
-    let mut pointers = Vec::new();
-    for surface in [b"a".as_slice(), b"b"] {
-        let mut handle = host.begin(host.grant(make(surface)).unwrap()).unwrap();
-        handle
-            .jsonl_append("turns.jsonl", 0, br#"{"one":true}"#)
-            .unwrap();
-        handle.commit().unwrap();
-        pointers.push(fs::read(path.join("current")).unwrap());
-        if first_generation.is_none() {
-            first_generation = Some(
-                fs::read_dir(&path)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .find(|entry| entry.is_dir())
-                    .unwrap(),
-            );
-        }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Ceiling {
+        Namespaces,
+        Bytes,
+        Entries,
     }
-    let mut generations = fs::read_dir(&path)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().unwrap().is_dir())
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    generations.sort();
-    assert_eq!(generations.len(), 2);
-    let (retained_pointer, removed_surface): (&[u8], &[u8]) =
-        if generations[0] == first_generation.unwrap() {
-            (&pointers[0], b"a")
-        } else {
-            (&pointers[1], b"b")
-        };
-    fs::write(path.join("current"), retained_pointer).unwrap();
-    let protected = generations[1].join("data");
-    fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
-    old_marker(&path.join("last-used"));
-    let ttl = BTreeMap::from([(
-        (
-            "storage-probe".parse().unwrap(),
-            StorageScope::PrivateConversation,
-        ),
-        StorageRetention::IdleTtl(Duration::from_secs(10)),
-    )]);
-    let result = host.sweep(&ttl).unwrap();
-    fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(result.errors, 1);
-    assert!(path.join("identity").exists());
-    assert!(path.join("last-used").exists());
-    assert_eq!(fs::read(path.join("current")).unwrap(), retained_pointer);
-    let reset = host.grant(make(removed_surface)).unwrap_err();
-    assert!(reset.namespace_reset(), "{reset:?}");
-    old_marker(&path.join("last-used"));
-    assert_eq!(host.sweep(&ttl).unwrap().deleted, 1);
-    assert!(!path.exists());
-    host.begin(
-        host.grant(request(
-            StorageScope::Agent,
-            "slack.t0123abc.u9xyz",
-            "reviewer",
-            "storage-probe",
-            "thread-2",
-            b"new",
-        ))
-        .unwrap(),
-    )
-    .unwrap()
-    .commit()
-    .unwrap();
-}
-
-#[test]
-fn partial_sweep_releases_root_bytes_and_entries_before_retry() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    for ceiling in ["bytes", "entries"] {
+    for ceiling in [Ceiling::Namespaces, Ceiling::Bytes, Ceiling::Entries] {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap().join("storage");
-        let seed = StorageHost::open(&root, StorageLimits::default()).unwrap();
+        let seed = StorageHost::open(
+            &root,
+            StorageLimits {
+                max_namespaces: match ceiling {
+                    Ceiling::Namespaces => 1,
+                    _ => StorageLimits::default().max_namespaces,
+                },
+                ..StorageLimits::default()
+            },
+        )
+        .unwrap();
         let make = |surface: &[u8]| {
             request(
                 StorageScope::PrivateConversation,
@@ -690,21 +568,25 @@ fn partial_sweep_releases_root_bytes_and_entries_before_retry() {
             .collect::<Vec<_>>();
         generations.sort();
         assert_eq!(generations.len(), 2);
-        let current_surface: &[u8] = if generations[1] == first_generation.unwrap() {
-            fs::write(path.join("current"), &pointers[0]).unwrap();
-            b"a"
-        } else {
-            b"b"
+        let current = match ceiling {
+            Ceiling::Namespaces => 0,
+            Ceiling::Bytes | Ceiling::Entries => 1,
         };
+        let (retained_pointer, current_surface): (&[u8], &[u8]) =
+            if generations[current] == first_generation.unwrap() {
+                (&pointers[0], b"a")
+            } else {
+                (&pointers[1], b"b")
+            };
+        fs::write(path.join("current"), retained_pointer).unwrap();
         let baseline = logical_usage(&root);
-        drop(seed);
         let limits = StorageLimits {
-            max_root_bytes: if ceiling == "bytes" {
+            max_root_bytes: if matches!(ceiling, Ceiling::Bytes) {
                 baseline.0
             } else {
                 StorageLimits::default().max_root_bytes
             },
-            startup_max_entries: if ceiling == "entries" {
+            startup_max_entries: if matches!(ceiling, Ceiling::Entries) {
                 baseline.1
             } else {
                 StorageLimits::default().startup_max_entries
@@ -715,18 +597,25 @@ fn partial_sweep_releases_root_bytes_and_entries_before_retry() {
             max_files_per_namespace: 4,
             ..StorageLimits::default()
         };
-        let host = StorageHost::open(&root, limits).unwrap();
-        let mut before = host
-            .begin(host.grant(make(current_surface)).unwrap())
-            .unwrap();
-        assert!(
-            matches!(
-                before.jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#),
-                Err(dekopon_storage_host::StorageHostError::QuotaExceeded)
-            ),
-            "{ceiling}"
-        );
-        drop(before);
+        let host = match ceiling {
+            Ceiling::Namespaces => seed,
+            Ceiling::Bytes | Ceiling::Entries => {
+                drop(seed);
+                let host = StorageHost::open(&root, limits).unwrap();
+                let mut before = host
+                    .begin(host.grant(make(current_surface)).unwrap())
+                    .unwrap();
+                assert!(
+                    matches!(
+                        before.jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#),
+                        Err(dekopon_storage_host::StorageHostError::QuotaExceeded)
+                    ),
+                    "{ceiling:?}"
+                );
+                drop(before);
+                host
+            }
+        };
 
         let protected = generations[1].join("data");
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
@@ -738,26 +627,37 @@ fn partial_sweep_releases_root_bytes_and_entries_before_retry() {
             ),
             StorageRetention::IdleTtl(Duration::from_secs(10)),
         )]);
-        assert_eq!(host.sweep(&ttl).unwrap().errors, 1, "{ceiling}");
+        assert_eq!(host.sweep(&ttl).unwrap().errors, 1, "{ceiling:?}");
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
-        let after_partial = logical_usage(&root);
-        assert!(
-            after_partial.0 < baseline.0 && after_partial.1 < baseline.1,
-            "{ceiling}"
-        );
-        assert!(path.join("current").exists(), "{ceiling}");
-        let mut after = host
-            .begin(host.grant(make(current_surface)).unwrap())
-            .unwrap();
-        assert!(after.jsonl_size("turns.jsonl").unwrap() > 0, "{ceiling}");
-        after
-            .jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#)
-            .unwrap();
-        after.commit().unwrap();
+        match ceiling {
+            Ceiling::Namespaces => {
+                assert!(path.join("identity").exists());
+                assert!(path.join("last-used").exists());
+                assert_eq!(fs::read(path.join("current")).unwrap(), retained_pointer);
+                let reset = host.grant(make(current_surface)).unwrap_err();
+                assert!(reset.namespace_reset(), "{reset:?}");
+            }
+            Ceiling::Bytes | Ceiling::Entries => {
+                let after_partial = logical_usage(&root);
+                assert!(
+                    after_partial.0 < baseline.0 && after_partial.1 < baseline.1,
+                    "{ceiling:?}"
+                );
+                assert!(path.join("current").exists(), "{ceiling:?}");
+                let mut after = host
+                    .begin(host.grant(make(current_surface)).unwrap())
+                    .unwrap();
+                assert!(after.jsonl_size("turns.jsonl").unwrap() > 0, "{ceiling:?}");
+                after
+                    .jsonl_append("extra.jsonl", 0, br#"{"extra":true}"#)
+                    .unwrap();
+                after.commit().unwrap();
+            }
+        }
 
         old_marker(&path.join("last-used"));
-        assert_eq!(host.sweep(&ttl).unwrap().deleted, 1, "{ceiling}");
-        assert!(!path.exists(), "{ceiling}");
+        assert_eq!(host.sweep(&ttl).unwrap().deleted, 1, "{ceiling:?}");
+        assert!(!path.exists(), "{ceiling:?}");
         host.begin(
             host.grant(request(
                 StorageScope::Agent,
