@@ -149,62 +149,33 @@ fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
     };
     assert!(memory.validate(&formerly_staged_copy_rejection).is_ok());
 
-    let exact_write_call = dekopon_storage_host::StorageLimits {
-        max_write_bytes_per_call: memory.compaction_target_bytes,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&exact_write_call).is_ok());
-    let one_below_write_call = dekopon_storage_host::StorageLimits {
-        max_write_bytes_per_call: memory.compaction_target_bytes - 1,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&one_below_write_call).is_err());
-
-    let exact_file = memory.compaction_threshold_bytes + memory.max_turn_bytes;
-    let exact_file_limit = dekopon_storage_host::StorageLimits {
-        max_file_bytes: exact_file,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&exact_file_limit).is_ok());
-    let one_below_file_limit = dekopon_storage_host::StorageLimits {
-        max_file_bytes: exact_file - 1,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&one_below_file_limit).is_err());
-
-    let exact_namespace = memory.compaction_threshold_bytes + memory.max_turn_bytes + 32 * 4_096;
-    let exact_namespace_limit = dekopon_storage_host::StorageLimits {
-        max_namespace_bytes: exact_namespace,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&exact_namespace_limit).is_ok());
-    let one_below_namespace_limit = dekopon_storage_host::StorageLimits {
-        max_namespace_bytes: exact_namespace - 1,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(memory.validate(&one_below_namespace_limit).is_err());
-
-    let exact_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 4,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(minimal.validate(&exact_host_calls).is_ok());
-    let one_below_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 3,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(minimal.validate(&one_below_host_calls).is_err());
-
-    let exact_file_count = dekopon_storage_host::StorageLimits {
-        max_files_per_namespace: 1,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(minimal.validate(&exact_file_count).is_ok());
-    let one_below_file_count = dekopon_storage_host::StorageLimits {
-        max_files_per_namespace: 0,
-        ..dekopon_storage_host::StorageLimits::default()
-    };
-    assert!(minimal.validate(&one_below_file_count).is_err());
+    type Limit = fn(&mut dekopon_storage_host::StorageLimits) -> &mut u64;
+    let boundaries: &[(&ChatMemoryConfig, Limit, u64)] = &[
+        (
+            &memory,
+            |v| &mut v.max_write_bytes_per_call,
+            memory.compaction_target_bytes,
+        ),
+        (
+            &memory,
+            |v| &mut v.max_file_bytes,
+            memory.compaction_threshold_bytes + memory.max_turn_bytes,
+        ),
+        (
+            &memory,
+            |v| &mut v.max_namespace_bytes,
+            memory.compaction_threshold_bytes + memory.max_turn_bytes + 32 * 4_096,
+        ),
+        (&minimal, |v| &mut v.max_host_calls_per_invocation, 4),
+        (&minimal, |v| &mut v.max_files_per_namespace, 1),
+    ];
+    for (config, field, exact) in boundaries {
+        let mut limits = dekopon_storage_host::StorageLimits::default();
+        *field(&mut limits) = *exact;
+        assert!(config.validate(&limits).is_ok());
+        *field(&mut limits) = exact - 1;
+        assert!(config.validate(&limits).is_err());
+    }
 
     let mut result_too_small_for_empty_history = minimal;
     result_too_small_for_empty_history.max_result_bytes = 29;
@@ -792,37 +763,18 @@ fn policy_http_scope_values_are_bounded() {
         );
     }
 
-    let unbounded = [
-        dekopon_capability::HttpConstraints {
-            allowed_hosts: Vec::new(),
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            allowed_methods: Vec::new(),
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            allowed_hosts: (0..65).map(|index| format!("h{index}.test")).collect(),
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            allowed_methods: (0..65).map(|index| format!("M{index}")).collect(),
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            max_requests: 0,
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            max_request_bytes: 0,
-            ..valid.clone()
-        },
-        dekopon_capability::HttpConstraints {
-            max_response_bytes: 0,
-            ..valid
-        },
+    let unbounded: &[fn(&mut HttpConstraints)] = &[
+        |v| v.allowed_hosts.clear(),
+        |v| v.allowed_methods.clear(),
+        |v| v.allowed_hosts = (0..65).map(|index| format!("h{index}.test")).collect(),
+        |v| v.allowed_methods = (0..65).map(|index| format!("M{index}")).collect(),
+        |v| v.max_requests = 0,
+        |v| v.max_request_bytes = 0,
+        |v| v.max_response_bytes = 0,
     ];
-    for http in unbounded {
+    for mutate in unbounded {
+        let mut http = valid.clone();
+        mutate(&mut http);
         assert!(
             super::validate_set_constraints(&constrain(http.clone())).is_err(),
             "{http:?} must not start this broker"
@@ -898,51 +850,38 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
 
 #[test]
 fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_own_code() {
-    let failure = BrokerHostError::ProviderFailure {
-        provider: "gpt-image".parse::<ProviderId>().expect("valid provider"),
-        capability: "gpt-image.edit"
-            .parse::<CapabilityId>()
-            .expect("valid capability"),
-        code: "upstream-rejected".to_owned(),
-        message: "the image route refused the request with HTTP 400 (moderation_blocked: the \
-                  request was rejected)"
-            .to_owned(),
-    };
-
-    assert_eq!(
-        public_host_error(&failure, CapabilityRoute::Generic),
-        "provider-failure"
-    );
-    assert_eq!(
-        provider_failure_detail(&failure),
-        Some(ProviderFailureDetail::new(
-            "upstream-rejected",
-            "the image route refused the request with HTTP 400 (moderation_blocked: the request \
-             was rejected)"
-        ))
-    );
-}
-
-#[test]
-fn a_provider_message_past_its_bound_is_cut_before_it_leaves_the_broker() {
-    let failure = BrokerHostError::ProviderFailure {
-        provider: "gpt-image".parse::<ProviderId>().expect("valid provider"),
-        capability: "gpt-image.edit"
-            .parse::<CapabilityId>()
-            .expect("valid capability"),
-        code: "upstream-rejected".to_owned(),
-        message: "m".repeat(MAX_FAILURE_MESSAGE_BYTES + 1),
-    };
-
-    let detail = provider_failure_detail(&failure).expect("a typed provider failure has a detail");
-
-    assert_eq!(
-        detail.message,
-        format!(
-            "{}\u{2026}[truncated]",
-            "m".repeat(MAX_FAILURE_MESSAGE_BYTES)
-        )
-    );
+    let message = "the image route refused the request with HTTP 400 (moderation_blocked: the \
+                   request was rejected)";
+    for (message, expected) in [
+        (message.to_owned(), message.to_owned()),
+        (
+            "m".repeat(MAX_FAILURE_MESSAGE_BYTES + 1),
+            format!(
+                "{}\u{2026}[truncated]",
+                "m".repeat(MAX_FAILURE_MESSAGE_BYTES)
+            ),
+        ),
+    ] {
+        let failure = BrokerHostError::ProviderFailure {
+            provider: "gpt-image".parse::<ProviderId>().expect("valid provider"),
+            capability: "gpt-image.edit"
+                .parse::<CapabilityId>()
+                .expect("valid capability"),
+            code: "upstream-rejected".to_owned(),
+            message,
+        };
+        assert_eq!(
+            public_host_error(&failure, CapabilityRoute::Generic),
+            "provider-failure"
+        );
+        assert_eq!(
+            provider_failure_detail(&failure),
+            Some(ProviderFailureDetail {
+                code: "upstream-rejected".to_owned(),
+                message: expected,
+            })
+        );
+    }
 }
 
 #[test]
