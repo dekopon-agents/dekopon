@@ -100,7 +100,9 @@ fetch_provider() {
       release=v0.5.0
       expected_sha=42488b0970422ab58a69f0abdd95aafd12f08bf1f16feca9ff59dae7acd10dc3
       expected_size=243968
-      signer="$repository/.github/workflows/release.yml"
+      # v0.5.0 builds through the shared reusable workflow, so the attestation's signer
+      # identity is provider-workflows' release.yml, not this repository's caller stub.
+      signer=dekopon-agents/provider-workflows/.github/workflows/release.yml
       source_ref=refs/tags/v0.5.0
       source_digest=f9df308b31a2a4f75b55c606cdb42fbe0c0fcc59
       ;;
