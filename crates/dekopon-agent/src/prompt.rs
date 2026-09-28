@@ -293,8 +293,6 @@ impl<'a> SessionInputs<'a> {
         self
     }
 
-    /// Independent of `with_agent_config`: the identifier rides `accounting.model.turn` whether or
-    /// not the route also offers `inspect_agent_config`.
     #[must_use]
     pub const fn with_agent(mut self, agent: &'a str) -> Self {
         self.agent = Some(agent);

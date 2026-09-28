@@ -7,12 +7,6 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
-### Added
-
-- `accounting.model.turn` carries an `agent` field, the calling agent's catalog ID, when the
-  embedder supplied one; `dekopond` always does. Turns a `trace_id` join against `gateway.session`
-  into a plain filter for per-agent accounting (#248).
-
 ### Changed
 
 - **Breaking:** `sessions.journal.maxBytes` is removed and refused. Journal files not written for
