@@ -166,12 +166,11 @@ Bootstrap credentials are never DRN-addressable, which prevents resolver cycles 
 source-store token as application material; the map file itself is prohibited as a `secureFile`
 source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
-`broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. Expiring AWS
-sessions and GCP/Azure/Kubernetes access tokens must be refreshed out of band for *this* system: no
-adapter here renews anything, a chart-copied file changes only after a pod rollout, and no ambient
-workload-identity refresh chain is claimed. The one credential the broker does renew itself is the
-legacy `chatgptSubscription` kind below, which is a different mechanism entirely — a named credential
-file rather than a DRN, and no private-map source. That legacy binding
+`broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. AWS
+sessions and GCP/Azure/Kubernetes API access tokens must be refreshed externally; a chart-copied
+file changes only after a pod rollout. `kubernetesTokenRequest` instead reads a live kubelet-rotated
+API token and mints an audience-specific token per invocation. The broker also renews the legacy
+`chatgptSubscription` kind below, a different mechanism — a named credential file rather than a DRN. That legacy binding
 [will be replaced by public DRNs](design.md#legacy-credential-bindings), preserving refresh support.
 
 ```yaml
@@ -254,7 +253,8 @@ Source and final Basic/Bearer material ceilings are 1 MiB and 4 KiB respectively
 native Basic/Bearer constructor.
 Every remote source kind also accepts `timeoutMs` (default `10000`, at most `120000`), the deadline
 for its single fetch, and every configured `endpoint` or `vaultUrl` must be a credential-free HTTPS
-URL or a literal loopback HTTP URL; `secureFile` and `kubernetesProjection` take neither field.
+URL or a literal loopback HTTP URL, except `kubernetesTokenRequest`, which requires HTTPS with its
+configured CA. `secureFile` and `kubernetesProjection` take neither field.
 
 ### `secureFile`
 
@@ -301,6 +301,59 @@ The on-disk layout cannot prove whether kubelet sourced a Secret, ConfigMap, or 
 entry must explicitly state `declaredOrigin`. A ConfigMap declaration requires `acknowledgeNonSecretSource: true`; this is
 an explicit operator claim rather than filesystem attestation. Values receive Dekopon's downstream
 redaction but do not gain Kubernetes Secret storage/RBAC properties retroactively.
+
+### `kubernetesTokenRequest`
+
+```yaml
+source:
+  kind: kubernetesTokenRequest
+  endpoint: https://kubernetes.default.svc
+  bootstrapRoot: /var/run/dekopon-secrets/kubernetes-api
+  tokenKey: token
+  caKey: ca.crt
+  namespace: agents
+  serviceAccount: runner-client
+  audience: vm-runner
+  expirationSeconds: 600
+  timeoutMs: 10000
+```
+
+All fields except `timeoutMs` are required. `bootstrapRoot` is an absolute live AtomicWriter
+projection containing the broker pod's **API-audience** ServiceAccount token and cluster CA PEM
+bundle. `tokenKey` and `caKey` are single path components. Use a broker-only read-only projected
+volume through `broker.secretSourceVolumes`, with a `serviceAccountToken` source and the namespace's
+`kube-root-ca.crt` ConfigMap; never use an init copy or `subPath`. The CA bundle is read at startup,
+so CA changes require a broker restart. Only those CA roots are trusted for this source; hostname
+verification remains enabled. Redirects and ambient proxies are disabled.
+
+The broker posts `authentication.k8s.io/v1` `TokenRequest` to
+`/api/v1/namespaces/<namespace>/serviceaccounts/<serviceAccount>/token`, with exactly one audience
+and the configured `expirationSeconds` (an integer from 600 through 4294967295). The API determines
+the actual lifetime. The broker requires a valid future `status.expirationTimestamp`, rather than
+assuming the requested duration was granted, and extracts only `status.token` as application
+material. An expired/malformed response or failed issuance fails this invocation before the provider
+runs. The receiving service still verifies JWT issuer, audience, subject and expiry on each use;
+a token that expires during an invocation is not refreshed or retried.
+
+Every authorized resolution mints anew and re-reads the bootstrap token, so kubelet rotation is
+picked up immediately. There is no token cache, background task, persistence, stale fallback or
+`boundObjectRef`. Existing connection admission bounds concurrent resolutions, and `timeoutMs`
+bounds the API request and response under the existing source byte/header ceilings. Namespace,
+ServiceAccount and audience come only from this private map, never from provider/model arguments.
+The usual per-invocation `secret.use` decision and native sink/host/path/method limits remain required.
+
+The target ServiceAccount must already exist. Grant the broker pod's actual ServiceAccount only
+`create` on core `serviceaccounts/token`, restricted by `resourceNames: [runner-client]` in the
+configured namespace. A separate ServiceAccount subject can isolate a delegated caller at its
+verifier; it does not give a VM guest credentials. Offline JWT verification does not immediately
+revoke tokens when a ServiceAccount or bound object is deleted; expiry and the verifier's allowlist
+remain the cutoff mechanisms.
+
+Upgrade the broker binary to a version supporting this source **before** activating the new private
+map; older strict decoders reject it. No provider WIT or broker protocol change is required. A chart
+already supporting broker-only `secretSourceVolumes` needs no new values key; render it to verify
+mount isolation. Install the verifier's subject allowlist/quota and the ServiceAccount/RBAC/mounts
+before enabling the caller's capability and exact-DRN Cedar grants.
 
 ### 1Password Connect
 
@@ -559,7 +612,7 @@ The project-wide list is [`design.md`](design.md#non-goals). Local to this featu
 - Vault dynamic leases and lifecycle;
 - 1Password direct service-account SDK mode or file fields;
 - AWS ambient credential/role chains, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins;
-- custom secret-source CA bundles, mTLS, request signing as a provider sink;
+- custom CA bundles for sources other than `kubernetesTokenRequest`, mTLS, request signing as a provider sink;
 - cache/stale serving, automatic retries, or transformed-reflection prevention;
 - claims that a ConfigMap is a secret store or that an allowed endpoint cannot exfiltrate what it
   legitimately receives.

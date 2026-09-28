@@ -30,7 +30,11 @@ use serde::{
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::BorrowedFormatItem, macros::format_description};
+use time::{
+    OffsetDateTime,
+    format_description::{BorrowedFormatItem, well_known::Rfc3339},
+    macros::format_description,
+};
 use tokio::{
     fs::OpenOptions,
     io::AsyncReadExt as _,
@@ -175,6 +179,18 @@ enum SecretSource {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+    KubernetesTokenRequest {
+        endpoint: String,
+        bootstrap_root: PathBuf,
+        token_key: String,
+        ca_key: String,
+        namespace: String,
+        service_account: String,
+        audience: String,
+        expiration_seconds: u32,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
     KubernetesApi {
         endpoint: String,
         token_file: PathBuf,
@@ -254,11 +270,11 @@ const fn default_max_injections() -> u32 {
 struct ResolvedEntry {
     source: SecretSource,
     projection: Projection,
+    client: reqwest::Client,
 }
 
 struct MapResolver {
     entries: BTreeMap<SecretDrn, ResolvedEntry>,
-    client: reqwest::Client,
     expected_uid: u32,
 }
 
@@ -280,16 +296,19 @@ impl SecretResolver for MapResolver {
                 category: "missing",
             });
         };
-        let bytes = self.resolve_source(&entry.source).await.map_err(|error| {
-            tracing::warn!(
-                event = "secret_source_resolution_failed",
-                source_kind = entry.source.kind(),
-                category = error.category(),
-            );
-            SecretResolutionError {
-                category: error.category(),
-            }
-        })?;
+        let bytes = self
+            .resolve_source(&entry.source, &entry.client)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    event = "secret_source_resolution_failed",
+                    source_kind = entry.source.kind(),
+                    category = error.category(),
+                );
+                SecretResolutionError {
+                    category: error.category(),
+                }
+            })?;
         project(bytes, &entry.projection)
             .map(SecretMaterial::new)
             .map_err(|error| {
@@ -306,7 +325,11 @@ impl SecretResolver for MapResolver {
 }
 
 impl MapResolver {
-    async fn resolve_source(&self, source: &SecretSource) -> Result<Vec<u8>, SourceError> {
+    async fn resolve_source(
+        &self,
+        source: &SecretSource,
+        client: &reqwest::Client,
+    ) -> Result<Vec<u8>, SourceError> {
         match source {
             SecretSource::SecureFile { path } => {
                 read_private_file(path, self.expected_uid, HARD_MAX_SOURCE_RESPONSE_BYTES).await
@@ -332,6 +355,7 @@ impl MapResolver {
                 }
                 let value = self
                     .request_json(
+                        client,
                         Method::GET,
                         url,
                         Some((header::AUTHORIZATION, format!("Bearer {}", token.expose()))),
@@ -366,6 +390,7 @@ impl MapResolver {
                 timeout_ms,
             } => {
                 self.vault_read(
+                    client,
                     endpoint,
                     token_file,
                     namespace.as_deref(),
@@ -389,6 +414,7 @@ impl MapResolver {
                 timeout_ms,
             } => {
                 self.vault_read(
+                    client,
                     endpoint,
                     token_file,
                     namespace.as_deref(),
@@ -425,6 +451,7 @@ impl MapResolver {
                 }
                 let (value, credentials) = self
                     .aws_post(
+                        client,
                         &endpoint,
                         region,
                         "secretsmanager",
@@ -472,6 +499,7 @@ impl MapResolver {
                     .map_or_else(|| name.clone(), |selector| format!("{name}:{selector}"));
                 let (value, credentials) = self
                     .aws_post(
+                        client,
                         &endpoint,
                         region,
                         "ssm",
@@ -526,6 +554,7 @@ impl MapResolver {
                 }
                 let value = self
                     .request_json(
+                        client,
                         Method::GET,
                         url,
                         Some((header::AUTHORIZATION, format!("Bearer {}", token.expose()))),
@@ -575,6 +604,7 @@ impl MapResolver {
                 url.query_pairs_mut().append_pair("api-version", "7.4");
                 let value = self
                     .request_json(
+                        client,
                         Method::GET,
                         url,
                         Some((header::AUTHORIZATION, format!("Bearer {}", token.expose()))),
@@ -586,6 +616,63 @@ impl MapResolver {
                     scalar_bytes(value.get("value").ok_or(SourceError::Missing)?)?,
                     &[token.expose()],
                 )
+            }
+            SecretSource::KubernetesTokenRequest {
+                endpoint,
+                bootstrap_root,
+                token_key,
+                namespace,
+                service_account,
+                audience,
+                expiration_seconds,
+                timeout_ms,
+                ..
+            } => {
+                let token =
+                    parse_token(read_kubernetes_projection(bootstrap_root, token_key).await?)?;
+                let mut url = endpoint_url(endpoint, false)?;
+                url.path_segments_mut()
+                    .map_err(|source| classified(SourceError::Config, &source))?
+                    .clear()
+                    .extend([
+                        "api",
+                        "v1",
+                        "namespaces",
+                        namespace,
+                        "serviceaccounts",
+                        service_account,
+                        "token",
+                    ]);
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "authentication.k8s.io/v1",
+                    "kind": "TokenRequest",
+                    "spec": {
+                        "audiences": [audience],
+                        "expirationSeconds": expiration_seconds,
+                    },
+                }))
+                .map_err(|source| classified(SourceError::Malformed, &source))?;
+                let value = bounded_json(
+                    client
+                        .post(url)
+                        .bearer_auth(token.expose())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body),
+                    *timeout_ms,
+                )
+                .await?;
+                let expiration = value
+                    .pointer("/status/expirationTimestamp")
+                    .and_then(Value::as_str)
+                    .ok_or(SourceError::Malformed)?;
+                let expiration = OffsetDateTime::parse(expiration, &Rfc3339)
+                    .map_err(|source| classified(SourceError::Malformed, &source))?;
+                if expiration <= OffsetDateTime::now_utc() {
+                    return Err(SourceError::Expired);
+                }
+                let material = value.pointer("/status/token").ok_or(SourceError::Missing)?;
+                let material = parse_token(scalar_bytes(material)?)?;
+                reject_bootstrap_reflection(material.into_inner().into_bytes(), &[token.expose()])
             }
             SecretSource::KubernetesApi {
                 endpoint,
@@ -611,6 +698,7 @@ impl MapResolver {
                 }
                 let value = self
                     .request_json(
+                        client,
                         Method::GET,
                         url,
                         Some((header::AUTHORIZATION, format!("Bearer {}", token.expose()))),
@@ -653,6 +741,7 @@ impl MapResolver {
     #[allow(clippy::too_many_arguments)]
     async fn vault_read(
         &self,
+        client: &reqwest::Client,
         endpoint: &str,
         token_file: &Path,
         namespace: Option<&str>,
@@ -683,7 +772,7 @@ impl MapResolver {
             url.query_pairs_mut()
                 .append_pair("version", &version.to_string());
         }
-        let mut request = self.client.get(url).header("x-vault-token", token.expose());
+        let mut request = client.get(url).header("x-vault-token", token.expose());
         if let Some(namespace) = namespace {
             request = request.header("x-vault-namespace", namespace);
         }
@@ -703,13 +792,14 @@ impl MapResolver {
 
     async fn request_json(
         &self,
+        client: &reqwest::Client,
         method: Method,
         url: Url,
         authorization: Option<(header::HeaderName, String)>,
         body: Option<Vec<u8>>,
         timeout_ms: u64,
     ) -> Result<Value, SourceError> {
-        let mut request = self.client.request(method, url);
+        let mut request = client.request(method, url);
         if let Some((name, value)) = authorization {
             request = request.header(name, value);
         }
@@ -724,6 +814,7 @@ impl MapResolver {
     #[allow(clippy::too_many_arguments)]
     async fn aws_post(
         &self,
+        client: &reqwest::Client,
         endpoint: &str,
         region: &str,
         service: &str,
@@ -786,8 +877,7 @@ impl MapResolver {
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
             credentials.access_key_id
         );
-        let mut request = self
-            .client
+        let mut request = client
             .post(url)
             .header(header::CONTENT_TYPE, "application/x-amz-json-1.1")
             .header(header::HOST, authority)
@@ -804,20 +894,25 @@ impl MapResolver {
 }
 
 impl SecretSource {
-    fn bootstrap_path(&self) -> Option<&Path> {
+    fn bootstrap_path(&self) -> Option<PathBuf> {
         match self {
             Self::OnePasswordConnect { token_file, .. }
             | Self::VaultKv1 { token_file, .. }
             | Self::VaultKv2 { token_file, .. }
             | Self::GcpSecretManager { token_file, .. }
             | Self::AzureKeyVault { token_file, .. }
-            | Self::KubernetesApi { token_file, .. } => Some(token_file),
+            | Self::KubernetesApi { token_file, .. } => Some(token_file.clone()),
+            Self::KubernetesTokenRequest {
+                bootstrap_root,
+                token_key,
+                ..
+            } => Some(bootstrap_root.join(token_key)),
             Self::AwsSecretsManager {
                 credentials_file, ..
             }
             | Self::AwsSsmParameter {
                 credentials_file, ..
-            } => Some(credentials_file),
+            } => Some(credentials_file.clone()),
             Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
         }
     }
@@ -842,6 +937,7 @@ impl SecretSource {
             Self::GcpSecretManager { .. } => "gcp-secret-manager",
             Self::AzureKeyVault { .. } => "azure-key-vault",
             Self::KubernetesApi { .. } => "kubernetes-api",
+            Self::KubernetesTokenRequest { .. } => "kubernetes-token-request",
         }
     }
 
@@ -996,6 +1092,29 @@ impl SecretSource {
                 }
                 validate_timeout(*timeout_ms)
             }
+            Self::KubernetesTokenRequest {
+                endpoint,
+                bootstrap_root,
+                token_key,
+                ca_key,
+                namespace,
+                service_account,
+                audience,
+                expiration_seconds,
+                timeout_ms,
+            } => {
+                validate_endpoint(endpoint, false)?;
+                validate_absolute(bootstrap_root)?;
+                validate_one_component(token_key)?;
+                validate_one_component(ca_key)?;
+                validate_texts([namespace, service_account, audience])?;
+                validate_locator_segment(namespace)?;
+                validate_locator_segment(service_account)?;
+                if *expiration_seconds < 600 {
+                    return Err("TokenRequest expirationSeconds must be at least 600");
+                }
+                validate_timeout(*timeout_ms)
+            }
             Self::KubernetesApi {
                 endpoint,
                 token_file,
@@ -1032,10 +1151,10 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
         })?;
     let file = serde_yaml::from_slice::<SecretMapFile>(&bytes)
         .map_err(|source| SecretMapError::Decode { source })?;
-    validate_map(file, path, expected_uid)
+    validate_map(file, path, expected_uid).await
 }
 
-fn validate_map(
+async fn validate_map(
     file: SecretMapFile,
     map_path: &Path,
     expected_uid: u32,
@@ -1071,7 +1190,7 @@ fn validate_map(
             problems.push(format!("{} source is invalid: {reason}", entry.drn));
         }
         if let Some(path) = entry.source.bootstrap_path() {
-            bootstrap_paths.insert(path.to_path_buf());
+            bootstrap_paths.insert(path);
         }
         if let Some(path) = entry.source.material_file() {
             material_paths.insert(path);
@@ -1135,13 +1254,7 @@ fn validate_map(
             }
             bindings.push(resolved);
         }
-        entries.insert(
-            entry.drn,
-            ResolvedEntry {
-                source: entry.source,
-                projection: entry.projection,
-            },
-        );
+        entries.insert(entry.drn, (entry.source, entry.projection));
     }
     if bootstrap_paths.contains(map_path) {
         problems
@@ -1172,14 +1285,54 @@ fn validate_map(
         .no_proxy()
         .build()
         .map_err(|source| SecretMapError::Client { source })?;
+    let mut resolved_entries = BTreeMap::new();
+    for (drn, (source, projection)) in entries {
+        let client = match &source {
+            SecretSource::KubernetesTokenRequest {
+                bootstrap_root,
+                ca_key,
+                ..
+            } => kubernetes_client(bootstrap_root, ca_key)
+                .await
+                .map_err(|source| SecretMapError::Source { source })?,
+            _ => client.clone(),
+        };
+        resolved_entries.insert(
+            drn,
+            ResolvedEntry {
+                source,
+                projection,
+                client,
+            },
+        );
+    }
     let resolver = Arc::new(MapResolver {
-        entries,
-        client,
+        entries: resolved_entries,
         expected_uid,
     });
     SecretCatalog::new(bindings, resolver)
         .and_then(|catalog| catalog.with_authority_revision(file.map_revision))
         .map_err(|source| SecretMapError::Catalog { source })
+}
+
+async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client, SourceError> {
+    let pem = read_kubernetes_projection(root, ca_key).await?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|source| classified(SourceError::Config, &source))?;
+    if certificates.is_empty() {
+        return Err(SourceError::Config);
+    }
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .tls_built_in_root_certs(false)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|source| classified(SourceError::Config, &source))
 }
 
 fn validate_timeout(value: u64) -> Result<(), &'static str> {
@@ -1280,6 +1433,13 @@ fn logical_parts(path: &str) -> Result<Vec<&str>, &'static str> {
 
 async fn read_token(path: &Path, uid: u32) -> Result<Redacted<String>, SourceError> {
     let bytes = read_private_file(path, uid, MAX_BOOTSTRAP_TOKEN_BYTES).await?;
+    parse_token(bytes)
+}
+
+fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
+    if bytes.len() > MAX_BOOTSTRAP_TOKEN_BYTES {
+        return Err(SourceError::TooLarge);
+    }
     let text =
         String::from_utf8(bytes).map_err(|source| classified(SourceError::Malformed, &source))?;
     let text = text.trim_end_matches(['\r', '\n']);
@@ -1761,6 +1921,8 @@ pub enum SourceError {
     BootstrapReflected,
     #[error("source value is empty")]
     Empty,
+    #[error("source token has expired")]
+    Expired,
     #[error("source response is malformed")]
     Malformed,
     #[error("source response is too large")]
@@ -1847,6 +2009,7 @@ impl SourceError {
             Self::Integrity => "integrity",
             Self::BootstrapReflected => "bootstrap-reflected",
             Self::Empty => "empty",
+            Self::Expired => "expired",
             Self::Malformed => "malformed",
             Self::TooLarge => "too-large",
             Self::Internal => "internal",
@@ -1874,12 +2037,20 @@ pub enum SecretMapError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("private secret source could not be initialized")]
+    Source {
+        #[source]
+        source: SourceError,
+    },
     #[error("private secret catalog could not be built")]
     Catalog {
         #[source]
         source: BrokerBuildError,
     },
 }
+
+#[cfg(test)]
+mod token_request_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1968,16 +2139,18 @@ mod tests {
         (format!("http://{authority}"), receiver, handle)
     }
 
-    fn resolver() -> MapResolver {
-        MapResolver {
-            entries: std::collections::BTreeMap::new(),
-            client: reqwest::Client::builder()
+    fn resolver() -> (MapResolver, reqwest::Client) {
+        (
+            MapResolver {
+                entries: std::collections::BTreeMap::new(),
+                expected_uid: uid(),
+            },
+            reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
                 .build()
                 .expect("client"),
-            expected_uid: uid(),
-        }
+        )
     }
 
     #[test]
@@ -2011,13 +2184,16 @@ secrets:
   - drn: drn:com.xrl:secret:test:azure/value
     source: { kind: azureKeyVault, vaultUrl: https://vault.azure.net, tokenFile: /run/azure, secret: app, version: v1 }
     bindings: []
+  - drn: drn:com.xrl:secret:test:token-request/value
+    source: { kind: kubernetesTokenRequest, endpoint: https://kubernetes.default.svc, bootstrapRoot: /run/kube, tokenKey: token, caKey: ca.crt, namespace: dekopon, serviceAccount: gylmar-vm, audience: vm-runner, expirationSeconds: 600 }
+    bindings: []
   - drn: drn:com.xrl:secret:test:kube/value
     source: { kind: kubernetesApi, endpoint: https://kubernetes.default.svc, tokenFile: /run/kube, namespace: default, objectKind: configMap, name: app, key: value, acknowledgeNonSecretSource: true }
     bindings: []
 "#;
         let parsed = serde_yaml::from_str::<super::SecretMapFile>(yaml)
             .expect("documented camelCase source fields decode");
-        assert_eq!(parsed.secrets.len(), 10);
+        assert_eq!(parsed.secrets.len(), 11);
     }
 
     #[test]
@@ -2037,8 +2213,8 @@ secrets:
         assert!(source.validate().is_ok());
     }
 
-    #[test]
-    fn config_map_projection_requires_non_secret_acknowledgement() {
+    #[tokio::test]
+    async fn config_map_projection_requires_non_secret_acknowledgement() {
         let yaml = r#"
 apiVersion: dekopon.dev/secret-map/v1alpha1
 mapRevision: test
@@ -2056,7 +2232,7 @@ secrets:
         let mut map: super::SecretMapFile = serde_yaml::from_str(yaml).expect("projection map");
         let path = std::path::Path::new("/run/map.yaml");
         assert!(matches!(
-            super::validate_map(map.clone(), path, uid()),
+            super::validate_map(map.clone(), path, uid()).await,
             Err(SecretMapError::Validation { .. })
         ));
         let SecretSource::KubernetesProjection {
@@ -2067,7 +2243,7 @@ secrets:
             panic!("projection fixture");
         };
         *acknowledge_non_secret_source = true;
-        assert!(super::validate_map(map, path, uid()).is_ok());
+        assert!(super::validate_map(map, path, uid()).await.is_ok());
     }
 
     #[tokio::test]
@@ -2096,19 +2272,22 @@ secrets:
             b"accessKeyId: AKIDEXAMPLE\nsecretAccessKey: fixture-secret-key\nsessionToken: fixture-session\n",
         )
         .await;
-        let resolver = resolver();
+        let (resolver, client) = resolver();
 
         let (endpoint, request, server) =
             mock_json(r#"{"fields":[{"id":"password","label":"password","value":"op-value"}]}"#);
         let value = resolver
-            .resolve_source(&SecretSource::OnePasswordConnect {
-                endpoint,
-                token_file: token.clone(),
-                vault: "vault-id".to_owned(),
-                item: "item-id".to_owned(),
-                field: "password".to_owned(),
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::OnePasswordConnect {
+                    endpoint,
+                    token_file: token.clone(),
+                    vault: "vault-id".to_owned(),
+                    item: "item-id".to_owned(),
+                    field: "password".to_owned(),
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("1Password response");
         assert_eq!(value, b"op-value");
@@ -2123,16 +2302,19 @@ secrets:
         let (endpoint, request, server) =
             mock_json(r#"{"data":{"data":{"password":"vault-value"}}}"#);
         let value = resolver
-            .resolve_source(&SecretSource::VaultKv2 {
-                endpoint,
-                token_file: token.clone(),
-                namespace: Some("tenant".to_owned()),
-                mount: "secret".to_owned(),
-                path: "apps/api".to_owned(),
-                key: "password".to_owned(),
-                version: None,
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::VaultKv2 {
+                    endpoint,
+                    token_file: token.clone(),
+                    namespace: Some("tenant".to_owned()),
+                    mount: "secret".to_owned(),
+                    path: "apps/api".to_owned(),
+                    key: "password".to_owned(),
+                    version: None,
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("Vault v2 response");
         assert_eq!(value, b"vault-value");
@@ -2148,15 +2330,18 @@ secrets:
 
         let (endpoint, request, server) = mock_json(r#"{"SecretString":"aws-value"}"#);
         let value = resolver
-            .resolve_source(&SecretSource::AwsSecretsManager {
-                endpoint: Some(endpoint),
-                region: "us-east-1".to_owned(),
-                credentials_file: aws.clone(),
-                secret_id: "arn:aws:secretsmanager:us-east-1:123:secret:test".to_owned(),
-                version_id: None,
-                version_stage: Some("AWSCURRENT".to_owned()),
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::AwsSecretsManager {
+                    endpoint: Some(endpoint),
+                    region: "us-east-1".to_owned(),
+                    credentials_file: aws.clone(),
+                    secret_id: "arn:aws:secretsmanager:us-east-1:123:secret:test".to_owned(),
+                    version_id: None,
+                    version_stage: Some("AWSCURRENT".to_owned()),
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("AWS response");
         assert_eq!(value, b"aws-value");
@@ -2173,14 +2358,17 @@ secrets:
 
         let (endpoint, request, server) = mock_json(r#"{"Parameter":{"Value":"ssm-value"}}"#);
         let value = resolver
-            .resolve_source(&SecretSource::AwsSsmParameter {
-                endpoint: Some(endpoint),
-                region: "us-east-1".to_owned(),
-                credentials_file: aws,
-                name: "/prod/api/password".to_owned(),
-                selector: Some("CURRENT".to_owned()),
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::AwsSsmParameter {
+                    endpoint: Some(endpoint),
+                    region: "us-east-1".to_owned(),
+                    credentials_file: aws,
+                    name: "/prod/api/password".to_owned(),
+                    selector: Some("CURRENT".to_owned()),
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("SSM response");
         assert_eq!(value, b"ssm-value");
@@ -2194,15 +2382,18 @@ secrets:
         let (endpoint, request, server) =
             mock_json(r#"{"payload":{"data":"Z2NwLXZhbHVl","dataCrc32c":"1275512963"}}"#);
         let value = resolver
-            .resolve_source(&SecretSource::GcpSecretManager {
-                endpoint: Some(endpoint),
-                token_file: token.clone(),
-                project: "project-1".to_owned(),
-                location: Some("us-central1".to_owned()),
-                secret: "api".to_owned(),
-                version: "latest".to_owned(),
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::GcpSecretManager {
+                    endpoint: Some(endpoint),
+                    token_file: token.clone(),
+                    project: "project-1".to_owned(),
+                    location: Some("us-central1".to_owned()),
+                    secret: "api".to_owned(),
+                    version: "latest".to_owned(),
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("GCP response");
         assert_eq!(value, b"gcp-value");
@@ -2217,13 +2408,16 @@ secrets:
 
         let (endpoint, _request, server) = mock_json(r#"{"value":"azure-value"}"#);
         let value = resolver
-            .resolve_source(&SecretSource::AzureKeyVault {
-                vault_url: endpoint,
-                token_file: token.clone(),
-                secret: "api".to_owned(),
-                version: Some("version-1".to_owned()),
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::AzureKeyVault {
+                    vault_url: endpoint,
+                    token_file: token.clone(),
+                    secret: "api".to_owned(),
+                    version: Some("version-1".to_owned()),
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("Azure response");
         assert_eq!(value, b"azure-value");
@@ -2231,16 +2425,19 @@ secrets:
 
         let (endpoint, _request, server) = mock_json(r#"{"data":{"password":"a3ViZS12YWx1ZQ=="}}"#);
         let value = resolver
-            .resolve_source(&SecretSource::KubernetesApi {
-                endpoint,
-                token_file: token,
-                namespace: "default".to_owned(),
-                object_kind: super::KubernetesObjectKind::Secret,
-                name: "api".to_owned(),
-                key: "password".to_owned(),
-                acknowledge_non_secret_source: false,
-                timeout_ms: 5_000,
-            })
+            .resolve_source(
+                &SecretSource::KubernetesApi {
+                    endpoint,
+                    token_file: token,
+                    namespace: "default".to_owned(),
+                    object_kind: super::KubernetesObjectKind::Secret,
+                    name: "api".to_owned(),
+                    key: "password".to_owned(),
+                    acknowledge_non_secret_source: false,
+                    timeout_ms: 5_000,
+                },
+                &client,
+            )
             .await
             .expect("Kubernetes response");
         assert_eq!(value, b"kube-value");
@@ -2317,10 +2514,10 @@ secrets:
             declared_origin: super::KubernetesProjectionOrigin::ServiceAccountToken,
             acknowledge_non_secret_source: false,
         };
-        let resolver = resolver();
+        let (resolver, client) = resolver();
         assert_eq!(
             resolver
-                .resolve_source(&source)
+                .resolve_source(&source, &client)
                 .await
                 .expect("first snapshot"),
             first
@@ -2329,7 +2526,7 @@ secrets:
         std::fs::rename(replacement, data_link).expect("atomic swap");
         assert_eq!(
             resolver
-                .resolve_source(&source)
+                .resolve_source(&source, &client)
                 .await
                 .expect("second snapshot"),
             second

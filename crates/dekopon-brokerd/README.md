@@ -380,15 +380,18 @@ disk is the retired one.
 propose one public logical DRN through the sandboxed curl Basic/Bearer forms, but possession grants
 nothing: the broker requires ordinary capability policy, a separate `secret.use` Cedar statement,
 and an exact private binding before one source snapshot is fetched. Providers receive neither DRN
-nor bytes. Adapters cover secure files, Kubernetes projections and API objects, 1Password Connect,
-Vault KV v1/v2, AWS Secrets Manager and SSM, GCP Secret Manager, and Azure Key Vault.
+nor bytes. Adapters cover secure files, Kubernetes projections, API objects and TokenRequest,
+1Password Connect, Vault KV v1/v2, AWS Secrets Manager and SSM, GCP Secret Manager, and Azure Key Vault.
 
 ```yaml
 secretMapPath: /etc/dekopon/secret-map.yaml
 ```
 
-Map descriptors are validated without network at startup. Resolution is per authorized invocation,
-with no stale fallback. Basic/Bearer rendering, path and query scope, injection limits, and the
+Map descriptors are validated without network at startup. `kubernetesTokenRequest` also loads its
+projected cluster CA then, and mints one token per authorized invocation for a fixed configured
+ServiceAccount and audience using a live-read projected API bootstrap token. It rejects expired
+issuance, stores no token across invocations and requires restart for CA changes.
+Resolution has no stale fallback. Basic/Bearer rendering, path and query scope, injection limits, and the
 credential echo check live in the native HTTP host. See
 [`../../docs/secrets.md`](../../docs/secrets.md) for the strict map schema, source fields,
 bootstrap-file hygiene, policies, and examples. `credentialsPath` and `secretMapPath` may coexist
