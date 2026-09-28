@@ -185,12 +185,12 @@ fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
     assert!(memory.validate(&one_below_namespace_limit).is_err());
 
     let exact_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 6,
+        max_host_calls_per_invocation: 4,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&exact_host_calls).is_ok());
     let one_below_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 5,
+        max_host_calls_per_invocation: 3,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&one_below_host_calls).is_err());
