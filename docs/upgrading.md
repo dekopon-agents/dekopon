@@ -8,6 +8,32 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Kubernetes TokenRequest secret source (0.27.0)
+
+Existing 0.26.0 configurations need no edits. To opt into the new broker-private
+`kubernetesTokenRequest` source:
+
+1. Create the target ServiceAccount and namespace-scoped RBAC allowing the broker's own
+   ServiceAccount to `create` `serviceaccounts/token`, restricted by `resourceNames` to that
+   target. Configure the destination's trusted issuer, audience and subject allowlist separately.
+2. Mount a live API-audience bootstrap token and cluster CA into the broker only. Chart 0.17.0
+   already supports this through `broker.secretSourceVolumes`; do not use an init copy or
+   `subPath`. The chart version and its default application version remain unchanged; explicitly
+   select the 0.27.0 application image when deploying it.
+3. **Upgrade the broker binary before activating the new private source map.** The 0.26.0
+   decoder refuses `kind: kubernetesTokenRequest`. Set a fixed namespace, ServiceAccount and
+   audience in the owner-controlled map, with the existing exact DRN/native Bearer sink bounds.
+4. Enable the intended capability and separate Cedar `secret.use` grants only after the
+   destination and broker source are ready. No token bytes belong in the catalog or provider input.
+
+The broker mints once per authorized invocation with the current projected bootstrap token, not
+through a cache or renewal daemon. CA changes require a broker restart. No provider WIT or local
+broker protocol changes accompany this source. See the [source contract](secrets.md#kubernetestokenrequest)
+for required fields, lifetimes and failure behavior.
+
+The new [learned-skills example](improvement.md#skills-the-agent-writes) is also opt-in: mount the
+skill and grant agent-scoped `turso` access explicitly; upgrading alone enables neither.
+
 ## Provider `--help` baked into the tool description (0.26.0)
 
 Roll `dekopon-brokerd` and `dekopond` together. The `Capabilities` response frame gains an optional

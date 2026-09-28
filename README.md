@@ -12,7 +12,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 Ordered by the goals it serves. Credentials stay inside the broker:
 
-- Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and a credential echo check. Providers never see values; a provider command may propose a reference. See [`docs/secrets.md`](docs/secrets.md).
+- Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters (including broker-private Kubernetes TokenRequest minting), canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and a credential echo check. Providers never see values; a provider command may propose a reference. See [`docs/secrets.md`](docs/secrets.md).
 - One capability presents a different credential per acting agent through `credential`/`agents.<id>.credentials`. *Committed direction:* these bindings will be replaced by public DRNs ([migration requirements](docs/design.md#legacy-credential-bindings)).
 - Credential-free self-inspection: an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 
@@ -51,7 +51,7 @@ The operator surface on top:
 
 Semantic or vector memory, cross-agent sharing, task memory, deletion and export UX, and encryption at rest do not exist. Durable chat turns carry across broker and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope, and are read on demand with `memory recent` or `memory search`; recording never deduplicates, so a redelivered message becomes a second stored turn. SQL reaches providers only as the optional out-of-tree component, and no shipped memory path uses it.
 
-There is no catalog operator CLI and no general invocation CLI. Secret sources need explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains and IRSA, GCP ADC and WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, and caching or stale fallback do not exist. Catalog provider and status resources are declarations only. The broker's provider manager has exact-reference `sync`, `list`, and `verify` only: no SemVer ranges, private-registry credentials or custom roots, publisher-provenance verification, install/update/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so image staging keeps its separate GitHub attestation checks. Only the broker can execute the provider effects the catalog example represents.
+There is no catalog operator CLI and no general invocation CLI. Secret sources need explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains and IRSA, GCP ADC and WIF, Azure managed identity, kubeconfig exec plugins, custom CAs for sources other than `kubernetesTokenRequest`, and caching or stale fallback do not exist. Catalog provider and status resources are declarations only. The broker's provider manager has exact-reference `sync`, `list`, and `verify` only: no SemVer ranges, private-registry credentials or custom roots, publisher-provenance verification, install/update/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so image staging keeps its separate GitHub attestation checks. Only the broker can execute the provider effects the catalog example represents.
 
 ## Install
 
@@ -76,12 +76,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.26.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.26.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.26.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.27.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.27.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.27.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.26.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.26.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.27.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.27.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io

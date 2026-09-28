@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-09-28
+
+### Added
+
+- Broker-private `kubernetesTokenRequest` secret sources mint fixed-audience ServiceAccount
+  bearer tokens per authorized invocation using live projected API bootstrap credentials and a
+  configured cluster CA. Upgrade the broker before activating this source kind in the private
+  map; 0.26.0 refuses it. See [upgrading](docs/upgrading.md#kubernetes-tokenrequest-secret-source-0270).
+- `examples/catalog/skills/learned-skills`, a catalog skill that lets an agent with an
+  agent-scoped `turso` grant keep and reuse skills it writes itself. See
+  [skills the agent writes](docs/improvement.md#skills-the-agent-writes).
+
 ## [0.26.0] - 2026-09-27
 
 ### Added
