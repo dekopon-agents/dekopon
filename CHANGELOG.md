@@ -7,15 +7,35 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-27
+
+### Added
+
+- Every shell builtin answers `--help` when it is the script's literal, unexpanded only argument,
+  naming the flags it accepts; `unsupported_flag` refusals append the same accepted subset.
+- **Breaking:** each reachable provider command word's `--help` page is rendered once at broker
+  load and baked into the `bash` tool description, capped at about 2 KiB per word, with no
+  per-session round trip or liveness flash. The pages ride a new `command_word_help` field on the
+  `Capabilities` frame, which a previous-release `dekopond` refuses; roll `dekopon-brokerd` and
+  `dekopond` together.
+- `suggest_improvement`'s `category` gains `efficiency`, for a note about an awkward path a session
+  took even after succeeding: a workaround it built, a retry loop, a multi-step dance one
+  capability or command word would have collapsed, or output it reshaped by hand every time.
+- `accounting.model.turn` carries an `agent` field, the calling agent's catalog ID, when the
+  embedder supplied one; `dekopond` always does, turning a `trace_id` join against
+  `gateway.session` into a plain filter for per-agent accounting (#248).
+
 ### Changed
 
 - **Breaking:** `sessions.journal.maxBytes` is removed and refused. Journal files not written for
   longer than the longest journal route `forgetAfterMs` are deleted at startup and on recall.
-- Each journal line carries the conversation's whole attachment inventory and next asset number,
-  and compaction reads the whole file. Files from earlier releases are deleted on first recall.
+- **Breaking:** each journal line carries the conversation's whole attachment inventory and next
+  asset number, and compaction reads the whole file. Files from earlier releases are deleted on
+  first recall.
 - Journal lines no longer cap the encoded user text at 64 KiB.
 - **Breaking:** the `storage.maxPendingTransactions` limit is renamed `maxActiveInvocations`; the
   old key is refused.
+- Chat-memory recording no longer deduplicates; a redelivered record appends a second turn.
 
 ### Removed
 
@@ -24,10 +44,15 @@ All notable changes to Dekopon are documented here. The format is based on
   `dekopon-provider-storage`. The patch bump bends semver on purpose: Wasmtime still links `0.1.0`
   guests that never imported the ladder, such as memory-chat. A component importing it is refused
   at load; upgrade turso-sql to 0.5.0 first.
-
-- `dekopon-model`'s `InferenceError::Unsupported` and `UnsupportedFeature` are gone now that
-  nothing constructs them; a pre-1.0 break to `dekopon-model`'s public error API.
-- Slack no longer streams the answer: `liveness.stream: true` is refused on every
+- **Breaking:** `chatMemory.maxDedupRecords` and `chatMemory.maxDedupBytes` are removed and
+  refused; memory-chat must be 0.5.0 or later, upgraded in the same restart as the broker.
+- **Breaking:** the route-level `improvementSuggestions` flag; `suggest_improvement` is always
+  offered, model-authored notes go to telemetry like every other record
+  ([goal 2](docs/design.md#constitution)), and `RouteConfig` refuses the key outright rather than
+  silently ignoring it.
+- **Breaking:** `dekopon-model`'s `InferenceError::Unsupported` and `UnsupportedFeature` are gone
+  now that nothing constructs them; a pre-1.0 break to `dekopon-model`'s public error API.
+- **Breaking:** Slack no longer streams the answer: `liveness.stream: true` is refused on every
   `slackSocketMode` transport (top level and per conversation kind), and the
   `chat.startStream`/`appendStream`/`stopStream` path is gone from the Slack driver. Progress on
   Slack now shows through the progress message or, on Agent installations, `liveness.statusText`;
@@ -49,8 +74,7 @@ All notable changes to Dekopon are documented here. The format is based on
   photos and asset counter recorded before it (#358).
 - OpenAI and OpenRouter chat completion parsing skips a tool item whose `type` is not
   `function` instead of failing the whole turn, so an answer beside an additive tool type still
-  reaches the caller. OpenRouter's native replay no longer carries a skipped item into the next
-  request, where it left a tool call with no answering tool message and the next request failed.
+  reaches the caller.
 - A finished run's terminal cleanup no longer overwrites the next turn's Working status: cleanup
   now runs to completion, including the native Idle write, before the acknowledgment that lets the
   same thread's next turn start.
@@ -68,6 +92,10 @@ All notable changes to Dekopon are documented here. The format is based on
   `broker.providerSet` directory from a ConfigMap's `providers.yaml`, using the Deployment's image.
   Its hook annotations are replaceable; Argo CD needs `Sync` in an early wave, not Helm's
   pre-install/pre-upgrade.
+
+### Changed
+
+- Default application version is now 0.26.0.
 
 ## [0.25.0] - 2026-09-27
 
