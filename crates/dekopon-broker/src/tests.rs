@@ -102,7 +102,7 @@ fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
 }
 
 #[test]
-fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
+fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
     let memory = ChatMemoryConfig {
         continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
@@ -112,8 +112,6 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
         max_query_bytes: 256,
         max_result_bytes: 65_536,
         max_turn_bytes: 32_768,
-        max_dedup_records: 16_000,
-        max_dedup_bytes: 4_194_304,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
     };
@@ -123,27 +121,25 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     minimal.max_recent_turns = 1;
     minimal.max_search_results = 1;
     minimal.max_turn_bytes = 241;
-    minimal.max_dedup_records = 1;
-    minimal.max_dedup_bytes = 256;
     minimal.compaction_target_bytes = 241;
     minimal.compaction_threshold_bytes = 242;
     let too_small_call = dekopon_storage_host::StorageLimits {
-        max_write_bytes_per_call: 255,
+        max_write_bytes_per_call: 240,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&too_small_call).is_err());
 
     let unaligned_read_budget = dekopon_storage_host::StorageLimits {
-        max_read_bytes_per_invocation: 300_000,
+        max_read_bytes_per_invocation: 262_143,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(
         minimal.validate(&unaligned_read_budget).is_err(),
-        "two final partial chunks are charged at their requested 256 KiB bounds"
+        "a partial final read is still charged its full 256 KiB chunk"
     );
 
     let too_small_namespace = dekopon_storage_host::StorageLimits {
-        max_namespace_bytes: 16 * 1024 * 1024,
+        max_namespace_bytes: 12 * 1024 * 1024,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(memory.validate(&too_small_namespace).is_err());
@@ -176,10 +172,7 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     };
     assert!(memory.validate(&one_below_file_limit).is_err());
 
-    let exact_namespace = memory.compaction_threshold_bytes
-        + memory.max_turn_bytes
-        + memory.max_dedup_bytes
-        + 32 * 4_096;
+    let exact_namespace = memory.compaction_threshold_bytes + memory.max_turn_bytes + 32 * 4_096;
     let exact_namespace_limit = dekopon_storage_host::StorageLimits {
         max_namespace_bytes: exact_namespace,
         ..dekopon_storage_host::StorageLimits::default()
@@ -192,23 +185,23 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     assert!(memory.validate(&one_below_namespace_limit).is_err());
 
     let exact_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 7,
+        max_host_calls_per_invocation: 4,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&exact_host_calls).is_ok());
     let one_below_host_calls = dekopon_storage_host::StorageLimits {
-        max_host_calls_per_invocation: 6,
+        max_host_calls_per_invocation: 3,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&one_below_host_calls).is_err());
 
     let exact_file_count = dekopon_storage_host::StorageLimits {
-        max_files_per_namespace: 2,
+        max_files_per_namespace: 1,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&exact_file_count).is_ok());
     let one_below_file_count = dekopon_storage_host::StorageLimits {
-        max_files_per_namespace: 1,
+        max_files_per_namespace: 0,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(minimal.validate(&one_below_file_count).is_err());
@@ -240,7 +233,6 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
             .maximum_provider_working_set_bytes()
             .expect("working-set arithmetic"),
         memory.compaction_threshold_bytes * 2
-            + memory.max_dedup_bytes * 2
             + memory.compaction_target_bytes * 2
             + memory.max_turn_bytes
             + memory.max_result_bytes
@@ -253,8 +245,7 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     assert!(minimum_fuel <= BrokerHostLimits::default().fuel);
     assert_eq!(
         minimum_fuel,
-        (memory.max_dedup_bytes
-            + memory.compaction_threshold_bytes
+        (memory.compaction_threshold_bytes
             + memory.compaction_target_bytes
             + memory.max_turn_bytes)
             * 256
@@ -400,8 +391,6 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
         max_query_bytes: 256,
         max_result_bytes: 65_536,
         max_turn_bytes: 32_768,
-        max_dedup_records: 16_000,
-        max_dedup_bytes: 4_194_304,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
     };
@@ -415,8 +404,6 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
         ("maxQueryBytes", |v| v.max_query_bytes += 1),
         ("maxResultBytes", |v| v.max_result_bytes += 1),
         ("maxTurnBytes", |v| v.max_turn_bytes += 1),
-        ("maxDedupRecords", |v| v.max_dedup_records += 1),
-        ("maxDedupBytes", |v| v.max_dedup_bytes += 1),
         ("compactionTargetBytes", |v| v.compaction_target_bytes += 1),
         ("compactionThresholdBytes", |v| {
             v.compaction_threshold_bytes += 1

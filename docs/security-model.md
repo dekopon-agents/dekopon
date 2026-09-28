@@ -299,8 +299,8 @@ or outcome-unknown. Its already delivered answer remains answered.
 Storage audit records carry every field a non-storage record does — principal, actor/agent,
 via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —
 plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
-content/dedup, evidence, authority, and generations are separate unkeyed SHA-256 domains, so no two
-are equal. Nothing in them is secret: isolation is the broker granting only the caller's own scope
+content commitment, evidence, authority, and generations are separate unkeyed SHA-256 domains, so
+no two are equal. Nothing in them is secret: isolation is the broker granting only the caller's own scope
 and the host binding each handle to that scope's directory, and a name the operator can recompute is
 a name the operator could already list.
 Storage spans likewise carry identity, capability, provider, input, and the namespace token, and
@@ -327,9 +327,8 @@ Writes apply per host call. A trap can leave partial database/log changes; neith
 invocation success promises cross-file atomicity or crash recovery ([`design.md`](design.md#non-goals)).
 
 Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
-automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte
-cap, new recording fails, classified as the generic `provider-failure`, while reads remain
-available.
+automatically replayed. Recording never deduplicates: a redelivered message becomes a second stored
+turn.
 
 ## Mapped compiled-provider trust
 

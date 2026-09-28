@@ -65,6 +65,35 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
 See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
+## Chat-memory dedup config removed (unreleased)
+
+Delete `chatMemory.maxDedupRecords` and `chatMemory.maxDedupBytes` from `broker.yaml`; the broker
+refuses them as unknown fields. Pin the `memory-chat` provider to v0.5.0 or later, whose `record`
+input schema refuses the matching `maxDedupRecords`/`maxDedupBytes` keys the same way. Change the
+broker binary, the `broker.yaml` keys, and the memory-chat pin together, in the same restart: a
+mismatch between them doesn't fail at startup. It only shows up as a `provider-failure` on every
+`memory.chat.record` call — an old provider still requiring the deleted fields from a new broker
+that no longer sends them, or the reverse — and because there is no invocation rollback, each turn
+that hits it is simply lost, not retried. `dedup.jsonl` is gone from the provider's own writes; only
+`turns.jsonl` remains.
+
+`memory.chat.record` no longer deduplicates: it appends every call as its own turn, whatever `id` or
+`commitment` it carries, instead of the old silent no-op on a repeated one (or, most recently, the
+generic `provider-failure` a changed commitment or exhausted dedup log used to raise). A redelivered
+message now becomes a second stored turn — the accepted cost, matching the WhatsApp and Discord
+rings below.
+
+This upgrade rotates every `authority-bound` namespace's generation: the provider artifact bytes and
+the memory-limits authority encoding both change, and either alone already rotates. `memory recent`
+and `memory search` start from empty on the first call after upgrading; prior turns aren't deleted,
+just unreachable from the new generation. Only explicit `stable` continuity keeps recalling them.
+
+memory-chat 0.5.0 never deletes an existing `dedup.jsonl`; the storage host has no notion of a
+provider's filenames, so an old one just stops growing and stays on disk. A `stable`-continuity
+namespace that recorded turns before this upgrade keeps that file, still counted against
+`maxFilesPerNamespace` and `maxNamespaceBytes`. Don't lower either to the new post-dedup minimums
+while such namespaces exist; nothing here cleans the file up.
+
 ## WhatsApp no longer dedups redeliveries; the Discord ring is deleted as redundant (unreleased)
 
 The WhatsApp `ClaimedIds` ring is gone; no configuration key changes. WhatsApp's HTTP 200 already
@@ -76,10 +105,7 @@ gets a second reply, the accepted cost.
 The Discord `SeenIds` ring is also gone, but this is a no-op for behavior: Discord's own gateway
 resume sequence-number tracking already prevented a resumed connection from replaying an event the
 client had already received, so the ring never had a real duplicate to catch on that path. The
-Slack dedup ring is unchanged.
-
-A chat-memory record that fails with what used to be `dedup-conflict` or `dedup-capacity` now
-classifies as the generic `provider-failure`; nothing consumes those two codes specially anymore.
+Slack dedup ring is unchanged. Chat-memory's own dedup is gone too; see the entry above.
 
 ## Slack no longer streams the answer (unreleased)
 

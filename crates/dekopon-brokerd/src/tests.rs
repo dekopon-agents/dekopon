@@ -1252,8 +1252,6 @@ async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() 
         max_query_bytes: 256,
         max_result_bytes: 65_536,
         max_turn_bytes: 32_768,
-        max_dedup_records: 16_000,
-        max_dedup_bytes: 4_194_304,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
     })

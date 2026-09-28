@@ -866,8 +866,6 @@ chatMemory:
   maxQueryBytes: 256
   maxResultBytes: 65536
   maxTurnBytes: 32768 # complete canonical turn JSONL line, including LF
-  maxDedupRecords: 16000
-  maxDedupBytes: 4194304
   compactionTargetBytes: 8388608
   compactionThresholdBytes: 12582912
 ```
@@ -942,10 +940,10 @@ this deployment chose.
 Each recent and search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
 headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
-capabilities and no fourth. Memory and storage composition rounds each 256 KiB JSONL read request
-when checking the invocation and host-call budgets, requires both logical files, and reserves the
-direct peak: the post-append turn file, live permanent dedup file, and conservative namespace entry
-metadata including authority-pointer and manifest temporaries, without staged JSONL file copies.
+capabilities and no fourth. Memory and storage composition rounds the 256 KiB JSONL read request
+when checking the invocation and host-call budgets, requires the one logical file, and reserves the
+direct peak: the post-append turn file and conservative namespace entry metadata including
+authority-pointer and manifest temporaries, without staged JSONL file copies.
 Startup accounts the worst-case JSON escaping of a bounded search query and proves that raw and
 decoded files plus canonical-ABI compaction copies and fixed allocator headroom fit the independent
 Wasm linear-memory ceiling.

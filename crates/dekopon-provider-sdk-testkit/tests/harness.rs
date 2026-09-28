@@ -16,8 +16,6 @@ fn record(id: &str, user: &str, assistant: &str) -> Value {
         "assistant": assistant,
         "maxTurnBytes": 4096,
         "maxLookbackTurns": 64,
-        "maxDedupRecords": 64,
-        "maxDedupBytes": 65536,
         "compactionTargetBytes": 8192,
         "compactionThresholdBytes": 16384,
     })

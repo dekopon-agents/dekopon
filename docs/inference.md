@@ -21,7 +21,7 @@ public OpenAI Platform API. Public OpenAI documentation is context, not a contra
 |---|---|---|---|
 | Prompt-prefix cache | Model provider | Avoid recomputing an identical leading prompt | Sends stable prefixes and dialect-specific hints; OpenRouter can mark an explicit system prefix; cannot manage provider entries |
 | Conversation history | `dekopond` | Let a person—or an explicitly configured exact-conversation audience—ask a follow-up | Optional bounded `(question, final answer)` window in process memory, private per subject by default |
-| Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns + permanent finite dedup; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
+| Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns, no deduplication; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
 
 A cache hit never substitutes an old answer. The provider evaluates the complete request and produces a new response, so “fresh” refers to whether prefix computation can be reused, not to the answer or its underlying data.
 
@@ -317,7 +317,7 @@ reference notes, never provider payload bytes. A partial native delivery suppres
 ## Optional durable chat-turn retrieval
 
 The independently released `memory-chat` component imports JSONL only and stores versioned
-`turns.jsonl` and `dedup.jsonl` inside an opaque broker-derived namespace. Scope always includes
+`turns.jsonl` inside an opaque broker-derived namespace. Scope always includes
 provider, agent, canonical sender, configured transport, channel, and conversation. `authority-bound`
 (default) rotates a persisted random epoch when effective capability metadata, constraints, selected
 symbolic credential, provider artifact bytes, host/storage ceilings, backend, or memory limits change;
@@ -333,9 +333,9 @@ memory search --query TEXT
 
 Recent returns whole chronological turns. Search examines the bounded newest lookback with Unicode
 lowercase plus literal substring matching and returns whole turns chronologically. Compaction has a
-lower target and higher threshold for hysteresis; dedup records are never compacted. The same ID and
-content succeeds without mutation. A changed commitment or finite dedup exhaustion now classifies as
-the generic `provider-failure`; malformed complete records remain `memory-corrupt`.
+lower target and higher threshold for hysteresis. Exactly-once delivery is not a goal: `record`
+appends every call as its own turn, whatever `id` or `commitment` it carries, so a redelivered
+message becomes a second stored turn. Malformed complete records remain `memory-corrupt`.
 
 Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
 files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage
