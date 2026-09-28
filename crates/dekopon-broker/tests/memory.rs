@@ -76,29 +76,9 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     ]
     .into_iter()
     .map(|(id, route, effect, risk, access)| {
-        let capability = id.parse().expect("capability");
         (
-            capability,
-            ConstraintSet {
-                route,
-                provider: "memory-chat".parse().expect("provider"),
-                effect,
-                risk,
-                credential: None,
-                constraints: dekopon_capability::ExecutionConstraints {
-                    asset: None,
-                    timeout_ms: 10_000,
-                    max_output_bytes: 131_072,
-                    http: None,
-                    storage: Some(StorageConstraints {
-                        interface: StorageInterface::Jsonl,
-                        access,
-                        scope: StorageScope::PrivateConversation,
-                        retention: Default::default(),
-                    }),
-                    secret_use: None,
-                },
-            },
+            id.parse().expect("capability"),
+            memory_constraint(route, effect, risk, access),
         )
     })
     .collect::<Vec<_>>();
@@ -582,8 +562,6 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     assert_eq!(result.result.error.as_deref(), Some("probe-write"));
 }
 
-/// The reserved chat-memory surface is determined by the declared route, not a provider's name or
-/// capability naming, so mimicking the shipped provider gains or loses nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabilities() {
     let registry = BrokerProviderRegistry::load(
@@ -751,43 +729,17 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     )
     .expect("world");
     let policy = PolicyEngine::new("", &world).expect("empty policy");
-    let constraints = ConstraintCatalog::new([
-        (
-            "memory.chat.record".parse().expect("capability"),
-            memory_constraint(
-                CapabilityRoute::ChatMemoryRecord,
-                EffectKind::LocalWrite,
-                RiskLevel::Medium,
-                StorageAccess::ReadWrite,
+    let catalog = constraints_with_http_credential(None);
+    let constraints = ConstraintCatalog::new(
+        catalog
+            .iter()
+            .filter(|(_, set)| set.route != CapabilityRoute::Generic)
+            .map(|(id, set)| (id.clone(), set.clone()))
+            .chain(
+                ["ordinary.escape", "memory.chat.export"]
+                    .map(|id| (id.parse().expect("capability"), reserved_read_constraint())),
             ),
-        ),
-        (
-            "memory.chat.recent".parse().expect("capability"),
-            memory_constraint(
-                CapabilityRoute::ChatMemoryRecent,
-                EffectKind::ReadOnly,
-                RiskLevel::High,
-                StorageAccess::ReadOnly,
-            ),
-        ),
-        (
-            "memory.chat.search".parse().expect("capability"),
-            memory_constraint(
-                CapabilityRoute::ChatMemorySearch,
-                EffectKind::ReadOnly,
-                RiskLevel::High,
-                StorageAccess::ReadOnly,
-            ),
-        ),
-        (
-            "ordinary.escape".parse().expect("capability"),
-            reserved_read_constraint(),
-        ),
-        (
-            "memory.chat.export".parse().expect("capability"),
-            reserved_read_constraint(),
-        ),
-    ])
+    )
     .expect("malicious constraints");
     let broker = Broker::new(
         registry,
@@ -808,272 +760,202 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let root = directory.join("provider-storage");
-    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
-    let registry = BrokerProviderRegistry::load_with_storage(
-        [provider_fixture("memory-reservation-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        Some(storage),
-    )
-    .await
-    .expect("rendering fixture loads");
-    let world = PolicyWorld::new(
-        [
-            "gateway".parse::<PrincipalId>().expect("gateway"),
-            "maintainer".parse().expect("maintainer"),
-        ],
-        registry
-            .capabilities()
-            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
-    )
-    .expect("policy world");
-    let policy = PolicyEngine::new(
-        r#"
-        @id("maintainer-prompt")
-        permit(principal == Dekopon::Principal::"maintainer",
-               action == Dekopon::Action::"agent.prompt",
-               resource == Dekopon::Agent::"reviewer")
-        when { context.via == "gateway" };
-        @id("maintainer-ordinary-escape")
-        permit(principal == Dekopon::Principal::"maintainer",
-               action == Dekopon::Action::"ordinary.escape",
-               resource == Dekopon::Provider::"memory-chat")
-        when { context.via == "gateway" && context.agent == "reviewer" };
-        "#,
-        &world,
-    )
-    .expect("policy");
-    let constraints = ConstraintCatalog::new([(
-        "ordinary.escape".parse().expect("capability"),
-        ConstraintSet {
-            route: CapabilityRoute::ChatMemoryRecent,
-            provider: "memory-chat".parse().expect("provider"),
-            effect: EffectKind::ReadOnly,
-            risk: RiskLevel::Low,
-            credential: None,
-            constraints: dekopon_capability::ExecutionConstraints {
-                asset: None,
-                timeout_ms: 10_000,
-                max_output_bytes: 131_072,
-                http: None,
-                storage: Some(StorageConstraints {
-                    interface: StorageInterface::Jsonl,
-                    access: StorageAccess::ReadOnly,
-                    scope: StorageScope::PrivateConversation,
-                    retention: Default::default(),
-                }),
-                secret_use: None,
+async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_name() {
+    for (fixture, provider, capability, constraint) in [
+        (
+            "memory-reservation-probe-provider.wasm",
+            "memory-chat",
+            "ordinary.escape",
+            memory_constraint(
+                CapabilityRoute::ChatMemoryRecent,
+                EffectKind::ReadOnly,
+                RiskLevel::Low,
+                StorageAccess::ReadOnly,
+            ),
+        ),
+        (
+            "storage-probe-provider.wasm",
+            "storage-probe",
+            "storage-probe.run",
+            ConstraintSet {
+                provider: "storage-probe".parse().expect("provider"),
+                ..memory_constraint(
+                    CapabilityRoute::ChatMemoryRecord,
+                    EffectKind::LocalWrite,
+                    RiskLevel::Medium,
+                    StorageAccess::ReadWrite,
+                )
             },
-        },
-    )])
-    .expect("constraints");
-    let broker = Broker::new(
-        registry,
-        "broker".parse().expect("broker"),
-        "reserved-render-policy".to_owned(),
-        policy,
-        constraints,
-        CredentialStore::empty(),
-        IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            "maintainer".parse().expect("principal"),
-        )])
-        .expect("identities"),
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-        BrokerLimits::default(),
-    )
-    .expect("broker");
-    let gateway = gateway();
-    let grant = attestor_grant();
-    let claim = claim();
-    let attestation = Attestation::for_subject(claim.subject, claim.agent);
-    let (_, words, _, _) = broker
-        .capability_surface(&gateway, Some(&grant), Some(&attestation))
-        .expect("the attestation is honored");
-    assert!(words.is_empty(), "a reserved word is not in the vocabulary");
-    let refused = broker
-        .run_command(
-            &gateway,
-            Some(&grant),
-            Some(&attestation),
-            "recall",
-            &["--help".to_owned()],
-            None,
+        ),
+    ] {
+        let route = constraint.route;
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let directory = temporary.path().canonicalize().expect("canonical tempdir");
+        let root = directory.join("provider-storage");
+        let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
+        let registry = BrokerProviderRegistry::load_with_storage(
+            [provider_fixture(fixture)],
+            BrokerHostLimits::default(),
+            Some(storage),
         )
         .await
-        .expect_err("a reserved word never reaches its guest");
-    assert!(
-        matches!(&refused, BrokerHostError::UnknownCommandWord { word } if word == "recall"),
-        "{refused:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let root = directory.join("provider-storage");
-    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
-    let registry = BrokerProviderRegistry::load_with_storage(
-        [provider_fixture("storage-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        Some(storage),
-    )
-    .await
-    .expect("storage probe fixture loads");
-    let world = PolicyWorld::new(
-        [
-            "gateway".parse::<PrincipalId>().expect("gateway"),
-            "maintainer".parse().expect("maintainer"),
-        ],
-        registry
-            .capabilities()
-            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
-    )
-    .expect("policy world");
-    let policy = PolicyEngine::new(
-        r#"
+        .expect("routed fixture loads");
+        let world = PolicyWorld::new(
+            [
+                "gateway".parse::<PrincipalId>().expect("gateway"),
+                "maintainer".parse().expect("maintainer"),
+            ],
+            registry
+                .capabilities()
+                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        )
+        .expect("policy world");
+        let policy = PolicyEngine::new(
+            r#"
         @id("maintainer-prompt")
         permit(principal == Dekopon::Principal::"maintainer",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"reviewer")
         when { context.via == "gateway" };
-        @id("maintainer-storage-probe-run")
+        @id("maintainer-routed-capability")
         permit(principal == Dekopon::Principal::"maintainer",
-               action == Dekopon::Action::"storage-probe.run",
-               resource == Dekopon::Provider::"storage-probe")
+               action == Dekopon::Action::"$CAPABILITY",
+               resource == Dekopon::Provider::"$PROVIDER")
         when { context.via == "gateway"
             && context.agent == "reviewer" };
-        "#,
-        &world,
-    )
-    .expect("policy");
-    let constraints = ConstraintCatalog::new([(
-        "storage-probe.run".parse().expect("capability"),
-        ConstraintSet {
-            route: CapabilityRoute::ChatMemoryRecord,
-            provider: "storage-probe".parse().expect("provider"),
-            effect: EffectKind::LocalWrite,
-            risk: RiskLevel::Medium,
-            credential: None,
-            constraints: dekopon_capability::ExecutionConstraints {
-                asset: None,
-                timeout_ms: 10_000,
-                max_output_bytes: 131_072,
-                http: None,
-                storage: Some(StorageConstraints {
-                    interface: StorageInterface::Jsonl,
-                    access: StorageAccess::ReadWrite,
-                    scope: StorageScope::PrivateConversation,
-                    retention: Default::default(),
-                }),
-                secret_use: None,
-            },
-        },
-    )])
-    .expect("constraints");
-    let broker = Broker::new(
-        registry,
-        "broker".parse().expect("broker"),
-        "renamed-route-policy".to_owned(),
-        policy,
-        constraints,
-        CredentialStore::empty(),
-        IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            "maintainer".parse().expect("principal"),
-        )])
-        .expect("identities"),
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-        BrokerLimits::default(),
-    )
-    .expect("broker");
-    let gateway = gateway();
-    let grant = attestor_grant();
-    let claim = claim();
-    let (listed, words, help, _memory) = broker
-        .capability_surface(
-            &gateway,
-            Some(&grant),
-            Some(&Attestation::for_subject(
-                claim.subject.clone(),
-                claim.agent.clone(),
-            )),
+        "#
+            .replace("$CAPABILITY", capability)
+            .replace("$PROVIDER", provider)
+            .as_str(),
+            &world,
         )
-        .expect("legacy attestation is honored");
-    assert!(listed.is_empty() && words.is_empty() && help.is_empty());
-    let (listed, words, help, memory) = broker
-        .capability_surface(&gateway, Some(&grant), Some(&claim))
-        .expect("ordinary chat remains available");
-    assert!(listed.is_empty() && words.is_empty() && help.is_empty() && memory.is_none());
-    assert!(
-        broker
-            .run_command(
+        .expect("policy");
+        let constraints =
+            ConstraintCatalog::new([(capability.parse().expect("capability"), constraint)])
+                .expect("constraints");
+        let broker = Broker::new(
+            registry,
+            "broker".parse().expect("broker"),
+            "renamed-route-policy".to_owned(),
+            policy,
+            constraints,
+            CredentialStore::empty(),
+            IdentityDirectory::new([(
+                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "maintainer".parse().expect("principal"),
+            )])
+            .expect("identities"),
+            Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+            BrokerLimits::default(),
+        )
+        .expect("broker");
+        let gateway = gateway();
+        let grant = attestor_grant();
+        let claim = claim();
+        if route == CapabilityRoute::ChatMemoryRecent {
+            let attestation = Attestation::for_subject(claim.subject, claim.agent);
+            let (_, words, _, _) = broker
+                .capability_surface(&gateway, Some(&grant), Some(&attestation))
+                .expect("the attestation is honored");
+            assert!(words.is_empty(), "a reserved word is not in the vocabulary");
+            let refused = broker
+                .run_command(
+                    &gateway,
+                    Some(&grant),
+                    Some(&attestation),
+                    "recall",
+                    &["--help".to_owned()],
+                    None,
+                )
+                .await
+                .expect_err("a reserved word never reaches its guest");
+            assert!(
+                matches!(&refused, BrokerHostError::UnknownCommandWord { word } if word == "recall"),
+                "{refused:?}"
+            );
+            continue;
+        }
+        let (listed, words, help, _memory) = broker
+            .capability_surface(
                 &gateway,
                 Some(&grant),
-                Some(&claim),
-                "storageprobe",
-                &[],
-                None
+                Some(&Attestation::for_subject(
+                    claim.subject.clone(),
+                    claim.agent.clone(),
+                )),
+            )
+            .expect("legacy attestation is honored");
+        assert!(listed.is_empty() && words.is_empty() && help.is_empty());
+        let (listed, words, help, memory) = broker
+            .capability_surface(&gateway, Some(&grant), Some(&claim))
+            .expect("ordinary chat remains available");
+        assert!(listed.is_empty() && words.is_empty() && help.is_empty() && memory.is_none());
+        assert!(
+            broker
+                .run_command(
+                    &gateway,
+                    Some(&grant),
+                    Some(&claim),
+                    "storageprobe",
+                    &[],
+                    None
+                )
+                .await
+                .is_err()
+        );
+
+        let chat_id = "renamed-chat".parse::<InvocationId>().expect("invocation");
+        let chat_result = broker
+            .invoke(
+                &gateway,
+                Some(&grant),
+                Some(&claim.bound_to(chat_id.clone())),
+                InvocationRequest {
+                    id: chat_id,
+                    capability: "storage-probe.run".parse().expect("capability"),
+                    trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                    input: json!({}),
+                    secret_use: None,
+                },
+                Default::default(),
             )
             .await
-            .is_err()
-    );
+            .expect("chat reserved denial is audited");
+        assert_eq!(
+            chat_result.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        assert_eq!(
+            chat_result.result.error.as_deref(),
+            Some("record-operation-required"),
+            "the record route is unreachable from the generic chat invoke path"
+        );
 
-    let chat_id = "renamed-chat".parse::<InvocationId>().expect("invocation");
-    let chat_result = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&claim.bound_to(chat_id.clone())),
-            InvocationRequest {
-                id: chat_id,
-                capability: "storage-probe.run".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("chat reserved denial is audited");
-    assert_eq!(
-        chat_result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(
-        chat_result.result.error.as_deref(),
-        Some("record-operation-required"),
-        "the record route is unreachable from the generic chat invoke path"
-    );
-
-    let id = "renamed-attested"
-        .parse::<InvocationId>()
-        .expect("invocation");
-    let result = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
-            InvocationRequest {
-                id,
-                capability: "storage-probe.run".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("attested reserved denial is audited");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
+        let id = "renamed-attested"
+            .parse::<InvocationId>()
+            .expect("invocation");
+        let result = broker
+            .invoke(
+                &gateway,
+                Some(&grant),
+                Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
+                InvocationRequest {
+                    id,
+                    capability: "storage-probe.run".parse().expect("capability"),
+                    trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                    input: json!({}),
+                    secret_use: None,
+                },
+                Default::default(),
+            )
+            .await
+            .expect("attested reserved denial is audited");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
+    }
 }
 
 fn memory_constraint(
@@ -1138,10 +1020,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     assert!(help.contains_key("memory"));
     assert!(memory.is_some());
 
-    // The same agent and conversation the Cedar policy authorizes for `agent.prompt`, but a
-    // broker whose `chat_memory.enabled_agents` does not name "reviewer": prompt succeeds and
-    // "memory" is still declared, but `memory_surface` returns `None` before Cedar ever
-    // evaluates the memory-specific rule.
     let unenrolled_root = directory.join("provider-storage-unenrolled");
     let unenrolled_broker = build_broker_with(
         &unenrolled_root,
@@ -1250,8 +1128,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             "every independently swapped selector field denies"
         );
     }
-    // A grant on a channel implicitly authorizes every thread under it, but the storage namespace
-    // keys on the whole conversation, so different threads under the same grant never share memory.
     let mut sibling_thread = claim.clone();
     sibling_thread
         .scope
@@ -1301,25 +1177,14 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         Some("record-operation-required")
     );
 
-    let record_id = "record-1".parse::<InvocationId>().expect("invocation");
-    let record = broker
-        .record_delivered_turn(
-            &gateway(),
-            Some(&grant),
-            &claim.bound_to(record_id.clone()),
-            DeliveredTurnRequest::new(
-                record_id,
-                TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                DeliveryIdentity::Slack {
-                    channel: "c0123abc".to_owned(),
-                    timestamp: "1712345678.000100".to_owned(),
-                },
-                "What shipped?".to_owned(),
-                DeliveredAnswer::accepted_by_transport("Durable memory shipped.".to_owned()),
-            ),
-        )
-        .await
-        .expect("record accounted");
+    let record = record_turn(
+        &broker,
+        "record-1",
+        "1712345678.000100",
+        "What shipped?",
+        "Durable memory shipped.",
+    )
+    .await;
     assert_eq!(
         record.outcome,
         dekopon_capability::InvocationOutcome::Succeeded,
@@ -1340,35 +1205,14 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 
     let audit_after_restart = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
     let broker = build_broker(&root, audit_after_restart).await;
-    let recent_id = "recent-1".parse::<InvocationId>().expect("invocation");
-    let recent = broker
-        .invoke(
-            &gateway(),
-            Some(&grant),
-            Some(&claim.bound_to(recent_id.clone())),
-            InvocationRequest {
-                id: recent_id,
-                capability: "memory.chat.recent".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({"last": 1}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("recent accounted");
-    assert_eq!(
-        recent.result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
-    );
-    assert_eq!(
-        recent
-            .result
-            .output
-            .as_ref()
-            .and_then(|value| value["turns"][0]["user"].as_str()),
-        Some("What shipped?")
-    );
+    let recent = query_memory(
+        &broker,
+        "recent-1",
+        "memory.chat.recent",
+        json!({"last": 1}),
+    )
+    .await;
+    assert_eq!(recent["turns"][0]["user"].as_str(), Some("What shipped?"));
 
     let physical_base = fs::read_dir(root.join("namespaces"))
         .expect("namespace paths")
@@ -1916,60 +1760,50 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
     );
     drop(broker);
 
-    let broker = build_broker_with_principal(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        config.clone(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        Some(("surface-token-a", "secret-value-two")),
-        false,
-    )
-    .await;
-    let same_name = query_memory(
-        &broker,
-        "credential-secret-value-change",
-        "memory.chat.recent",
-        json!({"last": 1}),
-    )
-    .await;
-    assert_eq!(same_name["turns"][0]["user"], "credential A sentinel");
-    drop(broker);
-    assert_eq!(generation_count(&root), 1);
-
-    let broker = build_broker_with_principal(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        config.clone(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        Some(("surface-token-b", "secret-value-two")),
-        false,
-    )
-    .await;
-    assert_recent_empty(&broker, "credential-surface-b").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 2);
-
-    let broker = build_broker_with_principal(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        config,
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        Some(("surface-token-a", "secret-value-three")),
-        false,
-    )
-    .await;
-    assert_recent_empty(&broker, "credential-surface-a-again").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 3);
+    for (credential, invocation, generations) in [
+        (
+            ("surface-token-a", "secret-value-two"),
+            "credential-secret-value-change",
+            1,
+        ),
+        (
+            ("surface-token-b", "secret-value-two"),
+            "credential-surface-b",
+            2,
+        ),
+        (
+            ("surface-token-a", "secret-value-three"),
+            "credential-surface-a-again",
+            3,
+        ),
+    ] {
+        let broker = build_broker_with_principal(
+            &root,
+            Arc::new(InMemoryAuditLog::new(16).expect("audit")),
+            config.clone(),
+            StorageLimits::default(),
+            BrokerHostLimits::default(),
+            false,
+            "maintainer",
+            Some(credential),
+            false,
+        )
+        .await;
+        if generations == 1 {
+            let same_name = query_memory(
+                &broker,
+                invocation,
+                "memory.chat.recent",
+                json!({"last": 1}),
+            )
+            .await;
+            assert_eq!(same_name["turns"][0]["user"], "credential A sentinel");
+        } else {
+            assert_recent_empty(&broker, invocation).await;
+        }
+        drop(broker);
+        assert_eq!(generation_count(&root), generations);
+    }
 
     let tree = walk(&root)
         .into_iter()
@@ -2162,135 +1996,97 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         "the first registry compiles the three distinct provider fixtures"
     );
 
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        baseline_memory.clone(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer-v2",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    let remapped = query_memory(
-        &broker,
-        "surface-principal-remap",
-        "memory.chat.recent",
-        json!({"last": 1}),
-    )
-    .await;
-    assert_eq!(remapped["turns"][0]["user"], "authority A sentinel");
-    drop(broker);
-    assert_eq!(generation_count(&root), 1);
-
     let mut reordered = baseline_memory.clone();
     reordered.enabled_agents.reverse();
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        reordered,
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        true,
-        "maintainer",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    let order_only = query_memory(
-        &broker,
-        "surface-order-only",
-        "memory.chat.recent",
-        json!({"last": 1}),
-    )
-    .await;
-    assert_eq!(order_only["turns"][0]["user"], "authority A sentinel");
-    drop(broker);
-    assert_eq!(
-        generation_count(&root),
-        1,
-        "provider/enabled-agent ordering and an unrelated denied provider do not rotate"
-    );
+    for (invocation, memory, reverse_providers, principal) in [
+        (
+            "surface-principal-remap",
+            baseline_memory.clone(),
+            false,
+            "maintainer-v2",
+        ),
+        ("surface-order-only", reordered, true, "maintainer"),
+    ] {
+        let broker = build_broker_with_options(
+            &root,
+            Arc::new(InMemoryAuditLog::new(16).expect("audit")),
+            memory,
+            StorageLimits::default(),
+            BrokerHostLimits::default(),
+            reverse_providers,
+            principal,
+            None,
+            false,
+            &options,
+        )
+        .await;
+        let recent = query_memory(
+            &broker,
+            invocation,
+            "memory.chat.recent",
+            json!({"last": 1}),
+        )
+        .await;
+        assert_eq!(recent["turns"][0]["user"], "authority A sentinel");
+        drop(broker);
+        assert_eq!(generation_count(&root), 1);
+    }
 
     let mut host_limits = BrokerHostLimits::default();
     host_limits.max_tables += 1;
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        baseline_memory.clone(),
-        StorageLimits::default(),
-        host_limits,
-        false,
-        "maintainer",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    assert_recent_empty(&broker, "surface-host").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 2);
-
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        baseline_memory.clone(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    assert_recent_empty(&broker, "surface-a-again").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 3);
-
     let mut memory_limit = baseline_memory.clone();
     memory_limit.max_recent_turns -= 1;
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        memory_limit,
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    assert_recent_empty(&broker, "surface-memory-limit").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 4);
-
     let storage_limit = StorageLimits {
         max_open_handles: StorageLimits::default().max_open_handles - 1,
         ..StorageLimits::default()
     };
-    let broker = build_broker_with_options(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        baseline_memory,
-        storage_limit,
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        None,
-        false,
-        &options,
-    )
-    .await;
-    assert_recent_empty(&broker, "surface-storage-limit").await;
-    drop(broker);
-    assert_eq!(generation_count(&root), 5);
+    for (invocation, memory, storage, host, generations) in [
+        (
+            "surface-host",
+            baseline_memory.clone(),
+            StorageLimits::default(),
+            host_limits,
+            2,
+        ),
+        (
+            "surface-a-again",
+            baseline_memory.clone(),
+            StorageLimits::default(),
+            BrokerHostLimits::default(),
+            3,
+        ),
+        (
+            "surface-memory-limit",
+            memory_limit,
+            StorageLimits::default(),
+            BrokerHostLimits::default(),
+            4,
+        ),
+        (
+            "surface-storage-limit",
+            baseline_memory,
+            storage_limit,
+            BrokerHostLimits::default(),
+            5,
+        ),
+    ] {
+        let broker = build_broker_with_options(
+            &root,
+            Arc::new(InMemoryAuditLog::new(16).expect("audit")),
+            memory,
+            storage,
+            host,
+            false,
+            "maintainer",
+            None,
+            false,
+            &options,
+        )
+        .await;
+        assert_recent_empty(&broker, invocation).await;
+        drop(broker);
+        assert_eq!(generation_count(&root), generations);
+    }
     assert_eq!(
         snapshot_tree_bytes(compiled.path()),
         cold_artifacts,
@@ -2457,37 +2253,21 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
     .expect("world");
-    let unrouted = |effect, risk, access| {
-        let mut set = memory_constraint(CapabilityRoute::ChatMemoryRecord, effect, risk, access);
-        set.route = CapabilityRoute::Generic;
-        set
-    };
-    let constraints = ConstraintCatalog::new([
-        (
-            MEMORY_RECORD.parse().expect("capability"),
-            unrouted(
-                EffectKind::LocalWrite,
-                RiskLevel::Medium,
-                StorageAccess::ReadWrite,
-            ),
-        ),
-        (
-            MEMORY_RECENT.parse().expect("capability"),
-            unrouted(
-                EffectKind::ReadOnly,
-                RiskLevel::High,
-                StorageAccess::ReadOnly,
-            ),
-        ),
-        (
-            "memory.chat.search".parse().expect("capability"),
-            unrouted(
-                EffectKind::ReadOnly,
-                RiskLevel::High,
-                StorageAccess::ReadOnly,
-            ),
-        ),
-    ])
+    let catalog = constraints_with_http_credential(None);
+    let constraints = ConstraintCatalog::new(
+        catalog
+            .iter()
+            .filter(|(_, set)| set.route != CapabilityRoute::Generic)
+            .map(|(id, set)| {
+                (
+                    id.clone(),
+                    ConstraintSet {
+                        route: CapabilityRoute::Generic,
+                        ..set.clone()
+                    },
+                )
+            }),
+    )
     .expect("an unrouted catalog is a valid catalog");
     let broker = Broker::new(
         registry,
