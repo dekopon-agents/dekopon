@@ -1,5 +1,5 @@
-# Promote CHANGELOG.md's Unreleased entries before running this command; CI requires the dated
-# version section. cargo-release prepares versions and tags; GitHub Actions owns publication.
+# Write the dated changelog section at release prep from Changelog: commit lines.
+# cargo-release prepares versions and tags; GitHub Actions owns publication.
 shared-version = true
 consolidate-commits = true
 tag-name = "v{{version}}"

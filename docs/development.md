@@ -227,7 +227,7 @@ See [`dekopond.md`](dekopond.md) for the user-facing contract, [`observability.m
 
 Use `--locked` for reproducible validation. Start with `git diff --check`. Targeted checks are encouraged during development; run every relevant group before opening a PR.
 
-Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target, or shared sccache; avoid routine `cargo clean`. Report cleanup, retention, and free space before/after at handoff.
+Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target, or kache's shared store; avoid routine `cargo clean`. Report cleanup, retention, and free space before/after at handoff.
 
 Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_that_cannot_be_opened_still_names_its_errno` and `dekopon-model`'s `a_rotated_credential_completes_the_turn_when_the_write_fails`. Under root, their unreadable-file/unwritable-directory setup does not establish the failure condition; report that verification gap rather than treating it as a regression.
 

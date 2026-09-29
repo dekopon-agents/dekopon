@@ -279,8 +279,6 @@ jobs:
         with:
           shared-key: package
           cache-bin: false
-      - name: Package every publishable crate
-        run: cargo package --workspace --locked
       - name: Request short-lived crates.io credential
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
@@ -324,8 +322,32 @@ jobs:
               : > "$publish_output"
             done
             rm -f "$publish_output"
-            # Allow the sparse index to make this dependency visible to the next package.
-            sleep 30
+            index_name=$(printf '%s' "$crate" | tr '[:upper:]' '[:lower:]')
+            case "${#index_name}" in
+              1) prefix=1 ;;
+              2) prefix=2 ;;
+              3) prefix="3/${index_name:0:1}" ;;
+              *) prefix="${index_name:0:2}/${index_name:2:2}" ;;
+            esac
+            deadline=$((SECONDS + 300))
+            while (( SECONDS < deadline )); do
+              remaining=$((deadline - SECONDS))
+              if (( remaining <= 0 )); then
+                break
+              fi
+              if index=$(curl --silent --fail --user-agent "dekopon-release-workflow" \
+                --max-time "$remaining" "https://index.crates.io/$prefix/$index_name") \
+                && grep -Fq "\"vers\":\"$version\"" <<< "$index"; then
+                return
+              fi
+              remaining=$((deadline - SECONDS))
+              if (( remaining > 0 )); then
+                sleep "$((remaining < 10 ? remaining : 10))"
+              fi
+            done
+            printf 'Timed out waiting for %s %s in the crates.io sparse index after 5 minutes.\n' \
+              "$crate" "$version" >&2
+            return 1
           }
           plan=.github/release-crates.txt
           if [[ ! -f "$plan" ]]; then
