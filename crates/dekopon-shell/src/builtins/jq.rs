@@ -157,7 +157,7 @@ fn collect(
             }
             Ok(ReadOutput::Exhausted) => {
                 return Err(LimitExceeded::ValueBytes {
-                    maximum: crate::DEFAULT_MAX_VALUE_BYTES,
+                    maximum: budget.max_value_bytes(),
                 }
                 .into());
             }
@@ -233,7 +233,9 @@ fn evaluate(
             excerpt
         });
         let (sender, receiver) = sync_channel(0);
-        let maximum = crate::DEFAULT_MAX_VALUE_BYTES.saturating_sub(budget.value_bytes());
+        let maximum = budget
+            .max_value_bytes()
+            .saturating_sub(budget.value_bytes());
         let reader = scope.spawn(move || {
             if let Err(error) = read_outputs(stdout, maximum, &sender) {
                 let _sent = sender.send(ReadOutput::Invalid(format!(

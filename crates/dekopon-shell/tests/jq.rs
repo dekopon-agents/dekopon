@@ -115,6 +115,20 @@ fn output_steps_and_bytes_are_charged() {
 }
 
 #[test]
+fn a_custom_value_byte_ceiling_refuses_a_single_jq_output_at_its_configured_maximum() {
+    worker();
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 1024,
+        ..Limits::default()
+    })
+    .run("jq '[range(5000)]'", &Invoker);
+    assert!(
+        outcome.output.contains("more than 1024 bytes"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
 fn raw_compact_flags_and_piped_json_text_keep_working() {
     for flag in ["-r", "-c", "--raw-output", "--compact-output"] {
         let outcome = Interpreter::new(Limits::default())
