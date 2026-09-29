@@ -19,6 +19,8 @@ mod diagnostics;
 mod failure;
 #[cfg(unix)]
 pub mod fragments;
+#[cfg(unix)]
+pub mod private_file;
 mod redaction;
 mod skill;
 mod subject;

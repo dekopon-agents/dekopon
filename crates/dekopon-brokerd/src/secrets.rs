@@ -40,6 +40,9 @@ use tokio::{
     io::AsyncReadExt as _,
     time::{Instant, timeout_at},
 };
+use tracing::Instrument as _;
+
+mod oauth2;
 
 pub const SECRET_MAP_API_VERSION: &str = "dekopon.dev/secret-map/v1alpha1";
 pub const HARD_MAX_SECRET_MAP_BYTES: usize = 1024 * 1024;
@@ -179,6 +182,14 @@ enum SecretSource {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+    #[serde(rename = "oauth2Refresh")]
+    OAuth2Refresh {
+        record_path: PathBuf,
+        token_endpoint: String,
+        client_id: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
     KubernetesTokenRequest {
         endpoint: String,
         bootstrap_root: PathBuf,
@@ -296,8 +307,31 @@ impl SecretResolver for MapResolver {
                 category: "missing",
             });
         };
+        let span = match &entry.source {
+            SecretSource::OAuth2Refresh { .. } => tracing::info_span!(
+                target: "credential",
+                "broker.credential.refresh",
+                credential = %secret,
+                outcome = tracing::field::Empty,
+                secret.source.kind = "oauth2-refresh",
+                duration_ms = tracing::field::Empty,
+                credential.expires_at_unix_ms = tracing::field::Empty,
+            ),
+            SecretSource::SecureFile { .. }
+            | SecretSource::KubernetesProjection { .. }
+            | SecretSource::OnePasswordConnect { .. }
+            | SecretSource::VaultKv1 { .. }
+            | SecretSource::VaultKv2 { .. }
+            | SecretSource::AwsSecretsManager { .. }
+            | SecretSource::AwsSsmParameter { .. }
+            | SecretSource::GcpSecretManager { .. }
+            | SecretSource::AzureKeyVault { .. }
+            | SecretSource::KubernetesTokenRequest { .. }
+            | SecretSource::KubernetesApi { .. } => tracing::Span::none(),
+        };
         let bytes = self
             .resolve_source(&entry.source, &entry.client)
+            .instrument(span)
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -340,6 +374,22 @@ impl MapResolver {
             }
             SecretSource::KubernetesProjection { root, key, .. } => {
                 read_kubernetes_projection(root, key).await
+            }
+            SecretSource::OAuth2Refresh {
+                record_path,
+                token_endpoint,
+                client_id,
+                timeout_ms,
+            } => {
+                oauth2::resolve(
+                    record_path,
+                    token_endpoint,
+                    client_id,
+                    *timeout_ms,
+                    self.expected_uid,
+                    client,
+                )
+                .await
             }
             SecretSource::OnePasswordConnect {
                 endpoint,
@@ -927,7 +977,9 @@ impl SecretSource {
             | Self::AwsSsmParameter {
                 credentials_file, ..
             } => Some(credentials_file.clone()),
-            Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
+            Self::SecureFile { .. }
+            | Self::KubernetesProjection { .. }
+            | Self::OAuth2Refresh { .. } => None,
         }
     }
 
@@ -939,6 +991,7 @@ impl SecretSource {
         match self {
             Self::SecureFile { path } => Some(path.clone()),
             Self::KubernetesProjection { root, key, .. } => Some(root.join(key)),
+            Self::OAuth2Refresh { record_path, .. } => Some(record_path.clone()),
             _ => None,
         }
     }
@@ -956,6 +1009,7 @@ impl SecretSource {
             Self::AzureKeyVault { .. } => "azure-key-vault",
             Self::KubernetesApi { .. } => "kubernetes-api",
             Self::KubernetesTokenRequest { .. } => "kubernetes-token-request",
+            Self::OAuth2Refresh { .. } => "oauth2-refresh",
         }
     }
 
@@ -966,6 +1020,17 @@ impl SecretSource {
     fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::SecureFile { path } => validate_absolute(path),
+            Self::OAuth2Refresh {
+                record_path,
+                token_endpoint,
+                client_id,
+                timeout_ms,
+            } => {
+                validate_absolute(record_path)?;
+                validate_endpoint(token_endpoint, true)?;
+                validate_texts([client_id])?;
+                validate_timeout(*timeout_ms)
+            }
             Self::KubernetesProjection {
                 root,
                 key,
@@ -1203,6 +1268,7 @@ async fn validate_map(
         ));
     }
     let mut seen = BTreeSet::new();
+    let mut oauth2_records: BTreeMap<PathBuf, Vec<OAuth2RecordOwner>> = BTreeMap::new();
     let mut bootstrap_paths = BTreeSet::new();
     let mut material_paths = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
@@ -1215,6 +1281,30 @@ async fn validate_map(
         }
         if let Err(reason) = entry.source.validate() {
             problems.push(format!("{} source is invalid: {reason}", entry.drn));
+        }
+        if let SecretSource::OAuth2Refresh {
+            record_path,
+            token_endpoint,
+            client_id,
+            ..
+        } = &entry.source
+        {
+            let owners = oauth2_records.entry(record_path.clone()).or_default();
+            for owner in owners.iter() {
+                if owner.token_endpoint != *token_endpoint || owner.client_id != *client_id {
+                    problems.push(format!(
+                        "oauth2Refresh record {} has conflicting tokenEndpoint or clientId for {} and {}",
+                        record_path.display(),
+                        owner.drn,
+                        entry.drn,
+                    ));
+                }
+            }
+            owners.push(OAuth2RecordOwner {
+                drn: entry.drn.clone(),
+                token_endpoint: token_endpoint.clone(),
+                client_id: client_id.clone(),
+            });
         }
         if let Some(path) = entry.source.bootstrap_path() {
             bootstrap_paths.insert(path);
@@ -1563,6 +1653,25 @@ async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
+struct OAuth2RecordOwner {
+    drn: SecretDrn,
+    token_endpoint: String,
+    client_id: String,
+}
+
+fn headers_within_limits(response: &reqwest::Response) -> bool {
+    response.headers().len() <= MAX_SOURCE_RESPONSE_HEADERS
+        && response
+            .headers()
+            .iter()
+            .try_fold(0_usize, |size, (name, value)| {
+                size.checked_add(name.as_str().len())?
+                    .checked_add(value.as_bytes().len())?
+                    .checked_add(4)
+            })
+            .is_some_and(|size| size <= MAX_SOURCE_RESPONSE_HEADER_BYTES)
+}
+
 async fn bounded_json(
     request: reqwest::RequestBuilder,
     timeout_ms: u64,
@@ -1587,17 +1696,7 @@ async fn bounded_json(
             SourceError::Rejected
         });
     }
-    if response.headers().len() > MAX_SOURCE_RESPONSE_HEADERS
-        || response
-            .headers()
-            .iter()
-            .try_fold(0_usize, |size, (name, value)| {
-                size.checked_add(name.as_str().len())?
-                    .checked_add(value.as_bytes().len())?
-                    .checked_add(4)
-            })
-            .is_none_or(|size| size > MAX_SOURCE_RESPONSE_HEADER_BYTES)
-    {
+    if !headers_within_limits(&response) {
         return Err(SourceError::TooLarge);
     }
     if response
@@ -1836,16 +1935,20 @@ fn selected_document_scalar(value: &Value, pointer: Option<&str>) -> Result<Vec<
     scalar_bytes(value)
 }
 
-fn reject_bootstrap_reflection(
-    material: Vec<u8>,
-    bootstrap_values: &[&str],
-) -> Result<Vec<u8>, SourceError> {
-    if bootstrap_values.iter().any(|bootstrap| {
+fn bootstrap_reflected(material: &[u8], bootstrap_values: &[&str]) -> bool {
+    bootstrap_values.iter().any(|bootstrap| {
         !bootstrap.is_empty()
             && material
                 .windows(bootstrap.len())
                 .any(|window| window == bootstrap.as_bytes())
-    }) {
+    })
+}
+
+fn reject_bootstrap_reflection(
+    material: Vec<u8>,
+    bootstrap_values: &[&str],
+) -> Result<Vec<u8>, SourceError> {
+    if bootstrap_reflected(&material, bootstrap_values) {
         return Err(SourceError::BootstrapReflected);
     }
     Ok(material)
@@ -1948,6 +2051,8 @@ pub enum SourceError {
     Transport,
     #[error("source rejected the request")]
     Rejected,
+    #[error("source requires reauthorization")]
+    ReauthorizationRequired,
     #[error("source value is missing")]
     Missing,
     #[error("source response failed an integrity check")]
@@ -2040,6 +2145,7 @@ impl SourceError {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
             Self::Rejected => "rejected",
+            Self::ReauthorizationRequired => "reauthorization-required",
             Self::Missing => "missing",
             Self::Integrity => "integrity",
             Self::BootstrapReflected => "bootstrap-reflected",
@@ -2084,6 +2190,8 @@ pub enum SecretMapError {
     },
 }
 
+#[cfg(test)]
+mod oauth2_tests;
 #[cfg(test)]
 mod token_request_tests;
 
