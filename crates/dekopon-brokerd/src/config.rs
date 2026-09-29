@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -10,8 +11,8 @@ use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ContextError,
 };
 use dekopon_broker_host::{
-    BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
-    NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts,
+    BrokerHostLimits, BrokerHostOptions, CacheMiss, DEFAULT_MAX_TOTAL_MEMORY_BYTES,
+    LockedProviderSource, NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts,
 };
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
@@ -64,6 +65,10 @@ pub struct BrokerdConfig {
     pub provider_set: Option<ManagedProviderSetConfig>,
     #[serde(default)]
     pub compile_on_load: bool,
+    #[serde(default)]
+    pub on_cache_miss: CacheMiss,
+    #[serde(default = "one_compile_thread")]
+    pub compile_threads: NonZeroU32,
     /// Tolerating a startup mismatch never grants anything at runtime: a capability nothing routes
     /// is still denied unconstrained-capability at invocation regardless of this setting.
     #[serde(default)]
@@ -96,6 +101,10 @@ pub struct BrokerdConfig {
     pub chat_memory: Option<ChatMemoryConfig>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+}
+
+const fn one_compile_thread() -> NonZeroU32 {
+    NonZeroU32::MIN
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -960,6 +969,8 @@ async fn resolve(
                 .as_ref()
                 .filter(|_| !config.compile_on_load && mode == LoadMode::Boot)
                 .map(|(_, store)| store.join("cwasm")),
+            cache_miss: config.on_cache_miss,
+            compile_threads: config.compile_threads,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
             plaintext_hosts: plaintext_hosts.clone(),
             extra_ca_bundles: Arc::new(extra_ca_bundles),

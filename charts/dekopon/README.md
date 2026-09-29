@@ -28,6 +28,7 @@ routing; it is disabled by default. The broker never receives a TCP surface.
 | Container | Kind | Runs |
 |---|---|---|
 | `prepare-files` | init, runs to completion, **root** | `busybox`, copies configuration into an `emptyDir` with the right owner and mode |
+| `precompile` | init, runs to completion, only with `broker.providerSet.enabled` and `broker.precompile.enabled` | `dekopon-brokerd provider precompile`, compiles the locked set into the store's cache and prunes the rest |
 | `broker` | native sidecar (`restartPolicy: Always`) when the gateway is enabled, otherwise the pod's only regular container | `dekopon-brokerd --config /etc/dekopon/broker.yaml` |
 | `gateway` | regular container, only when `gateway.enabled` | `dekopond --config /etc/dekopon/dekopond.yaml` |
 
@@ -200,9 +201,10 @@ emits **no audit record**.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker loads and validates every
   component before binding the socket, so "the socket answers" is exactly "fully started".
-  Managed providers default to verified mmap-backed cwasm on the provider store's persistent disk;
-  `compileOnLoad: true` bypasses it. Components load one at a time; a cold cache still runs Cranelift
-  and the probe budget has to cover it. Do not put the cache on the chart's memory-backed `/tmp`. The
+  Managed providers map verified cwasm from the provider store's persistent disk, which the
+  `precompile` init container fills before the broker starts; `compileOnLoad: true` bypasses it.
+  Components load one at a time. Baked-in providers, `compileOnLoad: true` and
+  `onCacheMiss: compile` still run Cranelift in the broker, and the probe budget has to cover it. Do not put the cache on the chart's memory-backed `/tmp`. The
   margin is large because a startup probe that gives up restarts the container, and every restart
   starts the compile over.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
@@ -449,10 +451,11 @@ claim is not the path the daemon reads. The broker mounts that subdirectory by `
 of its ChatGPT credential mount rather than a child of it. The gateway gets no mount for it, which
 is the same boundary the two credential directories have.
 
-**The pod does not write the lock or the store.** `dekopon-brokerd provider sync` does, and it has
+**The pod does not write the lock or the blobs.** `dekopon-brokerd provider sync` does, and it has
 to have completed before the pod rolls: either `broker.providerSync` below, or your own step against
-the same claim. The pod does the one thing only it can do: the init container
-creates the subdirectory if it is absent and hands it to `65532` as `0700`. Both halves are
+the same claim. The pod does two things only it can do: the root init container
+creates the subdirectory if it is absent and hands it to `65532` as `0700`, and the `precompile` init
+container compiles the locked set into the store's cache (see below). Both halves are
 load-bearing, because the broker refuses a lock or a store that is not owned by its own UID and
 refuses any ancestor that is group- or world-writable without the sticky bit, and a fresh
 `local-path` volume arrives root-owned and `0777`. The chown names that subtree only, and is not
@@ -464,6 +467,33 @@ rendered before, and a release that enables it must also stop naming `providers`
 `broker.yaml`. The chart refuses to render when `subdir` is not one non-dot path segment, when it
 collides with either ChatGPT subdirectory, or when `mountPath` is not canonical absolute or would
 overlap another of the broker's own mounts.
+
+### Compiling before the broker starts
+
+`broker.precompile.enabled` (default `true`, effective only with `broker.providerSet.enabled`) runs
+`dekopon-brokerd provider precompile` as an init container between `prepare-files` and the broker,
+with the Deployment's image, the broker's UID and the same `subPath` mount. It reads
+`<mountPath>/providers.lock.yaml` and `<mountPath>/store`, the paths the hook Job writes, compiles
+each locked component the cache lacks, deletes compiled code and blobs the lock no longer names, and
+exits. The kernel takes back Cranelift's working set when it exits, so the broker never holds it.
+With `broker.yaml` on its default `onCacheMiss: fail`, a component this step did not compile stops
+the broker's startup rather than compiling in it.
+
+```yaml
+broker:
+  precompile:
+    compileThreads: 1   # Cranelift threads per component, also passed to the hook Job
+    resources:
+      limits:
+        memory: 512Mi   # raise with compileThreads
+```
+
+Every Wasmtime upgrade changes the cache's engine key, so the first pod of such a release compiles
+every component here; later pods find the cache warm and only check it. Once this runs, the broker's
+own `resources.limits.memory` covers a warm broker plus `hostLimits.maxTotalMemoryBytes` rather than
+Cranelift; the chart leaves the default at `1Gi` because baked-in providers still compile in the
+broker. If `broker.yaml` points `providerSet` at other paths, disable this and run the command
+yourself.
 
 ### Syncing the set with the chart's hook Job
 

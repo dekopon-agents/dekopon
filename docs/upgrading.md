@@ -8,6 +8,37 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Precompiled providers (unreleased)
+
+The cwasm cache moves from `storePath/cwasm/v1` to `storePath/cwasm/v2`, keyed so that a Rust
+toolchain change no longer invalidates it, and a managed broker no longer compiles on a miss.
+Every managed-provider deployment's first start on this release finds the cache empty.
+
+- **Chart deployments** need no edits. The new `precompile` init container
+  (`broker.precompile.enabled`, on by default with `broker.providerSet.enabled`) compiles the
+  locked set before the broker starts and deletes `v1`. Deploy the chart with this release's image:
+  the older image has no `provider precompile`, so the init container would fail.
+- **Deployments outside the chart** that use `providerSet` must fill the cache before restarting the
+  broker, or the broker refuses to start with `no compiled artifact for …`. Stop the broker, then
+  run `dekopon-brokerd provider precompile --lock-file <lockPath> --store <storePath>` as the
+  broker's UID, then start it. To keep compiling in the broker instead, set `onCacheMiss: compile`
+  in `broker.yaml` and keep its memory limit sized for Cranelift.
+- `provider sync` and `provider precompile` now delete blobs the active lock does not name, and
+  `precompile` deletes compiled code for other locks, engines and `v1`. A running broker read its
+  blobs at startup, so `sync` may run beside it as the chart's hook Job does; run `precompile` with
+  the broker stopped. Rolling back to an earlier release then starts from a cold cache.
+- New broker keys: `onCacheMiss` (`fail` by default, or `compile`) and `compileThreads` (`1` by
+  default); new operator flag `--compile-threads` on `provider` commands. Cranelift now compiles one
+  function at a time unless you raise it; raise the memory limit of whatever compiles with it.
+- With the precompile step in place, the broker's memory limit only has to cover a warm broker
+  (67 MiB measured on 0.27.0) plus `hostLimits.maxTotalMemoryBytes`. The chart keeps its `1Gi`
+  default because baked-in providers still compile in the broker; lower it in your values when you
+  run a managed set.
+
+Embeddings: `BrokerHostOptions` gains `cache_miss` (default `CacheMiss::Fail`) and
+`compile_threads`. A caller that sets `cwasm_dir` and expects compile-on-miss sets
+`cache_miss: CacheMiss::Compile`; the testkit's `.compile_cache(dir)` already does.
+
 ## Kubernetes TokenRequest secret source (0.27.0)
 
 Existing 0.26.0 configurations need no edits. To opt into the new broker-private

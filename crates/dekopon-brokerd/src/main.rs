@@ -8,7 +8,7 @@
     )
 )]
 #[cfg(unix)]
-use std::{io, path::PathBuf, process::ExitCode};
+use std::{io, num::NonZeroU32, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -91,6 +91,9 @@ struct ProviderArgs {
         global = true
     )]
     plaintext_loopback_registries: Vec<String>,
+    /// Cranelift threads per component; raise the memory limit to match.
+    #[arg(long, value_name = "N", default_value = "1", global = true)]
+    compile_threads: NonZeroU32,
     /// Render command results as a table or JSON.
     #[arg(long, value_enum, default_value_t, global = true)]
     output: OutputFormat,
@@ -120,6 +123,9 @@ enum ProviderCommand {
     List,
     /// Verify locked bytes and the complete provider set without network access.
     Verify,
+    /// Compile every locked component missing from the cwasm cache, then prune what the lock no
+    /// longer names. Stop the broker using this store first.
+    Precompile,
 }
 
 /// Transport crates are silenced explicitly: an HTTP or gRPC stack logs every connection. The
@@ -316,6 +322,7 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
             store: provider.store.expect("validate_cli requires --store"),
         },
         plaintext_loopback_registries: provider.plaintext_loopback_registries,
+        compile_threads: provider.compile_threads,
     })
     .map_err(AppError::Provider)?;
     match provider.command {
@@ -363,6 +370,15 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
             let report = manager.verify().await.map_err(AppError::Provider)?;
             render(output, &report, || {
                 format!("verified {} locked provider(s)", report.providers)
+            })?;
+        }
+        ProviderCommand::Precompile => {
+            let report = manager.precompile().await.map_err(AppError::Provider)?;
+            render(output, &report, || {
+                format!(
+                    "PROVIDERS\tCOMPILED\tREMOVED-FILES\tREMOVED-BYTES\n{}\t{}\t{}\t{}",
+                    report.providers, report.compiled, report.removed_files, report.removed_bytes
+                )
             })?;
         }
     }

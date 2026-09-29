@@ -51,8 +51,13 @@ beyond that.
 into the broker's authority surface:
 
 - `cwasm_dir` enables immutable, content-addressed, mmap-backed compiled artifacts in a trusted
-  operator-owned directory. `None` compiles directly with no cache. A missing source/engine index
-  compiles once; a hit stream-verifies compiled bytes once per registry boot before mapping.
+  operator-owned directory. `None` compiles directly with no cache. `cache_miss` decides a missing
+  source/engine index: `CacheMiss::Fail` (the default) refuses with `CompiledArtifactMissing`, and
+  `CacheMiss::Compile` compiles once and publishes; a hit stream-verifies compiled bytes once per
+  registry boot before mapping. `precompile` fills and prunes a cache for a locked set without
+  loading providers.
+- `compile_threads` is Cranelift's parallelism within one component: `1` compiles serially, and a
+  larger value runs a pool of that many threads.
   Errors fail loading, never trigger fallback or repair. No invocation rehashes or reopens files.
   The operator must keep mapped inodes unchanged until every registry using them exits. One private
   `cwasm::deserialize` function is the sole scoped unsafe exception, calling Wasmtime's file API;

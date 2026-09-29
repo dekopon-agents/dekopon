@@ -675,6 +675,7 @@ migration is implemented here.
 | `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`ok`/`error`); one root for complete registry startup, including engine creation and descriptions |
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
+| `provider.precompile` | `dekopon-broker-host` | `providers`, `compiled`, `removed_files`, `removed_bytes`, `elapsed_us`, `outcome`; one root for `dekopon-brokerd provider precompile`, with `compile`/`artifact_hash`/`publish` stages beneath it for each component it compiled |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
 | `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
@@ -709,7 +710,9 @@ per native function. Every load/stage also emits a completion event with timing/
 stdout users without an exporter. A failed stage retains elapsed time and outcome; the enclosing
 component failure event carries its bounded cause chain. Absent later stages are not zero-cost successes.
 
-For a cold miss, expect `compile`, `artifact_hash`, `publish`, then `deserialize`. On a warm hit,
+Under the default `onCacheMiss: fail`, a miss records `cache = "miss"` and the load fails with no
+stage. With `onCacheMiss: compile`, a cold miss shows `compile`, `artifact_hash`, `publish`, then
+`deserialize`. On a warm hit,
 expect `verify` then `deserialize`, with **no compiler stage**. `reuse` means the same compiled hash
 was already verified/mapped in this registry boot; `bypass` means source compilation without cache
 I/O. `lookup` on failure means the lookup itself did not reach a usable hit/miss. Stage `bytes`
@@ -724,9 +727,10 @@ alongside these spans to measure memory savings. Neither cwasm size nor latency 
 RAM. Boot hashing touches every selected byte; clean mapped pages remain reclaimable afterward.
 
 Each loaded-provider event also carries provider ID, source digest prefix/size, capability and
-command-word counts, and `command_export`. The offline `dekopon-brokerd provider sync` and `verify`
-commands reuse uncached host validation and emit these spans to their stderr subscriber, but install
-no OTLP exporter. No startup verification/compilation spans recur during command runs or invocations.
+command-word counts, and `command_export`. The offline `dekopon-brokerd provider` commands emit these
+spans to their stderr subscriber, but install no OTLP exporter: `sync` validates through the store's
+cache and publishes what it compiles, `verify` validates uncached, and `precompile` emits
+`provider.precompile`. No startup verification/compilation spans recur during command runs or invocations.
 
 `stores` and `instantiations` are on all three guest-executing spans because the host resolves each
 provider's imports into one `InstancePre` at load: every description, command run, and invocation

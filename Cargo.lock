@@ -916,6 +916,7 @@ dependencies = [
  "dekopon-provider-sdk-testkit",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "rayon",
  "rustix",
  "serde",
  "serde_json",

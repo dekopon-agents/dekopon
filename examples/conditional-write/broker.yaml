@@ -28,8 +28,9 @@ policiesPath: policies.cedar
 # invocation either way.
 strict: true
 
-# Direct paths below compile on every startup. For a managed providerSet instead, cwasm is
-# enabled by default under storePath/cwasm; set compileOnLoad: true to bypass that cache.
+# Direct paths below compile on every startup. For a managed providerSet instead, the broker maps
+# cwasm from storePath/cwasm that `dekopon-brokerd provider precompile` filled, and a missing
+# artifact stops startup unless onCacheMiss: compile; set compileOnLoad: true to bypass that cache.
 # Cache errors are fatal, never an implicit fallback. Do not use the retired compileCachePath.
 providers:
   # The checked-in probe component: one read and one conditional write.

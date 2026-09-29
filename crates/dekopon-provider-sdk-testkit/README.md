@@ -65,8 +65,8 @@ Tests must use a multi-thread runtime — `#[tokio::test(flavor = "multi_thread"
 dispatches to `spawn_blocking`, and a current-thread runtime deadlocks waiting for a namespace
 lease.
 
-Pass `.compile_cache(dir)` when a suite loads the same component repeatedly. This now uses trusted,
-immutable, content-addressed cwasm mapped from files, not Wasmtime's compressed cache. Hashes are
+Pass `.compile_cache(dir)` when a suite loads the same component repeatedly. This uses trusted,
+immutable, content-addressed cwasm mapped from files, compiling on a miss. Hashes are
 verified once per harness startup. Keep files unchanged while a harness lives and serialize cache
 publishers; errors fail loading without fallback. Omit the option to compile without cache I/O.
 

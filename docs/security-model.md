@@ -352,6 +352,9 @@ The only unsafe-code exception is the private `dekopon-broker-host::cwasm::deser
 `Component::deserialize_file`. It is reached only for compiler-produced, locally indexed artifacts
 that were just published or verified. Wasmtime checks compatibility. Publication never overwrites
 an existing inode. Failures stop startup; `compileOnLoad: true` explicitly bypasses the feature.
+`provider precompile` is a second publisher into the same cache: the same binary, run as the
+broker's UID against the same private store, under the store lock. It adds no trust the broker
+did not already extend to its own writes, and the broker still verifies every artifact it maps.
 No hash, file read, or cache authority decision runs on invocations. Provider authority and source
 identity are unchanged. See [configuration and limits](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
 
