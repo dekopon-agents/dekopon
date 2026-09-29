@@ -45,10 +45,9 @@ impl PrivateFileLock {
 
 impl Drop for PrivateFileLock {
     fn drop(&mut self) {
-        #[allow(
+        #[expect(
             clippy::let_underscore_must_use,
-            reason = "a destructor has no caller to report to, and closing the file releases the \
-                      lock regardless of what an explicit unlock answers"
+            reason = "discard unlock's result because Drop cannot report it and closing the file releases the lock regardless"
         )]
         let _ = self.file.unlock();
     }
@@ -98,11 +97,9 @@ pub fn replace_private_file(path: &Path, bytes: &[u8]) -> Result<(), PrivateFile
         })
     })();
     if result.is_err() {
-        #[allow(
+        #[expect(
             clippy::let_underscore_must_use,
-            reason = "rollback of a temporary the write already failed on; the caller is being \
-                      given that write error, and a leftover 0600 temporary is not worth \
-                      replacing it with a cleanup error"
+            reason = "discard cleanup's result to return the original write error instead of replacing it with a temporary removal error"
         )]
         let _ = fs::remove_file(&temporary);
     }

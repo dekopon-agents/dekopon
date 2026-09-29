@@ -177,12 +177,10 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
     } = inputs;
     let started = std::time::Instant::now();
     let locked_path = path.clone();
-    let opened = tokio::task::spawn_blocking(move || read_locked(locked_path, uid))
-        .await
-        .map_err(|source| classified(SourceError::Internal, &source))?;
-    let outcome = match opened {
-        Ok(opened) => refresh(opened, path, endpoint, client_id, timeout, client).await,
-        Err(error) => Err(error),
+    let outcome = match tokio::task::spawn_blocking(move || read_locked(locked_path, uid)).await {
+        Ok(Ok(opened)) => refresh(opened, path, endpoint, client_id, timeout, client).await,
+        Ok(Err(error)) => Err(error),
+        Err(source) => Err(classified(SourceError::Internal, &source)),
     };
     span.record(
         "duration_ms",

@@ -279,7 +279,10 @@ endpoint must use HTTPS or literal loopback HTTP; redirects and ambient proxies 
 `reauthorization-required` means the OAuth error code says the token family is retired: re-import
 a working record. Other 4xx responses are `rejected`, 5xx and connection failures are `transport`,
 a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
-`insecure-file`; a missing file is `io`. If saving a rotated token fails, this invocation still
+`insecure-file`; a missing file is `io`.
+`too-large` means the record, token, or response headers exceed their configured ceiling.
+`internal` means a blocking or refresh task did not complete.
+If saving a rotated token fails, this invocation still
 returns the new access token and logs the path and I/O error. A refresh whose response is lost costs
 one re-import: the old refresh token remains on disk, and the next use may get `invalid_grant`.
 

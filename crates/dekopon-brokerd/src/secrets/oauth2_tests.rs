@@ -13,9 +13,19 @@ use std::{
     time::Duration,
 };
 
-use dekopon_broker::SecretResolver as _;
-use dekopon_core::SecretDrn;
-use dekopon_test_support::{CaptureLayer, content_length};
+use dekopon_broker::{
+    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld, SecretResolver as _,
+};
+use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+use dekopon_capability::{
+    EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule, InvocationOutcome,
+};
+use dekopon_core::{Actor, AgentId, PrincipalId, RiskLevel, SecretDrn};
+use dekopon_test_support::{
+    CaptureLayer, LoopbackServer, Record, content_length, provider_fixture,
+};
 use serde_json::{Value, json};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -38,6 +48,12 @@ struct TokenApi {
 
 impl TokenApi {
     fn serving(reply: impl Fn(usize) -> (&'static str, String) + Send + 'static) -> Self {
+        Self::serving_with_request(move |count, _| reply(count))
+    }
+
+    fn serving_with_request(
+        mut reply: impl FnMut(usize, &str) -> (&'static str, String) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("API listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -72,7 +88,7 @@ impl TokenApi {
                 }
                 let mut all = recorded.lock().expect("requests");
                 all.push(String::from_utf8(request).expect("HTTP request"));
-                let (status, body) = reply(all.len());
+                let (status, body) = reply(all.len(), all.last().expect("recorded request"));
                 drop(all);
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -277,8 +293,13 @@ async fn concurrent_resolutions_of_one_record_spend_one_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
-    let api = TokenApi::serving(|n| {
-        if n == 1 {
+    let mut used = std::collections::BTreeSet::new();
+    let api = TokenApi::serving_with_request(move |_, request| {
+        let token = url::form_urlencoded::parse(content(request).as_bytes())
+            .find(|(key, _)| key == "refresh_token")
+            .map(|(_, value)| value.into_owned())
+            .expect("refresh_token form field");
+        if used.insert(token) {
             success()
         } else {
             (
@@ -298,7 +319,14 @@ async fn concurrent_resolutions_of_one_record_spend_one_refresh() {
         })
         .collect::<Vec<_>>();
     for task in tasks {
-        assert_eq!(task.await.unwrap().unwrap(), NEW_ACCESS.as_bytes());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("resolution deadline")
+                .expect("join")
+                .expect("resolve"),
+            NEW_ACCESS.as_bytes()
+        );
     }
     assert_eq!(api.requests().len(), 1);
 }
@@ -319,7 +347,46 @@ fn map(path: &Path, endpoint: &str, bootstrap: Option<&Path>) -> SecretMapFile {
     serde_json::from_value(json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1","mapRevision":"test","secrets":secrets})).unwrap()
 }
 
-#[tokio::test]
+fn oauth_policy() -> PolicyEngine {
+    let policy = format!(
+        r#"@id("allow-fetch")
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"http-probe.fetch",
+               resource == Dekopon::Provider::"http-probe")
+        when {{ context.via == "gateway" && context.agent == "agent" }};
+        @id("allow-prompt")
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"agent.prompt",
+               resource == Dekopon::Agent::"agent")
+        when {{ context.via == "gateway" }};
+        @id("use-one")
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"secret.use",
+               resource == Dekopon::Secret::"{}")
+        when {{ context.capability == "http-probe.fetch"
+             && context.provider == "http-probe" && context.sink == "httpBearer" }};
+        @id("use-two")
+        permit(principal == Dekopon::Principal::"caller",
+               action == Dekopon::Action::"secret.use",
+               resource == Dekopon::Secret::"{}")
+        when {{ context.capability == "http-probe.fetch"
+             && context.provider == "http-probe" && context.sink == "httpBearer" }};"#,
+        drn("one"),
+        drn("two")
+    );
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().unwrap()],
+        [(
+            "http-probe.fetch".parse().unwrap(),
+            "http-probe".parse().unwrap(),
+        )],
+    )
+    .unwrap()
+    .with_secrets([drn("one"), drn("two")]);
+    PolicyEngine::new(&policy, &world).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_drns_over_one_record_share_one_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
@@ -334,31 +401,141 @@ async fn two_drns_over_one_record_share_one_refresh() {
             )
         }
     });
-    validate_map(
-        map(&path, &api.endpoint, None),
+    let target = LoopbackServer::serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        2,
+    );
+    let authority = target.authority().to_owned();
+    let mut file = map(&path, &api.endpoint, None);
+    for entry in &mut file.secrets {
+        for binding in &mut entry.bindings {
+            binding.capability = "http-probe.fetch".parse().unwrap();
+            binding.allowed_hosts = vec![authority.clone()];
+            binding.allowed_methods = vec!["GET".to_owned()];
+            binding.allowed_paths = vec![HttpPathRule::Exact {
+                path: "/api/v1/thing".to_owned(),
+            }];
+        }
+    }
+    let catalog = validate_map(
+        file,
         &dir.path().join("map.json"),
         rustix::process::geteuid().as_raw(),
     )
     .await
     .unwrap();
-    let resolver = Arc::new(resolver(&path, &api.endpoint, &["one", "two"]));
-    let a = {
-        let resolver = Arc::clone(&resolver);
+    assert_eq!(catalog.drns().count(), 2);
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap();
+    let constraints = ConstraintCatalog::new([(
+        "http-probe.fetch".parse().unwrap(),
+        ConstraintSet {
+            route: CapabilityRoute::Generic,
+            provider: "http-probe".parse().unwrap(),
+            effect: EffectKind::ReadOnly,
+            risk: RiskLevel::Low,
+            credential: None,
+            constraints: ExecutionConstraints {
+                asset: None,
+                timeout_ms: 5_000,
+                max_output_bytes: 1024 * 1024,
+                http: Some(HttpConstraints {
+                    allowed_hosts: vec![authority.clone()],
+                    propagate_trace: false,
+                    allowed_methods: vec!["GET".to_owned()],
+                    max_requests: 1,
+                    max_request_bytes: 64 * 1024,
+                    max_response_bytes: 64 * 1024,
+                    allow_plaintext_loopback: true,
+                }),
+                storage: None,
+                secret_use: None,
+            },
+        },
+    )])
+    .unwrap();
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test".parse().unwrap(),
+            "policy-test".to_owned(),
+            oauth_policy(),
+            constraints,
+            CredentialStore::empty(),
+            IdentityDirectory::new([(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "caller".parse().unwrap(),
+            )])
+            .unwrap(),
+            Arc::new(InMemoryAuditLog::new(16).unwrap()),
+            BrokerLimits::default(),
+        )
+        .unwrap()
+        .with_secret_catalog(catalog)
+        .unwrap(),
+    );
+    let invoke = |id: &'static str, secret: SecretDrn| {
+        let broker = Arc::clone(&broker);
+        let authority = authority.clone();
         tokio::spawn(async move {
-            let entry = resolver.entries.get(&drn("one")).unwrap();
-            resolver.resolve_source(&entry.source, &entry.client).await
+            let id: dekopon_core::InvocationId = id.parse().unwrap();
+            let request = InvocationRequest {
+                id: id.clone(),
+                capability: "http-probe.fetch".parse().unwrap(),
+                trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                    .parse()
+                    .unwrap(),
+                input: json!({"uri":format!("http://{authority}/api/v1/thing"),"method":"GET"}),
+                secret_use: Some(dekopon_core::SecretUseProposal::HttpBearer { secret }),
+            };
+            let context = AuthenticatedContext::new(
+                "gateway".parse().unwrap(),
+                Actor::Service {
+                    principal: "gateway".parse().unwrap(),
+                },
+            )
+            .unwrap();
+            let attestation = Attestation::for_subject(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "agent".parse::<AgentId>().unwrap(),
+            )
+            .bound_to(id);
+            broker
+                .invoke(
+                    &context,
+                    Some(&AttestorGrant { namespaces: None }),
+                    Some(&attestation),
+                    request,
+                    Default::default(),
+                )
+                .await
         })
     };
-    let b = {
-        let resolver = Arc::clone(&resolver);
-        tokio::spawn(async move {
-            let entry = resolver.entries.get(&drn("two")).unwrap();
-            resolver.resolve_source(&entry.source, &entry.client).await
-        })
-    };
-    assert_eq!(a.await.unwrap().unwrap(), NEW_ACCESS.as_bytes());
-    assert_eq!(b.await.unwrap().unwrap(), NEW_ACCESS.as_bytes());
+    let a = invoke("invoke-oauth-one", drn("one"));
+    let b = invoke("invoke-oauth-two", drn("two"));
+    for task in [a, b] {
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("resolution deadline")
+            .expect("join")
+            .expect("invocation");
+        assert_eq!(
+            result.result.outcome,
+            InvocationOutcome::Succeeded,
+            "{:?}",
+            result.result.error
+        );
+    }
     assert_eq!(api.requests().len(), 1);
+    for _ in 0..2 {
+        let request = target.request_text();
+        assert!(request.contains(&format!("authorization: Bearer {NEW_ACCESS}")));
+    }
+    target.join();
 }
 
 #[tokio::test]
@@ -379,16 +556,24 @@ async fn a_rotation_whose_save_fails_still_returns_the_token() {
         .await;
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(result.unwrap(), NEW_ACCESS.as_bytes());
-    let events = capture.events_text();
-    assert_eq!(
-        events
-            .matches("OAuth refresh succeeded but the record could not be saved")
-            .count(),
-        1,
-        "{events}"
-    );
-    assert!(events.contains(&path.display().to_string()), "{events}");
-    assert!(events.contains("Permission denied"), "{events}");
+    let errors = capture
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Event {
+                level: "ERROR",
+                fields,
+                ..
+            } => Some(fields),
+            Record::Event { .. } | Record::Span { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains(&format!(" record_path={}", path.display())));
+    assert!(errors[0].contains(" error=Permission denied"), "{errors:?}");
+    for token in [OLD_REFRESH, NEW_REFRESH, NEW_ACCESS] {
+        assert!(!errors[0].contains(token), "error event disclosed {token}");
+    }
 }
 
 #[tokio::test]
