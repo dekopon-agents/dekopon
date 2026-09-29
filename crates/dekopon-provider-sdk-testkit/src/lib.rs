@@ -62,6 +62,7 @@ use dekopon_storage_host::StorageGrantRequest;
 use serde_json::Value;
 use tempfile::TempDir;
 
+use dekopon_broker_host::CacheMiss;
 pub use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerInvocationFailure,
     BrokerInvocationOutput, BrokerProviderRegistry, CommandRunOutcome,
@@ -249,6 +250,7 @@ impl FakeBrokerBuilder {
     #[must_use]
     pub fn compile_cache(mut self, directory: impl Into<PathBuf>) -> Self {
         self.host_options.cwasm_dir = Some(directory.into());
+        self.host_options.cache_miss = CacheMiss::Compile;
         self
     }
 

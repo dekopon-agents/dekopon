@@ -14,6 +14,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     io::Read as _,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -52,6 +53,7 @@ mod metadata;
 mod settings;
 mod storage;
 use clock::ClockState;
+pub use cwasm::CacheMiss;
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, NonPublicHttpsAuthority,
     PlaintextHostError, PlaintextHosts, destinations_cover,
@@ -137,6 +139,8 @@ pub struct BrokerHostOptions {
     /// None compiles without a cache; the operator must not modify these mapped files while the
     /// registry is alive, since hashes are checked once at startup.
     pub cwasm_dir: Option<PathBuf>,
+    pub cache_miss: CacheMiss,
+    pub compile_threads: NonZeroU32,
     pub max_total_memory_bytes: Option<usize>,
     pub plaintext_hosts: PlaintextHosts,
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
@@ -150,6 +154,8 @@ impl Default for BrokerHostOptions {
     fn default() -> Self {
         Self {
             cwasm_dir: None,
+            cache_miss: CacheMiss::default(),
+            compile_threads: NonZeroU32::MIN,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
             plaintext_hosts: PlaintextHosts::default(),
             extra_ca_bundles: Arc::new(Vec::new()),
@@ -350,6 +356,7 @@ impl Drop for MemoryReservation {
 struct Runtime {
     engine: Engine,
     engine_key: String,
+    compiler: cwasm::Compiler,
     cwasm: Option<cwasm::Cache>,
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
@@ -371,14 +378,13 @@ impl Runtime {
                 name: "max_total_memory_bytes",
             });
         }
-        let config = host::config();
-        let engine = host::engine(config).map_err(|error| match error {
-            EngineError::Engine { source } => BrokerHostError::Engine { source },
-        })?;
+        let compiler = cwasm::Compiler::new(options.compile_threads)
+            .map_err(|source| BrokerHostError::CompilerThreads { source })?;
+        let engine = compile_engine(&compiler)?;
         let cwasm = options
             .cwasm_dir
             .clone()
-            .map(|root| cwasm::Cache::new(root, &engine));
+            .map(|root| cwasm::Cache::new(root, &engine, options.cache_miss));
         let mut linker = Linker::new(&engine);
         bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|source| BrokerHostError::Linker { source })?;
@@ -387,6 +393,7 @@ impl Runtime {
         Ok(Self {
             engine_key: cwasm::compatibility_key(&engine),
             engine,
+            compiler,
             cwasm,
             linker,
             limits,
@@ -619,6 +626,14 @@ impl fmt::Debug for BrokerWasmProvider {
     }
 }
 
+fn compile_engine(compiler: &cwasm::Compiler) -> Result<Engine, BrokerHostError> {
+    let mut config = host::config();
+    compiler.configure(&mut config);
+    host::engine(config).map_err(|error| match error {
+        EngineError::Engine { source } => BrokerHostError::Engine { source },
+    })
+}
+
 fn compile_component(
     runtime: &Runtime,
     source: ProviderSource,
@@ -658,10 +673,9 @@ fn compile_component(
     })
 }
 
-fn prepare_component(
-    runtime: &Runtime,
-    source: ProviderSource,
-) -> Result<CompiledComponent, BrokerHostError> {
+fn read_source(
+    source: &ProviderSource,
+) -> Result<(Vec<u8>, metadata::ArtifactIdentity), BrokerHostError> {
     let started = Instant::now();
     // Reads once, capped one byte over the limit, since a second read can't prove it matches what
     // Cranelift consumed and concurrent growth could otherwise allocate unbounded memory.
@@ -686,14 +700,14 @@ fn prepare_component(
         && metadata.len() != expected.artifact_bytes
     {
         return Err(BrokerHostError::ArtifactSizeMismatch {
-            path: source.path,
+            path: source.path.clone(),
             expected: expected.artifact_bytes,
             actual: metadata.len(),
         });
     }
     if metadata.len() > maximum {
         return Err(BrokerHostError::ArtifactTooLarge {
-            path: source.path,
+            path: source.path.clone(),
             actual: metadata.len(),
             maximum,
         });
@@ -709,12 +723,12 @@ fn prepare_component(
     if actual > maximum {
         return match &source.expected {
             Some(expected) => Err(BrokerHostError::ArtifactSizeMismatch {
-                path: source.path,
+                path: source.path.clone(),
                 expected: expected.artifact_bytes,
                 actual,
             }),
             None => Err(BrokerHostError::ArtifactTooLarge {
-                path: source.path,
+                path: source.path.clone(),
                 actual,
                 maximum,
             }),
@@ -724,14 +738,14 @@ fn prepare_component(
     if let Some(expected) = &source.expected {
         if artifact.bytes != expected.artifact_bytes {
             return Err(BrokerHostError::ArtifactSizeMismatch {
-                path: source.path,
+                path: source.path.clone(),
                 expected: expected.artifact_bytes,
                 actual: artifact.bytes,
             });
         }
         if artifact.sha256 != expected.artifact_sha256 {
             return Err(BrokerHostError::ArtifactDigestMismatch {
-                path: source.path,
+                path: source.path.clone(),
                 expected: expected.artifact_sha256.clone(),
                 actual: artifact.sha256,
             });
@@ -747,17 +761,32 @@ fn prepare_component(
         artifact_bytes = artifact.bytes,
         "provider source verified"
     );
+    Ok((bytes, artifact))
+}
+
+fn prepare_component(
+    runtime: &Runtime,
+    source: ProviderSource,
+) -> Result<CompiledComponent, BrokerHostError> {
+    let (bytes, artifact) = read_source(&source)?;
     let expected_provider_id = source.expected.map(|expected| expected.provider_id);
     let source = source.path;
     let component = match &runtime.cwasm {
-        Some(cache) => cache
-            .load(&runtime.engine, &bytes, &artifact.sha256)
+        Some(cache) => match cache
+            .load(&runtime.engine, &runtime.compiler, &bytes, &artifact.sha256)
             .map_err(|error| BrokerHostError::CompiledArtifact {
                 path: source.clone(),
                 source: error,
-            })?,
+            })? {
+            cwasm::Lookup::Mapped(component) => component,
+            cwasm::Lookup::Missing => {
+                return Err(BrokerHostError::CompiledArtifactMissing { path: source });
+            }
+        },
         None => cwasm::stage("compile", artifact.bytes, || {
-            Component::new(&runtime.engine, &bytes)
+            runtime
+                .compiler
+                .run(|| Component::new(&runtime.engine, &bytes))
         })
         .map_err(|error| BrokerHostError::Compile {
             path: source.clone(),
@@ -1290,6 +1319,88 @@ impl BrokerWasmProvider {
             }),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrecompileReport {
+    pub providers: usize,
+    pub compiled: usize,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
+}
+
+pub async fn precompile(
+    sources: Vec<LockedProviderSource>,
+    cwasm_dir: PathBuf,
+    compile_threads: NonZeroU32,
+) -> Result<PrecompileReport, BrokerHostError> {
+    let span = tracing::info_span!(
+        "provider.precompile",
+        providers = sources.len(),
+        compiled = tracing::field::Empty,
+        removed_files = tracing::field::Empty,
+        removed_bytes = tracing::field::Empty,
+        elapsed_us = tracing::field::Empty,
+        outcome = tracing::field::Empty
+    );
+    let started = Instant::now();
+    let path = cwasm_dir.clone();
+    let work_span = span.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        work_span.in_scope(|| precompile_sources(&sources, cwasm_dir, compile_threads))
+    })
+    .await
+    .map_err(|join| BrokerHostError::CacheMaintenance {
+        path,
+        source: wasmtime::Error::new(join),
+    })
+    .and_then(|result| result);
+    let elapsed_us = cwasm::micros(started);
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    if let Ok(report) = &result {
+        span.record("compiled", report.compiled);
+        span.record("removed_files", report.removed_files);
+        span.record("removed_bytes", report.removed_bytes);
+    }
+    span.record("elapsed_us", elapsed_us);
+    span.record("outcome", outcome);
+    span.in_scope(|| tracing::info!(elapsed_us, outcome, "provider precompile finished"));
+    result
+}
+
+fn precompile_sources(
+    sources: &[LockedProviderSource],
+    cwasm_dir: PathBuf,
+    compile_threads: NonZeroU32,
+) -> Result<PrecompileReport, BrokerHostError> {
+    let compiler = cwasm::Compiler::new(compile_threads)
+        .map_err(|source| BrokerHostError::CompilerThreads { source })?;
+    let engine = compile_engine(&compiler)?;
+    let cache = cwasm::Cache::new(cwasm_dir.clone(), &engine, CacheMiss::Compile);
+    let mut compiled = 0;
+    for locked in sources {
+        let source = ProviderSource::from(locked.clone());
+        let (bytes, artifact) = read_source(&source)?;
+        let published = cache
+            .publish_missing(&engine, &compiler, &bytes, &artifact.sha256)
+            .map_err(|error| BrokerHostError::CacheMaintenance {
+                path: source.path,
+                source: error,
+            })?;
+        compiled += usize::from(published);
+    }
+    let removed = cache
+        .prune(sources.iter().map(LockedProviderSource::artifact_sha256))
+        .map_err(|error| BrokerHostError::CacheMaintenance {
+            path: cwasm_dir,
+            source: error,
+        })?;
+    Ok(PrecompileReport {
+        providers: sources.len(),
+        compiled,
+        removed_files: removed.files,
+        removed_bytes: removed.bytes,
+    })
 }
 
 #[derive(Debug)]
@@ -2017,6 +2128,23 @@ pub enum BrokerHostError {
         path: PathBuf,
         #[source]
         source: wasmtime::Error,
+    },
+    #[error(
+        "no compiled artifact for {} in the cwasm cache; run `dekopon-brokerd provider precompile` \
+         or set onCacheMiss: compile",
+        path.display()
+    )]
+    CompiledArtifactMissing { path: PathBuf },
+    #[error("could not maintain the cwasm cache at {}", path.display())]
+    CacheMaintenance {
+        path: PathBuf,
+        #[source]
+        source: wasmtime::Error,
+    },
+    #[error("could not start the compiler thread pool")]
+    CompilerThreads {
+        #[source]
+        source: rayon::ThreadPoolBuildError,
     },
     #[error(
         "broker provider stores already reserve the {maximum}-byte aggregate guest memory ceiling; \

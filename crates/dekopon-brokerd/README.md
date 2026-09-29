@@ -578,36 +578,63 @@ providerSet:
   lockPath: /var/lib/dekopon/providers/providers.lock.yaml
   storePath: /var/lib/dekopon/providers/store
 compileOnLoad: false # default; true bypasses cwasm entirely
+onCacheMiss: fail    # default; compile builds a missing artifact in the broker
+compileThreads: 1    # default; Cranelift threads per component when the broker compiles
 hostLimits:
   maxTotalMemoryBytes: 268435456
 ```
 
-Managed providers default to immutable, file-backed compiled components under
-`providerSet.storePath/cwasm/v1`. A missing source/engine index compiles the verified Wasm once,
-atomically publishes a raw `.cwasm` named by its own SHA-256, then maps it with Wasmtime. Warm
-startup stream-verifies each selected compiled artifact's length and SHA-256 once, checks engine
-compatibility, and maps it without decompression or a whole-file buffer. Calls reuse the retained
-component; they neither hash nor reopen it. Source Wasm is still checked against the provider lock
-at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine compatibility
-fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
+Managed providers map immutable, file-backed compiled components from
+`providerSet.storePath/cwasm/v2`. `dekopon-brokerd provider precompile` fills that cache before the
+broker starts, in a process that exits and returns Cranelift's working set to the kernel. The broker
+then only verifies and maps: warm startup stream-verifies each selected compiled artifact's length
+and SHA-256 once, checks engine compatibility, and maps it without decompression or a whole-file
+buffer. Calls reuse the retained component; they neither hash nor reopen it. Source Wasm is still
+checked against the provider lock at every startup.
+
+The index binds source-Wasm SHA-256 plus the engine key to compiled SHA-256 and length:
+
+```text
+<storePath>/cwasm/v2/<engine-key>/<source-sha256>.json
+<storePath>/cwasm/v2/sha256/<compiled-sha256>.cwasm
+```
+
+The engine key is the SHA-256 of Wasmtime's precompile compatibility hash: the Wasmtime version,
+target, Cranelift flags including host-detected CPU features, tunables and enabled features. It does
+not depend on the Rust toolchain or on `compileThreads`. A Wasmtime upgrade, or a different CPU,
+selects a new key, so every locked component misses once.
+
+`onCacheMiss` decides what a missing index does. `fail`, the default, refuses startup and names the
+component; run `provider precompile` (or `provider sync`, which publishes what it compiles) and
+restart. `compile` compiles the verified Wasm in the broker, atomically publishes a raw `.cwasm`
+named by its own SHA-256, then maps it; size the broker's memory for Cranelift's peak if you choose
+it. `compileThreads` sets Cranelift's parallelism within one component wherever the broker compiles:
+`1` compiles each function in turn, and a larger value runs a pool of that many threads, each
+carrying its own working set. Raise memory with it.
 
 `compileOnLoad: true` disables cache reads and writes and compiles from source at every startup.
-Legacy `providers:` paths and offline provider-manager commands also compile without a cache.
-`compileCachePath` is removed, not aliased; remove it from old configurations. The old compressed
-Wasmtime cache is neither read nor migrated. Component startup runs one at a time off Tokio to bound
-compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
-component. The socket binds only after the entire registry validates.
+Legacy `providers:` paths compile without a cache under either `onCacheMiss` value. Components load
+one at a time off Tokio to bound compiler memory and stop scheduling on the first failure. The socket
+binds only after the entire registry validates.
 
-Errors are fatal: a corrupt index/artifact, missing indexed object, incompatible mapped artifact,
-publication conflict, or I/O failure is reported with its cause. There is no retry, eviction,
-automatic repair, or fallback. Disable the feature explicitly to get running again, or stop all
+Errors other than a missing index are fatal under both values: a corrupt index/artifact, missing
+indexed object, incompatible mapped artifact, publication conflict, or I/O failure is reported with
+its cause, with no retry or repair. Disable the feature explicitly to get running again, or stop all
 brokers using the cache and remove its generated `cwasm` directory before restarting. Never rewrite
 or truncate mapped files. The filesystem and local index are trusted; adversarial same-UID file
-replacement is outside this feature's model. Use one cache publisher at a time. Compiled artifacts
-are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or
-2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Historical objects are
-not automatically pruned. Keep the cache on persistent disk, not memory-backed `/tmp`, for
-reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
+replacement is outside this feature's model. Use one cache publisher at a time: `provider
+precompile` and `provider sync` hold the store lock, and must not run while a broker with
+`onCacheMiss: compile` starts on the same store. Compiled artifacts are capped at 512 MiB each;
+before publishing, the cache refuses growth beyond 1,024 objects or 2 GiB of compiled-object bytes
+(separate from the source-Wasm store limit). Keep the cache on persistent disk, not memory-backed
+`/tmp`, for reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
+
+`provider precompile` prunes after it publishes: it keeps, for the current lock and this engine key,
+each locked component's index and the object it names, and unlinks everything else under `cwasm/`,
+including `v1/`, other engine keys and leftover temporary files. Pruning only unlinks, so a file a
+running broker has mapped stays valid until that broker exits, but a broker that restarts afterwards
+needs the current generation: stop the broker using the store before running it. A rollback to an
+earlier release starts from a cold cache.
 
 See [startup tracing](../../docs/observability.md#broker-execution-spans) for cache status, sizes,
 source verification, compile/hash/publish/map stage timings, and total registry load time. These
@@ -713,7 +740,16 @@ dekopon-brokerd provider list \
 dekopon-brokerd provider verify \
   --lock-file /etc/dekopon/providers.lock.yaml \
   --store /var/lib/dekopon/provider-store
+
+# Fill the compilation cache for the lock and prune what it no longer names; stop the broker first:
+dekopon-brokerd provider precompile \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
 ```
+
+`sync` and `precompile` compile with `--compile-threads` Cranelift threads per component, default
+`1`; `sync` publishes what it compiles into the store's cache. See
+[the compilation cache](#compilation-cache-and-the-concurrent-memory-budget).
 
 `--output json` gives deterministic machine-readable command results. A successful lock change
 applies on the next broker restart; there is no hot reload.
@@ -746,8 +782,9 @@ the **complete** proposed set with the broker host before atomically replacing t
 failed multi-provider validation can leave an unreachable blob, but never a partially activated
 lock. The blob directory has a hard lifetime ceiling of 4 GiB and 1,024 files (stale temporaries
 count), checked under the store lock before another download, so repeated failed or changed
-resolutions cannot grow it without bound. There is no `prune` command; reaching that ceiling
-requires operator-reviewed cleanup until orphan deletion has its own safe lifecycle contract.
+resolutions cannot grow it without bound. After a successful sync, and in `provider precompile`,
+the manager deletes every file in the blob directory the active lock does not name, still under the
+store lock.
 
 The generated lock is strict, byte-capped, source-sorted, timestamp-free, and records both
 identities:

@@ -2,10 +2,11 @@
 //! must never modify or truncate a mapped artifact in place.
 
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    hash::{Hash as _, Hasher as _},
-    io::{Read as _, Write as _},
+    hash::{Hash as _, Hasher},
+    io::{self, Read as _, Write as _},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Instant,
@@ -13,9 +14,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use wasmtime::{Engine, component::Component};
+use wasmtime::{Config, Engine, component::Component};
 
 use crate::metadata::{hex_digest, identify_bytes};
+
+const LAYOUT: &str = "v2";
+const PREVIOUS_LAYOUT: &str = "v1";
 
 const MAX_INDEX_BYTES: u64 = 4096;
 // Compiled artifacts can exceed the 64 MiB source ceiling; this bounds refusal only, never
@@ -31,17 +35,89 @@ struct Entry {
     bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMiss {
+    #[default]
+    Fail,
+    Compile,
+}
+
+pub(crate) enum Lookup {
+    Mapped(Component),
+    Missing,
+}
+
+pub(crate) enum Compiler {
+    Serial,
+    Pool(rayon::ThreadPool),
+}
+
+impl Compiler {
+    pub(crate) fn new(threads: NonZeroU32) -> Result<Self, rayon::ThreadPoolBuildError> {
+        if threads.get() == 1 {
+            return Ok(Self::Serial);
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.get() as usize)
+            .thread_name(|index| format!("dekopon-compile-{index}"))
+            .build()
+            .map(Self::Pool)
+    }
+
+    pub(crate) fn configure(&self, config: &mut Config) {
+        config.parallel_compilation(matches!(self, Self::Pool(_)));
+    }
+
+    pub(crate) fn run<T: Send>(&self, work: impl FnOnce() -> T + Send) -> T {
+        match self {
+            Self::Serial => work(),
+            // Wasmtime's parallel compilation runs on the rayon pool of the calling thread.
+            Self::Pool(pool) => pool.install(work),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Removed {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+}
+
+impl Removed {
+    fn tree(&mut self, path: &Path) -> io::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.is_dir() {
+            for entry in entries(path)? {
+                self.tree(&entry)?;
+            }
+            return fs::remove_dir(path);
+        }
+        // Unlink only, never truncate: a mapped object stays valid until its mapper exits.
+        fs::remove_file(path)?;
+        self.files += 1;
+        self.bytes = self.bytes.saturating_add(metadata.len());
+        Ok(())
+    }
+}
+
 pub(crate) struct Cache {
     root: PathBuf,
     engine_key: String,
+    miss: CacheMiss,
     loaded: Mutex<BTreeMap<String, Component>>,
 }
 
 impl Cache {
-    pub(crate) fn new(root: PathBuf, engine: &Engine) -> Self {
+    pub(crate) fn new(root: PathBuf, engine: &Engine, miss: CacheMiss) -> Self {
         Self {
-            root: root.join("v1"),
+            root: root.join(LAYOUT),
             engine_key: compatibility_key(engine),
+            miss,
             loaded: Mutex::new(BTreeMap::new()),
         }
     }
@@ -49,89 +125,27 @@ impl Cache {
     pub(crate) fn load(
         &self,
         engine: &Engine,
+        compiler: &Compiler,
         wasm: &[u8],
         source_sha256: &str,
-    ) -> wasmtime::Result<Component> {
-        self.load_inner(engine, wasm, source_sha256)
+    ) -> wasmtime::Result<Lookup> {
+        self.load_inner(engine, compiler, wasm, source_sha256)
             .map_err(|error| error.context(format!("cwasm cache {}", self.root.display())))
     }
 
-    fn load_inner(
+    pub(crate) fn publish_missing(
         &self,
         engine: &Engine,
+        compiler: &Compiler,
         wasm: &[u8],
         source_sha256: &str,
-    ) -> wasmtime::Result<Component> {
-        let started = Instant::now();
-        let mut loaded = self.loaded.lock().map_err(|error| {
-            wasmtime::Error::msg(format!("compiled component loader lock poisoned: {error}"))
-        })?;
-        tracing::Span::current().record("cache_wait_us", micros(started));
-        let index = self
-            .root
-            .join(&self.engine_key)
-            .join(format!("{source_sha256}.json"));
-        let entry = match File::open(&index) {
-            Ok(file) => {
-                tracing::Span::current().record("cache", "hit");
-                let mut bytes = Vec::new();
-                file.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes)?;
-                wasmtime::ensure!(
-                    bytes.len() as u64 <= MAX_INDEX_BYTES,
-                    "index {} exceeds {MAX_INDEX_BYTES} bytes",
-                    index.display()
-                );
-                let entry: Entry = serde_json::from_slice(&bytes).map_err(|error| {
-                    wasmtime::Error::msg(format!(
-                        "invalid compiled index {}: {error}",
-                        index.display()
-                    ))
-                })?;
-                wasmtime::ensure!(
-                    entry.sha256.len() == 64
-                        && entry
-                            .sha256
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-                    "invalid compiled SHA-256 in {}",
-                    index.display()
-                );
-                wasmtime::ensure!(
-                    entry.bytes > 0 && entry.bytes <= MAX_CWASM_BYTES,
-                    "invalid compiled length {} in {} (maximum {MAX_CWASM_BYTES})",
-                    entry.bytes,
-                    index.display()
-                );
-                entry
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tracing::Span::current().record("cache", "miss");
-                let compiled = stage("compile", wasm.len() as u64, || {
-                    engine.precompile_component(wasm)
-                })?;
-                wasmtime::ensure!(
-                    compiled.len() as u64 <= MAX_CWASM_BYTES,
-                    "compiled component exceeds {MAX_CWASM_BYTES} bytes"
-                );
-                let artifact = stage("artifact_hash", compiled.len() as u64, || {
-                    Ok(identify_bytes(&compiled))
-                })?;
-                let entry = Entry {
-                    sha256: artifact.sha256,
-                    bytes: artifact.bytes,
-                };
-                let object = self.object(&entry);
-                stage("publish", entry.bytes, || {
-                    fs::create_dir_all(self.root.join("sha256"))?;
-                    fs::create_dir_all(self.root.join(&self.engine_key))?;
-                    ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
-                    publish(&object, &compiled)?;
-                    publish(&index, &serde_json::to_vec(&entry)?)
-                })?;
-                drop(compiled);
-                // No second verification pass runs on a cold miss, since these exact bytes were
-                // just hashed and published locally; warm boots stream-verify instead.
-                return self.map(engine, entry, &mut loaded);
+    ) -> wasmtime::Result<bool> {
+        let index = self.index(source_sha256);
+        let published = match fs::symlink_metadata(&index) {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.compile_and_publish(engine, compiler, wasm, &index)?;
+                true
             }
             Err(error) => {
                 return Err(wasmtime::Error::msg(format!(
@@ -140,6 +154,130 @@ impl Cache {
                 )));
             }
         };
+        Ok(published)
+    }
+
+    pub(crate) fn prune<'a>(
+        &self,
+        live_sources: impl IntoIterator<Item = &'a str>,
+    ) -> wasmtime::Result<Removed> {
+        let live_sources = live_sources.into_iter().collect::<BTreeSet<_>>();
+        let mut removed = Removed::default();
+        removed.tree(&self.root.with_file_name(PREVIOUS_LAYOUT))?;
+        let current = self.root.join(&self.engine_key);
+        let objects = self.root.join("sha256");
+        for path in entries(&self.root)? {
+            if path != current && path != objects {
+                removed.tree(&path)?;
+            }
+        }
+        let mut referenced = BTreeSet::new();
+        for path in entries(&current)? {
+            let live = path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| live_sources.contains(stem));
+            if live {
+                let file = File::open(&path)?;
+                referenced.insert(self.object(&read_entry(&path, file)?));
+            } else {
+                removed.tree(&path)?;
+            }
+        }
+        for path in entries(&objects)? {
+            if !referenced.contains(&path) {
+                removed.tree(&path)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn index(&self, source_sha256: &str) -> PathBuf {
+        self.root
+            .join(&self.engine_key)
+            .join(format!("{source_sha256}.json"))
+    }
+
+    fn compile_and_publish(
+        &self,
+        engine: &Engine,
+        compiler: &Compiler,
+        wasm: &[u8],
+        index: &Path,
+    ) -> wasmtime::Result<Entry> {
+        let compiled = stage("compile", wasm.len() as u64, || {
+            compiler.run(|| engine.precompile_component(wasm))
+        })?;
+        wasmtime::ensure!(
+            compiled.len() as u64 <= MAX_CWASM_BYTES,
+            "compiled component exceeds {MAX_CWASM_BYTES} bytes"
+        );
+        let artifact = stage("artifact_hash", compiled.len() as u64, || {
+            Ok(identify_bytes(&compiled))
+        })?;
+        let entry = Entry {
+            sha256: artifact.sha256,
+            bytes: artifact.bytes,
+        };
+        let object = self.object(&entry);
+        stage("publish", entry.bytes, || {
+            fs::create_dir_all(self.root.join("sha256"))?;
+            fs::create_dir_all(self.root.join(&self.engine_key))?;
+            ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
+            publish(&object, &compiled)?;
+            publish(index, &serde_json::to_vec(&entry)?)
+        })?;
+        Ok(entry)
+    }
+
+    fn load_inner(
+        &self,
+        engine: &Engine,
+        compiler: &Compiler,
+        wasm: &[u8],
+        source_sha256: &str,
+    ) -> wasmtime::Result<Lookup> {
+        let started = Instant::now();
+        let mut loaded = self.loaded.lock().map_err(|error| {
+            wasmtime::Error::msg(format!("compiled component loader lock poisoned: {error}"))
+        })?;
+        tracing::Span::current().record("cache_wait_us", micros(started));
+        let index = self.index(source_sha256);
+        let entry = match File::open(&index) {
+            Ok(file) => {
+                tracing::Span::current().record("cache", "hit");
+                read_entry(&index, file)?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::Span::current().record("cache", "miss");
+                if self.miss == CacheMiss::Fail {
+                    return Ok(Lookup::Missing);
+                }
+                let entry = self.compile_and_publish(engine, compiler, wasm, &index)?;
+                // No second verification pass runs on a cold miss, since these exact bytes were
+                // just hashed and published locally; warm boots stream-verify instead.
+                return self.map(engine, entry, &mut loaded).map(Lookup::Mapped);
+            }
+            Err(error) => {
+                return Err(wasmtime::Error::msg(format!(
+                    "open compiled index {}: {error}",
+                    index.display()
+                )));
+            }
+        };
+        self.load_entry(engine, entry, &mut loaded)
+            .map(Lookup::Mapped)
+    }
+
+    fn load_entry(
+        &self,
+        engine: &Engine,
+        entry: Entry,
+        loaded: &mut BTreeMap<String, Component>,
+    ) -> wasmtime::Result<Component> {
         if let Some(component) = loaded.get(&entry.sha256) {
             tracing::Span::current().record("cache", "reuse");
             record_artifact(&entry);
@@ -147,7 +285,7 @@ impl Cache {
         }
         let object = self.object(&entry);
         stage("verify", entry.bytes, || verify(&object, &entry))?;
-        self.map(engine, entry, &mut loaded)
+        self.map(engine, entry, loaded)
     }
 
     fn object(&self, entry: &Entry) -> PathBuf {
@@ -174,6 +312,48 @@ fn record_artifact(entry: &Entry) {
     let span = tracing::Span::current();
     span.record("cwasm_sha256", &entry.sha256);
     span.record("cwasm_bytes", entry.bytes);
+}
+
+fn entries(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::read_dir(directory) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_entry(index: &Path, file: File) -> wasmtime::Result<Entry> {
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes)?;
+    wasmtime::ensure!(
+        bytes.len() as u64 <= MAX_INDEX_BYTES,
+        "index {} exceeds {MAX_INDEX_BYTES} bytes",
+        index.display()
+    );
+    let entry: Entry = serde_json::from_slice(&bytes).map_err(|error| {
+        wasmtime::Error::msg(format!(
+            "invalid compiled index {}: {error}",
+            index.display()
+        ))
+    })?;
+    wasmtime::ensure!(
+        entry.sha256.len() == 64
+            && entry
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid compiled SHA-256 in {}",
+        index.display()
+    );
+    wasmtime::ensure!(
+        entry.bytes > 0 && entry.bytes <= MAX_CWASM_BYTES,
+        "invalid compiled length {} in {} (maximum {MAX_CWASM_BYTES})",
+        entry.bytes,
+        index.display()
+    );
+    Ok(entry)
 }
 
 fn verify(path: &Path, entry: &Entry) -> wasmtime::Result<()> {
@@ -252,12 +432,29 @@ fn deserialize(engine: &Engine, path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine, path) }
 }
 
+struct Fingerprint(Sha256);
+
+impl Hasher for Fingerprint {
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finalize();
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(prefix)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+}
+
+// The std Hash byte feed is stable in practice but not promised; if it moves, the key changes and
+// every entry misses, never matches wrongly, because deserialization re-checks compatibility.
 pub(crate) fn compatibility_key(engine: &Engine) -> String {
-    let mut fingerprint = DefaultHasher::new();
+    let mut fingerprint = Fingerprint(Sha256::new());
     engine
         .precompile_compatibility_hash()
         .hash(&mut fingerprint);
-    format!("{:016x}", fingerprint.finish())
+    hex_digest(&fingerprint.0.finalize())
 }
 
 pub(crate) fn micros(started: Instant) -> u64 {
@@ -310,10 +507,10 @@ mod tests {
     const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\0\x01\0";
 
     fn populate(root: &Path, engine: &Engine) -> (PathBuf, PathBuf) {
-        let cache = Cache::new(root.to_owned(), engine);
+        let cache = Cache::new(root.to_owned(), engine, CacheMiss::Compile);
         let source = identify_bytes(EMPTY_COMPONENT);
         cache
-            .load(engine, EMPTY_COMPONENT, &source.sha256)
+            .load(engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
             .expect("cold load");
         let index = cache
             .root
@@ -336,10 +533,10 @@ mod tests {
             object.file_stem().expect("stem").to_str(),
             Some(identify_bytes(&bytes).sha256.as_str())
         );
-        let cache = Cache::new(directory.path().to_owned(), &engine);
+        let cache = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile);
         let source = identify_bytes(EMPTY_COMPONENT);
         cache
-            .load(&engine, b"not wasm", &source.sha256)
+            .load(&engine, &Compiler::Serial, b"not wasm", &source.sha256)
             .expect("warm mapped load");
         #[cfg(target_os = "linux")]
         assert!(
@@ -349,12 +546,13 @@ mod tests {
         );
         fs::remove_file(&object).expect("unlink is safe; no mapped inode mutation");
         cache
-            .load(&engine, b"not wasm", &source.sha256)
+            .load(&engine, &Compiler::Serial, b"not wasm", &source.sha256)
             .expect("same boot reuses mapping without reopening or hashing");
         drop(cache);
-        let error = Cache::new(directory.path().to_owned(), &engine)
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("next boot verifies again");
+        let error = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile)
+            .load(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("next boot verifies again");
         assert!(
             format!("{error:#}").contains("open compiled artifact"),
             "{error:#}"
@@ -371,10 +569,11 @@ mod tests {
         damaged[0] ^= 1;
         fs::write(&object, &damaged).expect("corrupt unmapped object");
         let source = identify_bytes(EMPTY_COMPONENT);
-        let cache = Cache::new(directory.path().to_owned(), &engine);
+        let cache = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile);
         let error = cache
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("hash mismatch");
+            .load(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("hash mismatch");
         assert!(
             format!("{error:#}").contains("SHA-256 mismatch"),
             "{error:#}"
@@ -382,8 +581,9 @@ mod tests {
         assert_eq!(fs::read(&object).expect("unchanged"), damaged);
         fs::write(&object, &original[..original.len() - 1]).expect("truncate unmapped object");
         let error = cache
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("length mismatch");
+            .load(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("length mismatch");
         assert!(
             format!("{error:#}").contains("length mismatch"),
             "{error:#}"
@@ -397,18 +597,20 @@ mod tests {
         let (index, _) = populate(directory.path(), &engine);
         let source = identify_bytes(EMPTY_COMPONENT);
         fs::write(index, b"not json").expect("damage index");
-        let error = Cache::new(directory.path().to_owned(), &engine)
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("bad index");
+        let error = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile)
+            .load(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("bad index");
         assert!(
             format!("{error:#}").contains("invalid compiled index"),
             "{error:#}"
         );
         let file = directory.path().join("not-a-directory");
         fs::write(&file, b"x").expect("file");
-        let error = Cache::new(file, &engine)
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("I/O failure is not a miss");
+        let error = Cache::new(file, &engine, CacheMiss::Compile)
+            .load(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("I/O failure is not a miss");
         assert!(
             format!("{error:#}").contains("open compiled index"),
             "{error:#}"
@@ -423,10 +625,10 @@ mod tests {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
         let changed = Engine::new(&config).expect("different engine");
-        let cache = Cache::new(directory.path().to_owned(), &changed);
+        let cache = Cache::new(directory.path().to_owned(), &changed, CacheMiss::Compile);
         assert_ne!(
             cache.engine_key,
-            Cache::new(directory.path().to_owned(), &engine).engine_key
+            Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile).engine_key
         );
         let source = identify_bytes(EMPTY_COMPONENT);
         let other_index = cache
@@ -436,13 +638,70 @@ mod tests {
         fs::create_dir_all(other_index.parent().expect("parent")).expect("index directory");
         fs::copy(&index, &other_index).expect("deliberately misfile incompatible artifact");
         let error = cache
-            .load(&changed, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("Wasmtime compatibility refusal");
+            .load(&changed, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+            .err()
+            .expect("Wasmtime compatibility refusal");
         assert!(format!("{error:#}").contains("fuel"), "{error:#}");
         assert_eq!(
             fs::read(index).expect("original"),
             fs::read(other_index).expect("not repaired")
         );
+    }
+
+    #[test]
+    fn the_engine_key_is_a_digest_independent_of_the_compile_thread_count() {
+        let key = |compiler: &Compiler| {
+            let mut config = dekopon_provider_sdk::host::config();
+            compiler.configure(&mut config);
+            compatibility_key(&Engine::new(&config).expect("engine"))
+        };
+        let serial = key(&Compiler::Serial);
+        let pooled = key(&Compiler::new(NonZeroU32::new(2).expect("two")).expect("pool"));
+        assert_eq!(serial, pooled);
+        assert_eq!(serial, key(&Compiler::Serial));
+        assert_eq!(serial.len(), 64);
+    }
+
+    #[test]
+    fn prune_keeps_exactly_the_live_set() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Engine::default();
+        let (index, object) = populate(directory.path(), &engine);
+        let root = directory.path().join(LAYOUT);
+        let cache = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile);
+        let stale = [
+            directory.path().join("v1/abc/source.json"),
+            directory.path().join("v1/sha256/old.cwasm"),
+            root.join("0000/source.json"),
+            root.join(".tmpstray"),
+            root.join(&cache.engine_key)
+                .join(format!("{}.json", "f".repeat(64))),
+            root.join("sha256")
+                .join(format!("{}.cwasm", "e".repeat(64))),
+        ];
+        for path in &stale {
+            fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            fs::write(path, b"stale").expect("stale file");
+        }
+        let source = identify_bytes(EMPTY_COMPONENT);
+        let removed = cache.prune([source.sha256.as_str()]).expect("prune");
+        assert_eq!(removed.files, stale.len() as u64);
+        assert_eq!(removed.bytes, 5 * stale.len() as u64);
+        let mut remaining = Vec::new();
+        let mut pending = vec![directory.path().to_owned()];
+        while let Some(path) = pending.pop() {
+            for entry in entries(&path).expect("entries") {
+                if entry.is_dir() {
+                    pending.push(entry);
+                } else {
+                    remaining.push(entry);
+                }
+            }
+        }
+        remaining.sort();
+        let mut expected = vec![index, object];
+        expected.sort();
+        assert_eq!(remaining, expected);
     }
 
     #[test]

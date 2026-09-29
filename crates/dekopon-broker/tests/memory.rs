@@ -1948,6 +1948,7 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     let compiled = tempfile::tempdir().expect("compiled providers");
     let options = BrokerHostOptions {
         cwasm_dir: Some(compiled.path().to_owned()),
+        cache_miss: dekopon_broker_host::CacheMiss::Compile,
         ..BrokerHostOptions::default()
     };
     let temporary = tempfile::tempdir().expect("tempdir");

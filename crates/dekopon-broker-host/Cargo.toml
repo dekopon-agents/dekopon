@@ -21,6 +21,7 @@ rustix.workspace = true
 dekopon-http-host.workspace = true
 dekopon-provider-sdk = { workspace = true, features = ["host"] }
 dekopon-storage-host.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

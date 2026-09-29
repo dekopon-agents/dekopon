@@ -5,13 +5,15 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{
+    num::NonZeroU32,
     path::PathBuf,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CommandRunOutcome,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CacheMiss,
+    CommandRunOutcome, LockedProviderSource,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, ProposedInvocation, broker::AuthorizationGate,
@@ -19,6 +21,7 @@ use dekopon_capability::{
 use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -132,6 +135,7 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
     let directory = tempfile::tempdir().expect("cache");
     let options = BrokerHostOptions {
         cwasm_dir: Some(directory.path().to_owned()),
+        cache_miss: CacheMiss::Compile,
         ..BrokerHostOptions::default()
     };
     let cold = BrokerProviderRegistry::load_with_options(
@@ -215,7 +219,7 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
     );
     drop(warm);
 
-    let object = std::fs::read_dir(directory.path().join("v1/sha256"))
+    let object = std::fs::read_dir(directory.path().join("v2/sha256"))
         .expect("objects")
         .next()
         .expect("object")
@@ -283,6 +287,94 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
         "provider.load_stage",
         "stage",
         "verify"
+    ));
+}
+
+fn locked_probe() -> LockedProviderSource {
+    let path = probe();
+    let bytes = std::fs::read(&path).expect("probe bytes");
+    let digest = sha2::Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        });
+    LockedProviderSource::new(
+        path,
+        bytes.len() as u64,
+        digest,
+        "memory-chat".parse().expect("provider ID"),
+    )
+    .expect("locked probe")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_under_fail_refuses_with_the_component() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let directory = tempfile::tempdir().expect("cache");
+    let options = BrokerHostOptions {
+        cwasm_dir: Some(directory.path().to_owned()),
+        ..BrokerHostOptions::default()
+    };
+    let error = BrokerProviderRegistry::load_with_options(
+        [probe()],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect_err("an empty cache refuses under the default policy");
+    assert!(
+        matches!(&error, BrokerHostError::CompiledArtifactMissing { path } if *path == probe()),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precompile_then_fail_policy_boots_with_zero_compile_stages() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    let directory = tempfile::tempdir().expect("cache");
+    let report = dekopon_broker_host::precompile(
+        vec![locked_probe()],
+        directory.path().to_owned(),
+        NonZeroU32::MIN,
+    )
+    .await
+    .expect("precompile");
+    assert_eq!((report.providers, report.compiled), (1, 1));
+    let again = dekopon_broker_host::precompile(
+        vec![locked_probe()],
+        directory.path().to_owned(),
+        NonZeroU32::new(2).expect("two threads"),
+    )
+    .await
+    .expect("second precompile");
+    assert_eq!(
+        again.compiled, 0,
+        "the thread count does not change the cache key"
+    );
+
+    capture.clear();
+    let options = BrokerHostOptions {
+        cwasm_dir: Some(directory.path().to_owned()),
+        ..BrokerHostOptions::default()
+    };
+    BrokerProviderRegistry::load_locked_with_options(
+        [locked_probe()],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("warm boot under fail");
+    assert!(recorded_value(&capture, "provider.compile", "cache", "hit"));
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "compile"
     ));
 }
 

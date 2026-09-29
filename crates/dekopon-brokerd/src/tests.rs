@@ -262,12 +262,37 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     let mut runnable = document.clone();
     runnable["identities"] = json!([document["identities"][0].clone()]);
     write_config(&path, &runnable);
+    let error = super::run(&path, async {})
+        .await
+        .expect_err("a cold cache refuses under the default policy");
+    assert!(
+        matches!(
+            error,
+            super::BrokerdError::Host(
+                dekopon_broker_host::BrokerHostError::CompiledArtifactMissing { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    runnable["onCacheMiss"] = json!("compile");
+    runnable["compileThreads"] = json!(2);
+    write_config(&path, &runnable);
     super::run(&path, async {})
         .await
-        .expect("daemon populates the default mapped cache before binding");
+        .expect("compile on demand populates the mapped cache before binding");
+    runnable["onCacheMiss"] = json!("fail");
+    runnable["compileThreads"] = json!(1);
+    write_config(&path, &runnable);
     super::run(&path, async {})
         .await
-        .expect("warm daemon loads mapped artifacts");
+        .expect("warm daemon loads mapped artifacts under fail");
+
+    runnable["compileThreads"] = json!(0);
+    write_config(&path, &runnable);
+    config::load(&path, uid)
+        .await
+        .expect_err("zero compile threads is refused at parse");
+    runnable["compileThreads"] = json!(1);
 
     runnable["compileOnLoad"] = json!(true);
     write_config(&path, &runnable);

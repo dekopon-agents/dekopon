@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write as _},
+    num::NonZeroU32,
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -15,7 +16,7 @@ use std::{
 
 pub use dekopon_broker_host::HARD_MAX_PROVIDER_COMPONENT_BYTES;
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CacheMiss,
     LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::{
@@ -131,6 +132,7 @@ pub struct ProviderManagerPaths {
 pub struct ProviderManagerOptions {
     pub paths: ProviderManagerPaths,
     pub plaintext_loopback_registries: Vec<String>,
+    pub compile_threads: NonZeroU32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -161,9 +163,19 @@ pub struct ProviderVerifyReport {
     pub providers: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPrecompileReport {
+    pub providers: usize,
+    pub compiled: usize,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
+}
+
 pub struct ProviderManager {
     paths: ProviderManagerPaths,
     registry: RegistryClient,
+    compile_threads: NonZeroU32,
 }
 
 impl ProviderManager {
@@ -172,6 +184,7 @@ impl ProviderManager {
         Ok(Self {
             paths: options.paths,
             registry,
+            compile_threads: options.compile_threads,
         })
     }
 
@@ -215,13 +228,14 @@ impl ProviderManager {
             }
         }
 
-        let lock = validate_candidates(candidates, &store).await?;
+        let lock = validate_candidates(candidates, &store, self.compile_threads).await?;
         let encoded = encode_lock(&lock)?;
         let previous = old_lock.as_ref().map(encode_lock).transpose()?;
         let lock_changed = previous.as_deref() != Some(encoded.as_slice());
         if lock_changed {
             atomic_write(&self.paths.lock_file, &encoded, uid)?;
         }
+        store.prune(&lock)?;
         Ok(ProviderSyncReport {
             providers: lock.providers.len(),
             fetched,
@@ -250,7 +264,8 @@ impl ProviderManager {
                 fetched += 1;
             }
         }
-        validate_lock(&lock, &store).await?;
+        validate_lock(&lock, &store, store.cache_options(self.compile_threads)).await?;
+        store.prune(&lock)?;
         Ok(ProviderSyncReport {
             providers: lock.providers.len(),
             fetched,
@@ -307,9 +322,33 @@ impl ProviderManager {
         let uid = socket::current_uid();
         let lock = load_lock(&self.paths.lock_file, uid).await?;
         let store = ProviderStore::open(&self.paths.store, uid, false)?;
-        validate_lock(&lock, &store).await?;
+        validate_lock(&lock, &store, BrokerHostOptions::default()).await?;
         Ok(ProviderVerifyReport {
             providers: lock.providers.len(),
+        })
+    }
+
+    pub async fn precompile(&self) -> Result<ProviderPrecompileReport, ProviderManagerError> {
+        let uid = socket::current_uid();
+        let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
+        let store = ProviderStore::open(&self.paths.store, uid, false)?;
+        let _store_operation = store.lock()?;
+        let lock = load_lock(&self.paths.lock_file, uid).await?;
+        let sources = lock.sources(&store)?;
+        for source in &sources {
+            socket::validate_owned_file(source.path(), uid)
+                .map_err(|error| ProviderManagerError::file_security(source.path(), error))?;
+        }
+        let compiled =
+            dekopon_broker_host::precompile(sources, store.cwasm_dir(), self.compile_threads)
+                .await
+                .map_err(ProviderManagerError::Host)?;
+        let blobs = store.prune(&lock)?;
+        Ok(ProviderPrecompileReport {
+            providers: compiled.providers,
+            compiled: compiled.compiled,
+            removed_files: compiled.removed_files + blobs.files,
+            removed_bytes: compiled.removed_bytes + blobs.bytes,
         })
     }
 }
@@ -366,14 +405,20 @@ impl CandidateProvider {
 async fn validate_candidates(
     candidates: Vec<CandidateProvider>,
     store: &ProviderStore,
+    compile_threads: NonZeroU32,
 ) -> Result<ProviderLock, ProviderManagerError> {
     let paths = candidates
         .iter()
         .map(|candidate| store.blob_path(&candidate.component_digest))
         .collect::<Result<Vec<_>, _>>()?;
-    let registry = BrokerProviderRegistry::load(paths, BrokerHostLimits::default())
-        .await
-        .map_err(ProviderManagerError::Host)?;
+    let registry = BrokerProviderRegistry::load_with_options(
+        paths,
+        BrokerHostLimits::default(),
+        None,
+        &store.cache_options(compile_threads),
+    )
+    .await
+    .map_err(ProviderManagerError::Host)?;
     let metadata = registry
         .loaded_provider_metadata()
         .map(|metadata| (metadata.source.clone(), metadata))
@@ -435,6 +480,7 @@ async fn validate_candidates(
 async fn validate_lock(
     lock: &ProviderLock,
     store: &ProviderStore,
+    options: BrokerHostOptions,
 ) -> Result<Vec<LoadedProviderMetadata>, ProviderManagerError> {
     let uid = socket::current_uid();
     for provider in &lock.providers {
@@ -445,7 +491,7 @@ async fn validate_lock(
         lock.sources(store)?,
         BrokerHostLimits::default(),
         None,
-        &BrokerHostOptions::default(),
+        &options,
     )
     .await
     .map_err(ProviderManagerError::Host)?;
@@ -1430,6 +1476,51 @@ impl ProviderStore {
         Ok(self.sha256.join(format!("{}.wasm", digest_hex(digest)?)))
     }
 
+    fn cwasm_dir(&self) -> PathBuf {
+        self.root.join("cwasm")
+    }
+
+    fn cache_options(&self, compile_threads: NonZeroU32) -> BrokerHostOptions {
+        BrokerHostOptions {
+            cwasm_dir: Some(self.cwasm_dir()),
+            cache_miss: CacheMiss::Compile,
+            compile_threads,
+            ..BrokerHostOptions::default()
+        }
+    }
+
+    fn prune(&self, lock: &ProviderLock) -> Result<Removed, ProviderManagerError> {
+        let live = lock
+            .providers
+            .iter()
+            .map(|provider| self.blob_path(&provider.component_digest))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let entries = fs::read_dir(&self.sha256).map_err(|source| {
+            ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, &self.sha256, source)
+        })?;
+        let mut removed = Removed::default();
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, &self.sha256, source)
+            })?;
+            let path = entry.path();
+            if live.contains(&path) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|source| {
+                ProviderManagerError::io_at(PRUNE_STORE_BLOB, path.clone(), source)
+            })?;
+            fs::remove_file(&path)
+                .map_err(|source| ProviderManagerError::io_at(PRUNE_STORE_BLOB, path, source))?;
+            removed.files += 1;
+            removed.bytes = removed.bytes.saturating_add(metadata.len());
+        }
+        if removed.files > 0 {
+            sync_directory(&self.sha256)?;
+        }
+        Ok(removed)
+    }
+
     async fn install_resolved(
         &self,
         registry: &RegistryClient,
@@ -1555,6 +1646,12 @@ impl ProviderStore {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct Removed {
+    files: u64,
+    bytes: u64,
 }
 
 struct ProviderOperationLock {
@@ -1988,6 +2085,7 @@ fn url_authority(url: &Url) -> Result<String, ProviderManagerError> {
 const READ_PROVIDER_STATE: &str = "could not read provider state";
 const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
 const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";
+const PRUNE_STORE_BLOB: &str = "could not remove an unlocked provider blob";
 const LOCK_STORE_OPERATION: &str = "could not lock provider store operation";
 const WRITE_LOCK_TEMPORARY: &str = "could not write provider-lock temporary file";
 const STATE_TOO_LARGE: &str = "provider state exceeds its hard byte ceiling";
@@ -2401,6 +2499,7 @@ mod tests {
         let manager = ProviderManager::new(ProviderManagerOptions {
             paths: paths.clone(),
             plaintext_loopback_registries: vec![authority.to_owned()],
+            compile_threads: NonZeroU32::MIN,
         })
         .expect("manager fixture");
         (manager, paths)
@@ -2979,11 +3078,75 @@ providers:
         let manager = ProviderManager::new(ProviderManagerOptions {
             paths: paths.clone(),
             plaintext_loopback_registries: Vec::new(),
+            compile_threads: NonZeroU32::MIN,
         })
         .expect("manager");
         let owner = lock_activation(&paths.lock_file, socket::current_uid()).expect("lock owner");
         assert!(matches!(
             manager.sync_locked().await,
+            Err(ProviderManagerError::OperationInProgress { .. })
+        ));
+        drop(owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_publishes_what_it_compiles() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        manager.sync().await.expect("sync");
+        let warm = manager.precompile().await.expect("precompile after sync");
+        assert_eq!((warm.providers, warm.compiled), (1, 0));
+
+        fs::remove_dir_all(paths.store.join("cwasm")).expect("empty the cache");
+        let cold = manager
+            .precompile()
+            .await
+            .expect("precompile an empty cache");
+        assert_eq!((cold.providers, cold.compiled), (1, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_prunes_unlocked_blobs_after_activation() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        manager.sync().await.expect("first sync");
+        let blobs = paths.store.join("blobs/sha256");
+        let unlocked = blobs.join(format!("{}.wasm", "e".repeat(64)));
+        fs::write(&unlocked, b"unlocked").expect("unlocked blob");
+        fs::set_permissions(&unlocked, fs::Permissions::from_mode(0o600)).expect("secure");
+
+        manager.sync().await.expect("second sync");
+        let remaining = fs::read_dir(&blobs)
+            .expect("blobs")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        let locked = manager.list().await.expect("list");
+        assert_eq!(remaining, vec![locked[0].path.clone()]);
+    }
+
+    #[tokio::test]
+    async fn precompile_refuses_while_another_operation_holds_the_lock() {
+        let directory = tempfile::tempdir().expect("activation fixture");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture");
+        let paths = ProviderManagerPaths {
+            provider_set: None,
+            lock_file: directory.path().join("providers.lock.yaml"),
+            store: directory.path().join("store"),
+        };
+        let manager = ProviderManager::new(ProviderManagerOptions {
+            paths: paths.clone(),
+            plaintext_loopback_registries: Vec::new(),
+            compile_threads: NonZeroU32::MIN,
+        })
+        .expect("manager");
+        let owner = lock_activation(&paths.lock_file, socket::current_uid()).expect("lock owner");
+        assert!(matches!(
+            manager.precompile().await,
             Err(ProviderManagerError::OperationInProgress { .. })
         ));
         drop(owner);
