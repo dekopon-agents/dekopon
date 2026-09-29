@@ -35,6 +35,14 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - Publishing, releases, pushing/moving tags, adding credentials and protection changes require
   explicit human authorization for that action; release authorization names one version.
   Follow the [release procedure](README.md#maintainer-release-process), not memory.
+- Human intervention is not required when the plan is sufficiently scoped out and the changes
+  are expected. Scoped out: the owner approved a plan that names the change, its version and its
+  rollout. Expected: the diff does what the plan said and nothing else. Inside that, merge, tag,
+  release and deploy without waiting. A milestone the owner has funded in his campaign file is
+  explicit human authorization for that milestone's named version, its merges and its rollout.
+  The fresh adversarial review of the merged head is the review.
+- Stop for the owner when the work leaves the plan: a change it did not name, a result that
+  surprises its reviewer, a version it did not list, a new credential, a protection change.
 
 ## Committed direction
 
@@ -68,8 +76,9 @@ against these; a change that moves away from one stops for a human decision.
   Never delete active builds or another owner's artifacts.
 - Report checks actually observed, exact head/artifact tested and verification gaps.
   Local tests do not prove deployed behavior or remote CI; never claim otherwise.
-- Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and human review precede merge.
-  Automated agents never approve their own changes.
+- Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and review precede merge.
+  The review is a human's, or under an owner-approved plan a fresh adversarial reviewer's.
+  Automated agents never approve their own changes: the reviewer did not write the change.
 
 ## Rust guidelines
 

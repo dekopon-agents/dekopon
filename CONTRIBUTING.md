@@ -76,6 +76,6 @@ These recurring failure patterns are review requirements, not just lint suggesti
 
 ## Pull requests
 
-Pull requests require CI and human review. Automated agents must not approve their own changes. Follow the checklist in [Before opening a pull request](docs/development.md#before-opening-a-pull-request).
+Pull requests require CI and review. Under a plan the owner approved, a fresh adversarial reviewer that did not write the change stands in for human review ([AGENTS.md](AGENTS.md#boundaries-that-must-survive)); otherwise the review is a human's. Automated agents must not approve their own changes. Follow the checklist in [Before opening a pull request](docs/development.md#before-opening-a-pull-request).
 
 Security vulnerabilities follow [`SECURITY.md`](SECURITY.md), not the public issue tracker.
