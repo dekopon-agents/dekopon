@@ -247,11 +247,13 @@ The buffer — 30 s by default — is everything the two graces do not name: `SI
 kubelet's per-container bookkeeping, and each daemon's telemetry flush, since an OTLP exporter can
 burn its whole `exportTimeoutMs` against a collector that is itself restarting.
 
-The chart reads `shutdownGraceMs` out of an **inline** config. An `existingSecret` is opaque to it,
-and an inline config may leave the key out and take the daemon's default, so
-`drainBudget.assumedBrokerShutdownGraceMs` and `drainBudget.assumedGatewayShutdownGraceMs` are what
-the assertion believes in those cases. They configure nothing. If your Secret says something other
-than `120000`, correct them there or the arithmetic is guarding a number you are not running.
+The chart first reads `shutdownGraceMs` out of an **inline** config. If the key is absent, it uses
+`drainBudget.assumedBrokerShutdownGraceMs` or `drainBudget.assumedGatewayShutdownGraceMs` when set.
+Both assumptions default to `null`. Each daemon using `configDirectory` requires its assumption:
+the chart cannot read that directory and refuses to render without an explicit value. Otherwise,
+an unset assumption falls back to the daemon's `120000` ms default. An `existingSecret` is also
+opaque, so set the corresponding assumption if your Secret uses a non-default grace. These values
+only inform the assertion; they do not configure either daemon.
 
 A longer shutdown window does not promise crash recovery.
 
@@ -798,9 +800,10 @@ The chart refuses to render, with a message, when: `runAsUser` is changed while 
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, `secretMapPath`, or `capabilities` with no corresponding value supplied;
 an inline `broker.yaml`'s `identities` never map the broker's own UID, which the startup and
-readiness probes connect as; `paths.catalogDir` is inside `paths.configDir`; or
-`terminationGracePeriodSeconds` is shorter than the two drains it has to cover in sequence. When
-provider storage is enabled, its root and key directory must also be absolute, disjoint from one
+readiness probes connect as; `paths.catalogDir` is inside `paths.configDir`; a daemon uses
+`configDirectory` without its `drainBudget.assumedBrokerShutdownGraceMs` or
+`drainBudget.assumedGatewayShutdownGraceMs` value; or `terminationGracePeriodSeconds` is shorter than
+the two drains it has to cover in sequence. When provider storage is enabled, its root and key directory must also be absolute, disjoint from one
 another, and pairwise non-overlapping with every chart-owned mount (`config`, runtime, the state claim,
 catalog, `/tmp`, and both projected configuration/key sources); a nested mount would otherwise
 shadow or destructively replace those files. Every one of those is a mistake whose only other

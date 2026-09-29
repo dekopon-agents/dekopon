@@ -295,9 +295,8 @@ identities:
 {{- end -}}
 
 {{/*
-Each daemon's shutdown grace, in milliseconds. The chart reads the real value out of an inline
-config; an existingSecret is opaque here, and an inline config may leave the key out, so
-drainBudget.assumed*ShutdownGraceMs stands in for both cases. Both daemons default to 120000.
+A configDirectory is opaque to the chart, so without an inline shutdown grace it requires an
+explicit drainBudget assumption rather than silently using the daemon's 120000 ms default.
 */}}
 {{- define "dekopon.brokerShutdownGraceMs" -}}
 {{- $parsed := dict -}}
@@ -307,8 +306,12 @@ drainBudget.assumed*ShutdownGraceMs stands in for both cases. Both daemons defau
 {{- $limits := get $parsed "serverLimits" -}}
 {{- if and (kindIs "map" $limits) (hasKey $limits "shutdownGraceMs") -}}
 {{- get $limits "shutdownGraceMs" | int64 -}}
-{{- else -}}
+{{- else if ne .Values.drainBudget.assumedBrokerShutdownGraceMs nil -}}
 {{- .Values.drainBudget.assumedBrokerShutdownGraceMs | int64 -}}
+{{- else if .Values.broker.configDirectory.configMap -}}
+{{- fail "the chart cannot read shutdownGraceMs from a broker.configDirectory; set drainBudget.assumedBrokerShutdownGraceMs to the broker's configured shutdown grace in milliseconds" -}}
+{{- else -}}
+120000
 {{- end -}}
 {{- end -}}
 
@@ -319,8 +322,12 @@ drainBudget.assumed*ShutdownGraceMs stands in for both cases. Both daemons defau
 {{- end -}}
 {{- if hasKey $parsed "shutdownGraceMs" -}}
 {{- get $parsed "shutdownGraceMs" | int64 -}}
-{{- else -}}
+{{- else if ne .Values.drainBudget.assumedGatewayShutdownGraceMs nil -}}
 {{- .Values.drainBudget.assumedGatewayShutdownGraceMs | int64 -}}
+{{- else if .Values.gateway.configDirectory.configMap -}}
+{{- fail "the chart cannot read shutdownGraceMs from a gateway.configDirectory; set drainBudget.assumedGatewayShutdownGraceMs to the gateway's configured shutdown grace in milliseconds" -}}
+{{- else -}}
+120000
 {{- end -}}
 {{- end -}}
 
