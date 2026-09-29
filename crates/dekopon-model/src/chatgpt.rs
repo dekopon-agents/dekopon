@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -11,7 +11,10 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use dekopon_core::Redacted;
+use dekopon_core::{
+    Redacted,
+    private_file::{self, PrivateFileLock, TemporarySweep},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -61,9 +64,7 @@ pub struct ResolvedCredential {
     pub refresh: Option<RefreshOutcome>,
 }
 
-/// This owns the only refresh-and-persist sequence for this credential; don't reimplement it
-/// elsewhere, since the refresh token rotates and a second implementation risks bricking the
-/// credential.
+/// Do not duplicate refresh-and-persist; its primitives live in `dekopon_core::private_file` and a second sequence risks replaying a rotated token.
 pub struct CredentialFile {
     agent: Agent,
     path: PathBuf,
@@ -200,7 +201,11 @@ impl CredentialFile {
         let _entered = span.enter();
         let started = Instant::now();
 
-        let _lock = CredentialLock::acquire(&self.path)?;
+        let _lock =
+            PrivateFileLock::acquire(&self.path).map_err(|error| ChatGptError::LockAuth {
+                path: error.path,
+                source: error.source,
+            })?;
         // Credentials are re-read right after taking the refresh lock because another process may
         // have rotated them while this one waited.
         *credentials = self.snapshot();
@@ -810,50 +815,9 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The lock lives on a separate sibling file, not the credential itself, since the credential is
-/// replaced by rename on each refresh and would otherwise leave processes locking different inodes.
-struct CredentialLock {
-    file: File,
-}
-
-impl CredentialLock {
-    /// A failed lock fails the whole refresh rather than proceeding uncoordinated, since an
-    /// uncoordinated refresh would spend an already-retired refresh token.
-    fn acquire(auth_path: &Path) -> Result<Self, ChatGptError> {
-        let path = credential_lock_path(auth_path).ok_or_else(|| ChatGptError::LockAuth {
-            path: auth_path.to_path_buf(),
-            source: io::Error::from(io::ErrorKind::InvalidInput),
-        })?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        set_private_file_mode(&mut options);
-        let file = options
-            .open(&path)
-            .and_then(|file| file.lock().map(|()| file))
-            .map_err(|source| ChatGptError::LockAuth {
-                path: path.clone(),
-                source,
-            })?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for CredentialLock {
-    fn drop(&mut self) {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a destructor has no caller to report to, and closing the file releases the \
-                      lock regardless of what an explicit unlock answers"
-        )]
-        let _ = self.file.unlock();
-    }
-}
-
+#[cfg(test)]
 fn credential_lock_path(auth_path: &Path) -> Option<PathBuf> {
-    let name = auth_path.file_name()?;
-    let mut lock_name = OsString::from(name);
-    lock_name.push(".lock");
-    Some(auth_path.with_file_name(lock_name))
+    private_file::lock_path(auth_path)
 }
 
 fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
@@ -901,131 +865,41 @@ fn save_credentials(path: &Path, credentials: &ChatGptCredentials) -> Result<(),
         source,
     })?;
 
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    // Sweeps stale temp files first, since a SIGKILL between create and rename leaves plaintext
-    // credentials that would otherwise accumulate forever on a persistent volume.
+    let temporary = private_file::temporary_path(path);
     sweep_stale_temporaries(path, Some(&temporary));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    set_private_file_mode(&mut options);
-    let result = (|| {
-        let mut file = options
-            .open(&temporary)
-            .map_err(|source| ChatGptError::WriteAuth {
-                path: temporary.clone(),
-                source,
-            })?;
-        serde_json::to_writer(&mut file, credentials).map_err(|source| {
-            ChatGptError::SerializeAuth {
-                path: temporary.clone(),
-                source,
-            }
-        })?;
-        file.write_all(b"\n")
-            .and_then(|()| file.sync_all())
-            .map_err(|source| ChatGptError::WriteAuth {
-                path: temporary.clone(),
-                source,
-            })?;
-        replace_file(&temporary, path).map_err(|source| ChatGptError::WriteAuth {
-            path: path.to_path_buf(),
+    let mut bytes =
+        serde_json::to_vec(credentials).map_err(|source| ChatGptError::SerializeAuth {
+            path: temporary,
             source,
         })?;
-        // Without this directory sync, the rename can be lost on power failure, leaving only the
-        // already-invalidated predecessor credential on disk.
-        sync_directory(parent).map_err(|source| ChatGptError::WriteAuth {
-            path: parent.to_path_buf(),
-            source,
-        })
-    })();
-    if result.is_err() {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "rollback of a temporary the write already failed on; the caller is being \
-                      given that write error, and a leftover 0600 temporary is not worth \
-                      replacing it with a cleanup error"
-        )]
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    bytes.push(b'\n');
+    private_file::replace_private_file(path, &bytes).map_err(|error| ChatGptError::WriteAuth {
+        path: error.path,
+        source: error.source,
+    })
 }
 
-/// Deleting matched .tmp-* siblings is safe only because refreshes serialize on the lock and logins
-/// are human-paced, never concurrent.
+// Sweeping other writers' plaintext is safe because refreshes lock and logins are human-paced.
 fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) {
-    let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) else {
-        return;
-    };
-    let mut prefix = OsString::from(stem);
-    prefix.push(".tmp-");
-    let Some(prefix) = prefix.to_str().map(ToOwned::to_owned) else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let stale = entry.path();
-        if Some(stale.as_path()) == keep {
-            continue;
-        }
-        let Some(name) = stale.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        if let Err(error) = fs::remove_file(&stale) {
-            tracing::warn!(
-                event = "chatgpt_credential_temporary_orphaned",
-                path = %stale.display(),
-                error = %error,
-                "could not remove an abandoned ChatGPT credential temporary file"
-            );
-        } else {
-            tracing::warn!(
-                event = "chatgpt_credential_temporary_swept",
-                path = %stale.display(),
-                "removed an abandoned ChatGPT credential temporary file"
-            );
+    for outcome in private_file::sweep_stale_temporaries(path, keep) {
+        match outcome {
+            TemporarySweep::Failed { path, source } => {
+                tracing::warn!(
+                    event = "chatgpt_credential_temporary_orphaned",
+                    path = %path.display(),
+                    error = %source,
+                    "could not remove an abandoned ChatGPT credential temporary file"
+                );
+            }
+            TemporarySweep::Removed { path } => {
+                tracing::warn!(
+                    event = "chatgpt_credential_temporary_swept",
+                    path = %path.display(),
+                    "removed an abandoned ChatGPT credential temporary file"
+                );
+            }
         }
     }
-}
-
-#[cfg(unix)]
-fn sync_directory(parent: &Path) -> io::Result<()> {
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_parent: &Path) -> io::Result<()> {
-    // Windows can't open a directory as a file and its rename isn't the same durability contract,
-    // so this platform only gets the file's own sync_all.
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_mode(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn set_private_file_mode(_options: &mut OpenOptions) {}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(temporary, destination)
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    match fs::remove_file(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    fs::rename(temporary, destination)
 }
 
 #[allow(
