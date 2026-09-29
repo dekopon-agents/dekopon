@@ -110,8 +110,6 @@ curl -u 'userA:${drn:com.xrl:secret:prod:api/password}' \
   https://api.example.com/v1/thing
 ```
 
-No released provider proposes a DRN yet.
-
 The broker checks the proposal, not the provider's parsing of it: a `secretUse` whose DRN is not
 canonical does not decode, and the owner's binding — never the argv — fixes the sink, username,
 destination, and injection count. Bare DRN characters elsewhere are ordinary public text with no

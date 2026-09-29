@@ -50,6 +50,7 @@ jobs:
   # Missing classifier output is not false, so classification failures fall back to full CI.
   quality_checks:
     name: quality checks (stable)
+    timeout-minutes: 15
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
@@ -178,6 +179,7 @@ jobs:
   # rust-toolchain.toml pins the MSRV, so this one suite is both the test and the MSRV check.
   test:
     name: test (Rust)
+    timeout-minutes: 15
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
