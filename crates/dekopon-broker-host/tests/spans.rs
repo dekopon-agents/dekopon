@@ -28,7 +28,7 @@ fn capture() -> CaptureLayer {
     static CAPTURE: OnceLock<CaptureLayer> = OnceLock::new();
     CAPTURE
         .get_or_init(|| {
-            let capture = CaptureLayer::new();
+            let capture = CaptureLayer::workspace();
             tracing_subscriber::registry().with(capture.clone()).init();
             capture
         })

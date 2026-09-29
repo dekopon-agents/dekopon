@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn budget_refusal_is_a_guest_result_and_one_event() {
-        let capture = CaptureLayer::new();
+        let capture = CaptureLayer::workspace();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
             let engine = Engine::default();
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn unbudgeted_store_omits_budget_fields() {
-        let capture = CaptureLayer::new();
+        let capture = CaptureLayer::workspace();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
             let engine = Engine::default();
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn store_record_has_contract_fields_once_without_payload() {
-        let capture = CaptureLayer::new();
+        let capture = CaptureLayer::workspace();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
             let budget = Arc::new(MemoryBudget::new(4 * PAGE));
