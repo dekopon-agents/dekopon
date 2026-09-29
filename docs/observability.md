@@ -668,7 +668,8 @@ per native function. Every load/stage also emits a completion event with timing/
 stdout users without an exporter. A failed stage retains elapsed time and outcome; the enclosing
 component failure event carries its bounded cause chain. Absent later stages are not zero-cost successes.
 
-For a cold miss, expect `compile`, `artifact_hash`, `publish`, then `deserialize`. On a warm hit,
+For a cold miss, expect `compile`, `artifact_hash`, `publish`, then `deserialize`; a miss over an
+object that already exists also records `verify` before `publish`. On a warm hit,
 expect `verify` then `deserialize`, with **no compiler stage**. `reuse` means the same compiled hash
 was already verified/mapped in this registry boot; `bypass` means source compilation without cache
 I/O. `lookup` on failure means the lookup itself did not reach a usable hit/miss. Stage `bytes`

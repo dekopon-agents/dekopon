@@ -8,11 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Compiled-cache index misses with existing objects (0.28.1)
+## Compiled cache survives an engine-key change (0.28.1)
 
-No configuration or cache migration is needed; swap the broker binary. An index miss now
-verifies and reuses an existing compiled object with the same digest instead of failing during
-publication. A mismatched object still stops startup with the cache-reset instructions.
+0.28.0 exited on boot with
+`publish compiled artifact …: failed to persist temporary file: File exists` when a wasmtime
+upgrade changed the engine key but compiled byte-identical objects. The broker now verifies the
+existing object and reuses it; one that does not match still fails, naming the path. No
+configuration change and no cache cleanup is needed: swap the broker binary.
 
 ## Guest memory charged on growth; `oauth2Refresh` (0.28.0)
 
