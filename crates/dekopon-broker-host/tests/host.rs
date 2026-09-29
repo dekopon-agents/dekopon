@@ -1057,7 +1057,7 @@ async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
+async fn concurrent_small_guest_stores_do_not_reserve_their_maximum() {
     let limits = BrokerHostLimits::default();
     let options = BrokerHostOptions {
         max_total_memory_bytes: Some(limits.max_memory_bytes),
@@ -1112,13 +1112,10 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
             Default::default(),
         )
         .await
-        .expect_err("a second concurrent store exceeds the aggregate ceiling")
+        .expect_err("the fixture never answers, but a second small store is admitted")
         .error;
     assert!(
-        matches!(
-            error.as_ref(),
-            BrokerHostError::MemoryBudgetExhausted { .. }
-        ),
+        matches!(error.as_ref(), BrokerHostError::Timeout { .. }),
         "{error:?}"
     );
 

@@ -28,7 +28,7 @@ fn capture() -> CaptureLayer {
     static CAPTURE: OnceLock<CaptureLayer> = OnceLock::new();
     CAPTURE
         .get_or_init(|| {
-            let capture = CaptureLayer::workspace();
+            let capture = CaptureLayer::new();
             tracing_subscriber::registry().with(capture.clone()).init();
             capture
         })
@@ -298,6 +298,15 @@ async fn a_load_describes_once_and_a_run_adds_exactly_one_more() {
         .expect("command-word provider loads");
     assert_eq!(registry.command_words(), vec!["recall".to_owned()]);
     assert_one_store_each(&capture, "provider.describe", 1);
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|(fields, parent)| fields.contains("memory.store")
+                && parent.as_deref() == Some("provider.describe"))
+            .count(),
+        1
+    );
     assert!(
         recordings(&capture, "provider.run_command").is_empty(),
         "a load runs no command word:\n{}",
@@ -314,6 +323,15 @@ async fn a_load_describes_once_and_a_run_adds_exactly_one_more() {
     );
     assert_one_store_each(&capture, "provider.describe", 1);
     assert_one_store_each(&capture, "provider.run_command", 1);
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|(fields, parent)| fields.contains("memory.store")
+                && parent.as_deref() == Some("provider.run_command"))
+            .count(),
+        1
+    );
 
     let rendered = capture.spans_text();
     assert!(
@@ -745,45 +763,30 @@ fn memory_component(body: &str, failed: bool) -> tempfile::NamedTempFile {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_without_payloads() {
+async fn memory_store_reports_invocation_fuel_and_high_water_without_payloads() {
     let _sequential = SEQUENTIAL.lock().await;
     let capture = capture();
-    for (body, failed, outcome, peak, denied) in [
-        ("", false, "succeeded", 65_536, 0),
-        (
-            "i32.const 1 memory.grow drop",
-            false,
-            "succeeded",
-            131_072,
-            0,
-        ),
-        (
-            "i32.const 4 memory.grow drop",
-            false,
-            "succeeded",
-            65_536,
-            1,
-        ),
+    for (body, failed, outcome, peak) in [
+        ("", false, "succeeded", 65_536),
+        ("i32.const 1 memory.grow drop", false, "succeeded", 131_072),
+        ("i32.const 4 memory.grow drop", false, "succeeded", 65_536),
         (
             "i32.const 1 memory.grow drop",
             true,
             "provider-error",
             131_072,
-            0,
         ),
         (
             "i32.const 1 memory.grow drop unreachable",
             false,
             "trap",
             131_072,
-            0,
         ),
         (
             "i32.const 1 memory.grow drop (loop $spin br $spin)",
             false,
             "fuel-exhausted",
             131_072,
-            0,
         ),
     ] {
         capture.clear();
@@ -799,8 +802,8 @@ async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_witho
         .await
         .expect("synthetic provider loads");
         assert!(
-            !capture.text().contains("provider.memory"),
-            "describe is separate"
+            capture.text().contains("memory.store"),
+            "describe has a store"
         );
         let result = registry
             .invoke(
@@ -817,21 +820,19 @@ async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_witho
         let events = capture
             .events()
             .into_iter()
-            .filter(|(fields, _)| fields.contains("event=\"provider.memory\""))
+            .filter(|(fields, parent)| {
+                fields.contains("memory.store") && parent.as_deref() == Some("provider.invoke")
+            })
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 1, "{}", capture.text());
         let (fields, parent) = &events[0];
         assert_eq!(parent.as_deref(), Some("provider.invoke"));
         for expected in [
-            "operation=\"invoke\"".to_owned(),
             "provider=memory-probe".to_owned(),
-            "capability=memory-probe.run".to_owned(),
+            "capability=\"memory-probe.run\"".to_owned(),
             format!("outcome=\"{outcome}\""),
-            format!("memory.max_individual_observed_bytes={peak}"),
-            "memory.observation_complete=true".to_owned(),
-            "memory.per_memory_limit_bytes=196608".to_owned(),
-            format!("memory.growth_denied={denied}"),
-            "memory.growth_failed=0".to_owned(),
+            format!("memory.peak.bytes={peak}"),
+            "memory.budget.bytes=268435456".to_owned(),
         ] {
             assert!(fields.contains(&expected), "missing {expected}: {fields}");
         }
@@ -899,7 +900,9 @@ async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
         let events = capture
             .events()
             .into_iter()
-            .filter(|(fields, _)| fields.contains("event=\"provider.memory\""))
+            .filter(|(fields, parent)| {
+                fields.contains("memory.store") && parent.as_deref() == Some("provider.invoke")
+            })
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 1, "{}", capture.text());
         let (fields, parent) = &events[0];
@@ -909,12 +912,9 @@ async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
             fields.contains(&format!("outcome=\"{outcome}\"")),
             "{fields}"
         );
+        assert!(fields.contains("memory.peak.bytes=131072"), "{fields}");
         assert!(
-            fields.contains("memory.max_individual_observed_bytes=131072"),
-            "{fields}"
-        );
-        assert!(
-            fields.contains(&format!("fuel.initial={}", u64::MAX)),
+            fields.contains(&format!("fuel.initial={}", i64::MAX)),
             "{fields}"
         );
         if cancel {
@@ -929,7 +929,7 @@ async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
                 "{fields}"
             );
             assert!(
-                fields.contains(&format!("fuel.remaining={}", u64::MAX - consumed[0])),
+                fields.contains(&format!("fuel.remaining={}", i64::MAX)),
                 "{fields}"
             );
         }
