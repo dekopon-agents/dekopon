@@ -81,23 +81,54 @@ struct ErrorResponse {
 
 enum RefreshResult {
     NotDue(OAuth2Record),
-    Refreshed(OAuth2Record),
-    RefreshedUnsaved(OAuth2Record),
+    Refreshed {
+        record: OAuth2Record,
+        predecessor: Redacted<String>,
+    },
+    RefreshedUnsaved {
+        record: OAuth2Record,
+        predecessor: Redacted<String>,
+    },
 }
 
 impl RefreshResult {
     const fn label(&self) -> &'static str {
         match self {
             Self::NotDue(_) => "not-due",
-            Self::Refreshed(_) | Self::RefreshedUnsaved(_) => "refreshed",
+            Self::Refreshed { .. } | Self::RefreshedUnsaved { .. } => "refreshed",
         }
+    }
+
+    fn checked(self) -> Result<Self, SourceError> {
+        match &self {
+            Self::NotDue(record) => {
+                super::reject_bootstrap_reflection(
+                    record.access.expose().as_bytes().to_vec(),
+                    &[record.refresh.expose()],
+                )?;
+            }
+            Self::Refreshed {
+                record,
+                predecessor,
+            }
+            | Self::RefreshedUnsaved {
+                record,
+                predecessor,
+            } => {
+                super::reject_bootstrap_reflection(
+                    record.access.expose().as_bytes().to_vec(),
+                    &[predecessor.expose(), record.refresh.expose()],
+                )?;
+            }
+        }
+        Ok(self)
     }
 
     fn record(self) -> OAuth2Record {
         match self {
-            Self::NotDue(record) | Self::Refreshed(record) | Self::RefreshedUnsaved(record) => {
-                record
-            }
+            Self::NotDue(record)
+            | Self::Refreshed { record, .. }
+            | Self::RefreshedUnsaved { record, .. } => record,
         }
     }
 }
@@ -177,8 +208,18 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
     } = inputs;
     let started = std::time::Instant::now();
     let locked_path = path.clone();
-    let outcome = match tokio::task::spawn_blocking(move || read_locked(locked_path, uid)).await {
-        Ok(Ok(opened)) => refresh(opened, path, endpoint, client_id, timeout, client).await,
+    let read_span = span.clone();
+    let read_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let outcome = match tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&read_dispatch, || {
+            read_span.in_scope(|| read_locked(locked_path, uid))
+        })
+    })
+    .await
+    {
+        Ok(Ok(opened)) => refresh(opened, path, endpoint, client_id, timeout, client)
+            .await
+            .and_then(RefreshResult::checked),
         Ok(Err(error)) => Err(error),
         Err(source) => Err(classified(SourceError::Internal, &source)),
     };
@@ -233,24 +274,18 @@ async fn refresh(
     if now_seconds() < opened.record.expires_at.saturating_sub(60) {
         return Ok(RefreshResult::NotDue(opened.record));
     }
-    let replacement = post(
-        &client,
-        &endpoint,
-        &client_id,
-        &opened.record.refresh,
-        timeout,
-    )
-    .await?;
-    if replacement.access_token.expose().len() > super::HARD_MAX_SECRET_BYTES {
-        return Err(SourceError::TooLarge);
-    }
-    let expires_at = now_seconds()
+    let predecessor = opened.record.refresh;
+    let sent_at = now_seconds();
+    let replacement = post(&client, &endpoint, &client_id, &predecessor, timeout).await?;
+    let expires_at = sent_at
         .checked_add(replacement.expires_in.get())
         .ok_or(SourceError::Malformed)?;
     let record = OAuth2Record {
         version: 1,
         access: replacement.access_token,
-        refresh: replacement.refresh_token.unwrap_or(opened.record.refresh),
+        refresh: replacement
+            .refresh_token
+            .unwrap_or_else(|| predecessor.clone()),
         expires_at,
     };
     let bytes = serde_json::to_vec(&record)
@@ -259,14 +294,26 @@ async fn refresh(
         return Err(SourceError::Malformed);
     }
     let record_path = path.clone();
+    let save_span = tracing::Span::current();
+    let save_dispatch = tracing::dispatcher::get_default(Clone::clone);
     let saved = tokio::task::spawn_blocking(move || {
-        let _lock = opened.lock;
-        dekopon_core::private_file::replace_private_file(&path, &bytes)
+        tracing::dispatcher::with_default(&save_dispatch, || {
+            save_span.in_scope(|| {
+                let _lock = opened.lock;
+                drop(dekopon_core::private_file::sweep_stale_temporaries(
+                    &path, None,
+                ));
+                dekopon_core::private_file::replace_private_file(&path, &bytes)
+            })
+        })
     })
     .await
     .map_err(|source| classified(SourceError::Internal, &source))?;
     match saved {
-        Ok(()) => Ok(RefreshResult::Refreshed(record)),
+        Ok(()) => Ok(RefreshResult::Refreshed {
+            record,
+            predecessor,
+        }),
         Err(error) => {
             tracing::error!(
                 name: "broker.credential.refresh_save_failed",
@@ -276,7 +323,10 @@ async fn refresh(
                 error = %error.source,
                 "OAuth refresh succeeded but the record could not be saved"
             );
-            Ok(RefreshResult::RefreshedUnsaved(record))
+            Ok(RefreshResult::RefreshedUnsaved {
+                record,
+                predecessor,
+            })
         }
     }
 }
@@ -305,17 +355,7 @@ async fn post(
             )
         })?;
         let status = response.status();
-        if response.headers().len() > super::MAX_SOURCE_RESPONSE_HEADERS
-            || response
-                .headers()
-                .iter()
-                .try_fold(0_usize, |size, (name, value)| {
-                    size.checked_add(name.as_str().len())?
-                        .checked_add(value.as_bytes().len())?
-                        .checked_add(4)
-                })
-                .is_none_or(|size| size > super::MAX_SOURCE_RESPONSE_HEADER_BYTES)
-        {
+        if !super::headers_within_limits(&response) {
             return Err(SourceError::TooLarge);
         }
         let mut body = Vec::new();

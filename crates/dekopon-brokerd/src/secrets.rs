@@ -1268,6 +1268,7 @@ async fn validate_map(
         ));
     }
     let mut seen = BTreeSet::new();
+    let mut oauth2_records: BTreeMap<PathBuf, Vec<OAuth2RecordOwner>> = BTreeMap::new();
     let mut bootstrap_paths = BTreeSet::new();
     let mut material_paths = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
@@ -1280,6 +1281,30 @@ async fn validate_map(
         }
         if let Err(reason) = entry.source.validate() {
             problems.push(format!("{} source is invalid: {reason}", entry.drn));
+        }
+        if let SecretSource::OAuth2Refresh {
+            record_path,
+            token_endpoint,
+            client_id,
+            ..
+        } = &entry.source
+        {
+            let owners = oauth2_records.entry(record_path.clone()).or_default();
+            for owner in owners.iter() {
+                if owner.token_endpoint != *token_endpoint || owner.client_id != *client_id {
+                    problems.push(format!(
+                        "oauth2Refresh record {} has conflicting tokenEndpoint or clientId for {} and {}",
+                        record_path.display(),
+                        owner.drn,
+                        entry.drn,
+                    ));
+                }
+            }
+            owners.push(OAuth2RecordOwner {
+                drn: entry.drn.clone(),
+                token_endpoint: token_endpoint.clone(),
+                client_id: client_id.clone(),
+            });
         }
         if let Some(path) = entry.source.bootstrap_path() {
             bootstrap_paths.insert(path);
@@ -1628,6 +1653,25 @@ async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
+struct OAuth2RecordOwner {
+    drn: SecretDrn,
+    token_endpoint: String,
+    client_id: String,
+}
+
+fn headers_within_limits(response: &reqwest::Response) -> bool {
+    response.headers().len() <= MAX_SOURCE_RESPONSE_HEADERS
+        && response
+            .headers()
+            .iter()
+            .try_fold(0_usize, |size, (name, value)| {
+                size.checked_add(name.as_str().len())?
+                    .checked_add(value.as_bytes().len())?
+                    .checked_add(4)
+            })
+            .is_some_and(|size| size <= MAX_SOURCE_RESPONSE_HEADER_BYTES)
+}
+
 async fn bounded_json(
     request: reqwest::RequestBuilder,
     timeout_ms: u64,
@@ -1652,17 +1696,7 @@ async fn bounded_json(
             SourceError::Rejected
         });
     }
-    if response.headers().len() > MAX_SOURCE_RESPONSE_HEADERS
-        || response
-            .headers()
-            .iter()
-            .try_fold(0_usize, |size, (name, value)| {
-                size.checked_add(name.as_str().len())?
-                    .checked_add(value.as_bytes().len())?
-                    .checked_add(4)
-            })
-            .is_none_or(|size| size > MAX_SOURCE_RESPONSE_HEADER_BYTES)
-    {
+    if !headers_within_limits(&response) {
         return Err(SourceError::TooLarge);
     }
     if response

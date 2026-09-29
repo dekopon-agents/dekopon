@@ -273,27 +273,53 @@ and non-empty tokens are required. Every authorized resolution takes the sibling
 the record, and reuses its access token until 60 seconds before expiry; then it sends one OAuth
 refresh-token grant to the configured endpoint, writes the replacement `0600` file by atomic rename,
 and returns the access token. An omitted response `refresh_token` retains the predecessor; no
-in-memory token cache or retry exists. Two DRNs may share one record and lock. The configured
+in-memory token cache or retry exists. Two DRNs may share one record and lock only when their
+`tokenEndpoint` and `clientId` match. The record needs its own file-name stem: the broker writes
+`<stem>.tmp-<pid>` beside it and sweeps `<stem>.tmp-*` under the lock, so a sibling with the same
+stem (for example ChatGPT `auth.json` beside `auth.oauth`) shares those temporaries. The configured
 endpoint must use HTTPS or literal loopback HTTP; redirects and ambient proxies are disabled.
 
 `reauthorization-required` means the OAuth error code says the token family is retired: re-import
 a working record. Other 4xx responses are `rejected`, 5xx and connection failures are `transport`,
 a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
 `insecure-file`; a missing file is `io`.
-`too-large` means the record, token, or response headers exceed their configured ceiling.
+`bootstrap-reflected` means the access contains the current or predecessor refresh token; a
+rotated record is saved, if possible, before the refusal.
+`too-large` means the record, response headers, or body exceed their ceilings, or the returned
+token exceeds the final material limit after the rotation is saved.
 `internal` means a blocking or refresh task did not complete.
-If saving a rotated token fails, this invocation still
-returns the new access token and logs the path and I/O error. A refresh whose response is lost costs
+If saving a rotated token fails, an otherwise valid invocation still returns the new access token
+and logs the path and I/O error. A refresh whose response is lost costs
 one re-import: the old refresh token remains on disk, and the next use may get `invalid_grant`.
+A rotation the broker cannot parse or cannot save costs the same re-import.
 
-Enroll or reset the record from a trusted local `record.json` with one command (replace the pod,
-container, and path placeholders):
+The broker image is distroless: it has no shell, `cat`, `mv`, or `tar`, so neither `kubectl exec` with
+`sh` nor `kubectl cp` works. To enroll or reset from a trusted local `record.json`, stop the broker
+first: a refresh in flight could otherwise overwrite the reset. Replace `<namespace>`,
+`<deployment>`, `<release>`, `<broker-pod>`, and `<state-claim>` with the live values; choose the
+deployment's broker pod from the listing before scaling. The chart's generated state claim is
+`<deployment>-state` unless `state.existingClaim` overrides it. Pause any controller that would
+restore the deployment's replicas while the broker is stopped. The example assumes the
+broker has a writable state mount at `paths.stateDir` (`/var/lib/dekopon`) with subdirectory
+`broker-chatgpt` and record file `example-oauth2.json`; adjust the maintenance pod's `subPath` and
+both `/record/...` paths to match the owner-controlled map and the broker's writable mount. That
+subdirectory must already exist on the claim, owned by broker UID 65532 and writable by it.
+Use the chart's pinned `initImage` (BusyBox), not the distroless broker image:
 
 ```sh
-kubectl exec -i <broker pod> -c <broker container> -- sh -c 'umask 077; cat > <recordPath>.tmp && mv <recordPath>.tmp <recordPath>' < record.json
+kubectl -n <namespace> get pods -l app.kubernetes.io/instance=<release>
+kubectl -n <namespace> scale deployment/<deployment> --replicas=0
+kubectl -n <namespace> wait --for=delete pod/<broker-pod> --timeout=180s
+kubectl -n <namespace> run oauth2-record-reset --restart=Never --attach --stdin \
+  --image=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23 \
+  --overrides='{"apiVersion":"v1","spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532},"containers":[{"name":"oauth2-record-reset","image":"busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23","stdin":true,"stdinOnce":true,"command":["/bin/sh","-c","set -eu; umask 077; cat > /record/example-oauth2.tmp && mv /record/example-oauth2.tmp /record/example-oauth2.json"],"volumeMounts":[{"name":"state","mountPath":"/record","subPath":"broker-chatgpt"}]}],"volumes":[{"name":"state","persistentVolumeClaim":{"claimName":"<state-claim>"}}]}}' \
+  < record.json
+kubectl -n <namespace> delete pod oauth2-record-reset --wait=true
+kubectl -n <namespace> scale deployment/<deployment> --replicas=1
 ```
 
-There is no enrollment subcommand. Upgrade the broker before activating the map: 0.27.0 brokers
+Do not scale up if the write fails; investigate and remove the maintenance pod first. There is no
+enrollment subcommand. Upgrade the broker before activating the map: 0.27.0 brokers
 refuse `oauth2Refresh` as an unknown kind.
 
 ### `secureFile`

@@ -188,6 +188,8 @@ async fn a_refresh_replaces_the_record_and_the_next_resolution_reuses_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
+    let stale = dir.path().join("record.tmp-123");
+    fs::write(&stale, b"abandoned-private-record").unwrap();
     let api = TokenApi::serving(|_| success());
     let resolver = resolver(&path, &api.endpoint, &["one"]);
     for _ in 0..2 {
@@ -203,6 +205,7 @@ async fn a_refresh_replaces_the_record_and_the_next_resolution_reuses_it() {
     let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(stored["access"], NEW_ACCESS);
     assert_eq!(stored["refresh"], NEW_REFRESH);
+    assert!(!stale.exists());
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -584,10 +587,21 @@ async fn a_group_readable_or_missing_record_fails_without_a_refresh() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
     let api = TokenApi::serving(|_| success());
     let resolver = resolver(&path, &api.endpoint, &["one"]);
+    let capture = CaptureLayer::new();
     assert_eq!(
-        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        resolver
+            .resolve(&drn("one"))
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap_err()
+            .category,
         "insecure-file"
     );
+    assert!(capture.records().iter().any(|record| matches!(
+        record,
+        Record::Event { parent: Some(parent), fields, .. }
+            if parent == "broker.credential.refresh" && fields.contains("file-hygiene")
+    )));
     fs::remove_file(&path).unwrap();
     assert_eq!(
         resolver.resolve(&drn("one")).await.unwrap_err().category,
@@ -602,11 +616,21 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
     let path = dir.path().join("record.json");
     expired(&path);
     let api = TokenApi::serving(|n| {
-        if n == 1 {
-            success()
-        } else {
-            ("400 Bad Request", json!({"error":"invalid_grant","error_description":"private-error-description-sentinel"}).to_string())
-        }
+        match n {
+        1 => success(),
+        2 => (
+            "400 Bad Request",
+            json!({"error":"invalid_grant","error_description":"private-error-description-sentinel"}).to_string(),
+        ),
+        3 => (
+            "200 OK",
+            json!({"access_token":OLD_REFRESH,"refresh_token":NEW_REFRESH,"expires_in":3600}).to_string(),
+        ),
+        _ => (
+            "200 OK",
+            json!({"access_token":NEW_REFRESH,"refresh_token":NEW_REFRESH,"expires_in":3600}).to_string(),
+        ),
+    }
     });
     let resolver = resolver(&path, &api.endpoint, &["one"]);
     let capture = CaptureLayer::new();
@@ -617,6 +641,24 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
             resolver.resolve(&drn("one")).await.unwrap_err().category,
             "reauthorization-required"
         );
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            "bootstrap-reflected"
+        );
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["access"], OLD_REFRESH);
+        assert_eq!(stored["refresh"], NEW_REFRESH);
+        expired(&path);
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            "bootstrap-reflected"
+        );
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            "bootstrap-reflected"
+        );
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["access"], NEW_REFRESH);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
@@ -632,6 +674,46 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
         assert!(!recorded.contains(secret), "trace disclosed {secret}");
     }
     assert!(recorded.contains("reauth-required"), "{recorded}");
+    assert_eq!(api.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn a_shared_record_with_a_different_endpoint_or_client_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let mut file = map(&path, "https://one.example/token", None);
+    file.secrets[1].source = source(&path, "https://two.example/token");
+    let mut third = file.secrets[0].clone();
+    third.drn = drn("three");
+    third.source = serde_json::from_value(json!({
+        "kind": "oauth2Refresh",
+        "recordPath": path,
+        "tokenEndpoint": "https://one.example/token",
+        "clientId": "other-client-id"
+    }))
+    .unwrap();
+    third.bindings[0].id = "third".to_owned();
+    file.secrets.push(third);
+    let Err(SecretMapError::Validation { problems }) = validate_map(
+        file,
+        &dir.path().join("map.json"),
+        rustix::process::geteuid().as_raw(),
+    )
+    .await
+    else {
+        panic!("mismatched refresh sources cannot share a record");
+    };
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    for (first, second) in [("one", "two"), ("one", "three"), ("two", "three")] {
+        assert!(
+            problems.iter().any(|problem| {
+                problem.contains(&path.display().to_string())
+                    && problem.contains(drn(first).as_str())
+                    && problem.contains(drn(second).as_str())
+            }),
+            "{problems:?}"
+        );
+    }
 }
 
 #[tokio::test]
