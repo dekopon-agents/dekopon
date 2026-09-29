@@ -4034,6 +4034,39 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_gateway_session_wakes_its_running_shell_sleep() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let model = ModelScript::new([script_call("sleep 300")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&model), 4);
+    let running = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        message("sleep"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(model.requests(), 1, "the model started the script");
+    assert_eq!(
+        runner
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
+        CancelOutcome::Cancelled
+    );
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("the gateway script stops promptly")
+        .expect("session task finishes");
+    assert!(
+        driver
+            .rendered()
+            .contains(&format!("reply:{}", crate::session::STOPPED_REPLY))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(

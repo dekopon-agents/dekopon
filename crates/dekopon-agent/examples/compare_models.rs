@@ -100,7 +100,11 @@ impl Arguments {
 struct SyntheticRuntime;
 
 impl ScriptRuntime for SyntheticRuntime {
-    fn run_script(&self, _script: &str, _max_capability_calls: u32) -> ScriptOutcome {
+    fn capability_calls_used(&self) -> u32 {
+        0
+    }
+
+    fn run_script(&self, _script: &str) -> ScriptOutcome {
         ScriptOutcome {
             output: "synthetic: no script was executed".into(),
             exit_code: ExitCode::SUCCESS,

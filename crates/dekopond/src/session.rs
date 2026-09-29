@@ -34,7 +34,7 @@ use dekopon_model::{
     openai::OpenAiClient,
 };
 use dekopon_process::{CancelHandle, CancelSignal};
-use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
+use dekopon_shell::{CallBudget, CapabilityInvoker as _, Limits as ShellLimits};
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
@@ -1414,7 +1414,8 @@ async fn session(
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
-    let mut leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    let calls = CallBudget::new(limits.max_capability_calls);
+    let mut leg = leg.with_progress(Arc::clone(&progress_sink), calls.clone());
     if progress_notes {
         leg = leg.with_progress_notes();
     }
@@ -1444,6 +1445,7 @@ async fn session(
         let runtime = ShellRuntime {
             invoker: leg,
             limits: shell,
+            calls,
         };
         let mut history = seeded;
         let mut inputs = SessionInputs::new(&text, limits)

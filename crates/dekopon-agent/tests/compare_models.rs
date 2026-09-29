@@ -20,7 +20,11 @@ use std::{
 #[derive(Default)]
 struct SyntheticRuntime(Mutex<Vec<String>>);
 impl ScriptRuntime for SyntheticRuntime {
-    fn run_script(&self, script: &str, _budget: u32) -> ScriptOutcome {
+    fn capability_calls_used(&self) -> u32 {
+        0
+    }
+
+    fn run_script(&self, script: &str) -> ScriptOutcome {
         self.0.lock().unwrap().push(script.to_owned());
         ScriptOutcome {
             output: "synthetic-result".into(),

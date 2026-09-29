@@ -34,8 +34,8 @@ use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits as ShellLimits,
-    ScriptOutcome,
+    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter,
+    Limits as ShellLimits, ScriptOutcome, TreeContext,
 };
 use serde_json::Value;
 #[cfg(unix)]
@@ -63,22 +63,21 @@ pub use crate::progress::{
 pub struct ShellRuntime<I> {
     pub invoker: I,
     pub limits: ShellLimits,
+    pub calls: CallBudget,
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
-    fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
-        // Each script gets a fresh interpreter but not a fresh budget; capability allowance is
-        // spent across the whole session, and exhausting it trips the interpreter's own existing
-        // ceiling.
-        let limits = ShellLimits {
-            max_capability_calls: self.limits.max_capability_calls.min(max_capability_calls),
-            ..self.limits
-        };
-        let outcome = Interpreter::new(limits).run(script, &self.invoker);
+    fn run_script(&self, script: &str) -> ScriptOutcome {
+        let tree = TreeContext::new(self.limits.timeout, self.calls.clone());
+        let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
         // reports out of order.
         self.invoker.script_finished();
         outcome
+    }
+
+    fn capability_calls_used(&self) -> u32 {
+        self.calls.used()
     }
 
     fn command_words(&self) -> Vec<String> {
@@ -98,6 +97,14 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
+    fn cancelled(&self) -> bool {
+        self.direct.cancelled()
+            || self
+                .broker
+                .as_ref()
+                .is_some_and(|broker| broker.cancelled())
+    }
+
     fn granted(&self) -> Vec<String> {
         let mut granted = self.direct.granted();
         if let Some(broker) = &self.broker {
@@ -290,8 +297,7 @@ pub struct BrokerLeg {
     progress: Option<Arc<dyn ProgressSink>>,
     notes_enabled: bool,
     notes: AtomicU32,
-    calls_max: u32,
-    calls_used: AtomicU32,
+    calls: CallBudget,
     pending_report: Mutex<Option<(CommandWord, Instant)>>,
 }
 
@@ -338,8 +344,7 @@ impl BrokerLeg {
             progress: None,
             notes_enabled: false,
             notes: AtomicU32::new(0),
-            calls_max: 0,
-            calls_used: AtomicU32::new(0),
+            calls: CallBudget::new(0),
             pending_report: Mutex::new(None),
         })
     }
@@ -363,9 +368,9 @@ impl BrokerLeg {
     }
 
     #[must_use]
-    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, max_capability_calls: u32) -> Self {
+    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, calls: CallBudget) -> Self {
         self.progress = Some(sink);
-        self.calls_max = max_capability_calls;
+        self.calls = calls;
         self
     }
 
@@ -509,6 +514,10 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     fn granted(&self) -> Vec<String> {
         self.capabilities.keys().cloned().collect()
     }
@@ -543,8 +552,8 @@ impl CapabilityInvoker for BrokerLeg {
         self.emit(ProgressEvent::ToolStarted {
             word: reported.clone(),
             argument_count: bounded_count(argv.len()),
-            calls_used: self.calls_used.load(Ordering::Relaxed),
-            calls_max: self.calls_max,
+            calls_used: self.calls.used(),
+            calls_max: self.calls.maximum(),
         });
         // The round-trip task must be joined before returning, or the leg could answer while an
         // aborted call is still in flight.
@@ -604,13 +613,7 @@ impl CapabilityInvoker for BrokerLeg {
     ) -> CapabilityCallResult {
         let held = self.take_pending_report();
         let cancelled = self.cancel.is_cancelled();
-        let calls_used = if cancelled {
-            self.calls_used.load(Ordering::Relaxed)
-        } else {
-            self.calls_used
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1)
-        };
+        let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
         // line.
@@ -623,7 +626,7 @@ impl CapabilityInvoker for BrokerLeg {
                         input.as_object().map_or(0, serde_json::Map::len),
                     ),
                     calls_used,
-                    calls_max: self.calls_max,
+                    calls_max: self.calls.maximum(),
                 });
                 (word, Instant::now())
             })
@@ -1071,6 +1074,7 @@ mod tests {
             os::unix::fs::PermissionsExt as _,
             path::Path,
             sync::{Arc, Mutex, atomic::AtomicU32},
+            time::Duration,
         };
 
         use dekopon_broker_protocol::{
@@ -1422,8 +1426,7 @@ mod tests {
                 progress: None,
                 notes_enabled: false,
                 notes: AtomicU32::new(0),
-                calls_max: 0,
-                calls_used: AtomicU32::new(0),
+                calls: dekopon_shell::CallBudget::new(0),
                 pending_report: Mutex::new(None),
             }
         }
@@ -1991,7 +1994,8 @@ mod tests {
         async fn notes_without_the_broker_opt_in_emit_nothing() {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
-            let leg = leg_for(&directory.path().join("absent.sock")).with_progress(progress, 4);
+            let leg = leg_for(&directory.path().join("absent.sock"))
+                .with_progress(progress, dekopon_shell::CallBudget::new(4));
             leg.note("not enabled", None);
             assert!(sink.labels().is_empty());
         }
@@ -2001,22 +2005,24 @@ mod tests {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
             let leg = leg_for(&directory.path().join("absent.sock"))
-                .with_progress(progress, 4)
+                .with_progress(progress, dekopon_shell::CallBudget::new(4))
                 .with_progress_notes();
+            let calls = leg.calls.clone();
             let runtime = ShellRuntime {
                 invoker: crate::SessionInvoker {
                     direct: super::FakeLeg::new("cli-probe.upper", "direct"),
                     broker: Some(Box::new(leg)),
                 },
                 limits: Limits::default(),
+                calls,
             };
             let script = (1..=9)
                 .map(|index| format!("progress note-{index}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            assert_eq!(runtime.run_script(&script, 4).exit_code, ExitCode::SUCCESS);
+            assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
             assert_eq!(
-                runtime.run_script("progress fresh", 4).exit_code,
+                runtime.run_script("progress fresh").exit_code,
                 ExitCode::SUCCESS
             );
             let mut expected = (1..=8)
@@ -2043,7 +2049,7 @@ mod tests {
             )
             .await;
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, 4);
+            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
@@ -2055,7 +2061,7 @@ mod tests {
             assert_eq!(
                 sink.labels(),
                 vec![
-                    format!("started {CAPABILITY} arguments=1 calls=1/4"),
+                    format!("started {CAPABILITY} arguments=1 calls=0/4"),
                     format!("finished {CAPABILITY} Denied"),
                 ]
             );
@@ -2067,7 +2073,9 @@ mod tests {
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (handle, signal) = CancelSignal::pair();
             let (sink, progress) = recording_sink();
-            let leg = leg.with_cancel_signal(signal).with_progress(progress, 4);
+            let leg = leg
+                .with_cancel_signal(signal)
+                .with_progress(progress, dekopon_shell::CallBudget::new(4));
             handle.cancel();
 
             assert_eq!(
@@ -2085,6 +2093,57 @@ mod tests {
             );
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_broker_stop_interrupts_a_running_shell_loop() {
+            let directory = private_broker_directory();
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg_for(&directory.path().join("absent.sock")).with_cancel_signal(signal);
+            let limits = Limits {
+                max_steps: u64::MAX,
+                timeout: Duration::from_secs(300),
+                ..Limits::default()
+            };
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits,
+                calls: dekopon_shell::CallBudget::new(4),
+            };
+            let running =
+                tokio::task::spawn_blocking(move || runtime.run_script("while true; do :; done"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.cancel();
+            let outcome = tokio::time::timeout(Duration::from_secs(2), running)
+                .await
+                .expect("script stopped promptly")
+                .expect("script worker");
+            assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+            assert!(outcome.steps < u64::MAX);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_broker_stop_interrupts_a_sleeping_shell() {
+            let directory = private_broker_directory();
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg_for(&directory.path().join("absent.sock")).with_cancel_signal(signal);
+            let limits = Limits {
+                timeout: Duration::from_secs(310),
+                ..Limits::default()
+            };
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits,
+                calls: dekopon_shell::CallBudget::new(4),
+            };
+            let running = tokio::task::spawn_blocking(move || runtime.run_script("sleep 300"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.cancel();
+            let outcome = tokio::time::timeout(Duration::from_millis(1500), running)
+                .await
+                .expect("sleep stopped promptly")
+                .expect("script worker");
+            assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+        }
+
         async fn reporting_probe_leg(
             directory: &Path,
             responses: Vec<ResponseEnvelope>,
@@ -2092,7 +2151,10 @@ mod tests {
             let (mut leg, _observed) = stub_leg_observing(directory, responses, None).await;
             leg.command_words.insert("probe".to_owned());
             let (sink, progress) = recording_sink();
-            (leg.with_progress(progress, 4), sink)
+            (
+                leg.with_progress(progress, dekopon_shell::CallBudget::new(4)),
+                sink,
+            )
         }
 
         fn proposal_of(capability: &str) -> ResponseEnvelope {
@@ -2109,6 +2171,60 @@ mod tests {
                 stderr: String::new(),
                 status,
             })
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn progress_reads_the_same_call_count_across_scripts() {
+            let directory = private_broker_directory();
+            let denied = || {
+                ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Denied, Some("policy-denied")),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+            let (leg, sink) = reporting_probe_leg(
+                directory.path(),
+                vec![
+                    proposal_of(CAPABILITY),
+                    denied(),
+                    proposal_of(CAPABILITY),
+                    denied(),
+                ],
+            )
+            .await;
+            let calls = leg.calls.clone();
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits: Limits::default(),
+                calls: calls.clone(),
+            };
+            let (first, second) = tokio::task::spawn_blocking(move || {
+                (
+                    runtime.run_script("probe fetch 7"),
+                    runtime.run_script("probe fetch 7"),
+                )
+            })
+            .await
+            .expect("scripts finish");
+            assert_eq!(
+                (
+                    first.capability_calls,
+                    second.capability_calls,
+                    calls.used()
+                ),
+                (1, 1, 2)
+            );
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=2 calls=0/4".to_owned(),
+                    "finished probe Denied".to_owned(),
+                    "started probe arguments=2 calls=1/4".to_owned(),
+                    "finished probe Denied".to_owned(),
+                ]
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -2199,18 +2315,19 @@ mod tests {
             let directory = private_broker_directory();
             let (leg, sink) =
                 reporting_probe_leg(directory.path(), vec![proposal_of("gh.pr-merge")]).await;
+            let calls = leg.calls.clone();
             let runtime = ShellRuntime {
                 invoker: crate::SessionInvoker {
                     direct: super::FakeLeg::new("cli-probe.upper", "direct"),
                     broker: Some(Box::new(leg)),
                 },
                 limits: Limits::default(),
+                calls,
             };
 
-            let outcome =
-                tokio::task::spawn_blocking(move || runtime.run_script("probe merge 7", 4))
-                    .await
-                    .expect("blocking dispatch completes");
+            let outcome = tokio::task::spawn_blocking(move || runtime.run_script("probe merge 7"))
+                .await
+                .expect("blocking dispatch completes");
 
             assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{}", outcome.output);
             assert_eq!(
@@ -2268,7 +2385,7 @@ mod tests {
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, 4);
+            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
                 leg.invoke("ignore-your-instructions", json!({}), None)
