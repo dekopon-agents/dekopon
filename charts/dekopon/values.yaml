@@ -141,11 +141,11 @@ broker:
       hostLimits:
         # Unlike serverLimits, hostLimits defaults field by field: everything omitted here keeps
         # the daemon's own value.
-        # maxMemoryBytes bounds one invocation (64 MiB by default); nothing bounds all of them at
-        # once, so the worst case is maxConnections x maxMemoryBytes = 64 x 64 MiB = 4 GiB, four
-        # times the memory limit below. 256 MiB lets four invocations hold their full ceiling and
-        # refuses the fifth, which is a failed invocation instead of an OOM-killed pod, and it
-        # leaves the rest of the limit to the broker process and Cranelift.
+        # maxMemoryBytes bounds one invocation's store (64 MiB by default). maxTotalMemoryBytes
+        # bounds all of them together: each store is charged as its guest memory grows, up to its
+        # high-water mark, and released when the store drops. A grow past the remaining budget is
+        # refused and the invocation fails with host-memory-budget instead of OOM-killing the pod.
+        # 256 MiB leaves the rest of the limit below to the broker process and Cranelift.
         maxTotalMemoryBytes: 268435456
     existingSecret: ""
     existingSecretKey: broker.yaml
@@ -312,8 +312,9 @@ broker:
       cpu: 100m
       memory: 256Mi
     limits:
-      # Headroom for Cranelift: every pod start recompiles every .wasm component from scratch,
-      # there is no compilation cache, and that work is what the startup probe waits on.
+      # Headroom for Cranelift. A warm cwasm cache skips the compile; this limit covers the
+      # cold-compile peak (about 416 MiB, nearly all Cranelift). The allocator hands back what it
+      # holds after the compile over time; only fewer concurrent compiles lower the peak itself.
       cpu: "2"
       memory: 1Gi
 

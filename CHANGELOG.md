@@ -7,6 +7,46 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-09-29
+
+### Added
+
+- Broker-private `oauth2Refresh` secret sources resolve an access token from a 0600 record and
+  refresh it under a file lock when it expires. Upgrade the broker before any secret map uses the
+  kind, which 0.27.0 refuses. See [upgrading](docs/upgrading.md#guest-memory-charged-on-growth-oauth2refresh-0280).
+
+### Changed
+
+- The broker charges guest memory against `hostLimits.maxTotalMemoryBytes` as each store grows
+  instead of reserving every store's maximum up front; a refused grow fails the invocation with
+  `host-memory-budget`.
+- **Breaking:** the `provider.memory` log record is replaced by `memory.store` and
+  `memory.refused` on the `memory` target.
+- A cancelled turn stops its running script at the next step, and `sleep` wakes within a second
+  to notice; the script's deadline and capability-call budget are shared by everything the script
+  runs.
+
+### Fixed
+
+- A `jq` filter that allocates without bound, such as `[range(0;1000000000)]`, no longer kills
+  the gateway: each `jq` stage runs in a worker process with an address-space limit, killed at the
+  script's deadline or when its turn is cancelled.
+
+### Security
+
+- wasmtime moves to 48.0.3 for RUSTSEC-2026-0315 and RUSTSEC-2026-0316.
+
+## [dekopon-chart-0.18.0] - 2026-09-29
+
+### Changed
+
+- Default application version is now 0.28.0.
+
+### Fixed
+
+- The chart refuses to render when a daemon's config comes from `configDirectory` and
+  `drainBudget.assumed<Daemon>ShutdownGraceMs` is unset, instead of assuming 120000 ms.
+
 ## [0.27.0] - 2026-09-28
 
 ### Added

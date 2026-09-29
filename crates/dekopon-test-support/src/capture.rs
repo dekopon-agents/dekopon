@@ -42,7 +42,6 @@ const WORKSPACE_CATEGORIES: &[&str] = &[
 enum TargetFilter {
     #[default]
     All,
-    Prefix(&'static str),
     Workspace,
 }
 
@@ -66,18 +65,9 @@ impl CaptureLayer {
         }
     }
 
-    #[must_use]
-    pub fn with_target_prefix(prefix: &'static str) -> Self {
-        Self {
-            records: Arc::new(Mutex::new(Vec::new())),
-            targets: TargetFilter::Prefix(prefix),
-        }
-    }
-
     fn interested(&self, metadata: &Metadata<'_>) -> bool {
         match self.targets {
             TargetFilter::All => true,
-            TargetFilter::Prefix(prefix) => metadata.target().starts_with(prefix),
             TargetFilter::Workspace => {
                 metadata.target().starts_with("dekopon")
                     || WORKSPACE_CATEGORIES.contains(&metadata.target())
@@ -284,27 +274,6 @@ impl Visit for Visitor<'_> {
 mod tests {
     use super::{CaptureLayer, Record};
     use tracing_subscriber::layer::SubscriberExt as _;
-
-    #[test]
-    fn explicit_prefix_capture_keeps_its_original_scope() {
-        let capture = CaptureLayer::with_target_prefix("http::");
-        tracing::subscriber::with_default(
-            tracing_subscriber::registry().with(capture.clone()),
-            || {
-                tracing::info!(target: "http::client", "selected");
-                tracing::info!(target: "http", "excluded");
-                tracing::info!(target: "memory", "excluded");
-            },
-        );
-        let events = capture
-            .records()
-            .into_iter()
-            .filter(|record| matches!(record, Record::Event { .. }))
-            .collect::<Vec<_>>();
-        assert!(
-            matches!(events.as_slice(), [Record::Event { target, .. }] if target == "http::client")
-        );
-    }
 
     #[test]
     fn workspace_capture_includes_categories_but_not_third_party_targets() {
