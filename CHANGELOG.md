@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-09-29
+
+### Fixed
+
+- Reuse verified compiled objects when an index miss finds an existing artifact instead of failing
+  broker startup. 0.28.0 exited on boot with `failed to persist temporary file: File exists` after
+  an engine-key change; swap the binary, no cache cleanup needed. See
+  [upgrading](docs/upgrading.md#compiled-cache-survives-an-engine-key-change-0281).
+- A compiled object the broker cannot stat stops the load and names its path instead of being
+  treated as absent.
+
 ## [0.28.0] - 2026-09-29
 
 ### Added
