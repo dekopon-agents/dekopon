@@ -627,6 +627,12 @@ jobs:
             --set broker.config.inline= \
             --set broker.config.existingSecret=dekopon-config \
             --set drainBudget.assumedBrokerShutdownGraceMs=300000
+          assert_refused "set drainBudget.assumedBrokerShutdownGraceMs" \
+            -f charts/dekopon/ci/values-config-directory.yaml \
+            --set drainBudget.assumedBrokerShutdownGraceMs=null
+          assert_refused "set drainBudget.assumedGatewayShutdownGraceMs" \
+            -f charts/dekopon/ci/values-config-directory.yaml \
+            --set drainBudget.assumedGatewayShutdownGraceMs=null
       - name: Validate rendered manifests against Kubernetes schemas
         run: |
           docker run --rm -i \

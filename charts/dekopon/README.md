@@ -593,8 +593,9 @@ There is no `latest`. Prefer `image.digest`; it pins across the
 ## Publishing
 
 [`.github/workflows/chart-publish.yml`](https://github.com/dekopon-agents/dekopon/blob/main/.github/workflows/chart-publish.yml)
-triggers on `dekopon-chart-*` tags only. Before tagging, move the chart's completed bullets from
-[`CHANGELOG.md`](../../CHANGELOG.md) into a dated `[dekopon-chart-<VERSION>]` section. Pull-request
+triggers on `dekopon-chart-*` tags only. Before tagging, write a dated
+`[dekopon-chart-<VERSION>]` section in [`CHANGELOG.md`](../../CHANGELOG.md) from
+`git log dekopon-chart-<PREV>..HEAD --format=%B | grep '^Changelog: '`. Pull-request
 CI requires that section to match `Chart.yaml`, and the publish workflow repeats the check. It then
 takes the version from the tag (`VERSION="${GITHUB_REF_NAME#dekopon-chart-}"`), refuses to continue
 unless `Chart.yaml` declares that same version, packages the chart, lints and renders the **tarball**
