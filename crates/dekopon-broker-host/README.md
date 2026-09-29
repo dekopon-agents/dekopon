@@ -153,11 +153,9 @@ counts and the exact bytes read and written.
 
 ## Memory observations
 
-Each invocation that obtains a store emits one payload-free `provider.memory` summary on its
-`provider.invoke` span, including instantiation. It reports the largest **individual** linear-memory
-observation, its completeness and the configured per-memory cap, not aggregate use or RSS. The same
-summary carries actual initial, remaining and consumed Wasmtime fuel when observable; unavailable
-readings are omitted, not zero. Fuel budgets and metering policy are unchanged.
-See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing),
-including the distinction from concurrent-store admission reservations. Describe and command-run
-stores are excluded; enforcement is unchanged.
+Every store emits a payload-free `memory.store` record on target `memory` at drop. Granted
+memory growth is charged against the shared ceiling by the store's high-water, and released on
+drop, without refunds for failed allocation. A refused growth emits `memory.refused`; the guest
+sees -1, and an invocation that fails after refusal reports `host-memory-budget`. Invocation
+stores also report fuel where available. Describe and command-run stores emit `memory.store` too.
+See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing).

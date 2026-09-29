@@ -23,10 +23,33 @@ pub enum Record {
     },
 }
 
+const WORKSPACE_CATEGORIES: &[&str] = &[
+    "gateway",
+    "prompt",
+    "model",
+    "asset",
+    "shell",
+    "job",
+    "broker",
+    "provider",
+    "http",
+    "credential",
+    "memory",
+    "telemetry",
+];
+
+#[derive(Clone, Copy, Default)]
+enum TargetFilter {
+    #[default]
+    All,
+    Prefix(&'static str),
+    Workspace,
+}
+
 #[derive(Clone, Default)]
 pub struct CaptureLayer {
     records: Arc<Mutex<Vec<Record>>>,
-    prefix: Option<&'static str>,
+    targets: TargetFilter,
 }
 
 impl CaptureLayer {
@@ -37,20 +60,29 @@ impl CaptureLayer {
 
     #[must_use]
     pub fn workspace() -> Self {
-        Self::with_target_prefix("dekopon")
+        Self {
+            records: Arc::new(Mutex::new(Vec::new())),
+            targets: TargetFilter::Workspace,
+        }
     }
 
     #[must_use]
     pub fn with_target_prefix(prefix: &'static str) -> Self {
         Self {
             records: Arc::new(Mutex::new(Vec::new())),
-            prefix: Some(prefix),
+            targets: TargetFilter::Prefix(prefix),
         }
     }
 
     fn interested(&self, metadata: &Metadata<'_>) -> bool {
-        self.prefix
-            .is_none_or(|prefix| metadata.target().starts_with(prefix))
+        match self.targets {
+            TargetFilter::All => true,
+            TargetFilter::Prefix(prefix) => metadata.target().starts_with(prefix),
+            TargetFilter::Workspace => {
+                metadata.target().starts_with("dekopon")
+                    || WORKSPACE_CATEGORIES.contains(&metadata.target())
+            }
+        }
     }
 
     fn push(&self, record: Record) {
@@ -245,5 +277,70 @@ struct Visitor<'a>(&'a mut String);
 impl Visit for Visitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureLayer, Record};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[test]
+    fn explicit_prefix_capture_keeps_its_original_scope() {
+        let capture = CaptureLayer::with_target_prefix("http::");
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                tracing::info!(target: "http::client", "selected");
+                tracing::info!(target: "http", "excluded");
+                tracing::info!(target: "memory", "excluded");
+            },
+        );
+        let events = capture
+            .records()
+            .into_iter()
+            .filter(|record| matches!(record, Record::Event { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(events.as_slice(), [Record::Event { target, .. }] if target == "http::client")
+        );
+    }
+
+    #[test]
+    fn workspace_capture_includes_categories_but_not_third_party_targets() {
+        let capture = CaptureLayer::workspace();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                tracing::info!(target: "dekopon_broker_host", "workspace");
+                tracing::info!(target: "gateway", "category");
+                tracing::info!(target: "prompt", "category");
+                tracing::info!(target: "model", "category");
+                tracing::info!(target: "asset", "category");
+                tracing::info!(target: "shell", "category");
+                tracing::info!(target: "job", "category");
+                tracing::info!(target: "broker", "category");
+                tracing::info!(target: "provider", "category");
+                tracing::info!(target: "http", "category");
+                tracing::info!(target: "credential", "category");
+                tracing::info!(target: "memory", "category");
+                tracing::info!(target: "telemetry", "category");
+                tracing::info!(target: "http::client", "third-party");
+                tracing::info!(target: "wasmtime", "third-party");
+            },
+        );
+        let targets = capture
+            .records()
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Event { target, .. } => Some(target),
+                Record::Span { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), super::WORKSPACE_CATEGORIES.len() + 1);
+        assert!(targets.contains(&"dekopon_broker_host".to_owned()));
+        for category in super::WORKSPACE_CATEGORIES {
+            assert!(targets.iter().any(|target| target == category));
+        }
     }
 }

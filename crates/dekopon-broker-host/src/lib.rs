@@ -15,10 +15,7 @@ use std::{
     fmt,
     io::Read as _,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -312,48 +309,13 @@ pub struct BrokerInvocationOutput {
     pub storage: Option<StorageEvidence>,
 }
 
-#[derive(Debug)]
-struct MemoryBudget {
-    maximum: usize,
-    reserved: AtomicUsize,
-}
-
-impl MemoryBudget {
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<MemoryReservation> {
-        self.reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.maximum)
-            })
-            .ok()?;
-        Some(MemoryReservation {
-            budget: Arc::clone(self),
-            bytes,
-        })
-    }
-}
-
-struct MemoryReservation {
-    budget: Arc<MemoryBudget>,
-    bytes: usize,
-}
-
-impl Drop for MemoryReservation {
-    fn drop(&mut self) {
-        self.budget
-            .reserved
-            .fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
-
 struct Runtime {
     engine: Engine,
     engine_key: String,
     cwasm: Option<cwasm::Cache>,
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
-    memory_budget: Option<Arc<MemoryBudget>>,
+    memory_budget: Option<Arc<memory::MemoryBudget>>,
     plaintext_hosts: PlaintextHosts,
     extra_ca_bundles: Arc<Vec<Vec<u8>>>,
     non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
@@ -390,12 +352,9 @@ impl Runtime {
             cwasm,
             linker,
             limits,
-            memory_budget: options.max_total_memory_bytes.map(|maximum| {
-                Arc::new(MemoryBudget {
-                    maximum,
-                    reserved: AtomicUsize::new(0),
-                })
-            }),
+            memory_budget: options
+                .max_total_memory_bytes
+                .map(|maximum| Arc::new(memory::MemoryBudget::new(maximum))),
             plaintext_hosts: options.plaintext_hosts.clone(),
             extra_ca_bundles: Arc::clone(&options.extra_ca_bundles),
             non_public_https: Arc::clone(&options.non_public_https),
@@ -403,26 +362,22 @@ impl Runtime {
         })
     }
 
-    fn store(
+    fn store_for_provider(
         &self,
+        provider: &str,
         http: HttpState,
         storage: storage::StorageState,
         clock: ClockState,
         settings: SettingsState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
-        let reserved = match &self.memory_budget {
-            Some(budget) => Some(budget.reserve(self.limits.max_memory_bytes).ok_or(
-                BrokerHostError::MemoryBudgetExhausted {
-                    requested: self.limits.max_memory_bytes,
-                    maximum: budget.maximum,
-                },
-            )?),
-            None => None,
-        };
         let mut store = Store::new(
             &self.engine,
             StoreState {
-                limits: memory::MemoryLimiter::new(self.limits.store_bounds()),
+                limits: memory::MemoryLimiter::new(
+                    self.limits.store_bounds(),
+                    self.memory_budget.clone(),
+                    provider,
+                ),
                 http,
                 storage,
                 clock,
@@ -430,7 +385,6 @@ impl Runtime {
                 assets: asset::AssetState::disabled(),
                 table: storage::new_table(),
                 instantiations: 0,
-                _reserved: reserved,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -468,7 +422,6 @@ struct StoreState {
     settings: SettingsState,
     table: wasmtime::component::ResourceTable,
     instantiations: u64,
-    _reserved: Option<MemoryReservation>,
 }
 
 impl bindings::dekopon::http::client::Host for StoreState {
@@ -799,15 +752,16 @@ impl BrokerWasmProvider {
             pre,
             command_export,
         } = compiled;
-        let manifest_json = describe_component(&runtime, &pre, &source)
-            .instrument(tracing::info_span!(
-                "provider.describe",
-                path = %source.display(),
-                stores = tracing::field::Empty,
-                instantiations = tracing::field::Empty,
-                fuel.consumed = tracing::field::Empty,
-            ))
-            .await?;
+        let manifest_json =
+            describe_component(&runtime, &pre, &source, expected_provider_id.as_ref())
+                .instrument(tracing::info_span!(
+                    "provider.describe",
+                    path = %source.display(),
+                    stores = tracing::field::Empty,
+                    instantiations = tracing::field::Empty,
+                    fuel.consumed = tracing::field::Empty,
+                ))
+                .await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
             return Err(BrokerHostError::OutputTooLarge {
                 provider: source.display().to_string(),
@@ -908,7 +862,8 @@ impl BrokerWasmProvider {
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-        let mut store = self.runtime.store(
+        let mut store = self.runtime.store_for_provider(
+            self.manifest.id.as_str(),
             http,
             storage::StorageState::disabled(),
             ClockState::describe(),
@@ -1107,7 +1062,8 @@ impl BrokerWasmProvider {
             storage::StorageState::disabled,
             storage::StorageState::active,
         );
-        let mut store = self.runtime.store(
+        let mut store = self.runtime.store_for_provider(
+            self.manifest.id.as_str(),
             http,
             storage_state,
             ClockState::invoke(),
@@ -1130,11 +1086,10 @@ impl BrokerWasmProvider {
         // Reads the actual initial fuel balance rather than assuming the configured budget applies,
         // since an unavailable observation must not be treated as zero usage.
         let initial_fuel = store.get_fuel().ok();
-        store.data_mut().limits.observe_invocation(
-            self.manifest.id.as_str(),
-            capability.as_str(),
-            initial_fuel,
-        );
+        store
+            .data_mut()
+            .limits
+            .observe_invocation(capability.as_str(), initial_fuel);
         // The store outlives the guest on every path, including a timeout dropping the operation
         // future, so dispatched-call evidence is harvested exactly once regardless of outcome.
         let mut executed = self
@@ -1146,6 +1101,8 @@ impl BrokerWasmProvider {
                 operation_timeout,
             )
             .await;
+        executed = executed
+            .map_err(|error| invocation_budget_failure(error, store.data().limits.refusal()));
         store.data().assets.drain().await;
         // A caught, typed disk failure stays terminal even if later guest work times out or is
         // refused; never infer exhaustion from cancellation itself.
@@ -1173,6 +1130,7 @@ impl BrokerWasmProvider {
             Ok(_) => "succeeded",
             Err(BrokerHostError::ProviderFailure { .. }) => "provider-error",
             Err(BrokerHostError::Timeout { .. }) => "timeout",
+            Err(BrokerHostError::MemoryBudgetExhausted { .. }) => "host-memory-budget",
             Err(BrokerHostError::Invoke { source, .. })
                 if source.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) =>
             {
@@ -1220,7 +1178,6 @@ impl BrokerWasmProvider {
                     source,
                 })?;
             store.data_mut().instantiations += 1;
-            store.data_mut().limits.instantiated();
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
@@ -1751,11 +1708,15 @@ async fn describe_component(
     runtime: &Runtime,
     pre: &bindings::ProviderPre<StoreState>,
     source: &Path,
+    provider: Option<&ProviderId>,
 ) -> Result<String, BrokerHostError> {
     let operation_timeout = runtime.limits.max_timeout;
     let http = HttpState::describe(runtime.http_ceilings(), operation_timeout)
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-    let mut store = runtime.store(
+    let mut store = runtime.store_for_provider(
+        provider
+            .map(ProviderId::as_str)
+            .unwrap_or_else(|| source.to_str().unwrap_or("unknown-provider")),
         http,
         storage::StorageState::disabled(),
         ClockState::describe(),
@@ -1807,6 +1768,19 @@ async fn describe_component(
         });
     }
     Ok(manifest)
+}
+
+fn invocation_budget_failure(
+    error: BrokerHostError,
+    refusal: Option<memory::BudgetRefusal>,
+) -> BrokerHostError {
+    match refusal {
+        Some(refusal) => BrokerHostError::MemoryBudgetExhausted {
+            requested: refusal.requested,
+            maximum: refusal.maximum,
+        },
+        None => error,
+    }
 }
 
 fn validate_limits(limits: &BrokerHostLimits) -> Result<(), BrokerHostError> {
@@ -2023,7 +1997,7 @@ pub enum BrokerHostError {
         source: wasmtime::Error,
     },
     #[error(
-        "broker provider stores already reserve the {maximum}-byte aggregate guest memory ceiling; \
+        "guest memory growth exceeds the {maximum}-byte aggregate guest memory ceiling; \
          another {requested} bytes cannot be admitted"
     )]
     MemoryBudgetExhausted { requested: usize, maximum: usize },
@@ -2174,6 +2148,35 @@ pub enum BrokerHostError {
 #[cfg(test)]
 mod tests {
     use super::{MAX_COMMAND_WORD_HELP_BYTES, bounded_command_word_help};
+    use wasmtime::ResourceLimiter as _;
+
+    #[test]
+    fn failed_invocation_with_budget_refusal_maps_to_host_memory_budget() {
+        let mut limiter = super::memory::MemoryLimiter::new(
+            dekopon_provider_sdk::host::StoreLimits {
+                max_memory_bytes: 4 * 65_536,
+                ..Default::default()
+            },
+            Some(std::sync::Arc::new(super::memory::MemoryBudget::new(
+                65_536,
+            ))),
+            "probe",
+        );
+        assert!(!limiter.memory_growing(0, 2 * 65_536, None).unwrap());
+        let mapped = super::invocation_budget_failure(
+            super::BrokerHostError::Store {
+                source: wasmtime::Error::msg("synthetic trap"),
+            },
+            limiter.refusal(),
+        );
+        assert!(matches!(
+            mapped,
+            super::BrokerHostError::MemoryBudgetExhausted {
+                requested: 131_072,
+                maximum: 65_536
+            }
+        ));
+    }
 
     #[test]
     fn a_page_is_passed_through_at_the_bound_and_cut_at_a_character_boundary_past_it() {
