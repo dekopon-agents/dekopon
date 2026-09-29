@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::{ExitCode, ast::DEV_NULL};
+use crate::{ExitCode, ast::DEV_NULL, limits::LimitExceeded};
 
 const ECHO_HELP: &str = "-n -e -E";
 
@@ -442,9 +442,21 @@ impl Builtin for Sleep {
         // since it panics above roughly 1.8e19 seconds, and an astronomical sleep must not abort
         // the process.
         let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
-        let remaining = context.budget.remaining();
-        thread::sleep(requested.min(remaining));
-        context.budget.check_deadline()?;
+        let mut left = requested;
+        loop {
+            if context.invoker.cancelled() {
+                return Err(LimitExceeded::Cancelled.into());
+            }
+            context.budget.check_deadline()?;
+            if left.is_zero() {
+                break;
+            }
+            let slice = left
+                .min(context.budget.remaining())
+                .min(Duration::from_secs(1));
+            thread::sleep(slice);
+            left = left.saturating_sub(slice);
+        }
         Ok(CommandResult::status(ExitCode::SUCCESS))
     }
 }

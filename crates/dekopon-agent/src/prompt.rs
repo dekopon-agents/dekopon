@@ -64,7 +64,9 @@ what happened instead.";
 /// Returns no Result because a script failure is an outcome the model recovers from, like a nonzero
 /// exit code, not a reason to end the session.
 pub trait ScriptRuntime {
-    fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome;
+    fn run_script(&self, script: &str) -> ScriptOutcome;
+
+    fn capability_calls_used(&self) -> u32;
 
     fn command_words(&self) -> Vec<String> {
         Vec::new()
@@ -899,11 +901,9 @@ where
                 }
             };
 
-            // Remaining budget is computed from what the session already spent, so a model cannot
-            // widen its own capability budget by splitting work across more scripts.
             let remaining = limits
                 .max_capability_calls
-                .saturating_sub(capability_invocations);
+                .saturating_sub(runtime.capability_calls_used());
             let span = tracing::info_span!(
                 "prompt.script",
                 model.turn = model_turns,
@@ -924,7 +924,7 @@ where
                     "agent tool script"
                 );
                 check_cancelled(cancellation)?;
-                let outcome = runtime.run_script(&script, remaining);
+                let outcome = runtime.run_script(&script);
                 check_cancelled(cancellation)?;
                 tracing::info!(
                     target: "dekopon_agent::audit",
@@ -939,8 +939,7 @@ where
                 outcome
             };
             script_calls = script_calls.saturating_add(1);
-            capability_invocations =
-                capability_invocations.saturating_add(outcome.capability_calls);
+            capability_invocations = runtime.capability_calls_used();
             messages.push(ModelMessage::tool(call.id, format_script_outcome(&outcome)));
         }
     }
@@ -1706,9 +1705,11 @@ mod tests {
     }
 
     struct RecordingRuntime {
-        scripts: Mutex<Vec<(String, u32)>>,
+        scripts: Mutex<Vec<String>>,
         capability_calls_per_script: u32,
         steers: Option<Arc<QueuedSteers>>,
+        calls: Mutex<u32>,
+        max_calls: u32,
     }
 
     impl RecordingRuntime {
@@ -1717,20 +1718,30 @@ mod tests {
                 scripts: Mutex::new(Vec::new()),
                 capability_calls_per_script,
                 steers: None,
+                calls: Mutex::new(0),
+                max_calls: u32::MAX,
             }
+        }
+
+        fn with_call_limit(mut self, maximum: u32) -> Self {
+            self.max_calls = maximum;
+            self
         }
     }
 
     impl ScriptRuntime for RecordingRuntime {
-        fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
+        fn run_script(&self, script: &str) -> ScriptOutcome {
+            let mut calls = self.calls.lock().expect("calls lock");
+            let remaining = self.max_calls.saturating_sub(*calls);
             self.scripts
                 .lock()
                 .expect("script lock")
-                .push((script.to_owned(), max_capability_calls));
+                .push(script.to_owned());
             if let Some(steers) = &self.steers {
                 steers.push("msg2");
             }
-            let capability_calls = self.capability_calls_per_script.min(max_capability_calls);
+            let capability_calls = self.capability_calls_per_script.min(remaining);
+            *calls += capability_calls;
             ScriptOutcome {
                 output: format!("ran {} bytes", script.len()),
                 exit_code: ExitCode::SUCCESS,
@@ -1738,6 +1749,10 @@ mod tests {
                 capability_calls,
                 steps: 1,
             }
+        }
+
+        fn capability_calls_used(&self) -> u32 {
+            *self.calls.lock().expect("calls lock")
         }
     }
 
@@ -2379,7 +2394,7 @@ mod tests {
         .expect("the watched session answers");
         let without_sink = run_prompt_session(
             &unwatched,
-            &runtime,
+            &RecordingRuntime::new(1),
             SessionInputs::new("go", limits(4, 8)),
             &mut History::default(),
         )
@@ -3248,7 +3263,11 @@ mod tests {
     }
 
     impl ScriptRuntime for StaticHelpRuntime {
-        fn run_script(&self, script: &str, _max_capability_calls: u32) -> ScriptOutcome {
+        fn capability_calls_used(&self) -> u32 {
+            0
+        }
+
+        fn run_script(&self, script: &str) -> ScriptOutcome {
             panic!("this fixture's runtime never runs a script: {script}")
         }
 
@@ -4049,7 +4068,7 @@ mod tests {
         assert_eq!(outcome.capability_invocations, 1);
         let scripts = runtime.scripts.lock().expect("script lock");
         assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0].0, "probe upper --text hi | jq -r .text");
+        assert_eq!(scripts[0], "probe upper --text hi | jq -r .text");
     }
 
     #[test]
@@ -4087,17 +4106,13 @@ mod tests {
             script_call("call-3", "three"),
             answer("done"),
         ]);
-        let runtime = RecordingRuntime::new(4);
+        let runtime = RecordingRuntime::new(4).with_call_limit(10);
 
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 10))
             .expect("prompt session succeeds");
 
         let scripts = runtime.scripts.lock().expect("script lock");
-        let ceilings = scripts
-            .iter()
-            .map(|(_, ceiling)| *ceiling)
-            .collect::<Vec<_>>();
-        assert_eq!(ceilings, vec![10, 6, 2]);
+        assert_eq!(*scripts, ["one", "two", "three"]);
         assert_eq!(outcome.capability_invocations, 10);
     }
 
@@ -4108,13 +4123,13 @@ mod tests {
             script_call("call-2", "two"),
             answer("done"),
         ]);
-        let runtime = RecordingRuntime::new(8);
+        let runtime = RecordingRuntime::new(8).with_call_limit(3);
 
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 3))
             .expect("prompt session succeeds");
 
         let scripts = runtime.scripts.lock().expect("script lock");
-        assert_eq!(scripts[1].1, 0);
+        assert_eq!(*scripts, ["one", "two"]);
         assert_eq!(outcome.capability_invocations, 3);
     }
 
@@ -4243,10 +4258,15 @@ mod tests {
     struct BlockingBridgeRuntime {
         handle: tokio::runtime::Handle,
         dispatched: Arc<Mutex<Vec<String>>>,
+        calls: AtomicUsize,
     }
 
     impl ScriptRuntime for BlockingBridgeRuntime {
-        fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
+        fn capability_calls_used(&self) -> u32 {
+            u32::try_from(self.calls.load(AtomicOrdering::Relaxed)).unwrap_or(u32::MAX)
+        }
+
+        fn run_script(&self, script: &str) -> ScriptOutcome {
             let dispatched = Arc::clone(&self.dispatched);
             let script = script.to_owned();
             let output = self.handle.block_on(async move {
@@ -4257,11 +4277,12 @@ mod tests {
                     .push(script.clone());
                 format!("async runtime saw: {script}")
             });
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
             ScriptOutcome {
                 output,
                 exit_code: ExitCode::SUCCESS,
                 truncated: false,
-                capability_calls: 1.min(max_capability_calls),
+                capability_calls: 1,
                 steps: 1,
             }
         }
@@ -4281,6 +4302,7 @@ mod tests {
             let runtime = BlockingBridgeRuntime {
                 handle,
                 dispatched: recorded,
+                calls: AtomicUsize::new(0),
             };
             run_prompt(&model, &runtime, "fetch it", None, limits(4, 32))
         })

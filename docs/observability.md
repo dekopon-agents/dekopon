@@ -1069,7 +1069,7 @@ and log filters. Each command span carries:
 | `shell.command.output` | What the command wrote to stdout, bounded |
 | `shell.command.output.bytes` | The uncut length of that output |
 | `shell.command.exit_code` | The status the command reported |
-| `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
+| `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, `cancelled`, or `rejected` |
 
 Every command word gets its span, at `INFO`, however many a run executes. A model-authored `while`
 loop is bounded only by the step budget (default 100,000) and the script deadline, so one bash tool
@@ -1083,6 +1083,7 @@ constant size beside them:
 | `shell.script.commands` | Command words the script executed, loop iterations and `xargs` sub-invocations included |
 | `shell.script.capability_commands` | How many were a provider command word |
 | `shell.script.failed_commands` | How many reported a non-zero exit code |
+| `outcome` | The script's exit outcome, including `cancelled` when its turn was stopped |
 
 A capability identifier is not a command word. `wikipedia_page --title X` and
 `cli-probe.upper --text x` resolve to nothing, record `not-found`, and exit 127 with the shell's
@@ -1094,7 +1095,8 @@ deployment from the answer, and `shell.command.name` still says what it reached 
 (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code
 mapping; flattening them would hide an authorization refusal in the noise of ordinary failures.
 `rejected` and `limit-exceeded` name the two ways a command ends the whole script — a construct this
-shell excludes, and an exhausted sandbox budget.
+shell excludes, and an exhausted sandbox budget. A cancelled turn ends the script at its next step
+with outcome `cancelled`; a sleeping script checks at most one second later.
 
 Structured log records use stable `audit.event` attributes and do not mirror spans: a command's
 start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream
