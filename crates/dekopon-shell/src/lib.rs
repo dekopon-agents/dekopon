@@ -88,6 +88,7 @@
 //!                     capability: "cli-probe.upper".to_owned(),
 //!                     input: json!({ "text": text }),
 //!                     secret_use: None,
+//!                     report: None,
 //!                 }
 //!             }
 //!             _ => CommandRun::Failed {
@@ -96,12 +97,8 @@
 //!         })
 //!     }
 //!
-//!     fn invoke(
-//!         &self,
-//!         capability: &str,
-//!         input: Value,
-//!         secret_use: Option<dekopon_core::SecretUseProposal>,
-//!     ) -> CapabilityCallResult {
+//!     fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+//!         let dekopon_shell::CommandProposal { capability, input, secret_use, .. } = proposal;
 //!         if secret_use.is_some() {
 //!             return dekopon_shell::secret_use_unsupported();
 //!         }
@@ -140,8 +137,10 @@ mod lexer;
 pub use jq_worker::{run_jq_worker_if_requested, set_jq_worker_executable};
 pub mod limits;
 mod parser;
+mod proposal;
+pub use proposal::{CommandProposal, CommandReport, CommandReportOutcome};
 mod tree;
-pub use tree::{CallBudget, TreeContext};
+pub use tree::{CallBudget, RetainedBytes, TreeContext};
 pub mod value;
 
 pub use limits::{
@@ -173,7 +172,7 @@ pub enum CapabilityCallResult {
     NotFound,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum CommandRun {
     Proposed {
         capability: String,
@@ -182,6 +181,7 @@ pub enum CommandRun {
         /// from the capability, and an invoker with no broker behind it must refuse it rather than
         /// treat it as approved.
         secret_use: Option<SecretUseProposal>,
+        report: Option<CommandReport>,
     },
     Rendered {
         stdout: String,
@@ -202,7 +202,7 @@ pub enum CommandRun {
     },
 }
 
-pub trait CapabilityInvoker {
+pub trait CapabilityInvoker: Send + Sync {
     fn cancelled(&self) -> bool {
         false
     }
@@ -245,12 +245,7 @@ pub trait CapabilityInvoker {
 
     fn script_finished(&self) {}
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<SecretUseProposal>,
-    ) -> CapabilityCallResult;
+    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult;
 }
 
 #[must_use]
@@ -301,13 +296,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().script_finished();
     }
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<SecretUseProposal>,
-    ) -> CapabilityCallResult {
-        self.as_ref().invoke(capability, input, secret_use)
+    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult {
+        self.as_ref().invoke(proposal)
     }
 }
 
@@ -392,7 +382,7 @@ impl Interpreter {
             script,
             invoker,
             &TreeContext::new(
-                self.limits.timeout,
+                self.limits,
                 CallBudget::new(self.limits.max_capability_calls),
             ),
         )
@@ -477,6 +467,7 @@ mod tests {
                 capability: word.to_owned(),
                 input: json!({ "argv": argv, "stdin": stdin }),
                 secret_use: None,
+                report: None,
             })
         }
 
@@ -487,12 +478,9 @@ mod tests {
             })
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, proposal: super::CommandProposal) -> CapabilityCallResult {
+            let input = proposal.input;
+            let secret_use = proposal.secret_use;
             self.secret_uses
                 .lock()
                 .expect("recorded secret uses")
@@ -514,7 +502,7 @@ mod tests {
         fn granted(&self) -> Vec<String> {
             Vec::new()
         }
-        fn invoke(&self, _: &str, _: Value, _: Option<SecretUseProposal>) -> CapabilityCallResult {
+        fn invoke(&self, _: super::CommandProposal) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -564,7 +552,7 @@ mod tests {
             max_capability_calls: 1,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits.timeout, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1));
         let invoker = RecordingInvoker::default();
         let interpreter = Interpreter::new(limits);
         assert_eq!(
@@ -586,6 +574,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replacements_and_scope_drops_refund_retained_bytes() {
+        let limits = Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let script = "f() { local y=abcdefgh; }; x=abcdefgh; ".to_owned()
+            + &"x=ijklmnop; f; echo abcdefgh > buf; ".repeat(20);
+        let outcome =
+            Interpreter::new(limits).run_with_tree(&script, &RecordingInvoker::default(), &tree);
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn substitution_arguments_keep_their_charges_until_the_command_finishes() {
+        let invoker = RecordingInvoker::default();
+        let limits = Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(4));
+        let word = "\"$(printf 12345678901234567890123456789012)\"";
+        let interpreter = Interpreter::new(limits);
+        let failed = interpreter.run_with_tree(&format!("gh-extra {word} {word}"), &invoker, &tree);
+        assert_eq!(failed.exit_code, ExitCode::SYNTAX, "{}", failed.output);
+        assert!(invoker.secret_uses.lock().unwrap().is_empty());
+        assert_eq!(tree.value_bytes(), 0);
+        let script = format!("gh-extra {word}; gh-extra {word}");
+        let next = interpreter.run_with_tree(&script, &invoker, &tree);
+        assert_eq!(next.exit_code, ExitCode::SUCCESS, "{}", next.output);
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
     fn proposal() -> SecretUseProposal {
         SecretUseProposal::HttpBearer {
             secret: "drn:com.xrl:secret:prod:api/token"
@@ -600,11 +623,19 @@ mod tests {
         let shared: Arc<dyn CapabilityInvoker> = Arc::clone(&inner) as Arc<dyn CapabilityInvoker>;
 
         assert_eq!(
-            shared.invoke("http-probe.fetch", json!({"url": "https://x"}), None),
+            shared.invoke(super::CommandProposal::new(
+                "http-probe.fetch",
+                json!({"url": "https://x"}),
+                None
+            )),
             CapabilityCallResult::Succeeded(json!({"url": "https://x"}))
         );
         assert_eq!(
-            shared.invoke("http-probe.fetch", json!({}), Some(proposal())),
+            shared.invoke(super::CommandProposal::new(
+                "http-probe.fetch",
+                json!({}),
+                Some(proposal())
+            )),
             CapabilityCallResult::Succeeded(json!({}))
         );
 
@@ -631,14 +662,19 @@ mod tests {
             BTreeMap::from([("gh".to_owned(), "gh: recorded help".to_owned())])
         );
         assert!(shared.has_command_word("gh-extra"));
-        assert_eq!(
-            shared.run_command("gh", &["pr".to_owned()], Some("piped")),
-            Some(CommandRun::Proposed {
-                capability: "gh".to_owned(),
-                input: json!({"argv": ["pr"], "stdin": "piped"}),
-                secret_use: None,
-            })
-        );
+        let Some(CommandRun::Proposed {
+            capability,
+            input,
+            secret_use,
+            report,
+        }) = shared.run_command("gh", &["pr".to_owned()], Some("piped"))
+        else {
+            panic!("expected proposal")
+        };
+        assert_eq!(capability, "gh");
+        assert_eq!(input, json!({"argv": ["pr"], "stdin": "piped"}));
+        assert!(secret_use.is_none());
+        assert!(report.is_none());
         assert_eq!(
             shared.describe("gh.pr-view").map(|it| it.description),
             Some("recorded".to_owned())
@@ -678,15 +714,14 @@ mod tests {
                 capability: "http-probe.fetch".to_owned(),
                 input: json!({ "argv": argv, "stdin": stdin }),
                 secret_use: self.secret_use.clone(),
+                report: None,
             })
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, proposal: super::CommandProposal) -> CapabilityCallResult {
+            let capability = proposal.capability;
+            let input = proposal.input;
+            let secret_use = proposal.secret_use;
             self.invocations
                 .lock()
                 .expect("recorded invocations")

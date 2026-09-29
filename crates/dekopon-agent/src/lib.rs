@@ -39,7 +39,7 @@ use dekopon_shell::{
 };
 use serde_json::Value;
 #[cfg(unix)]
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 #[cfg(unix)]
 use thiserror::Error;
 
@@ -68,7 +68,7 @@ pub struct ShellRuntime<I> {
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
-        let tree = TreeContext::new(self.limits.timeout, self.calls.clone());
+        let tree = TreeContext::new(self.limits, self.calls.clone());
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
         // reports out of order.
@@ -93,7 +93,7 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
 /// it cannot reach anything); the broker leg is only for what direct mode provably cannot do: I/O.
 pub struct SessionInvoker<D> {
     pub direct: D,
-    pub broker: Option<Box<dyn CapabilityInvoker + Send>>,
+    pub broker: Option<Box<dyn CapabilityInvoker + Send + Sync>>,
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
@@ -139,27 +139,26 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         })
     }
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
+    fn invoke(&self, mut proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        let capability = &proposal.capability;
         // A secret-use proposal must reach only the broker leg; the direct leg has no authorizer to
         // check it.
-        if secret_use.is_some() {
+        if proposal.secret_use.is_some() {
             return match &self.broker {
-                Some(broker) if broker.is_granted(capability) => {
-                    broker.invoke(capability, input, secret_use)
-                }
+                Some(broker) if broker.is_granted(capability) => broker.invoke(proposal),
                 _ => dekopon_shell::secret_use_unsupported(),
             };
         }
         if self.direct.is_granted(capability) {
-            return self.direct.invoke(capability, input, None);
+            let report = proposal.report.take();
+            let result = self.direct.invoke(proposal);
+            if let Some(report) = report {
+                report.complete(report_outcome(call_outcome(&result)));
+            }
+            return result;
         }
         match &self.broker {
-            Some(broker) => broker.invoke(capability, input, None),
+            Some(broker) => broker.invoke(proposal),
             None => CapabilityCallResult::NotFound,
         }
     }
@@ -253,6 +252,7 @@ pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
             capability: capability.to_string(),
             input,
             secret_use,
+            report: None,
         },
         CommandRunOutcome::Rendered {
             stdout,
@@ -298,7 +298,6 @@ pub struct BrokerLeg {
     notes_enabled: bool,
     notes: AtomicU32,
     calls: CallBudget,
-    pending_report: Mutex<Option<(CommandWord, Instant)>>,
 }
 
 #[cfg(unix)]
@@ -345,7 +344,6 @@ impl BrokerLeg {
             notes_enabled: false,
             notes: AtomicU32::new(0),
             calls: CallBudget::new(0),
-            pending_report: Mutex::new(None),
         })
     }
 
@@ -383,25 +381,6 @@ impl BrokerLeg {
     fn emit(&self, event: ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink.emit(event);
-        }
-    }
-
-    fn take_pending_report(&self) -> Option<(CommandWord, Instant)> {
-        // Nothing inside this lock may panic, since even a poisoned mutex is recovered and trusted
-        // here.
-        self.pending_report
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-
-    fn settle_pending_report(&self) {
-        if let Some((word, started)) = self.take_pending_report() {
-            self.emit(ProgressEvent::ToolFinished {
-                word,
-                outcome: ToolOutcome::Failed,
-                duration: started.elapsed(),
-            });
         }
     }
 
@@ -459,7 +438,15 @@ fn bounded_count(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-#[cfg(unix)]
+fn report_outcome(outcome: ToolOutcome) -> dekopon_shell::CommandReportOutcome {
+    match outcome {
+        ToolOutcome::Succeeded => dekopon_shell::CommandReportOutcome::Succeeded,
+        ToolOutcome::Denied => dekopon_shell::CommandReportOutcome::Denied,
+        ToolOutcome::Failed => dekopon_shell::CommandReportOutcome::Failed,
+        ToolOutcome::Cancelled => dekopon_shell::CommandReportOutcome::Cancelled,
+    }
+}
+
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
         CapabilityCallResult::Succeeded(_) => ToolOutcome::Succeeded,
@@ -543,7 +530,6 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        self.settle_pending_report();
         if !self.command_words.contains(word) {
             return None;
         }
@@ -571,7 +557,7 @@ impl CapabilityInvoker for BrokerLeg {
             },
         );
         let outcome = self.runtime.block_on(ProcessRun::execute(operation));
-        let run = match outcome {
+        let mut run = match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
             ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
                 message: dekopon_core::error_chain(&error),
@@ -583,12 +569,28 @@ impl CapabilityInvoker for BrokerLeg {
                 message: error.to_string(),
             },
         };
-        let outcome = match &run {
-            CommandRun::Proposed { .. } => {
-                *self
-                    .pending_report
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some((reported, started));
+        let outcome = match &mut run {
+            CommandRun::Proposed { report, .. } => {
+                let sink = self.progress.clone();
+                *report = Some(dekopon_shell::CommandReport::new(move |outcome| {
+                    if let Some(sink) = sink {
+                        let outcome = match outcome {
+                            dekopon_shell::CommandReportOutcome::Succeeded => {
+                                ToolOutcome::Succeeded
+                            }
+                            dekopon_shell::CommandReportOutcome::Denied => ToolOutcome::Denied,
+                            dekopon_shell::CommandReportOutcome::Failed => ToolOutcome::Failed,
+                            dekopon_shell::CommandReportOutcome::Cancelled => {
+                                ToolOutcome::Cancelled
+                            }
+                        };
+                        sink.emit(ProgressEvent::ToolFinished {
+                            word: reported,
+                            outcome,
+                            duration: started.elapsed(),
+                        });
+                    }
+                }));
                 return Some(run);
             }
             CommandRun::Rendered { status: 0, .. } => ToolOutcome::Succeeded,
@@ -605,32 +607,36 @@ impl CapabilityInvoker for BrokerLeg {
         Some(run)
     }
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
-        let held = self.take_pending_report();
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        let dekopon_shell::CommandProposal {
+            capability,
+            input,
+            secret_use,
+            report,
+        } = proposal;
+        let capability = capability.as_str();
         let cancelled = self.cancel.is_cancelled();
         let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
         // line.
-        let reported = held.or_else(|| {
-            self.capabilities.contains_key(capability).then(|| {
-                let word = CommandWord::new(capability);
-                self.emit(ProgressEvent::ToolStarted {
-                    word: word.clone(),
-                    argument_count: bounded_count(
-                        input.as_object().map_or(0, serde_json::Map::len),
-                    ),
-                    calls_used,
-                    calls_max: self.calls.maximum(),
-                });
-                (word, Instant::now())
+        let reported = report
+            .is_none()
+            .then(|| {
+                self.capabilities.contains_key(capability).then(|| {
+                    let word = CommandWord::new(capability);
+                    self.emit(ProgressEvent::ToolStarted {
+                        word: word.clone(),
+                        argument_count: bounded_count(
+                            input.as_object().map_or(0, serde_json::Map::len),
+                        ),
+                        calls_used,
+                        calls_max: self.calls.maximum(),
+                    });
+                    (word, Instant::now())
+                })
             })
-        });
+            .flatten();
         let (result, outcome) = if cancelled {
             (
                 CapabilityCallResult::Denied {
@@ -643,6 +649,9 @@ impl CapabilityInvoker for BrokerLeg {
             let outcome = call_outcome(&result);
             (result, outcome)
         };
+        if let Some(report) = report {
+            report.complete(report_outcome(outcome));
+        }
         if let Some((word, started)) = reported {
             self.emit(ProgressEvent::ToolFinished {
                 word,
@@ -676,7 +685,6 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn script_finished(&self) {
-        self.settle_pending_report();
         self.notes.store(0, Ordering::Relaxed);
     }
 }
@@ -857,8 +865,10 @@ pub(crate) fn milliseconds(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use dekopon_shell::{CapabilityCallResult, CapabilityDescription, CapabilityInvoker};
-    use serde_json::{Value, json};
+    use dekopon_shell::{
+        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
+    };
+    use serde_json::json;
 
     use super::{SessionInvoker, current_trace_parent};
 
@@ -897,12 +907,9 @@ mod tests {
             })
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            _input: Value,
-            secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+            let capability = proposal.capability;
+            let secret_use = proposal.secret_use;
             if capability != self.capability {
                 return CapabilityCallResult::NotFound;
             }
@@ -927,7 +934,7 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke("shared.capability", json!({}), None),
+            invoker.invoke(CommandProposal::new("shared.capability", json!({}), None)),
             CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
         );
     }
@@ -940,7 +947,7 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke("http-probe.fetch", json!({}), None),
+            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
             CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
         );
         assert!(invoker.is_granted("http-probe.fetch"));
@@ -966,7 +973,7 @@ mod tests {
         assert_eq!(invoker.granted(), vec!["cli-probe.upper".to_owned()]);
         assert!(!invoker.is_granted("http-probe.fetch"));
         assert_eq!(
-            invoker.invoke("http-probe.fetch", json!({}), None),
+            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
             CapabilityCallResult::NotFound
         );
     }
@@ -985,12 +992,20 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke("http-probe.fetch", json!({}), Some(proposal.clone())),
+            invoker.invoke(CommandProposal::new(
+                "http-probe.fetch",
+                json!({}),
+                Some(proposal.clone())
+            )),
             CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
         );
 
         assert_eq!(
-            invoker.invoke("cli-probe.upper", json!({}), Some(proposal)),
+            invoker.invoke(CommandProposal::new(
+                "cli-probe.upper",
+                json!({}),
+                Some(proposal)
+            )),
             dekopon_shell::secret_use_unsupported()
         );
         assert!(
@@ -1026,12 +1041,7 @@ mod tests {
             word == self.word
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -1088,8 +1098,8 @@ mod tests {
         };
         use dekopon_process::CancelSignal;
         use dekopon_shell::{
-            CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
-            Limits,
+            CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
+            CommandRun, ExitCode, Limits,
         };
         use serde_json::json;
         use tokio::{
@@ -1240,14 +1250,17 @@ mod tests {
             leg.command_words.insert("probe".to_owned());
             let trace_parent = leg.identifiers.trace_parent();
 
-            assert_eq!(
-                run_word(leg, &["--help"], None).await,
-                Some(CommandRun::Rendered {
-                    stdout: "Usage: probe <COMMAND>\n".to_owned(),
-                    stderr: String::new(),
-                    status: 0,
-                })
-            );
+            let Some(CommandRun::Rendered {
+                stdout,
+                stderr,
+                status,
+            }) = run_word(leg, &["--help"], None).await
+            else {
+                panic!("expected rendered help")
+            };
+            assert_eq!(stdout, "Usage: probe <COMMAND>\n");
+            assert!(stderr.is_empty());
+            assert_eq!(status, 0);
             let request = observed.recv().await.expect("stub broker saw the run");
             assert_eq!(
                 request.request,
@@ -1278,14 +1291,19 @@ mod tests {
             leg.command_words.insert("probe".to_owned());
             let trace_parent = leg.identifiers.trace_parent();
 
-            assert_eq!(
-                run_word(leg, &["upper", "-"], Some("hello")).await,
-                Some(CommandRun::Proposed {
-                    capability: "cli-probe.upper".to_owned(),
-                    input: json!({"text": "hello"}),
-                    secret_use: None,
-                })
-            );
+            let Some(CommandRun::Proposed {
+                capability,
+                input,
+                secret_use,
+                report,
+            }) = run_word(leg, &["upper", "-"], Some("hello")).await
+            else {
+                panic!("expected proposal")
+            };
+            assert_eq!(capability, "cli-probe.upper");
+            assert_eq!(input, json!({"text": "hello"}));
+            assert!(secret_use.is_none());
+            assert!(report.is_some());
             let request = observed.recv().await.expect("stub broker saw the run");
             assert!(
                 matches!(
@@ -1322,14 +1340,19 @@ mod tests {
             .await;
             leg.command_words.insert("probe".to_owned());
 
-            assert_eq!(
-                run_word(leg, &["fetch", "https://example.test/"], None).await,
-                Some(CommandRun::Proposed {
-                    capability: CAPABILITY.to_owned(),
-                    input: json!({"uri": "https://example.test/"}),
-                    secret_use: Some(secret_use),
-                })
-            );
+            let Some(CommandRun::Proposed {
+                capability,
+                input,
+                secret_use: received,
+                report,
+            }) = run_word(leg, &["fetch", "https://example.test/"], None).await
+            else {
+                panic!("expected proposal")
+            };
+            assert_eq!(capability, CAPABILITY);
+            assert_eq!(input, json!({"uri": "https://example.test/"}));
+            assert_eq!(received, Some(secret_use));
+            assert!(report.is_some());
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1346,11 +1369,8 @@ mod tests {
             observed.recv().await.expect("the run reached the broker");
             handle.cancel();
 
-            assert_eq!(
-                run.await.expect("blocking dispatch completes"),
-                Some(CommandRun::Denied {
-                    reason: "session-cancelled".to_owned(),
-                })
+            assert!(
+                matches!(run.await.expect("blocking dispatch completes"), Some(CommandRun::Denied { reason }) if reason == "session-cancelled")
             );
             drop(release);
         }
@@ -1378,7 +1398,7 @@ mod tests {
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
 
-            assert_eq!(run_word(leg, &["--help"], None).await, None);
+            assert!(run_word(leg, &["--help"], None).await.is_none());
         }
 
         fn attestation() -> Attestation {
@@ -1427,13 +1447,16 @@ mod tests {
                 notes_enabled: false,
                 notes: AtomicU32::new(0),
                 calls: dekopon_shell::CallBudget::new(0),
-                pending_report: Mutex::new(None),
             }
         }
 
         async fn invoke(leg: BrokerLeg, capability: &'static str) -> CapabilityCallResult {
             tokio::task::spawn_blocking(move || {
-                leg.invoke(capability, json!({"uri": "http://x/"}), None)
+                leg.invoke(CommandProposal::new(
+                    capability,
+                    json!({"uri": "http://x/"}),
+                    None,
+                ))
             })
             .await
             .expect("blocking dispatch completes")
@@ -1781,7 +1804,11 @@ mod tests {
 
             assert_eq!(
                 tokio::task::spawn_blocking(move || {
-                    leg.invoke(CAPABILITY, json!({"uri": "http://x/"}), Some(submitted))
+                    leg.invoke(CommandProposal::new(
+                        CAPABILITY,
+                        json!({"uri": "http://x/"}),
+                        Some(submitted),
+                    ))
                 })
                 .await
                 .expect("blocking dispatch completes"),
@@ -1962,20 +1989,19 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_opted_in_note_leaves_the_pending_tool_report_in_order() {
+        async fn an_opted_in_note_precedes_a_dropped_proposals_report() {
             let directory = private_broker_directory();
             let (leg, sink) =
                 reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
             let leg = leg.with_progress_notes();
             tokio::task::spawn_blocking(move || {
-                assert!(matches!(
-                    leg.run_command("probe", &[], None),
-                    Some(CommandRun::Proposed { .. })
-                ));
+                let proposal = leg.run_command("probe", &[], None);
+                assert!(matches!(proposal, Some(CommandRun::Proposed { .. })));
                 leg.note(
                     " rendering the image ",
                     Some(std::time::Duration::from_secs(40)),
                 );
+                drop(proposal);
                 leg.script_finished();
             })
             .await
@@ -2173,6 +2199,96 @@ mod tests {
             })
         }
 
+        fn owned_proposal(run: Option<CommandRun>) -> CommandProposal {
+            match run {
+                Some(CommandRun::Proposed {
+                    capability,
+                    input,
+                    secret_use,
+                    report,
+                }) => CommandProposal {
+                    capability,
+                    input,
+                    secret_use,
+                    report,
+                },
+                other => panic!("expected proposal: {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_overlapping_direct_grant_settles_the_brokers_report_with_its_outcome() {
+            let directory = private_broker_directory();
+            let (leg, sink) =
+                reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
+            let invoker = crate::SessionInvoker {
+                direct: super::FakeLeg::new(CAPABILITY, "direct"),
+                broker: Some(Box::new(leg)),
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                invoker.invoke(owned_proposal(invoker.run_command("probe", &[], None)))
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
+            );
+            assert_eq!(sink.labels().last().unwrap(), "finished probe Succeeded");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn two_stage_threads_keep_their_proposals_reports_paired() {
+            let directory = private_broker_directory();
+            let reply = |outcome| {
+                ResponseEnvelope::invocation(result(outcome, None), vec![], vec![], vec![])
+            };
+            let (mut leg, sink) = reporting_probe_leg(
+                directory.path(),
+                vec![
+                    proposal_of(CAPABILITY),
+                    proposal_of(CAPABILITY),
+                    reply(InvocationOutcome::Succeeded),
+                    reply(InvocationOutcome::Failed),
+                ],
+            )
+            .await;
+            leg.command_words.insert("second".to_owned());
+            tokio::task::spawn_blocking(move || {
+                std::thread::scope(|scope| {
+                    let (ready, observed) = std::sync::mpsc::sync_channel(1);
+                    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+                    let leg = &leg;
+                    let first = scope.spawn(move || {
+                        let proposal = owned_proposal(leg.run_command("probe", &[], None));
+                        ready.send(()).unwrap();
+                        resumed.recv().unwrap();
+                        leg.invoke(proposal)
+                    });
+                    observed.recv().unwrap();
+                    let second = scope.spawn(move || {
+                        leg.invoke(owned_proposal(leg.run_command("second", &[], None)))
+                    });
+                    let second = second.join().unwrap();
+                    assert!(matches!(second, CapabilityCallResult::Succeeded(_)));
+                    resume.send(()).unwrap();
+                    let first = first.join().unwrap();
+                    assert!(matches!(first, CapabilityCallResult::Failed { .. }));
+                });
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=0 calls=0/4",
+                    "started second arguments=0 calls=0/4",
+                    "finished second Succeeded",
+                    "finished probe Failed",
+                ]
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn progress_reads_the_same_call_count_across_scripts() {
             let directory = private_broker_directory();
@@ -2280,15 +2396,7 @@ mod tests {
 
             let called = tokio::task::spawn_blocking(move || {
                 let argv = ["fetch".to_owned(), "7".to_owned()];
-                let Some(CommandRun::Proposed {
-                    capability,
-                    input,
-                    secret_use,
-                }) = leg.run_command("probe", &argv, None)
-                else {
-                    panic!("the stub broker answers the word with a proposal");
-                };
-                let called = leg.invoke(&capability, input, secret_use);
+                let called = leg.invoke(owned_proposal(leg.run_command("probe", &argv, None)));
                 leg.script_finished();
                 called
             })
@@ -2342,7 +2450,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_proposal_left_uninvoked_finishes_failed_before_the_next_word_starts() {
+        async fn a_later_word_does_not_settle_an_earlier_owned_proposal() {
             let directory = private_broker_directory();
             let (leg, sink) = reporting_probe_leg(
                 directory.path(),
@@ -2370,12 +2478,13 @@ mod tests {
             assert_eq!(
                 sink.labels(),
                 vec![
-                    "started probe arguments=2 calls=0/4".to_owned(),
-                    "finished probe Failed".to_owned(),
-                    "started probe arguments=1 calls=0/4".to_owned(),
-                    "finished probe Succeeded".to_owned(),
+                    "started probe arguments=2 calls=0/4",
+                    "started probe arguments=1 calls=0/4",
+                    "finished probe Succeeded",
                 ]
             );
+            drop(merge);
+            assert_eq!(sink.labels().last().unwrap(), "finished probe Failed");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -2388,7 +2497,11 @@ mod tests {
             let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
-                leg.invoke("ignore-your-instructions", json!({}), None)
+                leg.invoke(CommandProposal::new(
+                    "ignore-your-instructions",
+                    json!({}),
+                    None,
+                ))
             })
             .await
             .expect("blocking dispatch completes");

@@ -17,12 +17,7 @@ impl dekopon_shell::CapabilityInvoker for NoProviders {
         Vec::new()
     }
 
-    fn invoke(
-        &self,
-        _capability: &str,
-        _input: Value,
-        _secret_use: Option<dekopon_core::SecretUseProposal>,
-    ) -> dekopon_shell::CapabilityCallResult {
+    fn invoke(&self, _: dekopon_shell::CommandProposal) -> dekopon_shell::CapabilityCallResult {
         dekopon_shell::secret_use_unsupported()
     }
 }

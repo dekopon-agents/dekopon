@@ -3341,13 +3341,11 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            _input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            panic!("a refused construct must never reach {capability}");
+        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+            panic!(
+                "a refused construct must never reach {}",
+                proposal.capability
+            );
         }
     }
 
@@ -3444,6 +3442,7 @@ mod tests {
                 capability: capability.to_owned(),
                 input,
                 secret_use: None,
+                report: None,
             };
             let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
             Some(match argv.as_slice() {
@@ -3466,13 +3465,10 @@ mod tests {
             None
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            match capability {
+        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+            let capability = proposal.capability;
+            let input = proposal.input;
+            match capability.as_str() {
                 "posts.get" => CapabilityCallResult::Succeeded(input),
                 "locked.door" => CapabilityCallResult::Denied {
                     reason: "policy says no".to_owned(),
