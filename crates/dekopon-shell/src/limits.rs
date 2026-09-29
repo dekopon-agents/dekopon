@@ -157,6 +157,11 @@ impl Budget {
     pub fn value_bytes(&self) -> u64 {
         self.value_bytes
     }
+
+    #[must_use]
+    pub fn max_value_bytes(&self) -> u64 {
+        self.limits.max_value_bytes
+    }
 }
 
 /// Byte and line ceilings are independent so one oversized line cannot slip past a line-count-only

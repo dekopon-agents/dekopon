@@ -767,6 +767,8 @@ async fn boot_with(
     stream: bool,
     timing: &Timing,
 ) -> Fixture {
+    let _already_set =
+        dekopon_shell::set_jq_worker_executable(env!("CARGO_BIN_EXE_dekopond").into());
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
@@ -832,6 +834,35 @@ async fn boot_with(
         model_requests,
         model_prompts,
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbounded_jq_allocation_does_not_stop_the_next_gateway_message() {
+    let _audit = Audit::exclusive().await;
+    let fixture = boot(vec![
+        bash_tool_call("call-1", "echo '{}' | jq '[range(0;1000000000)]'"),
+        final_answer("The filter failed."),
+        final_answer("Still here."),
+    ])
+    .await;
+    let socket = fixture.socket();
+    let first = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "run filter"))
+        .await
+        .expect("first reply");
+    assert_eq!(first, "The filter failed.");
+    let tool = fixture
+        .prompt(1)
+        .into_iter()
+        .find_map(|(role, content)| (role == "tool").then_some(content))
+        .expect("tool response");
+    assert!(tool.contains("jq: worker exited"), "{tool}");
+    let socket = fixture.socket();
+    let second = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "still there?"))
+        .await
+        .expect("second reply");
+    assert_eq!(second, "Still here.");
+    let _directory = fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
