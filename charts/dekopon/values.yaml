@@ -559,12 +559,11 @@ drainBudget:
   # restarting collector), and the sidecar stop that only begins once the gateway's container is
   # gone.
   bufferSeconds: 30
-  # What the assertion assumes when it cannot read the real value: an existingSecret is opaque to
-  # the chart, and an inline config may leave shutdownGraceMs out, in which case the daemon's own
-  # default applies. Both daemons default to 120000. These configure nothing — they are what the
-  # arithmetic believes, so correct them when your Secret says something else.
-  assumedBrokerShutdownGraceMs: 120000
-  assumedGatewayShutdownGraceMs: 120000
+  # Required for each daemon using configDirectory because the chart cannot read its shutdown
+  # grace; also set these when an existingSecret uses a non-default grace (the default is 120000 ms).
+  # These only inform the drain arithmetic; an inline shutdownGraceMs takes precedence.
+  assumedBrokerShutdownGraceMs: null
+  assumedGatewayShutdownGraceMs: null
 
 nodeSelector: {}
 tolerations: []
