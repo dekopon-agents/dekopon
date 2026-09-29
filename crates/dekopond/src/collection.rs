@@ -38,6 +38,10 @@ pub(crate) enum Offered {
 }
 
 impl Collector {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn new(transports: &[TransportConfig], capacity: usize) -> Self {
         Self {
             windows: transports
@@ -78,6 +82,10 @@ impl Collector {
             })
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn offer(&mut self, route: usize, message: InboundMessage) -> Offered {
         if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_CONVERSATION {
             message.receive_span.in_scope(|| record_received(&message));
@@ -200,6 +208,10 @@ fn compatible(left: &InboundMessage, right: &InboundMessage) -> bool {
 }
 
 // Native reply-to message IDs differ among group members; audience coordinates must not.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn audience(reply: &ReplyTarget) -> ReplyTarget {
     match reply {
         ReplyTarget::Telegram {

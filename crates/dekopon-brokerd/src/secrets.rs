@@ -325,6 +325,10 @@ impl SecretResolver for MapResolver {
 }
 
 impl MapResolver {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn resolve_source(
         &self,
         source: &SecretSource,
@@ -738,7 +742,10 @@ impl MapResolver {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn vault_read(
         &self,
         client: &reqwest::Client,
@@ -790,6 +797,10 @@ impl MapResolver {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn request_json(
         &self,
         client: &reqwest::Client,
@@ -811,7 +822,10 @@ impl MapResolver {
         bounded_json(request, timeout_ms).await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn aws_post(
         &self,
         client: &reqwest::Client,
@@ -917,6 +931,10 @@ impl SecretSource {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn material_file(&self) -> Option<PathBuf> {
         match self {
             Self::SecureFile { path } => Some(path.clone()),
@@ -941,6 +959,10 @@ impl SecretSource {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::SecureFile { path } => validate_absolute(path),
@@ -1154,6 +1176,11 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
     validate_map(file, path, expected_uid).await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn validate_map(
     file: SecretMapFile,
     map_path: &Path,
@@ -1455,6 +1482,10 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
 
 /// The refusal stays one opaque Insecure error on purpose so a caller can't learn which check
 /// failed; the real cause is only logged.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
     tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
@@ -1690,6 +1721,10 @@ fn validate_document(value: &Value) -> Result<(), SourceError> {
     validate_document_bounds(value, 0, &mut entries)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn validate_document_bounds(
     value: &Value,
     depth: usize,
@@ -2262,6 +2297,7 @@ secrets:
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one long test scenario")]
     async fn remote_adapters_decode_their_native_response_shapes() {
         let directory = tempfile::tempdir().expect("tempdir");
         let token = directory.path().join("token");

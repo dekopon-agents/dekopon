@@ -325,7 +325,10 @@ enum ServeOutcome {
     TransportsLost,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn serve<F>(
     runner: Arc<SessionRunner>,
     routes: Arc<RoutingTable>,
@@ -470,7 +473,10 @@ fn observe_session(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn dispatch(
     runner: &Arc<SessionRunner>,
     routes: &Arc<RoutingTable>,

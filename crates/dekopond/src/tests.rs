@@ -616,6 +616,7 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn invalid_configurations_fail_closed_at_startup() {
     let directory = temporary();
     let mutate = |patch: &Value| {
@@ -1166,6 +1167,7 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn telegram_call_failures_never_render_bot_tokens() {
     use std::error::Error as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -11430,6 +11432,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixed_dispositions() {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::{
@@ -12114,6 +12117,10 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
     for origin in CancelOrigin::EVERY {
         let directory = temporary();
@@ -12592,6 +12599,11 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "one long test scenario"
+)]
 async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same_stored_bytes() {
     use crate::transport::whatsapp::tests_media::{
         JPEG, MediaPeer, PNG, accepted, admitted_photo, bytes_reply, json_reply, metadata,
@@ -13270,6 +13282,10 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refused() {
     use crate::collection::Offered;
     for count in [3, 11] {

@@ -249,6 +249,10 @@ enum StatusTextState {
     RestoreAttempted,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 struct Surface {
     driver: Arc<dyn ChatDriver>,
     target: Option<LivenessTarget>,

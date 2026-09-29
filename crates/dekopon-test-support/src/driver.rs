@@ -496,6 +496,10 @@ impl RecordingDriver {
     }
 
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn replies(&self) -> Vec<String> {
         self.calls()
             .into_iter()
@@ -507,6 +511,10 @@ impl RecordingDriver {
     }
 
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn image_bytes(&self) -> Vec<Vec<usize>> {
         self.calls()
             .into_iter()

@@ -348,6 +348,10 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     FakeBroker::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))

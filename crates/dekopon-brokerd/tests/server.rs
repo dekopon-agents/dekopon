@@ -227,6 +227,10 @@ fn server_limits() -> ServerLimits {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn run_command_over_the_socket_renders_help_then_proposes() {
     let uid = current_uid();
     let directory = private_directory();
@@ -1068,6 +1072,7 @@ async fn a_non_invoke_frame_with_descriptors_is_refused_without_a_broker_decisio
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_with_ordinary_audit() {
     use dekopon_broker_protocol::{AssetEncoding, AssetRow, InvokeAssets};
     use dekopon_capability::AssetConstraints;

@@ -676,6 +676,7 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_reads() {
     const PAGE: u64 = 4_096;
     const PAGES: u64 = 64;
@@ -1213,6 +1214,7 @@ fn stable_reactivation_survives_restart() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neighbour() {
     for continuity in [ContinuityPolicy::AuthorityBound, ContinuityPolicy::Stable] {
         let (_temporary, root) = fixture();

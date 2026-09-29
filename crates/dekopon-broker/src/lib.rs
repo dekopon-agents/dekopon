@@ -2018,6 +2018,10 @@ where
 
     /// Ungated by design: running a word only produces a proposal or rendered text and authorizes
     /// nothing; real authorization happens later, at the invocation that follows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub async fn run_command(
         &self,
         peer: &AuthenticatedContext,
@@ -2657,6 +2661,10 @@ where
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn invoke_inner(
         &self,
         context: &AuthenticatedContext,
@@ -2996,6 +3004,11 @@ where
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn execute(
         &self,
         context: &AuthenticatedContext,
@@ -4042,6 +4055,10 @@ fn execution_event(
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDetail> {
     match error {
         BrokerHostError::ProviderFailure { code, message, .. } => {
@@ -4119,6 +4136,10 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'static str {
     match error {
         BrokerHostError::AuthorizationExceedsHostLimit { .. }
@@ -4263,6 +4284,10 @@ pub enum BrokerError {
 
 impl BrokerError {
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub const fn storage_failure_code(&self) -> Option<&'static str> {
         let source = match self {
             Self::Storage { source } => source,

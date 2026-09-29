@@ -229,6 +229,10 @@ impl SessionWakes {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn check(&self, note: &str, span: Duration) -> Result<(), WakeRefusal> {
         if note.len() > MAX_NOTE_BYTES {
             return Err(WakeRefusal::NoteTooLong {

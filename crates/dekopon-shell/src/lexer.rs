@@ -939,6 +939,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn sub_word(&mut self, line: usize, text: &str) -> Result<RawWord, LexError> {
         let tokens = tokenize_nested(text, self.depth + 1, line)?;
         let mut parts = Vec::new();
@@ -968,6 +972,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn read_index(&mut self, line: usize) -> Result<RawIndex, LexError> {
         let mut text = String::new();
         let mut depth = 0_usize;
@@ -1213,6 +1221,10 @@ mod tests {
             .collect()
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn single_word(source: &str) -> Vec<RawPart> {
         match kinds(source).into_iter().next().expect("one token") {
             TokenKind::Word(word) => word.parts,
@@ -1543,6 +1555,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn several_here_documents_on_one_line_read_their_bodies_in_order() {
         let tokens = kinds("f <<A <<B\nfirst\nA\nsecond\nB\n");
         let bodies = tokens

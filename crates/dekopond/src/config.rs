@@ -992,6 +992,10 @@ fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<St
         .collect()
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
     // This file isn't a secret, since credentials live in the environment and transport credential
     // files, so the bar here is only that nobody else can rewrite it.
@@ -1031,6 +1035,11 @@ fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
         .map_err(|source| ConfigError::CurrentDirectory { source })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub(crate) fn resolve(
     config: DekopondConfig,
     source: PathBuf,
@@ -1584,6 +1593,10 @@ pub(crate) fn resolve(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn resolve_liveness(
     transport: &TransportConfig,
     problems: &mut Vec<ConfigProblem>,
@@ -2629,6 +2642,10 @@ routes:
     }
 
     #[test]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn openrouter_collects_all_numeric_routing_and_cache_problems_together() {
         let document = router_document(
             "openrouter",

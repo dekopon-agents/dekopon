@@ -1,3 +1,8 @@
+# Set from the Chat API's longest function on 2026-09-29: crates/dekopond/src/transport/local.rs:104.
+too-many-lines-threshold = 150
+# Set from the Chat API's widest signature carrying no expectation on 2026-09-29: crates/dekopond/src/transport/slack.rs:83 (whatsapp.rs:183 is wider and expected).
+too-many-arguments-threshold = 6
+
 # Tracing span guards are RAII handles on a thread-local stack. Holding one across `.await`
 # reparents every span opened by whatever task the executor resumes on that thread.
 await-holding-invalid-types = [

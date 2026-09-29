@@ -25,6 +25,10 @@ pub(crate) fn truthy(value: &Value) -> bool {
 }
 
 #[must_use]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub fn to_lines(value: &Value) -> Vec<String> {
     match value {
         Value::Array(items) => items.iter().map(display).collect(),
@@ -53,6 +57,10 @@ pub fn from_lines(lines: Vec<String>) -> Value {
 }
 
 #[must_use]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub fn to_text(value: &Value) -> String {
     match value {
         Value::Array(_) => to_lines(value).join("\n"),
@@ -61,6 +69,10 @@ pub fn to_text(value: &Value) -> String {
 }
 
 #[must_use]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub fn index(value: &Value, key: &str) -> Value {
     match value {
         Value::Array(items) => key

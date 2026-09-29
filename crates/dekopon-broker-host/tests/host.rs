@@ -160,6 +160,10 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn rejects_generic_wasi_imports() {
     let error = BrokerProviderRegistry::load(
         [host_fixture("wasi-import.wasm")],

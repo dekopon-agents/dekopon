@@ -72,6 +72,10 @@ impl Recorder {
         self.calls.lock().expect("recorder").clone()
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn texts(&self) -> Vec<String> {
         self.calls()
             .into_iter()
@@ -110,6 +114,10 @@ impl Recorder {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 struct Offers {
     typing: bool,
     status: bool,
@@ -833,6 +841,10 @@ async fn every_terminal_clears_status_text_before_delivery_and_native_cleanup() 
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() {
     let recorder = Arc::new(Recorder::default());
     let driver: Arc<dyn ChatDriver> = Arc::new(TestDriver {
