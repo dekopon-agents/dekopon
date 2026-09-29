@@ -1,10 +1,9 @@
 //! This interpreter is native Rust, not Wasm, so there is no fuel meter, memory ceiling, or engine
 //! deadline to fall back on; every bound a script can exhaust must be owned and enforced here.
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
+
+use crate::{CapabilityInvoker, CallBudget, TreeContext};
 
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
 pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
@@ -46,35 +45,44 @@ pub enum LimitExceeded {
     Deadline { timeout_ms: u128 },
     CapabilityCalls { maximum: u32 },
     ValueBytes { maximum: u64 },
+    Cancelled,
 }
 
 #[derive(Debug)]
 pub struct Budget {
     limits: Limits,
-    started: Instant,
+    tree: TreeContext,
+    cancelled: bool,
     steps: u64,
     depth: u32,
-    capability_calls: u32,
     value_bytes: u64,
 }
 
 impl Budget {
     #[must_use]
     pub fn start(limits: Limits) -> Self {
-        Self {
-            limits,
-            started: Instant::now(),
-            steps: 0,
-            depth: 0,
-            capability_calls: 0,
-            value_bytes: 0,
-        }
+        Self::start_tree(limits, TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)))
+    }
+
+    #[must_use]
+    pub fn start_tree(limits: Limits, tree: TreeContext) -> Self {
+        Self { limits, tree, cancelled: false, steps: 0, depth: 0, value_bytes: 0 }
+    }
+
+    pub fn charge_step_with(&mut self, invoker: &dyn CapabilityInvoker) -> Result<(), LimitExceeded> {
+        self.cancelled = invoker.cancelled();
+        self.charge_step()
+    }
+
+    pub fn check_cancelled(&self, invoker: &dyn CapabilityInvoker) -> Result<(), LimitExceeded> {
+        if invoker.cancelled() { Err(LimitExceeded::Cancelled) } else { Ok(()) }
     }
 
     /// This is the only backstop against an infinite loop; the deadline is re-read every step
     /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
     /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
+        if self.cancelled { return Err(LimitExceeded::Cancelled); }
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_steps {
             return Err(LimitExceeded::Steps {
@@ -97,17 +105,12 @@ impl Budget {
     }
 
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
-        if self.started.elapsed() > self.limits.timeout {
-            return Err(LimitExceeded::Deadline {
-                timeout_ms: self.limits.timeout.as_millis(),
-            });
-        }
-        Ok(())
+        self.tree.check_deadline()
     }
 
     #[must_use]
     pub fn remaining(&self) -> Duration {
-        self.limits.timeout.saturating_sub(self.started.elapsed())
+        self.tree.remaining()
     }
 
     pub fn enter_call(&mut self) -> Result<(), LimitExceeded> {
@@ -128,18 +131,12 @@ impl Budget {
     /// many calls where a single model tool call drives exactly one today, and that amplification
     /// needs its own ceiling.
     pub fn charge_capability_call(&mut self) -> Result<(), LimitExceeded> {
-        if self.capability_calls >= self.limits.max_capability_calls {
-            return Err(LimitExceeded::CapabilityCalls {
-                maximum: self.limits.max_capability_calls,
-            });
-        }
-        self.capability_calls = self.capability_calls.saturating_add(1);
-        Ok(())
+        self.tree.calls().charge()
     }
 
     #[must_use]
     pub fn capability_calls(&self) -> u32 {
-        self.capability_calls
+        self.tree.calls().used()
     }
 
     #[must_use]

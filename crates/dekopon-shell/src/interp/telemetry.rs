@@ -156,7 +156,12 @@ pub(crate) fn outcome_label(status: ExitCode) -> &'static str {
 pub(crate) fn fatal_exit_code(fatal: &FatalError) -> ExitCode {
     match fatal {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => ExitCode::TIMEOUT,
-        FatalError::Limit(_) | FatalError::Unsupported(_) => ExitCode::SYNTAX,
+        FatalError::Limit(LimitExceeded::Cancelled) => ExitCode::CANCELLED,
+        FatalError::Limit(LimitExceeded::Steps { .. })
+        | FatalError::Limit(LimitExceeded::RecursionDepth { .. })
+        | FatalError::Limit(LimitExceeded::CapabilityCalls { .. })
+        | FatalError::Limit(LimitExceeded::ValueBytes { .. })
+        | FatalError::Unsupported(_) => ExitCode::SYNTAX,
         FatalError::Assertion(_) => ExitCode::FAILURE,
     }
 }
@@ -164,7 +169,11 @@ pub(crate) fn fatal_exit_code(fatal: &FatalError) -> ExitCode {
 pub(crate) fn fatal_outcome(fatal: &FatalError) -> &'static str {
     match fatal {
         FatalError::Limit(LimitExceeded::Deadline { .. }) => "timed-out",
-        FatalError::Limit(_) => "limit-exceeded",
+        FatalError::Limit(LimitExceeded::Cancelled) => "cancelled",
+        FatalError::Limit(LimitExceeded::Steps { .. })
+        | FatalError::Limit(LimitExceeded::RecursionDepth { .. })
+        | FatalError::Limit(LimitExceeded::CapabilityCalls { .. })
+        | FatalError::Limit(LimitExceeded::ValueBytes { .. }) => "limit-exceeded",
         FatalError::Unsupported(_) => "rejected",
         FatalError::Assertion(_) => "assertion-failed",
     }

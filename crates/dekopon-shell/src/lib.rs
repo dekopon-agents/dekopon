@@ -142,6 +142,8 @@ mod interp;
 mod lexer;
 pub mod limits;
 mod parser;
+mod tree;
+pub use tree::{CallBudget, TreeContext};
 pub mod value;
 
 pub use limits::{
@@ -203,6 +205,8 @@ pub enum CommandRun {
 }
 
 pub trait CapabilityInvoker {
+    fn cancelled(&self) -> bool { false }
+
     fn granted(&self) -> Vec<String>;
 
     fn is_granted(&self, capability: &str) -> bool {
@@ -257,6 +261,8 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 }
 
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
+    fn cancelled(&self) -> bool { self.as_ref().cancelled() }
+
     fn granted(&self) -> Vec<String> {
         self.as_ref().granted()
     }
@@ -311,6 +317,7 @@ impl ExitCode {
     pub const FAILURE: Self = Self(1);
     pub const SYNTAX: Self = Self(2);
     pub const TIMEOUT: Self = Self(124);
+    pub const CANCELLED: Self = Self(130);
     pub const DENIED: Self = Self(126);
     pub const NOT_FOUND: Self = Self(127);
 
@@ -379,7 +386,11 @@ impl Interpreter {
     }
 
     pub fn run(&self, script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
-        interp::run(script, None, invoker, self.limits)
+        self.run_with_tree(script, invoker, &TreeContext::new(self.limits.timeout, CallBudget::new(self.limits.max_capability_calls)))
+    }
+
+    pub fn run_with_tree(&self, script: &str, invoker: &dyn CapabilityInvoker, tree: &TreeContext) -> ScriptOutcome {
+        interp::run_with_tree(script, None, invoker, self.limits, tree)
     }
 
     pub fn run_with_prev(

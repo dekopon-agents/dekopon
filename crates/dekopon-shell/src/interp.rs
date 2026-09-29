@@ -23,6 +23,7 @@ use crate::{
     },
     dispatch::{self, Resolution},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
+    CallBudget, TreeContext,
     parser::{
         expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
         pattern_metacharacter,
@@ -149,6 +150,17 @@ pub(crate) fn run(
     invoker: &dyn CapabilityInvoker,
     limits: Limits,
 ) -> ScriptOutcome {
+    run_with_tree(script, prev, invoker, limits, &TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)))
+}
+
+pub(crate) fn run_with_tree(
+    script: &str,
+    prev: Option<&str>,
+    invoker: &dyn CapabilityInvoker,
+    limits: Limits,
+    tree: &TreeContext,
+) -> ScriptOutcome {
+    let calls_before = tree.calls().used();
     let program = match parse(script) {
         Ok(program) => program,
         Err(error) => {
@@ -164,7 +176,7 @@ pub(crate) fn run(
 
     let mut evaluator = Evaluator {
         invoker,
-        budget: Budget::start(limits),
+        budget: Budget::start_tree(limits, tree.clone()),
         limits,
         output: OutputBuffer::new(&limits),
         globals: prev
@@ -202,7 +214,7 @@ pub(crate) fn run(
         output: evaluator.output.render(),
         exit_code,
         truncated: evaluator.output.is_truncated(),
-        capability_calls: evaluator.budget.capability_calls(),
+        capability_calls: evaluator.budget.capability_calls().saturating_sub(calls_before),
         steps: evaluator.budget.steps(),
     }
 }
@@ -248,6 +260,7 @@ impl Evaluator<'_> {
             FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
                 "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
             ),
+            FatalError::Limit(LimitExceeded::Cancelled) => "dekopon-shell: script cancelled".to_owned(),
             FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
                 format!("dekopon-shell: {reason}")
             }
@@ -391,7 +404,7 @@ impl Evaluator<'_> {
     }
 
     fn execute_statement(&mut self, statement: &Statement) -> Result<Flow, FatalError> {
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
         match statement {
             Statement::List(list) => {
                 let (status, flow) = self.execute_list(list)?;
@@ -452,7 +465,7 @@ impl Evaluator<'_> {
 
         for clause in &statement.clauses {
             for pattern in &clause.patterns {
-                self.budget.charge_step()?;
+                self.budget.charge_step_with(self.invoker)?;
                 let matched = match pattern {
                     CasePattern::Any => true,
                     CasePattern::Literal(word) => match self.expand_word(word) {
@@ -512,7 +525,7 @@ impl Evaluator<'_> {
 
         let mut body_status = ExitCode::SUCCESS;
         for item in items {
-            self.budget.charge_step()?;
+            self.budget.charge_step_with(self.invoker)?;
             self.assign(&statement.variable, Value::String(item))?;
             let flow = self.execute_program(&statement.body)?;
             body_status = self.last_status;
@@ -542,7 +555,7 @@ impl Evaluator<'_> {
     fn execute_while(&mut self, statement: &WhileLoop) -> Result<Flow, FatalError> {
         let mut body_status = ExitCode::SUCCESS;
         loop {
-            self.budget.charge_step()?;
+            self.budget.charge_step_with(self.invoker)?;
             let (status, flow) = self.tested(true, |evaluator| {
                 evaluator.execute_list(&statement.condition)
             })?;
@@ -769,7 +782,7 @@ impl Evaluator<'_> {
         &mut self,
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
         let mut input: Option<Rc<Value>> =
             self.stdin.last().and_then(|source| source.value.clone());
         let mut last = CommandResult::status(ExitCode::SUCCESS);
@@ -923,7 +936,7 @@ impl Evaluator<'_> {
         capture_output: bool,
         from_pipe: bool,
     ) -> Result<Executed, FatalError> {
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
 
         let mut argv = Vec::new();
         for word in &command.words {
@@ -1474,7 +1487,7 @@ impl Evaluator<'_> {
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
         };
 
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
         self.budget.enter_call()?;
         let positional = arguments
             .iter()
@@ -1538,7 +1551,7 @@ impl Evaluator<'_> {
         let mut outputs = Vec::new();
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
-            self.budget.charge_step()?;
+            self.budget.charge_step_with(self.invoker)?;
             match self.run_argv(&invocation, None, true, false, false)? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
@@ -1864,7 +1877,7 @@ impl Evaluator<'_> {
         &mut self,
         expression: &Conditional,
     ) -> Result<ExitCode, CommandFailure> {
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
         match expression {
             Conditional::Test(test) => self.evaluate_conditional_test(test),
             Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
@@ -1932,7 +1945,7 @@ impl Evaluator<'_> {
         reason = "reshaped by the unit that next rewrites this"
     )]
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
-        self.budget.charge_step()?;
+        self.budget.charge_step_with(self.invoker)?;
         Ok(match expression {
             ArithExpr::Integer(value) => Number::Integer(*value),
             ArithExpr::Float(value) => Number::Float(*value),
