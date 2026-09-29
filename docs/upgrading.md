@@ -22,8 +22,8 @@ Existing 0.27.0 configurations need no edits.
   `memory`; dashboards and queries on `provider.memory` or its fields need rewriting. See
   [provider linear-memory sizing](observability.md#provider-linear-memory-sizing).
 - **`oauth2Refresh` secret source.** **Upgrade the broker binary before any private secret map
-  uses `kind: oauth2Refresh`;** 0.27.0 refuses it as an unknown kind. Enrollment is a documented
-  `kubectl exec` recipe, not a subcommand. See the [source contract](secrets.md#oauth2refresh).
+  uses `kind: oauth2Refresh`;** 0.27.0 refuses it as an unknown kind. Enrollment uses a documented
+  `kubectl run` maintenance pod, not a subcommand. See the [source contract](secrets.md#oauth2refresh).
 - A cancelled turn now stops its running script at the next step, and `sleep` wakes within a
   second to notice. Each `jq` stage runs in a worker process with an address-space limit; no
   configuration changes.
