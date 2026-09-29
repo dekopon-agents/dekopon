@@ -13,6 +13,10 @@ keywords = ["agents", "shell", "interpreter", "sandbox", "jq"]
 categories = ["command-line-interface", "parser-implementations"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[[bin]]
+name = "dekopon-shell-jq-worker"
+path = "src/bin/dekopon-shell-jq-worker.rs"
+
 [dependencies]
 base64.workspace = true
 dekopon-core.workspace = true
@@ -23,6 +27,9 @@ regex-bites.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

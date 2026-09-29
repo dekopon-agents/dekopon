@@ -139,7 +139,9 @@ mod ast;
 mod builtins;
 mod dispatch;
 mod interp;
+mod jq_worker;
 mod lexer;
+pub use jq_worker::{JQ_WORKER_MARKER, run_jq_worker_if_requested, set_jq_worker_executable};
 pub mod limits;
 mod parser;
 mod tree;
@@ -421,13 +423,6 @@ impl Interpreter {
 
 pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
     Interpreter::new(Limits::default()).run(script, invoker)
-}
-
-/// A non-terminating jq filter has no interruption point, so its worker thread is abandoned and
-/// spins forever after the deadline, permanently costing this process a CPU core.
-#[must_use]
-pub fn abandoned_filter_workers() -> usize {
-    builtins::jq::abandoned_workers()
 }
 
 #[cfg(test)]
