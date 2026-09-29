@@ -115,7 +115,7 @@ category filter):
   high-water), and, when configured, `memory.budget.bytes` and `memory.budget.used.bytes`
   (shared charge just before release). Invocation stores additionally carry `capability`,
   `outcome`, `fuel.initial`, `fuel.remaining`, and `fuel.consumed` when observed.
-- `memory.refused` (WARN) is emitted for each budget-denied growth, carrying `provider`,
+- `memory.refused` (WARN) is emitted once per store, at its first refusal, carrying `provider`,
   `telemetry.detail`, `memory.request.bytes` (the attempted increment above high-water),
   `memory.budget.bytes`, `memory.budget.used.bytes` (before refusal), and `capability` when known.
   The guest sees -1, not a trap; a guest that handles it can succeed, but a failing invocation
@@ -125,8 +125,6 @@ category filter):
 All byte and fuel fields are signed 64-bit integers, saturating at `i64::MAX`. Fuel is read from
 Wasmtime; cancelled stores can lack remaining/consumed readings. The store record runs inside the
 saved span context even on cancellation. Process abort and exporter loss can still lose records.
-The provider identifier on an unsuccessful unpinned describe is the source path until a manifest
-can supply an id.
 
 **Operator workflow:** query broker logs with `o2_event_name = 'memory.store'` and a bounded time
 range, group by provider and capability, and compare `memory.peak.bytes` with the configured
@@ -694,8 +692,8 @@ provider's imports into one `InstancePre` at load: every description, command ru
 then builds exactly one fresh store and instantiates the component in it exactly once. Both read `1`
 on a healthy operation. A second instantiation under one span is a call path that started rebuilding
 instances per call — a regression with no other symptom than latency — and an operation that
-recorded neither field was refused before a store existed, which is what the input-size and
-aggregate-memory refusals look like from the outside.
+recorded neither field was refused before a store existed, which is what the input-size refusal
+looks like from the outside.
 
 `fuel.consumed` joins them on the same three spans: the Wasm instructions the guest actually burned,
 read back from the store when the operation ends as the supplied ceiling minus what Wasmtime says

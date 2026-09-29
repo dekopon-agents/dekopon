@@ -132,10 +132,6 @@ impl MemoryLimiter {
         }
     }
 
-    pub(super) fn set_provider(&mut self, provider: &str) {
-        self.report.provider = provider.to_owned();
-    }
-
     pub(super) fn observe_invocation(&mut self, capability: &str, initial_fuel: Option<u64>) {
         self.report.capability = Some(capability.to_owned());
         self.report.outcome = Some("cancelled");
@@ -166,17 +162,19 @@ impl ResourceLimiter for MemoryLimiter {
             return Ok(false);
         }
         if let Err(refusal) = self.charge.grow(desired) {
-            self.refusal.get_or_insert(refusal);
-            tracing::warn!(
-                name: "memory.refused",
-                target: "memory",
-                { telemetry.detail = detail(), provider = %self.report.provider,
-                  capability = self.report.capability.as_deref(),
-                  memory.request.bytes = recorded(refusal.requested),
-                  memory.budget.bytes = recorded(refusal.maximum),
-                  memory.budget.used.bytes = recorded(refusal.used) },
-                "memory.refused"
-            );
+            if self.refusal.is_none() {
+                self.refusal = Some(refusal);
+                tracing::warn!(
+                    name: "memory.refused",
+                    target: "memory",
+                    { telemetry.detail = detail(), provider = %self.report.provider,
+                      capability = self.report.capability.as_deref(),
+                      memory.request.bytes = recorded(refusal.requested),
+                      memory.budget.bytes = recorded(refusal.maximum),
+                      memory.budget.used.bytes = recorded(refusal.used) },
+                    "memory.refused"
+                );
+            }
             return Ok(false);
         }
         Ok(true)
@@ -295,14 +293,12 @@ mod tests {
                 &mut guest,
                 "(module (memory 1) (func (export \"grow\") (result i32) i32.const 1 memory.grow))",
             );
-            assert_eq!(
-                instance
-                    .get_typed_func::<(), i32>(&mut guest, "grow")
-                    .unwrap()
-                    .call(&mut guest, ())
-                    .unwrap(),
-                -1
-            );
+            let grow = instance
+                .get_typed_func::<(), i32>(&mut guest, "grow")
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(grow.call(&mut guest, ()).unwrap(), -1);
+            }
             assert_eq!(guest.data().refusal().map(|r| r.requested), Some(PAGE));
         });
         assert!(capture.records().iter().any(|record| matches!(record, Record::Event { target, fields, level, .. } if target == "memory" && level == &"WARN" && fields.contains("message=memory.refused"))));

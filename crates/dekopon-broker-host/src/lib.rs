@@ -398,17 +398,6 @@ impl Runtime {
         Ok(store)
     }
 
-    #[cfg(test)]
-    fn store(
-        &self,
-        http: HttpState,
-        storage: storage::StorageState,
-        clock: ClockState,
-        settings: SettingsState,
-    ) -> Result<Store<StoreState>, BrokerHostError> {
-        self.store_for_provider("test-provider", http, storage, clock, settings)
-    }
-
     fn http_ceilings(&self) -> HttpCeilings {
         HttpCeilings {
             max_requests: self.limits.max_http_requests,
@@ -1141,6 +1130,7 @@ impl BrokerWasmProvider {
             Ok(_) => "succeeded",
             Err(BrokerHostError::ProviderFailure { .. }) => "provider-error",
             Err(BrokerHostError::Timeout { .. }) => "timeout",
+            Err(BrokerHostError::MemoryBudgetExhausted { .. }) => "host-memory-budget",
             Err(BrokerHostError::Invoke { source, .. })
                 if source.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) =>
             {
@@ -1776,9 +1766,6 @@ async fn describe_component(
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });
-    }
-    if let Ok(value) = serde_json::from_str::<ProviderManifest>(&manifest) {
-        store.data_mut().limits.set_provider(value.id.as_str());
     }
     Ok(manifest)
 }

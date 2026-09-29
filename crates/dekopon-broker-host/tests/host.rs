@@ -1115,8 +1115,9 @@ async fn concurrent_small_guest_stores_do_not_reserve_their_maximum() {
         .expect_err("the fixture never answers, but a second small store is admitted")
         .error;
     assert!(
-        matches!(error.as_ref(), BrokerHostError::Timeout { .. }),
-        "{error:?}"
+        matches!(error.as_ref(), BrokerHostError::Timeout { .. })
+            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { code, .. } if code == "http-failed"),
+        "the second store ran; a budget refusal would be MemoryBudgetExhausted: {error:?}"
     );
 
     let held = holding.await.expect("held invocation joins");

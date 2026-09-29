@@ -927,7 +927,8 @@ mod tests {
             Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
         let http = HttpState::describe(runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
         let mut state = runtime
-            .store(
+            .store_for_provider(
+                "test-provider",
                 http,
                 StorageState::disabled(),
                 ClockState::invoke(),
@@ -1751,7 +1752,8 @@ mod tests {
             HttpState::describe(provider.runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
         let mut store = provider
             .runtime
-            .store(
+            .store_for_provider(
+                "test-provider",
                 http,
                 StorageState::disabled(),
                 ClockState::invoke(),
