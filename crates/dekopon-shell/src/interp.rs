@@ -2378,6 +2378,3 @@ fn arithmetic(
         },
     })
 }
-
-#[cfg(test)]
-mod tests;

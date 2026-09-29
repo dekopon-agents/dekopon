@@ -46,6 +46,9 @@ const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    if let Some(code) = dekopon_shell::run_jq_worker_if_requested() {
+        return code;
+    }
     let cli = Cli::parse();
     match &cli.command {
         Some(cli::Command::Auth(options)) => {
@@ -74,6 +77,17 @@ fn main() -> ExitCode {
         eprintln!("dekopond: --config is required for serving");
         return ExitCode::from(2);
     };
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("dekopond: could not locate jq worker executable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if dekopon_shell::set_jq_worker_executable(executable).is_err() {
+        eprintln!("dekopond: jq worker executable already supplied");
+        return ExitCode::FAILURE;
+    }
     match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(config)) {
         Ok(code) => code,
         Err(error) => {

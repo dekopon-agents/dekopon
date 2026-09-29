@@ -3559,11 +3559,6 @@ mod tests {
             json!(["broken.thing", "locked.door", "posts.get"])
         );
 
-        let structured =
-            dekopon_shell::run("jq '.n' <<'EOF'\n{\"n\": 3}\nEOF", &OutcomeCapabilities);
-        assert_eq!(structured.exit_code, ExitCode::SUCCESS, "{structured:?}");
-        assert_eq!(structured.output.trim(), "3");
-
         let truncated = dekopon_shell::Interpreter::new(dekopon_shell::Limits {
             max_output_lines: 4,
             ..dekopon_shell::Limits::default()

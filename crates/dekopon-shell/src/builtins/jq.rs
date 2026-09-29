@@ -1,12 +1,8 @@
 use std::{
-    cell::{Cell, RefCell},
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
-    },
-    time::{Duration, Instant},
+    io::{self, Read as _, Write as _},
+    process::{Command, Stdio},
+    sync::mpsc::{RecvTimeoutError, sync_channel},
+    time::Duration,
 };
 
 use jaq_core::{
@@ -17,7 +13,11 @@ use jaq_json::{Num, Val};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::limits::Budget;
+use crate::{
+    CapabilityInvoker,
+    jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
+    limits::{Budget, LimitExceeded},
+};
 
 /// env reads the host process environment and now reads the host wall clock; neither is reachable
 /// any other way in this crate, so both are excluded from the filter set.
@@ -63,7 +63,13 @@ impl Builtin for Jq {
             return Err(CommandFailure::usage("jq: a filter argument is required"));
         };
 
-        evaluate(&filter, parse_string_input(input), context.budget).map(CommandResult::value)
+        evaluate(
+            &filter,
+            parse_string_input(input),
+            context.budget,
+            context.invoker,
+        )
+        .map(CommandResult::value)
     }
 }
 
@@ -83,251 +89,194 @@ fn parse_string_input(input: Option<Value>) -> Value {
     }
 }
 
-/// A soft threshold, not a reservation, so admitted filters can overshoot it; on this crate's
-/// one-core deployment, four already-spinning cores is most of the machine.
-const MAX_ABANDONED_WORKERS: usize = 4;
-
-static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
-
-static TOTAL_ABANDONMENTS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn abandoned_workers() -> usize {
-    ABANDONED_WORKERS.load(Ordering::SeqCst)
-}
-
-struct Worker(AtomicU8);
-
-impl Worker {
-    const RUNNING: u8 = 0;
-    const FINISHED: u8 = 1;
-    const ABANDONED: u8 = 2;
-
-    fn new() -> Self {
-        Self(AtomicU8::new(Self::RUNNING))
-    }
-
-    fn finish(&self) -> bool {
-        if self
-            .0
-            .compare_exchange(
-                Self::RUNNING,
-                Self::FINISHED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return false;
-        }
-        ABANDONED_WORKERS.fetch_sub(1, Ordering::SeqCst);
-        true
-    }
-
-    fn abandon(&self) -> Option<u64> {
-        // Charge before publishing `ABANDONED`: `finish` releases the charge as soon as it sees that
-        // state, and releasing first would wrap the count below zero. A lost exchange undoes the
-        // charge, so the count can briefly read one high, never low.
-        ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
-        if self
-            .0
-            .compare_exchange(
-                Self::RUNNING,
-                Self::ABANDONED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            ABANDONED_WORKERS.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(
-            TOTAL_ABANDONMENTS
-                .fetch_add(1, Ordering::SeqCst)
-                .saturating_add(1),
-        )
-    }
-}
-
-fn admit(outstanding: usize) -> Result<(), CommandFailure> {
-    if outstanding < MAX_ABANDONED_WORKERS {
-        return Ok(());
-    }
-    Err(CommandFailure::failed(format!(
-        "jq: refusing to start another filter: {outstanding} filter workers abandoned by earlier \
-         non-terminating filters are still running in this process"
-    )))
-}
-
-struct FinishOnDrop(Arc<Worker>);
-
-impl Drop for FinishOnDrop {
-    fn drop(&mut self) {
-        let _released = self.0.finish();
-    }
-}
-
-enum Produced {
-    Output { value: Value, bytes: u64 },
-    Failed(String),
+enum ReadOutput {
+    Value(Value),
     Done,
+    Exhausted,
+    Invalid(String),
 }
 
-enum Stopped {
-    Worker(CommandFailure),
-    Evaluator(CommandFailure),
-}
-
-struct Job {
-    filter: String,
-    input: Value,
-    worker: Arc<Worker>,
-    outputs: SyncSender<Produced>,
-}
-
-thread_local! {
-    static WORKER: RefCell<Option<SyncSender<Job>>> = const { RefCell::new(None) };
-
-    static SPAWNED: Cell<u64> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-fn workers_spawned() -> u64 {
-    SPAWNED.get()
-}
-
-fn submit(job: Job) -> Result<(), CommandFailure> {
-    let job = WORKER.with_borrow(|worker| match worker {
-        Some(jobs) => jobs.send(job).err().map(|returned| returned.0),
-        None => Some(job),
-    });
-    let Some(job) = job else {
-        return Ok(());
-    };
-
-    let (jobs, queue) = sync_channel::<Job>(1);
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "owner: one reused worker per shell thread, never joined because a non-yielding \
-                  filter cannot be stopped; bound: MAX_ABANDONED_WORKERS plus the session ceiling"
-    )]
-    std::thread::Builder::new()
-        .name("dekopon-shell-jq".to_owned())
-        .spawn(move || serve(&queue))
-        .map_err(|error| {
-            CommandFailure::failed(format!("jq: could not start the filter evaluator: {error}"))
-        })?;
-    SPAWNED.set(SPAWNED.get().saturating_add(1));
-    let sent = jobs.send(job);
-    WORKER.replace(Some(jobs));
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "SendError hands back the job nobody received and says nothing else; the worker \
-                  died before serving it, which the message already states"
-    )]
-    sent.map_err(|_| CommandFailure::failed("jq: the filter evaluator stopped before it started"))
-}
-
-fn retire() {
-    WORKER.replace(None);
-}
-
-fn serve(queue: &Receiver<Job>) {
-    while let Ok(Job {
-        filter,
-        input,
-        worker,
-        outputs,
-    }) = queue.recv()
-    {
-        let _finish = FinishOnDrop(worker);
-        let message = match run_filter(&filter, input, &outputs) {
-            Ok(()) => Produced::Done,
-            Err(message) => Produced::Failed(message),
+fn read_outputs(
+    stdout: impl io::Read,
+    maximum: u64,
+    sender: &std::sync::mpsc::SyncSender<ReadOutput>,
+) -> io::Result<()> {
+    let mut limited = io::BufReader::new(stdout).take(maximum);
+    let mut stream = serde_json::Deserializer::from_reader(&mut limited).into_iter::<Value>();
+    let mut failure = None;
+    for item in &mut stream {
+        match item {
+            Ok(value) => {
+                if sender.send(ReadOutput::Value(value)).is_err() {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    drop(stream);
+    if let Some(error) = failure {
+        let output = if limited.limit() == 0 {
+            ReadOutput::Exhausted
+        } else {
+            ReadOutput::Invalid(format!("jq: invalid worker output: {error}"))
         };
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a closed receiver is the normal end of a filter the budget cut short, \
-                      and the returned SendError only hands back the message nobody is left \
-                      to read; this worker has no caller to report to either way"
-        )]
-        let _ = outputs.send(message);
+        let _sent = sender.send(output);
+        return Ok(());
+    }
+    if limited.limit() == 0 {
+        let mut extra = [0];
+        if limited.get_mut().read(&mut extra)? != 0 {
+            let _sent = sender.send(ReadOutput::Exhausted);
+            return Ok(());
+        }
+    }
+    let _sent = sender.send(ReadOutput::Done);
+    Ok(())
+}
+
+fn collect(
+    receiver: &std::sync::mpsc::Receiver<ReadOutput>,
+    budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
+) -> Result<Vec<Value>, CommandFailure> {
+    let mut outputs = Vec::new();
+    loop {
+        let wait = budget
+            .remaining()
+            .min(Duration::from_secs(1))
+            .max(Duration::from_millis(1));
+        match receiver.recv_timeout(wait) {
+            Ok(ReadOutput::Value(value)) => {
+                budget.charge_step_with(invoker)?;
+                budget.charge_value_bytes(weigh(&value))?;
+                outputs.push(value);
+            }
+            Ok(ReadOutput::Exhausted) => {
+                return Err(LimitExceeded::ValueBytes {
+                    maximum: budget.max_value_bytes(),
+                }
+                .into());
+            }
+            Ok(ReadOutput::Invalid(message)) => return Err(CommandFailure::failed(message)),
+            Ok(ReadOutput::Done) => {
+                if invoker.cancelled() {
+                    return Err(LimitExceeded::Cancelled.into());
+                }
+                budget.check_deadline()?;
+                return Ok(outputs);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CommandFailure::failed("jq: worker output reader stopped"));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if invoker.cancelled() {
+                    return Err(LimitExceeded::Cancelled.into());
+                }
+                budget.check_deadline()?;
+            }
+        }
     }
 }
 
-pub(crate) fn evaluate(
+fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailure {
+    CommandFailure::failed(format!("jq: worker exited {status}: {stderr}"))
+}
+
+const STDERR_BYTES: u64 = 4096;
+
+fn evaluate(
     filter: &str,
     input: Value,
     budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
 ) -> Result<Value, CommandFailure> {
-    admit(abandoned_workers())?;
-
-    // A rendezvous channel, so the filter cannot run ahead of the budget that is paying for it:
-    // every output waits until the evaluator has charged the previous one.
-    let (sender, receiver) = sync_channel::<Produced>(0);
-    let worker = Arc::new(Worker::new());
-    submit(Job {
-        filter: filter.to_owned(),
-        input,
-        worker: Arc::clone(&worker),
-        outputs: sender,
-    })?;
-
-    let started = Instant::now();
-    match collect(&receiver, budget) {
-        Ok(outputs) => Ok(reduce(outputs)),
-        Err(Stopped::Worker(failure)) => Err(failure),
-        Err(Stopped::Evaluator(failure)) => {
-            if let Some(total) = worker.abandon() {
-                retire();
-                tracing::warn!(
-                    event = "shell_jq_filter_abandoned",
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    abandoned_total = total,
-                    abandoned_live = abandoned_workers(),
-                    "a jq filter outlived the budget that was paying for it; its worker stops at \
-                     its next output, or runs until this process exits if it produces none"
-                );
-            }
-            Err(failure)
-        }
-    }
-}
-
-fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Value>, Stopped> {
-    let mut outputs = Vec::new();
-    loop {
-        // Never wait for zero: `remaining` reaching zero one tick before `check_deadline` agrees
-        // would otherwise spin instead of waiting.
-        let wait = budget.remaining().max(Duration::from_millis(1));
-        match receiver.recv_timeout(wait) {
-            Ok(Produced::Output { value, bytes }) => {
-                // Each pulled value is charged as its own step and re-reads the deadline; otherwise
-                // a whole jq command would cost exactly one step regardless of output count.
-                budget
-                    .charge_step()
-                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
-                budget
-                    .charge_value_bytes(bytes)
-                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
-                outputs.push(value);
-            }
-            Ok(Produced::Failed(message)) => {
-                return Err(Stopped::Worker(CommandFailure::failed(message)));
-            }
-            Ok(Produced::Done) => return Ok(outputs),
-            Err(RecvTimeoutError::Timeout) => {
-                budget
-                    .check_deadline()
-                    .map_err(|limit| Stopped::Evaluator(limit.into()))?;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(Stopped::Worker(CommandFailure::failed(
-                    "jq: the filter evaluator stopped without producing a result",
+    let path =
+        executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
+    let child = Command::new(path)
+        .env_clear()
+        .env(JQ_WORKER_MARKER, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CommandFailure::failed(format!("jq: could not start worker: {error}")))?;
+    let mut child = WorkerChild(child);
+    let stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stdin missing"))?;
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stdout missing"))?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> io::Result<()> {
+            let mut stdin = io::BufWriter::new(stdin);
+            serde_json::to_writer(&mut stdin, &(filter, input))?;
+            stdin.flush()
+        });
+        let errors = scope.spawn(move || {
+            let mut stderr = stderr;
+            let mut excerpt = String::new();
+            let _excerpt_result = stderr
+                .by_ref()
+                .take(STDERR_BYTES)
+                .read_to_string(&mut excerpt);
+            let _drain_result = io::copy(&mut stderr, &mut io::sink());
+            excerpt
+        });
+        let (sender, receiver) = sync_channel(0);
+        let maximum = budget
+            .max_value_bytes()
+            .saturating_sub(budget.value_bytes());
+        let reader = scope.spawn(move || {
+            if let Err(error) = read_outputs(stdout, maximum, &sender) {
+                let _sent = sender.send(ReadOutput::Invalid(format!(
+                    "jq: could not read worker output: {error}"
                 )));
             }
+        });
+        let result = collect(&receiver, budget, invoker);
+        drop(receiver);
+        if result.is_err() {
+            drop(child);
+            let _reader_result = reader.join();
+            let _writer_result = writer.join();
+            let _stderr_result = errors.join();
+            return result.map(reduce);
         }
-    }
+        let status = child.0.wait();
+        drop(child);
+        let read = reader.join();
+        let written = writer.join();
+        let stderr = errors.join().unwrap_or_default();
+        let status = status.map_err(|error| {
+            CommandFailure::failed(format!("jq: could not wait for worker: {error}"))
+        })?;
+        if !status.success() {
+            return Err(worker_status(status, &stderr));
+        }
+        if read.is_err() {
+            return Err(CommandFailure::failed("jq: worker output reader panicked"));
+        }
+        if let Ok(Err(error)) = written {
+            return Err(CommandFailure::failed(format!(
+                "jq: could not send worker input: {error}"
+            )));
+        }
+        result.map(reduce)
+    })
 }
 
 fn reduce(outputs: Vec<Value>) -> Value {
@@ -338,7 +287,11 @@ fn reduce(outputs: Vec<Value>) -> Value {
     }
 }
 
-fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Result<(), String> {
+pub(crate) fn run_filter(
+    filter: &str,
+    input: Val,
+    output: &mut impl io::Write,
+) -> Result<(), String> {
     let definitions = jaq_core::defs()
         .chain(jaq_std::defs())
         .chain(jaq_json::defs());
@@ -362,23 +315,20 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
         .compile(modules)
         .map_err(|errors| format!("jq: invalid filter: {}", describe_compile_errors(&errors)))?;
 
-    let value = serde_json::from_value::<Val>(input)
-        .map_err(|error| format!("jq: invalid input: {error}"))?;
-
     let context = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
-    for result in compiled.id.run((context, value)) {
+    for result in compiled.id.run((context, input)) {
         let produced = result.map_err(describe_exception)?;
         let value = convert(&produced, 0)?;
-        let bytes = weigh(&value);
-        if sender.send(Produced::Output { value, bytes }).is_err() {
-            return Ok(());
-        }
+        serde_json::to_writer(&mut *output, &value)
+            .map_err(|error| format!("jq: could not write output: {error}"))?;
+        output
+            .write_all(b"\n")
+            .map_err(|error| format!("jq: could not write output: {error}"))?;
     }
     Ok(())
 }
 
-/// Stands in for jaq_core::unwrap_valr, which calls process::exit on halt; here that would kill the
-/// whole gateway, so a halt becomes an ordinary jq failure instead.
+/// jaq_core::unwrap_valr calls process::exit on halt; the worker must report the halt as a failure.
 fn describe_exception(exception: Exn<'_, Val>) -> String {
     match exception.get_err() {
         Ok(error) => format!("jq: {error}"),
@@ -391,7 +341,7 @@ fn describe_exception(exception: Exn<'_, Val>) -> String {
 
 /// Matches serde_json's own nesting ceiling; without it a filter like
 /// `reduce range(100000) as $i (.;[.])` recurses once per level in convert and can abort the
-/// host process.
+/// worker before reporting a jq failure.
 const MAX_OUTPUT_DEPTH: usize = 128;
 
 /// jaq's value type is a JSON superset (byte strings, non-string keys, NaN) that its own writer
@@ -512,330 +462,4 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
         .map(|(symbol, undefined)| format!("undefined {} {symbol:?}", undefined.as_str()))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
-
-    use serde_json::{Value, json};
-
-    use crate::limits::{Budget, Limits};
-
-    use super::{
-        CommandFailure, MAX_ABANDONED_WORKERS, MAX_OUTPUT_DEPTH, TOTAL_ABANDONMENTS, Worker,
-        abandoned_workers, admit, evaluate, workers_spawned,
-    };
-
-    fn filter(filter: &str, input: Value) -> Result<Value, CommandFailure> {
-        evaluate(filter, input, &mut Budget::start(Limits::default()))
-    }
-
-    fn message(failure: CommandFailure) -> String {
-        match failure {
-            CommandFailure::Status { message, .. } => message,
-            CommandFailure::Fatal(fatal) => format!("{fatal:?}"),
-        }
-    }
-
-    #[test]
-    fn evaluates_real_jq_filters() {
-        assert_eq!(
-            filter(".a", json!({"a": 1})).expect("filter runs"),
-            json!(1)
-        );
-        assert_eq!(
-            filter("map(. * 2)", json!([1, 2, 3])).expect("filter runs"),
-            json!([2, 4, 6])
-        );
-        assert_eq!(
-            filter(
-                "{name: .id, total: (.items | length)}",
-                json!({"id": "x", "items": [1, 2]})
-            )
-            .expect("filter runs"),
-            json!({"name": "x", "total": 2})
-        );
-    }
-
-    #[test]
-    fn a_thread_reuses_its_filter_worker() {
-        for _ in 0..8 {
-            assert_eq!(
-                filter(".a", json!({"a": 1})).expect("filter runs"),
-                json!(1)
-            );
-        }
-        assert_eq!(workers_spawned(), 1);
-    }
-
-    #[test]
-    fn an_abandoned_worker_is_replaced_instead_of_being_handed_the_next_filter() {
-        assert_eq!(filter(".", json!(1)).expect("filter runs"), json!(1));
-        assert_eq!(workers_spawned(), 1);
-
-        let mut budget = Budget::start(Limits {
-            max_steps: 4,
-            ..Limits::default()
-        });
-        evaluate("range(1000000)", json!(null), &mut budget)
-            .expect_err("a long stream exhausts the budget");
-
-        assert_eq!(filter(".", json!(2)).expect("filter runs"), json!(2));
-        assert_eq!(workers_spawned(), 2);
-    }
-
-    #[test]
-    fn numbers_keep_the_values_the_json_boundary_used_to_give_them() {
-        assert_eq!(filter(".a", json!({"a": 1})).expect("runs"), json!(1));
-        assert_eq!(filter(".a", json!({"a": -7})).expect("runs"), json!(-7));
-        assert_eq!(filter(".a", json!({"a": 1.5})).expect("runs"), json!(1.5));
-        assert_eq!(filter(".a", json!({"a": 1.0})).expect("runs"), json!(1.0));
-        assert_eq!(filter("1 + 1", Value::Null).expect("runs"), json!(2));
-        assert_eq!(filter("3 / 2", Value::Null).expect("runs"), json!(1.5));
-        assert_eq!(filter("1.50", Value::Null).expect("runs"), json!(1.5));
-        assert_eq!(filter("1e3", Value::Null).expect("runs"), json!(1000.0));
-        assert_eq!(
-            filter("10000000000000000000 + 1", Value::Null).expect("runs"),
-            json!(10_000_000_000_000_000_001_u64)
-        );
-        assert_eq!(
-            filter("pow(2; 70)", Value::Null).expect("runs"),
-            json!(2f64.powi(70))
-        );
-        assert_eq!(filter("null", Value::Null).expect("runs"), Value::Null);
-        assert_eq!(filter("true", Value::Null).expect("runs"), json!(true));
-        assert_eq!(
-            filter(".s", json!({"s": "text"})).expect("runs"),
-            json!("text")
-        );
-        assert_eq!(
-            filter(".", json!({"a": {"b": [1, {"c": null}]}})).expect("runs"),
-            json!({"a": {"b": [1, {"c": null}]}})
-        );
-    }
-
-    #[test]
-    fn a_value_json_has_no_form_for_is_refused_rather_than_invented() {
-        for (source, expected) in [
-            ("nan", "NaN"),
-            ("infinite", "Infinity"),
-            (r#""a" | tobytes"#, "a byte string"),
-            ("{(1): 2}", "an object with a non-string key"),
-        ] {
-            let failure = filter(source, Value::Null).expect_err(source);
-            let message = message(failure);
-            assert!(message.starts_with("jq: a filter produced"), "{message}");
-            assert!(message.contains(expected), "{source}: {message}");
-        }
-    }
-
-    #[test]
-    fn output_nesting_is_bounded_the_way_parsing_it_used_to_be() {
-        let deep = format!("reduce range({}) as $i (.; [.])", MAX_OUTPUT_DEPTH + 10);
-        let failure = filter(&deep, Value::Null).expect_err("an over-nested output is refused");
-        let message = message(failure);
-        assert!(message.contains("nested deeper"), "{message}");
-        let allowed = format!(
-            "reduce range({}) as $i (.; [.]) | flatten | length",
-            MAX_OUTPUT_DEPTH - 1
-        );
-        assert_eq!(filter(&allowed, Value::Null).expect("runs"), json!(1));
-    }
-
-    #[test]
-    fn standard_library_functions_are_available() {
-        assert_eq!(
-            filter("[.[] | select(. > 1)] | sort | reverse", json!([3, 1, 2]))
-                .expect("filter runs"),
-            json!([3, 2])
-        );
-        assert_eq!(
-            filter("to_entries | map(.key) | sort", json!({"b": 2, "a": 1})).expect("filter runs"),
-            json!(["a", "b"])
-        );
-    }
-
-    #[test]
-    fn host_reaching_standard_library_filters_are_not_linked() {
-        assert!(std::env::var_os("PATH").is_some(), "PATH must be set here");
-        for source in ["env", "env.PATH", "env|keys", "now"] {
-            let failure = filter(source, json!({})).expect_err(source);
-            let message = message(failure);
-            assert!(message.contains("undefined"), "{source}: {message}");
-        }
-        assert_eq!(
-            filter("ltrimstr(\"a\")", json!("abc")).expect("filter runs"),
-            json!("bc")
-        );
-    }
-
-    #[test]
-    fn halt_fails_the_command_instead_of_exiting_the_process() {
-        for source in ["halt", "halt(3)", "\"x\" | halt_error", "1, halt, 2"] {
-            let message = message(filter(source, json!({})).expect_err(source));
-            assert!(message.contains("halt("), "{source}: {message}");
-        }
-    }
-
-    #[test]
-    fn a_multi_output_filter_becomes_an_array() {
-        assert_eq!(
-            filter(".[]", json!([1, 2, 3])).expect("filter runs"),
-            json!([1, 2, 3])
-        );
-    }
-
-    #[test]
-    fn an_empty_stream_becomes_null() {
-        assert_eq!(filter("empty", json!(1)).expect("filter runs"), Value::Null);
-    }
-
-    #[test]
-    fn a_streaming_filter_is_charged_against_the_step_budget() {
-        let mut budget = Budget::start(Limits {
-            max_steps: 16,
-            ..Limits::default()
-        });
-        let failure = evaluate("range(1000000)", json!(null), &mut budget)
-            .expect_err("a long stream exhausts the budget");
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-        assert!(budget.steps() <= 17, "{}", budget.steps());
-    }
-
-    #[test]
-    fn a_filter_that_never_yields_is_stopped_by_the_deadline_and_counted() {
-        let abandonments = TOTAL_ABANDONMENTS.load(Ordering::SeqCst);
-        let mut budget = Budget::start(Limits {
-            timeout: std::time::Duration::from_millis(50),
-            ..Limits::default()
-        });
-        let started = std::time::Instant::now();
-        let failure = evaluate("def f: f; f", json!(1), &mut budget)
-            .expect_err("a non-terminating filter trips the deadline");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-        assert!(message(failure).contains("Deadline"));
-
-        assert!(TOTAL_ABANDONMENTS.load(Ordering::SeqCst) > abandonments);
-        assert!(abandoned_workers() >= 1);
-    }
-
-    #[test]
-    fn a_saturated_process_refuses_to_start_another_filter() {
-        assert!(admit(MAX_ABANDONED_WORKERS - 1).is_ok());
-        let failure = admit(MAX_ABANDONED_WORKERS).expect_err("a saturated process refuses");
-        assert!(
-            matches!(failure, CommandFailure::Status { .. }),
-            "the script continues; only this filter is refused: {failure:?}"
-        );
-        let message = message(failure);
-        assert!(
-            message.contains("refusing to start another filter"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn an_abandoned_worker_stops_counting_once_it_finally_returns() {
-        let worker = Worker::new();
-        assert!(worker.abandon().is_some());
-        assert!(
-            worker.finish(),
-            "returning releases the abandonment it was charged"
-        );
-    }
-
-    #[test]
-    fn a_worker_that_finished_first_is_not_counted_as_abandoned() {
-        let worker = Worker::new();
-        assert!(!worker.finish());
-        assert!(worker.abandon().is_none());
-    }
-
-    #[test]
-    fn a_filter_cannot_outgrow_the_value_byte_ceiling() {
-        let mut budget = Budget::start(Limits {
-            max_value_bytes: 1_024,
-            ..Limits::default()
-        });
-        let failure = evaluate("range(100000) | tostring", json!(null), &mut budget)
-            .expect_err("an oversized stream trips the value ceiling");
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-    }
-
-    #[test]
-    fn raw_and_compact_flags_are_accepted_because_they_match_the_only_output_mode() {
-        use crate::builtins::test_support::run_builtin;
-
-        for flags in [
-            vec!["-r", ".a"],
-            vec!["-c", ".a"],
-            vec!["--raw-output", ".a"],
-            vec!["--compact-output", ".a"],
-        ] {
-            let result = run_builtin(&super::Jq, &flags, Some(json!({"a": "x"})))
-                .expect("documented output flags are accepted");
-            assert_eq!(result.value, json!("x"), "{flags:?}");
-        }
-        assert!(run_builtin(&super::Jq, &["--slurp", "."], Some(json!(1))).is_err());
-    }
-
-    #[test]
-    fn a_piped_string_holding_json_text_is_parsed_before_filtering() {
-        use crate::builtins::test_support::run_builtin;
-
-        // `result=$(gh pr list …)` captures the object; `echo "$result" | jq …` is what
-        // stringifies it into display text, and the builtin should parse that text back
-        // rather than index it as a string.
-        let captured = json!({"page": 2, "pullRequests": [{"author": "xrl"}]}).to_string();
-        let result = run_builtin(
-            &super::Jq,
-            &[".pullRequests[0].author"],
-            Some(json!(captured)),
-        )
-        .expect("the captured JSON text is parsed, not indexed as a string");
-        assert_eq!(result.value, json!("xrl"));
-
-        // Text that isn't JSON is still indexed as a string value.
-        assert_eq!(
-            run_builtin(&super::Jq, &["ltrimstr(\"a\")"], Some(json!("abc")))
-                .expect("non-JSON text still indexes as a string")
-                .value,
-            json!("bc")
-        );
-    }
-
-    #[test]
-    fn a_piped_string_holding_a_json_scalar_is_still_indexed_as_a_string() {
-        use crate::builtins::test_support::run_builtin;
-
-        // Only an object or array is substituted for its parse: this crate parses without
-        // `arbitrary_precision`, so promoting a scalar would round a decimal-seconds Slack
-        // timestamp like the last case to a lossy f64, and would break a string-only filter
-        // (`test(...)`, `ltrimstr`, ...) built for what stays a string.
-        for source in ["123", "true", "null", "1727400000.123450"] {
-            let result = run_builtin(&super::Jq, &["."], Some(json!(source)))
-                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
-            assert_eq!(result.value, json!(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn invalid_filters_report_an_error_instead_of_panicking() {
-        let error = message(filter(".[", json!({})).expect_err("unbalanced filter"));
-        assert!(error.starts_with("jq: invalid filter"), "{error}");
-        let error = message(filter("no_such_function", json!({})).expect_err("undefined filter"));
-        assert!(error.contains("undefined"), "{error}");
-    }
-
-    #[test]
-    fn runtime_errors_are_reported_not_fatal() {
-        let failure = filter(".a", json!([1, 2])).expect_err("indexing an array by name fails");
-        assert!(
-            matches!(failure, CommandFailure::Status { .. }),
-            "{failure:?}"
-        );
-        assert!(message(failure).starts_with("jq:"));
-    }
 }
