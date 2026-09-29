@@ -813,10 +813,6 @@ async fn aggregate_memory_defaults_and_partial_limits_are_resolved_and_validated
         resolved.host_options.max_total_memory_bytes,
         Some(256 * 1024 * 1024)
     );
-    assert_eq!(
-        resolved.worst_case_guest_memory_bytes,
-        resolved.server_limits.max_connections * resolved.host_limits.max_memory_bytes
-    );
 
     document["hostLimits"] = host_limits_document(Some(
         u64::try_from(dekopon_broker_host::BrokerHostLimits::default().max_memory_bytes)

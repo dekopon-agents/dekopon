@@ -314,7 +314,6 @@ pub struct ResolvedConfig {
     pub host_limits: BrokerHostLimits,
     pub host_options: BrokerHostOptions,
     pub plaintext_hosts: PlaintextHosts,
-    pub worst_case_guest_memory_bytes: usize,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
     pub storage: Option<StorageConfig>,
@@ -865,11 +864,6 @@ async fn resolve(
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
     }
-    let worst_case_guest_memory_bytes = config
-        .server_limits
-        .max_connections
-        .checked_mul(host_limits.max_memory_bytes)
-        .ok_or(ConfigError::InvalidHostLimits)?;
     if config
         .host_limits
         .max_total_memory_bytes
@@ -975,7 +969,6 @@ async fn resolve(
             provider_settings: Arc::new(provider_settings),
         },
         plaintext_hosts,
-        worst_case_guest_memory_bytes,
         broker_limits: config.broker_limits,
         server_limits,
         storage,

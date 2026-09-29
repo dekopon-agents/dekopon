@@ -125,7 +125,6 @@ where
     tracing::info!(
         max_connections = config.server_limits.max_connections,
         max_memory_bytes = config.host_limits.max_memory_bytes,
-        worst_case_guest_memory_bytes = config.worst_case_guest_memory_bytes,
         aggregate_ceiling_bytes = config.host_options.max_total_memory_bytes,
         cwasm_cache = config
             .host_options
