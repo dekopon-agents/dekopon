@@ -98,6 +98,7 @@ pub(crate) fn script_span() -> tracing::Span {
         shell.script.commands = tracing::field::Empty,
         shell.script.capability_commands = tracing::field::Empty,
         shell.script.failed_commands = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     )
 }
 

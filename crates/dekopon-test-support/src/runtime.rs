@@ -73,7 +73,11 @@ impl BlockedRuntime {
 }
 
 impl ScriptRuntime for BlockedRuntime {
-    fn run_script(&self, script: &str, _max_capability_calls: u32) -> ScriptOutcome {
+    fn capability_calls_used(&self) -> u32 {
+        self.outcome.capability_calls
+    }
+
+    fn run_script(&self, script: &str) -> ScriptOutcome {
         self.scripts
             .lock()
             .expect("script lock")

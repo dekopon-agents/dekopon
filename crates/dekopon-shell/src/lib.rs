@@ -205,7 +205,9 @@ pub enum CommandRun {
 }
 
 pub trait CapabilityInvoker {
-    fn cancelled(&self) -> bool { false }
+    fn cancelled(&self) -> bool {
+        false
+    }
 
     fn granted(&self) -> Vec<String>;
 
@@ -261,7 +263,9 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 }
 
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
-    fn cancelled(&self) -> bool { self.as_ref().cancelled() }
+    fn cancelled(&self) -> bool {
+        self.as_ref().cancelled()
+    }
 
     fn granted(&self) -> Vec<String> {
         self.as_ref().granted()
@@ -386,10 +390,22 @@ impl Interpreter {
     }
 
     pub fn run(&self, script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
-        self.run_with_tree(script, invoker, &TreeContext::new(self.limits.timeout, CallBudget::new(self.limits.max_capability_calls)))
+        self.run_with_tree(
+            script,
+            invoker,
+            &TreeContext::new(
+                self.limits.timeout,
+                CallBudget::new(self.limits.max_capability_calls),
+            ),
+        )
     }
 
-    pub fn run_with_tree(&self, script: &str, invoker: &dyn CapabilityInvoker, tree: &TreeContext) -> ScriptOutcome {
+    pub fn run_with_tree(
+        &self,
+        script: &str,
+        invoker: &dyn CapabilityInvoker,
+        tree: &TreeContext,
+    ) -> ScriptOutcome {
         interp::run_with_tree(script, None, invoker, self.limits, tree)
     }
 
@@ -420,16 +436,17 @@ mod tests {
         collections::BTreeMap,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU32, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
+        time::{Duration, Instant},
     };
 
     use dekopon_core::{SecretDrn, SecretUseProposal};
     use serde_json::{Value, json};
 
     use super::{
-        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
-        Interpreter, Limits,
+        CallBudget, CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
+        ExitCode, Interpreter, Limits, TreeContext,
     };
 
     #[derive(Default)]
@@ -444,7 +461,7 @@ mod tests {
         }
 
         fn is_granted(&self, capability: &str) -> bool {
-            capability == "gh.pr-view"
+            capability == "gh.pr-view" || capability == "gh-extra"
         }
 
         fn command_words(&self) -> Vec<String> {
@@ -495,6 +512,87 @@ mod tests {
         fn script_finished(&self) {
             self.scripts_finished.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    struct Cancellation(Arc<AtomicBool>);
+
+    impl CapabilityInvoker for Cancellation {
+        fn cancelled(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn invoke(&self, _: &str, _: Value, _: Option<SecretUseProposal>) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+
+    #[test]
+    fn a_cancelled_loop_stops_before_exhausting_steps() {
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let limits = Limits {
+            max_steps: 100_000,
+            ..Limits::default()
+        };
+        let outcome =
+            Interpreter::new(limits).run("while true; do :; done", &Cancellation(cancelled));
+        assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+        assert_eq!(
+            super::interp::telemetry::fatal_outcome(&super::builtins::FatalError::Limit(
+                super::limits::LimitExceeded::Cancelled
+            )),
+            "cancelled"
+        );
+        assert!(outcome.steps < 100);
+    }
+
+    #[test]
+    fn a_sleep_wakes_for_cancellation_without_waiting_for_the_deadline() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flip.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let outcome = Interpreter::new(Limits {
+            timeout: Duration::from_secs(310),
+            ..Limits::default()
+        })
+        .run("sleep 300", &Cancellation(cancelled));
+        worker.join().expect("cancel worker");
+        assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+        assert!(start.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn interpreters_in_one_tree_share_calls_and_deadline() {
+        let limits = Limits {
+            timeout: Duration::from_millis(80),
+            max_capability_calls: 1,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits.timeout, CallBudget::new(1));
+        let invoker = RecordingInvoker::default();
+        let interpreter = Interpreter::new(limits);
+        assert_eq!(
+            interpreter
+                .run_with_tree("gh-extra one", &invoker, &tree)
+                .capability_calls,
+            1
+        );
+        let second_interpreter = Interpreter::new(limits);
+        let second = second_interpreter.run_with_tree("gh-extra two", &invoker, &tree);
+        assert_eq!(second.exit_code, ExitCode::SYNTAX);
+        assert_eq!(tree.calls().used(), 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            second_interpreter
+                .run_with_tree("echo late", &invoker, &tree)
+                .exit_code,
+            ExitCode::TIMEOUT
+        );
     }
 
     fn proposal() -> SecretUseProposal {

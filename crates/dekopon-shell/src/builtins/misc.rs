@@ -446,8 +446,12 @@ impl Builtin for Sleep {
         loop {
             context.budget.check_cancelled(context.invoker)?;
             context.budget.check_deadline()?;
-            if left.is_zero() { break; }
-            let slice = left.min(context.budget.remaining()).min(Duration::from_secs(1));
+            if left.is_zero() {
+                break;
+            }
+            let slice = left
+                .min(context.budget.remaining())
+                .min(Duration::from_secs(1));
             thread::sleep(slice);
             left = left.saturating_sub(slice);
         }

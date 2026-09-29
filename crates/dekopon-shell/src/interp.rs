@@ -11,7 +11,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
+    CallBudget, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome, TreeContext,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
         Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
@@ -23,7 +23,6 @@ use crate::{
     },
     dispatch::{self, Resolution},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    CallBudget, TreeContext,
     parser::{
         expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
         pattern_metacharacter,
@@ -150,7 +149,13 @@ pub(crate) fn run(
     invoker: &dyn CapabilityInvoker,
     limits: Limits,
 ) -> ScriptOutcome {
-    run_with_tree(script, prev, invoker, limits, &TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)))
+    run_with_tree(
+        script,
+        prev,
+        invoker,
+        limits,
+        &TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)),
+    )
 }
 
 pub(crate) fn run_with_tree(
@@ -201,10 +206,18 @@ pub(crate) fn run_with_tree(
     let exit_code = {
         let _entered = script.enter();
         match evaluator.execute_program(&program) {
-            Ok(Flow::Exit(code)) => code,
-            Ok(Flow::Return(code)) => code,
-            Ok(_) => evaluator.last_status,
-            Err(fatal) => evaluator.report_fatal(&fatal),
+            Ok(Flow::Exit(code)) | Ok(Flow::Return(code)) => {
+                script.record("outcome", telemetry::outcome_label(code));
+                code
+            }
+            Ok(_) => {
+                script.record("outcome", telemetry::outcome_label(evaluator.last_status));
+                evaluator.last_status
+            }
+            Err(fatal) => {
+                script.record("outcome", telemetry::fatal_outcome(&fatal));
+                evaluator.report_fatal(&fatal)
+            }
         }
     };
     evaluator.counters.record_on(&script);
@@ -214,7 +227,10 @@ pub(crate) fn run_with_tree(
         output: evaluator.output.render(),
         exit_code,
         truncated: evaluator.output.is_truncated(),
-        capability_calls: evaluator.budget.capability_calls().saturating_sub(calls_before),
+        capability_calls: evaluator
+            .budget
+            .capability_calls()
+            .saturating_sub(calls_before),
         steps: evaluator.budget.steps(),
     }
 }
@@ -260,7 +276,9 @@ impl Evaluator<'_> {
             FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
                 "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
             ),
-            FatalError::Limit(LimitExceeded::Cancelled) => "dekopon-shell: script cancelled".to_owned(),
+            FatalError::Limit(LimitExceeded::Cancelled) => {
+                "dekopon-shell: script cancelled".to_owned()
+            }
             FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
                 format!("dekopon-shell: {reason}")
             }

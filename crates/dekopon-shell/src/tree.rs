@@ -17,7 +17,10 @@ pub struct CallBudget {
 impl CallBudget {
     #[must_use]
     pub fn new(maximum: u32) -> Self {
-        Self { used: Arc::new(AtomicU32::new(0)), maximum }
+        Self {
+            used: Arc::new(AtomicU32::new(0)),
+            maximum,
+        }
     }
 
     #[must_use]
@@ -31,9 +34,20 @@ impl CallBudget {
     }
 
     pub(crate) fn charge(&self) -> Result<(), LimitExceeded> {
-        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            (used < self.maximum).then_some(used + 1)
-        }).map(|_| ()).map_err(|_| LimitExceeded::CapabilityCalls { maximum: self.maximum })
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < self.maximum).then_some(used + 1)
+            })
+            .map(|_| ())
+            .map_err(|_used| LimitExceeded::CapabilityCalls {
+                maximum: self.maximum,
+            })
+    }
+}
+
+impl From<u32> for CallBudget {
+    fn from(maximum: u32) -> Self {
+        Self::new(maximum)
     }
 }
 
@@ -47,12 +61,19 @@ pub struct TreeContext {
 impl TreeContext {
     #[must_use]
     pub fn new(timeout: Duration, calls: CallBudget) -> Self {
-        Self { deadline: Instant::now() + timeout, timeout, calls }
+        let started = Instant::now();
+        Self {
+            deadline: started.checked_add(timeout).unwrap_or(started),
+            timeout,
+            calls,
+        }
     }
 
     pub(crate) fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if Instant::now() > self.deadline {
-            Err(LimitExceeded::Deadline { timeout_ms: self.timeout.as_millis() })
+            Err(LimitExceeded::Deadline {
+                timeout_ms: self.timeout.as_millis(),
+            })
         } else {
             Ok(())
         }

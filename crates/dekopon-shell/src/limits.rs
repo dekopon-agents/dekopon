@@ -3,7 +3,7 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use crate::{CapabilityInvoker, CallBudget, TreeContext};
+use crate::{CallBudget, CapabilityInvoker, TreeContext};
 
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
 pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
@@ -61,28 +61,47 @@ pub struct Budget {
 impl Budget {
     #[must_use]
     pub fn start(limits: Limits) -> Self {
-        Self::start_tree(limits, TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)))
+        Self::start_tree(
+            limits,
+            TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)),
+        )
     }
 
     #[must_use]
     pub fn start_tree(limits: Limits, tree: TreeContext) -> Self {
-        Self { limits, tree, cancelled: false, steps: 0, depth: 0, value_bytes: 0 }
+        Self {
+            limits,
+            tree,
+            cancelled: false,
+            steps: 0,
+            depth: 0,
+            value_bytes: 0,
+        }
     }
 
-    pub fn charge_step_with(&mut self, invoker: &dyn CapabilityInvoker) -> Result<(), LimitExceeded> {
+    pub fn charge_step_with(
+        &mut self,
+        invoker: &dyn CapabilityInvoker,
+    ) -> Result<(), LimitExceeded> {
         self.cancelled = invoker.cancelled();
         self.charge_step()
     }
 
     pub fn check_cancelled(&self, invoker: &dyn CapabilityInvoker) -> Result<(), LimitExceeded> {
-        if invoker.cancelled() { Err(LimitExceeded::Cancelled) } else { Ok(()) }
+        if invoker.cancelled() {
+            Err(LimitExceeded::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     /// This is the only backstop against an infinite loop; the deadline is re-read every step
     /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
     /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
-        if self.cancelled { return Err(LimitExceeded::Cancelled); }
+        if self.cancelled {
+            return Err(LimitExceeded::Cancelled);
+        }
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_steps {
             return Err(LimitExceeded::Steps {
