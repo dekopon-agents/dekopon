@@ -8,6 +8,35 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Guest memory charged on growth; `oauth2Refresh` (0.28.0)
+
+Existing 0.27.0 configurations need no edits.
+
+- **Memory is charged as it grows.** The broker no longer reserves every store's
+  `hostLimits.maxMemoryBytes` against `hostLimits.maxTotalMemoryBytes` up front. Each store is
+  charged as its guest memory grows, up to its high-water mark, and released when the store drops.
+  More small invocations now fit in the same budget. A grow past the remaining budget returns -1
+  to the guest and the invocation fails with `host-memory-budget`.
+- **Breaking, telemetry:** the `provider.memory` log record is gone. `memory.store` (once per
+  store, at drop) and `memory.refused` (once per store, at its first refusal) replace it on target
+  `memory`; dashboards and queries on `provider.memory` or its fields need rewriting. See
+  [provider linear-memory sizing](observability.md#provider-linear-memory-sizing).
+- **`oauth2Refresh` secret source.** **Upgrade the broker binary before any private secret map
+  uses `kind: oauth2Refresh`;** 0.27.0 refuses it as an unknown kind. Enrollment is a documented
+  `kubectl exec` recipe, not a subcommand. See the [source contract](secrets.md#oauth2refresh).
+- A cancelled turn now stops its running script at the next step, and `sleep` wakes within a
+  second to notice. Each `jq` stage runs in a worker process with an address-space limit; no
+  configuration changes.
+
+## Shutdown grace under `configDirectory` (chart 0.18.0)
+
+A daemon whose configuration comes from `broker.configDirectory` or the gateway's
+`configDirectory` now needs its `drainBudget.assumedBrokerShutdownGraceMs` or
+`drainBudget.assumedGatewayShutdownGraceMs` set, or the chart refuses to render instead of
+assuming 120000 ms. Inline configurations keep reading the grace from the config. See
+[draining takes both graces](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence).
+Chart 0.18.0 defaults to application 0.28.0.
+
 ## Kubernetes TokenRequest secret source (0.27.0)
 
 Existing 0.26.0 configurations need no edits. To opt into the new broker-private

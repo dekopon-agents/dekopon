@@ -82,14 +82,13 @@ struct ErrorResponse {
 enum RefreshResult {
     NotDue(OAuth2Record),
     Refreshed(OAuth2Record),
-    RefreshedUnsaved(OAuth2Record),
 }
 
 impl RefreshResult {
     const fn label(&self) -> &'static str {
         match self {
             Self::NotDue(_) => "not-due",
-            Self::Refreshed(_) | Self::RefreshedUnsaved(_) => "refreshed",
+            Self::Refreshed(_) => "refreshed",
         }
     }
 
@@ -101,7 +100,7 @@ impl RefreshResult {
                     &[record.refresh.expose()],
                 )?;
             }
-            Self::Refreshed(record) | Self::RefreshedUnsaved(record) => {
+            Self::Refreshed(record) => {
                 if record.expires_at == 0 {
                     return Err(SourceError::BootstrapReflected);
                 }
@@ -112,9 +111,7 @@ impl RefreshResult {
 
     fn record(self) -> OAuth2Record {
         match self {
-            Self::NotDue(record) | Self::Refreshed(record) | Self::RefreshedUnsaved(record) => {
-                record
-            }
+            Self::NotDue(record) | Self::Refreshed(record) => record,
         }
     }
 }
@@ -315,7 +312,7 @@ async fn refresh(
                 error = %error.source,
                 "OAuth refresh succeeded but the record could not be saved"
             );
-            Ok(RefreshResult::RefreshedUnsaved(record))
+            Ok(RefreshResult::Refreshed(record))
         }
     }
 }
