@@ -95,6 +95,8 @@ APIs are internals for now.
 
 - Yes: pick `AssetInputs { rows, descriptors, sends_remaining }` as the host's parameter type and report it.
 - No: `contact_supervisor("should the parameter be named AssetInputs or InvokeAssets?")`
+- Yes: an ambiguous invariant read one way, implemented, and the reading listed under "Choices I made".
+- No: a turn that ends with a question and no code.
 
 ### Errors
 
@@ -118,6 +120,8 @@ A closed enum makes the compiler find every match arm when the next kind arrives
 
 - Yes: `enum Source { File { fd: OwnedFd, cursor: u64, len: u64 } }` … `match source { Source::File { .. } => … }`
 - No: `Box<dyn AssetSource>` with one implementer, or `trait Source { fn read(&mut self, …) }` plus generics threaded through every caller.
+- Yes: `match state { State::Open => true, State::Draining | State::Closed => false }` on an enum this crate defines.
+- No: `matches!(state, State::Open)` on your own enum; it is a hidden `_ => false` the next variant slips past.
 
 ### Newtypes
 
