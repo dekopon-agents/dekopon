@@ -810,6 +810,17 @@ for document in yaml.safe_load_all(sys.stdin):
     assert init["name"] == "prepare-files", init["name"]
     assert 'chown "$uid:$gid" "' + SET + '"' in init["args"][0]
     assert 'chmod 0700 "' + SET + '"' in init["args"][0]
+    # Precompile runs after ownership is fixed and before the broker, as the broker's UID, on the
+    # same subPath view.
+    names = [c["name"] for c in spec["initContainers"]]
+    assert names[:3] == ["prepare-files", "precompile", "broker"], names
+    precompile = spec["initContainers"][1]
+    assert precompile["args"][-1] == "precompile", precompile["args"]
+    assert "--compile-threads=1" in precompile["args"], precompile["args"]
+    assert precompile["securityContext"]["runAsUser"] == broker["securityContext"]["runAsUser"]
+    assert [(m["name"], m["mountPath"], m.get("subPath")) for m in precompile["volumeMounts"]] == [
+        ("state", SET, "providers")
+    ], precompile["volumeMounts"]
 SETMOUNTS
 python_yaml "$(cat "$work/provider-set-mounts.py")" "$work/provider-set-render.yaml"
 echo "PASS the provider set is broker-only and the init container owns it"

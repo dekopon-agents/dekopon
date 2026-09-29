@@ -104,6 +104,7 @@ spec:
             - --provider-set={{ $mount }}/providers.yaml
             - --lock-file={{ $mount }}/providers.lock.yaml
             - --store={{ $mount }}/store
+            - --compile-threads={{ .Values.broker.precompile.compileThreads | int }}
             - --output=json
             - sync
           securityContext:

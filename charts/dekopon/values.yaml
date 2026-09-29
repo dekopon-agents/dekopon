@@ -252,6 +252,25 @@ broker:
     # the chart places the directory, it does not rewrite configuration.
     mountPath: /var/lib/dekopon/providers
 
+  # An init container that runs `dekopon-brokerd provider precompile` against the sync Job's paths,
+  # <providerSet.mountPath>/providers.lock.yaml and <providerSet.mountPath>/store, before the
+  # broker starts. It compiles every locked component missing from the store's cwasm cache, then
+  # deletes compiled code and blobs the lock no longer names, and exits; the kernel takes its
+  # Cranelift working set back with it. Only with providerSet.enabled. If broker.yaml points
+  # providerSet.lockPath or storePath elsewhere, disable this and run the command yourself.
+  precompile:
+    enabled: true
+    # Cranelift threads per component, also passed to the sync Job. Each thread carries its own
+    # compile working set; raise resources.limits.memory with it.
+    compileThreads: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
   # A hook Job that runs `dekopon-brokerd provider sync` with the Deployment's own image, writing
   # `<mountPath>/providers.lock.yaml` and `<mountPath>/store` from the `providers.yaml` key of
   # `configMap`. Requires providerSet.enabled. A failed sync fails the release before the pod rolls,
@@ -312,8 +331,11 @@ broker:
       cpu: 100m
       memory: 256Mi
     limits:
-      # Headroom for Cranelift: every pod start recompiles every .wasm component from scratch,
-      # there is no compilation cache, and that work is what the startup probe waits on.
+      # Headroom for Cranelift in the broker itself. Components baked into the image, and a managed
+      # set with `onCacheMiss: compile` or `compileOnLoad: true`, compile in this container at start.
+      # With providerSet and broker.precompile enabled and broker.yaml's default
+      # `onCacheMiss: fail`, the broker only maps compiled code: size this for a warm broker
+      # (67 MiB measured on 0.27.0) plus `hostLimits.maxTotalMemoryBytes` (256 MiB by default).
       cpu: "2"
       memory: 1Gi
 
