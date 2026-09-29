@@ -137,7 +137,7 @@ mod dispatch;
 mod interp;
 mod jq_worker;
 mod lexer;
-pub use jq_worker::{JQ_WORKER_MARKER, run_jq_worker_if_requested, set_jq_worker_executable};
+pub use jq_worker::{run_jq_worker_if_requested, set_jq_worker_executable};
 pub mod limits;
 mod parser;
 mod tree;

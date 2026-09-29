@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read as _},
+    io::{self, Read as _, Write as _},
     process::{Command, Stdio},
     sync::mpsc::{RecvTimeoutError, sync_channel},
     time::Duration,
@@ -101,7 +101,7 @@ fn read_outputs(
     maximum: u64,
     sender: &std::sync::mpsc::SyncSender<ReadOutput>,
 ) -> io::Result<()> {
-    let mut limited = stdout.take(maximum);
+    let mut limited = io::BufReader::new(stdout).take(maximum);
     let mut stream = serde_json::Deserializer::from_reader(&mut limited).into_iter::<Value>();
     let mut failure = None;
     for item in &mut stream {
@@ -221,7 +221,11 @@ fn evaluate(
         .take()
         .ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
     std::thread::scope(|scope| {
-        let writer = scope.spawn(move || serde_json::to_writer(stdin, &(filter, input)));
+        let writer = scope.spawn(move || -> io::Result<()> {
+            let mut stdin = io::BufWriter::new(stdin);
+            serde_json::to_writer(&mut stdin, &(filter, input))?;
+            stdin.flush()
+        });
         let errors = scope.spawn(move || {
             let mut stderr = stderr;
             let mut excerpt = String::new();
