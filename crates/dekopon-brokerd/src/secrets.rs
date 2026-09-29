@@ -1935,16 +1935,20 @@ fn selected_document_scalar(value: &Value, pointer: Option<&str>) -> Result<Vec<
     scalar_bytes(value)
 }
 
-fn reject_bootstrap_reflection(
-    material: Vec<u8>,
-    bootstrap_values: &[&str],
-) -> Result<Vec<u8>, SourceError> {
-    if bootstrap_values.iter().any(|bootstrap| {
+fn bootstrap_reflected(material: &[u8], bootstrap_values: &[&str]) -> bool {
+    bootstrap_values.iter().any(|bootstrap| {
         !bootstrap.is_empty()
             && material
                 .windows(bootstrap.len())
                 .any(|window| window == bootstrap.as_bytes())
-    }) {
+    })
+}
+
+fn reject_bootstrap_reflection(
+    material: Vec<u8>,
+    bootstrap_values: &[&str],
+) -> Result<Vec<u8>, SourceError> {
+    if bootstrap_reflected(&material, bootstrap_values) {
         return Err(SourceError::BootstrapReflected);
     }
     Ok(material)

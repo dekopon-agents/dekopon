@@ -648,17 +648,20 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
         let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored["access"], OLD_REFRESH);
         assert_eq!(stored["refresh"], NEW_REFRESH);
-        expired(&path);
+        assert_eq!(stored["expiresAt"], 0);
+        assert_eq!(api.requests().len(), 3);
         assert_eq!(
             resolver.resolve(&drn("one")).await.unwrap_err().category,
             "bootstrap-reflected"
         );
+        assert_eq!(api.requests().len(), 4);
         assert_eq!(
             resolver.resolve(&drn("one")).await.unwrap_err().category,
             "bootstrap-reflected"
         );
         let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored["access"], NEW_REFRESH);
+        assert_eq!(stored["expiresAt"], 0);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
@@ -674,7 +677,7 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
         assert!(!recorded.contains(secret), "trace disclosed {secret}");
     }
     assert!(recorded.contains("reauth-required"), "{recorded}");
-    assert_eq!(api.requests().len(), 4);
+    assert_eq!(api.requests().len(), 5);
 }
 
 #[tokio::test]

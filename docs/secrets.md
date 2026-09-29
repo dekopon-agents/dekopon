@@ -284,9 +284,11 @@ a working record. Other 4xx responses are `rejected`, 5xx and connection failure
 a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
 `insecure-file`; a missing file is `io`.
 `bootstrap-reflected` means the access contains the current or predecessor refresh token; a
-rotated record is saved, if possible, before the refusal.
-`too-large` means the record, response headers, or body exceed their ceilings, or the returned
-token exceeds the final material limit after the rotation is saved.
+reflected rotation is saved already expired (`expiresAt: 0`), so the next resolution refreshes
+again rather than serving it.
+`too-large` means the record file on read or the response headers exceed their ceilings, or the
+returned token exceeds the final material limit after the rotation is saved. An over-ceiling
+response body or serialized record is `malformed`.
 `internal` means a blocking or refresh task did not complete.
 If saving a rotated token fails, an otherwise valid invocation still returns the new access token
 and logs the path and I/O error. A refresh whose response is lost costs

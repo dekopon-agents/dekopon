@@ -81,21 +81,15 @@ struct ErrorResponse {
 
 enum RefreshResult {
     NotDue(OAuth2Record),
-    Refreshed {
-        record: OAuth2Record,
-        predecessor: Redacted<String>,
-    },
-    RefreshedUnsaved {
-        record: OAuth2Record,
-        predecessor: Redacted<String>,
-    },
+    Refreshed(OAuth2Record),
+    RefreshedUnsaved(OAuth2Record),
 }
 
 impl RefreshResult {
     const fn label(&self) -> &'static str {
         match self {
             Self::NotDue(_) => "not-due",
-            Self::Refreshed { .. } | Self::RefreshedUnsaved { .. } => "refreshed",
+            Self::Refreshed(_) | Self::RefreshedUnsaved(_) => "refreshed",
         }
     }
 
@@ -107,18 +101,10 @@ impl RefreshResult {
                     &[record.refresh.expose()],
                 )?;
             }
-            Self::Refreshed {
-                record,
-                predecessor,
-            }
-            | Self::RefreshedUnsaved {
-                record,
-                predecessor,
-            } => {
-                super::reject_bootstrap_reflection(
-                    record.access.expose().as_bytes().to_vec(),
-                    &[predecessor.expose(), record.refresh.expose()],
-                )?;
+            Self::Refreshed(record) | Self::RefreshedUnsaved(record) => {
+                if record.expires_at == 0 {
+                    return Err(SourceError::BootstrapReflected);
+                }
             }
         }
         Ok(self)
@@ -126,9 +112,9 @@ impl RefreshResult {
 
     fn record(self) -> OAuth2Record {
         match self {
-            Self::NotDue(record)
-            | Self::Refreshed { record, .. }
-            | Self::RefreshedUnsaved { record, .. } => record,
+            Self::NotDue(record) | Self::Refreshed(record) | Self::RefreshedUnsaved(record) => {
+                record
+            }
         }
     }
 }
@@ -277,9 +263,18 @@ async fn refresh(
     let predecessor = opened.record.refresh;
     let sent_at = now_seconds();
     let replacement = post(&client, &endpoint, &client_id, &predecessor, timeout).await?;
-    let expires_at = sent_at
-        .checked_add(replacement.expires_in.get())
-        .ok_or(SourceError::Malformed)?;
+    let next_refresh = replacement.refresh_token.as_ref().unwrap_or(&predecessor);
+    let reflected = super::bootstrap_reflected(
+        replacement.access_token.expose().as_bytes(),
+        &[predecessor.expose(), next_refresh.expose()],
+    );
+    let expires_at = if reflected {
+        0
+    } else {
+        sent_at
+            .checked_add(replacement.expires_in.get())
+            .ok_or(SourceError::Malformed)?
+    };
     let record = OAuth2Record {
         version: 1,
         access: replacement.access_token,
@@ -310,10 +305,7 @@ async fn refresh(
     .await
     .map_err(|source| classified(SourceError::Internal, &source))?;
     match saved {
-        Ok(()) => Ok(RefreshResult::Refreshed {
-            record,
-            predecessor,
-        }),
+        Ok(()) => Ok(RefreshResult::Refreshed(record)),
         Err(error) => {
             tracing::error!(
                 name: "broker.credential.refresh_save_failed",
@@ -323,10 +315,7 @@ async fn refresh(
                 error = %error.source,
                 "OAuth refresh succeeded but the record could not be saved"
             );
-            Ok(RefreshResult::RefreshedUnsaved {
-                record,
-                predecessor,
-            })
+            Ok(RefreshResult::RefreshedUnsaved(record))
         }
     }
 }
