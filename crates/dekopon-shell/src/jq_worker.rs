@@ -70,7 +70,7 @@ pub(crate) struct WorkerChild(pub(crate) Child);
 
 impl Drop for WorkerChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _kill_result = self.0.kill();
+        let _wait_result = self.0.wait();
     }
 }

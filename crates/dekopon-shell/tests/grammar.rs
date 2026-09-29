@@ -2,7 +2,7 @@ use std::{cell::RefCell, time::Duration};
 
 use serde_json::{Value, json};
 
-use crate::{
+use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
     Interpreter, Limits, ScriptOutcome,
 };
@@ -11,9 +11,17 @@ const PROBE: &str = "probe";
 
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
 
-#[derive(Default)]
-pub(super) struct Fixture {
-    pub(super) calls: RefCell<Vec<(String, Value)>>,
+struct Fixture {
+    calls: RefCell<Vec<(String, Value)>>,
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        worker();
+        Self {
+            calls: RefCell::default(),
+        }
+    }
 }
 
 impl CapabilityInvoker for Fixture {
@@ -99,7 +107,7 @@ impl CapabilityInvoker for Fixture {
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
         if secret_use.is_some() {
-            return crate::secret_use_unsupported();
+            return dekopon_shell::secret_use_unsupported();
         }
         self.calls
             .borrow_mut()
@@ -158,6 +166,12 @@ fn object_from_flags(flags: &[&str]) -> Option<Value> {
         object.insert(key.to_owned(), value);
     }
     Some(Value::Object(object))
+}
+
+fn worker() {
+    let _already_set = dekopon_shell::set_jq_worker_executable(
+        env!("CARGO_BIN_EXE_dekopon-shell-jq-worker").into(),
+    );
 }
 
 fn run(script: &str) -> ScriptOutcome {

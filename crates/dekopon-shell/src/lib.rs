@@ -1,9 +1,7 @@
 //! A sandboxed, bash-flavored scripting language whose commands dispatch to Dekopon capabilities.
 //!
-//! This crate is a pure interpreter library. It has no notion of Wasmtime, provider components, the
-//! broker, HTTP, the filesystem, or the process environment. Everything a script can reach outside
-//! its own value space goes through one seam, [`CapabilityInvoker`], which the embedding binary
-//! implements.
+//! Capability calls go through [`CapabilityInvoker`]. `jq` runs in a worker executable supplied by
+//! the embedder, with an address-space limit on Linux; the worker is killed on deadline or cancel.
 //!
 //! # What this is for
 //!
@@ -11,12 +9,11 @@
 //! a model into many small round trips. A single scripting tool lets a model express a multi-step
 //! plan — loops, conditionals, functions, JSON handling — in one tool call. The "commands" in that
 //! script are builtins and the command words loaded providers contribute, each of which proposes a
-//! capability invocation; none is an operating-system process.
+//! capability invocation; `jq` alone uses a worker process.
 //!
 //! # Safety model
 //!
-//! There is no operating-system sandbox here. This is a native tree-walking evaluator, so every
-//! bound is hand-built in [`limits`]:
+//! The shell is a native tree-walking evaluator, with bounds enforced in [`limits`]:
 //!
 //! - a step budget covering statements, loop iterations, function calls, arithmetic nodes, and
 //!   values pulled from a `jq` filter,
@@ -25,7 +22,8 @@
 //! - a wall-clock deadline, re-read on every step and around every capability call,
 //! - a capability-invocation ceiling that is deliberately separate from the step budget,
 //! - a cumulative ceiling on the value bytes a script may materialize, which is what bounds memory
-//!   for a script that is cheap in steps and expensive in bytes.
+//!   for a script that is cheap in steps and expensive in bytes. `jq` also has a worker address-space
+//!   limit on Linux.
 //!
 //! One bound is *not* in [`limits`], because it applies before any budget exists: the parser caps
 //! grammar nesting depth at a fixed ceiling. Parsing is recursive and runs on the native stack, so
@@ -36,9 +34,7 @@
 //! reads the host process environment — including through `jq`, whose standard library exports an
 //! `env` filter that is deliberately not linked.
 //!
-//! One residual is stated rather than hidden: a `jq` filter that never produces an output cannot be
-//! stopped cooperatively, so one that outlives its script keeps a thread busy. See
-//! [`abandoned_filter_workers`].
+//! A `jq` filter that does not yield is killed with its worker at the deadline or on cancel.
 //!
 //! # Observability
 //!
@@ -116,9 +112,9 @@
 //! }
 //!
 //! let outcome = Interpreter::new(Limits::default())
-//!     .run("probe upper --text hi | jq -r .text", &Fixture);
+//!     .run("probe upper --text hi | cat", &Fixture);
 //! assert_eq!(outcome.exit_code.get(), 0);
-//! assert_eq!(outcome.output, "HI");
+//! assert_eq!(outcome.output, r#"{"text":"HI"}"#);
 //! ```
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]

@@ -15,7 +15,80 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-use crate::{Interpreter, Limits, ScriptOutcome, interp::tests::Fixture};
+use crate::{
+    CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, ScriptOutcome,
+};
+use serde_json::{Value, json};
+
+struct Fixture;
+
+fn proposal(capability: &str) -> CommandRun {
+    CommandRun::Proposed {
+        capability: capability.into(),
+        input: json!({}),
+        secret_use: None,
+    }
+}
+
+impl CapabilityInvoker for Fixture {
+    fn granted(&self) -> Vec<String> {
+        vec![
+            "cli-probe.upper".into(),
+            "provider.broken".into(),
+            "policy.denied".into(),
+        ]
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        vec!["probe".into()]
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if word != "probe" {
+            return None;
+        }
+        let args = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(match args.as_slice() {
+            ["upper", "--text", text] => CommandRun::Proposed {
+                capability: "cli-probe.upper".into(),
+                input: json!({"text": text}),
+                secret_use: None,
+            },
+            ["upper", "-"] => CommandRun::Proposed {
+                capability: "cli-probe.upper".into(),
+                input: json!({"text": stdin}),
+                secret_use: None,
+            },
+            ["broken"] => proposal("provider.broken"),
+            ["denied"] => proposal("policy.denied"),
+            ["ungranted"] => proposal("nothing.granted"),
+            _ => CommandRun::Failed {
+                message: "unknown probe command".into(),
+            },
+        })
+    }
+
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        _: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        match capability {
+            "cli-probe.upper" => CapabilityCallResult::Succeeded(json!({
+                "text": input["text"].as_str().unwrap_or_default().to_uppercase()
+            })),
+            "provider.broken" => CapabilityCallResult::Failed {
+                error: "provider trapped".into(),
+                detail: None,
+            },
+            "policy.denied" => CapabilityCallResult::Denied {
+                reason: "refused".into(),
+            },
+            _ => CapabilityCallResult::NotFound,
+        }
+    }
+}
 
 use super::{CONTROL_WORDS, SCRIPT_SPAN};
 
@@ -139,7 +212,7 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
     let outcome = tracing::subscriber::with_default(subscriber, || {
         let enclosing = enclose.then(|| tracing::info_span!("caller.enclosing"));
         let _entered = enclosing.as_ref().map(tracing::Span::enter);
-        Interpreter::new(limits).run(script, &Fixture::default())
+        Interpreter::new(limits).run(script, &Fixture)
     });
 
     let spans = spans.lock().expect("span lock").clone();
@@ -159,14 +232,14 @@ fn assert_recorded(span: &Captured, field: &str, recorded: &str, total: usize) {
 #[test]
 fn every_command_produces_exactly_one_span() {
     let telemetry =
-        capture("greet() { echo hi; }\ngreet\njq -n 1\nprobe upper --text two\nnosuchcommand\n:");
+        capture("greet() { echo hi; }\ngreet\ntrue\nprobe upper --text two\nnosuchcommand\n:");
 
     assert_eq!(
         telemetry.commands(),
         vec![
             ("builtin", "echo"),
             ("function", "greet"),
-            ("builtin", "jq"),
+            ("builtin", "true"),
             ("provider-command", "probe"),
             ("not-found", "nosuchcommand"),
             ("control", ":"),
@@ -353,11 +426,10 @@ fn a_capability_shaped_word_is_recorded_as_not_found_with_its_arguments() {
 
 #[test]
 fn xargs_records_every_command_it_actually_drove() {
-    let telemetry =
-        capture("probe object --a a --b b --c c | jq '[.a,.b,.c]' | xargs probe upper --text");
+    let telemetry = capture("printf 'a\\nb\\nc' | xargs probe upper --text");
 
     let probes = telemetry.command_spans("probe");
-    assert_eq!(probes.len(), 4, "the producer plus one per element");
+    assert_eq!(probes.len(), 3, "one per element");
     let nested = probes
         .iter()
         .filter(|span| span.parents.iter().any(|parent| parent == "shell.command"))

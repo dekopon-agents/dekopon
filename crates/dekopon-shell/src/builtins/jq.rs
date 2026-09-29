@@ -14,9 +14,9 @@ use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::{
+    CapabilityInvoker,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
     limits::{Budget, LimitExceeded},
-    CapabilityInvoker,
 };
 
 /// env reads the host process environment and now reads the host wall clock; neither is reachable
@@ -63,8 +63,13 @@ impl Builtin for Jq {
             return Err(CommandFailure::usage("jq: a filter argument is required"));
         };
 
-        evaluate(&filter, parse_string_input(input), context.budget, context.invoker)
-            .map(CommandResult::value)
+        evaluate(
+            &filter,
+            parse_string_input(input),
+            context.budget,
+            context.invoker,
+        )
+        .map(CommandResult::value)
     }
 }
 
@@ -86,6 +91,7 @@ fn parse_string_input(input: Option<Value>) -> Value {
 
 enum ReadOutput {
     Value(Value),
+    Done,
     Exhausted,
     Invalid(String),
 }
@@ -125,8 +131,10 @@ fn read_outputs(
         let mut extra = [0];
         if limited.get_mut().read(&mut extra)? != 0 {
             let _sent = sender.send(ReadOutput::Exhausted);
+            return Ok(());
         }
     }
+    let _sent = sender.send(ReadOutput::Done);
     Ok(())
 }
 
@@ -137,18 +145,33 @@ fn collect(
 ) -> Result<Vec<Value>, CommandFailure> {
     let mut outputs = Vec::new();
     loop {
-        let wait = budget.remaining().min(Duration::from_secs(1)).max(Duration::from_millis(1));
+        let wait = budget
+            .remaining()
+            .min(Duration::from_secs(1))
+            .max(Duration::from_millis(1));
         match receiver.recv_timeout(wait) {
             Ok(ReadOutput::Value(value)) => {
                 budget.charge_step_with(invoker)?;
                 budget.charge_value_bytes(weigh(&value))?;
                 outputs.push(value);
             }
-            Ok(ReadOutput::Exhausted) => return Err(LimitExceeded::ValueBytes {
-                maximum: crate::DEFAULT_MAX_VALUE_BYTES,
-            }.into()),
+            Ok(ReadOutput::Exhausted) => {
+                return Err(LimitExceeded::ValueBytes {
+                    maximum: crate::DEFAULT_MAX_VALUE_BYTES,
+                }
+                .into());
+            }
             Ok(ReadOutput::Invalid(message)) => return Err(CommandFailure::failed(message)),
-            Err(RecvTimeoutError::Disconnected) => return Ok(outputs),
+            Ok(ReadOutput::Done) => {
+                if invoker.cancelled() {
+                    return Err(LimitExceeded::Cancelled.into());
+                }
+                budget.check_deadline()?;
+                return Ok(outputs);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CommandFailure::failed("jq: worker output reader stopped"));
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if invoker.cancelled() {
                     return Err(LimitExceeded::Cancelled.into());
@@ -171,7 +194,8 @@ fn evaluate(
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
 ) -> Result<Value, CommandFailure> {
-    let path = executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
+    let path =
+        executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
     let child = Command::new(path)
         .env_clear()
         .env(JQ_WORKER_MARKER, "1")
@@ -181,28 +205,49 @@ fn evaluate(
         .spawn()
         .map_err(|error| CommandFailure::failed(format!("jq: could not start worker: {error}")))?;
     let mut child = WorkerChild(child);
-    let stdin = child.0.stdin.take().ok_or_else(|| CommandFailure::failed("jq: worker stdin missing"))?;
-    let stdout = child.0.stdout.take().ok_or_else(|| CommandFailure::failed("jq: worker stdout missing"))?;
-    let stderr = child.0.stderr.take().ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
+    let stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stdin missing"))?;
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stdout missing"))?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || serde_json::to_writer(stdin, &(filter, input)));
         let errors = scope.spawn(move || {
             let mut stderr = stderr;
             let mut excerpt = String::new();
-            let _ = stderr.by_ref().take(STDERR_BYTES).read_to_string(&mut excerpt);
-            let _ = io::copy(&mut stderr, &mut io::sink());
+            let _excerpt_result = stderr
+                .by_ref()
+                .take(STDERR_BYTES)
+                .read_to_string(&mut excerpt);
+            let _drain_result = io::copy(&mut stderr, &mut io::sink());
             excerpt
         });
         let (sender, receiver) = sync_channel(0);
         let maximum = crate::DEFAULT_MAX_VALUE_BYTES.saturating_sub(budget.value_bytes());
-        let reader = scope.spawn(move || read_outputs(stdout, maximum, &sender));
+        let reader = scope.spawn(move || {
+            if let Err(error) = read_outputs(stdout, maximum, &sender) {
+                let _sent = sender.send(ReadOutput::Invalid(format!(
+                    "jq: could not read worker output: {error}"
+                )));
+            }
+        });
         let result = collect(&receiver, budget, invoker);
         drop(receiver);
         if result.is_err() {
             drop(child);
-            let _ = reader.join();
-            let _ = writer.join();
-            let _ = errors.join();
+            let _reader_result = reader.join();
+            let _writer_result = writer.join();
+            let _stderr_result = errors.join();
             return result.map(reduce);
         }
         let status = child.0.wait();
@@ -210,15 +255,19 @@ fn evaluate(
         let read = reader.join();
         let written = writer.join();
         let stderr = errors.join().unwrap_or_default();
-        let status = status.map_err(|error| CommandFailure::failed(format!("jq: could not wait for worker: {error}")))?;
+        let status = status.map_err(|error| {
+            CommandFailure::failed(format!("jq: could not wait for worker: {error}"))
+        })?;
         if !status.success() {
             return Err(worker_status(status, &stderr));
         }
-        if let Ok(Err(error)) = read {
-            return Err(CommandFailure::failed(format!("jq: could not read worker: {error}")));
+        if read.is_err() {
+            return Err(CommandFailure::failed("jq: worker output reader panicked"));
         }
         if let Ok(Err(error)) = written {
-            return Err(CommandFailure::failed(format!("jq: could not send worker input: {error}")));
+            return Err(CommandFailure::failed(format!(
+                "jq: could not send worker input: {error}"
+            )));
         }
         result.map(reduce)
     })
@@ -232,7 +281,11 @@ fn reduce(outputs: Vec<Value>) -> Value {
     }
 }
 
-pub(crate) fn run_filter(filter: &str, input: Val, output: &mut impl io::Write) -> Result<(), String> {
+pub(crate) fn run_filter(
+    filter: &str,
+    input: Val,
+    output: &mut impl io::Write,
+) -> Result<(), String> {
     let definitions = jaq_core::defs()
         .chain(jaq_std::defs())
         .chain(jaq_json::defs());
@@ -262,14 +315,14 @@ pub(crate) fn run_filter(filter: &str, input: Val, output: &mut impl io::Write) 
         let value = convert(&produced, 0)?;
         serde_json::to_writer(&mut *output, &value)
             .map_err(|error| format!("jq: could not write output: {error}"))?;
-        output.write_all(b"\n")
+        output
+            .write_all(b"\n")
             .map_err(|error| format!("jq: could not write output: {error}"))?;
     }
     Ok(())
 }
 
-/// Stands in for jaq_core::unwrap_valr, which calls process::exit on halt; here that would kill the
-/// whole gateway, so a halt becomes an ordinary jq failure instead.
+/// jaq_core::unwrap_valr calls process::exit on halt; the worker must report the halt as a failure.
 fn describe_exception(exception: Exn<'_, Val>) -> String {
     match exception.get_err() {
         Ok(error) => format!("jq: {error}"),
@@ -282,7 +335,7 @@ fn describe_exception(exception: Exn<'_, Val>) -> String {
 
 /// Matches serde_json's own nesting ceiling; without it a filter like
 /// `reduce range(100000) as $i (.;[.])` recurses once per level in convert and can abort the
-/// host process.
+/// worker before reporting a jq failure.
 const MAX_OUTPUT_DEPTH: usize = 128;
 
 /// jaq's value type is a JSON superset (byte strings, non-string keys, NaN) that its own writer
@@ -403,330 +456,4 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
         .map(|(symbol, undefined)| format!("undefined {} {symbol:?}", undefined.as_str()))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
-
-    use serde_json::{Value, json};
-
-    use crate::limits::{Budget, Limits};
-
-    use super::{
-        CommandFailure, MAX_ABANDONED_WORKERS, MAX_OUTPUT_DEPTH, TOTAL_ABANDONMENTS, Worker,
-        abandoned_workers, admit, evaluate, workers_spawned,
-    };
-
-    fn filter(filter: &str, input: Value) -> Result<Value, CommandFailure> {
-        evaluate(filter, input, &mut Budget::start(Limits::default()))
-    }
-
-    fn message(failure: CommandFailure) -> String {
-        match failure {
-            CommandFailure::Status { message, .. } => message,
-            CommandFailure::Fatal(fatal) => format!("{fatal:?}"),
-        }
-    }
-
-    #[test]
-    fn evaluates_real_jq_filters() {
-        assert_eq!(
-            filter(".a", json!({"a": 1})).expect("filter runs"),
-            json!(1)
-        );
-        assert_eq!(
-            filter("map(. * 2)", json!([1, 2, 3])).expect("filter runs"),
-            json!([2, 4, 6])
-        );
-        assert_eq!(
-            filter(
-                "{name: .id, total: (.items | length)}",
-                json!({"id": "x", "items": [1, 2]})
-            )
-            .expect("filter runs"),
-            json!({"name": "x", "total": 2})
-        );
-    }
-
-    #[test]
-    fn a_thread_reuses_its_filter_worker() {
-        for _ in 0..8 {
-            assert_eq!(
-                filter(".a", json!({"a": 1})).expect("filter runs"),
-                json!(1)
-            );
-        }
-        assert_eq!(workers_spawned(), 1);
-    }
-
-    #[test]
-    fn an_abandoned_worker_is_replaced_instead_of_being_handed_the_next_filter() {
-        assert_eq!(filter(".", json!(1)).expect("filter runs"), json!(1));
-        assert_eq!(workers_spawned(), 1);
-
-        let mut budget = Budget::start(Limits {
-            max_steps: 4,
-            ..Limits::default()
-        });
-        evaluate("range(1000000)", json!(null), &mut budget)
-            .expect_err("a long stream exhausts the budget");
-
-        assert_eq!(filter(".", json!(2)).expect("filter runs"), json!(2));
-        assert_eq!(workers_spawned(), 2);
-    }
-
-    #[test]
-    fn numbers_keep_the_values_the_json_boundary_used_to_give_them() {
-        assert_eq!(filter(".a", json!({"a": 1})).expect("runs"), json!(1));
-        assert_eq!(filter(".a", json!({"a": -7})).expect("runs"), json!(-7));
-        assert_eq!(filter(".a", json!({"a": 1.5})).expect("runs"), json!(1.5));
-        assert_eq!(filter(".a", json!({"a": 1.0})).expect("runs"), json!(1.0));
-        assert_eq!(filter("1 + 1", Value::Null).expect("runs"), json!(2));
-        assert_eq!(filter("3 / 2", Value::Null).expect("runs"), json!(1.5));
-        assert_eq!(filter("1.50", Value::Null).expect("runs"), json!(1.5));
-        assert_eq!(filter("1e3", Value::Null).expect("runs"), json!(1000.0));
-        assert_eq!(
-            filter("10000000000000000000 + 1", Value::Null).expect("runs"),
-            json!(10_000_000_000_000_000_001_u64)
-        );
-        assert_eq!(
-            filter("pow(2; 70)", Value::Null).expect("runs"),
-            json!(2f64.powi(70))
-        );
-        assert_eq!(filter("null", Value::Null).expect("runs"), Value::Null);
-        assert_eq!(filter("true", Value::Null).expect("runs"), json!(true));
-        assert_eq!(
-            filter(".s", json!({"s": "text"})).expect("runs"),
-            json!("text")
-        );
-        assert_eq!(
-            filter(".", json!({"a": {"b": [1, {"c": null}]}})).expect("runs"),
-            json!({"a": {"b": [1, {"c": null}]}})
-        );
-    }
-
-    #[test]
-    fn a_value_json_has_no_form_for_is_refused_rather_than_invented() {
-        for (source, expected) in [
-            ("nan", "NaN"),
-            ("infinite", "Infinity"),
-            (r#""a" | tobytes"#, "a byte string"),
-            ("{(1): 2}", "an object with a non-string key"),
-        ] {
-            let failure = filter(source, Value::Null).expect_err(source);
-            let message = message(failure);
-            assert!(message.starts_with("jq: a filter produced"), "{message}");
-            assert!(message.contains(expected), "{source}: {message}");
-        }
-    }
-
-    #[test]
-    fn output_nesting_is_bounded_the_way_parsing_it_used_to_be() {
-        let deep = format!("reduce range({}) as $i (.; [.])", MAX_OUTPUT_DEPTH + 10);
-        let failure = filter(&deep, Value::Null).expect_err("an over-nested output is refused");
-        let message = message(failure);
-        assert!(message.contains("nested deeper"), "{message}");
-        let allowed = format!(
-            "reduce range({}) as $i (.; [.]) | flatten | length",
-            MAX_OUTPUT_DEPTH - 1
-        );
-        assert_eq!(filter(&allowed, Value::Null).expect("runs"), json!(1));
-    }
-
-    #[test]
-    fn standard_library_functions_are_available() {
-        assert_eq!(
-            filter("[.[] | select(. > 1)] | sort | reverse", json!([3, 1, 2]))
-                .expect("filter runs"),
-            json!([3, 2])
-        );
-        assert_eq!(
-            filter("to_entries | map(.key) | sort", json!({"b": 2, "a": 1})).expect("filter runs"),
-            json!(["a", "b"])
-        );
-    }
-
-    #[test]
-    fn host_reaching_standard_library_filters_are_not_linked() {
-        assert!(std::env::var_os("PATH").is_some(), "PATH must be set here");
-        for source in ["env", "env.PATH", "env|keys", "now"] {
-            let failure = filter(source, json!({})).expect_err(source);
-            let message = message(failure);
-            assert!(message.contains("undefined"), "{source}: {message}");
-        }
-        assert_eq!(
-            filter("ltrimstr(\"a\")", json!("abc")).expect("filter runs"),
-            json!("bc")
-        );
-    }
-
-    #[test]
-    fn halt_fails_the_command_instead_of_exiting_the_process() {
-        for source in ["halt", "halt(3)", "\"x\" | halt_error", "1, halt, 2"] {
-            let message = message(filter(source, json!({})).expect_err(source));
-            assert!(message.contains("halt("), "{source}: {message}");
-        }
-    }
-
-    #[test]
-    fn a_multi_output_filter_becomes_an_array() {
-        assert_eq!(
-            filter(".[]", json!([1, 2, 3])).expect("filter runs"),
-            json!([1, 2, 3])
-        );
-    }
-
-    #[test]
-    fn an_empty_stream_becomes_null() {
-        assert_eq!(filter("empty", json!(1)).expect("filter runs"), Value::Null);
-    }
-
-    #[test]
-    fn a_streaming_filter_is_charged_against_the_step_budget() {
-        let mut budget = Budget::start(Limits {
-            max_steps: 16,
-            ..Limits::default()
-        });
-        let failure = evaluate("range(1000000)", json!(null), &mut budget)
-            .expect_err("a long stream exhausts the budget");
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-        assert!(budget.steps() <= 17, "{}", budget.steps());
-    }
-
-    #[test]
-    fn a_filter_that_never_yields_is_stopped_by_the_deadline_and_counted() {
-        let abandonments = TOTAL_ABANDONMENTS.load(Ordering::SeqCst);
-        let mut budget = Budget::start(Limits {
-            timeout: std::time::Duration::from_millis(50),
-            ..Limits::default()
-        });
-        let started = std::time::Instant::now();
-        let failure = evaluate("def f: f; f", json!(1), &mut budget)
-            .expect_err("a non-terminating filter trips the deadline");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-        assert!(message(failure).contains("Deadline"));
-
-        assert!(TOTAL_ABANDONMENTS.load(Ordering::SeqCst) > abandonments);
-        assert!(abandoned_workers() >= 1);
-    }
-
-    #[test]
-    fn a_saturated_process_refuses_to_start_another_filter() {
-        assert!(admit(MAX_ABANDONED_WORKERS - 1).is_ok());
-        let failure = admit(MAX_ABANDONED_WORKERS).expect_err("a saturated process refuses");
-        assert!(
-            matches!(failure, CommandFailure::Status { .. }),
-            "the script continues; only this filter is refused: {failure:?}"
-        );
-        let message = message(failure);
-        assert!(
-            message.contains("refusing to start another filter"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn an_abandoned_worker_stops_counting_once_it_finally_returns() {
-        let worker = Worker::new();
-        assert!(worker.abandon().is_some());
-        assert!(
-            worker.finish(),
-            "returning releases the abandonment it was charged"
-        );
-    }
-
-    #[test]
-    fn a_worker_that_finished_first_is_not_counted_as_abandoned() {
-        let worker = Worker::new();
-        assert!(!worker.finish());
-        assert!(worker.abandon().is_none());
-    }
-
-    #[test]
-    fn a_filter_cannot_outgrow_the_value_byte_ceiling() {
-        let mut budget = Budget::start(Limits {
-            max_value_bytes: 1_024,
-            ..Limits::default()
-        });
-        let failure = evaluate("range(100000) | tostring", json!(null), &mut budget)
-            .expect_err("an oversized stream trips the value ceiling");
-        assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
-    }
-
-    #[test]
-    fn raw_and_compact_flags_are_accepted_because_they_match_the_only_output_mode() {
-        use crate::builtins::test_support::run_builtin;
-
-        for flags in [
-            vec!["-r", ".a"],
-            vec!["-c", ".a"],
-            vec!["--raw-output", ".a"],
-            vec!["--compact-output", ".a"],
-        ] {
-            let result = run_builtin(&super::Jq, &flags, Some(json!({"a": "x"})))
-                .expect("documented output flags are accepted");
-            assert_eq!(result.value, json!("x"), "{flags:?}");
-        }
-        assert!(run_builtin(&super::Jq, &["--slurp", "."], Some(json!(1))).is_err());
-    }
-
-    #[test]
-    fn a_piped_string_holding_json_text_is_parsed_before_filtering() {
-        use crate::builtins::test_support::run_builtin;
-
-        // `result=$(gh pr list …)` captures the object; `echo "$result" | jq …` is what
-        // stringifies it into display text, and the builtin should parse that text back
-        // rather than index it as a string.
-        let captured = json!({"page": 2, "pullRequests": [{"author": "xrl"}]}).to_string();
-        let result = run_builtin(
-            &super::Jq,
-            &[".pullRequests[0].author"],
-            Some(json!(captured)),
-        )
-        .expect("the captured JSON text is parsed, not indexed as a string");
-        assert_eq!(result.value, json!("xrl"));
-
-        // Text that isn't JSON is still indexed as a string value.
-        assert_eq!(
-            run_builtin(&super::Jq, &["ltrimstr(\"a\")"], Some(json!("abc")))
-                .expect("non-JSON text still indexes as a string")
-                .value,
-            json!("bc")
-        );
-    }
-
-    #[test]
-    fn a_piped_string_holding_a_json_scalar_is_still_indexed_as_a_string() {
-        use crate::builtins::test_support::run_builtin;
-
-        // Only an object or array is substituted for its parse: this crate parses without
-        // `arbitrary_precision`, so promoting a scalar would round a decimal-seconds Slack
-        // timestamp like the last case to a lossy f64, and would break a string-only filter
-        // (`test(...)`, `ltrimstr`, ...) built for what stays a string.
-        for source in ["123", "true", "null", "1727400000.123450"] {
-            let result = run_builtin(&super::Jq, &["."], Some(json!(source)))
-                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
-            assert_eq!(result.value, json!(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn invalid_filters_report_an_error_instead_of_panicking() {
-        let error = message(filter(".[", json!({})).expect_err("unbalanced filter"));
-        assert!(error.starts_with("jq: invalid filter"), "{error}");
-        let error = message(filter("no_such_function", json!({})).expect_err("undefined filter"));
-        assert!(error.contains("undefined"), "{error}");
-    }
-
-    #[test]
-    fn runtime_errors_are_reported_not_fatal() {
-        let failure = filter(".a", json!([1, 2])).expect_err("indexing an array by name fails");
-        assert!(
-            matches!(failure, CommandFailure::Status { .. }),
-            "{failure:?}"
-        );
-        assert!(message(failure).starts_with("jq:"));
-    }
 }
