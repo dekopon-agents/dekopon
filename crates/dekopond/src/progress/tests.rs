@@ -560,7 +560,7 @@ async fn producer_events(
         let leg = BrokerLeg::connect(client, None)
             .await
             .unwrap()
-            .with_progress(sink, 1)
+            .with_progress(sink, dekopon_shell::CallBudget::new(1))
             .with_progress_notes();
         leg.note(text, eta);
         if let Some(word) = command {

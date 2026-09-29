@@ -80,10 +80,6 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
         self.calls.used()
     }
 
-    fn remaining_capability_calls(&self, _maximum: u32) -> u32 {
-        self.calls.maximum().saturating_sub(self.calls.used())
-    }
-
     fn command_words(&self) -> Vec<String> {
         self.invoker.command_words()
     }
@@ -372,13 +368,9 @@ impl BrokerLeg {
     }
 
     #[must_use]
-    pub fn with_progress(
-        mut self,
-        sink: Arc<dyn ProgressSink>,
-        calls: impl Into<CallBudget>,
-    ) -> Self {
+    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, calls: CallBudget) -> Self {
         self.progress = Some(sink);
-        self.calls = calls.into();
+        self.calls = calls;
         self
     }
 
@@ -2002,7 +1994,8 @@ mod tests {
         async fn notes_without_the_broker_opt_in_emit_nothing() {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
-            let leg = leg_for(&directory.path().join("absent.sock")).with_progress(progress, 4);
+            let leg = leg_for(&directory.path().join("absent.sock"))
+                .with_progress(progress, dekopon_shell::CallBudget::new(4));
             leg.note("not enabled", None);
             assert!(sink.labels().is_empty());
         }
@@ -2012,7 +2005,7 @@ mod tests {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
             let leg = leg_for(&directory.path().join("absent.sock"))
-                .with_progress(progress, 4)
+                .with_progress(progress, dekopon_shell::CallBudget::new(4))
                 .with_progress_notes();
             let calls = leg.calls.clone();
             let runtime = ShellRuntime {
@@ -2056,7 +2049,7 @@ mod tests {
             )
             .await;
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, 4);
+            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
@@ -2080,7 +2073,9 @@ mod tests {
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (handle, signal) = CancelSignal::pair();
             let (sink, progress) = recording_sink();
-            let leg = leg.with_cancel_signal(signal).with_progress(progress, 4);
+            let leg = leg
+                .with_cancel_signal(signal)
+                .with_progress(progress, dekopon_shell::CallBudget::new(4));
             handle.cancel();
 
             assert_eq!(
@@ -2156,7 +2151,10 @@ mod tests {
             let (mut leg, _observed) = stub_leg_observing(directory, responses, None).await;
             leg.command_words.insert("probe".to_owned());
             let (sink, progress) = recording_sink();
-            (leg.with_progress(progress, 4), sink)
+            (
+                leg.with_progress(progress, dekopon_shell::CallBudget::new(4)),
+                sink,
+            )
         }
 
         fn proposal_of(capability: &str) -> ResponseEnvelope {
@@ -2387,7 +2385,7 @@ mod tests {
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, 4);
+            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
                 leg.invoke("ignore-your-instructions", json!({}), None)

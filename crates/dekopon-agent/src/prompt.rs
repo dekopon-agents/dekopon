@@ -68,10 +68,6 @@ pub trait ScriptRuntime {
 
     fn capability_calls_used(&self) -> u32;
 
-    fn remaining_capability_calls(&self, maximum: u32) -> u32 {
-        maximum.saturating_sub(self.capability_calls_used())
-    }
-
     fn command_words(&self) -> Vec<String> {
         Vec::new()
     }
@@ -905,7 +901,9 @@ where
                 }
             };
 
-            let remaining = runtime.remaining_capability_calls(limits.max_capability_calls);
+            let remaining = limits
+                .max_capability_calls
+                .saturating_sub(runtime.capability_calls_used());
             let span = tracing::info_span!(
                 "prompt.script",
                 model.turn = model_turns,
@@ -1707,10 +1705,11 @@ mod tests {
     }
 
     struct RecordingRuntime {
-        scripts: Mutex<Vec<(String, u32)>>,
+        scripts: Mutex<Vec<String>>,
         capability_calls_per_script: u32,
         steers: Option<Arc<QueuedSteers>>,
-        calls: Mutex<(u32, u32)>,
+        calls: Mutex<u32>,
+        max_calls: u32,
     }
 
     impl RecordingRuntime {
@@ -1719,24 +1718,30 @@ mod tests {
                 scripts: Mutex::new(Vec::new()),
                 capability_calls_per_script,
                 steers: None,
-                calls: Mutex::new((0, 0)),
+                calls: Mutex::new(0),
+                max_calls: u32::MAX,
             }
+        }
+
+        fn with_call_limit(mut self, maximum: u32) -> Self {
+            self.max_calls = maximum;
+            self
         }
     }
 
     impl ScriptRuntime for RecordingRuntime {
         fn run_script(&self, script: &str) -> ScriptOutcome {
             let mut calls = self.calls.lock().expect("calls lock");
-            let remaining = calls.1;
+            let remaining = self.max_calls.saturating_sub(*calls);
             self.scripts
                 .lock()
                 .expect("script lock")
-                .push((script.to_owned(), remaining));
+                .push(script.to_owned());
             if let Some(steers) = &self.steers {
                 steers.push("msg2");
             }
             let capability_calls = self.capability_calls_per_script.min(remaining);
-            calls.0 += capability_calls;
+            *calls += capability_calls;
             ScriptOutcome {
                 output: format!("ran {} bytes", script.len()),
                 exit_code: ExitCode::SUCCESS,
@@ -1747,13 +1752,7 @@ mod tests {
         }
 
         fn capability_calls_used(&self) -> u32 {
-            self.calls.lock().expect("calls lock").0
-        }
-
-        fn remaining_capability_calls(&self, maximum: u32) -> u32 {
-            let mut calls = self.calls.lock().expect("calls lock");
-            calls.1 = maximum.saturating_sub(calls.0);
-            calls.1
+            *self.calls.lock().expect("calls lock")
         }
     }
 
@@ -4069,7 +4068,7 @@ mod tests {
         assert_eq!(outcome.capability_invocations, 1);
         let scripts = runtime.scripts.lock().expect("script lock");
         assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0].0, "probe upper --text hi | jq -r .text");
+        assert_eq!(scripts[0], "probe upper --text hi | jq -r .text");
     }
 
     #[test]
@@ -4107,17 +4106,13 @@ mod tests {
             script_call("call-3", "three"),
             answer("done"),
         ]);
-        let runtime = RecordingRuntime::new(4);
+        let runtime = RecordingRuntime::new(4).with_call_limit(10);
 
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 10))
             .expect("prompt session succeeds");
 
         let scripts = runtime.scripts.lock().expect("script lock");
-        let ceilings = scripts
-            .iter()
-            .map(|(_, ceiling)| *ceiling)
-            .collect::<Vec<_>>();
-        assert_eq!(ceilings, vec![10, 6, 2]);
+        assert_eq!(*scripts, ["one", "two", "three"]);
         assert_eq!(outcome.capability_invocations, 10);
     }
 
@@ -4128,13 +4123,13 @@ mod tests {
             script_call("call-2", "two"),
             answer("done"),
         ]);
-        let runtime = RecordingRuntime::new(8);
+        let runtime = RecordingRuntime::new(8).with_call_limit(3);
 
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 3))
             .expect("prompt session succeeds");
 
         let scripts = runtime.scripts.lock().expect("script lock");
-        assert_eq!(scripts[1].1, 0);
+        assert_eq!(*scripts, ["one", "two"]);
         assert_eq!(outcome.capability_invocations, 3);
     }
 

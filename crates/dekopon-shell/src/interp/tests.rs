@@ -1569,7 +1569,9 @@ fn the_capability_call_cap_is_independent_of_the_step_budget() {
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert_eq!(outcome.capability_calls, 2);
     assert!(
-        outcome.output.contains("more than 2 capability calls"),
+        outcome
+            .output
+            .contains("turn's capability-call budget of 2 is spent"),
         "{}",
         outcome.output
     );

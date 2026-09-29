@@ -52,7 +52,6 @@ pub enum LimitExceeded {
 pub struct Budget {
     limits: Limits,
     tree: TreeContext,
-    cancelled: bool,
     steps: u64,
     depth: u32,
     value_bytes: u64,
@@ -72,7 +71,6 @@ impl Budget {
         Self {
             limits,
             tree,
-            cancelled: false,
             steps: 0,
             depth: 0,
             value_bytes: 0,
@@ -83,15 +81,10 @@ impl Budget {
         &mut self,
         invoker: &dyn CapabilityInvoker,
     ) -> Result<(), LimitExceeded> {
-        self.cancelled = invoker.cancelled();
-        self.charge_step()
-    }
-
-    pub fn check_cancelled(&self, invoker: &dyn CapabilityInvoker) -> Result<(), LimitExceeded> {
         if invoker.cancelled() {
             Err(LimitExceeded::Cancelled)
         } else {
-            Ok(())
+            self.charge_step()
         }
     }
 
@@ -99,9 +92,6 @@ impl Budget {
     /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
     /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
-        if self.cancelled {
-            return Err(LimitExceeded::Cancelled);
-        }
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.limits.max_steps {
             return Err(LimitExceeded::Steps {

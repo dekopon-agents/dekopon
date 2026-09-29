@@ -45,12 +45,6 @@ impl CallBudget {
     }
 }
 
-impl From<u32> for CallBudget {
-    fn from(maximum: u32) -> Self {
-        Self::new(maximum)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TreeContext {
     deadline: Instant,
@@ -70,7 +64,7 @@ impl TreeContext {
     }
 
     pub(crate) fn check_deadline(&self) -> Result<(), LimitExceeded> {
-        if Instant::now() > self.deadline {
+        if Instant::now() >= self.deadline {
             Err(LimitExceeded::Deadline {
                 timeout_ms: self.timeout.as_millis(),
             })

@@ -271,7 +271,7 @@ impl Evaluator<'_> {
                 format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline")
             }
             FatalError::Limit(LimitExceeded::CapabilityCalls { maximum }) => {
-                format!("dekopon-shell: script tried to make more than {maximum} capability calls")
+                format!("dekopon-shell: the turn's capability-call budget of {maximum} is spent")
             }
             FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
                 "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
