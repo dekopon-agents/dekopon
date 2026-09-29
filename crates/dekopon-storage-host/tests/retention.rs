@@ -37,7 +37,10 @@ fn request(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn request_at(
     scope: StorageScope,
     subject: &str,

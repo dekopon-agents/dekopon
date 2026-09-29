@@ -179,7 +179,10 @@ struct QueuedDelivery {
 impl WhatsappTransport {
     /// An empty app secret would be an HMAC key anyone can guess, so every credential must arrive
     /// non-empty.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn new(
         name: String,
         bind: std::net::SocketAddr,

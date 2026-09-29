@@ -742,7 +742,10 @@ impl MapResolver {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn vault_read(
         &self,
         client: &reqwest::Client,
@@ -819,7 +822,10 @@ impl MapResolver {
         bounded_json(request, timeout_ms).await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn aws_post(
         &self,
         client: &reqwest::Client,
@@ -2291,10 +2297,7 @@ secrets:
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
+    #[expect(clippy::too_many_lines, reason = "one long test scenario")]
     async fn remote_adapters_decode_their_native_response_shapes() {
         let directory = tempfile::tempdir().expect("tempdir");
         let token = directory.path().join("token");

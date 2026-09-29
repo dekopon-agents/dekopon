@@ -147,7 +147,10 @@ impl fmt::Debug for StorageGrantRequest {
 }
 
 impl StorageGrantRequest {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn new(
         invocation: InvocationId,
         capability: CapabilityId,
