@@ -8,6 +8,12 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Compiled-cache index misses with existing objects (0.28.1)
+
+No configuration or cache migration is needed; swap the broker binary. An index miss now
+verifies and reuses an existing compiled object with the same digest instead of failing during
+publication. A mismatched object still stops startup with the cache-reset instructions.
+
 ## Guest memory charged on growth; `oauth2Refresh` (0.28.0)
 
 Existing 0.27.0 configurations need no edits.

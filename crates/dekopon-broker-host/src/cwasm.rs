@@ -121,16 +121,26 @@ impl Cache {
                     bytes: artifact.bytes,
                 };
                 let object = self.object(&entry);
+                let existing = object.exists();
+                if existing {
+                    stage("verify", entry.bytes, || verify(&object, &entry)).map_err(|error| {
+                        error.context(format!(
+                            "compiled artifact {} cannot be reused; stop its users and remove the cwasm directory, or set compileOnLoad: true",
+                            object.display()
+                        ))
+                    })?;
+                }
                 stage("publish", entry.bytes, || {
-                    fs::create_dir_all(self.root.join("sha256"))?;
                     fs::create_dir_all(self.root.join(&self.engine_key))?;
-                    ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
-                    publish(&object, &compiled)?;
+                    if !existing {
+                        fs::create_dir_all(self.root.join("sha256"))?;
+                        ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
+                        publish(&object, &compiled)?;
+                    }
                     publish(&index, &serde_json::to_vec(&entry)?)
                 })?;
                 drop(compiled);
-                // No second verification pass runs on a cold miss, since these exact bytes were
-                // just hashed and published locally; warm boots stream-verify instead.
+                // An existing object was verified above; a freshly published object needs no second pass.
                 return self.map(engine, entry, &mut loaded);
             }
             Err(error) => {
@@ -388,6 +398,51 @@ mod tests {
             format!("{error:#}").contains("length mismatch"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn missing_index_reuses_verified_object_and_republishes_index() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Engine::default();
+        let (index, object) = populate(directory.path(), &engine);
+        fs::remove_file(&index).expect("remove index");
+        let source = identify_bytes(EMPTY_COMPONENT);
+        Cache::new(directory.path().to_owned(), &engine)
+            .load(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("load existing object");
+        assert!(index.is_file());
+        let entry: Entry =
+            serde_json::from_slice(&fs::read(&index).expect("index")).expect("entry");
+        assert_eq!(
+            object,
+            Cache::new(directory.path().to_owned(), &engine).object(&entry)
+        );
+    }
+
+    #[test]
+    fn missing_index_refuses_mismatched_object_with_reset_path() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Engine::default();
+        let (index, object) = populate(directory.path(), &engine);
+        fs::remove_file(&index).expect("remove index");
+        let mut damaged = fs::read(&object).expect("compiled bytes");
+        damaged[0] ^= 1;
+        fs::write(&object, &damaged).expect("corrupt unmapped object");
+        let source = identify_bytes(EMPTY_COMPONENT);
+        let error = Cache::new(directory.path().to_owned(), &engine)
+            .load(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect_err("mismatched object");
+        let message = format!("{error:#}");
+        assert!(message.contains(&object.display().to_string()), "{message}");
+        assert!(message.contains("SHA-256 mismatch"), "{message}");
+        assert!(
+            message.contains(
+                "stop its users and remove the cwasm directory, or set compileOnLoad: true"
+            ),
+            "{message}"
+        );
+        assert!(!index.exists());
+        assert_eq!(fs::read(&object).expect("unchanged object"), damaged);
     }
 
     #[test]
