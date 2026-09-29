@@ -121,7 +121,13 @@ impl Cache {
                     bytes: artifact.bytes,
                 };
                 let object = self.object(&entry);
-                let existing = object.exists();
+                // An engine-key change can compile bytes another index already published.
+                let existing = object.try_exists().map_err(|error| {
+                    wasmtime::Error::msg(format!(
+                        "stat compiled artifact {}: {error}",
+                        object.display()
+                    ))
+                })?;
                 if existing {
                     stage("verify", entry.bytes, || verify(&object, &entry)).map_err(|error| {
                         error.context(format!(
@@ -140,7 +146,6 @@ impl Cache {
                     publish(&index, &serde_json::to_vec(&entry)?)
                 })?;
                 drop(compiled);
-                // An existing object was verified above; a freshly published object needs no second pass.
                 return self.map(engine, entry, &mut loaded);
             }
             Err(error) => {

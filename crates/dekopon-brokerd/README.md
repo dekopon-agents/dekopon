@@ -584,9 +584,10 @@ hostLimits:
 
 Managed providers default to immutable, file-backed compiled components under
 `providerSet.storePath/cwasm/v1`. A missing source/engine index compiles the verified Wasm once,
-atomically publishes a raw `.cwasm` named by its own SHA-256, then maps it with Wasmtime. Warm
-startup stream-verifies each selected compiled artifact's length and SHA-256 once, checks engine
-compatibility, and maps it without decompression or a whole-file buffer. Calls reuse the retained
+atomically publishes a raw `.cwasm` named by its own SHA-256, then maps it with Wasmtime. If that
+object already exists, the miss stream-verifies and reuses it instead, and also records `verify`.
+Warm startup stream-verifies each selected compiled artifact's length and SHA-256 once, checks
+engine compatibility, and maps it without decompression or a whole-file buffer. Calls reuse the retained
 component; they neither hash nor reopen it. Source Wasm is still checked against the provider lock
 at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine compatibility
 fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
