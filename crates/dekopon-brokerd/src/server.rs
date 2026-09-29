@@ -286,6 +286,10 @@ fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn handle<A>(
     stream: UnixStream,
     broker: &Broker<A>,

@@ -101,6 +101,10 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn audit_records(captured: &CaptureLayer) -> Vec<(String, Option<String>)> {
     captured
         .records()

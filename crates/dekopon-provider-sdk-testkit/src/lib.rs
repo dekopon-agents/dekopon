@@ -134,6 +134,10 @@ impl FakeBrokerError {
     /// Asserting on the code is the difference between "the provider refused this for the reason
     /// it documents" and "something, somewhere, went wrong".
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn provider_failure(&self) -> Option<(&str, &str)> {
         let Self::Invocation(failure) = self else {
             return None;

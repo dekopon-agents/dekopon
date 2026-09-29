@@ -376,6 +376,10 @@ impl Evaluator<'_> {
             .map_or(&[][..], |frame| frame.positional.as_slice())
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn execute_program(&mut self, program: &Program) -> Result<Flow, FatalError> {
         for statement in &program.statements {
             match self.execute_statement(statement)? {
@@ -489,6 +493,10 @@ impl Evaluator<'_> {
         Ok(Flow::Normal)
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn execute_for(&mut self, statement: &ForLoop) -> Result<Flow, FatalError> {
         let mut items = Vec::new();
         for word in &statement.words {
@@ -527,6 +535,10 @@ impl Evaluator<'_> {
         Ok(Flow::Normal)
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn execute_while(&mut self, statement: &WhileLoop) -> Result<Flow, FatalError> {
         let mut body_status = ExitCode::SUCCESS;
         loop {
@@ -818,6 +830,10 @@ impl Evaluator<'_> {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn execute_compound_command(
         &mut self,
         statement: &Statement,
@@ -1551,6 +1567,10 @@ impl Evaluator<'_> {
     /// Assigning a variable from a whole command substitution or another whole variable keeps its
     /// structured value instead of flattening it to text, a deliberate deviation from real shells
     /// that lets a script later index into what it captured.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if word.parts.is_empty() {
@@ -1618,6 +1638,10 @@ impl Evaluator<'_> {
         Ok(self.expand_quoted_fields(parts)?.join(" "))
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
         let mut fields = vec![String::new()];
         for part in parts {
@@ -1903,6 +1927,10 @@ impl Evaluator<'_> {
         Ok((value, status))
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
         self.budget.charge_step()?;
         Ok(match expression {
@@ -1954,6 +1982,10 @@ impl Evaluator<'_> {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn splits_inside_quotes(parameter: &Parameter) -> bool {
     match parameter {
         Parameter::AllPositional => true,
@@ -1992,6 +2024,10 @@ fn unsupported_option(message: impl Into<String>) -> CommandFailure {
     CommandFailure::Fatal(FatalError::Unsupported(message.into()))
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn parameter_length(value: &Value) -> Value {
     match value {
         Value::Null => Value::from(0),
@@ -2139,6 +2175,10 @@ fn append(fields: &mut Vec<String>, text: &str) {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn spread(fields: &mut Vec<String>, value: &Value) -> bool {
     match value {
         Value::Array(items) => {
@@ -2164,6 +2204,10 @@ fn spread(fields: &mut Vec<String>, value: &Value) -> bool {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn quoted_text(value: &Value) -> String {
     match value {
         Value::Array(items) => items.iter().map(display).collect::<Vec<_>>().join(" "),
@@ -2206,6 +2250,10 @@ fn render_number(number: Number) -> String {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn to_number(value: &Value) -> Number {
     match value {
         Value::Number(number) => number.as_i64().map_or_else(
@@ -2224,6 +2272,10 @@ fn to_number(value: &Value) -> Number {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn arithmetic(
     operator: ArithBinaryOp,
     left: Number,

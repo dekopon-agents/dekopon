@@ -970,6 +970,10 @@ impl BufferedHttpClient {
         result.map(|(response, _bytes)| response)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn prepare(
         &mut self,
         request: Request,

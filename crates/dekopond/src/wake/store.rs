@@ -418,6 +418,10 @@ impl From<&Wake> for Line {
 }
 
 impl Line {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn wake(self) -> Option<Wake> {
         Some(Wake {
             id: WakeId(self.id),

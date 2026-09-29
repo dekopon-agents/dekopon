@@ -719,6 +719,10 @@ pub mod broker {
             Self { _private: () }
         }
 
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "reshaped by the unit that next rewrites this"
+        )]
         pub fn authorize(
             &self,
             proposal: ProposedInvocation,

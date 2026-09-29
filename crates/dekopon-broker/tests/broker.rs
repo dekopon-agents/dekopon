@@ -677,6 +677,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails() {
     use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
 
@@ -1502,6 +1503,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_it() {
     const DEFAULT_SECRET: &str = "dekopon-agents-token";
     const OVERRIDE_SECRET: &str = "scientist-hq-token";
@@ -2553,6 +2555,10 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broker() {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],

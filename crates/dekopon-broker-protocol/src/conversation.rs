@@ -93,6 +93,10 @@ impl Conversation {
     /// Slack ids skip the leading-letter check because multi-person DMs are G-prefixed on old
     /// workspaces and C-prefixed on new ones, so a strict prefix rule would reject real traffic.
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn is_canonical_for(&self, kind: ChatTransportKind, subject: &ExternalSubject) -> bool {
         if !self.is_bounded() || !kind.produces(self.kind) {
             return false;

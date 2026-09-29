@@ -1494,6 +1494,10 @@ impl BrokerClient {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn validate_response_descriptors(
     response: &BrokerResponse,
     count: usize,
@@ -1597,6 +1601,10 @@ impl fmt::Display for ExchangePhase {
 #[cfg(unix)]
 impl ClientError {
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn may_have_executed(&self) -> bool {
         match self {
             Self::Protocol { phase, .. } => *phase == ExchangePhase::Response,

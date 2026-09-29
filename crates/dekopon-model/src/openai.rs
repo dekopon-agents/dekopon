@@ -570,6 +570,10 @@ struct WireFunctionCall {
 }
 
 impl WireToolCall {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn into_model(
         self,
         secrets: crate::diagnostic::DiagnosticSecrets<'_>,

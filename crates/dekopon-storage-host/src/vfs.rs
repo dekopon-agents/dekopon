@@ -7,6 +7,10 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,

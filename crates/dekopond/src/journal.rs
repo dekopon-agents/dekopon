@@ -104,6 +104,10 @@ impl Journal {
         Ok(journal)
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn recall(
         &self,
         stem: &str,
@@ -399,6 +403,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn append_turn(
         journal: &Journal,
         stem: &str,

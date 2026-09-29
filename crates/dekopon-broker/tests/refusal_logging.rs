@@ -163,6 +163,11 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "one long test scenario"
+)]
 async fn every_inspection_refusal_names_its_class_and_its_subject() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();

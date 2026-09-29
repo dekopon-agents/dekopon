@@ -292,6 +292,10 @@ async fn input_during_terminal_delivery_queues_a_fresh_turn_without_busy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish() {
     const OTHER: &str = "tel.16035550100";
     let (capture, _subscriber) = capture_spans();

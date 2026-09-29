@@ -154,6 +154,10 @@ impl CodexClient {
             .map_err(credential_failure)
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn exchange(
         &self,
         request: GenerateRequest<'_>,
@@ -431,6 +435,11 @@ pub(crate) struct CodexReducer<'a> {
 }
 
 impl CodexReducer<'_> {
+    #[expect(
+        clippy::too_many_lines,
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn apply(
         &mut self,
         data: &str,
@@ -743,6 +752,10 @@ pub(crate) fn replay_transcript(
     })?;
     reducer.finish(&ClientIdentity::new())
 }
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn credential_failure(source: ChatGptError) -> InferenceError {
     match source {
         source @ ChatGptError::TokenRefused {

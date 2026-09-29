@@ -193,6 +193,10 @@ impl Parser {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn peek_reserved(&self) -> Option<&str> {
         match self.peek_kind()? {
             TokenKind::Word(word) => {
@@ -857,6 +861,10 @@ impl Parser {
         true
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
@@ -1087,6 +1095,10 @@ fn word_is_constant(word: &RawWord) -> bool {
     parts_are_constant(&word.parts)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn literal_pattern_metacharacter(word: &RawWord) -> Option<(char, &'static str)> {
     word.parts.iter().find_map(|part| match part {
         RawPart::Literal(text) => pattern_metacharacter(text),

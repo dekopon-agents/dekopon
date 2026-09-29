@@ -5,6 +5,10 @@ use tempfile::tempdir;
 use super::{CatalogProblem, ConfigError, DiscoveryContext, LocalCatalog};
 
 #[track_caller]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn problems(error: &ConfigError) -> &[CatalogProblem] {
     match error {
         ConfigError::Invalid { problems, .. } => problems,

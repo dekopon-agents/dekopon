@@ -44,6 +44,7 @@ fn owned(path: &Path, uid: u32, gid: u32, mode: u32, root: bool) {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn ipc_process_boundary() {
     if let Ok(role) = std::env::var("DEKOPON_IPC_TEST_ROLE") {
         let socket = std::env::var("DEKOPON_IPC_TEST_SOCKET").unwrap();
