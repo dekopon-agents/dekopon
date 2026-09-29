@@ -125,6 +125,7 @@ fn probe() -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
     let _sequential = SEQUENTIAL.lock().await;
     let capture = capture();

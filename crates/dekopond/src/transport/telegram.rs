@@ -159,6 +159,10 @@ impl TelegramTransport {
         Ok(())
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn routable(
         &self,
         message: &Value,

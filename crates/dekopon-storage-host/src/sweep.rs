@@ -126,6 +126,10 @@ impl StorageHost {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn eligible(
     base: &Directory,
     token: &str,
@@ -168,6 +172,10 @@ fn eligible(
     Ok(now.duration_since(last_used).is_ok_and(|age| age >= *ttl))
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn remove_entry(
     parent: &Directory,
     name: &str,

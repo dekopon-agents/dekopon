@@ -371,6 +371,10 @@ enum AcceptFailure {
     Fatal,
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn classify_accept(error: &io::Error) -> AcceptFailure {
     match error.kind() {
         io::ErrorKind::ConnectionAborted

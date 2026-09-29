@@ -229,6 +229,10 @@ impl ModelMessage {
     }
 
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn parts(&self) -> Option<&[ContentPart]> {
         match self {
             Self::User { content } => content.as_parts(),
@@ -236,6 +240,10 @@ impl ModelMessage {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn tool_calls(&self) -> &[ModelToolCall] {
         match self {
             Self::Assistant { turn } => &turn.tool_calls,
@@ -243,6 +251,10 @@ impl ModelMessage {
         }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::ToolResults { tool_call_id, .. } => Some(tool_call_id.as_str()),

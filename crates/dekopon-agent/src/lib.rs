@@ -1930,6 +1930,10 @@ mod tests {
             }
         }
 
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "reshaped by the unit that next rewrites this"
+        )]
         fn label(event: &ProgressEvent) -> String {
             match event {
                 ProgressEvent::ToolStarted {

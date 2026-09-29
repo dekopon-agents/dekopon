@@ -11,6 +11,10 @@ use tracing_subscriber::{Layer, layer::Context, prelude::*};
 use super::*;
 
 #[tokio::test]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn typed_success_and_operation_error_are_preserved() {
     let success = process_fn(
         ProcessMetadata::non_interruptible("success-test"),
@@ -34,6 +38,10 @@ async fn typed_success_and_operation_error_are_preserved() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::match_wildcard_for_single_variants,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn panic_preserves_the_tokio_task_failure() {
     let process = process_fn(ProcessMetadata::non_interruptible("panic-test"), || async {
         panic!("deliberate process panic");

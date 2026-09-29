@@ -833,6 +833,10 @@ impl StorageHostError {
         Self::Corrupt { scope, site: None }
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn site_mut(&mut self) -> Option<&mut CorruptionSite> {
         match self {
             Self::Corrupt { site, .. } => Some(site.get_or_insert_with(Box::default)),
@@ -863,6 +867,10 @@ impl StorageHostError {
     }
 
     #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub const fn class(&self) -> StorageFailureClass {
         match self {
             Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,

@@ -1005,6 +1005,10 @@ impl BrokerWasmProvider {
             .collect()
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     async fn render_provider_help(&self) -> Option<String> {
         let json = match self.run_command(&["--help".to_owned()], None).await {
             Ok(json) => json,

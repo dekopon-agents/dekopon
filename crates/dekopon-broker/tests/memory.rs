@@ -563,6 +563,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabilities() {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("memory-reservation-probe-provider.wasm")],
@@ -760,6 +761,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_name() {
     for (fixture, provider, capability, constraint) in [
         (
@@ -998,6 +1000,7 @@ fn reserved_read_constraint() -> ConstraintSet {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
@@ -1392,6 +1395,10 @@ async fn a_turns_file_at_the_read_chunk_boundary_still_compacts_and_records() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
     let capture = CaptureLayer::workspace();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))

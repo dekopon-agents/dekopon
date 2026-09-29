@@ -473,6 +473,10 @@ async fn read_owner_only(
     .map_err(|error| trusted_read_error(path, error))
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn trusted_read_error(path: &Path, error: FileHygieneError) -> ConfigError {
     match error {
         FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },
@@ -561,6 +565,10 @@ fn expand_provider_entry(path: &Path, expected_uid: u32) -> Result<Vec<PathBuf>,
     Ok(providers)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn resolve(
     config: BrokerdConfig,
     source: PathBuf,

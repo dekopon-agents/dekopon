@@ -304,6 +304,10 @@ impl Directory {
         Ok(metadata.dev() == stat.st_dev as u64 && metadata.ino() == stat.st_ino as u64)
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub(crate) fn metadata(&self, name: &str) -> Result<Option<EntryMetadata>, StorageHostError> {
         validate_component(name)?;
         let stat = match rustix::fs::statat(self.file.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -616,6 +620,10 @@ fn validate_component(name: &str) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
     let policy = AncestorPolicy {
         canonicalize: false,
@@ -719,6 +727,10 @@ fn scan_entry(
     Ok(())
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub(crate) fn scan_root_usage(
     layout: &Layout,
     maximum_entries: u64,

@@ -1678,6 +1678,10 @@ async fn verify_component_file(
 
 /// These provider-state files are group-readable like broker.yaml; the real bar is that nobody else
 /// can rewrite them.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn read_secure_file(
     path: &Path,
     expected_uid: u32,
@@ -1754,6 +1758,10 @@ fn validate_directory(
 
 /// Canonicalizes from path inclusive so aliases like macOS's /var -> /private/var resolve before
 /// the caller's own symlink check.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
     let policy = AncestorPolicy {
         canonicalize: true,

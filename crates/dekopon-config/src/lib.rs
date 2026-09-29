@@ -82,6 +82,10 @@ impl LocalCatalog {
         Self::from_sources(source, &[(source.to_path_buf(), contents.to_owned())])
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn from_sources(source: &Path, files: &[(PathBuf, String)]) -> Result<Self, ConfigError> {
         let source = source.to_path_buf();
         let source_name = source.display().to_string();

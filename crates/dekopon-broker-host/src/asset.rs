@@ -288,6 +288,10 @@ impl AssetState {
 }
 
 pub(crate) fn references(input: &serde_json::Value) -> Vec<u64> {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn walk(input: &serde_json::Value, found: &mut Vec<u64>) {
         match input {
             serde_json::Value::String(text) => {

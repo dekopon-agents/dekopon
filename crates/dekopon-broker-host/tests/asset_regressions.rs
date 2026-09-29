@@ -85,6 +85,7 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_record_decoded_hashes()
 {
     let capture = CaptureLayer::workspace();

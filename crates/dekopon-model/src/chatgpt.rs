@@ -444,6 +444,10 @@ struct ChatGptCredentials {
     account_id: String,
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn start_device_login(
     agent: &Agent,
     endpoints: &ChatGptEndpoints,
@@ -687,6 +691,10 @@ fn oauth_detail(body: &str, code: Option<&str>) -> String {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn oauth_error_code(body: &str) -> Option<String> {
     match serde_json::from_str::<Value>(body).ok()?.get("error")? {
         Value::String(code) => Some(code.clone()),

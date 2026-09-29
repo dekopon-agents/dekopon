@@ -900,6 +900,10 @@ fn platform_window(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn append_journal(
     journal: &Arc<Journal>,
     key: &ConversationKey,
@@ -1159,6 +1163,11 @@ impl SessionSteers {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn session(
     runner: &SessionRunner,
     route: &BoundRoute,

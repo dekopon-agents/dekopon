@@ -211,6 +211,10 @@ impl ReplyAttachments {
                 .images,
         )
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     pub fn receive(
         &self,
         attached: Vec<NewAsset>,
@@ -396,6 +400,10 @@ fn input_total(total: usize, bytes: usize) -> Result<usize, ChatAssetRefusal> {
 }
 
 pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn walk(input: &Value, ids: &mut Vec<u64>) -> Result<(), ChatAssetRefusal> {
         match input {
             Value::String(text) => {

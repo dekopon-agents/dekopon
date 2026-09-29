@@ -413,6 +413,10 @@ fn map_durability(value: durable::Durability) -> Durability {
         durable::Durability::Full => Durability::Full,
     }
 }
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
     match error {
         StorageHostError::NotFound => jsonl::StorageError::NotFound,
@@ -434,6 +438,10 @@ fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
         _ => jsonl::StorageError::Io,
     }
 }
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn map_durable_error(error: StorageHostError) -> durable::StorageError {
     match error {
         StorageHostError::NotFound => durable::StorageError::NotFound,

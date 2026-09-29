@@ -90,6 +90,10 @@ impl CredentialKind {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
@@ -415,6 +419,10 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
 }
 
 impl ChatGptSubscriptionCredential {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn classify(&self, error: &ChatGptError) -> CredentialRefreshError {
         let (permanent, category) = match error {
             ChatGptError::TokenRefused { status, code, .. } => {

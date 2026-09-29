@@ -140,6 +140,12 @@ unsafe_code = "deny"
 broken_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
+# Shape lints whose existing violations carry site expectations.
+too_many_lines = "warn"
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+wildcard_enum_match_arm = "warn"
+match_wildcard_for_single_variants = "warn"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"

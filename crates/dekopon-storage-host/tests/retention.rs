@@ -503,6 +503,11 @@ fn concurrent_grant_and_sweep_never_recreate_a_path_behind_an_unlinked_lease() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "one long test scenario"
+)]
 fn partial_sweep_preserves_metadata_and_releases_quota() {
     use std::os::unix::fs::PermissionsExt as _;
 

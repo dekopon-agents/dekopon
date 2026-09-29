@@ -365,6 +365,10 @@ struct Ready {
 
 /// Every problem found before the broker is built is returned together; the policy and the
 /// constraint sets are independent, so one refusing does not hide the other.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 async fn prepare(
     config: ResolvedConfig,
     max_frame_bytes: usize,

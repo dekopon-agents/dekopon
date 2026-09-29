@@ -705,6 +705,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn one_canonical_conversation_form_decides_every_transport() {
     let sender =
         |value: &str| -> dekopon_core::ExternalSubject { value.parse().expect("subject fixture") };
@@ -1205,6 +1206,7 @@ fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let slack = ChatScopeClaim {
         transport: "scientist-slack".parse().expect("transport"),

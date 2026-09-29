@@ -176,6 +176,10 @@ where
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 pub fn run_prompt_with_history_and_options<M, R>(
     model: &M,
     runtime: &R,
@@ -490,6 +494,10 @@ fn drain_steers(
     any
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn run_turns<M, R>(
     model: &M,
     runtime: &R,
@@ -1342,6 +1350,10 @@ fn clamp_textual_asset(mut text: String) -> String {
     text
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
@@ -1834,6 +1846,10 @@ mod tests {
                 .collect()
         }
 
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "reshaped by the unit that next rewrites this"
+        )]
         fn forwarded_chars(&self) -> Vec<usize> {
             self.events
                 .lock()
@@ -2240,6 +2256,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
     fn a_boundary_draft_is_reset_before_the_replacement_declines() {
         struct StreamingDraft(SteeringModel);
         impl ChatModel for StreamingDraft {

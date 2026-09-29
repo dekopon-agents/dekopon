@@ -360,6 +360,10 @@ impl InferenceResponse {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
 fn response_context(error: InferenceError, metadata: ProviderFailure) -> InferenceError {
     match error {
         InferenceError::Provider(mut context) => {
