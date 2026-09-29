@@ -36,6 +36,21 @@ The model proposes; a separate broker authorizes and executes provider effects.
   explicit human authorization for that action; release authorization names one version.
   Follow the [release procedure](README.md#maintainer-release-process), not memory.
 
+## Committed direction
+
+Decided by the owner on 2026-09-29. Code follows in the 0.28 to 0.33 releases. Design new work
+against these; a change that moves away from one stops for a human decision.
+
+- **No call-site rules.** Anything that can run, runs from any depth: a model's script, a
+  provider, a nested provider, a job. Bounds are memory, time, output and the turn's call budget,
+  shared by the whole tree. Authority is not a call site: the broker authorizes every invocation
+  for the person and agent, and a probe stays read-only.
+- **Streams only.** A provider's output is its stdout. No contract offers a returned value beside
+  a stream, a buffered call beside a streaming one, or a shim for the previous epoch.
+- **Serving beats recording.** Telemetry is best effort: a full queue drops and counts, and
+  nothing in a serving path waits on an exporter. One complete trace per message is the aim,
+  never a reason to stall a reply.
+
 ## Change and verify
 
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
@@ -162,6 +177,13 @@ The name states the invariant and the primitives are real; one test per behaviou
 - Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
 - No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`, exactly-the-ceiling beside one-over twins, a 1 ns-over timeout cap, `assert!(elapsed < Duration::from_millis(50))`, production bytes canonicalized so a golden fixture is stable (compare parsed `Value`s instead).
 - An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
+
+### Telemetry
+
+A dashboard should never have to parse a string, and the store makes a column of every name.
+
+- Yes: `http.response.body.size = 12288`; `url.query.keys = ["q", "page"]` beside `url.query.values = ["rust", "[redacted]"]`; the OpenTelemetry semantic-convention name where one exists; a job as a `job.started` and a `job.finished` record, linked; a rollup as a log record, which keeps its number types.
+- No: `url.query.q = "rust"` (data as an attribute name); `"12 KiB"`; a JSON array inside a string; a map attribute; one span held open for a job's life (the store rejects a span that started over five hours ago); a provider argument that changes what is recorded about the provider.
 
 ### Wire formats
 
