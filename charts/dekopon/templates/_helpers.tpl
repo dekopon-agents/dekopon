@@ -790,8 +790,6 @@ Arguments: dict "ctx" $ "sidecar" bool
     # store `dekopon-brokerd provider sync` wrote onto the claim before this pod rolled. A second
     # subPath view of the same claim, a sibling of the credential directory rather than a child of
     # it, so the claim root stays unmounted here and unreachable from the gateway.
-    # The broker checks every blob's length and SHA-256 against the lock on the same read it hands
-    # to Wasmtime, and every compiled artifact's before it maps it.
     - name: state
       mountPath: {{ $.Values.broker.providerSet.mountPath }}
       subPath: {{ $.Values.broker.providerSet.subdir }}

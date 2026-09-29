@@ -226,8 +226,16 @@ impl Cache {
         stage("publish", entry.bytes, || {
             fs::create_dir_all(self.root.join("sha256"))?;
             fs::create_dir_all(self.root.join(&self.engine_key))?;
-            ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
-            publish(&object, &compiled)?;
+            match fs::symlink_metadata(&object) {
+                // An interrupted publish can leave the object without its index; identical bytes
+                // are reused so the next run completes it instead of refusing forever.
+                Ok(_) => verify(&object, &entry)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
+                    publish(&object, &compiled)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
             publish(index, &serde_json::to_vec(&entry)?)
         })?;
         Ok(entry)
@@ -396,7 +404,7 @@ fn ensure_capacity(objects: &Path, requested: u64) -> wasmtime::Result<()> {
         bytes = bytes.saturating_add(entry.metadata()?.len());
         wasmtime::ensure!(
             count + 1 < MAX_CACHE_OBJECTS && bytes <= MAX_CACHE_BYTES,
-            "compiled cache {} is full (maximum {MAX_CACHE_OBJECTS} objects / {MAX_CACHE_BYTES} bytes); stop its users and remove the cwasm directory, or set compileOnLoad: true",
+            "compiled cache {} is full (maximum {MAX_CACHE_OBJECTS} objects / {MAX_CACHE_BYTES} bytes); stop its users and run `dekopon-brokerd provider precompile` to prune it, or set compileOnLoad: true",
             objects.display()
         );
     }
@@ -702,6 +710,22 @@ mod tests {
         let mut expected = vec![index, object];
         expected.sort();
         assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn an_object_left_without_its_index_is_verified_and_reused() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Engine::default();
+        let (index, object) = populate(directory.path(), &engine);
+        fs::remove_file(&index).expect("interrupt after the object landed");
+        let cache = Cache::new(directory.path().to_owned(), &engine, CacheMiss::Compile);
+        let source = identify_bytes(EMPTY_COMPONENT);
+        assert!(
+            cache
+                .publish_missing(&engine, &Compiler::Serial, EMPTY_COMPONENT, &source.sha256)
+                .expect("completes the publish")
+        );
+        assert!(index.exists() && object.exists());
     }
 
     #[test]

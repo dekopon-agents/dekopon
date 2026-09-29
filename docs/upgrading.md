@@ -24,8 +24,9 @@ Every managed-provider deployment's first start on this release finds the cache 
   broker's UID, then start it. To keep compiling in the broker instead, set `onCacheMiss: compile`
   in `broker.yaml` and keep its memory limit sized for Cranelift.
 - `provider sync` and `provider precompile` now delete blobs the active lock does not name, and
-  `precompile` deletes compiled code for other locks, engines and `v1`. Run either with the broker
-  that uses the store stopped. Rolling back to an earlier release then starts from a cold cache.
+  `precompile` deletes compiled code for other locks, engines and `v1`. A running broker read its
+  blobs at startup, so `sync` may run beside it as the chart's hook Job does; run `precompile` with
+  the broker stopped. Rolling back to an earlier release then starts from a cold cache.
 - New broker keys: `onCacheMiss` (`fail` by default, or `compile`) and `compileThreads` (`1` by
   default); new operator flag `--compile-threads` on `provider` commands. Cranelift now compiles one
   function at a time unless you raise it; raise the memory limit of whatever compiles with it.

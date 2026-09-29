@@ -630,8 +630,9 @@ before publishing, the cache refuses growth beyond 1,024 objects or 2 GiB of com
 `/tmp`, for reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
 
 `provider precompile` prunes after it publishes: it keeps, for the current lock and this engine key,
-each locked component's index and the object it names, and unlinks everything else under `cwasm/`,
-including `v1/`, other engine keys and leftover temporary files. Pruning only unlinks, so a file a
+each locked component's index and the object it names, and unlinks `cwasm/v1/` and everything else
+under `cwasm/v2/`: other engine keys, other components' indices, unnamed objects and leftover
+temporary files. Pruning only unlinks, so a file a
 running broker has mapped stays valid until that broker exits, but a broker that restarts afterwards
 needs the current generation: stop the broker using the store before running it. A rollback to an
 earlier release starts from a cold cache.
