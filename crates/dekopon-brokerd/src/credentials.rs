@@ -34,7 +34,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Anything not explicitly listed here is treated as transient by default, since classifying an
 /// outage as permanent would take a capability out of service until an operator noticed.
-const REAUTHORIZATION_CODES: [&str; 4] = [
+pub(crate) const REAUTHORIZATION_CODES: [&str; 4] = [
     "invalid_grant",
     "refresh_token_reused",
     "refresh_token_invalidated",

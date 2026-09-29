@@ -40,6 +40,9 @@ use tokio::{
     io::AsyncReadExt as _,
     time::{Instant, timeout_at},
 };
+use tracing::Instrument as _;
+
+mod oauth2;
 
 pub const SECRET_MAP_API_VERSION: &str = "dekopon.dev/secret-map/v1alpha1";
 pub const HARD_MAX_SECRET_MAP_BYTES: usize = 1024 * 1024;
@@ -179,6 +182,14 @@ enum SecretSource {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+    #[serde(rename = "oauth2Refresh")]
+    OAuth2Refresh {
+        record_path: PathBuf,
+        token_endpoint: String,
+        client_id: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
     KubernetesTokenRequest {
         endpoint: String,
         bootstrap_root: PathBuf,
@@ -296,8 +307,31 @@ impl SecretResolver for MapResolver {
                 category: "missing",
             });
         };
+        let span = match &entry.source {
+            SecretSource::OAuth2Refresh { .. } => tracing::info_span!(
+                target: "credential",
+                "broker.credential.refresh",
+                credential = %secret,
+                outcome = tracing::field::Empty,
+                secret.source.kind = "oauth2-refresh",
+                duration_ms = tracing::field::Empty,
+                credential.expires_at_unix_ms = tracing::field::Empty,
+            ),
+            SecretSource::SecureFile { .. }
+            | SecretSource::KubernetesProjection { .. }
+            | SecretSource::OnePasswordConnect { .. }
+            | SecretSource::VaultKv1 { .. }
+            | SecretSource::VaultKv2 { .. }
+            | SecretSource::AwsSecretsManager { .. }
+            | SecretSource::AwsSsmParameter { .. }
+            | SecretSource::GcpSecretManager { .. }
+            | SecretSource::AzureKeyVault { .. }
+            | SecretSource::KubernetesTokenRequest { .. }
+            | SecretSource::KubernetesApi { .. } => tracing::Span::none(),
+        };
         let bytes = self
             .resolve_source(&entry.source, &entry.client)
+            .instrument(span)
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -340,6 +374,22 @@ impl MapResolver {
             }
             SecretSource::KubernetesProjection { root, key, .. } => {
                 read_kubernetes_projection(root, key).await
+            }
+            SecretSource::OAuth2Refresh {
+                record_path,
+                token_endpoint,
+                client_id,
+                timeout_ms,
+            } => {
+                oauth2::resolve(
+                    record_path,
+                    token_endpoint,
+                    client_id,
+                    *timeout_ms,
+                    self.expected_uid,
+                    client,
+                )
+                .await
             }
             SecretSource::OnePasswordConnect {
                 endpoint,
@@ -927,7 +977,9 @@ impl SecretSource {
             | Self::AwsSsmParameter {
                 credentials_file, ..
             } => Some(credentials_file.clone()),
-            Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
+            Self::SecureFile { .. }
+            | Self::KubernetesProjection { .. }
+            | Self::OAuth2Refresh { .. } => None,
         }
     }
 
@@ -939,6 +991,7 @@ impl SecretSource {
         match self {
             Self::SecureFile { path } => Some(path.clone()),
             Self::KubernetesProjection { root, key, .. } => Some(root.join(key)),
+            Self::OAuth2Refresh { record_path, .. } => Some(record_path.clone()),
             _ => None,
         }
     }
@@ -956,6 +1009,7 @@ impl SecretSource {
             Self::AzureKeyVault { .. } => "azure-key-vault",
             Self::KubernetesApi { .. } => "kubernetes-api",
             Self::KubernetesTokenRequest { .. } => "kubernetes-token-request",
+            Self::OAuth2Refresh { .. } => "oauth2-refresh",
         }
     }
 
@@ -966,6 +1020,17 @@ impl SecretSource {
     fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::SecureFile { path } => validate_absolute(path),
+            Self::OAuth2Refresh {
+                record_path,
+                token_endpoint,
+                client_id,
+                timeout_ms,
+            } => {
+                validate_absolute(record_path)?;
+                validate_endpoint(token_endpoint, true)?;
+                validate_texts([client_id])?;
+                validate_timeout(*timeout_ms)
+            }
             Self::KubernetesProjection {
                 root,
                 key,
@@ -1948,6 +2013,8 @@ pub enum SourceError {
     Transport,
     #[error("source rejected the request")]
     Rejected,
+    #[error("source requires reauthorization")]
+    ReauthorizationRequired,
     #[error("source value is missing")]
     Missing,
     #[error("source response failed an integrity check")]
@@ -2040,6 +2107,7 @@ impl SourceError {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
             Self::Rejected => "rejected",
+            Self::ReauthorizationRequired => "reauthorization-required",
             Self::Missing => "missing",
             Self::Integrity => "integrity",
             Self::BootstrapReflected => "bootstrap-reflected",
@@ -2084,6 +2152,8 @@ pub enum SecretMapError {
     },
 }
 
+#[cfg(test)]
+mod oauth2_tests;
 #[cfg(test)]
 mod token_request_tests;
 

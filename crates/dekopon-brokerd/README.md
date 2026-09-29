@@ -381,7 +381,7 @@ propose one public logical DRN through the sandboxed curl Basic/Bearer forms, bu
 nothing: the broker requires ordinary capability policy, a separate `secret.use` Cedar statement,
 and an exact private binding before one source snapshot is fetched. Providers receive neither DRN
 nor bytes. Adapters cover secure files, Kubernetes projections, API objects and TokenRequest,
-1Password Connect, Vault KV v1/v2, AWS Secrets Manager and SSM, GCP Secret Manager, and Azure Key Vault.
+1Password Connect, Vault KV v1/v2, AWS Secrets Manager and SSM, GCP Secret Manager, Azure Key Vault, and `oauth2Refresh` (a broker-private rotating OAuth record).
 
 ```yaml
 secretMapPath: /etc/dekopon/secret-map.yaml

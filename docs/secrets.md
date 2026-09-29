@@ -165,8 +165,9 @@ source-store token as application material; the map file itself is prohibited as
 source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
 `broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. AWS
-sessions and GCP/Azure/Kubernetes API access tokens must be refreshed externally; a chart-copied
-file changes only after a pod rollout. `kubernetesTokenRequest` instead reads a live kubelet-rotated
+sessions and GCP/Azure/Kubernetes API access tokens from other map sources must be refreshed
+externally; a chart-copied file changes only after a pod rollout. `oauth2Refresh` is the one
+refreshing map source. `kubernetesTokenRequest` instead reads a live kubelet-rotated
 API token and mints an audience-specific token per invocation. The broker also renews the legacy
 `chatgptSubscription` kind below, a different mechanism — a named credential file rather than a DRN. That legacy binding
 [will be replaced by public DRNs](design.md#legacy-credential-bindings), preserving refresh support.
@@ -253,6 +254,44 @@ Every remote source kind also accepts `timeoutMs` (default `10000`, at most `120
 for its single fetch, and every configured `endpoint` or `vaultUrl` must be a credential-free HTTPS
 URL or a literal loopback HTTP URL, except `kubernetesTokenRequest`, which requires HTTPS with its
 configured CA. `secureFile` and `kubernetesProjection` take neither field.
+
+### `oauth2Refresh`
+
+```yaml
+source:
+  kind: oauth2Refresh
+  recordPath: /var/lib/dekopon/broker-chatgpt/example-oauth2.json
+  tokenEndpoint: https://auth.example/oauth/token
+  clientId: public-client-id
+  timeoutMs: 10000
+```
+
+Only `recordPath`, `tokenEndpoint`, `clientId`, and optional `timeoutMs` are accepted. The broker
+reads the broker-UID-owned, regular, single-link `0600` JSON record (at most 64 KiB):
+`{"version":1,"access":"...","refresh":"...","expiresAt":<Unix seconds>}`. Version 1
+and non-empty tokens are required. Every authorized resolution takes the sibling `.lock`, re-reads
+the record, and reuses its access token until 60 seconds before expiry; then it sends one OAuth
+refresh-token grant to the configured endpoint, writes the replacement `0600` file by atomic rename,
+and returns the access token. An omitted response `refresh_token` retains the predecessor; no
+in-memory token cache or retry exists. Two DRNs may share one record and lock. The configured
+endpoint must use HTTPS or literal loopback HTTP; redirects and ambient proxies are disabled.
+
+`reauthorization-required` means the OAuth error code says the token family is retired: re-import
+a working record. Other 4xx responses are `rejected`, 5xx and connection failures are `transport`,
+a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
+`insecure-file`; a missing file is `io`. If saving a rotated token fails, this invocation still
+returns the new access token and logs the path and I/O error. A refresh whose response is lost costs
+one re-import: the old refresh token remains on disk, and the next use may get `invalid_grant`.
+
+Enroll or reset the record from a trusted local `record.json` with one command (replace the pod,
+container, and path placeholders):
+
+```sh
+kubectl exec -i <broker pod> -c <broker container> -- sh -c 'umask 077; cat > <recordPath>.tmp && mv <recordPath>.tmp <recordPath>' < record.json
+```
+
+There is no enrollment subcommand. Upgrade the broker before activating the map: 0.27.0 brokers
+refuse `oauth2Refresh` as an unknown kind.
 
 ### `secureFile`
 
@@ -602,15 +641,14 @@ The project-wide list is [`design.md`](design.md#non-goals). Local to this featu
 - arbitrary secret interpolation, headers, URL/query/body placement, environment variables, files,
   or a `resolve-secret -> bytes` interface; the `chatgptSubscription` companion header is one fixed
   name chosen by that credential kind, not an owner- or provider-authored header;
-- a generalized `oauth2RefreshToken { tokenEndpoint, clientId }` kind, or any provider-declared
-  refresh callback: only owner-authored broker configuration may name a token endpoint, and one
-  consumer does not justify the template machinery;
+- a generalized refresh template or provider-declared refresh callback: only the owner-authored
+  `oauth2Refresh` source may name a token endpoint, for the OAuth refresh-token grant alone;
 - secret references in provider invoke input, or a new HTTP/provider WIT package; a command guest
   reads a reference from argv only to propose it;
 - Vault dynamic leases and lifecycle;
 - 1Password direct service-account SDK mode or file fields;
 - AWS ambient credential/role chains, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins;
 - custom CA bundles for sources other than `kubernetesTokenRequest`, mTLS, request signing as a provider sink;
-- cache/stale serving, automatic retries, or transformed-reflection prevention;
+- an in-memory cache or stale serving, automatic retries, or transformed-reflection prevention;
 - claims that a ConfigMap is a secret store or that an allowed endpoint cannot exfiltrate what it
   legitimately receives.
