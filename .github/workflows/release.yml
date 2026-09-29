@@ -330,8 +330,7 @@ jobs:
               *) prefix="${index_name:0:2}/${index_name:2:2}" ;;
             esac
             deadline=$((SECONDS + 300))
-            while (( SECONDS < deadline )); do
-              remaining=$((deadline - SECONDS))
+            while (( (remaining = deadline - SECONDS) > 0 )); do
               if index=$(curl --silent --fail --user-agent "dekopon-release-workflow" \
                 --max-time "$remaining" "https://index.crates.io/$prefix/$index_name") \
                 && grep -Fq "\"vers\":\"$version\"" <<< "$index"; then
