@@ -8,6 +8,40 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The shell speaks bytes (0.29.0)
+
+No broker or gateway configuration changes. Scripts the model writes, and any recipe an operator
+keeps in a prompt or a skill, see these behaviour changes:
+
+- **Bytes between stages.** Each pipeline stage runs on its own thread and hands the next stage
+  bytes, not a value. A command's trailing newline travels with its output: `echo hi | wc -c` is
+  3, and a provider stage receives `hi\n`. Piped input is consumed once, so
+  `echo x | { cat; cat; }` prints `x` once.
+- **`echo` writes a newline; `printf` and `echo -n` do not.** Text builtins (`sort`, `uniq`,
+  `grep`, `sed`, `cut`, `cat` of a buffer) produce newline-joined text, never a list, and `xargs`
+  reads one item per line instead of expanding a JSON array.
+- **`jq` quotes strings.** Input must be JSON; each result is one compact line, and a string
+  result is JSON-quoted unless `-r` is given. `jq -r .name` is the form that yields bare text.
+  Several results are several lines, never an array; `-s` collects them under the retained-value
+  budget and `-n` ignores stdin.
+- **Typed assignment only for `{` or `[`.** `x=$(...)` parses the capture as JSON only when its
+  trimmed text starts with `{` or `[`, so `${pr[headSha]}` indexes an object; scalars stay exact
+  text. Unquoted substitution splits on newlines, never on spaces.
+- **Non-final stages are isolated.** A compound, function or `xargs` stage that is not last runs
+  from a snapshot of the scope: its assignments, redirects into named buffers, `exit`, `return`
+  and `break` never reach the parent. The last stage keeps its assignments, as in bash.
+- **No live provider streams.** A provider stage still receives its stdin drained as text after
+  the upstream stage finishes, and a provider command reads only its own pipe or here-doc, never
+  an enclosing compound's input. Invalid UTF-8 bound for a provider, a variable or argv fails that
+  stage with a message.
+- **`head` and `tail` are reserved command words.** A provider that declares either is refused at
+  load.
+- **Library consumers:** `CapabilityInvoker` now requires `Send + Sync` and takes an owned
+  `CommandProposal`.
+
+Chart 0.18.0 defaults to application 0.28.0; set `image.tag: v0.29.0` (or the release's
+`image.digest`) to deploy 0.29.0. No chart release accompanies it.
+
 ## Compiled cache survives an engine-key change (0.28.1)
 
 0.28.0 exited on boot with
