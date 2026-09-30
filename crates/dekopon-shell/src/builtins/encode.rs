@@ -1,136 +1,90 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::Value;
 
-use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::value::to_text;
+use super::{CommandFailure, unsupported_flag};
+use crate::{
+    CapabilityInvoker,
+    limits::Budget,
+    pipe::{PipeReader, ReadOutcome},
+};
 
-const HELP: &str = "-d";
+pub(crate) const HELP: &str = "-d";
 
-pub(crate) struct Base64;
-
-impl Builtin for Base64 {
-    fn name(&self) -> &'static str {
-        "base64"
+pub(crate) fn stream(
+    arguments: &[String],
+    reader: &mut PipeReader,
+    budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
+    mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<(), CommandFailure> {
+    let mut decode = false;
+    let mut literal = None;
+    for argument in arguments {
+        match argument.as_str() {
+            "-d" | "-D" | "--decode" => decode = true,
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(unsupported_flag("base64", flag, HELP));
+            }
+            other if literal.is_none() => literal = Some(other.as_bytes()),
+            _ => {
+                return Err(CommandFailure::usage(
+                    "base64: at most one literal argument is supported",
+                ));
+            }
+        }
     }
-
-    fn help(&self) -> &'static str {
-        HELP
-    }
-
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut decode = false;
-        let mut literal = None;
-
-        for argument in arguments {
-            match argument.as_str() {
-                "-d" | "-D" | "--decode" => decode = true,
-                flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("base64", flag, HELP));
+    let mut pending = Vec::with_capacity(4);
+    let mut finished = false;
+    let mut process = |chunk: &[u8], budget: &mut Budget| -> Result<bool, CommandFailure> {
+        budget.charge_step_with(invoker)?;
+        for &byte in chunk {
+            if decode && byte.is_ascii_whitespace() {
+                continue;
+            }
+            if finished {
+                return Err(CommandFailure::failed(
+                    "base64: invalid input after padding",
+                ));
+            }
+            pending.push(byte);
+            let width = if decode { 4 } else { 3 };
+            if pending.len() == width {
+                let output = if decode {
+                    STANDARD.decode(&pending).map_err(|error| {
+                        CommandFailure::failed(format!("base64: invalid input: {error}"))
+                    })?
+                } else {
+                    STANDARD.encode(&pending).into_bytes()
+                };
+                if decode && pending.contains(&b'=') {
+                    finished = true;
                 }
-                other => {
-                    if literal.is_some() {
-                        return Err(CommandFailure::usage(
-                            "base64: at most one literal argument is supported",
-                        ));
-                    }
-                    literal = Some(other.to_owned());
+                pending.clear();
+                if !emit(&output)? {
+                    return Ok(false);
                 }
             }
         }
-
-        let text = match (literal, input) {
-            (Some(literal), _) => literal,
-            (None, Some(input)) => to_text(&input),
-            (None, None) => String::new(),
-        };
-
-        if !decode {
-            return Ok(CommandResult::value(Value::String(STANDARD.encode(text))));
+        Ok(true)
+    };
+    if let Some(literal) = literal {
+        if !process(literal, budget)? {
+            return Ok(());
         }
-
-        // Real base64 tolerates embedded newlines in encoded input.
-        let compact = text
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect::<String>();
-        let bytes = STANDARD
-            .decode(compact.as_bytes())
-            .map_err(|error| CommandFailure::failed(format!("base64: invalid input: {error}")))?;
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "FromUtf8Error adds only the byte offset of the first invalid sequence, and \
-                      the message already names the whole diagnosis: the decode succeeded and the \
-                      shell has no value type for the bytes it produced"
-        )]
-        let decoded = String::from_utf8(bytes).map_err(|_| {
-            CommandFailure::failed(
-                "base64: decoded bytes are not valid UTF-8, and this shell has no binary value type",
-            )
-        })?;
-        Ok(CommandResult::value(Value::String(decoded)))
+    } else {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
+            if !process(&chunk, budget)? {
+                return Ok(());
+            }
+        }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{Value, json};
-
-    use crate::builtins::test_support::run_builtin;
-
-    use super::Base64;
-
-    #[test]
-    fn round_trips_through_encode_and_decode() {
-        let encoded = run_builtin(&Base64, &[], Some(json!("hello world")))
-            .expect("encodes")
-            .value;
-        assert_eq!(encoded, json!("aGVsbG8gd29ybGQ="));
-        let decoded = run_builtin(&Base64, &["-d"], Some(encoded))
-            .expect("decodes")
-            .value;
-        assert_eq!(decoded, json!("hello world"));
+    if !pending.is_empty() {
+        if decode {
+            return Err(CommandFailure::failed(
+                "base64: invalid input: incomplete group",
+            ));
+        }
+        budget.charge_step_with(invoker)?;
+        emit(STANDARD.encode(&pending).as_bytes())?;
     }
-
-    #[test]
-    fn accepts_a_literal_argument() {
-        assert_eq!(
-            run_builtin(&Base64, &["hi"], None).expect("encodes").value,
-            json!("aGk=")
-        );
-    }
-
-    #[test]
-    fn newline_joins_arrays_before_encoding() {
-        let encoded = run_builtin(&Base64, &[], Some(json!(["a", "b"])))
-            .expect("encodes")
-            .value;
-        let decoded = run_builtin(&Base64, &["--decode"], Some(encoded))
-            .expect("decodes")
-            .value;
-        assert_eq!(decoded, json!("a\nb"));
-    }
-
-    #[test]
-    fn tolerates_wrapped_encoded_input() {
-        let decoded = run_builtin(&Base64, &["-d"], Some(json!("aGVsbG8g\nd29ybGQ=")))
-            .expect("decodes")
-            .value;
-        assert_eq!(decoded, json!("hello world"));
-    }
-
-    #[test]
-    fn invalid_input_fails_without_panicking() {
-        assert!(run_builtin(&Base64, &["-d"], Some(json!("!!!!"))).is_err());
-        assert!(run_builtin(&Base64, &["-d"], Some(json!("/w=="))).is_err());
-        assert!(run_builtin(&Base64, &["-w", "0"], Some(Value::Null)).is_err());
-    }
+    Ok(())
 }

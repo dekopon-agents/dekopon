@@ -100,6 +100,10 @@ impl Budget {
         self.check_deadline()
     }
 
+    pub(crate) fn value_limit(&self) -> u64 {
+        self.limits.max_value_bytes
+    }
+
     pub fn charge_value_bytes(&self, bytes: u64) -> Result<crate::RetainedBytes, LimitExceeded> {
         self.tree.retain(bytes)
     }
@@ -169,6 +173,7 @@ pub struct OutputBuffer {
     total_lines: usize,
     truncated: bool,
     pending: String,
+    pending_truncated: bool,
 }
 
 impl OutputBuffer {
@@ -184,6 +189,7 @@ impl OutputBuffer {
             total_lines: 0,
             truncated: false,
             pending: String::new(),
+            pending_truncated: false,
         }
     }
 
@@ -220,28 +226,41 @@ impl OutputBuffer {
     }
 
     pub fn push_fragment(&mut self, fragment: &str) {
-        self.pending.push_str(fragment);
-        self.drain_complete_lines();
-    }
-
-    pub fn push_block(&mut self, block: &str) {
-        self.pending.push_str(block);
-        self.pending.push('\n');
-        self.drain_complete_lines();
-    }
-
-    fn drain_complete_lines(&mut self) {
-        while let Some(offset) = self.pending.find('\n') {
-            let line = self.pending[..offset].to_owned();
-            self.pending.drain(..=offset);
-            self.push_line(&line);
+        for (index, part) in fragment.split('\n').enumerate() {
+            if index != 0 {
+                self.flush_pending();
+            }
+            if !self.pending_truncated {
+                let room = self.max_bytes.saturating_sub(self.pending.len());
+                let mut end = part.len().min(room);
+                while !part.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.pending.push_str(&part[..end]);
+                if end < part.len() {
+                    self.pending_truncated = true;
+                }
+            }
         }
     }
 
+    pub fn push_block(&mut self, block: &str) {
+        self.push_fragment(block);
+        self.flush_pending();
+    }
+
+    fn flush_pending(&mut self) {
+        let mut line = std::mem::take(&mut self.pending);
+        if self.pending_truncated {
+            line = clamp_line(&line, self.max_bytes);
+            self.pending_truncated = false;
+        }
+        self.push_line(&line);
+    }
+
     pub fn finish(&mut self) {
-        if !self.pending.is_empty() {
-            let line = std::mem::take(&mut self.pending);
-            self.push_line(&line);
+        if !self.pending.is_empty() || self.pending_truncated {
+            self.flush_pending();
         }
     }
 
@@ -422,6 +441,22 @@ mod tests {
             Err(LimitExceeded::Deadline { .. })
         ));
         assert_eq!(budget.steps(), 2);
+    }
+
+    #[test]
+    fn fragmented_line_never_grows_pending_past_the_output_ceiling() {
+        let mut buffer = OutputBuffer::new(&Limits {
+            max_output_bytes: 32,
+            ..Limits::default()
+        });
+        for _ in 0..100_000 {
+            buffer.push_fragment("abcdefgh");
+            assert!(buffer.pending.len() <= 32);
+        }
+        buffer.push_fragment("\ntail");
+        buffer.finish();
+        assert!(buffer.is_truncated());
+        assert!(buffer.render().ends_with("tail"));
     }
 
     #[test]

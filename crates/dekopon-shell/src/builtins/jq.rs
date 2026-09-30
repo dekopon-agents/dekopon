@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read as _, Write as _},
+    io::{self, BufRead as _, Read as _, Write as _},
     process::{Command, Stdio},
     sync::mpsc::{RecvTimeoutError, sync_channel},
     time::Duration,
@@ -12,87 +12,62 @@ use jaq_core::{
 use jaq_json::{Num, Val};
 use serde_json::Value;
 
-use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
+use super::{CommandFailure, unsupported_flag};
 use crate::{
-    CapabilityInvoker,
+    CapabilityInvoker, ExitCode,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
     limits::{Budget, LimitExceeded},
+    pipe::{PipeReader, ReadOutcome},
 };
 
 /// env reads the host process environment and now reads the host wall clock; neither is reachable
 /// any other way in this crate, so both are excluded from the filter set.
 const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 
-const HELP: &str = "-r -c";
+pub(crate) const HELP: &str = "-r -c -n -s";
 
-pub(crate) struct Jq;
-
-impl Builtin for Jq {
-    fn name(&self) -> &'static str {
-        "jq"
-    }
-
-    fn help(&self) -> &'static str {
-        HELP
-    }
-
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut filter = None;
-        for argument in arguments {
-            match argument.as_str() {
-                "-r" | "--raw-output" | "-c" | "--compact-output" => {}
-                flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("jq", flag, HELP));
-                }
-                _ => {
-                    if filter.is_some() {
-                        return Err(CommandFailure::usage(
-                            "jq: exactly one filter argument is supported",
-                        ));
-                    }
-                    filter = Some(argument.clone());
-                }
-            }
-        }
-        let Some(filter) = filter else {
-            return Err(CommandFailure::usage("jq: a filter argument is required"));
-        };
-
-        evaluate(
-            &filter,
-            parse_string_input(input),
-            context.budget,
-            context.invoker,
-        )
-    }
+#[derive(Default)]
+struct Options<'a> {
+    filter: Option<&'a str>,
+    raw: bool,
+    null_input: bool,
+    slurp: bool,
 }
 
-/// `echo "$r"` stringifies a captured value's structure into display text; parsing that text
-/// back into an object or array here makes filtering it match filtering the original value. A
-/// scalar stays a string: this crate parses without `arbitrary_precision`, so a decimal-seconds
-/// timestamp like `1727400000.123450` would come back a rounded `f64`, and a filter built for a
-/// string (`test("^[0-9]+$")`) would see a number instead.
-fn parse_string_input(input: Option<Value>) -> Value {
-    match input {
-        Some(Value::String(text)) => match serde_json::from_str(&text) {
-            Ok(parsed @ (Value::Object(_) | Value::Array(_))) => parsed,
-            _ => Value::String(match text.strip_suffix('\n') {
-                Some(line) => line.to_owned(),
-                None => text,
-            }),
-        },
-        Some(other) => other,
-        None => Value::Null,
+fn options(arguments: &[String]) -> Result<Options<'_>, CommandFailure> {
+    let mut opts = Options::default();
+    for argument in arguments {
+        match argument.as_str() {
+            "-r" | "--raw-output" => opts.raw = true,
+            "-c" | "--compact-output" => {}
+            "-n" | "--null-input" => opts.null_input = true,
+            "-s" | "--slurp" => opts.slurp = true,
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(unsupported_flag("jq", flag, HELP));
+            }
+            filter if opts.filter.is_none() => opts.filter = Some(filter),
+            _ => {
+                return Err(CommandFailure::usage(
+                    "jq: exactly one filter argument is supported",
+                ));
+            }
+        }
     }
+    if opts.filter.is_none() {
+        return Err(CommandFailure::usage("jq: a filter argument is required"));
+    }
+    Ok(opts)
+}
+
+pub(crate) fn stream(
+    arguments: &[String],
+    reader: &mut PipeReader,
+    budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
+    emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<(), CommandFailure> {
+    let opts = options(arguments)?;
+    evaluate(opts, reader, budget, invoker, emit)
 }
 
 enum ReadOutput {
@@ -105,38 +80,34 @@ enum ReadOutput {
 fn read_outputs(
     stdout: impl io::Read,
     maximum: u64,
+    raw: bool,
     sender: &std::sync::mpsc::SyncSender<ReadOutput>,
 ) -> io::Result<()> {
-    let mut limited = io::BufReader::new(stdout).take(maximum);
-    let mut stream = serde_json::Deserializer::from_reader(&mut limited).into_iter::<Value>();
-    let mut failure = None;
-    for item in &mut stream {
-        match item {
-            Ok(value) => {
-                if sender.send(ReadOutput::Value(value)).is_err() {
-                    return Ok(());
-                }
-            }
-            Err(error) => {
-                failure = Some(error);
-                break;
-            }
+    let mut stdout = io::BufReader::new(stdout);
+    let frame_limit = if raw {
+        maximum.saturating_mul(6).saturating_add(3)
+    } else {
+        maximum.saturating_add(1)
+    };
+    loop {
+        let mut line = Vec::new();
+        let count = stdout
+            .by_ref()
+            .take(frame_limit.saturating_add(1))
+            .read_until(b'\n', &mut line)?;
+        if count == 0 {
+            break;
         }
-    }
-    drop(stream);
-    if let Some(error) = failure {
-        let output = if limited.limit() == 0 {
+        let item = if count as u64 > frame_limit {
             ReadOutput::Exhausted
         } else {
-            ReadOutput::Invalid(format!("jq: invalid worker output: {error}"))
+            match serde_json::from_slice(&line) {
+                Ok(value) => ReadOutput::Value(value),
+                Err(error) => ReadOutput::Invalid(format!("jq: invalid worker output: {error}")),
+            }
         };
-        let _sent = sender.send(output);
-        return Ok(());
-    }
-    if limited.limit() == 0 {
-        let mut extra = [0];
-        if limited.get_mut().read(&mut extra)? != 0 {
-            let _sent = sender.send(ReadOutput::Exhausted);
+        let terminal = !matches!(item, ReadOutput::Value(_));
+        if sender.send(item).is_err() || terminal {
             return Ok(());
         }
     }
@@ -148,9 +119,9 @@ fn collect(
     receiver: &std::sync::mpsc::Receiver<ReadOutput>,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
-) -> Result<CommandResult, CommandFailure> {
-    let mut outputs = Vec::new();
-    let mut retained = Vec::new();
+    raw: bool,
+    emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<bool, CommandFailure> {
     loop {
         let wait = budget
             .remaining()
@@ -159,8 +130,16 @@ fn collect(
         match receiver.recv_timeout(wait) {
             Ok(ReadOutput::Value(value)) => {
                 budget.charge_step_with(invoker)?;
-                retained.push(budget.charge_value_bytes(weigh(&value))?);
-                outputs.push(value);
+                let bytes = match (raw, value) {
+                    (true, Value::String(text)) => text.into_bytes(),
+                    (_, value) => serde_json::to_vec(&value).map_err(|error| {
+                        CommandFailure::failed(format!("jq: invalid worker output: {error}"))
+                    })?,
+                };
+                let _charge = budget.charge_value_bytes(bytes.len() as u64)?;
+                if !emit(&bytes)? || !emit(b"\n")? {
+                    return Ok(false);
+                }
             }
             Ok(ReadOutput::Exhausted) => {
                 return Err(LimitExceeded::ValueBytes {
@@ -174,9 +153,7 @@ fn collect(
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
-                let mut result = CommandResult::value(Value::Array(outputs));
-                result.retained = retained;
-                return Ok(result);
+                return Ok(true);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(CommandFailure::failed("jq: worker output reader stopped"));
@@ -192,17 +169,25 @@ fn collect(
 }
 
 fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailure {
-    CommandFailure::failed(format!("jq: worker exited {status}: {stderr}"))
+    CommandFailure::Status {
+        message: format!("jq: worker exited {status}: {stderr}"),
+        status: if status.code() == Some(2) {
+            ExitCode::SYNTAX
+        } else {
+            ExitCode::FAILURE
+        },
+    }
 }
 
 const STDERR_BYTES: u64 = 4096;
 
 fn evaluate(
-    filter: &str,
-    input: Value,
+    opts: Options<'_>,
+    input: &mut PipeReader,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
-) -> Result<CommandResult, CommandFailure> {
+    emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<(), CommandFailure> {
     let path =
         executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
     let child = Command::new(path)
@@ -230,11 +215,64 @@ fn evaluate(
         .take()
         .ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
     std::thread::scope(|scope| {
-        let writer = scope.spawn(move || -> io::Result<()> {
-            let mut stdin = io::BufWriter::new(stdin);
-            serde_json::to_writer(&mut stdin, &(filter, input))?;
-            stdin.flush()
-        });
+        let mut input_budget = budget.fork();
+        let writer = scope.spawn(
+            move || -> Result<Vec<crate::RetainedBytes>, CommandFailure> {
+                let mut stdin = io::BufWriter::new(stdin);
+                serde_json::to_writer(&mut stdin, &(opts.filter.unwrap_or_default(), opts.slurp))
+                .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
+                stdin.write_all(b"\n").map_err(input_error)?;
+                if opts.null_input {
+                    stdin.write_all(b"null\n").map_err(input_error)?;
+                    stdin.flush().map_err(input_error)?;
+                    return Ok(Vec::new());
+                }
+                if opts.slurp {
+                    let mut values = Vec::new();
+                    let mut charges = Vec::new();
+                    let retention = input_budget.fork();
+                    let mut source = PipeSource::new(input, &mut input_budget, invoker);
+                    loop {
+                        let item = serde_json::Deserializer::from_reader(&mut source)
+                            .into_iter::<Value>()
+                            .next();
+                        let value = match item {
+                            Some(Ok(value)) => value,
+                            Some(Err(error)) => {
+                                if let Some(failure) = source.failure {
+                                    return Err(failure.into());
+                                }
+                                return Err(CommandFailure::Status {
+                                    message: format!("jq: invalid JSON input: {error}"),
+                                    status: ExitCode::SYNTAX,
+                                });
+                            }
+                            None => break,
+                        };
+                        drop(source.charged.take());
+                        charges.push(retention.charge_value_bytes(weigh(&value))?);
+                        values.push(value);
+                    }
+                    if let Some(error) = source.failure {
+                        return Err(error.into());
+                    }
+                    serde_json::to_writer(&mut stdin, &values).map_err(|error| {
+                        CommandFailure::failed(format!("jq: worker input: {error}"))
+                    })?;
+                    stdin.write_all(b"\n").map_err(input_error)?;
+                    stdin.flush().map_err(input_error)?;
+                    return Ok(charges);
+                } else {
+                    while let ReadOutcome::Bytes(chunk) = input.read(&input_budget, invoker)? {
+                        stdin.write_all(&chunk).map_err(input_error)?;
+                        stdin.flush().map_err(input_error)?;
+                        input_budget.charge_step_with(invoker)?;
+                    }
+                }
+                stdin.flush().map_err(input_error)?;
+                Ok(Vec::new())
+            },
+        );
         let errors = scope.spawn(move || {
             let mut stderr = stderr;
             let mut excerpt = String::new();
@@ -246,24 +284,22 @@ fn evaluate(
             excerpt
         });
         let (sender, receiver) = sync_channel(0);
-        let maximum = budget
-            .max_value_bytes()
-            .saturating_sub(budget.value_bytes());
+        let maximum = budget.max_value_bytes();
         let reader = scope.spawn(move || {
-            if let Err(error) = read_outputs(stdout, maximum, &sender) {
+            if let Err(error) = read_outputs(stdout, maximum, opts.raw, &sender) {
                 let _sent = sender.send(ReadOutput::Invalid(format!(
                     "jq: could not read worker output: {error}"
                 )));
             }
         });
-        let result = collect(&receiver, budget, invoker);
+        let result = collect(&receiver, budget, invoker, opts.raw, emit);
         drop(receiver);
-        if result.is_err() {
+        if !matches!(result, Ok(true)) {
             drop(child);
             let _reader_result = reader.join();
             let _writer_result = writer.join();
             let _stderr_result = errors.join();
-            return result.map(reduce);
+            return result.map(|_| ());
         }
         let status = child.0.wait();
         drop(child);
@@ -279,31 +315,104 @@ fn evaluate(
         if read.is_err() {
             return Err(CommandFailure::failed("jq: worker output reader panicked"));
         }
-        if let Ok(Err(error)) = written {
-            return Err(CommandFailure::failed(format!(
-                "jq: could not send worker input: {error}"
-            )));
-        }
-        result.map(reduce)
+        let _charges = match written {
+            Ok(Ok(charges)) => charges,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(CommandFailure::failed("jq: worker input writer panicked")),
+        };
+        result.map(|_| ())
     })
 }
 
-fn reduce(mut result: CommandResult) -> CommandResult {
-    if let Value::Array(mut outputs) = result.value {
-        result.value = if outputs.len() <= 1 {
-            outputs.pop().unwrap_or(Value::Null)
-        } else {
-            Value::Array(outputs)
-        };
+fn input_error(error: io::Error) -> CommandFailure {
+    CommandFailure::failed(format!("jq: could not send worker input: {error}"))
+}
+
+struct PipeSource<'a> {
+    reader: &'a mut PipeReader,
+    budget: &'a mut Budget,
+    invoker: &'a dyn CapabilityInvoker,
+    pending: Vec<u8>,
+    offset: usize,
+    failure: Option<LimitExceeded>,
+    charged: Option<crate::RetainedBytes>,
+}
+
+impl<'a> PipeSource<'a> {
+    fn new(
+        reader: &'a mut PipeReader,
+        budget: &'a mut Budget,
+        invoker: &'a dyn CapabilityInvoker,
+    ) -> Self {
+        Self {
+            reader,
+            budget,
+            invoker,
+            pending: Vec::new(),
+            offset: 0,
+            failure: None,
+            charged: None,
+        }
     }
-    result
+}
+
+impl io::Read for PipeSource<'_> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if target.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.pending.len() {
+            match self.reader.read(self.budget, self.invoker) {
+                Ok(ReadOutcome::Bytes(bytes)) => {
+                    if let Err(error) = self.budget.charge_step_with(self.invoker) {
+                        self.failure = Some(error);
+                        return Err(io::Error::other("jq: input interrupted"));
+                    }
+                    self.pending = bytes;
+                    self.offset = 0;
+                }
+                Ok(ReadOutcome::End) => return Ok(0),
+                Err(error) => {
+                    self.failure = Some(error);
+                    return Err(io::Error::other("jq: input interrupted"));
+                }
+            }
+        }
+        let len = target.len().min(self.pending.len() - self.offset);
+        let charge = match self.charged.as_mut() {
+            Some(charge) => charge.grow(len as u64),
+            None => self.budget.charge_value_bytes(len as u64).map(|charge| {
+                self.charged = Some(charge);
+            }),
+        };
+        if let Err(error) = charge {
+            self.failure = Some(error);
+            return Err(io::Error::other("jq: input exceeds retained-byte budget"));
+        }
+        target[..len].copy_from_slice(&self.pending[self.offset..self.offset + len]);
+        self.offset += len;
+        Ok(len)
+    }
+}
+
+pub(crate) enum WorkerFailure {
+    InvalidInput(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 pub(crate) fn run_filter(
     filter: &str,
-    input: Val,
+    inputs: impl Iterator<Item = Result<Val, serde_json::Error>>,
     output: &mut impl io::Write,
-) -> Result<(), String> {
+) -> Result<(), WorkerFailure> {
     let definitions = jaq_core::defs()
         .chain(jaq_std::defs())
         .chain(jaq_json::defs());
@@ -321,21 +430,42 @@ pub(crate) fn run_filter(
                 path: (),
             },
         )
-        .map_err(|errors| format!("jq: invalid filter: {}", describe_load_errors(&errors)))?;
+        .map_err(|errors| {
+            WorkerFailure::Failed(format!(
+                "jq: invalid filter: {}",
+                describe_load_errors(&errors)
+            ))
+        })?;
     let compiled = Compiler::default()
         .with_funs(functions)
         .compile(modules)
-        .map_err(|errors| format!("jq: invalid filter: {}", describe_compile_errors(&errors)))?;
+        .map_err(|errors| {
+            WorkerFailure::Failed(format!(
+                "jq: invalid filter: {}",
+                describe_compile_errors(&errors)
+            ))
+        })?;
 
-    let context = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
-    for result in compiled.id.run((context, input)) {
-        let produced = result.map_err(describe_exception)?;
-        let value = convert(&produced, 0)?;
-        serde_json::to_writer(&mut *output, &value)
-            .map_err(|error| format!("jq: could not write output: {error}"))?;
-        output
-            .write_all(b"\n")
-            .map_err(|error| format!("jq: could not write output: {error}"))?;
+    for input in inputs {
+        let input = input.map_err(|error| {
+            WorkerFailure::InvalidInput(format!("jq: invalid JSON input: {error}"))
+        })?;
+        let context = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
+        for result in compiled.id.run((context, input)) {
+            let produced = result
+                .map_err(describe_exception)
+                .map_err(WorkerFailure::Failed)?;
+            let value = convert(&produced, 0).map_err(WorkerFailure::Failed)?;
+            serde_json::to_writer(&mut *output, &value).map_err(|error| {
+                WorkerFailure::Failed(format!("jq: could not write output: {error}"))
+            })?;
+            output.write_all(b"\n").map_err(|error| {
+                WorkerFailure::Failed(format!("jq: could not write output: {error}"))
+            })?;
+            output.flush().map_err(|error| {
+                WorkerFailure::Failed(format!("jq: could not flush output: {error}"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -481,23 +611,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collected_output_keeps_its_charge_until_the_result_drops() {
+    fn slurp_refuses_an_oversized_document_before_finishing_its_parse() {
+        let mut input = PipeReader::from_bytes(format!("\"{}\"", "x".repeat(100_000)).into_bytes());
+        let mut budget = Budget::start(crate::Limits {
+            max_value_bytes: 64,
+            ..crate::Limits::default()
+        });
+        let invoker = crate::builtins::test_support::NoCapabilities;
+        let mut source = PipeSource::new(&mut input, &mut budget, &invoker);
+        let parsed = serde_json::from_reader::<_, Value>(&mut source);
+        assert!(parsed.is_err());
+        assert!(matches!(
+            source.failure,
+            Some(LimitExceeded::ValueBytes { maximum: 64 })
+        ));
+        assert!(
+            source.offset <= 64,
+            "parser consumed {} bytes",
+            source.offset
+        );
+        drop(source);
+        assert_eq!(budget.value_bytes(), 0);
+    }
+
+    #[test]
+    fn emitted_output_releases_its_charge() {
         let (sender, receiver) = sync_channel(2);
         sender
             .send(ReadOutput::Value(Value::from("retained")))
             .unwrap();
         sender.send(ReadOutput::Done).unwrap();
         let mut budget = Budget::start(crate::Limits::default());
-        let result = reduce(
-            collect(
-                &receiver,
-                &mut budget,
-                &crate::builtins::test_support::NoCapabilities,
-            )
-            .unwrap(),
-        );
-        assert_eq!(budget.value_bytes(), weigh(&result.value));
-        drop(result);
+        let mut output = Vec::new();
+        collect(
+            &receiver,
+            &mut budget,
+            &crate::builtins::test_support::NoCapabilities,
+            false,
+            &mut |bytes| {
+                output.extend_from_slice(bytes);
+                Ok(true)
+            },
+        )
+        .expect("collect output");
+        assert_eq!(output, b"\"retained\"\n");
         assert_eq!(budget.value_bytes(), 0);
     }
 }

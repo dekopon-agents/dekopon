@@ -1,4 +1,7 @@
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Mutex, mpsc},
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 
@@ -76,6 +79,11 @@ impl CapabilityInvoker for Fixture {
                 None => CommandRun::Failed {
                     message: "probe: object takes --key value pairs".to_owned(),
                 },
+            },
+            ["json-text"] => CommandRun::Rendered {
+                stdout: "{\"headSha\":\"0123456789012345678901234567890123456789\"}\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
             },
             ["list"] => proposal("fixture.list", json!({})),
             ["null"] => proposal("fixture.null", json!({})),
@@ -272,7 +280,7 @@ fn if_elif_else_selects_one_branch() {
 fn for_loops_iterate_over_words_and_arrays() {
     assert_eq!(output("for x in a b c; do echo $x; done"), "a\nb\nc");
     assert_eq!(
-        output("for x in $(probe object --a 1 --b 2 --c 3 | jq '[.a,.b,.c]'); do echo $x; done"),
+        output("for x in $(probe object --a 1 --b 2 --c 3 | jq -r '.a,.b,.c'); do echo $x; done"),
         "1\n2\n3"
     );
 }
@@ -323,6 +331,475 @@ fn functions_take_positional_parameters_and_return_status() {
 }
 
 #[test]
+fn binary_base64_passes_through_cat_but_not_text_boundaries() {
+    assert_eq!(output("printf /w== | base64 -d | cat"), "�");
+    assert_eq!(output("printf /w== | base64 -d"), "�");
+    assert_eq!(output("printf 'aGVs\nbG8=' | base64 -d"), "hello");
+    assert_eq!(output("base64 hi"), "aGk=");
+    assert_eq!(output("printf 'eHjDqQ==' | base64 -d"), "xxé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 -d"), "�aé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 --decode | cat"), "�aé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 -d | head -1"), "�aé");
+    assert_eq!(code("base64 -d !!!!"), 1);
+    assert_eq!(code("base64 -w 0 hi"), 2);
+    let resumed = run("v=$(base64 -d /w==); echo after");
+    assert_eq!(resumed.exit_code, ExitCode::SUCCESS, "{resumed:?}");
+    assert_eq!(
+        resumed.output,
+        "standard input is not valid UTF-8 text\nafter"
+    );
+    let captured = run("v=$(printf /w== | base64 -d); echo $? reached");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(
+        captured.output,
+        "standard input is not valid UTF-8 text\n1 reached"
+    );
+    let provider = run("printf /w== | base64 -d | probe upper -");
+    assert_ne!(provider.exit_code, ExitCode::SUCCESS, "{provider:?}");
+    assert!(provider.output.contains("not valid UTF-8"), "{provider:?}");
+    assert_eq!(output("printf /w== | base64 -d | base64"), "/w==");
+}
+
+#[test]
+fn a_function_redirect_captures_its_body() {
+    assert_eq!(output("f() { printf ab; }; f > buf; cat buf"), "ab");
+    assert_eq!(output("f() { echo hi; }; f > buf; cat buf | wc -c"), "3");
+}
+
+#[test]
+fn function_stderr_redirect_keeps_exact_endings() {
+    assert_eq!(output("f() { echo hi; }; f >&2; echo after"), "hi\nafter");
+    assert_eq!(output("f() { printf hi; }; f >&2; echo after"), "hiafter");
+}
+
+#[test]
+fn discarded_cat_in_a_diagnostics_redirected_function_stays_discarded() {
+    let outcome = run("f() { cat > /dev/null; echo visible; }; printf secret | f >&2; echo after");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "visible\nafter");
+}
+
+#[test]
+fn redirected_bodies_in_a_substitution_send_stdout_to_diagnostics() {
+    assert_eq!(
+        output("f() { echo diagnostic; }; x=$(f >&2; echo kept); echo $x"),
+        "diagnostic\nkept"
+    );
+    assert_eq!(
+        output("x=$({ echo diagnostic; } >&2; echo kept); echo $x"),
+        "diagnostic\nkept"
+    );
+}
+
+#[test]
+fn nested_stage_routes_capture_and_redirect_before_its_pipe() {
+    assert_eq!(
+        output("{ v=$(printf a | cat); printf '<%s>' \"$v\"; } | cat"),
+        "<a>"
+    );
+    assert_eq!(output("{ base64 -d /w==; } > b | wc -c"), "0");
+    assert_eq!(output("{ printf leaked; } > /dev/null | wc -c"), "0");
+    assert_eq!(
+        output("f() { base64 -d /w==; }; f > b; cat b | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn discarded_compound_does_not_retain_assembled_output() {
+    let outcome = run_with(
+        "{ printf abcdefghijklmnopqrstuvwxyz; printf abcdefghijklmnopqrstuvwxyz; } > /dev/null",
+        Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+}
+
+#[test]
+fn reduced_capture_and_overwritten_pipestatus_refund_their_excess() {
+    let outcome = run_with(
+        "v=$(printf a; printf b; printf c; printf d); w=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+        Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    let outcome = run_with(
+        "PIPESTATUS=abcdefghijklmnopqrstuvwxyzabcdefghijklmn; x=abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
+        Limits {
+            max_value_bytes: 96,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+}
+
+#[test]
+fn capture_reduction_charges_the_combined_value_before_allocation() {
+    let outcome = run_with(
+        "v=$(printf a; printf b; printf c; printf d)",
+        Limits {
+            max_value_bytes: 80,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn discarded_compound_cat_never_emits_stdin() {
+    assert_eq!(output("printf secret | { cat; } > /dev/null"), "");
+}
+
+#[test]
+fn xargs_refuses_expanded_argv_before_allocating_it() {
+    let outcome = run_with(
+        "s=x; i=0; while [ \"$i\" -lt 20 ]; do s=\"$s$s\"; i=$((i+1)); done; printf '%s\\n' \"$s\" | xargs -I x echo \"$s\"",
+        Limits {
+            max_value_bytes: STAGE_STACK + 4 * 1024 * 1024,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn a_discarded_function_does_not_retain_its_output() {
+    let outcome = run_with(
+        "f() { i=0; while [ $i -lt 200 ]; do printf abcdefgh; i=$((i+1)); done; }; f > /dev/null; echo done",
+        Limits {
+            max_value_bytes: 256,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "done");
+    assert_eq!(
+        output("f() { echo hidden; }; v=$(f > /dev/null; echo visible); echo $v"),
+        "visible"
+    );
+    assert_eq!(
+        output("f() { v=$(printf keep); }; f > /dev/null; echo \"$v\""),
+        "keep"
+    );
+    assert_eq!(
+        output(
+            "f() { v=$(printf keep); echo hidden; }; got=$(f > /dev/null; echo \"$v\"); echo \"$got\""
+        ),
+        "keep"
+    );
+    assert_eq!(
+        output(
+            "f() { printf hi | base64; printf 'line\\n' | head -1; }; got=$(f > /dev/null; echo visible); echo \"$got\""
+        ),
+        "visible"
+    );
+}
+
+#[test]
+fn a_redirected_function_charges_each_fragment_before_assembling_its_output() {
+    let outcome = run_with(
+        "f() { printf 'abcdefghijklmnopqrst'; printf 'abcdefghijklmnopqrst'; }; f > buf; echo reached",
+        Limits {
+            max_value_bytes: 30,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn slurp_from_a_pipe_refuses_four_kib_of_value_headroom() {
+    let outcome = run_with(
+        "while true; do printf '12345678901234567890123456789012\\n'; done | jq -s .",
+        Limits {
+            max_value_bytes: STAGE_STACK + 4096,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn jq_slurp_keeps_its_documents_charged_while_processing() {
+    let outcome = run_with(
+        "jq -s . <<EOF\n\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"\nEOF",
+        Limits {
+            max_value_bytes: 40,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+    let admitted = run_with(
+        "jq -s . <<EOF\n\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"\nEOF",
+        Limits {
+            max_value_bytes: 512,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(admitted.exit_code, ExitCode::SUCCESS, "{admitted:?}");
+}
+
+#[test]
+fn an_unterminated_flood_into_sort_is_refused_at_the_retained_budget() {
+    let outcome = run_with(
+        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); while true; do printf \"$big\"; done | sort",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 1024,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn cut_uniq_wc_and_sort_preserve_fragmented_and_unterminated_lines() {
+    assert_eq!(
+        output("printf 'a:2\\na:2\\nb:3' | cut -d : -f 2 | uniq -c"),
+        "2 2\n1 3"
+    );
+    assert_eq!(output("printf '10\\n2\\n1' | sort -n -r -u"), "10\n2\n1");
+    assert_eq!(output("printf 'α β\\nγ' | wc -w"), "3");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output("printf 'α β\\nγ' | wc")).expect("wc result is JSON"),
+        json!({"bytes": 8, "lines": 2, "words": 3})
+    );
+    assert_eq!(output("printf 'a\\nb' | wc -l"), "2");
+    assert_eq!(output("printf /w== | base64 -d | wc -c"), "1");
+}
+
+#[test]
+fn sort_refuses_growing_retention_but_wc_counts_a_long_stream() {
+    let limits = Limits {
+        max_value_bytes: 2 * 1024 * 1024 + 1024,
+        ..Limits::default()
+    };
+    let sorted = run_with(
+        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); for x in 1 2 3 4 5; do printf '%s\\n' \"$big\"; done | sort",
+        limits,
+    );
+    assert_eq!(sorted.exit_code, ExitCode::SUCCESS, "{sorted:?}");
+    let long = format!(
+        "printf '%s' '{}' | sort",
+        "x".repeat(2 * 1024 * 1024 + 2048)
+    );
+    let refused = run_with(&long, limits);
+    assert_ne!(refused.exit_code, ExitCode::SUCCESS, "{refused:?}");
+    assert!(refused.output.contains("bytes of values"), "{refused:?}");
+    let counted = run_with(
+        &format!(
+            "printf '%s' '{}' | wc -c",
+            "x".repeat(2 * 1024 * 1024 + 2048)
+        ),
+        limits,
+    );
+    assert_eq!(counted.exit_code, ExitCode::SUCCESS, "{counted:?}");
+    assert_eq!(counted.output, (2 * 1024 * 1024 + 2048).to_string());
+}
+
+#[test]
+fn grep_and_sed_stream_fragmented_lines_without_adding_newlines() {
+    assert_eq!(output("printf 'abc\\ndef' | grep -n -E '^d'"), "2:def");
+    assert_eq!(
+        output("printf 'abc\\ndef' | sed -E 's/([a-z]+)/x/g'"),
+        "x\nx"
+    );
+    assert_eq!(output("printf 'abc\\ndef' | grep -c -E '^z'"), "0");
+    assert_eq!(output("printf 'abc\\ndef' | grep -c -E '^z' | wc -c"), "2");
+    assert_eq!(code("set -o pipefail; printf 'abc\\ndef' | grep -c z"), 1);
+    assert_eq!(output("printf 'abc\\ndef' | grep -i -v 'ABC'"), "def");
+    assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|'"), "x");
+    assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|' | wc -c"), "2");
+}
+
+#[test]
+fn a_redirected_grep_count_keeps_zero_bytes_when_status_is_one() {
+    assert_eq!(
+        output("printf x | grep -c z > count; cat count | wc -c"),
+        "2"
+    );
+    assert_eq!(
+        output("printf x | grep -c z > count; echo ${PIPESTATUS[1]}"),
+        "1"
+    );
+}
+
+#[test]
+fn case_insensitive_grep_charges_its_folded_line() {
+    let script = "grep -i X <<EOF\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nEOF";
+    let refused = run_with(
+        script,
+        Limits {
+            max_value_bytes: 50,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(refused.exit_code, ExitCode::SUCCESS, "{refused:?}");
+    assert!(refused.output.contains("bytes of values"), "{refused:?}");
+    let accepted = run_with(
+        script,
+        Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(accepted.exit_code, ExitCode::SUCCESS, "{accepted:?}");
+    assert_eq!(accepted.output, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn large_here_docs_charge_a_step_for_each_text_chunk() {
+    for command in ["grep x", "sed s/x/y/"] {
+        let limits = Limits {
+            max_steps: 30,
+            ..Limits::default()
+        };
+        let small = run_with(&format!("{command} <<EOF\nx\nEOF"), limits);
+        assert_eq!(small.exit_code, ExitCode::SUCCESS, "{small:?}");
+        let huge = format!("{command} <<EOF\n{}\nEOF", "x".repeat(256 * 1024));
+        let result = run_with(&huge, limits);
+        assert_ne!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+        assert!(result.output.contains("steps"), "{result:?}");
+    }
+}
+
+#[test]
+fn a_global_sed_replacement_emits_in_bounded_fragments() {
+    let replacement = "y".repeat(8 * 1024);
+    let script = format!("printf xxxxx | sed 's/x/{replacement}/g' | wc -c");
+    let result = run(&script);
+    assert_eq!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+    assert_eq!(result.output, "40960");
+}
+
+#[test]
+fn grep_and_sed_refuse_invalid_utf8_in_a_stream() {
+    for command in ["grep x", "sed s/x/y/"] {
+        let script = format!("printf /w== | base64 -d | {command}");
+        let result = run(&script);
+        assert_ne!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+        assert!(result.output.contains("not valid UTF-8"), "{result:?}");
+    }
+}
+
+#[test]
+fn head_closes_a_loop_producer_and_preserves_its_status_under_pipefail() {
+    assert_eq!(output("while true; do echo y; done | head -1"), "y");
+    assert_eq!(
+        code("set -o pipefail; while true; do echo y; done | head -1"),
+        0
+    );
+    assert_eq!(output("while true; do echo y; done | head -n 0"), "");
+    assert_eq!(output("printf 'a\\nb\\n' | { head -n 0; cat; }"), "");
+}
+
+#[test]
+fn head_and_tail_select_fragmented_and_unterminated_lines() {
+    let crossing = "x".repeat(6000);
+    let script = format!("printf 'a\\n{crossing}\\nb\\nc' | tail -n 3");
+    assert_eq!(output(&script), format!("{crossing}\nb\nc"));
+    let script = format!("printf '{crossing}\\nb\\nc' | head -1");
+    assert_eq!(output(&script), crossing);
+    assert_eq!(output("printf 'a\\nb\\nc' | head -3"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 2"), "b\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +2"), "b\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +0"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | head"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +1"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 0"), "");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -2"), "b\nc");
+    assert_eq!(code("echo a | head -x"), 2);
+    assert_eq!(code("echo a | tail -f"), 2);
+    assert_eq!(code("echo a | tail -+2"), 2);
+    assert_eq!(code("echo a | head file"), 2);
+}
+
+#[test]
+fn a_multibyte_character_split_across_pipe_chunks_stays_valid_text() {
+    let crossing = "x".repeat(4095);
+    let script = format!("printf '{crossing}é' | tail -n +1");
+    assert_eq!(output(&script), format!("{crossing}é"));
+    let captured = format!("v=$(printf '{crossing}é' | tail -n +1); echo ${{#v}}");
+    assert_eq!(output(&captured), "4096");
+}
+
+#[test]
+fn a_discarded_line_stream_does_not_use_the_retained_byte_budget() {
+    let outcome = run_with(
+        "while true; do echo x; done | head -100 > /dev/null; echo done",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "done");
+}
+
+#[test]
+fn line_selections_honor_named_buffer_redirection() {
+    assert_eq!(
+        output("printf 'a\\nb\\nc' | head -n 2 > buf; cat buf | wc -c"),
+        "4"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\nc' | tail -n +2 > buf; cat buf"),
+        "b\nc"
+    );
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 1 > buf; cat buf"), "c");
+    assert_eq!(output("printf 'a\\nb' | { head -1 > buf; cat buf; }"), "a");
+}
+
+#[test]
+fn a_tail_replaces_an_affordable_line_before_charging_the_next() {
+    let outcome = run_with(
+        "printf '12345678\\nabcdefgh\\n' | tail -n 1",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 16,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "abcdefgh");
+}
+
+#[test]
+fn line_selection_capture_is_charged_before_retaining_output() {
+    let outcome = run_with(
+        "v=$(printf '12345678901234567890' | head -n 1); echo reached",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 25,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn tail_refuses_to_retain_lines_past_the_shared_value_budget() {
+    let outcome = run_with(
+        "printf 'abcdefghij\\nabcdefghij\\n' | tail -n 2",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 16,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
 fn a_negated_pipeline_inverts_its_status() {
     assert_eq!(output("if ! false; then echo neg; fi"), "neg");
     assert_eq!(output("if ! true; then echo no; else echo yes; fi"), "yes");
@@ -358,7 +835,7 @@ fn a_piped_stream_is_consumed_once_by_the_statements_that_share_it() {
         "first\npayload"
     );
     assert_eq!(
-        output(r#"probe object --a 1 --b two | jq '.b' | cat"#),
+        output(r#"probe object --a 1 --b two | jq -r '.b' | cat"#),
         "two"
     );
     assert_eq!(
@@ -507,6 +984,10 @@ fn division_by_zero_is_recoverable_not_fatal() {
 #[test]
 fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
     assert_eq!(
+        output("pr=$(probe json-text); printf '%s' \"${pr[headSha]}\""),
+        "0123456789012345678901234567890123456789"
+    );
+    assert_eq!(
         output(r#"r=$(probe object --status 200); echo ${r[status]}"#),
         "200"
     );
@@ -586,12 +1067,167 @@ fn redirection_writes_and_cat_reads_named_buffers() {
 }
 
 #[test]
+fn named_buffers_append_exact_bytes_and_refund_on_replacement() {
+    assert_eq!(output("printf a > buf; printf b >> buf; cat buf"), "ab");
+    assert_eq!(
+        output("echo a > buf; printf b >> buf; cat buf | wc -c"),
+        "3"
+    );
+    assert_eq!(output("echo old > buf; printf x > buf; cat buf"), "x");
+    assert_eq!(
+        output("printf '/w==' | base64 -d > buf; cat buf | base64"),
+        "/w=="
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d > first; cat first > second; cat second | base64"),
+        "/w=="
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d | cat > buf; cat buf | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn compound_redirects_keep_terminators_and_binary_bytes_exact() {
+    assert_eq!(
+        output("{ printf a; printf b; } > buf; cat buf | wc -c"),
+        "2"
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d > src; { cat src; } > buf; cat buf | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn named_buffer_growth_is_refused_before_retaining_past_the_limit() {
+    let outcome = run_with(
+        "printf 12345678 > buf; printf 12345678 >> buf; printf 12345678 >> buf",
+        Limits {
+            max_value_bytes: 20,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn copying_a_named_buffer_charges_only_the_destination_without_a_snapshot() {
+    let outcome = run_with(
+        "printf 12345678 > src; cat src > dst; cat dst",
+        Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "12345678");
+    let self_append = run_with(
+        "printf 12345678 > src; cat src >> src; cat src",
+        Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(self_append.exit_code, ExitCode::SUCCESS, "{self_append:?}");
+    assert_eq!(self_append.output, "1234567812345678");
+}
+
+#[test]
+fn a_nonfinal_named_cat_routes_diagnostics_to_its_stage_capture() {
+    let outcome = run("printf 'producer\\n' > buf; cat buf >&2 | probe errored");
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    let producer = outcome.output.find("producer").expect("cat stderr");
+    let consumer = outcome
+        .output
+        .find("could not connect")
+        .expect("consumer stderr");
+    assert!(producer < consumer, "{outcome:?}");
+}
+
+#[test]
+fn a_large_binary_buffer_to_stderr_is_rendered_only_up_to_the_capture_bound() {
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(vec![0xff; 64 * 1024]);
+    let script = format!("printf '{encoded}' | base64 -d > buf; cat buf >&2 | cat");
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_output_bytes: 512,
+            max_output_lines: 4,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(
+        outcome.output.contains("redirected diagnostics truncated"),
+        "{outcome:?}"
+    );
+    assert!(outcome.output.len() < 1024, "{outcome:?}");
+}
+
+#[test]
+fn pipeline_diagnostics_follow_stage_order_even_if_the_consumer_fails_first() {
+    let outcome = run("probe decline | probe errored");
+    let producer = outcome
+        .output
+        .find("probe: declined")
+        .expect("producer diagnostic");
+    let consumer = outcome
+        .output
+        .find("could not connect")
+        .expect("consumer diagnostic");
+    assert!(producer < consumer, "{outcome:?}");
+}
+
+#[test]
+fn a_binary_named_buffer_refuses_text_capture_and_provider_stdin() {
+    let capture = run("printf '/w==' | base64 -d > buf; v=$(cat buf)");
+    assert_ne!(capture.exit_code, ExitCode::SUCCESS, "{capture:?}");
+    assert!(capture.output.contains("not valid UTF-8"), "{capture:?}");
+    let provider = run("printf '/w==' | base64 -d > buf; cat buf | probe upper");
+    assert_ne!(provider.exit_code, ExitCode::SUCCESS, "{provider:?}");
+    assert!(provider.output.contains("not valid UTF-8"), "{provider:?}");
+}
+
+#[test]
+fn substitution_trims_only_trailing_line_feeds_and_splits_on_lines() {
+    assert_eq!(output("v=$(printf 'x\\n\\n'); printf '%s' \"$v\""), "x");
+    assert_eq!(output("count() { echo $#; }; count $(printf 'a b')"), "1");
+    assert_eq!(output("count() { echo $#; }; count $(printf 'a\\nb')"), "2");
+}
+
+#[test]
 fn exit_sets_the_script_status_and_wraps_like_bash() {
     assert_eq!(code("exit 0"), 0);
     assert_eq!(code("exit 7"), 7);
     assert_eq!(code("exit 300"), 44);
     assert_eq!(output("echo a; exit 1; echo b"), "a");
     assert_eq!(code("echo a; exit 1; echo b"), 1);
+}
+
+#[test]
+fn xargs_never_invokes_its_command_for_empty_input() {
+    for script in [
+        "printf '' | xargs probe upper --text",
+        "printf '1\\n' | jq empty | xargs probe upper --text",
+    ] {
+        let fixture = Fixture::default();
+        let outcome = Interpreter::new(Limits::default()).run(script, &fixture);
+        assert_eq!(
+            outcome.exit_code,
+            ExitCode::SUCCESS,
+            "{script}: {outcome:?}"
+        );
+        assert_eq!(outcome.capability_calls, 0, "{script}: {outcome:?}");
+        assert!(
+            fixture.calls.lock().expect("fixture calls").is_empty(),
+            "{script}"
+        );
+    }
 }
 
 #[test]
@@ -611,7 +1247,7 @@ fn xargs_maps_a_command_over_a_list() {
             ("cli-probe.upper".to_owned(), json!({"text": "b"})),
         ]
     );
-    assert_eq!(outcome.output, r#"[{"text":"A"},{"text":"B"}]"#);
+    assert_eq!(outcome.output, "{\"text\":\"A\"}\n{\"text\":\"B\"}");
 }
 
 #[test]
@@ -623,7 +1259,7 @@ fn help_interception_requires_help_to_be_the_only_argument() {
     assert_eq!(output("echo try --help"), "try --help");
     assert_eq!(
         output(r#"printf 'one\ntwo' | xargs -I {} echo {} --help"#),
-        r#"["one --help","two --help"]"#
+        "one --help\ntwo --help"
     );
 }
 
@@ -634,10 +1270,7 @@ fn help_interception_decides_on_the_unexpanded_word_not_the_expanded_string() {
         output(r#"pat=--help; grep "$pat""#),
         "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
     );
-    assert_eq!(
-        output(r#"printf 'a\n--help\n' | xargs echo"#),
-        r#"["a","--help"]"#
-    );
+    assert_eq!(output(r#"printf 'a\n--help\n' | xargs echo"#), "a\n--help");
     assert_eq!(
         output(r#"f() { "$@" --help; }; f grep -v"#),
         "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
@@ -883,16 +1516,14 @@ fn case_charges_the_step_budget_like_every_other_construct() {
 fn a_here_document_becomes_the_commands_input_as_one_string() {
     assert_eq!(output("cat <<EOF\nalpha\nbeta\nEOF"), "alpha\nbeta");
 
-    // jq parses the heredoc's JSON text before filtering, the same as a filter reading the
-    // same text from a real pipe.
     assert_eq!(
         output("jq -r .name <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
         "dekopon"
     );
     let unparsed = run("jq -r .name <<EOF\nnot json\nEOF");
-    assert_eq!(unparsed.exit_code, ExitCode::FAILURE);
+    assert_eq!(unparsed.exit_code, ExitCode::SYNTAX);
     assert!(
-        unparsed.output.contains("cannot index"),
+        unparsed.output.contains("invalid JSON input"),
         "{}",
         unparsed.output
     );
@@ -900,8 +1531,6 @@ fn a_here_document_becomes_the_commands_input_as_one_string() {
 
 #[test]
 fn a_captured_object_reaches_jq_through_an_echo_pipe() {
-    // `r=$(cmd)` captures the object; `echo "$r"` is what stringifies it into display text,
-    // and jq parses that text back rather than indexing it as a string.
     assert_eq!(
         output(r#"r=$(probe object --a 1 --b 2); echo "$r" | jq '.a + .b'"#),
         "3"
@@ -1109,7 +1738,7 @@ fn nounset_refuses_a_name_nothing_ever_set() {
 fn pipefail_reports_the_rightmost_stage_that_failed() {
     assert_eq!(code("nosuchcmd | jq ."), 0);
     assert_eq!(code("set -o pipefail\nnosuchcmd | jq ."), 127);
-    assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
+    assert_eq!(code("set -o pipefail\necho hi | jq ."), 2);
     assert_eq!(
         code("set -o pipefail\nset +o pipefail\nnosuchcmd | jq ."),
         0
@@ -1121,7 +1750,7 @@ fn pipestatus_reports_every_stage() {
     assert!(output("nosuchcmd | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
     assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
     assert_eq!(
-        output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
+        output("echo 1 | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
         "1\n3"
     );
 }
@@ -1974,6 +2603,114 @@ fn echo_writes_its_newline_into_the_pipe() {
 }
 
 #[test]
+fn cat_redirected_to_diagnostics_consumes_its_pipe_without_leaking_into_a_capture() {
+    let redirected = run("printf 'payload\\n' | cat >&2");
+    assert_eq!(redirected.exit_code, ExitCode::SUCCESS, "{redirected:?}");
+    assert_eq!(redirected.output, "payload");
+    let captured = run("v=$(printf 'error\\n' | cat >&2); printf 'stdout:%s' \"$v\"");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(captured.output, "error\nstdout:");
+    let binary = run("printf '/w==' | base64 -d | cat >&2");
+    assert_eq!(binary.exit_code, ExitCode::SUCCESS, "{binary:?}");
+    assert!(binary.output.contains('�'), "{binary:?}");
+}
+
+#[test]
+fn text_commands_count_and_transform_pipe_bytes_not_json_array_elements() {
+    assert_eq!(output("printf '[\"a\",\"b\"]' | wc -l"), "1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output("printf 'a b\\nc d' | wc")).expect("wc JSON"),
+        json!({"lines": 2, "words": 4, "bytes": 7})
+    );
+    assert_eq!(output("printf 'a b\\nc d' | wc -l -w"), "[2,4]");
+    assert_eq!(output("printf 'foo\\nbop' | sed s/o/0/g"), "f00\nb0p");
+    assert_eq!(output("printf 'alpha\\nbravo' | grep b"), "bravo");
+}
+
+#[test]
+fn cut_selects_ranges_characters_and_undelimited_pipe_lines() {
+    assert_eq!(output("printf 'a,b\\nc,d' | cut -d , -f 1"), "a\nc");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 1,3"), "a:c");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 2-3"), "b:c");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 3-"), "c:d");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f -2"), "a:b");
+    assert_eq!(output("printf abcdef | cut -c 1-3"), "abc");
+    assert_eq!(output("printf plain | cut -d : -f 2"), "plain");
+}
+
+#[test]
+fn uniq_selects_duplicate_and_unique_pipe_lines() {
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -c"), "2 a\n1 b");
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -d"), "a");
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -u"), "b");
+}
+
+#[test]
+fn cut_refuses_missing_and_conflicting_field_selections() {
+    for (script, cause) in [
+        ("printf 'a:b' | cut -f", "cut: -f requires a value"),
+        ("printf 'a:b' | cut", "cut: -f or -c is required"),
+        (
+            "printf 'a:b' | cut -f 1 -c 1",
+            "cut: -f and -c are mutually exclusive",
+        ),
+    ] {
+        let result = run(script);
+        assert_eq!(result.exit_code.get(), 2, "{script}: {result:?}");
+        assert!(result.output.contains(cause), "{script}: {result:?}");
+    }
+}
+
+#[test]
+fn uniq_refuses_conflicting_and_unsupported_options() {
+    for (script, cause) in [
+        (
+            "printf 'a\\na' | uniq -d -u",
+            "uniq: -d and -u are mutually exclusive",
+        ),
+        (
+            "printf 'a\\na' | uniq -i",
+            "uniq: option not yet supported: -i",
+        ),
+    ] {
+        let result = run(script);
+        assert_eq!(result.exit_code.get(), 2, "{script}: {result:?}");
+        assert!(result.output.contains(cause), "{script}: {result:?}");
+    }
+}
+
+#[test]
+fn wc_refuses_unsupported_options() {
+    let result = run("printf a | wc -m");
+    assert_eq!(result.exit_code.get(), 2, "{result:?}");
+    assert!(
+        result.output.contains("wc: option not yet supported: -m"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn uniq_collapses_only_adjacent_duplicates() {
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq"), "a\nb\na");
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq -d"), "a");
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq -u"), "a\nb");
+}
+
+#[test]
+fn cat_copies_bytes_into_a_command_substitution_capture() {
+    let captured = run("v=$(printf x | cat); printf '%s' \"$v\"");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(captured.output, "x");
+    assert_eq!(
+        output("v=$(printf 'a\\nb\\n' | cat | cat); printf '%s' \"$v\""),
+        "a\nb"
+    );
+    let invalid = run("v=$(printf '/w==' | base64 -d | cat)");
+    assert_ne!(invalid.exit_code, ExitCode::SUCCESS, "{invalid:?}");
+    assert!(invalid.output.contains("not valid UTF-8"), "{invalid:?}");
+}
+
+#[test]
 fn a_flooding_producer_ends_when_the_last_stage_stops_reading() {
     let flood = "x".repeat(256 * 1024);
     let script = format!("printf 'first\\n{flood}' | read line\necho $line ${{PIPESTATUS[@]}}");
@@ -2076,9 +2813,7 @@ fn a_builtin_writes_its_lines_and_xargs_reads_text_not_json() {
         output("printf 'b\\na\\n' | sort | { read first; echo $first; }"),
         "a"
     );
-    let one_argument: Value =
-        serde_json::from_str(&output(r#"echo '["a","b"]' | xargs echo"#)).expect("json");
-    assert_eq!(one_argument, json!([r#"["a","b"]"#]));
+    assert_eq!(output(r#"echo '["a","b"]' | xargs echo"#), r#"["a","b"]"#);
 }
 
 #[test]
@@ -2111,6 +2846,16 @@ fn exit_in_a_non_final_stage_ends_only_that_stage() {
 }
 
 #[test]
+fn non_final_return_and_break_do_not_escape_to_the_parent() {
+    let returned = run("f() { return 7; }; f | cat; echo after ${PIPESTATUS[@]}");
+    assert_eq!(returned.output, "after 7 0");
+    assert_eq!(
+        output("for n in 1 2; do { break; } | cat; echo $n; done"),
+        "1\n2"
+    );
+}
+
+#[test]
 fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
     for (script, expected) in [
         ("x=outer; { x=inner; echo ok; } | cat; echo $x", "ok\nouter"),
@@ -2120,6 +2865,182 @@ fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
     ] {
         assert_eq!(output(script), expected);
     }
+}
+
+struct OrderedFixture {
+    fixture: Fixture,
+    released: Mutex<mpsc::Receiver<()>>,
+    release: mpsc::SyncSender<()>,
+}
+
+impl CapabilityInvoker for OrderedFixture {
+    fn granted(&self) -> Vec<String> {
+        self.fixture.granted()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.fixture.has_command_word(word)
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
+            self.released
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("consumer observed first output before producer supplied second line");
+        }
+        if argv == ["line", "second"] {
+            return Some(CommandRun::Rendered {
+                stdout: "second\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            });
+        }
+        if argv == ["upper", "--text", "release"] {
+            self.release.send(()).expect("producer still waiting");
+        }
+        self.fixture.run_command(word, argv, stdin)
+    }
+
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        self.fixture.invoke(proposal)
+    }
+}
+
+fn ordered_fixture() -> OrderedFixture {
+    let (release, released) = mpsc::sync_channel(1);
+    OrderedFixture {
+        fixture: Fixture::default(),
+        released: Mutex::new(released),
+        release,
+    }
+}
+
+#[test]
+fn a_compound_emits_its_first_line_before_its_second_statement() {
+    let fixture = ordered_fixture();
+    let outcome = Interpreter::new(Limits::default()).run(
+        "{ echo first; probe upper --text held; } | { read first; probe upper --text release; cat; }",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        outcome.output,
+        "{\"text\":\"RELEASE\"}\n{\"text\":\"HELD\"}"
+    );
+}
+
+#[test]
+fn xargs_emits_one_item_before_requesting_the_next() {
+    let fixture = ordered_fixture();
+    let outcome = Interpreter::new(Limits::default()).run(
+        "{ echo first; probe line second; } | xargs probe upper --text | { read first; probe upper --text release; cat; }",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        outcome.output,
+        "{\"text\":\"RELEASE\"}\n{\"text\":\"SECOND\"}"
+    );
+}
+
+struct StdinFixture {
+    fixture: Fixture,
+    received: Mutex<Vec<Option<String>>>,
+}
+
+impl CapabilityInvoker for StdinFixture {
+    fn granted(&self) -> Vec<String> {
+        self.fixture.granted()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.fixture.has_command_word(word)
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        self.received
+            .lock()
+            .expect("received")
+            .push(stdin.map(str::to_owned));
+        self.fixture.run_command(word, argv, stdin)
+    }
+
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        self.fixture.invoke(proposal)
+    }
+}
+
+#[test]
+fn redirected_xargs_routes_each_item_to_the_resolved_sink() {
+    assert_eq!(
+        output("printf 'a\\n' | xargs echo > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\n' | xargs echo > buf; cat buf"),
+        "a\nb"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\n' | xargs echo 1>&2 | cat; echo after"),
+        "a\nb\nafter"
+    );
+}
+
+#[test]
+fn xargs_function_outputs_obey_its_redirect() {
+    assert_eq!(
+        output("f() { echo leaked; }; printf 'a\\n' | xargs f > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("f() { echo kept; }; printf 'a\\n' | xargs f > buf; cat buf"),
+        "kept"
+    );
+}
+
+#[test]
+fn xargs_streaming_builtin_outputs_obey_its_redirect() {
+    assert_eq!(
+        output("printf '1\\n' | xargs -I '{}' jq -n '{}' > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("printf '1\\n2\\n' | xargs -I '{}' jq -n '{}' > buf; cat buf"),
+        "1\n2"
+    );
+}
+
+#[test]
+fn a_compound_read_does_not_pass_its_stream_to_a_provider() {
+    let fixture = StdinFixture {
+        fixture: Fixture::default(),
+        received: Mutex::default(),
+    };
+    let outcome = Interpreter::new(Limits::default()).run(
+        "printf 'a\\nb\\n' | while read n; do probe object --a 1; done",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        *fixture.received.lock().expect("received"),
+        vec![None, None]
+    );
+}
+
+#[test]
+fn sibling_non_final_loops_share_the_tree_step_budget() {
+    let limits = Limits {
+        max_steps: 150,
+        ..Limits::default()
+    };
+    let outcome = run_with(
+        "{ while true; do :; done; } | { while true; do :; done; } | cat",
+        limits,
+    );
+    assert_eq!(outcome.steps, limits.max_steps);
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
 }
 
 #[test]

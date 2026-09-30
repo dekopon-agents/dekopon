@@ -21,19 +21,34 @@ pub fn run_jq_worker_if_requested() -> Option<ExitCode> {
     std::env::var_os(JQ_WORKER_MARKER)?;
     Some(match serve() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(super::builtins::jq::WorkerFailure::InvalidInput(message)) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+        Err(super::builtins::jq::WorkerFailure::Failed(message)) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
     })
 }
 
-fn serve() -> Result<(), String> {
+fn serve() -> Result<(), super::builtins::jq::WorkerFailure> {
+    use super::builtins::jq::WorkerFailure;
     #[cfg(target_os = "linux")]
-    limit_address_space()?;
+    limit_address_space().map_err(WorkerFailure::Failed)?;
 
-    let (filter, input): (String, Val) = serde_json::from_reader(std::io::stdin().lock())
-        .map_err(|error| format!("jq: invalid worker request: {error}"))?;
+    let mut stdin = std::io::stdin().lock();
+    let mut header = String::new();
+    std::io::BufRead::read_line(&mut stdin, &mut header)
+        .map_err(|error| WorkerFailure::Failed(format!("jq: invalid worker request: {error}")))?;
+    let (filter, slurp): (String, bool) = serde_json::from_str(&header)
+        .map_err(|error| WorkerFailure::Failed(format!("jq: invalid worker request: {error}")))?;
+    let documents = serde_json::Deserializer::from_reader(stdin).into_iter::<Val>();
+    let input: Box<dyn Iterator<Item = Result<Val, serde_json::Error>>> = if slurp {
+        Box::new(documents.take(1))
+    } else {
+        Box::new(documents)
+    };
     super::builtins::jq::run_filter(&filter, input, &mut std::io::stdout().lock())
 }
 

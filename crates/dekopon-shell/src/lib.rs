@@ -612,7 +612,7 @@ mod tests {
     fn substitution_arguments_keep_their_charges_until_the_command_finishes() {
         let invoker = RecordingInvoker::default();
         let limits = Limits {
-            max_value_bytes: 64,
+            max_value_bytes: 80,
             ..Limits::default()
         };
         let tree = TreeContext::new(limits, CallBudget::new(4));
@@ -629,24 +629,122 @@ mod tests {
     }
 
     #[test]
+    fn substitution_refunds_trailing_line_feeds_before_the_next_capture() {
+        let limits = Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let invoker = RecordingInvoker {
+            tree: Some(tree.clone()),
+            ..RecordingInvoker::default()
+        };
+        let outcome = Interpreter::new(limits).run_with_tree(
+            "v=$(printf 'x\\n\\n'); retained; w=$(printf 12345678); retained",
+            &invoker,
+            &tree,
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+        assert_eq!(*invoker.retained.lock().unwrap(), vec![49, 73]);
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn local_assignment_in_a_snapshot_does_not_copy_uncharged_globals() {
+        let limits = Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 96 * 1024,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let script = format!(
+            "big={}; f() {{ local n=0; n=1 sleep 1 | cat; }}; f",
+            "x".repeat(64 * 1024)
+        );
+        let outcome =
+            Interpreter::new(limits).run_with_tree(&script, &RecordingInvoker::default(), &tree);
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn four_kib_value_headroom_is_enforced_and_streaming_bytes_are_not_retained() {
+        let limits = Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 4096,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let interpreter = Interpreter::new(limits);
+        let invoker = RecordingInvoker::default();
+        for script in [
+            "v=$(while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | cat)",
+            "while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | sort",
+            "while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | tail -n 200",
+        ] {
+            let outcome = interpreter.run_with_tree(script, &invoker, &tree);
+            assert_ne!(
+                outcome.exit_code,
+                ExitCode::SUCCESS,
+                "{script}: {outcome:?}"
+            );
+            assert!(
+                outcome.output.contains("bytes of values"),
+                "{script}: {outcome:?}"
+            );
+            assert_eq!(tree.value_bytes(), 0, "{script}");
+        }
+        let streaming_limits = Limits {
+            max_value_bytes: 2 * 2 * 1024 * 1024 + 4096,
+            ..limits
+        };
+        let streaming_tree = TreeContext::new(streaming_limits, CallBudget::new(1));
+        let script = format!("printf '{}' | cat | wc -c", "x".repeat(1024 * 1024));
+        let streamed =
+            Interpreter::new(streaming_limits).run_with_tree(&script, &invoker, &streaming_tree);
+        assert_eq!(streamed.exit_code, ExitCode::SUCCESS, "{streamed:?}");
+        assert_eq!(streamed.output, "1048576");
+        assert_eq!(streaming_tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn redirect_keeps_source_charge_while_copying_to_a_buffer() {
+        let limits = Limits {
+            max_value_bytes: 15,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let invoker = RecordingInvoker {
+            tree: Some(tree.clone()),
+            ..RecordingInvoker::default()
+        };
+        let outcome = Interpreter::new(limits).run_with_tree("render > buf", &invoker, &tree);
+        assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+        assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
     fn storage_adopts_moved_charges_and_refunds_unset_and_replacement() {
         for (maximum, script, expected) in [
             (
-                32,
+                128,
                 "x=$(printf abcdefgh); retained; x=a; retained; unset x; retained",
-                vec![24, 17, 0],
+                vec![56, 49, 32],
             ),
             (
-                31,
+                128,
                 "printf abcdefgh > buf; retained; : > buf; retained; render >> buf; retained; : > buf; retained",
-                vec![24, 0, 24, 0],
+                vec![40, 32, 40, 32],
             ),
             (
-                48,
+                128,
                 "render > buf; retained; render >> buf; retained; : > buf; retained",
-                vec![24, 48, 0],
+                vec![40, 48, 32],
             ),
-            (32, "cat <<EOF\n$(printf abcdefgh)\nEOF\nretained", vec![0]),
+            (
+                128,
+                "cat <<EOF\n$(printf abcdefgh)\nEOF\nretained",
+                vec![32],
+            ),
         ] {
             let limits = Limits {
                 max_value_bytes: maximum,

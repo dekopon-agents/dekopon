@@ -1405,7 +1405,7 @@ output followed by an `[exit code: N]` trailer, exactly as a terminal would.
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
 leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
 groups — the compound ones all usable as pipeline stages, so `cmd | while ...; do ...; done` \
-works and a piped loop keeps what it assigns because nothing here forks — `break`/`continue`, \
+works — `break`/`continue`, \
 functions with `$1`/`$@`/`$#`/`shift`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
 `${NAME[@]}`, `${#NAME}`, `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( \
 )`, `$(( ))`, `$?`, `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, `exit`, \
@@ -1427,17 +1427,33 @@ present, is baked in below the word listing at the end of this description; run 
 yourself for that page when it is not, or for a deeper subcommand's own page. Its subcommands call \
 capabilities on your behalf, so a word can do only what this session was granted, and `cap --list` \
 shows those capability IDs.
-3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
-in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
-`x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \
-capture the error text itself. Merging only happens when there is a diagnostic: `cmd 2>&1` on a \
-quiet command leaves its value, and its type, untouched.
-4. The session is bounded. Steps, output, wall-clock time, and capability calls all have \
-ceilings; tripping one ends the script with a message naming it. Filter with `jq`, loop in the \
-shell, and print only what you need next.
+3. Variables can hold JSON values, but `|` carries bytes, not values. `echo` writes a newline; \
+`printf` and `echo -n` do not. `read`, `cat`, and other stdin-reading builtins consume their \
+input once; a silent or failed stage supplies end of input, not JSON null. A provider command \
+receives only its own pipe or here-document, as UTF-8 text; it returns a drained answer, not a \
+live stream. Invalid UTF-8 sent to a provider, captured into a variable, or expanded into an \
+argument fails that stage. `$(cmd)` strips trailing newlines; a whole assignment like \
+`pr=$(cmd)` parses object/array JSON, while scalar text stays text. Unquoted substitution \
+splits on newlines, not spaces. `x=$(cmd 2>&1)` captures diagnostics; `> buf` and `>> buf` \
+store exact bytes, including binary bytes for `cat` or `base64` to copy.
+4. Each pipeline stage runs concurrently. Earlier stages, including compounds, functions, \
+and `xargs`, have isolated scope snapshots: assignments and buffer redirects there do not \
+change the parent; only the last stage keeps assignments. A non-final `exit`, `return`, or \
+`break` ends that stage, not the parent. Inside a compound, stdin-reading builtins share its \
+one-shot stream; provider commands do not inherit it. Under `set -o pipefail` the rightmost \
+failure determines status; `${PIPESTATUS[@]}` lists each stage. A closed consumer stops its \
+producer without turning that producer into status 141.
+5. The session is bounded. Steps, retained bytes (including substitutions, sort, tail, \
+slurped jq input, and stage stacks), output, wall-clock time, and capability calls have \
+ceilings; tripping one ends the script with a message naming it. Streaming bytes do not \
+accumulate against the retained-value ceiling. Filter with `jq`, loop in the shell, and print \
+only what you need next.
 
-Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
-`sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Any provider command words this session has \
+Builtins: `jq` (`-r` raw strings, `-c` compact, `-n` null input, `-s` slurp; one JSON \
+document per output line, strings quoted unless `-r`), `cap`, `cat`, `echo`, `printf`, \
+`test`/`[`, `true`, `false`, `sleep`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, \
+`head`/`tail` (default 10 lines, `-n N` or `-N`; `tail -n +N` starts at N; no file \
+operands), `base64`, `xargs`. Any provider command words this session has \
 are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \
@@ -1454,8 +1470,9 @@ the metacharacter rather than a search that quietly finds nothing. Under `-E`, a
 mean what they mean in any regex, but the replacement half of `sed` is still literal text, so \
 groups select and do not substitute. `${#NAME}` counts characters of a string but elements of an \
 array and keys of an object, because values here are real JSON. Use `jq` when the thing you want \
-is structure rather than lines: a piped or here-document string that parses to an object or \
-array is filtered as that value, and a string holding a scalar is still indexed as text.
+is structure rather than lines: it parses each piped JSON document (including scalars), \
+refuses invalid JSON at status 2, and emits each result before waiting for more input. `jq -s` \
+collects documents against the retained-byte budget; `jq -n` ignores stdin.
 
 Reading the result. The tool result is your only evidence: what a script printed is what you \
 know, and what it did not print you do not know, so never guess what a capability returned, what \

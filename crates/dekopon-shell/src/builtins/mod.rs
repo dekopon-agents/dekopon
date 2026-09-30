@@ -1,7 +1,3 @@
-//! Builtins are text-shaped (grep, sed, cut, sort, uniq, wc, base64: lines in and out) or
-//! value-shaped (jq, cap, cat: JSON-native); every name here is reserved, so a provider declaring
-//! one is refused at load rather than shadowed.
-
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -107,7 +103,7 @@ pub(crate) struct BuiltinContext<'a> {
     pub budget: &'a mut Budget,
     /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
     /// a real filesystem path.
-    pub buffers: &'a BTreeMap<String, Value>,
+    pub buffers: &'a BTreeMap<String, Vec<u8>>,
 }
 
 impl BuiltinContext<'_> {
@@ -159,10 +155,6 @@ pub(crate) trait Builtin {
 
     fn help(&self) -> &'static str;
 
-    fn reads_stdin(&self) -> bool {
-        false
-    }
-
     fn copies_stdin(&self) -> bool {
         false
     }
@@ -178,20 +170,17 @@ pub(crate) trait Builtin {
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinKind {
     Simple(&'static dyn Builtin),
+    Lines(text::lines::LineCommand),
+    TextStream(text::stream::TextStream),
+    Extra(text::extra::ExtraStream),
+    Base64,
+    Jq,
     Xargs,
 }
 
 const REGISTRY: &[&dyn Builtin] = &[
-    &jq::Jq,
     &misc::Sleep,
     &misc::Progress,
-    &text::Grep,
-    &text::Sed,
-    &text::Cut,
-    &text::Sort,
-    &text::Uniq,
-    &text::Wc,
-    &encode::Base64,
     &misc::Echo,
     &misc::Printf,
     &misc::Test,
@@ -203,6 +192,31 @@ const REGISTRY: &[&dyn Builtin] = &[
 ];
 
 pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
+    if let Some(command) = text::lines::LineCommand::lookup(name) {
+        return Some(BuiltinKind::Lines(command));
+    }
+    if let Some(command) = match name {
+        "grep" => Some(text::stream::TextStream::Grep),
+        "sed" => Some(text::stream::TextStream::Sed),
+        _ => None,
+    } {
+        return Some(BuiltinKind::TextStream(command));
+    }
+    if let Some(command) = match name {
+        "cut" => Some(text::extra::ExtraStream::Cut),
+        "uniq" => Some(text::extra::ExtraStream::Uniq),
+        "wc" => Some(text::extra::ExtraStream::Wc),
+        "sort" => Some(text::extra::ExtraStream::Sort),
+        _ => None,
+    } {
+        return Some(BuiltinKind::Extra(command));
+    }
+    if name == "jq" {
+        return Some(BuiltinKind::Jq);
+    }
+    if name == "base64" {
+        return Some(BuiltinKind::Base64);
+    }
     if name == xargs::NAME {
         return Some(BuiltinKind::Xargs);
     }
@@ -212,14 +226,15 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
         .map(|builtin| BuiltinKind::Simple(*builtin))
 }
 
-/// names() must stay derived from REGISTRY rather than hand-listed, or the drift test against
-/// RESERVED_COMMAND_WORDS could pass while stale.
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = REGISTRY
         .iter()
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
+    names.extend([
+        "head", "tail", "base64", "grep", "sed", "cut", "uniq", "wc", "sort", "jq",
+    ]);
     names.push(xargs::NAME);
     names.sort_unstable();
     names
@@ -300,7 +315,7 @@ pub(crate) mod test_support {
         arguments: &[&str],
         input: Option<Value>,
         limits: Limits,
-        buffers: &mut BTreeMap<String, Value>,
+        buffers: &mut BTreeMap<String, Vec<u8>>,
     ) -> Result<CommandResult, CommandFailure> {
         let invoker = NoCapabilities;
         let mut budget = Budget::start(limits);
@@ -319,14 +334,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
-    use super::{
-        CommandFailure, lookup, names, test_support::NoCapabilities, test_support::run_builtin,
-        text::Grep, xargs,
-    };
+    use super::{lookup, names, test_support::NoCapabilities, xargs};
 
     #[test]
     fn the_registry_covers_every_documented_builtin() {
@@ -339,12 +349,14 @@ mod tests {
             "echo",
             "false",
             "grep",
+            "head",
             "jq",
             "printf",
             "progress",
             "sed",
             "sleep",
             "sort",
+            "tail",
             "test",
             "true",
             "uniq",
@@ -394,14 +406,14 @@ mod tests {
 
     #[test]
     fn unsupported_flag_names_the_accepted_subset() {
-        let failure =
-            run_builtin(&Grep, &["-q", "a"], Some(json!("a"))).expect_err("-q is not implemented");
-        let CommandFailure::Status { message, .. } = failure else {
-            panic!("a usage error must stay recoverable");
-        };
-        assert_eq!(
-            message,
-            "grep: option not yet supported: -q (supported: -v -i -c -n -E)"
+        let result =
+            Interpreter::new(Limits::default()).run("grep -q a <<EOF\na\nEOF", &NoCapabilities);
+        assert_eq!(result.exit_code, ExitCode::SYNTAX);
+        assert!(
+            result
+                .output
+                .contains("grep: option not yet supported: -q (supported: -v -i -c -n -E)"),
+            "{result:?}"
         );
     }
 
