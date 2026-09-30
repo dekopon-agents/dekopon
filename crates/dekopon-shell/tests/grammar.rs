@@ -342,6 +342,10 @@ fn functions_participate_in_pipelines_in_both_directions() {
     );
     assert_eq!(output("f() { echo one; echo two; }\nf | grep one"), "one");
     assert_eq!(output("f() { echo one; echo two; }\nf"), "one\ntwo");
+    assert_eq!(
+        output("f() { if [ $1 -gt 0 ]; then f $(($1 - 1)); else echo done; fi; }; f 40 | cat"),
+        "done"
+    );
     assert_eq!(output("echo a\nq() { true; }\nq\necho b"), "a\nb");
 }
 
@@ -2000,7 +2004,7 @@ fn cat_passes_an_unending_stream_through_until_its_reader_closes() {
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 }
 
-const STAGE_STACK: u64 = 4 * 1024 * 1024;
+const STAGE_STACK: u64 = 2 * 1024 * 1024;
 
 #[test]
 fn a_stage_writing_pipestatus_is_charged_for_its_copy_of_the_globals() {
@@ -2096,4 +2100,62 @@ fn a_final_cat_streams_its_input_to_the_output_as_it_arrives() {
     let slow = run_with("{ echo first; sleep 5; } | cat", limits);
     assert!(slow.output.starts_with("first\n"), "{}", slow.output);
     assert_eq!(output("printf a | cat > buf\necho ---\ncat buf"), "---\na");
+}
+
+#[test]
+fn exit_in_a_non_final_stage_ends_only_that_stage() {
+    assert_eq!(
+        output("{ echo first; exit 7; } | cat; echo ${PIPESTATUS[@]}"),
+        "first\n7 0"
+    );
+}
+
+#[test]
+fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
+    for (script, expected) in [
+        ("x=outer; { x=inner; echo ok; } | cat; echo $x", "ok\nouter"),
+        ("x=o; f() { x=i; echo ok; }; f|cat; echo $x", "ok\no"),
+        ("x=outer; echo inner | { read x; }; echo $x", "inner"),
+        ("echo o > b; { echo i > b; cat b; }|cat; cat b", "i\no"),
+    ] {
+        assert_eq!(output(script), expected);
+    }
+}
+
+#[test]
+fn joined_stages_refund_their_stack_reservations() {
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 4096,
+        ..Limits::default()
+    };
+    let outcome = run_with("echo a | cat; echo b | cat", limits);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "a\nb");
+}
+
+#[test]
+fn a_substitution_after_the_consumer_closed_does_not_end_the_script() {
+    let flood = "x".repeat(256 * 1024);
+    let script = format!(
+        "{{ printf 'first\\n{flood}'; case $(echo x) in x) true;; esac; }} | read first\necho $first ${{PIPESTATUS[@]}}\necho after"
+    );
+    let outcome = run(&script);
+    assert_eq!(outcome.output, "first 0 0\nafter");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+}
+
+#[test]
+fn the_last_stage_copying_shared_globals_is_refunded_at_join() {
+    let big = "x".repeat(200 * 1024);
+    let flood = "x".repeat(128 * 1024);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 1024 * 1024,
+        ..Limits::default()
+    };
+    let script = format!(
+        "big={big}\nfor i in 1 2 3 4 5 6 7 8 9 10; do printf 'a\\n{flood}' | read x; done\necho $x"
+    );
+    let outcome = run_with(&script, limits);
+    assert_eq!(outcome.output, "a");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 }

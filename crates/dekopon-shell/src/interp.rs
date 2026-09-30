@@ -72,8 +72,8 @@ enum StageInput {
 }
 
 /// Each non-final stage thread reserves this much stack, charged against retained bytes until its
-/// join, so the default budget admits eight concurrent producers.
-const STAGE_STACK_BYTES: usize = 4 * 1024 * 1024;
+/// join, so the default budget admits sixteen concurrent producers.
+const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 struct StageOutcome {
     status: ExitCode,
@@ -931,7 +931,7 @@ impl<'a> Evaluator<'a> {
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step_with(self.invoker)?;
-        if self.reader_gone {
+        if self.reader_gone && self.captures.is_empty() {
             return Ok((self.last_status, Some(Flow::Exit(self.last_status))));
         }
         let Some((last, producers)) = pipeline.commands.split_last() else {
@@ -952,6 +952,7 @@ impl<'a> Evaluator<'a> {
             let outcomes = running.into_iter().map(Stage::join).collect::<Vec<_>>();
             (outcomes, executed)
         });
+        self.shared_charges.clear();
 
         let mut stages = Vec::with_capacity(pipeline.commands.len());
         let mut fatal = None;
@@ -1030,48 +1031,51 @@ impl<'a> Evaluator<'a> {
                 ));
             }
         };
-        let enclosing = match input {
-            StageInput::Inherited => self.stdin.last_mut().map(std::mem::take),
-            StageInput::Piped(_) => None,
-        };
         let mut stage = match self.snapshot(writer) {
             Ok(stage) => stage,
             Err(limit) => return refused(&format_args!("{limit:?}")),
         };
+        let enclosing = match input {
+            StageInput::Inherited => self.stdin.last_mut().map(std::mem::take),
+            StageInput::Piped(_) => None,
+        };
         let span = tracing::Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let spawned = thread::Builder::new()
             .name(format!("dekopon-shell-stage-{index}"))
             .stack_size(STAGE_STACK_BYTES)
             .spawn_scoped(scope, move || {
-                let _entered = span.enter();
-                let inherited = enclosing.is_some();
-                if let Some(reader) = enclosing {
-                    stage.stdin.push(reader);
-                }
-                let executed =
-                    stage.tested(true, |stage| stage.execute_command(command, input, false))?;
-                let status = match executed {
-                    Executed::Result(result) => {
-                        let status = result.status;
-                        stage.emit(result);
-                        status
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    let _entered = span.enter();
+                    let inherited = enclosing.is_some();
+                    if let Some(reader) = enclosing {
+                        stage.stdin.push(reader);
                     }
-                    Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => status,
-                    Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
-                        stage.last_status
-                    }
-                };
-                stage.stdout = None;
-                let enclosing = if inherited { stage.stdin.pop() } else { None };
-                let diagnostics = stage
-                    .stderr_capture
-                    .pop()
-                    .map(StderrCapture::finish)
-                    .unwrap_or_default();
-                Ok(StageOutcome {
-                    status,
-                    diagnostics,
-                    enclosing,
+                    let executed =
+                        stage.tested(true, |stage| stage.execute_command(command, input, false))?;
+                    let status = match executed {
+                        Executed::Result(result) => {
+                            let status = result.status;
+                            stage.emit(result);
+                            status
+                        }
+                        Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => status,
+                        Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
+                            stage.last_status
+                        }
+                    };
+                    stage.stdout = None;
+                    let enclosing = if inherited { stage.stdin.pop() } else { None };
+                    let diagnostics = stage
+                        .stderr_capture
+                        .pop()
+                        .map(StderrCapture::finish)
+                        .unwrap_or_default();
+                    Ok(StageOutcome {
+                        status,
+                        diagnostics,
+                        enclosing,
+                    })
                 })
             });
         match spawned {
