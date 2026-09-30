@@ -100,6 +100,10 @@ impl Budget {
         self.check_deadline()
     }
 
+    pub(crate) fn value_limit(&self) -> u64 {
+        self.limits.max_value_bytes
+    }
+
     pub fn charge_value_bytes(&self, bytes: u64) -> Result<crate::RetainedBytes, LimitExceeded> {
         self.tree.retain(bytes)
     }

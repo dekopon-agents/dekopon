@@ -373,6 +373,102 @@ fn function_stderr_redirect_keeps_exact_endings() {
 }
 
 #[test]
+fn discarded_cat_in_a_diagnostics_redirected_function_stays_discarded() {
+    let outcome = run("f() { cat > /dev/null; echo visible; }; printf secret | f >&2; echo after");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "visible\nafter");
+}
+
+#[test]
+fn redirected_bodies_in_a_substitution_send_stdout_to_diagnostics() {
+    assert_eq!(
+        output("f() { echo diagnostic; }; x=$(f >&2; echo kept); echo $x"),
+        "diagnostic\nkept"
+    );
+    assert_eq!(
+        output("x=$({ echo diagnostic; } >&2; echo kept); echo $x"),
+        "diagnostic\nkept"
+    );
+}
+
+#[test]
+fn nested_stage_routes_capture_and_redirect_before_its_pipe() {
+    assert_eq!(
+        output("{ v=$(printf a | cat); printf '<%s>' \"$v\"; } | cat"),
+        "<a>"
+    );
+    assert_eq!(output("{ base64 -d /w==; } > b | wc -c"), "0");
+    assert_eq!(output("{ printf leaked; } > /dev/null | wc -c"), "0");
+    assert_eq!(
+        output("f() { base64 -d /w==; }; f > b; cat b | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn discarded_compound_does_not_retain_assembled_output() {
+    let outcome = run_with(
+        "{ printf abcdefghijklmnopqrstuvwxyz; printf abcdefghijklmnopqrstuvwxyz; } > /dev/null",
+        Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+}
+
+#[test]
+fn reduced_capture_and_overwritten_pipestatus_refund_their_excess() {
+    let outcome = run_with(
+        "v=$(printf a; printf b; printf c; printf d); w=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+        Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    let outcome = run_with(
+        "PIPESTATUS=abcdefghijklmnopqrstuvwxyzabcdefghijklmn; x=abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
+        Limits {
+            max_value_bytes: 96,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+}
+
+#[test]
+fn capture_reduction_charges_the_combined_value_before_allocation() {
+    let outcome = run_with(
+        "v=$(printf a; printf b; printf c; printf d)",
+        Limits {
+            max_value_bytes: 80,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn discarded_compound_cat_never_emits_stdin() {
+    assert_eq!(output("printf secret | { cat; } > /dev/null"), "");
+}
+
+#[test]
+fn xargs_refuses_expanded_argv_before_allocating_it() {
+    let outcome = run_with(
+        "s=x; i=0; while [ \"$i\" -lt 20 ]; do s=\"$s$s\"; i=$((i+1)); done; printf '%s\\n' \"$s\" | xargs -I x echo \"$s\"",
+        Limits {
+            max_value_bytes: STAGE_STACK + 4 * 1024 * 1024,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
 fn a_discarded_function_does_not_retain_its_output() {
     let outcome = run_with(
         "f() { i=0; while [ $i -lt 200 ]; do printf abcdefgh; i=$((i+1)); done; }; f > /dev/null; echo done",
@@ -411,6 +507,19 @@ fn a_redirected_function_charges_each_fragment_before_assembling_its_output() {
         "f() { printf 'abcdefghijklmnopqrst'; printf 'abcdefghijklmnopqrst'; }; f > buf; echo reached",
         Limits {
             max_value_bytes: 30,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn slurp_from_a_pipe_refuses_four_kib_of_value_headroom() {
+    let outcome = run_with(
+        "while true; do printf '12345678901234567890123456789012\\n'; done | jq -s .",
+        Limits {
+            max_value_bytes: STAGE_STACK + 4096,
             ..Limits::default()
         },
     );
@@ -1009,7 +1118,7 @@ fn copying_a_named_buffer_charges_only_the_destination_without_a_snapshot() {
     let outcome = run_with(
         "printf 12345678 > src; cat src > dst; cat dst",
         Limits {
-            max_value_bytes: 20,
+            max_value_bytes: 64,
             ..Limits::default()
         },
     );
@@ -1018,7 +1127,7 @@ fn copying_a_named_buffer_charges_only_the_destination_without_a_snapshot() {
     let self_append = run_with(
         "printf 12345678 > src; cat src >> src; cat src",
         Limits {
-            max_value_bytes: 20,
+            max_value_bytes: 64,
             ..Limits::default()
         },
     );
@@ -1098,6 +1207,27 @@ fn exit_sets_the_script_status_and_wraps_like_bash() {
     assert_eq!(code("exit 300"), 44);
     assert_eq!(output("echo a; exit 1; echo b"), "a");
     assert_eq!(code("echo a; exit 1; echo b"), 1);
+}
+
+#[test]
+fn xargs_never_invokes_its_command_for_empty_input() {
+    for script in [
+        "printf '' | xargs probe upper --text",
+        "printf '1\\n' | jq empty | xargs probe upper --text",
+    ] {
+        let fixture = Fixture::default();
+        let outcome = Interpreter::new(Limits::default()).run(script, &fixture);
+        assert_eq!(
+            outcome.exit_code,
+            ExitCode::SUCCESS,
+            "{script}: {outcome:?}"
+        );
+        assert_eq!(outcome.capability_calls, 0, "{script}: {outcome:?}");
+        assert!(
+            fixture.calls.lock().expect("fixture calls").is_empty(),
+            "{script}"
+        );
+    }
 }
 
 #[test]

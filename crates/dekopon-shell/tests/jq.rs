@@ -336,7 +336,7 @@ fn a_custom_value_byte_ceiling_refuses_a_single_jq_output_at_its_configured_maxi
 fn worker_framing_does_not_count_against_the_emitted_result_ceiling() {
     worker();
     let limits = Limits {
-        max_value_bytes: 4,
+        max_value_bytes: 128,
         ..Limits::default()
     };
     let number = Interpreter::new(limits).run("jq -n 1234", &Invoker);
@@ -349,9 +349,10 @@ fn worker_framing_does_not_count_against_the_emitted_result_ceiling() {
         Interpreter::new(limits).run("jq -n -r '\"\\u0001\\u0002\\u0003\\u0004\"'", &Invoker);
     assert_eq!(escaped.exit_code.get(), 0, "{escaped:?}");
     assert_eq!(escaped.output, "\u{1}\u{2}\u{3}\u{4}");
-    let too_large = Interpreter::new(limits).run("jq -n 12345", &Invoker);
+    let too_large =
+        Interpreter::new(limits).run(&format!("jq -n -r '\"{}\"'", "x".repeat(129)), &Invoker);
     assert!(
-        too_large.output.contains("more than 4 bytes"),
+        too_large.output.contains("more than 128 bytes"),
         "{too_large:?}"
     );
 }

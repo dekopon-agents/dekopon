@@ -1,24 +1,16 @@
-//! This module only builds the invocation plan; the interpreter re-enters itself to actually run
-//! each one, and elements come from JSON array items or text lines rather than POSIX word
-//! splitting.
-
-use serde_json::Value;
-
 use super::CommandFailure;
-use crate::value::{display, to_lines};
 
 pub(crate) const NAME: &str = "xargs";
 pub(crate) const HELP: &str = "-I -n";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Plan {
-    pub invocations: Vec<Vec<String>>,
+pub(crate) struct Template<'a> {
+    words: &'a [String],
+    placeholder: Option<&'a str>,
 }
 
-pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, CommandFailure> {
-    let mut placeholder: Option<String> = None;
+pub(crate) fn parse(arguments: &[String]) -> Result<Template<'_>, CommandFailure> {
+    let mut placeholder = None;
     let mut index = 0;
-
     while index < arguments.len() {
         match arguments[index].as_str() {
             "-I" | "--replace" => {
@@ -32,7 +24,7 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
                         "xargs: the -I placeholder must not be empty",
                     ));
                 }
-                placeholder = Some(value.clone());
+                placeholder = Some(value.as_str());
                 index += 2;
             }
             "-n" => {
@@ -52,9 +44,8 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
             _ => break,
         }
     }
-
-    let template = &arguments[index..];
-    let Some(command) = template.first() else {
+    let words = &arguments[index..];
+    let Some(command) = words.first() else {
         return Err(CommandFailure::usage(
             "xargs: a command is required, as in `xargs gh issue view`",
         ));
@@ -64,105 +55,69 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
             "xargs: expected a command, found flag {command}"
         )));
     }
+    Ok(Template { words, placeholder })
+}
 
-    let elements = match input {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items.iter().map(display).collect(),
-        Some(other) => to_lines(other),
-    };
+impl Template<'_> {
+    pub(crate) fn expanded_bytes(&self, element: &str) -> Option<u64> {
+        let mut total = 0u64;
+        for word in self.words {
+            let length = match self.placeholder {
+                Some(token) => {
+                    let count = u64::try_from(word.matches(token).count()).ok()?;
+                    let original = u64::try_from(word.len()).ok()?;
+                    let removed = count.checked_mul(u64::try_from(token.len()).ok()?)?;
+                    original
+                        .checked_sub(removed)?
+                        .checked_add(count.checked_mul(u64::try_from(element.len()).ok()?)?)?
+                }
+                None => u64::try_from(word.len()).ok()?,
+            };
+            total = total.checked_add(length)?;
+        }
+        if self.placeholder.is_none() {
+            total = total.checked_add(u64::try_from(element.len()).ok()?)?;
+        }
+        Some(total)
+    }
 
-    let invocations = elements
-        .into_iter()
-        .map(|element| match &placeholder {
-            Some(placeholder) => template
-                .iter()
-                .map(|word| word.replace(placeholder.as_str(), &element))
-                .collect(),
-            None => {
-                let mut argv = template.to_vec();
-                argv.push(element);
-                argv
-            }
-        })
-        .collect();
-
-    Ok(Plan { invocations })
+    pub(crate) fn expand(&self, element: &str) -> Vec<String> {
+        let mut invocation: Vec<String> = self
+            .words
+            .iter()
+            .map(|word| match self.placeholder {
+                Some(token) => word.replace(token, element),
+                None => word.clone(),
+            })
+            .collect();
+        if self.placeholder.is_none() {
+            invocation.push(element.to_owned());
+        }
+        invocation
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use super::parse;
 
-    use super::plan;
-
-    fn arguments(items: &[&str]) -> Vec<String> {
-        items.iter().map(|item| (*item).to_owned()).collect()
+    #[test]
+    fn replacement_size_is_checked_before_expansion() {
+        let words = vec!["-I".into(), "x".into(), "echo".into(), "xx".into()];
+        let template = parse(&words).expect("template");
+        assert_eq!(template.expanded_bytes("abc"), Some(10));
+        assert_eq!(template.expand("abc"), ["echo", "abcabc"]);
     }
 
     #[test]
-    fn appends_each_text_line_as_a_trailing_argument() {
-        let planned = plan(&arguments(&["probe", "--id"]), Some(&json!("1\n2"))).expect("plans");
-        assert_eq!(
-            planned.invocations,
-            vec![
-                arguments(&["probe", "--id", "1"]),
-                arguments(&["probe", "--id", "2"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_placeholder_substitutes_anywhere_in_the_template() {
-        let planned = plan(
-            &arguments(&["-I", "{}", "probe", "--id", "{}", "--tag", "x{}y"]),
-            Some(&json!("7")),
-        )
-        .expect("plans");
-        assert_eq!(
-            planned.invocations,
-            vec![arguments(&["probe", "--id", "7", "--tag", "x7y"])]
-        );
-    }
-
-    #[test]
-    fn line_oriented_text_yields_one_invocation_per_line() {
-        let planned = plan(&arguments(&["echo"]), Some(&json!("a\nb"))).expect("plans");
-        assert_eq!(
-            planned.invocations,
-            vec![arguments(&["echo", "a"]), arguments(&["echo", "b"])]
-        );
-    }
-
-    #[test]
-    fn no_input_plans_no_invocations() {
-        assert!(
-            plan(&arguments(&["echo"]), None)
-                .expect("plans")
-                .invocations
-                .is_empty()
-        );
-        assert!(
-            plan(&arguments(&["echo"]), Some(&Value::Null))
-                .expect("plans")
-                .invocations
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_json_line_is_passed_as_literal_text() {
-        let planned = plan(&arguments(&["cap", "x.y"]), Some(&json!(r#"{"a":1}"#))).expect("plans");
-        assert_eq!(
-            planned.invocations,
-            vec![arguments(&["cap", "x.y", r#"{"a":1}"#])]
-        );
-    }
-
-    #[test]
-    fn malformed_usage_is_rejected() {
-        assert!(plan(&arguments(&[]), Some(&json!([1]))).is_err());
-        assert!(plan(&arguments(&["-I"]), Some(&json!([1]))).is_err());
-        assert!(plan(&arguments(&["-n", "5", "echo"]), Some(&json!([1]))).is_err());
-        assert!(plan(&arguments(&["-P", "4", "echo"]), Some(&json!([1]))).is_err());
+    fn malformed_usage_is_refused() {
+        for words in [
+            vec![],
+            vec!["-I"],
+            vec!["-n", "5", "echo"],
+            vec!["-P", "4", "echo"],
+        ] {
+            assert!(parse(&words.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err());
+        }
     }
 }

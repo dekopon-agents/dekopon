@@ -34,6 +34,8 @@ use crate::{
 
 use telemetry::CommandKind;
 
+#[cfg(test)]
+mod local_snapshot_tests;
 pub(crate) mod telemetry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,6 +291,7 @@ pub(crate) fn run_with_tree(
         captures: Vec::new(),
         active_buffer: None,
         discard_capture_depth: None,
+        diagnostics_depth: None,
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
         testing_status: 0,
@@ -351,6 +354,7 @@ struct Evaluator<'a> {
     captures: Vec<Vec<CommandResult>>,
     active_buffer: Option<(String, usize)>,
     discard_capture_depth: Option<usize>,
+    diagnostics_depth: Option<usize>,
     expansion_charges: Vec<crate::RetainedBytes>,
     stdin: Vec<PipeReader>,
     stdout: Option<PipeWriter>,
@@ -430,12 +434,29 @@ impl<'a> Evaluator<'a> {
             .is_some_and(|depth| self.captures.len() <= depth)
     }
 
+    fn diagnostics_redirected(&self) -> bool {
+        self.diagnostics_depth
+            .is_some_and(|depth| self.captures.len() <= depth)
+    }
+
+    fn stdin_to_diagnostics(&self, sink: &Sink) -> bool {
+        matches!(sink, Sink::Diagnostics)
+            || (matches!(sink, Sink::Value)
+                && self.diagnostics_redirected()
+                && !self.output_discarded()
+                && self.active_buffer_name().is_none())
+    }
+
     fn emit(&mut self, mut result: CommandResult) -> Result<(), LimitExceeded> {
         if result.value.is_null() || self.output_discarded() {
             return Ok(());
         }
         if let Some(name) = self.active_buffer_name().map(str::to_owned) {
             self.append_buffer(&name, result)?;
+            return Ok(());
+        }
+        if self.diagnostics_redirected() {
+            self.write_redirected_diagnostics(&result);
             return Ok(());
         }
         if let Some(capture) = self.captures.last_mut() {
@@ -530,15 +551,15 @@ impl<'a> Evaluator<'a> {
         {
             self.unshare_globals()?;
         }
-        let (values, charges) = self
+        let (values, charges) = match self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(name))
-            .map_or(
-                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
-                |frame| (&mut frame.locals, &mut frame.local_charges),
-            );
+        {
+            Some(frame) => (&mut frame.locals, &mut frame.local_charges),
+            None => (Arc::make_mut(&mut self.globals), &mut self.global_charges),
+        };
         values.remove(name);
         charges.remove(name);
         retain_value(&self.budget, &result.value, &mut result.retained)?;
@@ -604,15 +625,15 @@ impl<'a> Evaluator<'a> {
             }
             return;
         }
-        let (values, charges) = self
+        let (values, charges) = match self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(&name))
-            .map_or(
-                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
-                |frame| (&mut frame.locals, &mut frame.local_charges),
-            );
+        {
+            Some(frame) => (&mut frame.locals, &mut frame.local_charges),
+            None => (Arc::make_mut(&mut self.globals), &mut self.global_charges),
+        };
         values.remove(&name);
         charges.remove(&name);
         if let Some(value) = value {
@@ -1004,15 +1025,17 @@ impl<'a> Evaluator<'a> {
 
     fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) -> Result<(), LimitExceeded> {
         self.unshare_globals()?;
-        Arc::make_mut(&mut self.globals).insert(
-            "PIPESTATUS".to_owned(),
-            Value::Array(
-                stages
-                    .into_iter()
-                    .map(|stage| Value::from(stage.get()))
-                    .collect(),
-            ),
+        let value = Value::Array(
+            stages
+                .into_iter()
+                .map(|stage| Value::from(stage.get()))
+                .collect(),
         );
+        self.global_charges.remove("PIPESTATUS");
+        let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
+        Arc::make_mut(&mut self.globals).insert("PIPESTATUS".to_owned(), value);
+        self.global_charges
+            .insert("PIPESTATUS".to_owned(), vec![charge]);
         Ok(())
     }
 
@@ -1307,6 +1330,7 @@ impl<'a> Evaluator<'a> {
             captures: Vec::new(),
             active_buffer: None,
             discard_capture_depth: None,
+            diagnostics_depth: None,
             expansion_charges: Vec::new(),
             options: self.options,
             testing_status: 0,
@@ -1328,7 +1352,7 @@ impl<'a> Evaluator<'a> {
         capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
-        if matches!(sink, Sink::Diagnostics) {
+        if self.stdin_to_diagnostics(sink) {
             let mut piped = match input {
                 StageInput::Piped(reader) => Some(reader),
                 StageInput::Inherited => None,
@@ -1386,6 +1410,8 @@ impl<'a> Evaluator<'a> {
             }
             return Ok(CommandResult::status(ExitCode::SUCCESS));
         }
+        let discard = self.output_discarded() || matches!(sink, Sink::Discard);
+        let routed = discard || !self.captures.is_empty() || self.diagnostics_redirected();
         let Self {
             stdin,
             stdout,
@@ -1413,7 +1439,10 @@ impl<'a> Evaluator<'a> {
         let mut partial = Vec::new();
         while let ReadOutcome::Bytes(chunk) = reader.read(budget, *invoker)? {
             budget.charge_step_with(*invoker)?;
-            let Some(writer) = stdout.as_mut() else {
+            if discard {
+                continue;
+            }
+            let Some(writer) = stdout.as_mut().filter(|_| !routed) else {
                 telemetry::stage_write(chunk.len(), true, None);
                 partial.extend_from_slice(&chunk);
                 let complete = lossy_complete_prefix(&partial);
@@ -1456,13 +1485,15 @@ impl<'a> Evaluator<'a> {
                 ));
             }
         }
-        let retained = capture_charges(&mut collected);
+        let mut retained = capture_charges(&mut collected);
+        let value = if collected.is_empty() {
+            Value::Null
+        } else {
+            reduce_charged(budget, collected, &mut retained)?
+        };
+        retain_value(budget, &value, &mut retained)?;
         Ok(CommandResult {
-            value: if collected.is_empty() {
-                Value::Null
-            } else {
-                reduce_captured(collected)
-            },
+            value,
             status: ExitCode::SUCCESS,
             suppress_newline: true,
             retained,
@@ -1528,8 +1559,7 @@ impl<'a> Evaluator<'a> {
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
         };
-        let collect =
-            !matches!(stdout, Sink::Buffer { .. }) && (capture_output || stdout != Sink::Value);
+        let collect = stdout == Sink::Value && capture_output;
         self.open_buffers(&[&stdout, &stderr])?;
         let previous_buffer = match &stdout {
             Sink::Buffer { name, .. } => self
@@ -1553,8 +1583,23 @@ impl<'a> Evaluator<'a> {
         if collect {
             self.captures.push(Vec::new());
         }
-
+        let previous_discard = self.discard_capture_depth;
+        if stdout == Sink::Discard {
+            self.discard_capture_depth = Some(self.captures.len());
+        }
+        let previous_diagnostics = self.diagnostics_depth;
+        if stdout == Sink::Diagnostics {
+            self.diagnostics_depth = Some(self.captures.len());
+        }
+        let saved_stdout = (stdout != Sink::Value)
+            .then(|| self.stdout.take())
+            .flatten();
         let flow = self.execute_statement(statement);
+        if stdout != Sink::Value {
+            self.stdout = saved_stdout;
+        }
+        self.discard_capture_depth = previous_discard;
+        self.diagnostics_depth = previous_diagnostics;
         if stdout != Sink::Value {
             self.active_buffer = previous_buffer;
         }
@@ -1574,9 +1619,9 @@ impl<'a> Evaluator<'a> {
             .unwrap_or_default();
 
         let flow = flow?;
-        let retained = capture_charges(&mut captured);
+        let mut retained = capture_charges(&mut captured);
         let value = if collect {
-            reduce_captured(captured)
+            reduce_charged(&self.budget, captured, &mut retained)?
         } else {
             Value::Null
         };
@@ -1605,6 +1650,7 @@ impl<'a> Evaluator<'a> {
             }
         }
         self.route_diagnostics(diagnostics, &stderr)?;
+        retain_value(&self.budget, &result.value, &mut result.retained)?;
 
         match stdout {
             Sink::Value => Ok(Executed::Result(result)),
@@ -1997,6 +2043,7 @@ impl<'a> Evaluator<'a> {
         let mut utf8_pending = Vec::new();
         let retention_budget = self.budget.fork();
         let discard = self.output_discarded();
+        let diagnostics = self.diagnostics_redirected();
         let active_buffer = self.active_buffer_name().map(str::to_owned);
         let outcome = crate::builtins::encode::stream(
             arguments,
@@ -2007,7 +2054,20 @@ impl<'a> Evaluator<'a> {
                 if matches!(stdout_sink, Sink::Discard) {
                     return Ok(true);
                 }
-                if let Some(writer) = self.stdout.as_mut() {
+                if matches!(stdout_sink, Sink::Value)
+                    && diagnostics
+                    && !discard
+                    && active_buffer.is_none()
+                {
+                    push_diagnostic_bytes(chunk, &mut self.stderr_capture, &mut self.output);
+                    return Ok(true);
+                }
+                if !discard
+                    && self.captures.is_empty()
+                    && active_buffer.is_none()
+                    && matches!(stdout_sink, Sink::Value)
+                    && let Some(writer) = self.stdout.as_mut()
+                {
                     return Ok(match writer.write(chunk) {
                         WriteOutcome::Accepted => true,
                         WriteOutcome::ReaderGone => {
@@ -2092,13 +2152,7 @@ impl<'a> Evaluator<'a> {
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
         if literal_help {
-            let (name, help) = match command {
-                StreamCommand::Lines(command) => (command.name(), command.help()),
-                StreamCommand::Text(command) => (command.name(), command.help()),
-                StreamCommand::Extra(command) => (command.name(), command.help()),
-                StreamCommand::Jq => ("jq", builtins::jq::HELP),
-            };
-            return Ok(Executed::Result(builtins::help_result(name, help)));
+            return Ok(Executed::Result(stream_help(command)));
         }
         let retention_budget = self.budget.fork();
         let mut redirected_bytes = Vec::new();
@@ -2113,12 +2167,26 @@ impl<'a> Evaluator<'a> {
                 .unwrap_or_default(),
         };
         let discard = self.output_discarded();
+        let diagnostics = self.diagnostics_redirected();
         let active_buffer = self.active_buffer_name().map(str::to_owned);
         let mut emit = |line: &[u8]| {
             if matches!(stdout_sink, Sink::Discard) {
                 return Ok(true);
             }
-            if let Some(writer) = self.stdout.as_mut() {
+            if matches!(stdout_sink, Sink::Value)
+                && diagnostics
+                && !discard
+                && active_buffer.is_none()
+            {
+                push_diagnostic_bytes(line, &mut self.stderr_capture, &mut self.output);
+                return Ok(true);
+            }
+            if matches!(stdout_sink, Sink::Value)
+                && !discard
+                && self.captures.is_empty()
+                && active_buffer.is_none()
+                && let Some(writer) = self.stdout.as_mut()
+            {
                 match writer.write(line) {
                     WriteOutcome::Accepted => return Ok(true),
                     WriteOutcome::ReaderGone => {
@@ -2227,20 +2295,30 @@ impl<'a> Evaluator<'a> {
                 ))?;
             }
         }
-        if !redirected_bytes.is_empty() {
-            if let Sink::Buffer { name, .. } = stdout_sink {
-                self.append_charged_buffer_bytes(name, &redirected_bytes, redirect_charges)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-            let text = String::from_utf8(redirected_bytes).map_err(|_invalid_utf8| {
-                FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
-            })?;
-            let mut result = CommandResult::value(Value::String(text)).without_newline();
-            result.status = status;
-            result.retained = redirect_charges;
-            return Ok(Executed::Result(result));
+        self.finish_stream_redirect(stdout_sink, redirected_bytes, redirect_charges, status)
+    }
+
+    fn finish_stream_redirect(
+        &mut self,
+        sink: &Sink,
+        bytes: Vec<u8>,
+        charges: Vec<crate::RetainedBytes>,
+        status: ExitCode,
+    ) -> Result<Executed, FatalError> {
+        if bytes.is_empty() {
+            return Ok(Executed::Result(CommandResult::status(status)));
         }
-        Ok(Executed::Result(CommandResult::status(status)))
+        if let Sink::Buffer { name, .. } = sink {
+            self.append_charged_buffer_bytes(name, &bytes, charges)?;
+            return Ok(Executed::Result(CommandResult::status(status)));
+        }
+        let text = String::from_utf8(bytes).map_err(|_invalid_utf8| {
+            FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
+        })?;
+        let mut result = CommandResult::value(Value::String(text)).without_newline();
+        result.status = status;
+        result.retained = charges;
+        Ok(Executed::Result(result))
     }
 
     fn append_named_buffer(
@@ -2302,6 +2380,13 @@ impl<'a> Evaluator<'a> {
                 Sink::Value => {
                     if let Some(destination) = self.active_buffer_name().map(str::to_owned) {
                         self.append_named_buffer(name, &destination)?;
+                        continue;
+                    }
+                    if self.output_discarded() {
+                        continue;
+                    }
+                    if self.diagnostics_redirected() {
+                        push_diagnostic_bytes(bytes, &mut self.stderr_capture, &mut self.output);
                         continue;
                     }
                     if let Some(writer) = self.stdout.as_mut() {
@@ -2693,8 +2778,7 @@ impl<'a> Evaluator<'a> {
         capture_output: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output =
-            *stdout_sink != Sink::Discard && (capture_output || *stdout_sink != Sink::Value);
+        let capture_output = *stdout_sink == Sink::Value && capture_output;
         let Some(body) = self.functions.get(name).cloned() else {
             self.write_line(&format!("dekopon-shell: {name}: command not found"));
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
@@ -2726,13 +2810,23 @@ impl<'a> Evaluator<'a> {
         if capture_output {
             self.captures.push(Vec::new());
         }
-
+        let saved_stdout = (*stdout_sink != Sink::Value)
+            .then(|| self.stdout.take())
+            .flatten();
         let previous_discard = self.discard_capture_depth;
+        let previous_diagnostics = self.diagnostics_depth;
+        if *stdout_sink == Sink::Diagnostics {
+            self.diagnostics_depth = Some(self.captures.len());
+        }
         if *stdout_sink == Sink::Discard {
             self.discard_capture_depth = Some(self.captures.len());
         }
         let flow = self.execute_program(&body);
+        if *stdout_sink != Sink::Value {
+            self.stdout = saved_stdout;
+        }
         self.discard_capture_depth = previous_discard;
+        self.diagnostics_depth = previous_diagnostics;
         let mut captured = if capture_output {
             self.captures.pop().unwrap_or_default()
         } else {
@@ -2745,39 +2839,24 @@ impl<'a> Evaluator<'a> {
         self.budget.leave_call();
 
         let mut retained = capture_charges(&mut captured);
-        let redirected = *stdout_sink != Sink::Value;
-        let value = if redirected {
-            let mut output = String::new();
-            for result in &captured {
-                let text = display(&result.value);
-                let newline = usize::from(!result.suppress_newline);
-                retained.push(
-                    self.budget
-                        .charge_value_bytes((text.len() + newline) as u64)?,
-                );
-                output.push_str(&text);
-                if newline != 0 {
-                    output.push('\n');
-                }
-            }
-            Value::String(output)
-        } else if capture_output {
-            reduce_captured(captured)
+        let value = if capture_output {
+            reduce_charged(&self.budget, captured, &mut retained)?
         } else {
             Value::Null
         };
+        retain_value(&self.budget, &value, &mut retained)?;
         Ok(match flow? {
             Flow::Return(status) => Executed::Result(CommandResult {
                 value,
                 status,
-                suppress_newline: redirected,
+                suppress_newline: false,
                 retained,
             }),
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
             Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
                 value,
                 status: self.last_status,
-                suppress_newline: redirected,
+                suppress_newline: false,
                 retained,
             }),
         })
@@ -2789,10 +2868,13 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        if let Err(failure) = xargs::plan(arguments, None) {
-            let status = self.absorb(failure)?;
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
+        let template = match xargs::parse(arguments) {
+            Ok(template) => template,
+            Err(failure) => {
+                let status = self.absorb(failure)?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
+        };
         let mut piped = match input {
             StageInput::Piped(reader) => Some(reader),
             StageInput::Inherited => None,
@@ -2815,15 +2897,15 @@ impl<'a> Evaluator<'a> {
                     break;
                 }
             };
-            let plan = match xargs::plan(arguments, Some(&Value::Array(vec![Value::String(text)])))
-            {
-                Ok(plan) => plan,
-                Err(failure) => {
-                    status = self.absorb(failure)?;
-                    break;
-                }
+            let Some(bytes) = template.expanded_bytes(&text) else {
+                status = self.absorb(CommandFailure::failed(
+                    "xargs: expanded arguments exceed the retained budget",
+                ))?;
+                break;
             };
-            for invocation in plan.invocations {
+            let _argv_charge = self.budget.charge_value_bytes(bytes)?;
+            let invocation = template.expand(&text);
+            {
                 match self.run_argv(
                     &invocation,
                     StageInput::Piped(PipeReader::default()),
@@ -2865,6 +2947,7 @@ impl<'a> Evaluator<'a> {
                     && let Ok(parsed) = serde_json::from_str(trimmed)
                 {
                     result.value = parsed;
+                    retain_value(&self.budget, &result.value, &mut result.retained)?;
                 }
             }
             return Ok(result);
@@ -3225,19 +3308,9 @@ impl<'a> Evaluator<'a> {
         }
 
         let mut retained = capture_charges(&mut captured);
-        let mut value = reduce_captured(captured);
+        let mut value = reduce_charged(&self.budget, captured, &mut retained)?;
         if let Value::String(text) = &mut value {
-            let length = text.trim_end_matches('\n').len();
-            let mut refund = (text.len() - length) as u64;
-            text.truncate(length);
-            for charge in retained.iter_mut().rev() {
-                let bytes = refund.min(charge.bytes());
-                charge.shrink(bytes);
-                refund -= bytes;
-                if refund == 0 {
-                    break;
-                }
-            }
+            text.truncate(text.trim_end_matches('\n').len());
         }
         let mut result = CommandResult {
             value,
@@ -3432,15 +3505,33 @@ fn append_charged_buffer(
     Ok(())
 }
 
+fn stream_help(command: StreamCommand) -> CommandResult {
+    let (name, help) = match command {
+        StreamCommand::Lines(command) => (command.name(), command.help()),
+        StreamCommand::Text(command) => (command.name(), command.help()),
+        StreamCommand::Extra(command) => (command.name(), command.help()),
+        StreamCommand::Jq => ("jq", builtins::jq::HELP),
+    };
+    builtins::help_result(name, help)
+}
+
 fn retain_value(
     budget: &Budget,
     value: &Value,
     charges: &mut Vec<crate::RetainedBytes>,
 ) -> Result<(), LimitExceeded> {
     let charged: u64 = charges.iter().map(crate::RetainedBytes::bytes).sum();
-    let missing = value_bytes(value).saturating_sub(charged);
-    if missing > 0 {
-        charges.push(budget.charge_value_bytes(missing)?);
+    let needed = value_bytes(value);
+    if needed > charged {
+        charges.push(budget.charge_value_bytes(needed - charged)?);
+    } else {
+        let mut excess = charged - needed;
+        for charge in charges.iter_mut().rev() {
+            let refund = excess.min(charge.bytes());
+            charge.shrink(refund);
+            excess -= refund;
+        }
+        charges.retain(|charge| charge.bytes() > 0);
     }
     Ok(())
 }
@@ -3450,6 +3541,14 @@ fn capture_charges(captured: &mut [CommandResult]) -> Vec<crate::RetainedBytes> 
         .iter_mut()
         .flat_map(|result| std::mem::take(&mut result.retained))
         .collect()
+}
+
+fn push_diagnostic_bytes(bytes: &[u8], captures: &mut [StderrCapture], output: &mut OutputBuffer) {
+    if let Some(capture) = captures.last_mut() {
+        capture.push_bytes(bytes);
+    } else {
+        push_lossy_bytes(output, bytes);
+    }
 }
 
 fn push_lossy_bytes(output: &mut OutputBuffer, bytes: &[u8]) {
@@ -3478,6 +3577,65 @@ fn lossy_complete_prefix(bytes: &[u8]) -> usize {
             },
         }
     }
+}
+
+struct RenderSize {
+    bytes: u64,
+    maximum: u64,
+}
+
+impl std::io::Write for RenderSize {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(u64::try_from(chunk.len()).map_err(std::io::Error::other)?)
+            .filter(|bytes| *bytes <= self.maximum)
+            .ok_or_else(|| std::io::Error::other("rendered value exceeds retention limit"))?;
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn rendered_bytes(value: &Value, maximum: u64) -> Result<u64, LimitExceeded> {
+    match value {
+        Value::Null => Ok(0),
+        Value::String(text) => u64::try_from(text.len())
+            .ok()
+            .filter(|bytes| *bytes <= maximum)
+            .ok_or(LimitExceeded::ValueBytes { maximum }),
+        Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            let mut counter = RenderSize { bytes: 0, maximum };
+            serde_json::to_writer(&mut counter, value)
+                .map_err(|_oversized| LimitExceeded::ValueBytes { maximum })?;
+            Ok(counter.bytes)
+        }
+    }
+}
+
+fn reduce_charged(
+    budget: &Budget,
+    captured: Vec<CommandResult>,
+    retained: &mut Vec<crate::RetainedBytes>,
+) -> Result<Value, LimitExceeded> {
+    if captured.len() > 1 {
+        let maximum = budget.value_limit();
+        let too_large = || LimitExceeded::ValueBytes { maximum };
+        let mut bytes = 16u64;
+        let mut previous_suppressed = true;
+        for result in &captured {
+            let length = rendered_bytes(&result.value, maximum)?;
+            bytes = bytes
+                .checked_add(length)
+                .and_then(|total| total.checked_add(u64::from(!previous_suppressed)))
+                .ok_or_else(too_large)?;
+            previous_suppressed = result.suppress_newline;
+        }
+        retained.push(budget.charge_value_bytes(bytes)?);
+    }
+    Ok(reduce_captured(captured))
 }
 
 fn reduce_captured(captured: Vec<CommandResult>) -> Value {
