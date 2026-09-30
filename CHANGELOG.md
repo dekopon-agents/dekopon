@@ -26,6 +26,10 @@ All notable changes to Dekopon are documented here. The format is based on
   text instead of a list, and `xargs` no longer expands a JSON array into arguments.
 - **Breaking:** `CapabilityInvoker` requires `Send + Sync` and consumes an owned `CommandProposal`
   carrying its command report.
+- **Breaking:** `x=$(...)` parses its capture as JSON only when the trimmed text starts with `{` or
+  `[`; scalars, numbers and `jobId`s included, stay exact text.
+- **Breaking:** unquoted `$(...)` splits on newlines only, never on spaces, and command substitution
+  strips trailing LF bytes.
 - A provider command no longer inherits an enclosing compound's piped input; it reads only its own
   pipe or here-doc.
 - Shell builtin input flows exclusively through byte streams while providers continue receiving

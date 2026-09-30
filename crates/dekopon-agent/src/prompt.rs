@@ -1415,7 +1415,7 @@ buffers all behave the way you expect. Everything outside that curated set fails
 name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never silent no-ops. \
 If a script ran, it did what it said.
 
-Four things genuinely differ from a real shell:
+Five things genuinely differ from a real shell:
 
 1. There are no processes, no filesystem, no environment variables, and no network reachable \
 except through a capability. The capabilities you may invoke are exactly those this session was \
