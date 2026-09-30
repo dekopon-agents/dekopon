@@ -39,13 +39,11 @@ with HTTP 400 (moderation_blocked)`. The classification is what the exit status 
 the provider's sentence, and it is how an upstream refusal reaches the model at all rather than
 being guessed at.
 
-The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them.
+A provider receives its own pipe's bytes as UTF-8 text; invalid UTF-8 fails that stage rather than being replaced. `echo hello | gh issue create -` supplies `hello\n`, while a provider without its own pipe or here-document receives `None`.
 
 ## Value model
 
-Every variable is a `serde_json::Value`, not bash text. Capability inputs and outputs therefore need no marshaling, and JSON, arrays, maps, and arithmetic are native rather than emulated. `|` hands one structured value to the next command, closer to `jq`'s own `|` than to byte-stream piping.
-
-A here-document lands in that model as a plain string: a block of literal text is what a string is here, and no byte stream is involved anywhere. `cat <<EOF` prints that string as-is even when its body looks like JSON — auto-parsing would make `cat <<EOF` mean two different things depending on its contents. `jq` parses each piped or here-document JSON document, including scalars, with a depth limit; invalid input exits with status 2. It emits each filter result as a separate compact JSON line, quoting strings unless `-r` is set. `-n` runs the filter once on null without reading stdin; `-s` retains the document array against the value-byte budget and runs the filter once, including on empty input (`[]`). Its worker compiles the filter once per stage and emits the first result without waiting for the end of stdin. The newline ending the last body line is dropped, matching the rule that values here are not newline-terminated (`echo hi` produces `"hi"`, and emitting a value is what adds the line ending), so `cat <<EOF` prints what bash prints rather than a trailing blank line.
+Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `echo` appends a newline, `printf` does not, and a here-document supplies its literal text. `jq` parses each input JSON document, including scalars, with a depth limit; invalid input exits with status 2. It emits each filter result as a separate compact JSON line, quoting strings unless `-r` is set; `-c` changes nothing. An empty result emits no document. `-n` runs once on null without reading stdin; `-s` retains the document array against the value-byte budget and runs once, including on empty input (`[]`). Its worker compiles the filter once per stage and emits the first result without waiting for the end of stdin. A downstream stage that closes early kills and joins the worker.
 
 ## Grammar
 

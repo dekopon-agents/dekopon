@@ -94,10 +94,32 @@ fn string_results_are_quoted_unless_raw_output_is_requested() {
 }
 
 #[test]
-fn invalid_json_input_has_status_two() {
+fn invalid_json_input_has_status_two_even_after_a_valid_result() {
     worker();
-    let invalid = Interpreter::new(Limits::default()).run("printf 'not json' | jq .", &Invoker);
-    assert_eq!(invalid.exit_code.get(), 2, "{invalid:?}");
+    for flag in ["", "-s "] {
+        let invalid = Interpreter::new(Limits::default())
+            .run(&format!("printf '1\\nnot json' | jq {flag}."), &Invoker);
+        assert_eq!(invalid.exit_code.get(), 2, "{flag}: {invalid:?}");
+        if flag.is_empty() {
+            assert!(invalid.output.starts_with("1\n"), "{invalid:?}");
+        }
+    }
+}
+
+#[test]
+fn a_downstream_early_close_kills_a_busy_jq_worker_and_joins_its_stage() {
+    worker();
+    let outcome = Interpreter::new(Limits {
+        timeout: Duration::from_secs(3),
+        ..Limits::default()
+    })
+    .run(
+        "set -o pipefail; jq -n 'range(1000000000)' | head -1",
+        &Invoker,
+    );
+    assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
+    assert_eq!(outcome.output, "0");
+    assert_eq!(filter(".", json!(1)).exit_code.get(), 0);
 }
 
 #[test]
