@@ -69,7 +69,6 @@ impl Builtin for Jq {
             context.budget,
             context.invoker,
         )
-        .map(CommandResult::value)
     }
 }
 
@@ -142,8 +141,9 @@ fn collect(
     receiver: &std::sync::mpsc::Receiver<ReadOutput>,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
-) -> Result<Vec<Value>, CommandFailure> {
+) -> Result<CommandResult, CommandFailure> {
     let mut outputs = Vec::new();
+    let mut retained = Vec::new();
     loop {
         let wait = budget
             .remaining()
@@ -152,7 +152,7 @@ fn collect(
         match receiver.recv_timeout(wait) {
             Ok(ReadOutput::Value(value)) => {
                 budget.charge_step_with(invoker)?;
-                budget.charge_value_bytes(weigh(&value))?;
+                retained.push(budget.charge_value_bytes(weigh(&value))?);
                 outputs.push(value);
             }
             Ok(ReadOutput::Exhausted) => {
@@ -167,7 +167,9 @@ fn collect(
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
-                return Ok(outputs);
+                let mut result = CommandResult::value(Value::Array(outputs));
+                result.retained = retained;
+                return Ok(result);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(CommandFailure::failed("jq: worker output reader stopped"));
@@ -193,7 +195,7 @@ fn evaluate(
     input: Value,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
-) -> Result<Value, CommandFailure> {
+) -> Result<CommandResult, CommandFailure> {
     let path =
         executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
     let child = Command::new(path)
@@ -279,12 +281,15 @@ fn evaluate(
     })
 }
 
-fn reduce(outputs: Vec<Value>) -> Value {
-    match outputs.len() {
-        0 => Value::Null,
-        1 => outputs.into_iter().next().unwrap_or(Value::Null),
-        _ => Value::Array(outputs),
+fn reduce(mut result: CommandResult) -> CommandResult {
+    if let Value::Array(mut outputs) = result.value {
+        result.value = if outputs.len() <= 1 {
+            outputs.pop().unwrap_or(Value::Null)
+        } else {
+            Value::Array(outputs)
+        };
     }
+    result
 }
 
 pub(crate) fn run_filter(
@@ -462,4 +467,30 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
         .map(|(symbol, undefined)| format!("undefined {} {symbol:?}", undefined.as_str()))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collected_output_keeps_its_charge_until_the_result_drops() {
+        let (sender, receiver) = sync_channel(2);
+        sender
+            .send(ReadOutput::Value(Value::from("retained")))
+            .unwrap();
+        sender.send(ReadOutput::Done).unwrap();
+        let mut budget = Budget::start(crate::Limits::default());
+        let result = reduce(
+            collect(
+                &receiver,
+                &mut budget,
+                &crate::builtins::test_support::NoCapabilities,
+            )
+            .unwrap(),
+        );
+        assert_eq!(budget.value_bytes(), weigh(&result.value));
+        drop(result);
+        assert_eq!(budget.value_bytes(), 0);
+    }
 }

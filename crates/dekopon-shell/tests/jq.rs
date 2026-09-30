@@ -8,12 +8,7 @@ impl CapabilityInvoker for Invoker {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(
-        &self,
-        _: &str,
-        _: Value,
-        _: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
+    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }
@@ -165,12 +160,7 @@ impl CapabilityInvoker for Cancelled {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(
-        &self,
-        _: &str,
-        _: Value,
-        _: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
+    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }

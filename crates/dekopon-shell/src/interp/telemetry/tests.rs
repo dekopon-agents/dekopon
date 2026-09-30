@@ -18,7 +18,7 @@ use tracing_subscriber::{
 use crate::{
     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, ScriptOutcome,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 struct Fixture;
 
@@ -27,6 +27,7 @@ fn proposal(capability: &str) -> CommandRun {
         capability: capability.into(),
         input: json!({}),
         secret_use: None,
+        report: None,
     }
 }
 
@@ -53,11 +54,13 @@ impl CapabilityInvoker for Fixture {
                 capability: "cli-probe.upper".into(),
                 input: json!({"text": text}),
                 secret_use: None,
+                report: None,
             },
             ["upper", "-"] => CommandRun::Proposed {
                 capability: "cli-probe.upper".into(),
                 input: json!({"text": stdin}),
                 secret_use: None,
+                report: None,
             },
             ["broken"] => proposal("provider.broken"),
             ["denied"] => proposal("policy.denied"),
@@ -68,13 +71,10 @@ impl CapabilityInvoker for Fixture {
         })
     }
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        _: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
-        match capability {
+    fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+        let capability = proposal.capability;
+        let input = proposal.input;
+        match capability.as_str() {
             "cli-probe.upper" => CapabilityCallResult::Succeeded(json!({
                 "text": input["text"].as_str().unwrap_or_default().to_uppercase()
             })),

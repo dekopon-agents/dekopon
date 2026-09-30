@@ -91,6 +91,7 @@ impl Builtin for Grep {
             value,
             status,
             suppress_newline: false,
+            retained: Vec::new(),
         })
     }
 }

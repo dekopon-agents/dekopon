@@ -1,17 +1,11 @@
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter, Limits};
-use serde_json::Value;
 
 struct Invoker;
 impl CapabilityInvoker for Invoker {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(
-        &self,
-        _: &str,
-        _: Value,
-        _: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
+    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }

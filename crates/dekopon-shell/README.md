@@ -7,7 +7,7 @@ Exposing one model-facing tool schema per capability bloats a system prompt and 
 This crate is a pure interpreter library. It links no Wasmtime, no broker, no HTTP client, and no filesystem access. Everything a script can reach outside its own value space goes through one seam:
 
 ```rust
-pub trait CapabilityInvoker {
+pub trait CapabilityInvoker: Send + Sync {
     fn granted(&self) -> Vec<String>;
     fn is_granted(&self, capability: &str) -> bool { /* scans `granted` */ }
     fn command_words(&self) -> Vec<String> { /* none */ }
@@ -19,12 +19,7 @@ pub trait CapabilityInvoker {
         stdin: Option<&str>,
     ) -> Option<CommandRun> { /* None: no provider owns the word */ }
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> { /* None */ }
-    fn invoke(
-        &self,
-        capability: &str,
-        input: serde_json::Value,
-        secret_use: Option<SecretUseProposal>,
-    ) -> CapabilityCallResult;
+    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult;
     fn script_finished(&self) { /* no-op: the script's last command has returned */ }
 }
 ```
@@ -35,7 +30,7 @@ A command word resolves in a fixed order. A word this shell refuses outright (`e
 
 ## Provider command words
 
-A loaded provider can contribute bare words — `gh pr view 12` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked through the same budget, denial, and telemetry path as every capability call, and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted. A proposal may also carry `secret_use`, the typed intent to use one public DRN the provider's command named. It reaches `CapabilityInvoker::invoke` unchanged, the broker authorizes it separately as documented in [`docs/secrets.md`](../../docs/secrets.md), and an invoker with no broker behind it refuses it.
+A loaded provider can contribute bare words — `gh pr view 12` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked through the same budget, denial, and telemetry path as every capability call, and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted. The proposal's owned report follows it into `invoke`; dropping a refused proposal settles that report as failed, without a shared pending slot. A proposal may also carry `secret_use`, the typed intent to use one public DRN the provider's command named. It reaches `CapabilityInvoker::invoke` unchanged, the broker authorizes it separately as documented in [`docs/secrets.md`](../../docs/secrets.md), and an invoker with no broker behind it refuses it.
 
 A capability that ran and failed reports `<id>: failed: <classification>` at exit `1`, and when
 the broker's classification came from the provider's own typed failure its code and message follow:
@@ -211,7 +206,7 @@ The shell has no clock. Reading the wall time from here would be ambient authori
 
 ## Sandboxing
 
-This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, a recursion-depth cap, independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept separate from the step budget, and a cumulative ceiling on the value bytes a script may materialize — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
+This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, a recursion-depth cap, independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept separate from the step budget, and a shared ceiling on retained value bytes, refunded when their owners drop or replace them — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
 
 Parsing has its own fixed nesting ceiling, applied before any budget exists, because the parser is recursive and runs on the native stack: deeply nested `$( $( ... ) )` is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
 
