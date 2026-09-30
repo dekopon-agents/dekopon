@@ -647,16 +647,17 @@ impl Evaluator<'_> {
     }
 
     fn assign(&mut self, name: &str, mut result: CommandResult) -> Result<(), LimitExceeded> {
-        self.prepare_globals()?;
-        let (values, charges) = self
+        let (values, charges) = if let Some(frame) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(name))
-            .map_or(
-                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
-                |frame| (&mut frame.locals, &mut frame.local_charges),
-            );
+        {
+            (&mut frame.locals, &mut frame.local_charges)
+        } else {
+            self.prepare_globals()?;
+            (Arc::make_mut(&mut self.globals), &mut self.global_charges)
+        };
         values.remove(name);
         charges.remove(name);
         retain_value(&self.budget, &result.value, &mut result.retained)?;

@@ -406,6 +406,21 @@ fn an_upstream_fatal_budget_error_overrides_a_final_exit() {
 }
 
 #[test]
+fn a_snapshot_local_assignment_does_not_reserve_the_globals_copy() {
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 2 * 1024 * 1024 + 64,
+        ..Limits::default()
+    })
+    .run(
+        "g=x; f() { local v=a; v=b probe upper --text ok | cat; echo $v; }; f",
+        &Fixture::default(),
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(outcome.output, "{\"text\":\"OK\"}\na");
+    assert_eq!(outcome.capability_calls, 1);
+}
+
+#[test]
 fn a_snapshot_charges_its_function_table_before_copying_it() {
     let outcome = Interpreter::new(Limits {
         max_value_bytes: 2 * 1024 * 1024,
