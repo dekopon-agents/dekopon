@@ -340,9 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn operates_line_by_line_over_arrays() {
+    fn operates_line_by_line_over_text() {
         assert_eq!(
-            sed(&["s/o/0/g"], json!(["foo", "bop"])).value,
+            sed(&["s/o/0/g"], json!("foo\nbop")).value,
             json!("f00\nb0p")
         );
     }
@@ -431,7 +431,7 @@ mod tests {
             json!("X X")
         );
         assert_eq!(
-            sed(&["-E", "s/o$/0/"], json!(["foo", "of"])).value,
+            sed(&["-E", "s/o$/0/"], json!("foo\nof")).value,
             json!("fo0\nof")
         );
     }

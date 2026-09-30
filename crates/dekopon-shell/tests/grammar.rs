@@ -2473,6 +2473,114 @@ fn echo_writes_its_newline_into_the_pipe() {
 }
 
 #[test]
+fn cat_redirected_to_diagnostics_consumes_its_pipe_without_leaking_into_a_capture() {
+    let redirected = run("printf 'payload\\n' | cat >&2");
+    assert_eq!(redirected.exit_code, ExitCode::SUCCESS, "{redirected:?}");
+    assert_eq!(redirected.output, "payload");
+    let captured = run("v=$(printf 'error\\n' | cat >&2); printf 'stdout:%s' \"$v\"");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(captured.output, "error\nstdout:");
+    let binary = run("printf '/w==' | base64 -d | cat >&2");
+    assert_eq!(binary.exit_code, ExitCode::SUCCESS, "{binary:?}");
+    assert!(binary.output.contains('�'), "{binary:?}");
+}
+
+#[test]
+fn text_commands_count_and_transform_pipe_bytes_not_json_array_elements() {
+    assert_eq!(output("printf '[\"a\",\"b\"]' | wc -l"), "1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output("printf 'a b\\nc d' | wc")).expect("wc JSON"),
+        json!({"lines": 2, "words": 4, "bytes": 7})
+    );
+    assert_eq!(output("printf 'a b\\nc d' | wc -l -w"), "[2,4]");
+    assert_eq!(output("printf 'foo\\nbop' | sed s/o/0/g"), "f00\nb0p");
+    assert_eq!(output("printf 'alpha\\nbravo' | grep b"), "bravo");
+}
+
+#[test]
+fn cut_selects_ranges_characters_and_undelimited_pipe_lines() {
+    assert_eq!(output("printf 'a,b\\nc,d' | cut -d , -f 1"), "a\nc");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 1,3"), "a:c");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 2-3"), "b:c");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f 3-"), "c:d");
+    assert_eq!(output("printf 'a:b:c:d' | cut -d : -f -2"), "a:b");
+    assert_eq!(output("printf abcdef | cut -c 1-3"), "abc");
+    assert_eq!(output("printf plain | cut -d : -f 2"), "plain");
+}
+
+#[test]
+fn uniq_selects_duplicate_and_unique_pipe_lines() {
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -c"), "2 a\n1 b");
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -d"), "a");
+    assert_eq!(output("printf 'a\\na\\nb' | uniq -u"), "b");
+}
+
+#[test]
+fn cut_refuses_missing_and_conflicting_field_selections() {
+    for (script, cause) in [
+        ("printf 'a:b' | cut -f", "cut: -f requires a value"),
+        ("printf 'a:b' | cut", "cut: -f or -c is required"),
+        (
+            "printf 'a:b' | cut -f 1 -c 1",
+            "cut: -f and -c are mutually exclusive",
+        ),
+    ] {
+        let result = run(script);
+        assert_eq!(result.exit_code.get(), 2, "{script}: {result:?}");
+        assert!(result.output.contains(cause), "{script}: {result:?}");
+    }
+}
+
+#[test]
+fn uniq_refuses_conflicting_and_unsupported_options() {
+    for (script, cause) in [
+        (
+            "printf 'a\\na' | uniq -d -u",
+            "uniq: -d and -u are mutually exclusive",
+        ),
+        (
+            "printf 'a\\na' | uniq -i",
+            "uniq: option not yet supported: -i",
+        ),
+    ] {
+        let result = run(script);
+        assert_eq!(result.exit_code.get(), 2, "{script}: {result:?}");
+        assert!(result.output.contains(cause), "{script}: {result:?}");
+    }
+}
+
+#[test]
+fn wc_refuses_unsupported_options() {
+    let result = run("printf a | wc -m");
+    assert_eq!(result.exit_code.get(), 2, "{result:?}");
+    assert!(
+        result.output.contains("wc: option not yet supported: -m"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn uniq_collapses_only_adjacent_duplicates() {
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq"), "a\nb\na");
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq -d"), "a");
+    assert_eq!(output("printf 'a\\nb\\na\\na' | uniq -u"), "a\nb");
+}
+
+#[test]
+fn cat_copies_bytes_into_a_command_substitution_capture() {
+    let captured = run("v=$(printf x | cat); printf '%s' \"$v\"");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(captured.output, "x");
+    assert_eq!(
+        output("v=$(printf 'a\\nb\\n' | cat | cat); printf '%s' \"$v\""),
+        "a\nb"
+    );
+    let invalid = run("v=$(printf '/w==' | base64 -d | cat)");
+    assert_ne!(invalid.exit_code, ExitCode::SUCCESS, "{invalid:?}");
+    assert!(invalid.output.contains("not valid UTF-8"), "{invalid:?}");
+}
+
+#[test]
 fn a_flooding_producer_ends_when_the_last_stage_stops_reading() {
     let flood = "x".repeat(256 * 1024);
     let script = format!("printf 'first\\n{flood}' | read line\necho $line ${{PIPESTATUS[@]}}");

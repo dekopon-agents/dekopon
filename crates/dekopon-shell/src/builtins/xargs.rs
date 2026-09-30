@@ -100,8 +100,8 @@ mod tests {
     }
 
     #[test]
-    fn appends_each_array_element_as_a_trailing_argument() {
-        let planned = plan(&arguments(&["probe", "--id"]), Some(&json!([1, 2]))).expect("plans");
+    fn appends_each_text_line_as_a_trailing_argument() {
+        let planned = plan(&arguments(&["probe", "--id"]), Some(&json!("1\n2"))).expect("plans");
         assert_eq!(
             planned.invocations,
             vec![
@@ -115,7 +115,7 @@ mod tests {
     fn a_placeholder_substitutes_anywhere_in_the_template() {
         let planned = plan(
             &arguments(&["-I", "{}", "probe", "--id", "{}", "--tag", "x{}y"]),
-            Some(&json!(["7"])),
+            Some(&json!("7")),
         )
         .expect("plans");
         assert_eq!(
@@ -150,8 +150,8 @@ mod tests {
     }
 
     #[test]
-    fn object_elements_are_passed_as_compact_json() {
-        let planned = plan(&arguments(&["cap", "x.y"]), Some(&json!([{"a": 1}]))).expect("plans");
+    fn a_json_line_is_passed_as_literal_text() {
+        let planned = plan(&arguments(&["cap", "x.y"]), Some(&json!(r#"{"a":1}"#))).expect("plans");
         assert_eq!(
             planned.invocations,
             vec![arguments(&["cap", "x.y", r#"{"a":1}"#])]

@@ -14,10 +14,6 @@ pub(crate) mod grep;
 pub(crate) mod lines;
 pub(crate) mod sed;
 pub(crate) mod stream;
-#[cfg(test)]
-pub(crate) mod uniq;
-#[cfg(test)]
-pub(crate) mod wc;
 
 const METACHARACTERS: &[(char, &str)] = &[
     ('[', "a character class"),

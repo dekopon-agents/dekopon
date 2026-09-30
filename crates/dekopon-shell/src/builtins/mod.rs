@@ -155,10 +155,6 @@ pub(crate) trait Builtin {
 
     fn help(&self) -> &'static str;
 
-    fn reads_stdin(&self) -> bool {
-        false
-    }
-
     fn copies_stdin(&self) -> bool {
         false
     }

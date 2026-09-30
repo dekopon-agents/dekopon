@@ -1,123 +1,4 @@
-#[cfg(test)]
-use serde_json::Value;
-
 use crate::builtins::CommandFailure;
-#[cfg(test)]
-use crate::{
-    builtins::{Builtin, BuiltinContext, CommandResult, unsupported_flag},
-    value::to_lines,
-};
-
-#[cfg(test)]
-const HELP: &str = "-d -f -c";
-
-#[cfg(test)]
-pub(crate) struct Cut;
-
-#[cfg(test)]
-impl Builtin for Cut {
-    fn name(&self) -> &'static str {
-        "cut"
-    }
-
-    fn help(&self) -> &'static str {
-        HELP
-    }
-
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut delimiter = '\t';
-        let mut fields = None;
-        let mut characters = None;
-
-        let mut index = 0;
-        while index < arguments.len() {
-            let argument = arguments[index].as_str();
-            match argument {
-                "-d" | "--delimiter" => {
-                    let value = take_value(arguments, &mut index, argument)?;
-                    let mut value_characters = value.chars();
-                    let Some(single) = value_characters.next() else {
-                        return Err(CommandFailure::usage("cut: -d requires a delimiter"));
-                    };
-                    if value_characters.next().is_some() {
-                        return Err(CommandFailure::usage(
-                            "cut: -d accepts exactly one delimiter character",
-                        ));
-                    }
-                    delimiter = single;
-                }
-                "-f" | "--fields" => {
-                    let value = take_value(arguments, &mut index, argument)?;
-                    fields = Some(Selection::parse("cut", &value)?);
-                }
-                "-c" | "--characters" => {
-                    let value = take_value(arguments, &mut index, argument)?;
-                    characters = Some(Selection::parse("cut", &value)?);
-                }
-                flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("cut", flag, HELP));
-                }
-                other => {
-                    return Err(CommandFailure::usage(format!(
-                        "cut: unexpected argument {other:?}; input arrives through a pipe"
-                    )));
-                }
-            }
-        }
-
-        let selection = match (fields, characters) {
-            (Some(_), Some(_)) => {
-                return Err(CommandFailure::usage(
-                    "cut: -f and -c are mutually exclusive",
-                ));
-            }
-            (Some(fields), None) => Mode::Fields(fields),
-            (None, Some(characters)) => Mode::Characters(characters),
-            (None, None) => {
-                return Err(CommandFailure::usage("cut: -f or -c is required"));
-            }
-        };
-
-        let lines = to_lines(&input.unwrap_or(Value::Null))
-            .into_iter()
-            .map(|line| match &selection {
-                Mode::Fields(selection) => {
-                    let parts = line.split(delimiter).collect::<Vec<_>>();
-                    if parts.len() == 1 {
-                        return line;
-                    }
-                    selection
-                        .select(&parts)
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                        .join(&delimiter.to_string())
-                }
-                Mode::Characters(selection) => {
-                    let parts = line.chars().map(String::from).collect::<Vec<_>>();
-                    let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-                    selection.select(&parts).concat()
-                }
-            })
-            .collect::<Vec<_>>();
-
-        Ok(CommandResult::lines(lines))
-    }
-}
-
-#[cfg(test)]
-enum Mode {
-    Fields(Selection),
-    Characters(Selection),
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Selection {
@@ -178,17 +59,6 @@ impl Selection {
             next: 0,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn select<'a>(&self, parts: &[&'a str]) -> Vec<&'a str> {
-        let mut cursor = self.cursor();
-        parts
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| cursor.includes(position + 1))
-            .map(|(_, part)| *part)
-            .collect()
-    }
 }
 
 pub(crate) struct SelectionCursor<'a> {
@@ -228,80 +98,8 @@ fn parse_position(command: &str, text: &str) -> Result<usize, CommandFailure> {
 }
 
 #[cfg(test)]
-fn take_value(
-    arguments: &[String],
-    index: &mut usize,
-    flag: &str,
-) -> Result<String, CommandFailure> {
-    let Some(value) = arguments.get(*index + 1) else {
-        return Err(CommandFailure::usage(format!(
-            "cut: {flag} requires a value"
-        )));
-    };
-    *index += 2;
-    Ok(value.clone())
-}
-
-#[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
-
-    use crate::builtins::{CommandResult, test_support::run_builtin};
-
-    use super::{Cut, Selection};
-
-    fn cut(arguments: &[&str], input: Value) -> CommandResult {
-        run_builtin(&Cut, arguments, Some(input)).expect("cut runs")
-    }
-
-    #[test]
-    fn selects_single_fields() {
-        assert_eq!(
-            cut(&["-d", ":", "-f", "2"], json!("a:b:c")).value,
-            json!("b")
-        );
-    }
-
-    #[test]
-    fn selects_ranges_and_lists() {
-        assert_eq!(
-            cut(&["-d", ":", "-f", "1,3"], json!("a:b:c:d")).value,
-            json!("a:c")
-        );
-        assert_eq!(
-            cut(&["-d", ":", "-f", "2-3"], json!("a:b:c:d")).value,
-            json!("b:c")
-        );
-        assert_eq!(
-            cut(&["-d", ":", "-f", "3-"], json!("a:b:c:d")).value,
-            json!("c:d")
-        );
-        assert_eq!(
-            cut(&["-d", ":", "-f", "-2"], json!("a:b:c:d")).value,
-            json!("a:b")
-        );
-    }
-
-    #[test]
-    fn selects_characters() {
-        assert_eq!(cut(&["-c", "1-3"], json!("abcdef")).value, json!("abc"));
-    }
-
-    #[test]
-    fn lines_without_the_delimiter_pass_through() {
-        assert_eq!(
-            cut(&["-d", ":", "-f", "2"], json!("plain")).value,
-            json!("plain")
-        );
-    }
-
-    #[test]
-    fn operates_over_arrays_of_lines() {
-        assert_eq!(
-            cut(&["-d", ",", "-f", "1"], json!(["a,b", "c,d"])).value,
-            json!("a\nc")
-        );
-    }
+    use super::Selection;
 
     #[test]
     fn unordered_overlapping_ranges_merge_and_a_cursor_advances_once() {
@@ -327,8 +125,5 @@ mod tests {
                 "{list:?} must be rejected"
             );
         }
-        assert!(run_builtin(&Cut, &["-f"], Some(json!("a"))).is_err());
-        assert!(run_builtin(&Cut, &[], Some(json!("a"))).is_err());
-        assert!(run_builtin(&Cut, &["-f", "1", "-c", "1"], Some(json!("a"))).is_err());
     }
 }

@@ -352,16 +352,15 @@ fn a_fatal_producer_still_emits_its_diagnostics_before_the_consumers() {
 }
 
 #[test]
-fn a_buffered_builtin_records_its_drained_stdin_but_a_stream_copy_does_not() {
-    let telemetry = capture("echo payload | cat >&2");
-    let cat = telemetry.command_spans("cat")[0];
-    assert_recorded(cat, "shell.command.stdin", "payload\n", 8);
-    assert_eq!(cat.field("shell.command.input.bytes"), Some("8"));
+fn a_provider_records_its_drained_stdin_but_a_stream_copy_does_not() {
+    let telemetry = capture("echo payload | probe upper -");
+    let provider = telemetry.command_spans("probe")[0];
+    assert_recorded(provider, "shell.command.stdin", "payload\n", 8);
+    assert_eq!(provider.field("shell.command.input.bytes"), Some("8"));
     let streamed = capture("echo payload | cat");
-    assert_eq!(
-        streamed.command_spans("cat")[0].field("shell.command.stdin"),
-        None
-    );
+    let cat = streamed.command_spans("cat")[0];
+    assert_eq!(cat.field("shell.command.stdin"), None);
+    assert_eq!(cat.field("shell.command.input.bytes"), Some("8"));
 }
 
 #[test]

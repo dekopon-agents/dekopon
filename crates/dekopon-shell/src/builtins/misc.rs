@@ -472,10 +472,6 @@ impl Builtin for Cat {
         ""
     }
 
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
     fn copies_stdin(&self) -> bool {
         true
     }
@@ -806,19 +802,5 @@ mod tests {
             panic!("a missing buffer must stay recoverable");
         };
         assert!(message.contains("no such buffer"), "{message}");
-    }
-
-    #[test]
-    fn cat_without_arguments_passes_its_input_through() {
-        assert_eq!(
-            run_builtin(&Cat, &[], Some(json!({"a": 1})))
-                .expect("cat runs")
-                .value,
-            json!({"a": 1})
-        );
-        assert_eq!(
-            run_builtin(&Cat, &[], None).expect("cat runs").value,
-            Value::Null
-        );
     }
 }

@@ -95,8 +95,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_json_array_of_lines() {
-        let result = grep(&["b"], json!(["alpha", "bravo"]));
+    fn accepts_separate_text_lines() {
+        let result = grep(&["b"], json!("alpha\nbravo"));
         assert_eq!(result.value, json!("bravo"));
     }
 
@@ -132,7 +132,7 @@ mod tests {
             json!("port 8080")
         );
         assert_eq!(
-            grep(&["-E", "^ba(r|z)$"], json!(["bar", "baz", "barn"])).value,
+            grep(&["-E", "^ba(r|z)$"], json!("bar\nbaz\nbarn")).value,
             json!("bar\nbaz")
         );
         assert_eq!(

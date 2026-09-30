@@ -71,6 +71,11 @@ enum StageInput {
     Piped(PipeReader),
 }
 
+enum SimpleBuiltinMode {
+    Help,
+    Run { capture_output: bool },
+}
+
 enum StreamCommand {
     Lines(builtins::text::lines::LineCommand),
     Text(builtins::text::stream::TextStream),
@@ -80,7 +85,7 @@ enum StreamCommand {
 
 struct BuiltinInput {
     value: Value,
-    charges: Vec<crate::RetainedBytes>,
+    _charges: Vec<crate::RetainedBytes>,
 }
 
 /// Each non-final stage thread reserves this much stack, charged against retained bytes until its
@@ -1317,7 +1322,49 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    fn copy_stdin(&mut self, input: StageInput) -> Result<CommandResult, CommandFailure> {
+    fn copy_stdin(
+        &mut self,
+        input: StageInput,
+        capture_output: bool,
+        sink: &Sink,
+    ) -> Result<CommandResult, CommandFailure> {
+        if matches!(sink, Sink::Diagnostics) {
+            let mut piped = match input {
+                StageInput::Piped(reader) => Some(reader),
+                StageInput::Inherited => None,
+            };
+            let mut excerpt = Vec::new();
+            let mut truncated = false;
+            loop {
+                let chunk = if let Some(reader) = piped.as_mut() {
+                    reader.read(&self.budget, self.invoker)?
+                } else if let Some(reader) = self.stdin.last_mut() {
+                    reader.read(&self.budget, self.invoker)?
+                } else {
+                    break;
+                };
+                let ReadOutcome::Bytes(chunk) = chunk else {
+                    break;
+                };
+                self.budget.charge_step_with(self.invoker)?;
+                let room = self.limits.max_output_bytes.saturating_sub(excerpt.len());
+                truncated |= chunk.len() > room;
+                excerpt.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            if let Some(capture) = self.stderr_capture.last_mut() {
+                capture.push_bytes(&excerpt);
+                if truncated {
+                    capture.truncated = true;
+                }
+            } else {
+                push_lossy_bytes(&mut self.output, &excerpt);
+                if truncated {
+                    self.output
+                        .push_block("... redirected diagnostics truncated ...");
+                }
+            }
+            return Ok(CommandResult::status(ExitCode::SUCCESS));
+        }
         if let Some(name) = self.active_buffer_name().map(str::to_owned) {
             let mut piped = match input {
                 StageInput::Piped(reader) => Some(reader),
@@ -1343,11 +1390,15 @@ impl<'a> Evaluator<'a> {
             stdin,
             stdout,
             output,
+            captures,
             budget,
             invoker,
             reader_gone,
             ..
         } = self;
+        let mut collected = Vec::new();
+        let into_capture = !captures.is_empty();
+        let collect = capture_output;
         let mut piped;
         let reader = match input {
             StageInput::Piped(reader) => {
@@ -1366,7 +1417,25 @@ impl<'a> Evaluator<'a> {
                 telemetry::stage_write(chunk.len(), true, None);
                 partial.extend_from_slice(&chunk);
                 let complete = lossy_complete_prefix(&partial);
-                output.push_fragment(&String::from_utf8_lossy(&partial[..complete]));
+                if !into_capture && !collect {
+                    output.push_fragment(&String::from_utf8_lossy(&partial[..complete]));
+                } else if complete > 0 {
+                    let text =
+                        std::str::from_utf8(&partial[..complete]).map_err(|_invalid_utf8| {
+                            CommandFailure::failed("standard input is not valid UTF-8 text")
+                        })?;
+                    let charge = budget.charge_value_bytes(complete as u64)?;
+                    let mut result =
+                        CommandResult::value(Value::String(text.to_owned())).without_newline();
+                    result.retained.push(charge);
+                    if into_capture {
+                        if let Some(capture) = captures.last_mut() {
+                            capture.push(result);
+                        }
+                    } else {
+                        collected.push(result);
+                    }
+                }
                 partial.drain(..complete);
                 continue;
             };
@@ -1379,25 +1448,34 @@ impl<'a> Evaluator<'a> {
             }
         }
         if !partial.is_empty() {
-            output.push_fragment(&String::from_utf8_lossy(&partial));
+            if !into_capture && !collect {
+                output.push_fragment(&String::from_utf8_lossy(&partial));
+            } else {
+                return Err(CommandFailure::failed(
+                    "standard input is not valid UTF-8 text",
+                ));
+            }
         }
-        Ok(CommandResult::status(ExitCode::SUCCESS))
+        let retained = capture_charges(&mut collected);
+        Ok(CommandResult {
+            value: if collected.is_empty() {
+                Value::Null
+            } else {
+                reduce_captured(collected)
+            },
+            status: ExitCode::SUCCESS,
+            suppress_newline: true,
+            retained,
+        })
     }
 
-    fn builtin_input(
+    fn provider_input(
         &mut self,
-        reads_stdin: bool,
         input: StageInput,
     ) -> Result<Option<BuiltinInput>, CommandFailure> {
         let bytes = match input {
-            StageInput::Piped(mut reader) if reads_stdin => {
-                reader.drain(&self.budget, self.invoker)?
-            }
-            StageInput::Inherited if reads_stdin => match self.stdin.last_mut() {
-                Some(reader) => reader.drain(&self.budget, self.invoker)?,
-                None => return Ok(None),
-            },
-            StageInput::Piped(_) | StageInput::Inherited => return Ok(None),
+            StageInput::Piped(mut reader) => reader.drain(&self.budget, self.invoker)?,
+            StageInput::Inherited => return Ok(None),
         };
         if bytes.bytes.is_empty() {
             return Ok(None);
@@ -1408,7 +1486,10 @@ impl<'a> Evaluator<'a> {
         })?;
         let value = Value::String(text);
         telemetry::record_stdin(&tracing::Span::current(), &value);
-        Ok(Some(BuiltinInput { value, charges }))
+        Ok(Some(BuiltinInput {
+            value,
+            _charges: charges,
+        }))
     }
 
     fn execute_command(
@@ -2263,24 +2344,31 @@ impl<'a> Evaluator<'a> {
         builtin: &dyn builtins::Builtin,
         arguments: &[String],
         input: StageInput,
-        capture_output: bool,
-        literal_help: bool,
+        mode: SimpleBuiltinMode,
+        stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        if literal_help {
-            return Ok(Executed::Result(builtins::help_result(
-                builtin.name(),
-                builtin.help(),
-            )));
+        let capture_output = match mode {
+            SimpleBuiltinMode::Help => {
+                return Ok(Executed::Result(builtins::help_result(
+                    builtin.name(),
+                    builtin.help(),
+                )));
+            }
+            SimpleBuiltinMode::Run { capture_output } => capture_output,
+        };
+        if builtin.name() == "cat" && !arguments.is_empty() {
+            return self.run_named_cat(arguments, stdout_sink);
         }
         if builtin.copies_stdin()
             && arguments.is_empty()
-            && !capture_output
-            && self.captures.is_empty()
             && (self.stdout.is_some()
+                || capture_output
+                || !self.captures.is_empty()
                 || !self.stdout_redirected
-                || self.active_buffer_name().is_some())
+                || self.active_buffer_name().is_some()
+                || matches!(stdout_sink, Sink::Diagnostics))
         {
-            return match self.copy_stdin(input) {
+            return match self.copy_stdin(input, capture_output, stdout_sink) {
                 Ok(result) => Ok(Executed::Result(result)),
                 Err(failure) => {
                     let status = self.absorb(failure)?;
@@ -2288,23 +2376,15 @@ impl<'a> Evaluator<'a> {
                 }
             };
         }
-        let input = match self.builtin_input(builtin.reads_stdin(), input) {
-            Ok(input) => input,
-            Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-        };
-        let (value, charges) = input.map(|input| (input.value, input.charges)).unzip();
+        drop(input);
         let outcome = {
             let mut context = BuiltinContext {
                 invoker: self.invoker,
                 budget: &mut self.budget,
                 buffers: &self.buffers,
             };
-            builtin.run(&mut context, arguments, value)
+            builtin.run(&mut context, arguments, None)
         };
-        drop(charges);
         match outcome {
             Ok(result) => Ok(Executed::Result(result)),
             Err(failure) => {
@@ -2342,13 +2422,17 @@ impl<'a> Evaluator<'a> {
             Resolution::Function => {
                 self.call_function(command, arguments, input, capture_output, stdout_sink)
             }
-            Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
-                if builtin.name() == "cat" && !arguments.is_empty() && !literal_help {
-                    self.run_named_cat(arguments, stdout_sink)
+            Resolution::Builtin(BuiltinKind::Simple(builtin)) => self.run_simple_builtin(
+                builtin,
+                arguments,
+                input,
+                if literal_help {
+                    SimpleBuiltinMode::Help
                 } else {
-                    self.run_simple_builtin(builtin, arguments, input, capture_output, literal_help)
-                }
-            }
+                    SimpleBuiltinMode::Run { capture_output }
+                },
+                stdout_sink,
+            ),
             Resolution::Builtin(BuiltinKind::Jq) => self.run_lines(
                 StreamCommand::Jq,
                 arguments,
@@ -2391,7 +2475,7 @@ impl<'a> Evaluator<'a> {
             }
             Resolution::ProviderCommand => {
                 let stdin = match input {
-                    StageInput::Piped(_) => match self.builtin_input(true, input) {
+                    StageInput::Piped(_) => match self.provider_input(input) {
                         Ok(stdin) => stdin,
                         Err(failure) => {
                             let status = self.absorb(failure)?;
