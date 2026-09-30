@@ -1,14 +1,20 @@
+#[cfg(test)]
 use serde_json::Value;
 
+use crate::builtins::CommandFailure;
+#[cfg(test)]
 use crate::{
-    builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
+    builtins::{Builtin, BuiltinContext, CommandResult, unsupported_flag},
     value::to_lines,
 };
 
+#[cfg(test)]
 const HELP: &str = "-d -f -c";
 
+#[cfg(test)]
 pub(crate) struct Cut;
 
+#[cfg(test)]
 impl Builtin for Cut {
     fn name(&self) -> &'static str {
         "cut"
@@ -107,6 +113,7 @@ impl Builtin for Cut {
     }
 }
 
+#[cfg(test)]
 enum Mode {
     Fields(Selection),
     Characters(Selection),
@@ -148,22 +155,57 @@ impl Selection {
             }
             ranges.push(parsed);
         }
-        Ok(Self { ranges })
-    }
-
-    pub(crate) fn select<'a>(&self, parts: &[&'a str]) -> Vec<&'a str> {
-        let mut selected = Vec::new();
-        for (position, part) in parts.iter().enumerate() {
-            let one_based = position + 1;
-            let included = self
-                .ranges
-                .iter()
-                .any(|(start, end)| one_based >= *start && end.is_none_or(|end| one_based <= end));
-            if included {
-                selected.push(*part);
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        let mut merged: Vec<(usize, Option<usize>)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some((_, previous_end)) = merged.last_mut()
+                && previous_end.is_none_or(|last| start <= last.saturating_add(1))
+            {
+                *previous_end = match (*previous_end, end) {
+                    (None, _) | (_, None) => None,
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                };
+            } else {
+                merged.push((start, end));
             }
         }
-        selected
+        Ok(Self { ranges: merged })
+    }
+
+    pub(crate) fn cursor(&self) -> SelectionCursor<'_> {
+        SelectionCursor {
+            ranges: &self.ranges,
+            next: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select<'a>(&self, parts: &[&'a str]) -> Vec<&'a str> {
+        let mut cursor = self.cursor();
+        parts
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| cursor.includes(position + 1))
+            .map(|(_, part)| *part)
+            .collect()
+    }
+}
+
+pub(crate) struct SelectionCursor<'a> {
+    ranges: &'a [(usize, Option<usize>)],
+    next: usize,
+}
+
+impl SelectionCursor<'_> {
+    pub(crate) fn includes(&mut self, one_based: usize) -> bool {
+        while let Some((_, Some(end))) = self.ranges.get(self.next)
+            && one_based > *end
+        {
+            self.next += 1;
+        }
+        self.ranges.get(self.next).is_some_and(|(start, end)| {
+            one_based >= *start && end.is_none_or(|end| one_based <= end)
+        })
     }
 }
 
@@ -185,6 +227,7 @@ fn parse_position(command: &str, text: &str) -> Result<usize, CommandFailure> {
     Ok(position)
 }
 
+#[cfg(test)]
 fn take_value(
     arguments: &[String],
     index: &mut usize,
@@ -258,6 +301,22 @@ mod tests {
             cut(&["-d", ",", "-f", "1"], json!(["a,b", "c,d"])).value,
             json!("a\nc")
         );
+    }
+
+    #[test]
+    fn unordered_overlapping_ranges_merge_and_a_cursor_advances_once() {
+        let selection = Selection::parse("cut", "9-,3-5,1-2,4-8").expect("valid ranges");
+        assert_eq!(selection.ranges, vec![(1, None)]);
+        let mut cursor = selection.cursor();
+        for position in 1..1000 {
+            assert!(cursor.includes(position));
+        }
+        let selection = Selection::parse("cut", "8,2,5-6").expect("valid gaps");
+        let mut cursor = selection.cursor();
+        let selected = (1..=9)
+            .filter(|position| cursor.includes(*position))
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec![2, 5, 6, 8]);
     }
 
     #[test]

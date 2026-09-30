@@ -7,18 +7,17 @@ use regex_bites::{Regex, RegexBuilder};
 use crate::builtins::CommandFailure;
 
 pub(crate) mod cut;
+pub(crate) mod extra;
+#[cfg(test)]
+mod extra_tests;
 pub(crate) mod grep;
 pub(crate) mod lines;
 pub(crate) mod sed;
-pub(crate) mod sort;
 pub(crate) mod stream;
+#[cfg(test)]
 pub(crate) mod uniq;
+#[cfg(test)]
 pub(crate) mod wc;
-
-pub(crate) use cut::Cut;
-pub(crate) use sort::Sort;
-pub(crate) use uniq::Uniq;
-pub(crate) use wc::Wc;
 
 const METACHARACTERS: &[(char, &str)] = &[
     ('[', "a character class"),

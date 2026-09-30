@@ -432,9 +432,9 @@ fn a_builtin_keeps_its_drained_input_charged_while_processing() {
 }
 
 #[test]
-fn an_unterminated_flood_is_refused_at_the_retained_budget() {
+fn an_unterminated_flood_into_sort_is_refused_at_the_retained_budget() {
     let outcome = run_with(
-        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); while true; do printf \"$big\"; done | wc -c",
+        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); while true; do printf \"$big\"; done | sort",
         Limits {
             max_value_bytes: 2 * 1024 * 1024 + 1024,
             ..Limits::default()
@@ -442,6 +442,51 @@ fn an_unterminated_flood_is_refused_at_the_retained_budget() {
     );
     assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
     assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn cut_uniq_wc_and_sort_preserve_fragmented_and_unterminated_lines() {
+    assert_eq!(
+        output("printf 'a:2\\na:2\\nb:3' | cut -d : -f 2 | uniq -c"),
+        "2 2\n1 3"
+    );
+    assert_eq!(output("printf '10\\n2\\n1' | sort -n -r -u"), "10\n2\n1");
+    assert_eq!(output("printf 'α β\\nγ' | wc -w"), "3");
+    assert_eq!(
+        output("printf 'α β\\nγ' | wc"),
+        r#"{"bytes":8,"lines":2,"words":3}"#
+    );
+    assert_eq!(output("printf 'a\\nb' | wc -l"), "2");
+    assert_eq!(output("printf /w== | base64 -d | wc -c"), "1");
+}
+
+#[test]
+fn sort_refuses_growing_retention_but_wc_counts_a_long_stream() {
+    let limits = Limits {
+        max_value_bytes: 2 * 1024 * 1024 + 1024,
+        ..Limits::default()
+    };
+    let sorted = run_with(
+        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); for x in 1 2 3 4 5; do printf '%s\\n' \"$big\"; done | sort",
+        limits,
+    );
+    assert_eq!(sorted.exit_code, ExitCode::SUCCESS, "{sorted:?}");
+    let long = format!(
+        "printf '%s' '{}' | sort",
+        "x".repeat(2 * 1024 * 1024 + 2048)
+    );
+    let refused = run_with(&long, limits);
+    assert_ne!(refused.exit_code, ExitCode::SUCCESS, "{refused:?}");
+    assert!(refused.output.contains("bytes of values"), "{refused:?}");
+    let counted = run_with(
+        &format!(
+            "printf '%s' '{}' | wc -c",
+            "x".repeat(2 * 1024 * 1024 + 2048)
+        ),
+        limits,
+    );
+    assert_eq!(counted.exit_code, ExitCode::SUCCESS, "{counted:?}");
+    assert_eq!(counted.output, (2 * 1024 * 1024 + 2048).to_string());
 }
 
 #[test]

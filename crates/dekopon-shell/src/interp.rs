@@ -74,6 +74,7 @@ enum StageInput {
 enum StreamCommand {
     Lines(builtins::text::lines::LineCommand),
     Text(builtins::text::stream::TextStream),
+    Extra(builtins::text::extra::ExtraStream),
 }
 
 struct BuiltinInput {
@@ -1780,6 +1781,7 @@ impl<'a> Evaluator<'a> {
             let (name, help) = match command {
                 StreamCommand::Lines(command) => (command.name(), command.help()),
                 StreamCommand::Text(command) => (command.name(), command.help()),
+                StreamCommand::Extra(command) => (command.name(), command.help()),
             };
             return Ok(Executed::Result(builtins::help_result(name, help)));
         }
@@ -1856,6 +1858,13 @@ impl<'a> Evaluator<'a> {
                     &mut emit,
                 )
                 .map(|()| ExitCode::SUCCESS),
+            StreamCommand::Extra(command) => command.run(
+                arguments,
+                &mut reader,
+                &mut self.budget,
+                self.invoker,
+                &mut emit,
+            ),
             StreamCommand::Text(command) => command.run(
                 arguments,
                 &mut reader,
@@ -1987,6 +1996,13 @@ impl<'a> Evaluator<'a> {
             ),
             Resolution::Builtin(BuiltinKind::TextStream(command)) => self.run_lines(
                 StreamCommand::Text(command),
+                arguments,
+                input,
+                literal_help,
+                stdout_sink,
+            ),
+            Resolution::Builtin(BuiltinKind::Extra(command)) => self.run_lines(
+                StreamCommand::Extra(command),
                 arguments,
                 input,
                 literal_help,

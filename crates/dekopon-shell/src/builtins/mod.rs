@@ -180,6 +180,7 @@ pub(crate) enum BuiltinKind {
     Simple(&'static dyn Builtin),
     Lines(text::lines::LineCommand),
     TextStream(text::stream::TextStream),
+    Extra(text::extra::ExtraStream),
     Base64,
     Xargs,
 }
@@ -188,10 +189,6 @@ const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &misc::Sleep,
     &misc::Progress,
-    &text::Cut,
-    &text::Sort,
-    &text::Uniq,
-    &text::Wc,
     &misc::Echo,
     &misc::Printf,
     &misc::Test,
@@ -213,6 +210,15 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
     } {
         return Some(BuiltinKind::TextStream(command));
     }
+    if let Some(command) = match name {
+        "cut" => Some(text::extra::ExtraStream::Cut),
+        "uniq" => Some(text::extra::ExtraStream::Uniq),
+        "wc" => Some(text::extra::ExtraStream::Wc),
+        "sort" => Some(text::extra::ExtraStream::Sort),
+        _ => None,
+    } {
+        return Some(BuiltinKind::Extra(command));
+    }
     if name == "base64" {
         return Some(BuiltinKind::Base64);
     }
@@ -231,7 +237,9 @@ pub(crate) fn names() -> Vec<&'static str> {
         .iter()
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
-    names.extend(["head", "tail", "base64", "grep", "sed"]);
+    names.extend([
+        "head", "tail", "base64", "grep", "sed", "cut", "uniq", "wc", "sort",
+    ]);
     names.push(xargs::NAME);
     names.sort_unstable();
     names
