@@ -272,7 +272,7 @@ fn if_elif_else_selects_one_branch() {
 fn for_loops_iterate_over_words_and_arrays() {
     assert_eq!(output("for x in a b c; do echo $x; done"), "a\nb\nc");
     assert_eq!(
-        output("for x in $(probe object --a 1 --b 2 --c 3 | jq '[.a,.b,.c]'); do echo $x; done"),
+        output("for x in $(probe object --a 1 --b 2 --c 3 | jq -r '.a,.b,.c'); do echo $x; done"),
         "1\n2\n3"
     );
 }
@@ -411,20 +411,20 @@ fn a_redirected_function_charges_each_fragment_before_assembling_its_output() {
 }
 
 #[test]
-fn a_builtin_keeps_its_drained_input_charged_while_processing() {
+fn jq_slurp_keeps_its_documents_charged_while_processing() {
     let outcome = run_with(
-        "printf '\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"' | jq .",
+        "jq -s . <<EOF\n\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"\nEOF",
         Limits {
-            max_value_bytes: 2 * 1024 * 1024 + 95,
+            max_value_bytes: 40,
             ..Limits::default()
         },
     );
     assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
     assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
     let admitted = run_with(
-        "printf '\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"' | jq .",
+        "jq -s . <<EOF\n\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"\nEOF",
         Limits {
-            max_value_bytes: 2 * 1024 * 1024 + 160,
+            max_value_bytes: 512,
             ..Limits::default()
         },
     );
@@ -718,7 +718,7 @@ fn a_piped_stream_is_consumed_once_by_the_statements_that_share_it() {
         "first\npayload"
     );
     assert_eq!(
-        output(r#"probe object --a 1 --b two | jq '.b' | cat"#),
+        output(r#"probe object --a 1 --b two | jq -r '.b' | cat"#),
         "two"
     );
     assert_eq!(
@@ -1243,16 +1243,14 @@ fn case_charges_the_step_budget_like_every_other_construct() {
 fn a_here_document_becomes_the_commands_input_as_one_string() {
     assert_eq!(output("cat <<EOF\nalpha\nbeta\nEOF"), "alpha\nbeta");
 
-    // jq parses the heredoc's JSON text before filtering, the same as a filter reading the
-    // same text from a real pipe.
     assert_eq!(
         output("jq -r .name <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
         "dekopon"
     );
     let unparsed = run("jq -r .name <<EOF\nnot json\nEOF");
-    assert_eq!(unparsed.exit_code, ExitCode::FAILURE);
+    assert_eq!(unparsed.exit_code, ExitCode::SYNTAX);
     assert!(
-        unparsed.output.contains("cannot index"),
+        unparsed.output.contains("invalid JSON input"),
         "{}",
         unparsed.output
     );
@@ -1260,8 +1258,6 @@ fn a_here_document_becomes_the_commands_input_as_one_string() {
 
 #[test]
 fn a_captured_object_reaches_jq_through_an_echo_pipe() {
-    // `r=$(cmd)` captures the object; `echo "$r"` is what stringifies it into display text,
-    // and jq parses that text back rather than indexing it as a string.
     assert_eq!(
         output(r#"r=$(probe object --a 1 --b 2); echo "$r" | jq '.a + .b'"#),
         "3"
@@ -1469,7 +1465,7 @@ fn nounset_refuses_a_name_nothing_ever_set() {
 fn pipefail_reports_the_rightmost_stage_that_failed() {
     assert_eq!(code("nosuchcmd | jq ."), 0);
     assert_eq!(code("set -o pipefail\nnosuchcmd | jq ."), 127);
-    assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
+    assert_eq!(code("set -o pipefail\necho hi | jq ."), 2);
     assert_eq!(
         code("set -o pipefail\nset +o pipefail\nnosuchcmd | jq ."),
         0
@@ -1481,7 +1477,7 @@ fn pipestatus_reports_every_stage() {
     assert!(output("nosuchcmd | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
     assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
     assert_eq!(
-        output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
+        output("echo 1 | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
         "1\n3"
     );
 }

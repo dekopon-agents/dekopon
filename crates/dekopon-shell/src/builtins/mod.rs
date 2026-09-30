@@ -182,11 +182,11 @@ pub(crate) enum BuiltinKind {
     TextStream(text::stream::TextStream),
     Extra(text::extra::ExtraStream),
     Base64,
+    Jq,
     Xargs,
 }
 
 const REGISTRY: &[&dyn Builtin] = &[
-    &jq::Jq,
     &misc::Sleep,
     &misc::Progress,
     &misc::Echo,
@@ -219,6 +219,9 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
     } {
         return Some(BuiltinKind::Extra(command));
     }
+    if name == "jq" {
+        return Some(BuiltinKind::Jq);
+    }
     if name == "base64" {
         return Some(BuiltinKind::Base64);
     }
@@ -238,7 +241,7 @@ pub(crate) fn names() -> Vec<&'static str> {
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
     names.extend([
-        "head", "tail", "base64", "grep", "sed", "cut", "uniq", "wc", "sort",
+        "head", "tail", "base64", "grep", "sed", "cut", "uniq", "wc", "sort", "jq",
     ]);
     names.push(xargs::NAME);
     names.sort_unstable();

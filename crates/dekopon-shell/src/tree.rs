@@ -60,11 +60,24 @@ pub struct TreeContext {
 pub struct RetainedBytes {
     used: Arc<AtomicU64>,
     bytes: u64,
+    maximum: u64,
 }
 
 impl RetainedBytes {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    pub(crate) fn grow(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.maximum)
+            })
+            .map_err(|_used| LimitExceeded::ValueBytes {
+                maximum: self.maximum,
+            })?;
+        self.bytes += bytes;
+        Ok(())
     }
 }
 
@@ -112,6 +125,7 @@ impl TreeContext {
         Ok(RetainedBytes {
             used: Arc::clone(&self.retained),
             bytes,
+            maximum: self.limits.max_value_bytes,
         })
     }
 

@@ -75,6 +75,7 @@ enum StreamCommand {
     Lines(builtins::text::lines::LineCommand),
     Text(builtins::text::stream::TextStream),
     Extra(builtins::text::extra::ExtraStream),
+    Jq,
 }
 
 struct BuiltinInput {
@@ -1782,6 +1783,7 @@ impl<'a> Evaluator<'a> {
                 StreamCommand::Lines(command) => (command.name(), command.help()),
                 StreamCommand::Text(command) => (command.name(), command.help()),
                 StreamCommand::Extra(command) => (command.name(), command.help()),
+                StreamCommand::Jq => ("jq", builtins::jq::HELP),
             };
             return Ok(Executed::Result(builtins::help_result(name, help)));
         }
@@ -1872,6 +1874,14 @@ impl<'a> Evaluator<'a> {
                 self.invoker,
                 &mut emit,
             ),
+            StreamCommand::Jq => builtins::jq::stream(
+                arguments,
+                &mut reader,
+                &mut self.budget,
+                self.invoker,
+                &mut emit,
+            )
+            .map(|()| ExitCode::SUCCESS),
         };
         let mut status = match outcome {
             Ok(status) => status,
@@ -1984,6 +1994,13 @@ impl<'a> Evaluator<'a> {
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
                 self.run_simple_builtin(builtin, arguments, input, capture_output, literal_help)
             }
+            Resolution::Builtin(BuiltinKind::Jq) => self.run_lines(
+                StreamCommand::Jq,
+                arguments,
+                input,
+                literal_help,
+                stdout_sink,
+            ),
             Resolution::Builtin(BuiltinKind::Base64) => {
                 self.run_base64(arguments, input, capture_output, stdout_sink, literal_help)
             }
@@ -2387,7 +2404,16 @@ impl<'a> Evaluator<'a> {
     fn assignment_value(&mut self, word: &Word) -> Result<CommandResult, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if let [WordPart::CommandSubstitution(program)] = word.parts.as_slice() {
-            return self.run_substitution(program);
+            let mut result = self.run_substitution(program)?;
+            if let Value::String(text) = &result.value {
+                let trimmed = text.trim();
+                if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                    && let Ok(parsed) = serde_json::from_str(trimmed)
+                {
+                    result.value = parsed;
+                }
+            }
+            return Ok(result);
         }
         let start = self.expansion_charges.len();
         let value = match word.parts.as_slice() {
@@ -2437,7 +2463,19 @@ impl<'a> Evaluator<'a> {
                 }
                 WordPart::CommandSubstitution(program) => {
                     let result = self.run_substitution(program)?;
-                    produced |= spread(&mut fields, &result.value);
+                    if let Value::String(text) = &result.value {
+                        let mut lines = text.split('\n');
+                        if let Some(first) = lines.next() {
+                            append(&mut fields, first);
+                            produced |= !first.is_empty();
+                        }
+                        for line in lines {
+                            fields.push(line.to_owned());
+                            produced = true;
+                        }
+                    } else {
+                        produced |= spread(&mut fields, &result.value);
+                    }
                     self.expansion_charges.extend(result.retained);
                 }
             }
@@ -2735,7 +2773,10 @@ impl<'a> Evaluator<'a> {
         }
 
         let retained = capture_charges(&mut captured);
-        let value = reduce_captured(captured);
+        let mut value = reduce_captured(captured);
+        if let Value::String(text) = &mut value {
+            *text = text.trim_end_matches('\n').to_owned();
+        }
         let mut result = CommandResult {
             value,
             status: self.last_status,
