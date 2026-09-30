@@ -17,6 +17,10 @@ impl Builtin for Base64 {
         HELP
     }
 
+    fn reads_stdin(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         _context: &mut BuiltinContext<'_>,

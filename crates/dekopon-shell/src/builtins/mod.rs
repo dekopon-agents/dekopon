@@ -49,6 +49,13 @@ impl CommandResult {
         self.suppress_newline = true;
         self
     }
+
+    pub(crate) fn lines(lines: Vec<String>) -> Self {
+        if lines.is_empty() {
+            return Self::status(ExitCode::SUCCESS);
+        }
+        Self::value(Value::String(lines.join("\n")))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,7 +107,7 @@ pub(crate) struct BuiltinContext<'a> {
     pub budget: &'a mut Budget,
     /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
     /// a real filesystem path.
-    pub buffers: &'a mut BTreeMap<String, Value>,
+    pub buffers: &'a BTreeMap<String, Value>,
 }
 
 impl BuiltinContext<'_> {
@@ -151,6 +158,14 @@ pub(crate) trait Builtin {
     fn name(&self) -> &'static str;
 
     fn help(&self) -> &'static str;
+
+    fn reads_stdin(&self) -> bool {
+        false
+    }
+
+    fn copies_stdin(&self) -> bool {
+        false
+    }
 
     fn run(
         &self,

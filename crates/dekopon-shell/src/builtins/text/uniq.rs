@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{
     builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::{from_lines, to_lines},
+    value::to_lines,
 };
 
 const HELP: &str = "-c -d -u";
@@ -16,6 +16,10 @@ impl Builtin for Uniq {
 
     fn help(&self) -> &'static str {
         HELP
+    }
+
+    fn reads_stdin(&self) -> bool {
+        true
     }
 
     fn run(
@@ -77,7 +81,7 @@ impl Builtin for Uniq {
             })
             .collect::<Vec<_>>();
 
-        Ok(CommandResult::value(from_lines(lines)))
+        Ok(CommandResult::lines(lines))
     }
 }
 
@@ -97,7 +101,7 @@ mod tests {
     fn collapses_only_adjacent_duplicates() {
         assert_eq!(
             uniq(&[], json!(["a", "a", "b", "a"])).value,
-            json!(["a", "b", "a"])
+            json!("a\nb\na")
         );
     }
 
@@ -105,7 +109,7 @@ mod tests {
     fn counts_occurrences() {
         assert_eq!(
             uniq(&["-c"], json!(["a", "a", "b"])).value,
-            json!(["2 a", "1 b"])
+            json!("2 a\n1 b")
         );
     }
 

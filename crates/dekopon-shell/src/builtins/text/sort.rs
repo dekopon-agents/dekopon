@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{
     builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::{from_lines, to_lines},
+    value::to_lines,
 };
 
 const HELP: &str = "-r -n -u";
@@ -16,6 +16,10 @@ impl Builtin for Sort {
 
     fn help(&self) -> &'static str {
         HELP
+    }
+
+    fn reads_stdin(&self) -> bool {
+        true
     }
 
     fn run(
@@ -64,7 +68,7 @@ impl Builtin for Sort {
             lines.dedup();
         }
 
-        Ok(CommandResult::value(from_lines(lines)))
+        Ok(CommandResult::lines(lines))
     }
 }
 
@@ -92,7 +96,7 @@ mod tests {
     fn sorts_lexicographically_by_default() {
         assert_eq!(
             sort(&[], json!(["pear", "apple", "fig"])).value,
-            json!(["apple", "fig", "pear"])
+            json!("apple\nfig\npear")
         );
     }
 
@@ -100,11 +104,11 @@ mod tests {
     fn numeric_sorting_orders_by_value_not_text() {
         assert_eq!(
             sort(&["-n"], json!(["10", "9", "100"])).value,
-            json!(["9", "10", "100"])
+            json!("9\n10\n100")
         );
         assert_eq!(
             sort(&[], json!(["10", "9", "100"])).value,
-            json!(["10", "100", "9"])
+            json!("10\n100\n9")
         );
     }
 
@@ -112,15 +116,12 @@ mod tests {
     fn reverse_and_unique_compose() {
         assert_eq!(
             sort(&["-r"], json!(["a", "c", "b"])).value,
-            json!(["c", "b", "a"])
+            json!("c\nb\na")
         );
-        assert_eq!(
-            sort(&["-u"], json!(["b", "a", "b"])).value,
-            json!(["a", "b"])
-        );
+        assert_eq!(sort(&["-u"], json!(["b", "a", "b"])).value, json!("a\nb"));
         assert_eq!(
             sort(&["-n", "-r", "-u"], json!(["2", "1", "2"])).value,
-            json!(["2", "1"])
+            json!("2\n1")
         );
     }
 
@@ -128,13 +129,13 @@ mod tests {
     fn a_nan_line_cannot_leave_the_list_unsorted() {
         assert_eq!(
             sort(&["-n"], json!(["5", "nan", "3", "NaN", "1"])).value,
-            json!(["NaN", "nan", "1", "3", "5"])
+            json!("NaN\nnan\n1\n3\n5")
         );
     }
 
     #[test]
     fn accepts_newline_separated_text() {
-        assert_eq!(sort(&[], json!("b\na")).value, json!(["a", "b"]));
+        assert_eq!(sort(&[], json!("b\na")).value, json!("a\nb"));
     }
 
     #[test]
