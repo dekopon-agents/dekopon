@@ -10,6 +10,7 @@ use crate::builtins::CommandFailure;
 
 pub(crate) mod cut;
 pub(crate) mod grep;
+pub(crate) mod lines;
 pub(crate) mod sed;
 pub(crate) mod sort;
 pub(crate) mod uniq;

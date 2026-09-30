@@ -178,6 +178,7 @@ pub(crate) trait Builtin {
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinKind {
     Simple(&'static dyn Builtin),
+    Lines(text::lines::LineCommand),
     Xargs,
 }
 
@@ -203,6 +204,9 @@ const REGISTRY: &[&dyn Builtin] = &[
 ];
 
 pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
+    if let Some(command) = text::lines::LineCommand::lookup(name) {
+        return Some(BuiltinKind::Lines(command));
+    }
     if name == xargs::NAME {
         return Some(BuiltinKind::Xargs);
     }
@@ -220,6 +224,7 @@ pub(crate) fn names() -> Vec<&'static str> {
         .iter()
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
+    names.extend(["head", "tail"]);
     names.push(xargs::NAME);
     names.sort_unstable();
     names
@@ -339,12 +344,14 @@ mod tests {
             "echo",
             "false",
             "grep",
+            "head",
             "jq",
             "printf",
             "progress",
             "sed",
             "sleep",
             "sort",
+            "tail",
             "test",
             "true",
             "uniq",

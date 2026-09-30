@@ -1437,7 +1437,7 @@ ceilings; tripping one ends the script with a message naming it. Filter with `jq
 shell, and print only what you need next.
 
 Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
-`sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Any provider command words this session has \
+`sed`, `cut`, `sort`, `uniq`, `wc`, `head`/`tail` (-n N or -N lines; tail -n +N starts at N), `base64`, `xargs`. Any provider command words this session has \
 are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \

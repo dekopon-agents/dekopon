@@ -323,6 +323,117 @@ fn functions_take_positional_parameters_and_return_status() {
 }
 
 #[test]
+fn head_closes_a_loop_producer_and_preserves_its_status_under_pipefail() {
+    assert_eq!(output("while true; do echo y; done | head -1"), "y");
+    assert_eq!(
+        code("set -o pipefail; while true; do echo y; done | head -1"),
+        0
+    );
+    assert_eq!(output("while true; do echo y; done | head -n 0"), "");
+    assert_eq!(output("printf 'a\\nb\\n' | { head -n 0; cat; }"), "");
+}
+
+#[test]
+fn head_and_tail_select_fragmented_and_unterminated_lines() {
+    let crossing = "x".repeat(6000);
+    let script = format!("printf 'a\\n{crossing}\\nb\\nc' | tail -n 3");
+    assert_eq!(output(&script), format!("{crossing}\nb\nc"));
+    let script = format!("printf '{crossing}\\nb\\nc' | head -1");
+    assert_eq!(output(&script), crossing);
+    assert_eq!(output("printf 'a\\nb\\nc' | head -3"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 2"), "b\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +2"), "b\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +0"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | head"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n +1"), "a\nb\nc");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 0"), "");
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -2"), "b\nc");
+    assert_eq!(code("echo a | head -x"), 2);
+    assert_eq!(code("echo a | tail -f"), 2);
+    assert_eq!(code("echo a | tail -+2"), 2);
+    assert_eq!(code("echo a | head file"), 2);
+}
+
+#[test]
+fn a_multibyte_character_split_across_pipe_chunks_stays_valid_text() {
+    let crossing = "x".repeat(4095);
+    let script = format!("printf '{crossing}é' | tail -n +1");
+    assert_eq!(output(&script), format!("{crossing}é"));
+    let captured = format!("v=$(printf '{crossing}é' | tail -n +1); echo ${{#v}}");
+    assert_eq!(output(&captured), "4096");
+}
+
+#[test]
+fn a_discarded_line_stream_does_not_use_the_retained_byte_budget() {
+    let outcome = run_with(
+        "while true; do echo x; done | head -100 > /dev/null; echo done",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "done");
+}
+
+#[test]
+fn line_selections_honor_named_buffer_redirection() {
+    assert_eq!(
+        output("printf 'a\\nb\\nc' | head -n 2 > buf; cat buf"),
+        "a\nb\n"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\nc' | tail -n +2 > buf; cat buf"),
+        "b\nc"
+    );
+    assert_eq!(output("printf 'a\\nb\\nc' | tail -n 1 > buf; cat buf"), "c");
+    assert_eq!(
+        output("printf 'a\\nb' | { head -1 > buf; cat buf; }"),
+        "a\n"
+    );
+}
+
+#[test]
+fn a_tail_replaces_an_affordable_line_before_charging_the_next() {
+    let outcome = run_with(
+        "printf '12345678\\nabcdefgh\\n' | tail -n 1",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 16,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "abcdefgh");
+}
+
+#[test]
+fn line_selection_capture_is_charged_before_retaining_output() {
+    let outcome = run_with(
+        "v=$(printf '12345678901234567890' | head -n 1); echo reached",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 25,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn tail_refuses_to_retain_lines_past_the_shared_value_budget() {
+    let outcome = run_with(
+        "printf 'abcdefghij\\nabcdefghij\\n' | tail -n 2",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 16,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
 fn a_negated_pipeline_inverts_its_status() {
     assert_eq!(output("if ! false; then echo neg; fi"), "neg");
     assert_eq!(output("if ! true; then echo no; else echo yes; fi"), "yes");

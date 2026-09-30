@@ -20,7 +20,7 @@ use crate::{
         Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
-        self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
+        self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, text, xargs,
     },
     dispatch::{self, Resolution},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
@@ -1430,7 +1430,7 @@ impl<'a> Evaluator<'a> {
         };
         let redirected = self.stdout_redirected;
         self.stdout_redirected |= stdout != Sink::Value;
-        let executed = self.run_argv(&argv, input, capture_output, literal_help);
+        let executed = self.run_argv(&argv, input, capture_output, literal_help, &stdout);
         self.stdout_redirected = redirected;
         if let Some(writer) = stage_stdout {
             self.stdout = Some(writer);
@@ -1603,6 +1603,7 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
         capture_output: bool,
         literal_help: bool,
+        stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
@@ -1628,6 +1629,7 @@ impl<'a> Evaluator<'a> {
             input,
             capture_output,
             literal_help,
+            stdout_sink,
         );
         let (status, outcome) = match &executed {
             Ok(Executed::Result(result)) => {
@@ -1654,6 +1656,106 @@ impl<'a> Evaluator<'a> {
         executed
     }
 
+    fn run_lines(
+        &mut self,
+        command: text::lines::LineCommand,
+        arguments: &[String],
+        input: StageInput,
+        literal_help: bool,
+        stdout_sink: &Sink,
+    ) -> Result<Executed, FatalError> {
+        if literal_help {
+            return Ok(Executed::Result(builtins::help_result(
+                command.name(),
+                command.help(),
+            )));
+        }
+        let retention_budget = self.budget.fork();
+        let mut redirected_bytes = Vec::new();
+        let mut redirect_charges = Vec::new();
+        let mut utf8_pending = Vec::new();
+        let mut reader = match input {
+            StageInput::Piped(reader) => reader,
+            StageInput::Inherited => self
+                .stdin
+                .last_mut()
+                .map(std::mem::take)
+                .unwrap_or_default(),
+        };
+        let outcome = command.run(
+            arguments,
+            &mut reader,
+            &mut self.budget,
+            self.invoker,
+            |line| {
+                if matches!(stdout_sink, Sink::Discard) {
+                    return Ok(true);
+                }
+                if let Some(writer) = self.stdout.as_mut() {
+                    match writer.write(line) {
+                        WriteOutcome::Accepted => return Ok(true),
+                        WriteOutcome::ReaderGone => {
+                            self.reader_gone = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+                if !matches!(stdout_sink, Sink::Value) {
+                    let charge = retention_budget.charge_value_bytes(line.len() as u64)?;
+                    redirected_bytes.extend_from_slice(line);
+                    redirect_charges.push(charge);
+                    return Ok(true);
+                }
+                utf8_pending.extend_from_slice(line);
+                let complete = match std::str::from_utf8(&utf8_pending) {
+                    Ok(text) => text.len(),
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(_invalid_utf8) => {
+                        return Err(CommandFailure::failed(
+                            "standard input is not valid UTF-8 text",
+                        ));
+                    }
+                };
+                if complete > 0 {
+                    let text = std::str::from_utf8(&utf8_pending[..complete]).map_err(
+                        |_invalid_utf8| {
+                            CommandFailure::failed("standard input is not valid UTF-8 text")
+                        },
+                    )?;
+                    if let Some(capture) = self.captures.last_mut() {
+                        let charge = retention_budget.charge_value_bytes(complete as u64)?;
+                        let mut result =
+                            CommandResult::value(Value::String(text.to_owned())).without_newline();
+                        result.retained.push(charge);
+                        capture.push(result);
+                    } else {
+                        self.output.push_fragment(text);
+                    }
+                    utf8_pending.drain(..complete);
+                }
+                Ok(true)
+            },
+        );
+        let mut status = match outcome {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(failure) => self.absorb(failure)?,
+        };
+        if status == ExitCode::SUCCESS && !utf8_pending.is_empty() {
+            status = self.absorb(CommandFailure::failed(
+                "standard input is not valid UTF-8 text",
+            ))?;
+        }
+        if !redirected_bytes.is_empty() && status == ExitCode::SUCCESS {
+            let text = String::from_utf8(redirected_bytes).map_err(|_invalid_utf8| {
+                FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
+            })?;
+            let mut result = CommandResult::value(Value::String(text)).without_newline();
+            result.retained = redirect_charges;
+            return Ok(Executed::Result(result));
+        }
+        Ok(Executed::Result(CommandResult::status(status)))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "each argument is an independent piece of run_argv's execution context, not a \
@@ -1667,6 +1769,7 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
         capture_output: bool,
         literal_help: bool,
+        stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
             if let Some(executed) = self.run_control_word(command, arguments, input)? {
@@ -1722,6 +1825,9 @@ impl<'a> Evaluator<'a> {
                         Ok(Executed::Result(CommandResult::status(status)))
                     }
                 }
+            }
+            Resolution::Builtin(BuiltinKind::Lines(command)) => {
+                self.run_lines(command, arguments, input, literal_help, stdout_sink)
             }
             Resolution::Builtin(BuiltinKind::Xargs) => {
                 if literal_help {
@@ -2043,6 +2149,7 @@ impl<'a> Evaluator<'a> {
                 StageInput::Piped(PipeReader::default()),
                 true,
                 false,
+                &Sink::Value,
             )? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
