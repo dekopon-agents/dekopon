@@ -2,8 +2,6 @@
 //! of being silently treated as literal text, so a script can never mistake literal matching for a
 //! regex that ran.
 
-use std::borrow::Cow;
-
 use regex_bites::{Regex, RegexBuilder};
 
 use crate::builtins::CommandFailure;
@@ -13,12 +11,11 @@ pub(crate) mod grep;
 pub(crate) mod lines;
 pub(crate) mod sed;
 pub(crate) mod sort;
+pub(crate) mod stream;
 pub(crate) mod uniq;
 pub(crate) mod wc;
 
 pub(crate) use cut::Cut;
-pub(crate) use grep::Grep;
-pub(crate) use sed::Sed;
 pub(crate) use sort::Sort;
 pub(crate) use uniq::Uniq;
 pub(crate) use wc::Wc;
@@ -156,9 +153,13 @@ impl Pattern {
         })
     }
 
-    pub(crate) fn matches(&self, line: &str) -> bool {
+    pub(crate) fn matches_charged(
+        &self,
+        line: &str,
+        budget: &crate::limits::Budget,
+    ) -> Result<bool, crate::limits::LimitExceeded> {
         let (needle, anchored_start, anchored_end, ignore_case) = match self {
-            Self::Extended(regex) => return regex.is_match(line),
+            Self::Extended(regex) => return Ok(regex.is_match(line)),
             Self::Literal {
                 needle,
                 anchored_start,
@@ -166,18 +167,32 @@ impl Pattern {
                 ignore_case,
             } => (needle, *anchored_start, *anchored_end, *ignore_case),
         };
-        let candidate = if ignore_case {
-            Cow::Owned(line.to_lowercase())
+        let folded_len = if ignore_case {
+            line.chars()
+                .flat_map(char::to_lowercase)
+                .map(char::len_utf8)
+                .sum::<usize>()
         } else {
-            Cow::Borrowed(line)
+            0
         };
-        let candidate: &str = &candidate;
-        match (anchored_start, anchored_end) {
+        let _charge = budget.charge_value_bytes(folded_len as u64)?;
+        let folded = ignore_case.then(|| line.to_lowercase());
+        let candidate = folded.as_deref().unwrap_or(line);
+        Ok(match (anchored_start, anchored_end) {
             (true, true) => candidate == needle,
             (true, false) => candidate.starts_with(needle),
             (false, true) => candidate.ends_with(needle),
             (false, false) => candidate.contains(needle),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn matches(&self, line: &str) -> bool {
+        self.matches_charged(
+            line,
+            &crate::limits::Budget::start(crate::limits::Limits::default()),
+        )
+        .expect("test pattern fits the default retention budget")
     }
 }
 

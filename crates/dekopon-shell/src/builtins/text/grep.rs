@@ -1,36 +1,18 @@
-use serde_json::Value;
-
-use crate::{
-    ExitCode,
-    builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::to_lines,
-};
+use crate::builtins::{CommandFailure, unsupported_flag};
 
 use super::Pattern;
 
 const HELP: &str = "-v -i -c -n -E";
 
-pub(crate) struct Grep;
+pub(crate) struct GrepConfig {
+    invert: bool,
+    count_only: bool,
+    number: bool,
+    pattern: Pattern,
+}
 
-impl Builtin for Grep {
-    fn name(&self) -> &'static str {
-        "grep"
-    }
-
-    fn help(&self) -> &'static str {
-        HELP
-    }
-
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
+impl GrepConfig {
+    pub(crate) fn parse(arguments: &[String]) -> Result<Self, CommandFailure> {
         let mut invert = false;
         let mut ignore_case = false;
         let mut count_only = false;
@@ -64,35 +46,28 @@ impl Builtin for Grep {
                 "grep: a pattern argument is required",
             ));
         };
-        let pattern = Pattern::compile("grep", &pattern, ignore_case, extended)?;
+        Ok(Self {
+            invert,
+            count_only,
+            number,
+            pattern: Pattern::compile("grep", &pattern, ignore_case, extended)?,
+        })
+    }
 
-        let mut matched = Vec::new();
-        for (index, line) in to_lines(&input.unwrap_or(Value::Null))
-            .into_iter()
-            .enumerate()
-        {
-            if pattern.matches(&line) == invert {
-                continue;
-            }
-            matched.push(if number {
-                format!("{}:{line}", index + 1)
-            } else {
-                line
-            });
-        }
+    pub(crate) fn count_only(&self) -> bool {
+        self.count_only
+    }
 
-        let status = if matched.is_empty() {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
-        let mut result = if count_only {
-            CommandResult::value(Value::from(matched.len()))
-        } else {
-            CommandResult::lines(matched)
-        };
-        result.status = status;
-        Ok(result)
+    pub(crate) fn selects(
+        &self,
+        line: &str,
+        budget: &crate::limits::Budget,
+    ) -> Result<bool, CommandFailure> {
+        Ok(self.pattern.matches_charged(line, budget)? != self.invert)
+    }
+
+    pub(crate) fn number(&self) -> bool {
+        self.number
     }
 }
 
@@ -102,13 +77,14 @@ mod tests {
 
     use crate::{
         ExitCode,
-        builtins::{CommandResult, test_support::run_builtin},
+        builtins::{
+            CommandResult,
+            text::stream::{TextStream, run_test},
+        },
     };
 
-    use super::Grep;
-
     fn grep(arguments: &[&str], input: Value) -> CommandResult {
-        run_builtin(&Grep, arguments, Some(input)).expect("grep runs")
+        run_test(TextStream::Grep, arguments, input).expect("grep runs")
     }
 
     #[test]
@@ -144,7 +120,7 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_rejected_by_name() {
-        let failure = run_builtin(&Grep, &["-o", "a"], Some(json!("a")))
+        let failure = run_test(TextStream::Grep, &["-o", "a"], json!("a"))
             .expect_err("only-matching is not implemented");
         assert!(format!("{failure:?}").contains("-o"), "{failure:?}");
     }
@@ -176,14 +152,14 @@ mod tests {
     #[test]
     fn without_the_e_flag_a_regex_is_still_refused_by_name() {
         let failure =
-            run_builtin(&Grep, &["[0-9]"], Some(json!("a1"))).expect_err("literal by default");
+            run_test(TextStream::Grep, &["[0-9]"], json!("a1")).expect_err("literal by default");
         let message = format!("{failure:?}");
         assert!(message.contains("literal text"), "{message}");
     }
 
     #[test]
     fn an_uncompilable_e_pattern_fails_rather_than_matching_nothing() {
-        let failure = run_builtin(&Grep, &["-E", "a("], Some(json!("a(")))
+        let failure = run_test(TextStream::Grep, &["-E", "a("], json!("a("))
             .expect_err("an unclosed group is not a literal");
         assert!(
             format!("{failure:?}").contains("closing ')'"),

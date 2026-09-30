@@ -445,6 +445,88 @@ fn an_unterminated_flood_is_refused_at_the_retained_budget() {
 }
 
 #[test]
+fn grep_and_sed_stream_fragmented_lines_without_adding_newlines() {
+    assert_eq!(output("printf 'abc\\ndef' | grep -n -E '^d'"), "2:def");
+    assert_eq!(
+        output("printf 'abc\\ndef' | sed -E 's/([a-z]+)/x/g'"),
+        "x\nx"
+    );
+    assert_eq!(output("printf 'abc\\ndef' | grep -c -E '^z'"), "0");
+    assert_eq!(output("printf 'abc\\ndef' | grep -c -E '^z' | wc -c"), "2");
+    assert_eq!(code("set -o pipefail; printf 'abc\\ndef' | grep -c z"), 1);
+    assert_eq!(output("printf 'abc\\ndef' | grep -i -v 'ABC'"), "def");
+    assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|'"), "x");
+    assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|' | wc -c"), "2");
+}
+
+#[test]
+fn a_redirected_grep_count_keeps_zero_bytes_when_status_is_one() {
+    assert_eq!(output("printf x | grep -c z > count; cat count"), "0\n");
+    assert_eq!(
+        output("printf x | grep -c z > count; echo ${PIPESTATUS[1]}"),
+        "1"
+    );
+}
+
+#[test]
+fn case_insensitive_grep_charges_its_folded_line() {
+    let script = "grep -i X <<EOF\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nEOF";
+    let refused = run_with(
+        script,
+        Limits {
+            max_value_bytes: 50,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(refused.exit_code, ExitCode::SUCCESS, "{refused:?}");
+    assert!(refused.output.contains("bytes of values"), "{refused:?}");
+    let accepted = run_with(
+        script,
+        Limits {
+            max_value_bytes: 128,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(accepted.exit_code, ExitCode::SUCCESS, "{accepted:?}");
+    assert_eq!(accepted.output, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn large_here_docs_charge_a_step_for_each_text_chunk() {
+    for command in ["grep x", "sed s/x/y/"] {
+        let limits = Limits {
+            max_steps: 30,
+            ..Limits::default()
+        };
+        let small = run_with(&format!("{command} <<EOF\nx\nEOF"), limits);
+        assert_eq!(small.exit_code, ExitCode::SUCCESS, "{small:?}");
+        let huge = format!("{command} <<EOF\n{}\nEOF", "x".repeat(256 * 1024));
+        let result = run_with(&huge, limits);
+        assert_ne!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+        assert!(result.output.contains("steps"), "{result:?}");
+    }
+}
+
+#[test]
+fn a_global_sed_replacement_emits_in_bounded_fragments() {
+    let replacement = "y".repeat(8 * 1024);
+    let script = format!("printf xxxxx | sed 's/x/{replacement}/g' | wc -c");
+    let result = run(&script);
+    assert_eq!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+    assert_eq!(result.output, "40960");
+}
+
+#[test]
+fn grep_and_sed_refuse_invalid_utf8_in_a_stream() {
+    for command in ["grep x", "sed s/x/y/"] {
+        let script = format!("printf /w== | base64 -d | {command}");
+        let result = run(&script);
+        assert_ne!(result.exit_code, ExitCode::SUCCESS, "{result:?}");
+        assert!(result.output.contains("not valid UTF-8"), "{result:?}");
+    }
+}
+
+#[test]
 fn head_closes_a_loop_producer_and_preserves_its_status_under_pipefail() {
     assert_eq!(output("while true; do echo y; done | head -1"), "y");
     assert_eq!(

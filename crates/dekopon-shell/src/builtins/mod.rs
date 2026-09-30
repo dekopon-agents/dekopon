@@ -179,6 +179,7 @@ pub(crate) trait Builtin {
 pub(crate) enum BuiltinKind {
     Simple(&'static dyn Builtin),
     Lines(text::lines::LineCommand),
+    TextStream(text::stream::TextStream),
     Base64,
     Xargs,
 }
@@ -187,8 +188,6 @@ const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &misc::Sleep,
     &misc::Progress,
-    &text::Grep,
-    &text::Sed,
     &text::Cut,
     &text::Sort,
     &text::Uniq,
@@ -207,6 +206,13 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
     if let Some(command) = text::lines::LineCommand::lookup(name) {
         return Some(BuiltinKind::Lines(command));
     }
+    if let Some(command) = match name {
+        "grep" => Some(text::stream::TextStream::Grep),
+        "sed" => Some(text::stream::TextStream::Sed),
+        _ => None,
+    } {
+        return Some(BuiltinKind::TextStream(command));
+    }
     if name == "base64" {
         return Some(BuiltinKind::Base64);
     }
@@ -219,15 +225,13 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
         .map(|builtin| BuiltinKind::Simple(*builtin))
 }
 
-/// names() must stay derived from REGISTRY rather than hand-listed, or the drift test against
-/// RESERVED_COMMAND_WORDS could pass while stale.
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = REGISTRY
         .iter()
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
-    names.extend(["head", "tail", "base64"]);
+    names.extend(["head", "tail", "base64", "grep", "sed"]);
     names.push(xargs::NAME);
     names.sort_unstable();
     names
@@ -327,14 +331,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
-    use super::{
-        CommandFailure, lookup, names, test_support::NoCapabilities, test_support::run_builtin,
-        text::Grep, xargs,
-    };
+    use super::{lookup, names, test_support::NoCapabilities, xargs};
 
     #[test]
     fn the_registry_covers_every_documented_builtin() {
@@ -404,14 +403,14 @@ mod tests {
 
     #[test]
     fn unsupported_flag_names_the_accepted_subset() {
-        let failure =
-            run_builtin(&Grep, &["-q", "a"], Some(json!("a"))).expect_err("-q is not implemented");
-        let CommandFailure::Status { message, .. } = failure else {
-            panic!("a usage error must stay recoverable");
-        };
-        assert_eq!(
-            message,
-            "grep: option not yet supported: -q (supported: -v -i -c -n -E)"
+        let result =
+            Interpreter::new(Limits::default()).run("grep -q a <<EOF\na\nEOF", &NoCapabilities);
+        assert_eq!(result.exit_code, ExitCode::SYNTAX);
+        assert!(
+            result
+                .output
+                .contains("grep: option not yet supported: -q (supported: -v -i -c -n -E)"),
+            "{result:?}"
         );
     }
 

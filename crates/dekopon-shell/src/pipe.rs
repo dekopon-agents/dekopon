@@ -35,7 +35,7 @@ impl ChargedBytes {
     }
 }
 
-const CHUNK_BYTES: usize = 4 * 1024;
+pub(crate) const CHUNK_BYTES: usize = 4 * 1024;
 
 const CAPACITY_CHUNKS: usize = 16;
 
@@ -104,7 +104,10 @@ impl PipeReader {
         invoker: &dyn CapabilityInvoker,
     ) -> Result<ReadOutcome, LimitExceeded> {
         if !self.pending.is_empty() {
-            let bytes: Vec<u8> = self.pending.drain(..).collect();
+            let bytes: Vec<u8> = self
+                .pending
+                .drain(..self.pending.len().min(CHUNK_BYTES))
+                .collect();
             return Ok(ReadOutcome::Bytes(bytes));
         }
         loop {
