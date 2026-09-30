@@ -45,12 +45,12 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::{Cell, RefCell},
         collections::BTreeSet,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
-
-    use dekopon_core::SecretUseProposal;
-    use serde_json::Value;
 
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
@@ -58,14 +58,14 @@ mod tests {
 
     #[derive(Default)]
     struct Session {
-        granted_lists: Cell<usize>,
-        word_lists: Cell<usize>,
-        invoked: RefCell<Vec<String>>,
+        granted_lists: AtomicUsize,
+        word_lists: AtomicUsize,
+        invoked: Mutex<Vec<String>>,
     }
 
     impl CapabilityInvoker for Session {
         fn granted(&self) -> Vec<String> {
-            self.granted_lists.set(self.granted_lists.get() + 1);
+            self.granted_lists.fetch_add(1, Ordering::Relaxed);
             vec!["cli-probe.upper".to_owned(), "wikipedia_page".to_owned()]
         }
 
@@ -74,7 +74,7 @@ mod tests {
         }
 
         fn command_words(&self) -> Vec<String> {
-            self.word_lists.set(self.word_lists.get() + 1);
+            self.word_lists.fetch_add(1, Ordering::Relaxed);
             vec!["probe".to_owned()]
         }
 
@@ -82,16 +82,14 @@ mod tests {
             word == "probe"
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+            let capability = proposal.capability;
+            let input = proposal.input;
+            let secret_use = proposal.secret_use;
             if secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
-            self.invoked.borrow_mut().push(capability.to_owned());
+            self.invoked.lock().unwrap().push(capability);
             CapabilityCallResult::Succeeded(input)
         }
     }
@@ -107,13 +105,8 @@ mod tests {
             self.0.iter().map(|word| (*word).to_owned()).collect()
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            if secret_use.is_some() {
+        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+            if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
             CapabilityCallResult::NotFound
@@ -177,7 +170,7 @@ mod tests {
             assert_eq!(outcome.capability_calls, 0, "{script}");
         }
         assert!(
-            session.invoked.borrow().is_empty(),
+            session.invoked.lock().unwrap().is_empty(),
             "a capability identifier typed as a command reached invoke"
         );
     }
@@ -189,8 +182,8 @@ mod tests {
         for word in ["probe", "wikipedia_page", "cli-probe.upper", "unknown"] {
             let _resolution = resolve(word, &functions, &session);
         }
-        assert_eq!(session.granted_lists.get(), 0);
-        assert_eq!(session.word_lists.get(), 0);
+        assert_eq!(session.granted_lists.load(Ordering::Relaxed), 0);
+        assert_eq!(session.word_lists.load(Ordering::Relaxed), 0);
     }
 
     #[test]

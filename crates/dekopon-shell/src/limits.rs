@@ -52,9 +52,7 @@ pub enum LimitExceeded {
 pub struct Budget {
     limits: Limits,
     tree: TreeContext,
-    steps: u64,
     depth: u32,
-    value_bytes: u64,
 }
 
 impl Budget {
@@ -62,7 +60,7 @@ impl Budget {
     pub fn start(limits: Limits) -> Self {
         Self::start_tree(
             limits,
-            TreeContext::new(limits.timeout, CallBudget::new(limits.max_capability_calls)),
+            TreeContext::new(limits, CallBudget::new(limits.max_capability_calls)),
         )
     }
 
@@ -71,9 +69,7 @@ impl Budget {
         Self {
             limits,
             tree,
-            steps: 0,
             depth: 0,
-            value_bytes: 0,
         }
     }
 
@@ -92,25 +88,12 @@ impl Budget {
     /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
     /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
-        self.steps = self.steps.saturating_add(1);
-        if self.steps > self.limits.max_steps {
-            return Err(LimitExceeded::Steps {
-                maximum: self.limits.max_steps,
-            });
-        }
+        self.tree.charge_step()?;
         self.check_deadline()
     }
 
-    /// This counter is cumulative, not retained: it bounds total bytes materialized over the run,
-    /// not bytes held at one instant, so it needs no release path a missed call could corrupt.
-    pub fn charge_value_bytes(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
-        self.value_bytes = self.value_bytes.saturating_add(bytes);
-        if self.value_bytes > self.limits.max_value_bytes {
-            return Err(LimitExceeded::ValueBytes {
-                maximum: self.limits.max_value_bytes,
-            });
-        }
-        Ok(())
+    pub fn charge_value_bytes(&self, bytes: u64) -> Result<crate::RetainedBytes, LimitExceeded> {
+        self.tree.retain(bytes)
     }
 
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
@@ -150,17 +133,17 @@ impl Budget {
 
     #[must_use]
     pub fn steps(&self) -> u64 {
-        self.steps
+        self.tree.steps()
     }
 
     #[must_use]
     pub fn value_bytes(&self) -> u64 {
-        self.value_bytes
+        self.tree.value_bytes()
     }
 
     #[must_use]
     pub fn max_value_bytes(&self) -> u64 {
-        self.limits.max_value_bytes
+        self.tree.max_value_bytes()
     }
 }
 
@@ -369,17 +352,38 @@ mod tests {
     }
 
     #[test]
-    fn value_bytes_accumulate_across_the_whole_run() {
-        let mut budget = Budget::start(Limits {
+    fn retained_bytes_are_shared_and_refunded_on_drop() {
+        let first = Budget::start(Limits {
             max_value_bytes: 10,
             ..Limits::default()
         });
-        assert!(budget.charge_value_bytes(6).is_ok());
-        assert_eq!(
-            budget.charge_value_bytes(6),
+        let second = Budget::start_tree(Limits::default(), first.tree.clone());
+        let retained = first.charge_value_bytes(6).expect("fits");
+        assert!(matches!(
+            second.charge_value_bytes(6),
             Err(LimitExceeded::ValueBytes { maximum: 10 })
+        ));
+        assert_eq!(second.value_bytes(), 6);
+        drop(retained);
+        assert_eq!(second.value_bytes(), 0);
+        assert!(second.charge_value_bytes(6).is_ok());
+    }
+
+    #[test]
+    fn two_budgets_share_one_step_allowance() {
+        let mut first = Budget::start(Limits {
+            max_steps: 3,
+            ..Limits::default()
+        });
+        let mut second = Budget::start_tree(Limits::default(), first.tree.clone());
+        first.charge_step().expect("first");
+        second.charge_step().expect("second");
+        first.charge_step().expect("third");
+        assert_eq!(
+            second.charge_step(),
+            Err(LimitExceeded::Steps { maximum: 3 })
         );
-        assert_eq!(budget.value_bytes(), 12);
+        assert_eq!(first.steps(), second.steps());
     }
 
     #[test]

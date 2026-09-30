@@ -1,4 +1,4 @@
-use std::{cell::RefCell, time::Duration};
+use std::{sync::Mutex, time::Duration};
 
 use serde_json::{Value, json};
 
@@ -12,14 +12,14 @@ const PROBE: &str = "probe";
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
 
 struct Fixture {
-    calls: RefCell<Vec<(String, Value)>>,
+    calls: Mutex<Vec<(String, Value)>>,
 }
 
 impl Default for Fixture {
     fn default() -> Self {
         worker();
         Self {
-            calls: RefCell::default(),
+            calls: Mutex::default(),
         }
     }
 }
@@ -100,17 +100,17 @@ impl CapabilityInvoker for Fixture {
         })
     }
 
-    fn invoke(
-        &self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        let capability = proposal.capability;
+        let input = proposal.input;
+        let secret_use = proposal.secret_use;
+        let capability = capability.as_str();
         if secret_use.is_some() {
             return dekopon_shell::secret_use_unsupported();
         }
         self.calls
-            .borrow_mut()
+            .lock()
+            .expect("fixture calls")
             .push((capability.to_owned(), input.clone()));
         match capability {
             "cli-probe.upper" => match input.get("text").and_then(Value::as_str) {
@@ -151,6 +151,7 @@ fn proposal(capability: &str, input: Value) -> CommandRun {
         capability: capability.to_owned(),
         input,
         secret_use: None,
+        report: None,
     }
 }
 
@@ -595,7 +596,7 @@ fn xargs_maps_a_command_over_a_list() {
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(outcome.capability_calls, 3);
     assert_eq!(
-        *fixture.calls.borrow(),
+        *fixture.calls.lock().expect("fixture calls"),
         vec![
             ("fixture.object".to_owned(), json!({"a": "a", "b": "b"})),
             ("cli-probe.upper".to_owned(), json!({"text": "a"})),
@@ -651,7 +652,7 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
          dekopon-shell: cli-probe.upper: command not found\n127"
     );
     assert!(
-        fixture.calls.borrow().is_empty(),
+        fixture.calls.lock().expect("fixture calls").is_empty(),
         "a capability-shaped word invoked a capability"
     );
     assert_eq!(outcome.capability_calls, 0);
@@ -1678,12 +1679,8 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             (word == "slow").then(|| proposal("slow.call", json!({})))
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+            let input = proposal.input;
             std::thread::sleep(Duration::from_millis(20));
             CapabilityCallResult::Succeeded(input)
         }
@@ -1762,7 +1759,7 @@ fn a_provider_command_help_page_is_stdout_exit_0_and_capturable() {
     );
     assert_eq!(outcome.capability_calls, 0);
     assert!(
-        fixture.calls.borrow().is_empty(),
+        fixture.calls.lock().expect("fixture calls").is_empty(),
         "help invoked a capability"
     );
 
@@ -1797,7 +1794,7 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(
-        *fixture.calls.borrow(),
+        *fixture.calls.lock().expect("fixture calls"),
         vec![
             ("cli-probe.upper".to_owned(), json!({"text": "hello"})),
             ("fixture.object".to_owned(), json!({"a": 1})),
@@ -1823,7 +1820,7 @@ fn a_provider_command_proposal_still_needs_the_grant() {
          session"
     );
     assert!(
-        fixture.calls.borrow().is_empty(),
+        fixture.calls.lock().expect("fixture calls").is_empty(),
         "an ungranted proposal ran"
     );
     assert_eq!(outcome.capability_calls, 0);

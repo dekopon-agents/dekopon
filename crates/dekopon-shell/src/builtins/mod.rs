@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use dekopon_core::SecretUseProposal;
 use serde_json::Value;
 
 use crate::{
@@ -19,11 +18,12 @@ pub(crate) mod misc;
 pub(crate) mod text;
 pub(crate) mod xargs;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct CommandResult {
     pub value: Value,
     pub status: ExitCode,
     pub suppress_newline: bool,
+    pub retained: Vec<crate::RetainedBytes>,
 }
 
 impl CommandResult {
@@ -32,6 +32,7 @@ impl CommandResult {
             value,
             status: ExitCode::SUCCESS,
             suppress_newline: false,
+            retained: Vec::new(),
         }
     }
 
@@ -40,6 +41,7 @@ impl CommandResult {
             value: Value::Null,
             status,
             suppress_newline: false,
+            retained: Vec::new(),
         }
     }
 
@@ -105,15 +107,14 @@ impl BuiltinContext<'_> {
     /// Capability calls are wall-clock expensive but step-cheap (the default budget allows 32 in 96
     /// steps), so the deadline is re-read on both sides; step-counting alone let a script overrun
     /// its deadline by minutes.
-    pub(crate) fn invoke_capability_with_secret_use(
+    pub(crate) fn invoke_proposal(
         &mut self,
-        capability: &str,
-        input: Value,
-        secret_use: Option<SecretUseProposal>,
+        proposal: crate::CommandProposal,
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.charge_capability_call()?;
         self.budget.check_deadline()?;
-        let result = self.invoker.invoke(capability, input, secret_use);
+        let capability = proposal.capability.clone();
+        let result = self.invoker.invoke(proposal);
         self.budget.check_deadline()?;
         let status = ExitCode::from_capability_result(&result);
         Ok(match result {
@@ -121,6 +122,7 @@ impl BuiltinContext<'_> {
                 value: output,
                 status,
                 suppress_newline: false,
+                retained: Vec::new(),
             },
             CapabilityCallResult::Denied { reason } => {
                 return Err(CommandFailure::Status {
@@ -245,12 +247,7 @@ pub(crate) mod test_support {
             Vec::new()
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, _: crate::CommandProposal) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -307,8 +304,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use dekopon_core::SecretUseProposal;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
@@ -401,13 +397,8 @@ mod tests {
             vec!["http-probe.fetch".to_owned()]
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            if secret_use.is_some() {
+        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+            if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
             CapabilityCallResult::Failed {

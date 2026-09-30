@@ -186,6 +186,7 @@ own page.
 
 Each model turn admits at most ten tool calls, and the model-step limit bounds the session.
 The capability-call ceiling is spent across the whole session, not refreshed per script.
-Other interpreter ceilings apply per script, including steps, recursion, output, deadline,
-and cumulative materialized-value bytes. Model or embedder configuration never seeds the
+Steps, retained-value bytes, capability calls, and the deadline are shared by interpreters in one
+`TreeContext`; retained charges are refunded on drop or replacement. Recursion depth and output
+ceilings remain local to each interpreter. Model or embedder configuration never seeds the
 script's environment. See the [shell contract](../dekopon-shell/README.md).

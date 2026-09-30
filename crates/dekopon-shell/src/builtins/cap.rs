@@ -64,9 +64,9 @@ impl Builtin for Cap {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use crate::{
         CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode, Interpreter,
@@ -78,7 +78,7 @@ mod tests {
 
     #[derive(Default)]
     struct Fixture {
-        invoked: RefCell<Vec<String>>,
+        invoked: Mutex<Vec<String>>,
     }
 
     impl CapabilityInvoker for Fixture {
@@ -93,16 +93,11 @@ mod tests {
             })
         }
 
-        fn invoke(
-            &self,
-            capability: &str,
-            _input: Value,
-            secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            if secret_use.is_some() {
+        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+            if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
-            self.invoked.borrow_mut().push(capability.to_owned());
+            self.invoked.lock().unwrap().push(proposal.capability);
             CapabilityCallResult::NotFound
         }
     }
@@ -173,7 +168,7 @@ mod tests {
         );
         assert_eq!(outcome.capability_calls, 0);
         assert!(
-            fixture.invoked.borrow().is_empty(),
+            fixture.invoked.lock().unwrap().is_empty(),
             "cap invoked a capability"
         );
     }
@@ -202,7 +197,7 @@ mod tests {
             assert!(message.contains(cause), "{arguments:?}: {message}");
         }
         assert!(
-            fixture.invoked.borrow().is_empty(),
+            fixture.invoked.lock().unwrap().is_empty(),
             "cap invoked a capability"
         );
     }

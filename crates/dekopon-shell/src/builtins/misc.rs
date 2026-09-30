@@ -537,12 +537,7 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            _secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
+        fn invoke(&self, _: crate::CommandProposal) -> CapabilityCallResult {
             panic!("progress must not invoke a capability")
         }
 
