@@ -159,7 +159,7 @@ The recommended way to write the same thing. Enable the SDK's `clap` feature and
 
 ```toml
 [dependencies]
-dekopon-provider-sdk = { version = "0.28.1", features = ["clap"] }
+dekopon-provider-sdk = { version = "0.29.0", features = ["clap"] }
 ```
 
 ```rust,ignore

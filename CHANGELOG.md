@@ -7,6 +7,46 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-09-30
+
+### Added
+
+- Stream `head` and `tail` line selections through bounded shell pipes. Both are now reserved
+  command words. See [upgrading](docs/upgrading.md#the-shell-speaks-bytes-0290).
+
+### Changed
+
+- **Breaking:** pipeline stages exchange bytes: a command's output reaches the next stage with its
+  trailing newline, so `echo hi | wc -c` is 3 and a provider stage receives `hi\n`.
+- **Breaking:** piped input is consumed once: `echo x | { cat; cat; }` prints `x` once, and
+  `echo '' | read x` reads one empty line and succeeds.
+- **Breaking:** `jq` accepts only JSON input, streams separate compact JSON results, quotes strings
+  unless `-r` is set, and supports `-n` and budgeted `-s`.
+- **Breaking:** `sort`, `uniq`, `grep`, `sed`, `cut` and `cat` of buffers produce newline-joined
+  text instead of a list, and `xargs` no longer expands a JSON array into arguments.
+- **Breaking:** `CapabilityInvoker` requires `Send + Sync` and consumes an owned `CommandProposal`
+  carrying its command report.
+- A provider command no longer inherits an enclosing compound's piped input; it reads only its own
+  pipe or here-doc.
+- Shell builtin input flows exclusively through byte streams while providers continue receiving
+  drained text.
+- Shell `base64` streams binary bytes between pipeline stages.
+- Shell `grep` and `sed` stream lines through bounded pipes with per-chunk resource checks.
+- Shell `cut`, `uniq`, `wc` and `sort` process pipe bytes with bounded retained state.
+- Shell `xargs` streams each item through its stage, and non-final compound and function stages
+  isolate their scope.
+- Shell named buffers concatenate exact bytes and pipeline diagnostics follow stage order.
+- Shell streaming redirects and captures preserve binary output and enforce shared retained-byte
+  accounting.
+- Shell interpreters in one tree share step and retained-value budgets, with retained charges
+  refunded on replacement or drop.
+- Shell command telemetry identifies pipeline stages, their byte counts and close reasons.
+- The script tool describes byte pipes, isolated non-final stages and streaming builtins.
+
+### Fixed
+
+- Bound retained line input and pending model output while preserving redirected function output.
+
 ## [0.28.1] - 2026-09-29
 
 ### Fixed
