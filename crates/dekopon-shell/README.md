@@ -121,12 +121,14 @@ that, so the parser translates them back.
 They parse through the same production either way, and carry their own redirections:
 `{ a; b; } 2> log`.
 
-A compound stage runs in the **current scope**. There are no subshells here to run it in, so a
-variable a piped `while` loop assigns remains set after the loop — the opposite of bash, where that
-assignment is thrown away with the subshell and is the single most notorious trap in the language.
-The obvious script does the obvious thing.
+The last stage runs in the current scope, retaining assignments. Every earlier stage, including a
+compound, function, or `xargs`, runs on its own thread from a scope snapshot: assignments and
+named-buffer redirects there do not change the parent. `exit`, `return`, and `break` in a non-final
+stage end only that stage. Inside a compound, `read`, `cat`, and stdin-reading builtins share its
+one-shot input stream; provider commands do not inherit that stream.
 
-Pipeline stages exchange bytes; named redirection buffers append exact bytes, including invalid
+Pipeline stages exchange bytes; `xargs` runs one input line at a time and emits each command's
+output before reading the next line. Named redirection buffers append exact bytes, including invalid
 UTF-8, and `cat` copies those bytes to another pipe or buffer. Expanding buffer bytes into text or
 passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
 a whole assignment from JSON object or array text retains its structure, while unquoted text

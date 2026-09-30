@@ -1,4 +1,7 @@
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Mutex, mpsc},
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 
@@ -1114,7 +1117,7 @@ fn xargs_maps_a_command_over_a_list() {
             ("cli-probe.upper".to_owned(), json!({"text": "b"})),
         ]
     );
-    assert_eq!(outcome.output, r#"[{"text":"A"},{"text":"B"}]"#);
+    assert_eq!(outcome.output, "{\"text\":\"A\"}\n{\"text\":\"B\"}");
 }
 
 #[test]
@@ -1126,7 +1129,7 @@ fn help_interception_requires_help_to_be_the_only_argument() {
     assert_eq!(output("echo try --help"), "try --help");
     assert_eq!(
         output(r#"printf 'one\ntwo' | xargs -I {} echo {} --help"#),
-        r#"["one --help","two --help"]"#
+        "one --help\ntwo --help"
     );
 }
 
@@ -1137,10 +1140,7 @@ fn help_interception_decides_on_the_unexpanded_word_not_the_expanded_string() {
         output(r#"pat=--help; grep "$pat""#),
         "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
     );
-    assert_eq!(
-        output(r#"printf 'a\n--help\n' | xargs echo"#),
-        r#"["a","--help"]"#
-    );
+    assert_eq!(output(r#"printf 'a\n--help\n' | xargs echo"#), "a\n--help");
     assert_eq!(
         output(r#"f() { "$@" --help; }; f grep -v"#),
         "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
@@ -2575,9 +2575,7 @@ fn a_builtin_writes_its_lines_and_xargs_reads_text_not_json() {
         output("printf 'b\\na\\n' | sort | { read first; echo $first; }"),
         "a"
     );
-    let one_argument: Value =
-        serde_json::from_str(&output(r#"echo '["a","b"]' | xargs echo"#)).expect("json");
-    assert_eq!(one_argument, json!([r#"["a","b"]"#]));
+    assert_eq!(output(r#"echo '["a","b"]' | xargs echo"#), r#"["a","b"]"#);
 }
 
 #[test]
@@ -2610,6 +2608,16 @@ fn exit_in_a_non_final_stage_ends_only_that_stage() {
 }
 
 #[test]
+fn non_final_return_and_break_do_not_escape_to_the_parent() {
+    let returned = run("f() { return 7; }; f | cat; echo after ${PIPESTATUS[@]}");
+    assert_eq!(returned.output, "after 7 0");
+    assert_eq!(
+        output("for n in 1 2; do { break; } | cat; echo $n; done"),
+        "1\n2"
+    );
+}
+
+#[test]
 fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
     for (script, expected) in [
         ("x=outer; { x=inner; echo ok; } | cat; echo $x", "ok\nouter"),
@@ -2619,6 +2627,182 @@ fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
     ] {
         assert_eq!(output(script), expected);
     }
+}
+
+struct OrderedFixture {
+    fixture: Fixture,
+    released: Mutex<mpsc::Receiver<()>>,
+    release: mpsc::SyncSender<()>,
+}
+
+impl CapabilityInvoker for OrderedFixture {
+    fn granted(&self) -> Vec<String> {
+        self.fixture.granted()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.fixture.has_command_word(word)
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
+            self.released
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("consumer observed first output before producer supplied second line");
+        }
+        if argv == ["line", "second"] {
+            return Some(CommandRun::Rendered {
+                stdout: "second\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            });
+        }
+        if argv == ["upper", "--text", "release"] {
+            self.release.send(()).expect("producer still waiting");
+        }
+        self.fixture.run_command(word, argv, stdin)
+    }
+
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        self.fixture.invoke(proposal)
+    }
+}
+
+fn ordered_fixture() -> OrderedFixture {
+    let (release, released) = mpsc::sync_channel(1);
+    OrderedFixture {
+        fixture: Fixture::default(),
+        released: Mutex::new(released),
+        release,
+    }
+}
+
+#[test]
+fn a_compound_emits_its_first_line_before_its_second_statement() {
+    let fixture = ordered_fixture();
+    let outcome = Interpreter::new(Limits::default()).run(
+        "{ echo first; probe upper --text held; } | { read first; probe upper --text release; cat; }",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        outcome.output,
+        "{\"text\":\"RELEASE\"}\n{\"text\":\"HELD\"}"
+    );
+}
+
+#[test]
+fn xargs_emits_one_item_before_requesting_the_next() {
+    let fixture = ordered_fixture();
+    let outcome = Interpreter::new(Limits::default()).run(
+        "{ echo first; probe line second; } | xargs probe upper --text | { read first; probe upper --text release; cat; }",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        outcome.output,
+        "{\"text\":\"RELEASE\"}\n{\"text\":\"SECOND\"}"
+    );
+}
+
+struct StdinFixture {
+    fixture: Fixture,
+    received: Mutex<Vec<Option<String>>>,
+}
+
+impl CapabilityInvoker for StdinFixture {
+    fn granted(&self) -> Vec<String> {
+        self.fixture.granted()
+    }
+
+    fn has_command_word(&self, word: &str) -> bool {
+        self.fixture.has_command_word(word)
+    }
+
+    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        self.received
+            .lock()
+            .expect("received")
+            .push(stdin.map(str::to_owned));
+        self.fixture.run_command(word, argv, stdin)
+    }
+
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        self.fixture.invoke(proposal)
+    }
+}
+
+#[test]
+fn redirected_xargs_routes_each_item_to_the_resolved_sink() {
+    assert_eq!(
+        output("printf 'a\\n' | xargs echo > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\n' | xargs echo > buf; cat buf"),
+        "a\nb"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\n' | xargs echo 1>&2 | cat; echo after"),
+        "a\nb\nafter"
+    );
+}
+
+#[test]
+fn xargs_function_outputs_obey_its_redirect() {
+    assert_eq!(
+        output("f() { echo leaked; }; printf 'a\\n' | xargs f > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("f() { echo kept; }; printf 'a\\n' | xargs f > buf; cat buf"),
+        "kept"
+    );
+}
+
+#[test]
+fn xargs_streaming_builtin_outputs_obey_its_redirect() {
+    assert_eq!(
+        output("printf '1\\n' | xargs -I '{}' jq -n '{}' > /dev/null; echo after"),
+        "after"
+    );
+    assert_eq!(
+        output("printf '1\\n2\\n' | xargs -I '{}' jq -n '{}' > buf; cat buf"),
+        "1\n2"
+    );
+}
+
+#[test]
+fn a_compound_read_does_not_pass_its_stream_to_a_provider() {
+    let fixture = StdinFixture {
+        fixture: Fixture::default(),
+        received: Mutex::default(),
+    };
+    let outcome = Interpreter::new(Limits::default()).run(
+        "printf 'a\\nb\\n' | while read n; do probe object --a 1; done",
+        &fixture,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(
+        *fixture.received.lock().expect("received"),
+        vec![None, None]
+    );
+}
+
+#[test]
+fn sibling_non_final_loops_share_the_tree_step_budget() {
+    let limits = Limits {
+        max_steps: 150,
+        ..Limits::default()
+    };
+    let outcome = run_with(
+        "{ while true; do :; done; } | { while true; do :; done; } | cat",
+        limits,
+    );
+    assert_eq!(outcome.steps, limits.max_steps);
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
 }
 
 #[test]

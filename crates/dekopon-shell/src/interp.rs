@@ -2285,7 +2285,7 @@ impl<'a> Evaluator<'a> {
                         xargs::HELP,
                     )));
                 }
-                self.run_xargs(arguments, input)
+                self.run_xargs(arguments, input, stdout_sink)
             }
             Resolution::ProviderCommand => {
                 let stdin = match input {
@@ -2601,54 +2601,69 @@ impl<'a> Evaluator<'a> {
         &mut self,
         arguments: &[String],
         input: StageInput,
+        stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let plan = match self
-            .builtin_input(true, input)
-            .and_then(|input| xargs::plan(arguments, input.as_ref().map(|input| &input.value)))
-        {
-            Ok(plan) => plan,
-            Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
+        if let Err(failure) = xargs::plan(arguments, None) {
+            let status = self.absorb(failure)?;
+            return Ok(Executed::Result(CommandResult::status(status)));
+        }
+        let mut piped = match input {
+            StageInput::Piped(reader) => Some(reader),
+            StageInput::Inherited => None,
         };
-
-        let mut outputs = Vec::new();
-        let mut retained = Vec::new();
         let mut status = ExitCode::SUCCESS;
-        for invocation in plan.invocations {
+        loop {
+            let line = match piped.as_mut().or_else(|| self.stdin.last_mut()) {
+                Some(reader) => reader.read_line(&self.budget, self.invoker)?,
+                None => None,
+            };
+            let Some(line) = line else { break };
             self.budget.charge_step_with(self.invoker)?;
-            match self.run_argv(
-                &invocation,
-                StageInput::Piped(PipeReader::default()),
-                true,
-                false,
-                &Sink::Value,
-            )? {
-                Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
-                Executed::Result(result) => {
-                    if result.status != ExitCode::SUCCESS {
-                        status = result.status;
-                    }
-                    if !result.value.is_null() {
-                        outputs.push(result.value);
-                        retained.extend(result.retained);
+            let (bytes, _charges) = line.into_parts();
+            let text = match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    status = self.absorb(CommandFailure::failed(
+                        "xargs: standard input is not valid UTF-8 text",
+                    ))?;
+                    break;
+                }
+            };
+            let plan = match xargs::plan(arguments, Some(&Value::Array(vec![Value::String(text)])))
+            {
+                Ok(plan) => plan,
+                Err(failure) => {
+                    status = self.absorb(failure)?;
+                    break;
+                }
+            };
+            for invocation in plan.invocations {
+                match self.run_argv(
+                    &invocation,
+                    StageInput::Piped(PipeReader::default()),
+                    false,
+                    false,
+                    stdout_sink,
+                )? {
+                    Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
+                    Executed::Result(result) => {
+                        if result.status != ExitCode::SUCCESS {
+                            status = result.status;
+                        }
+                        match stdout_sink {
+                            Sink::Value => self.emit(result)?,
+                            Sink::Diagnostics => self.write_redirected_diagnostics(&result),
+                            Sink::Discard => {}
+                            Sink::Buffer { name, .. } => self.append_buffer(name, result)?,
+                        }
+                        if self.reader_gone {
+                            return Ok(Executed::Result(CommandResult::status(status)));
+                        }
                     }
                 }
             }
         }
-
-        let value = if outputs.is_empty() {
-            Value::Null
-        } else {
-            Value::Array(outputs)
-        };
-        Ok(Executed::Result(CommandResult {
-            value,
-            status,
-            suppress_newline: false,
-            retained,
-        }))
+        Ok(Executed::Result(CommandResult::status(status)))
     }
 
     /// Assigning a variable from a whole command substitution or another whole variable keeps its
@@ -3018,10 +3033,8 @@ impl<'a> Evaluator<'a> {
         let flow = flow.map_err(CommandFailure::Fatal)?;
 
         if let Flow::Exit(status) = flow {
-            // This shell has no subshells, so calling exit inside a captured command substitution
-            // ends the entire script rather than only the substitution, unlike a real shell.
             return Err(CommandFailure::Fatal(FatalError::Unsupported(format!(
-                "exit {status} inside $( ) ends the whole script; this shell has no subshells"
+                "exit {status} inside $( ) is not supported"
             ))));
         }
 
