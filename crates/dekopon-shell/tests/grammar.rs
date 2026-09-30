@@ -453,8 +453,8 @@ fn cut_uniq_wc_and_sort_preserve_fragmented_and_unterminated_lines() {
     assert_eq!(output("printf '10\\n2\\n1' | sort -n -r -u"), "10\n2\n1");
     assert_eq!(output("printf 'α β\\nγ' | wc -w"), "3");
     assert_eq!(
-        output("printf 'α β\\nγ' | wc"),
-        r#"{"bytes":8,"lines":2,"words":3}"#
+        serde_json::from_str::<Value>(&output("printf 'α β\\nγ' | wc")).expect("wc result is JSON"),
+        json!({"bytes": 8, "lines": 2, "words": 3})
     );
     assert_eq!(output("printf 'a\\nb' | wc -l"), "2");
     assert_eq!(output("printf /w== | base64 -d | wc -c"), "1");
