@@ -179,6 +179,7 @@ pub(crate) trait Builtin {
 pub(crate) enum BuiltinKind {
     Simple(&'static dyn Builtin),
     Lines(text::lines::LineCommand),
+    Base64,
     Xargs,
 }
 
@@ -192,7 +193,6 @@ const REGISTRY: &[&dyn Builtin] = &[
     &text::Sort,
     &text::Uniq,
     &text::Wc,
-    &encode::Base64,
     &misc::Echo,
     &misc::Printf,
     &misc::Test,
@@ -206,6 +206,9 @@ const REGISTRY: &[&dyn Builtin] = &[
 pub(crate) fn lookup(name: &str) -> Option<BuiltinKind> {
     if let Some(command) = text::lines::LineCommand::lookup(name) {
         return Some(BuiltinKind::Lines(command));
+    }
+    if name == "base64" {
+        return Some(BuiltinKind::Base64);
     }
     if name == xargs::NAME {
         return Some(BuiltinKind::Xargs);
@@ -224,7 +227,7 @@ pub(crate) fn names() -> Vec<&'static str> {
         .iter()
         .map(|builtin| builtin.name())
         .collect::<Vec<_>>();
-    names.extend(["head", "tail"]);
+    names.extend(["head", "tail", "base64"]);
     names.push(xargs::NAME);
     names.sort_unstable();
     names

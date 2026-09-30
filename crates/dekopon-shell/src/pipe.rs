@@ -4,7 +4,36 @@ use std::{
     time::Duration,
 };
 
-use crate::{CapabilityInvoker, limits::Budget, limits::LimitExceeded};
+use crate::{CapabilityInvoker, RetainedBytes, limits::Budget, limits::LimitExceeded};
+
+pub(crate) struct ChargedBytes {
+    pub(crate) bytes: Vec<u8>,
+    charges: Vec<RetainedBytes>,
+}
+
+impl ChargedBytes {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<RetainedBytes>) {
+        (self.bytes, self.charges)
+    }
+
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            charges: Vec::new(),
+        }
+    }
+
+    fn extend(
+        &mut self,
+        chunk: impl IntoIterator<Item = u8>,
+        len: usize,
+        budget: &Budget,
+    ) -> Result<(), LimitExceeded> {
+        self.charges.push(budget.charge_value_bytes(len as u64)?);
+        self.bytes.extend(chunk);
+        Ok(())
+    }
+}
 
 const CHUNK_BYTES: usize = 4 * 1024;
 
@@ -106,18 +135,19 @@ impl PipeReader {
         &mut self,
         budget: &Budget,
         invoker: &dyn CapabilityInvoker,
-    ) -> Result<Option<Vec<u8>>, LimitExceeded> {
-        let mut line = Vec::new();
+    ) -> Result<Option<ChargedBytes>, LimitExceeded> {
+        let mut line = ChargedBytes::new();
         loop {
             if let Some(offset) = self.pending.iter().position(|byte| *byte == b'\n') {
-                line.extend(self.pending.drain(..offset));
+                line.extend(self.pending.drain(..offset), offset, budget)?;
                 self.pending.pop_front();
                 return Ok(Some(line));
             }
-            line.extend(self.pending.drain(..));
+            let len = self.pending.len();
+            line.extend(self.pending.drain(..), len, budget)?;
             match self.read_more(budget, invoker)? {
                 true => {}
-                false if line.is_empty() => return Ok(None),
+                false if line.bytes.is_empty() => return Ok(None),
                 false => {
                     return Ok(Some(line));
                 }
@@ -129,10 +159,11 @@ impl PipeReader {
         &mut self,
         budget: &Budget,
         invoker: &dyn CapabilityInvoker,
-    ) -> Result<Vec<u8>, LimitExceeded> {
-        let mut bytes = Vec::new();
+    ) -> Result<ChargedBytes, LimitExceeded> {
+        let mut bytes = ChargedBytes::new();
         while let ReadOutcome::Bytes(chunk) = self.read(budget, invoker)? {
-            bytes.extend(chunk);
+            let len = chunk.len();
+            bytes.extend(chunk, len, budget)?;
         }
         Ok(bytes)
     }
@@ -188,7 +219,10 @@ mod tests {
         assert_eq!(writer.write(b"a\nbc"), WriteOutcome::Accepted);
         drop(writer);
         assert_eq!(
-            reader.read_line(&budget, &Idle).expect("reads"),
+            reader
+                .read_line(&budget, &Idle)
+                .expect("reads")
+                .map(|line| line.bytes),
             Some(b"a".to_vec())
         );
         assert_eq!(
@@ -199,6 +233,30 @@ mod tests {
             reader.read(&budget, &Idle).expect("reads"),
             ReadOutcome::End
         );
+    }
+
+    #[test]
+    fn a_growing_line_and_drain_are_charged_before_appending() {
+        let budget = Budget::start(Limits {
+            max_value_bytes: 12,
+            ..Limits::default()
+        });
+        let (mut writer, mut reader) = pipe();
+        assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
+        drop(writer);
+        assert!(matches!(
+            reader.read_line(&budget, &Idle),
+            Err(LimitExceeded::ValueBytes { maximum: 12 })
+        ));
+        assert_eq!(budget.value_bytes(), 0);
+        let (mut writer, mut reader) = pipe();
+        assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
+        drop(writer);
+        assert!(matches!(
+            reader.drain(&budget, &Idle),
+            Err(LimitExceeded::ValueBytes { maximum: 12 })
+        ));
+        assert_eq!(budget.value_bytes(), 0);
     }
 
     #[test]

@@ -323,6 +323,128 @@ fn functions_take_positional_parameters_and_return_status() {
 }
 
 #[test]
+fn binary_base64_passes_through_cat_but_not_text_boundaries() {
+    assert_eq!(output("printf /w== | base64 -d | cat"), "�");
+    assert_eq!(output("printf /w== | base64 -d"), "�");
+    assert_eq!(output("printf 'aGVs\nbG8=' | base64 -d"), "hello");
+    assert_eq!(output("base64 hi"), "aGk=");
+    assert_eq!(output("printf 'eHjDqQ==' | base64 -d"), "xxé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 -d"), "�aé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 --decode | cat"), "�aé");
+    assert_eq!(output("printf '/2HDqQ==' | base64 -d | head -1"), "�aé");
+    assert_eq!(code("base64 -d !!!!"), 1);
+    assert_eq!(code("base64 -w 0 hi"), 2);
+    let resumed = run("v=$(base64 -d /w==); echo after");
+    assert_eq!(resumed.exit_code, ExitCode::SUCCESS, "{resumed:?}");
+    assert_eq!(
+        resumed.output,
+        "standard input is not valid UTF-8 text\nafter"
+    );
+    let captured = run("v=$(printf /w== | base64 -d); echo $? reached");
+    assert_eq!(captured.exit_code, ExitCode::SUCCESS, "{captured:?}");
+    assert_eq!(
+        captured.output,
+        "standard input is not valid UTF-8 text\n1 reached"
+    );
+    let provider = run("printf /w== | base64 -d | probe upper -");
+    assert_ne!(provider.exit_code, ExitCode::SUCCESS, "{provider:?}");
+    assert!(provider.output.contains("not valid UTF-8"), "{provider:?}");
+    assert_eq!(output("printf /w== | base64 -d | base64"), "/w==");
+}
+
+#[test]
+fn a_function_redirect_captures_its_body() {
+    assert_eq!(output("f() { printf ab; }; f > buf; cat buf"), "ab");
+    assert_eq!(output("f() { echo hi; }; f > buf; cat buf"), "hi\n");
+}
+
+#[test]
+fn function_stderr_redirect_keeps_exact_endings() {
+    assert_eq!(output("f() { echo hi; }; f >&2; echo after"), "hi\nafter");
+    assert_eq!(output("f() { printf hi; }; f >&2; echo after"), "hiafter");
+}
+
+#[test]
+fn a_discarded_function_does_not_retain_its_output() {
+    let outcome = run_with(
+        "f() { i=0; while [ $i -lt 200 ]; do printf abcdefgh; i=$((i+1)); done; }; f > /dev/null; echo done",
+        Limits {
+            max_value_bytes: 256,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "done");
+    assert_eq!(
+        output("f() { echo hidden; }; v=$(f > /dev/null; echo visible); echo $v"),
+        "visible"
+    );
+    assert_eq!(
+        output("f() { v=$(printf keep); }; f > /dev/null; echo \"$v\""),
+        "keep"
+    );
+    assert_eq!(
+        output(
+            "f() { v=$(printf keep); echo hidden; }; got=$(f > /dev/null; echo \"$v\"); echo \"$got\""
+        ),
+        "keep"
+    );
+    assert_eq!(
+        output(
+            "f() { printf hi | base64; printf 'line\\n' | head -1; }; got=$(f > /dev/null; echo visible); echo \"$got\""
+        ),
+        "visible"
+    );
+}
+
+#[test]
+fn a_redirected_function_charges_each_fragment_before_assembling_its_output() {
+    let outcome = run_with(
+        "f() { printf 'abcdefghijklmnopqrst'; printf 'abcdefghijklmnopqrst'; }; f > buf; echo reached",
+        Limits {
+            max_value_bytes: 30,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn a_builtin_keeps_its_drained_input_charged_while_processing() {
+    let outcome = run_with(
+        "printf '\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"' | jq .",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 95,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+    let admitted = run_with(
+        "printf '\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"' | jq .",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 160,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(admitted.exit_code, ExitCode::SUCCESS, "{admitted:?}");
+}
+
+#[test]
+fn an_unterminated_flood_is_refused_at_the_retained_budget() {
+    let outcome = run_with(
+        "big=$(printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); while true; do printf \"$big\"; done | wc -c",
+        Limits {
+            max_value_bytes: 2 * 1024 * 1024 + 1024,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
 fn head_closes_a_loop_producer_and_preserves_its_status_under_pipefail() {
     assert_eq!(output("while true; do echo y; done | head -1"), "y");
     assert_eq!(
