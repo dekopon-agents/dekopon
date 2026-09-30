@@ -328,7 +328,7 @@ fn a_negated_pipeline_inverts_its_status() {
 
 #[test]
 fn functions_participate_in_pipelines_in_both_directions() {
-    assert_eq!(output("f() { echo hi; }\nf | wc -c"), "2");
+    assert_eq!(output("f() { echo hi; }\nf | wc -c"), "3");
     assert_eq!(output("g() { cat; }\necho payload | g"), "payload");
     assert_eq!(
         output("g() { if [ -n \"$1\" ]; then cat; fi; }\necho payload | g yes"),
@@ -336,15 +336,17 @@ fn functions_participate_in_pipelines_in_both_directions() {
     );
     assert_eq!(output("f() { echo one; echo two; }\nf | grep one"), "one");
     assert_eq!(output("f() { echo one; echo two; }\nf"), "one\ntwo");
+    assert_eq!(
+        output("f() { if [ $1 -gt 0 ]; then f $(($1 - 1)); else echo done; fi; }; f 40 | cat"),
+        "done"
+    );
     assert_eq!(output("echo a\nq() { true; }\nq\necho b"), "a\nb");
 }
 
 #[test]
-fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
-    assert_eq!(
-        output("g() { cat; cat; }\necho payload | g"),
-        "payload\npayload"
-    );
+fn a_piped_stream_is_consumed_once_by_functions_and_compounds() {
+    assert_eq!(output("g() { cat; cat; }\necho payload | g"), "payload");
+    assert_eq!(output("echo payload | { cat; cat; }"), "payload");
     assert_eq!(
         output("g() { true; echo first; cat; }\necho payload | g"),
         "first\npayload"
@@ -354,10 +356,161 @@ fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
         "two"
     );
     assert_eq!(
-        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; probe object --a 1 --b 2 | g"#),
-        "1\n2"
+        output(r#"g() { cat | jq '.a'; cat; }; probe object --a 1 --b 2 | g"#),
+        "1"
     );
     assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
+}
+
+#[test]
+fn byte_stages_preserve_their_newline_flags() {
+    assert_eq!(output("echo hi | wc -c"), "3");
+    assert_eq!(output("echo -n hi | cat | wc -c"), "2");
+    let unicode = format!("{}é", "x".repeat(4095));
+    assert_eq!(output(&format!("printf '{unicode}' | cat | cat")), unicode);
+    assert_eq!(output("printf hi | cat | wc -c"), "2");
+    assert_eq!(output("{ printf a; echo -n b; } | cat | wc -c"), "2");
+    assert_eq!(output("f() { printf a; echo -n b; }; f | wc -c"), "2");
+    assert_eq!(output("false | cat | wc -c"), "0");
+    assert_eq!(
+        output("{ echo first; exit 7; } | cat; echo ${PIPESTATUS[@]}"),
+        "first\n7 0"
+    );
+}
+
+#[test]
+fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
+    for (script, expected) in [
+        ("x=outer; { x=inner; echo ok; } | cat; echo $x", "ok\nouter"),
+        ("x=o; f() { x=i; echo ok; }; f|cat; echo $x", "ok\no"),
+        ("x=outer; echo inner | { read x; }; echo $x", "inner"),
+        ("echo o > b; { echo i > b; cat b; }|cat; cat b", "i\no"),
+    ] {
+        assert_eq!(output(script), expected);
+    }
+}
+
+#[test]
+fn an_upstream_fatal_budget_error_overrides_a_final_exit() {
+    let outcome = Interpreter::new(Limits {
+        max_steps: 100,
+        ..Limits::default()
+    })
+    .run("while true; do :; done | exit 0", &Fixture::default());
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("step budget exhausted"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_snapshot_charges_its_function_table_before_copying_it() {
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 2 * 1024 * 1024,
+        ..Limits::default()
+    })
+    .run("f() { :; }; { g() { :; }; } | cat", &Fixture::default());
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+    assert_eq!(
+        output("f() { echo old; }; { f() { echo new; }; f; } | cat; f"),
+        "new\nold"
+    );
+}
+
+#[test]
+fn read_preserves_long_fragmented_lines_and_their_unterminated_remainder() {
+    let line = "x".repeat(128 * 1024);
+    let script = format!(
+        "printf '{line}\\ntail' | {{ read first; read second; printf '%s|%s' \"$first\" \"$second\"; }}"
+    );
+    let outcome = run(&script);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, format!("{line}|tail"));
+}
+
+#[test]
+fn non_reading_builtins_and_help_leave_compound_stdin_for_cat() {
+    for command in [
+        "cap --list",
+        "cat --help",
+        "jq --help",
+        "grep --help",
+        "xargs --help",
+        "base64 --help",
+        "base64 literal",
+        "echo value > buf; cat buf",
+    ] {
+        let outcome = run(&format!("printf 'a\\n' | {{ {command}; cat; }}"));
+        assert_eq!(
+            outcome.exit_code,
+            ExitCode::SUCCESS,
+            "{command}: {}",
+            outcome.output
+        );
+        assert_eq!(outcome.output.lines().last(), Some("a"), "{command}");
+    }
+}
+
+#[test]
+fn a_failed_transient_assignment_restores_without_an_uncharged_copy() {
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 2 * 1024 * 1024 + 19,
+        ..Limits::default()
+    })
+    .run("x=old; { x=inner true; } | cat", &Fixture::default());
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_refused_spawn_is_status_one_and_releases_the_pipeline() {
+    let fixture = Fixture::default();
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 1024,
+        ..Limits::default()
+    })
+    .run("echo hi | cat", &fixture);
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+    assert!(
+        outcome.output.contains("cannot spawn pipeline stage"),
+        "{}",
+        outcome.output
+    );
+    assert_eq!(outcome.capability_calls, 0);
+}
+
+#[test]
+fn a_consumer_close_joins_a_flooding_provider_without_status_141() {
+    let payload = "x".repeat(128 * 1024);
+    let outcome = run(&format!(
+        "set -o pipefail; probe upper --text {payload} | true; echo ${{PIPESTATUS[@]}}"
+    ));
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "0 0");
+    assert_eq!(outcome.capability_calls, 1);
+}
+
+#[test]
+fn joined_stages_refund_their_stack_reservations() {
+    let fixture = Fixture::default();
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 2 * 1024 * 1024 + 4096,
+        ..Limits::default()
+    })
+    .run("echo a | cat; echo b | cat", &fixture);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "a\nb");
 }
 
 #[test]
@@ -998,7 +1151,8 @@ fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
     let outcome = run("echo one | while read line; do echo $line; done");
     assert_eq!(outcome.output, "one");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
-    assert_eq!(code("echo '' | read x"), 1, "no lines is a failing read");
+    assert_eq!(code("printf '' | read x"), 1, "no bytes is a failing read");
+    assert_eq!(code("echo '' | read x"), 0, "a newline is an empty line");
 }
 
 #[test]
@@ -1113,7 +1267,7 @@ fn pipestatus_reports_every_stage() {
     assert!(output("nosuchcmd | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
     assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
     assert_eq!(
-        output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
+        output("echo -n a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
         "1\n3"
     );
 }
@@ -1796,9 +1950,9 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     assert_eq!(
         *fixture.calls.lock().expect("fixture calls"),
         vec![
-            ("cli-probe.upper".to_owned(), json!({"text": "hello"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "hello\n"})),
             ("fixture.object".to_owned(), json!({"a": 1})),
-            ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}\n"})),
             ("cli-probe.upper".to_owned(), json!({"text": "flag"})),
         ]
     );

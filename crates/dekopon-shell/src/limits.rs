@@ -48,7 +48,7 @@ pub enum LimitExceeded {
     Cancelled,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Budget {
     limits: Limits,
     tree: TreeContext,

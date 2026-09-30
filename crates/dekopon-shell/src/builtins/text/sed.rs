@@ -11,6 +11,10 @@ const HELP: &str = "-e -E";
 pub(crate) struct Sed;
 
 impl Builtin for Sed {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "sed"
     }

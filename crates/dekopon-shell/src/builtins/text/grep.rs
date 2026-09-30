@@ -13,6 +13,10 @@ const HELP: &str = "-v -i -c -n -E";
 pub(crate) struct Grep;
 
 impl Builtin for Grep {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "grep"
     }

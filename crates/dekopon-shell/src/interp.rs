@@ -5,7 +5,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    rc::Rc,
+    sync::Arc,
 };
 
 use serde_json::Value;
@@ -32,7 +32,10 @@ use crate::{
 
 use telemetry::CommandKind;
 
+mod pipe;
 pub(crate) mod telemetry;
+
+use pipe::{Pipe, PipeReader, PipeWriter, ReadOutcome, STACK_BYTES, WriteOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
@@ -46,6 +49,13 @@ enum Flow {
 enum Executed {
     Result(CommandResult),
     Flow(Flow),
+}
+
+struct StageCompletion {
+    result: Result<ExitCode, FatalError>,
+    diagnostics: Vec<String>,
+    counters: telemetry::ScriptCounters,
+    inherited: Option<StdinSource>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -63,37 +73,91 @@ enum Sink {
     Buffer { name: String, append: bool },
 }
 
-#[derive(Debug, Default)]
-struct StdinSource {
-    value: Option<Rc<Value>>,
-    /// The read command consumes piped input one line at a time through a cursor, while other
-    /// commands see the whole value unconsumed each time, which is what lets a while-read loop
-    /// terminate instead of repeating the first line forever.
-    lines: Option<Vec<String>>,
-    position: usize,
+enum StdinSource {
+    Pipe {
+        reader: PipeReader,
+        pending: Vec<u8>,
+    },
+    Text {
+        bytes: Vec<u8>,
+        position: usize,
+    },
 }
 
 impl StdinSource {
-    fn new(value: Option<Rc<Value>>) -> Self {
-        Self {
-            value,
-            lines: None,
+    fn new(value: Option<Arc<Value>>) -> Self {
+        Self::Text {
+            bytes: value
+                .as_deref()
+                .map(value::to_text)
+                .unwrap_or_default()
+                .into_bytes(),
             position: 0,
         }
     }
 
-    fn next_line(&mut self) -> Option<String> {
-        let lines = self.lines.get_or_insert_with(|| {
-            self.value
-                .as_deref()
-                .map(value::to_lines)
-                .unwrap_or_default()
-        });
-        let line = lines.get(self.position).cloned();
-        if line.is_some() {
-            self.position += 1;
+    fn next_line(
+        &mut self,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
+    ) -> Result<Option<String>, CommandFailure> {
+        let mut scanned = 0;
+        let bytes = match self {
+            Self::Text { bytes, position } => {
+                if *position == bytes.len() {
+                    return Ok(None);
+                }
+                let end = bytes[*position..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| *position + offset);
+                let line = bytes[*position..end].to_vec();
+                *position = (end + 1).min(bytes.len());
+                line
+            }
+            Self::Pipe { reader, pending } => loop {
+                if let Some(end) = pending[scanned..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map(|offset| scanned + offset)
+                {
+                    let line = pending.drain(..=end).collect::<Vec<_>>();
+                    break line[..line.len() - 1].to_vec();
+                }
+                scanned = pending.len();
+                match reader.read(budget, invoker)? {
+                    ReadOutcome::Bytes(chunk) => pending.extend_from_slice(chunk.bytes()),
+                    ReadOutcome::End if pending.is_empty() => return Ok(None),
+                    ReadOutcome::End => break std::mem::take(pending),
+                }
+            },
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| CommandFailure::failed(format!("read: input is not UTF-8: {error}")))
+    }
+
+    fn drain(
+        &mut self,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
+    ) -> Result<Vec<u8>, LimitExceeded> {
+        match self {
+            Self::Text { bytes, position } => {
+                let remaining = bytes[*position..].to_vec();
+                *position = bytes.len();
+                Ok(remaining)
+            }
+            Self::Pipe { reader, pending } => {
+                let mut bytes = std::mem::take(pending);
+                loop {
+                    match reader.read(budget, invoker)? {
+                        ReadOutcome::Bytes(chunk) => bytes.extend_from_slice(chunk.bytes()),
+                        ReadOutcome::End => return Ok(bytes),
+                    }
+                }
+            }
         }
-        line
     }
 }
 
@@ -137,18 +201,18 @@ impl StderrCapture {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
-    local_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
-    _positional_charges: Vec<crate::RetainedBytes>,
+    local_charges: BTreeMap<String, Vec<Arc<crate::RetainedBytes>>>,
+    _positional_charges: Vec<Arc<crate::RetainedBytes>>,
 }
 
 struct SavedVariable {
     name: String,
     value: Option<Value>,
-    charge: Option<Vec<crate::RetainedBytes>>,
+    charge: Option<Vec<Arc<crate::RetainedBytes>>>,
 }
 
 pub(crate) fn run(
@@ -192,16 +256,19 @@ pub(crate) fn run_with_tree(
         budget: Budget::start_tree(limits, tree.clone()),
         limits,
         output: OutputBuffer::new(&limits),
-        globals: prev
-            .map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
-            .into_iter()
-            .collect(),
+        globals: Arc::new(
+            prev.map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
+                .into_iter()
+                .collect(),
+        ),
         global_charges: BTreeMap::new(),
         buffer_charges: BTreeMap::new(),
         frames: Vec::new(),
-        functions: BTreeMap::new(),
+        functions: Arc::new(BTreeMap::new()),
         function_names: BTreeSet::new(),
-        buffers: BTreeMap::new(),
+        buffers: Arc::new(BTreeMap::new()),
+        cow_charges: Vec::new(),
+        stage_output: None,
         captures: Vec::new(),
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
@@ -251,18 +318,17 @@ struct Evaluator<'a> {
     budget: Budget,
     limits: Limits,
     output: OutputBuffer,
-    globals: BTreeMap<String, Value>,
-    global_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
-    buffer_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
+    globals: Arc<BTreeMap<String, Value>>,
+    global_charges: BTreeMap<String, Vec<Arc<crate::RetainedBytes>>>,
+    buffer_charges: BTreeMap<String, Vec<Arc<crate::RetainedBytes>>>,
     frames: Vec<Frame>,
-    functions: BTreeMap<String, Rc<Program>>,
+    functions: Arc<BTreeMap<String, Arc<Program>>>,
     function_names: BTreeSet<String>,
-    buffers: BTreeMap<String, Value>,
+    buffers: Arc<BTreeMap<String, Value>>,
+    cow_charges: Vec<Arc<crate::RetainedBytes>>,
+    stage_output: Option<PipeWriter>,
     captures: Vec<Vec<CommandResult>>,
     expansion_charges: Vec<crate::RetainedBytes>,
-    /// Unlike a function call, a pipeline stage receiving piped input does not open a new variable
-    /// scope, so piping into a while-read loop can still leave a variable set afterward, unlike a
-    /// real shell subshell.
     stdin: Vec<StdinSource>,
     options: ShellOptions,
     testing_status: u32,
@@ -273,6 +339,207 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    fn snapshot(&self) -> Self {
+        Self {
+            invoker: self.invoker,
+            budget: self.budget.clone(),
+            limits: self.limits,
+            output: OutputBuffer::new(&self.limits),
+            globals: Arc::clone(&self.globals),
+            global_charges: self.global_charges.clone(),
+            buffer_charges: self.buffer_charges.clone(),
+            frames: self.frames.clone(),
+            functions: Arc::clone(&self.functions),
+            function_names: self.function_names.clone(),
+            buffers: Arc::clone(&self.buffers),
+            cow_charges: self.cow_charges.clone(),
+            stage_output: None,
+            captures: Vec::new(),
+            expansion_charges: Vec::new(),
+            stdin: Vec::new(),
+            options: self.options,
+            testing_status: self.testing_status,
+            stderr_capture: vec![StderrCapture::new(&self.limits)],
+            counters: telemetry::ScriptCounters::default(),
+            last_status: self.last_status,
+            last_substitution_status: self.last_substitution_status,
+        }
+    }
+
+    fn prepare_globals(&mut self) -> Result<(), LimitExceeded> {
+        if Arc::strong_count(&self.globals) > 1 {
+            let bytes = self.globals.values().map(value_bytes).sum();
+            self.cow_charges
+                .push(Arc::new(self.budget.charge_value_bytes(bytes)?));
+        }
+        Ok(())
+    }
+
+    fn prepare_functions(&mut self) -> Result<(), LimitExceeded> {
+        if Arc::strong_count(&self.functions) > 1 {
+            let bytes = self
+                .functions
+                .keys()
+                .map(|name| (name.len() + std::mem::size_of::<(String, Arc<Program>)>()) as u64)
+                .sum();
+            self.cow_charges
+                .push(Arc::new(self.budget.charge_value_bytes(bytes)?));
+        }
+        Ok(())
+    }
+
+    fn prepare_buffers(&mut self) -> Result<(), LimitExceeded> {
+        if Arc::strong_count(&self.buffers) > 1 {
+            let bytes = self.buffers.values().map(value_bytes).sum();
+            self.cow_charges
+                .push(Arc::new(self.budget.charge_value_bytes(bytes)?));
+        }
+        Ok(())
+    }
+
+    fn execute_stage(
+        &mut self,
+        command: &Command,
+        reader: Option<PipeReader>,
+        writer: Option<PipeWriter>,
+        from_pipe: bool,
+    ) -> Result<Executed, FatalError> {
+        let has_reader = reader.is_some();
+        if let Some(reader) = reader {
+            self.stdin.push(StdinSource::Pipe {
+                reader,
+                pending: Vec::new(),
+            });
+        }
+        let parent_output = self.stage_output.take();
+        self.stage_output = writer;
+        let piped = self.stage_output.is_some();
+        let executed = self.tested(piped, |evaluator| {
+            evaluator.execute_command(command, None, piped, from_pipe)
+        });
+        if has_reader {
+            self.stdin.pop();
+        }
+        let mut writer = self.stage_output.take();
+        self.stage_output = parent_output;
+        let executed = executed?;
+        if let (Some(writer), Executed::Result(result)) = (&mut writer, &executed)
+            && !result.value.is_null()
+        {
+            let text = display(&result.value);
+            match writer.write(text.as_bytes(), &mut self.budget, self.invoker)? {
+                WriteOutcome::Accepted if !result.suppress_newline => {
+                    match writer.write(b"\n", &mut self.budget, self.invoker)? {
+                        WriteOutcome::Accepted | WriteOutcome::ReaderGone => {}
+                    }
+                }
+                WriteOutcome::Accepted | WriteOutcome::ReaderGone => {}
+            }
+        }
+        Ok(executed)
+    }
+
+    fn byte_cat(
+        &mut self,
+        input: Option<Arc<Value>>,
+        capture_output: bool,
+    ) -> Result<Executed, FatalError> {
+        let inherited = input.is_none();
+        let mut source = match input {
+            Some(value) => StdinSource::new(Some(value)),
+            None => match self.stdin.pop() {
+                Some(source) => source,
+                None => return Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS))),
+            },
+        };
+        let mut collected = Vec::new();
+        let mut model_pending = Vec::new();
+        let stream = self.captures.is_empty() && (self.stage_output.is_some() || !capture_output);
+        let result = (|| {
+            loop {
+                let bytes = match &mut source {
+                    StdinSource::Text { bytes, position } => {
+                        if *position == bytes.len() {
+                            break;
+                        }
+                        let end = (*position + pipe::CHUNK_BYTES).min(bytes.len());
+                        let chunk = bytes[*position..end].to_vec();
+                        *position = end;
+                        chunk
+                    }
+                    StdinSource::Pipe { reader, pending } => {
+                        if !pending.is_empty() {
+                            std::mem::take(pending)
+                        } else {
+                            match reader.read(&mut self.budget, self.invoker)? {
+                                ReadOutcome::Bytes(chunk) => chunk.bytes().to_vec(),
+                                ReadOutcome::End => break,
+                            }
+                        }
+                    }
+                };
+                self.budget.charge_step_with(self.invoker)?;
+                if stream {
+                    if let Some(writer) = &mut self.stage_output {
+                        match writer.write(&bytes, &mut self.budget, self.invoker)? {
+                            WriteOutcome::Accepted => {}
+                            WriteOutcome::ReaderGone => break,
+                        }
+                    } else {
+                        model_pending.extend_from_slice(&bytes);
+                        let mut start = 0;
+                        loop {
+                            match std::str::from_utf8(&model_pending[start..]) {
+                                Ok(text) => {
+                                    self.output.push_fragment(text);
+                                    start = model_pending.len();
+                                    break;
+                                }
+                                Err(error) => {
+                                    let end = start + error.valid_up_to();
+                                    self.output.push_fragment(&String::from_utf8_lossy(
+                                        &model_pending[start..end],
+                                    ));
+                                    if let Some(length) = error.error_len() {
+                                        self.output.push_fragment("\u{fffd}");
+                                        start = end + length;
+                                    } else {
+                                        start = end;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        model_pending.drain(..start);
+                    }
+                } else {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            if stream {
+                self.output
+                    .push_fragment(&String::from_utf8_lossy(&model_pending));
+                Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS)))
+            } else {
+                match String::from_utf8(collected) {
+                    Ok(text) => Ok(Executed::Result(
+                        CommandResult::value(Value::String(text)).without_newline(),
+                    )),
+                    Err(error) => {
+                        self.write_line(&format!(
+                            "dekopon-shell: cat: capture is not UTF-8: {error}"
+                        ));
+                        Ok(Executed::Result(CommandResult::status(ExitCode::FAILURE)))
+                    }
+                }
+            }
+        })();
+        if inherited {
+            self.stdin.push(source);
+        }
+        result
+    }
+
     fn report_fatal(&mut self, fatal: &FatalError) -> ExitCode {
         let message = match fatal {
             FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
@@ -380,19 +647,24 @@ impl Evaluator<'_> {
     }
 
     fn assign(&mut self, name: &str, mut result: CommandResult) -> Result<(), LimitExceeded> {
+        self.prepare_globals()?;
         let (values, charges) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(name))
-            .map_or((&mut self.globals, &mut self.global_charges), |frame| {
-                (&mut frame.locals, &mut frame.local_charges)
-            });
+            .map_or(
+                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
+                |frame| (&mut frame.locals, &mut frame.local_charges),
+            );
         values.remove(name);
         charges.remove(name);
         retain_value(&self.budget, &result.value, &mut result.retained)?;
         values.insert(name.to_owned(), result.value);
-        charges.insert(name.to_owned(), result.retained);
+        charges.insert(
+            name.to_owned(),
+            result.retained.into_iter().map(Arc::new).collect(),
+        );
         Ok(())
     }
 
@@ -414,20 +686,36 @@ impl Evaluator<'_> {
         }
     }
 
-    fn restore(&mut self, saved: SavedVariable) {
+    fn restore(&mut self, saved: SavedVariable) -> Result<(), LimitExceeded> {
         let SavedVariable {
             name,
             value,
             charge,
         } = saved;
-        let (values, charges) = self
+        let local = self
+            .frames
+            .iter()
+            .any(|frame| frame.locals.contains_key(&name));
+        if !local && self.globals.get(&name) == value.as_ref() {
+            self.global_charges.remove(&name);
+            if let Some(charge) = charge {
+                self.global_charges.insert(name, charge);
+            }
+            return Ok(());
+        }
+        if !local {
+            self.prepare_globals()?;
+        }
+        let (values, charges) = if let Some(frame) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(&name))
-            .map_or((&mut self.globals, &mut self.global_charges), |frame| {
-                (&mut frame.locals, &mut frame.local_charges)
-            });
+        {
+            (&mut frame.locals, &mut frame.local_charges)
+        } else {
+            (Arc::make_mut(&mut self.globals), &mut self.global_charges)
+        };
         values.remove(&name);
         charges.remove(&name);
         if let Some(value) = value {
@@ -436,6 +724,7 @@ impl Evaluator<'_> {
         if let Some(charge) = charge {
             charges.insert(name, charge);
         }
+        Ok(())
     }
 
     fn declare_local(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
@@ -444,7 +733,9 @@ impl Evaluator<'_> {
             frame.local_charges.remove(name);
             let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
             frame.locals.insert(name.to_owned(), value);
-            frame.local_charges.insert(name.to_owned(), vec![charge]);
+            frame
+                .local_charges
+                .insert(name.to_owned(), vec![Arc::new(charge)]);
             return Ok(());
         }
         self.assign(name, CommandResult::value(value))
@@ -495,9 +786,10 @@ impl Evaluator<'_> {
                 Ok(Flow::Normal)
             }
             Statement::Function(definition) => {
+                self.prepare_functions()?;
                 self.function_names.insert(definition.name.clone());
-                self.functions
-                    .insert(definition.name.clone(), Rc::new(definition.body.clone()));
+                Arc::make_mut(&mut self.functions)
+                    .insert(definition.name.clone(), Arc::new(definition.body.clone()));
                 self.last_status = ExitCode::SUCCESS;
                 Ok(Flow::Normal)
             }
@@ -701,8 +993,8 @@ impl Evaluator<'_> {
     fn run_read(
         &mut self,
         arguments: &[String],
-        input: Option<Rc<Value>>,
-        from_pipe: bool,
+        input: Option<Arc<Value>>,
+        _from_pipe: bool,
     ) -> Result<CommandResult, CommandFailure> {
         let mut names = arguments;
         if names.first().is_some_and(|first| first == "-r") {
@@ -726,10 +1018,12 @@ impl Evaluator<'_> {
             }
         }
 
-        let line = if from_pipe {
-            StdinSource::new(input).next_line()
+        let line = if input.is_some() {
+            StdinSource::new(input).next_line(&mut self.budget, self.invoker)?
+        } else if let Some(source) = self.stdin.last_mut() {
+            source.next_line(&mut self.budget, self.invoker)?
         } else {
-            self.stdin.last_mut().and_then(StdinSource::next_line)
+            None
         };
         let Some(line) = line else {
             return Ok(CommandResult::status(ExitCode::FAILURE));
@@ -814,8 +1108,9 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) {
-        self.globals.insert(
+    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) -> Result<(), LimitExceeded> {
+        self.prepare_globals()?;
+        Arc::make_mut(&mut self.globals).insert(
             "PIPESTATUS".to_owned(),
             Value::Array(
                 stages
@@ -824,6 +1119,7 @@ impl Evaluator<'_> {
                     .collect(),
             ),
         );
+        Ok(())
     }
 
     fn tested<T>(
@@ -856,34 +1152,133 @@ impl Evaluator<'_> {
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step_with(self.invoker)?;
-        let mut input: Option<Rc<Value>> =
-            self.stdin.last().and_then(|source| source.value.clone());
-        let mut last = CommandResult::status(ExitCode::SUCCESS);
-        let mut input_charges = Vec::new();
         let commands = pipeline.commands.len();
-        let mut stages = Vec::with_capacity(commands);
-
-        for (index, command) in pipeline.commands.iter().enumerate() {
-            let piped = index + 1 < commands;
-            let from_pipe = index > 0;
-            match self.tested(pipeline.negated || piped, |evaluator| {
-                evaluator.execute_command(command, input.take(), piped, from_pipe)
-            })? {
-                Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
-                Executed::Result(result) => {
-                    input_charges.clear();
-                    stages.push(result.status);
-                    if piped {
-                        last = CommandResult::status(result.status);
-                        input = Some(Rc::new(result.value));
-                        input_charges = result.retained;
-                    } else {
-                        last = result;
+        let mut stages = vec![ExitCode::SUCCESS; commands];
+        let mut final_result = Ok(Executed::Result(CommandResult::status(ExitCode::FAILURE)));
+        let mut stage_fatal = None;
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            let mut reader = None;
+            for (index, command) in pipeline.commands.iter().enumerate() {
+                if index + 1 == commands {
+                    final_result = self.tested(pipeline.negated, |evaluator| {
+                        evaluator.execute_stage(command, reader.take(), None, index > 0)
+                    });
+                    break;
+                }
+                let reservation = match self.budget.charge_value_bytes(STACK_BYTES as u64) {
+                    Ok(reservation) => reservation,
+                    Err(limit) => {
+                        self.write_line(&format!(
+                            "dekopon-shell: cannot spawn pipeline stage: {limit:?}"
+                        ));
+                        stages[index] = ExitCode::FAILURE;
+                        break;
+                    }
+                };
+                let Pipe {
+                    reader: next_reader,
+                    writer,
+                } = Pipe::new();
+                let input = reader.take();
+                let mut snapshot = self.snapshot();
+                if index == 0
+                    && let Some(source) = self.stdin.pop()
+                {
+                    snapshot.stdin.push(source);
+                }
+                let parent = tracing::Span::current();
+                let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+                let spawn = std::thread::Builder::new()
+                    .name(format!("shell-stage-{index}"))
+                    .stack_size(STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        tracing::dispatcher::with_default(&dispatcher, || {
+                            let _entered = parent.enter();
+                            let result = snapshot
+                                .execute_stage(command, input, Some(writer), index > 0)
+                                .map(|executed| match executed {
+                                    Executed::Result(result) => result.status,
+                                    Executed::Flow(flow) => flow_status(flow),
+                                });
+                            let diagnostics = snapshot
+                                .stderr_capture
+                                .pop()
+                                .map(StderrCapture::finish)
+                                .unwrap_or_default();
+                            StageCompletion {
+                                result,
+                                diagnostics,
+                                counters: snapshot.counters,
+                                inherited: snapshot.stdin.pop(),
+                            }
+                        })
+                    });
+                match spawn {
+                    Ok(thread) => {
+                        threads.push((index, thread, reservation));
+                        reader = Some(next_reader);
+                    }
+                    Err(error) => {
+                        self.write_line(&format!(
+                            "dekopon-shell: cannot spawn pipeline stage: {error}"
+                        ));
+                        stages[index] = ExitCode::FAILURE;
+                        drop(next_reader);
+                        break;
                     }
                 }
             }
+            drop(reader);
+            for (index, thread, reservation) in threads {
+                match thread.join() {
+                    Ok(StageCompletion {
+                        result,
+                        diagnostics,
+                        counters,
+                        inherited,
+                    }) => {
+                        if let Some(source) = inherited {
+                            self.stdin.push(source);
+                        }
+                        for line in diagnostics {
+                            self.write_line(&line);
+                        }
+                        self.counters.merge(counters);
+                        match result {
+                            Ok(status) => stages[index] = status,
+                            Err(fatal) => {
+                                stages[index] = telemetry::fatal_exit_code(&fatal);
+                                stage_fatal.get_or_insert(fatal);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(panic = ?error, "pipeline stage panicked");
+                        self.write_line("dekopon-shell: pipeline stage panicked");
+                        stages[index] = ExitCode::FAILURE;
+                    }
+                }
+                drop(reservation);
+            }
+        });
+        if let Some(fatal) = stage_fatal {
+            return Err(fatal);
         }
-
+        let last = match final_result {
+            Ok(Executed::Result(result)) => result,
+            Ok(Executed::Flow(flow)) => {
+                if let Some(status) = stages.last_mut() {
+                    *status = flow_status(flow);
+                }
+                self.record_pipe_statuses(stages)?;
+                return Ok((flow_status(flow), Some(flow)));
+            }
+            Err(fatal) => return Err(fatal),
+        };
+        if let Some(status) = stages.last_mut() {
+            *status = last.status;
+        }
         let mut status = last.status;
         if self.options.pipefail
             && let Some(failed) = stages
@@ -893,7 +1288,7 @@ impl Evaluator<'_> {
         {
             status = *failed;
         }
-        self.record_pipe_statuses(stages);
+        self.record_pipe_statuses(stages)?;
         if pipeline.negated {
             status = invert(status);
         }
@@ -904,7 +1299,7 @@ impl Evaluator<'_> {
     fn execute_command(
         &mut self,
         command: &Command,
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
         from_pipe: bool,
     ) -> Result<Executed, FatalError> {
@@ -930,7 +1325,7 @@ impl Evaluator<'_> {
         &mut self,
         statement: &Statement,
         redirects: &[Redirect],
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let (stdout, stderr) = match self.resolve_redirects(redirects) {
@@ -946,7 +1341,10 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        self.stdin.push(StdinSource::new(input));
+        let has_input = input.is_some();
+        if has_input {
+            self.stdin.push(StdinSource::new(input));
+        }
         if collect {
             self.captures.push(Vec::new());
         }
@@ -958,7 +1356,9 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
-        self.stdin.pop();
+        if has_input {
+            self.stdin.pop();
+        }
         let mut diagnostics = capturing
             .then(|| self.stderr_capture.pop())
             .flatten()
@@ -967,13 +1367,19 @@ impl Evaluator<'_> {
 
         let flow = flow?;
         let retained = capture_charges(&mut captured);
-        let value = if collect {
+        let byte_output = capture_output && self.stage_output.is_some() && stdout == Sink::Value;
+        let value = if byte_output {
+            render_stage_capture(captured)
+        } else if collect {
             reduce_captured(captured)
         } else {
             Value::Null
         };
         let status = match flow {
             Flow::Normal => self.last_status,
+            Flow::Break(_) | Flow::Continue(_) | Flow::Return(_) | Flow::Exit(_) if byte_output => {
+                flow_status(flow)
+            }
             _ => {
                 self.route_diagnostics(diagnostics, &stderr)?;
                 return Ok(Executed::Flow(flow));
@@ -983,14 +1389,14 @@ impl Evaluator<'_> {
         let mut result = CommandResult {
             value,
             status,
-            suppress_newline: false,
+            suppress_newline: byte_output,
             retained,
         };
         if stderr == Sink::Value {
             result.value = merge_diagnostics(result.value, diagnostics);
             diagnostics = Vec::new();
         }
-        self.open_buffers(&[&stdout, &stderr]);
+        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1014,7 +1420,7 @@ impl Evaluator<'_> {
     fn execute_simple_command(
         &mut self,
         command: &SimpleCommand,
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
         from_pipe: bool,
     ) -> Result<Executed, FatalError> {
@@ -1045,7 +1451,7 @@ impl Evaluator<'_> {
             let value = match self.assignment_value(&assignment.value) {
                 Ok(value) => value,
                 Err(failure) => {
-                    self.restore_all(restore);
+                    self.restore_all(restore)?;
                     let status = self.absorb(failure)?;
                     return Ok(Executed::Result(CommandResult::status(status)));
                 }
@@ -1055,7 +1461,7 @@ impl Evaluator<'_> {
                 restore.push(self.save_variable(&assignment.name));
             }
             if let Err(limit) = self.assign(&assignment.name, value) {
-                self.restore_all(restore);
+                self.restore_all(restore)?;
                 return Err(limit.into());
             }
         }
@@ -1078,13 +1484,13 @@ impl Evaluator<'_> {
                     let value = Value::String(text);
                     here_doc_charges = self.expansion_charges.split_off(start);
                     if let Err(limit) = retain_value(&self.budget, &value, &mut here_doc_charges) {
-                        self.restore_all(restore);
+                        self.restore_all(restore)?;
                         return Err(limit.into());
                     }
-                    Some(Rc::new(value))
+                    Some(Arc::new(value))
                 }
                 Err(failure) => {
-                    self.restore_all(restore);
+                    self.restore_all(restore)?;
                     let status = self.absorb(failure)?;
                     return Ok(Executed::Result(CommandResult::status(status)));
                 }
@@ -1094,7 +1500,7 @@ impl Evaluator<'_> {
         let (stdout, stderr) = match self.resolve_redirects(&command.redirects) {
             Ok(sinks) => sinks,
             Err(failure) => {
-                self.restore_all(restore);
+                self.restore_all(restore)?;
                 let status = self.absorb(failure)?;
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
@@ -1104,7 +1510,19 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        let executed = self.run_argv(&argv, input, capture_output, from_pipe, literal_help);
+        let redirected_output = (stdout != Sink::Value)
+            .then(|| self.stage_output.take())
+            .flatten();
+        let executed = self.run_argv(
+            &argv,
+            input,
+            capture_output || stdout != Sink::Value,
+            from_pipe,
+            literal_help,
+        );
+        if redirected_output.is_some() {
+            self.stage_output = redirected_output;
+        }
         // The stderr capture is removed before the fallible step that follows can return early, so
         // a fatal error can never leave a capture installed that silently swallows the rest of the
         // script's diagnostics.
@@ -1113,7 +1531,7 @@ impl Evaluator<'_> {
             .flatten()
             .map(StderrCapture::finish)
             .unwrap_or_default();
-        self.restore_all(restore);
+        self.restore_all(restore)?;
         drop(here_doc_charges);
         let executed = executed?;
         let Executed::Result(mut result) = executed else {
@@ -1129,7 +1547,7 @@ impl Evaluator<'_> {
         // A redirect truncates its target once, when it is set up, not on every write, so combining
         // a value redirect with a merged stderr redirect cannot let one silently overwrite the
         // other depending on order.
-        self.open_buffers(&[&stdout, &stderr]);
+        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1150,17 +1568,19 @@ impl Evaluator<'_> {
         }
     }
 
-    fn open_buffers(&mut self, sinks: &[&Sink]) {
+    fn open_buffers(&mut self, sinks: &[&Sink]) -> Result<(), LimitExceeded> {
         for sink in sinks {
             if let Sink::Buffer {
                 name,
                 append: false,
             } = sink
             {
-                self.buffers.insert(name.clone(), Value::Null);
+                self.prepare_buffers()?;
+                Arc::make_mut(&mut self.buffers).insert(name.clone(), Value::Null);
                 self.buffer_charges.remove(name);
             }
         }
+        Ok(())
     }
 
     fn resolve_redirects(
@@ -1228,10 +1648,11 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn restore_all(&mut self, restore: Vec<SavedVariable>) {
+    fn restore_all(&mut self, restore: Vec<SavedVariable>) -> Result<(), LimitExceeded> {
         for saved in restore.into_iter().rev() {
-            self.restore(saved);
+            self.restore(saved)?;
         }
+        Ok(())
     }
 
     fn append_buffer(
@@ -1246,18 +1667,19 @@ impl Evaluator<'_> {
         self.buffer_charges
             .entry(name.to_owned())
             .or_default()
-            .extend(result.retained);
+            .extend(result.retained.into_iter().map(Arc::new));
+        self.prepare_buffers()?;
         let value = result.value;
-        match self.buffers.remove(name) {
+        match Arc::make_mut(&mut self.buffers).remove(name) {
             None | Some(Value::Null) => {
-                self.buffers.insert(name.to_owned(), value);
+                Arc::make_mut(&mut self.buffers).insert(name.to_owned(), value);
             }
             Some(Value::Array(mut existing)) => {
                 existing.push(value);
-                self.buffers.insert(name.to_owned(), Value::Array(existing));
+                Arc::make_mut(&mut self.buffers).insert(name.to_owned(), Value::Array(existing));
             }
             Some(existing) => {
-                self.buffers
+                Arc::make_mut(&mut self.buffers)
                     .insert(name.to_owned(), Value::Array(vec![existing, value]));
             }
         }
@@ -1267,7 +1689,7 @@ impl Evaluator<'_> {
     fn run_argv(
         &mut self,
         argv: &[String],
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
         from_pipe: bool,
         literal_help: bool,
@@ -1280,6 +1702,46 @@ impl Evaluator<'_> {
         } else {
             let resolution = dispatch::resolve(command, &self.function_names, self.invoker);
             (CommandKind::of(&resolution), Some(resolution))
+        };
+        let reads_stdin = match &resolution {
+            Some(Resolution::Builtin(BuiltinKind::Simple(builtin))) => {
+                !literal_help && builtin.reads_stdin(arguments)
+            }
+            Some(Resolution::Builtin(BuiltinKind::Xargs)) => !literal_help,
+            Some(Resolution::ProviderCommand) => from_pipe,
+            Some(Resolution::Function | Resolution::NotFound | Resolution::Rejected(_)) | None => {
+                false
+            }
+        };
+        let input = if input.is_none() && reads_stdin && !(command == "cat" && arguments.is_empty())
+        {
+            if let Some(source) = self.stdin.last_mut() {
+                let bytes = source.drain(&mut self.budget, self.invoker)?;
+                match String::from_utf8(bytes) {
+                    Ok(text)
+                        if text.is_empty()
+                            && !matches!(resolution, Some(Resolution::ProviderCommand)) =>
+                    {
+                        None
+                    }
+                    Ok(mut text) => {
+                        if command == "jq" && text.ends_with('\n') {
+                            text.pop();
+                        }
+                        Some(Arc::new(Value::String(text)))
+                    }
+                    Err(error) => {
+                        self.write_line(&format!(
+                            "dekopon-shell: {command}: input is not UTF-8: {error}"
+                        ));
+                        return Ok(Executed::Result(CommandResult::status(ExitCode::FAILURE)));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            input
         };
         self.counters.charge(kind);
         let span = telemetry::command_span(command, kind, arguments.len());
@@ -1336,7 +1798,7 @@ impl Evaluator<'_> {
         command: &str,
         arguments: &[String],
         resolution: Option<Resolution>,
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
         from_pipe: bool,
         literal_help: bool,
@@ -1359,16 +1821,27 @@ impl Evaluator<'_> {
                         builtin.help(),
                     )));
                 }
+                if builtin.name() == "cat" && arguments.is_empty() {
+                    return self.byte_cat(input, capture_output);
+                }
                 let outcome = {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
                         budget: &mut self.budget,
-                        buffers: &mut self.buffers,
+                        buffers: &self.buffers,
                     };
                     builtin.run(&mut context, arguments, own(input))
                 };
                 match outcome {
-                    Ok(result) => Ok(Executed::Result(result)),
+                    Ok(mut result) => {
+                        if self.stage_output.is_some()
+                            && !matches!(builtin.name(), "jq" | "cap")
+                            && !result.value.is_null()
+                        {
+                            result.value = Value::String(value::to_text(&result.value));
+                        }
+                        Ok(Executed::Result(result))
+                    }
                     Err(failure) => {
                         let status = self.absorb(failure)?;
                         Ok(Executed::Result(CommandResult::status(status)))
@@ -1442,7 +1915,7 @@ impl Evaluator<'_> {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
                         budget: &mut self.budget,
-                        buffers: &mut self.buffers,
+                        buffers: &self.buffers,
                     };
                     context.invoke_proposal(proposal)
                 };
@@ -1465,7 +1938,7 @@ impl Evaluator<'_> {
         &mut self,
         command: &str,
         arguments: &[String],
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         from_pipe: bool,
     ) -> Result<Option<Executed>, FatalError> {
         let executed = match command {
@@ -1564,7 +2037,8 @@ impl Evaluator<'_> {
             }
             "unset" => {
                 for name in arguments {
-                    self.globals.remove(name);
+                    self.prepare_globals()?;
+                    Arc::make_mut(&mut self.globals).remove(name);
                     self.global_charges.remove(name);
                     for frame in &mut self.frames {
                         frame.locals.remove(name);
@@ -1583,7 +2057,7 @@ impl Evaluator<'_> {
         &mut self,
         name: &str,
         arguments: &[String],
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(body) = self.functions.get(name).cloned() else {
@@ -1599,7 +2073,11 @@ impl Evaluator<'_> {
             .collect::<Vec<_>>();
         let positional_charges = positional
             .iter()
-            .map(|argument| self.budget.charge_value_bytes(value_bytes(argument)))
+            .map(|argument| {
+                self.budget
+                    .charge_value_bytes(value_bytes(argument))
+                    .map(Arc::new)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.frames.push(Frame {
             locals: BTreeMap::new(),
@@ -1607,7 +2085,10 @@ impl Evaluator<'_> {
             local_charges: BTreeMap::new(),
             _positional_charges: positional_charges,
         });
-        self.stdin.push(StdinSource::new(input));
+        let has_input = input.is_some();
+        if has_input {
+            self.stdin.push(StdinSource::new(input));
+        }
         if capture_output {
             self.captures.push(Vec::new());
         }
@@ -1618,12 +2099,17 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
-        self.stdin.pop();
+        if has_input {
+            self.stdin.pop();
+        }
         self.frames.pop();
         self.budget.leave_call();
 
         let retained = capture_charges(&mut captured);
-        let value = if capture_output {
+        let byte_output = capture_output && self.stage_output.is_some();
+        let value = if byte_output {
+            render_stage_capture(captured)
+        } else if capture_output {
             reduce_captured(captured)
         } else {
             Value::Null
@@ -1632,14 +2118,20 @@ impl Evaluator<'_> {
             Flow::Return(status) => Executed::Result(CommandResult {
                 value,
                 status,
-                suppress_newline: false,
+                suppress_newline: byte_output,
+                retained,
+            }),
+            Flow::Exit(status) if byte_output => Executed::Result(CommandResult {
+                value,
+                status,
+                suppress_newline: true,
                 retained,
             }),
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
             Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
                 value,
                 status: self.last_status,
-                suppress_newline: false,
+                suppress_newline: byte_output,
                 retained,
             }),
         })
@@ -1648,8 +2140,19 @@ impl Evaluator<'_> {
     fn run_xargs(
         &mut self,
         arguments: &[String],
-        input: Option<Rc<Value>>,
+        input: Option<Arc<Value>>,
     ) -> Result<Executed, FatalError> {
+        let input = input.map(|value| match value.as_ref() {
+            Value::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_array)
+                .map_or(value, Arc::new),
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::Array(_)
+            | Value::Object(_) => value,
+        });
         let plan = match xargs::plan(arguments, input.as_deref()) {
             Ok(plan) => plan,
             Err(failure) => {
@@ -1679,6 +2182,8 @@ impl Evaluator<'_> {
 
         let value = if outputs.is_empty() {
             Value::Null
+        } else if self.stage_output.is_some() {
+            Value::String(outputs.iter().map(display).collect::<Vec<_>>().join("\n"))
         } else {
             Value::Array(outputs)
         };
@@ -2036,10 +2541,8 @@ impl Evaluator<'_> {
         let flow = flow.map_err(CommandFailure::Fatal)?;
 
         if let Flow::Exit(status) = flow {
-            // This shell has no subshells, so calling exit inside a captured command substitution
-            // ends the entire script rather than only the substitution, unlike a real shell.
             return Err(CommandFailure::Fatal(FatalError::Unsupported(format!(
-                "exit {status} inside $( ) ends the whole script; this shell has no subshells"
+                "exit {status} inside $( ) is not supported"
             ))));
         }
 
@@ -2176,8 +2679,15 @@ fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     value::from_lines(lines)
 }
 
-fn own(input: Option<Rc<Value>>) -> Option<Value> {
-    input.map(Rc::unwrap_or_clone)
+fn flow_status(flow: Flow) -> ExitCode {
+    match flow {
+        Flow::Return(status) | Flow::Exit(status) => status,
+        Flow::Normal | Flow::Break(_) | Flow::Continue(_) => ExitCode::SUCCESS,
+    }
+}
+
+fn own(input: Option<Arc<Value>>) -> Option<Value> {
+    input.map(Arc::unwrap_or_clone)
 }
 
 fn invert(status: ExitCode) -> ExitCode {
@@ -2206,6 +2716,20 @@ fn capture_charges(captured: &mut [CommandResult]) -> Vec<crate::RetainedBytes> 
         .iter_mut()
         .flat_map(|result| std::mem::take(&mut result.retained))
         .collect()
+}
+
+fn render_stage_capture(captured: Vec<CommandResult>) -> Value {
+    if captured.is_empty() {
+        return Value::Null;
+    }
+    let mut text = String::new();
+    for result in captured {
+        text.push_str(&display(&result.value));
+        if !result.suppress_newline {
+            text.push('\n');
+        }
+    }
+    Value::String(text)
 }
 
 fn reduce_captured(captured: Vec<CommandResult>) -> Value {

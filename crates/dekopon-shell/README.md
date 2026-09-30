@@ -39,13 +39,13 @@ with HTTP 400 (moderation_blocked)`. The classification is what the exit status 
 the provider's sentence, and it is how an upstream refusal reaches the model at all rather than
 being guessed at.
 
-The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them.
+A provider stage receives its pipe drained as UTF-8 text, including line endings, or `None` when it has no pipe or here-document. Its returned value enters the next pipe as display text plus one newline: strings verbatim, other values as compact JSON. Provider invocations remain buffered; this is not live provider stdio.
 
 ## Value model
 
-Every variable is a `serde_json::Value`, not bash text. Capability inputs and outputs therefore need no marshaling, and JSON, arrays, maps, and arithmetic are native rather than emulated. `|` hands one structured value to the next command, closer to `jq`'s own `|` than to byte-stream piping.
+Every variable is a `serde_json::Value`, not bash text. JSON, arrays, maps, and arithmetic remain native in variables, while `|` carries bytes through bounded in-process pipes. `echo` terminates its output with a newline; `echo -n` and `printf` do not. `cat` copies and consumes its input without adding a newline. Builtins not yet migrated drain their bytes at the builtin boundary into their existing value path.
 
-A here-document lands in that model as a plain string: a block of literal text is what a string is here, and no byte stream is involved anywhere. `cat <<EOF` prints that string as-is even when its body looks like JSON — auto-parsing would make `cat <<EOF` mean two different things depending on its contents. `jq` is the one builtin that crosses over on its own: a piped or here-document string that parses as a JSON object or array is filtered as that value — `jq . <<EOF` agrees with the same body reaching `jq` through a real pipe — while a string holding a scalar (or text that does not parse at all) is still indexed as the plain string it is. The newline ending the last body line is dropped, matching the rule that values here are not newline-terminated (`echo hi` produces `"hi"`, and emitting a value is what adds the line ending), so `cat <<EOF` prints what bash prints rather than a trailing blank line.
+A here-document lands in that model as a plain string. `cat <<EOF` prints that string as-is even when its body looks like JSON — auto-parsing would make `cat <<EOF` mean two different things depending on its contents. `jq` is the one builtin that crosses over on its own: a piped or here-document string that parses as a JSON object or array is filtered as that value — `jq . <<EOF` agrees with the same body reaching `jq` through a real pipe — while a string holding a scalar (or text that does not parse at all) is still indexed as the plain string it is. The parser currently drops the newline ending the last here-document body line; `cat` copies the resulting text without adding one.
 
 ## Grammar
 
@@ -59,11 +59,7 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 ## `read`
 
-`read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
-place input is *consumed*. Everywhere else a piped value is *offered*: every pipeline in a body sees
-it, so a condition that never looks at it cannot swallow it before the command that does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
-which is what ends the loop. End of input is a status and not a diagnostic, because a message there
-would be one per loop, every loop.
+`read [-r] NAME...` consumes one line from the enclosing stage and reports failure at end of input, ending a `while read` loop. `cat` and stdin-reading builtins also consume that stream; a second `cat` sees only what remains. Commands that do not read stdin leave it alone. A provider command inside a compound gets input only from its own pipe or here-document, not the enclosing stream. End of input is a status, not a diagnostic.
 
 Several names split the line on whitespace runs with the remainder in the last, exactly as bash
 does. That is a rule local to `read`, not a return of POSIX IFS word splitting: nothing else here
@@ -123,14 +119,11 @@ that, so the parser translates them back.
 They parse through the same production either way, and carry their own redirections:
 `{ a; b; } 2> log`.
 
-A compound stage runs in the **current scope**. There are no subshells here to run it in, so a
-variable a piped `while` loop assigns remains set after the loop — the opposite of bash, where that
-assignment is thrown away with the subshell and is the single most notorious trap in the language.
-The obvious script does the obvious thing.
+The last stage runs on the calling thread in the **current scope**, so a final piped `while` can retain assignments. Every non-final stage runs on its own thread from a scope snapshot: its assignments, function definitions and buffer writes do not affect the parent. Globals and buffers are shared copy-on-write; live input cursors and parent captures are not part of a snapshot.
 
-A stage feeding a pipe, a redirection, or a `$( )` has its emissions collected into one value, since
-each statement inside emits separately and `{ echo a; echo b; } | wc -l` must see both. That is the
-same collection a command substitution already performed.
+Each pipe queues at most eight 4096-byte chunks (32 KiB). Spawn reserves a 2 MiB stack against the tree's retained-byte budget and refunds it at join; a refused spawn is status 1. The pipeline closes its ends and joins every producer before returning, including on errors, cancellation or consumer close. A producer whose reader closes keeps its earned status, not 141.
+
+Non-final compounds and functions currently collect their emissions before draining them into their byte pipe. Redirects and command substitutions also retain their existing capture path.
 
 `{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
 unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.

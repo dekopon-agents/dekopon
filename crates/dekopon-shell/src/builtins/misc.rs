@@ -464,6 +464,10 @@ impl Builtin for Sleep {
 pub(crate) struct Cat;
 
 impl Builtin for Cat {
+    fn reads_stdin(&self, arguments: &[String]) -> bool {
+        arguments.is_empty()
+    }
+
     fn name(&self) -> &'static str {
         "cat"
     }

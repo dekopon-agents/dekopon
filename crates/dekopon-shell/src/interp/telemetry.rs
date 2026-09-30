@@ -18,6 +18,14 @@ pub(crate) struct ScriptCounters {
 }
 
 impl ScriptCounters {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.commands = self.commands.saturating_add(other.commands);
+        self.capability_commands = self
+            .capability_commands
+            .saturating_add(other.capability_commands);
+        self.failed_commands = self.failed_commands.saturating_add(other.failed_commands);
+    }
+
     pub(crate) fn charge(&mut self, kind: CommandKind) {
         self.commands = self.commands.saturating_add(1);
         if kind == CommandKind::ProviderCommand {

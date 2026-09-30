@@ -348,8 +348,8 @@ fn a_command_span_records_its_arguments_stdin_and_output() {
 
     let arguments = r#"["upper","-"]"#;
     assert_recorded(piped, "shell.command.arguments", arguments, arguments.len());
-    assert_recorded(piped, "shell.command.stdin", "piped", "piped".len());
-    let output = r#"{"text":"PIPED"}"#;
+    assert_recorded(piped, "shell.command.stdin", "piped\n", "piped\n".len());
+    let output = r#"{"text":"PIPED\n"}"#;
     assert_recorded(piped, "shell.command.output", output, output.len());
 }
 
@@ -369,11 +369,13 @@ fn an_oversized_attribute_keeps_a_4096_byte_head_a_marker_and_its_full_length() 
 
     let arguments = format!(r#"["upper","--text","{payload}"]"#);
     let output = format!(r#"{{"text":"{}"}}"#, payload.to_uppercase());
+    let stdin = format!("{payload}\n");
+    let piped_output = format!(r#"{{"text":"{}\n"}}"#, payload.to_uppercase());
     for (span, field, full) in [
         (flag, "shell.command.arguments", &arguments),
         (flag, "shell.command.output", &output),
-        (piped, "shell.command.stdin", &payload),
-        (piped, "shell.command.output", &output),
+        (piped, "shell.command.stdin", &stdin),
+        (piped, "shell.command.output", &piped_output),
     ] {
         let head = format!("{}{MARKER}", &full[..CAP]);
         assert_recorded(span, field, &head, full.len());

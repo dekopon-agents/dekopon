@@ -28,6 +28,10 @@ const HELP: &str = "-r -c";
 pub(crate) struct Jq;
 
 impl Builtin for Jq {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "jq"
     }

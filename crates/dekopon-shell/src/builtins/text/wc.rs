@@ -12,6 +12,10 @@ const HELP: &str = "-l -w -c";
 pub(crate) struct Wc;
 
 impl Builtin for Wc {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "wc"
     }

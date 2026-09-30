@@ -9,6 +9,12 @@ const HELP: &str = "-d";
 pub(crate) struct Base64;
 
 impl Builtin for Base64 {
+    fn reads_stdin(&self, arguments: &[String]) -> bool {
+        arguments
+            .iter()
+            .all(|argument| matches!(argument.as_str(), "-d" | "-D" | "--decode"))
+    }
+
     fn name(&self) -> &'static str {
         "base64"
     }

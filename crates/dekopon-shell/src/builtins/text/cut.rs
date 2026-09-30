@@ -10,6 +10,10 @@ const HELP: &str = "-d -f -c";
 pub(crate) struct Cut;
 
 impl Builtin for Cut {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "cut"
     }

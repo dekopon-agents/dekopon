@@ -10,6 +10,10 @@ const HELP: &str = "-c -d -u";
 pub(crate) struct Uniq;
 
 impl Builtin for Uniq {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "uniq"
     }

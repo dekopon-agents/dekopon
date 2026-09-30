@@ -10,6 +10,10 @@ const HELP: &str = "-r -n -u";
 pub(crate) struct Sort;
 
 impl Builtin for Sort {
+    fn reads_stdin(&self, _arguments: &[String]) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "sort"
     }
