@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::{ExitCode, ast::DEV_NULL, limits::LimitExceeded};
+use crate::{ExitCode, ast::DEV_NULL, limits::LimitExceeded, value::to_lines};
 
 const ECHO_HELP: &str = "-n -e -E";
 
@@ -472,6 +472,14 @@ impl Builtin for Cat {
         ""
     }
 
+    fn reads_stdin(&self) -> bool {
+        true
+    }
+
+    fn copies_stdin(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -485,7 +493,7 @@ impl Builtin for Cat {
         }
 
         if arguments.is_empty() {
-            return Ok(CommandResult::value(input.unwrap_or(Value::Null)));
+            return Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline());
         }
 
         let mut values = Vec::new();
@@ -502,10 +510,16 @@ impl Builtin for Cat {
             values.push(value.clone());
         }
 
-        Ok(CommandResult::value(match values.len() {
-            1 => values.into_iter().next().unwrap_or(Value::Null),
-            _ => Value::Array(values),
-        }))
+        if let [single] = values.as_slice()
+            && !single.is_array()
+        {
+            return Ok(CommandResult::value(
+                values.into_iter().next().unwrap_or(Value::Null),
+            ));
+        }
+        Ok(CommandResult::lines(
+            values.iter().flat_map(to_lines).collect(),
+        ))
     }
 }
 

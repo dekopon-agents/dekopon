@@ -29,6 +29,8 @@ impl CapabilityInvoker for Fixture {
         vec![
             "cli-probe.upper".to_owned(),
             "fixture.object".to_owned(),
+            "fixture.list".to_owned(),
+            "fixture.null".to_owned(),
             "http-probe.fetch".to_owned(),
             "policy.denied".to_owned(),
             "provider.broken".to_owned(),
@@ -75,6 +77,8 @@ impl CapabilityInvoker for Fixture {
                     message: "probe: object takes --key value pairs".to_owned(),
                 },
             },
+            ["list"] => proposal("fixture.list", json!({})),
+            ["null"] => proposal("fixture.null", json!({})),
             ["fetch"] => proposal("http-probe.fetch", json!({})),
             ["denied"] => proposal("policy.denied", json!({})),
             ["broken"] => proposal("provider.broken", json!({})),
@@ -123,6 +127,8 @@ impl CapabilityInvoker for Fixture {
                 },
             },
             "fixture.object" => CapabilityCallResult::Succeeded(input),
+            "fixture.list" => CapabilityCallResult::Succeeded(json!(["a", "b"])),
+            "fixture.null" => CapabilityCallResult::Succeeded(Value::Null),
             "policy.denied" => CapabilityCallResult::Denied {
                 reason: "exact policy refused this proposal".to_owned(),
             },
@@ -328,7 +334,7 @@ fn a_negated_pipeline_inverts_its_status() {
 
 #[test]
 fn functions_participate_in_pipelines_in_both_directions() {
-    assert_eq!(output("f() { echo hi; }\nf | wc -c"), "2");
+    assert_eq!(output("f() { echo hi; }\nf | wc -c"), "3");
     assert_eq!(output("g() { cat; }\necho payload | g"), "payload");
     assert_eq!(
         output("g() { if [ -n \"$1\" ]; then cat; fi; }\necho payload | g yes"),
@@ -336,15 +342,17 @@ fn functions_participate_in_pipelines_in_both_directions() {
     );
     assert_eq!(output("f() { echo one; echo two; }\nf | grep one"), "one");
     assert_eq!(output("f() { echo one; echo two; }\nf"), "one\ntwo");
+    assert_eq!(
+        output("f() { if [ $1 -gt 0 ]; then f $(($1 - 1)); else echo done; fi; }; f 40 | cat"),
+        "done"
+    );
     assert_eq!(output("echo a\nq() { true; }\nq\necho b"), "a\nb");
 }
 
 #[test]
-fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
-    assert_eq!(
-        output("g() { cat; cat; }\necho payload | g"),
-        "payload\npayload"
-    );
+fn a_piped_stream_is_consumed_once_by_the_statements_that_share_it() {
+    assert_eq!(output("g() { cat; cat; }\necho payload | g"), "payload");
+    assert_eq!(output("echo payload | { cat; cat; }"), "payload");
     assert_eq!(
         output("g() { true; echo first; cat; }\necho payload | g"),
         "first\npayload"
@@ -355,7 +363,7 @@ fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
     );
     assert_eq!(
         output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; probe object --a 1 --b 2 | g"#),
-        "1\n2"
+        "1"
     );
     assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
 }
@@ -590,7 +598,7 @@ fn exit_sets_the_script_status_and_wraps_like_bash() {
 fn xargs_maps_a_command_over_a_list() {
     let fixture = Fixture::default();
     let outcome = Interpreter::new(Limits::default()).run(
-        r#"probe object --a a --b b | jq '[.a,.b]' | xargs probe upper --text"#,
+        r#"probe object --a a --b b | jq -r '.a + "\n" + .b' | xargs probe upper --text"#,
         &fixture,
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
@@ -998,7 +1006,7 @@ fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
     let outcome = run("echo one | while read line; do echo $line; done");
     assert_eq!(outcome.output, "one");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
-    assert_eq!(code("echo '' | read x"), 1, "no lines is a failing read");
+    assert_eq!(code("printf '' | read x"), 1, "no lines is a failing read");
 }
 
 #[test]
@@ -1796,9 +1804,9 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     assert_eq!(
         *fixture.calls.lock().expect("fixture calls"),
         vec![
-            ("cli-probe.upper".to_owned(), json!({"text": "hello"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "hello\n"})),
             ("fixture.object".to_owned(), json!({"a": 1})),
-            ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}\n"})),
             ("cli-probe.upper".to_owned(), json!({"text": "flag"})),
         ]
     );
@@ -1936,7 +1944,7 @@ cap --list | jq length";
     assert!(outcome.output.contains("3-2"), "{}", outcome.output);
     assert!(outcome.output.contains("10"), "{}", outcome.output);
     assert!(
-        outcome.output.trim_end().ends_with('6'),
+        outcome.output.trim_end().ends_with('8'),
         "{}",
         outcome.output
     );
@@ -1952,4 +1960,202 @@ fn a_syntax_error_reports_exit_code_two_without_running_anything() {
         outcome.output
     );
     assert!(!outcome.output.contains("before"), "{}", outcome.output);
+}
+
+#[test]
+fn echo_writes_its_newline_into_the_pipe() {
+    assert_eq!(output("echo hi | wc -c"), "3");
+    let fixture = Fixture::default();
+    Interpreter::new(Limits::default()).run("echo hi | probe upper -", &fixture);
+    assert_eq!(
+        *fixture.calls.lock().expect("fixture calls"),
+        vec![("cli-probe.upper".to_owned(), json!({"text": "hi\n"}))]
+    );
+}
+
+#[test]
+fn a_flooding_producer_ends_when_the_last_stage_stops_reading() {
+    let flood = "x".repeat(256 * 1024);
+    let script = format!("printf 'first\\n{flood}' | read line\necho $line ${{PIPESTATUS[@]}}");
+    let outcome = run(&script);
+    assert_eq!(outcome.output, "first 0 0");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+}
+
+#[test]
+fn a_stage_whose_stack_the_budget_cannot_cover_fails_with_status_1() {
+    let limits = Limits {
+        max_value_bytes: 1024 * 1024,
+        ..Limits::default()
+    };
+    let outcome = run_with("echo hi | cat\necho ${PIPESTATUS[@]}", limits);
+    assert!(
+        outcome.output.contains("cannot reserve"),
+        "{}",
+        outcome.output
+    );
+    assert!(outcome.output.ends_with("1 0"), "{}", outcome.output);
+}
+
+#[test]
+fn cat_passes_an_unending_stream_through_until_its_reader_closes() {
+    let outcome = run("while true; do echo y; done | cat | read line\necho $line ${PIPESTATUS[@]}");
+    assert_eq!(outcome.output, "y 0 0 0");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+}
+
+const STAGE_STACK: u64 = 2 * 1024 * 1024;
+
+#[test]
+fn a_stage_writing_pipestatus_is_charged_for_its_copy_of_the_globals() {
+    let big = "x".repeat(400 * 1024);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 600 * 1024,
+        ..Limits::default()
+    };
+    let script = format!("big={big}\n{{ true; echo reached; }} | cat");
+    let outcome = run_with(&script, limits);
+    assert!(!outcome.output.contains("reached"), "{}", outcome.output);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_stage_truncating_a_buffer_is_charged_for_its_copy_of_the_buffers() {
+    let big = "x".repeat(400 * 1024);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 600 * 1024,
+        ..Limits::default()
+    };
+    let script = format!("echo {big} > held\n{{ echo inner > other; echo reached; }} | cat");
+    let outcome = run_with(&script, limits);
+    assert!(!outcome.output.contains("reached"), "{}", outcome.output);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_provider_list_crosses_the_pipe_as_one_json_document() {
+    let fixture = Fixture::default();
+    Interpreter::new(Limits::default()).run("probe list | probe upper -", &fixture);
+    assert_eq!(
+        fixture.calls.lock().expect("fixture calls").last(),
+        Some(&(
+            "cli-probe.upper".to_owned(),
+            json!({"text": "[\"a\",\"b\"]\n"})
+        ))
+    );
+}
+
+#[test]
+fn a_transient_assignment_the_budget_cannot_copy_fails_the_stage_and_joins() {
+    let big = "x".repeat(400 * 1024);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 600 * 1024,
+        ..Limits::default()
+    };
+    let script = format!("big={big}\n{{ big=small true; echo reached; }} | cat\necho after");
+    let outcome = run_with(&script, limits);
+    assert!(!outcome.output.contains("reached"), "{}", outcome.output);
+    assert!(
+        outcome.output.contains("bytes of values"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_builtin_writes_its_lines_and_xargs_reads_text_not_json() {
+    assert_eq!(
+        output("printf 'b\\na\\n' | sort | { read first; echo $first; }"),
+        "a"
+    );
+    let one_argument: Value =
+        serde_json::from_str(&output(r#"echo '["a","b"]' | xargs echo"#)).expect("json");
+    assert_eq!(one_argument, json!([r#"["a","b"]"#]));
+}
+
+#[test]
+fn a_provider_that_returns_null_still_writes_its_newline() {
+    assert_eq!(output("probe null | wc -c"), "1");
+    assert_eq!(output("probe null | wc -l"), "1");
+}
+
+#[test]
+fn a_final_cat_streams_its_input_to_the_output_as_it_arrives() {
+    let line = "x".repeat(1023);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 256 * 1024,
+        timeout: Duration::from_millis(500),
+        ..Limits::default()
+    };
+    let script = format!("i=0; while [ $i -lt 1024 ]; do echo {line}; i=$((i+1)); done | cat");
+    assert_eq!(run_with(&script, limits).exit_code, ExitCode::SUCCESS);
+    let slow = run_with("{ echo first; sleep 5; } | cat", limits);
+    assert!(slow.output.starts_with("first\n"), "{}", slow.output);
+    assert_eq!(output("printf a | cat > buf\necho ---\ncat buf"), "---\na");
+}
+
+#[test]
+fn exit_in_a_non_final_stage_ends_only_that_stage() {
+    assert_eq!(
+        output("{ echo first; exit 7; } | cat; echo ${PIPESTATUS[@]}"),
+        "first\n7 0"
+    );
+}
+
+#[test]
+fn non_final_assignments_are_isolated_and_the_last_stage_keeps_its_scope() {
+    for (script, expected) in [
+        ("x=outer; { x=inner; echo ok; } | cat; echo $x", "ok\nouter"),
+        ("x=o; f() { x=i; echo ok; }; f|cat; echo $x", "ok\no"),
+        ("x=outer; echo inner | { read x; }; echo $x", "inner"),
+        ("echo o > b; { echo i > b; cat b; }|cat; cat b", "i\no"),
+    ] {
+        assert_eq!(output(script), expected);
+    }
+}
+
+#[test]
+fn joined_stages_refund_their_stack_reservations() {
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 4096,
+        ..Limits::default()
+    };
+    let outcome = run_with("echo a | cat; echo b | cat", limits);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "a\nb");
+}
+
+#[test]
+fn a_substitution_after_the_consumer_closed_does_not_end_the_script() {
+    let flood = "x".repeat(256 * 1024);
+    let script = format!(
+        "{{ printf 'first\\n{flood}'; case $(echo x) in x) true;; esac; }} | read first\necho $first ${{PIPESTATUS[@]}}\necho after"
+    );
+    let outcome = run(&script);
+    assert_eq!(outcome.output, "first 0 0\nafter");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+}
+
+#[test]
+fn the_last_stage_copying_shared_globals_is_refunded_at_join() {
+    let big = "x".repeat(200 * 1024);
+    let flood = "x".repeat(128 * 1024);
+    let limits = Limits {
+        max_value_bytes: STAGE_STACK + 1024 * 1024,
+        ..Limits::default()
+    };
+    let script = format!(
+        "big={big}\nfor i in 1 2 3 4 5 6 7 8 9 10; do printf 'a\\n{flood}' | read x; done\necho $x"
+    );
+    let outcome = run_with(&script, limits);
+    assert_eq!(outcome.output, "a");
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 }

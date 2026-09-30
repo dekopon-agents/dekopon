@@ -73,6 +73,14 @@ impl Budget {
         }
     }
 
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            limits: self.limits,
+            tree: self.tree.clone(),
+            depth: self.depth,
+        }
+    }
+
     pub fn charge_step_with(
         &mut self,
         invoker: &dyn CapabilityInvoker,

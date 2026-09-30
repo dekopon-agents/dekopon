@@ -137,6 +137,7 @@ mod lexer;
 pub use jq_worker::{run_jq_worker_if_requested, set_jq_worker_executable};
 pub mod limits;
 mod parser;
+mod pipe;
 mod proposal;
 pub use proposal::{CommandProposal, CommandReport, CommandReportOutcome};
 mod tree;

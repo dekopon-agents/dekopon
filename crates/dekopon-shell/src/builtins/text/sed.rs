@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{
     builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::{from_lines, to_lines},
+    value::to_lines,
 };
 
 const HELP: &str = "-e -E";
@@ -17,6 +17,10 @@ impl Builtin for Sed {
 
     fn help(&self) -> &'static str {
         HELP
+    }
+
+    fn reads_stdin(&self) -> bool {
+        true
     }
 
     fn run(
@@ -55,7 +59,7 @@ impl Builtin for Sed {
             .into_iter()
             .map(|line| substitution.apply(&line))
             .collect::<Vec<_>>();
-        Ok(CommandResult::value(from_lines(lines)))
+        Ok(CommandResult::lines(lines))
     }
 }
 
@@ -316,7 +320,7 @@ mod tests {
     fn operates_line_by_line_over_arrays() {
         assert_eq!(
             sed(&["s/o/0/g"], json!(["foo", "bop"])).value,
-            json!(["f00", "b0p"])
+            json!("f00\nb0p")
         );
     }
 
@@ -405,7 +409,7 @@ mod tests {
         );
         assert_eq!(
             sed(&["-E", "s/o$/0/"], json!(["foo", "of"])).value,
-            json!(["fo0", "of"])
+            json!("fo0\nof")
         );
     }
 

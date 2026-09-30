@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::{
     ExitCode,
     builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::{from_lines, to_lines},
+    value::to_lines,
 };
 
 use super::Pattern;
@@ -19,6 +19,10 @@ impl Builtin for Grep {
 
     fn help(&self) -> &'static str {
         HELP
+    }
+
+    fn reads_stdin(&self) -> bool {
+        true
     }
 
     fn run(
@@ -82,17 +86,13 @@ impl Builtin for Grep {
         } else {
             ExitCode::SUCCESS
         };
-        let value = if count_only {
-            Value::from(matched.len())
+        let mut result = if count_only {
+            CommandResult::value(Value::from(matched.len()))
         } else {
-            from_lines(matched)
+            CommandResult::lines(matched)
         };
-        Ok(CommandResult {
-            value,
-            status,
-            suppress_newline: false,
-            retained: Vec::new(),
-        })
+        result.status = status;
+        Ok(result)
     }
 }
 
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn selects_matching_lines_from_a_string() {
         let result = grep(&["ell"], json!("hello\nworld\nshell"));
-        assert_eq!(result.value, json!(["hello", "shell"]));
+        assert_eq!(result.value, json!("hello\nshell"));
         assert_eq!(result.status, ExitCode::SUCCESS);
     }
 
@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(grep(&["-c", "o"], json!("foo\nbar\nboo")).value, json!(2));
         assert_eq!(
             grep(&["-n", "o"], json!("foo\nbar\nboo")).value,
-            json!(["1:foo", "3:boo"])
+            json!("1:foo\n3:boo")
         );
     }
 
@@ -157,7 +157,7 @@ mod tests {
         );
         assert_eq!(
             grep(&["-E", "^ba(r|z)$"], json!(["bar", "baz", "barn"])).value,
-            json!(["bar", "baz"])
+            json!("bar\nbaz")
         );
         assert_eq!(
             grep(&["-c", "-E", r"\d"], json!("a1\nb2\ncc")).value,

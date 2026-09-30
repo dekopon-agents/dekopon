@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{
     builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::{from_lines, to_lines},
+    value::to_lines,
 };
 
 const HELP: &str = "-d -f -c";
@@ -16,6 +16,10 @@ impl Builtin for Cut {
 
     fn help(&self) -> &'static str {
         HELP
+    }
+
+    fn reads_stdin(&self) -> bool {
+        true
     }
 
     fn run(
@@ -99,7 +103,7 @@ impl Builtin for Cut {
             })
             .collect::<Vec<_>>();
 
-        Ok(CommandResult::value(from_lines(lines)))
+        Ok(CommandResult::lines(lines))
     }
 }
 
@@ -252,7 +256,7 @@ mod tests {
     fn operates_over_arrays_of_lines() {
         assert_eq!(
             cut(&["-d", ",", "-f", "1"], json!(["a,b", "c,d"])).value,
-            json!(["a", "c"])
+            json!("a\nc")
         );
     }
 
