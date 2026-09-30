@@ -141,14 +141,14 @@ impl StderrCapture {
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
-    local_charges: BTreeMap<String, crate::RetainedBytes>,
+    local_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
     _positional_charges: Vec<crate::RetainedBytes>,
 }
 
 struct SavedVariable {
     name: String,
     value: Option<Value>,
-    charge: Option<crate::RetainedBytes>,
+    charge: Option<Vec<crate::RetainedBytes>>,
 }
 
 pub(crate) fn run(
@@ -252,7 +252,7 @@ struct Evaluator<'a> {
     limits: Limits,
     output: OutputBuffer,
     globals: BTreeMap<String, Value>,
-    global_charges: BTreeMap<String, crate::RetainedBytes>,
+    global_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
     buffer_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
     frames: Vec<Frame>,
     functions: BTreeMap<String, Rc<Program>>,
@@ -379,22 +379,20 @@ impl Evaluator<'_> {
         self.globals.get(name)
     }
 
-    fn assign(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
-        for frame in self.frames.iter_mut().rev() {
-            if let Some(slot) = frame.locals.get_mut(name) {
-                *slot = Value::Null;
-                frame.local_charges.remove(name);
-                let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
-                *slot = value;
-                frame.local_charges.insert(name.to_owned(), charge);
-                return Ok(());
-            }
-        }
-        self.globals.remove(name);
-        self.global_charges.remove(name);
-        let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
-        self.globals.insert(name.to_owned(), value);
-        self.global_charges.insert(name.to_owned(), charge);
+    fn assign(&mut self, name: &str, mut result: CommandResult) -> Result<(), LimitExceeded> {
+        let (values, charges) = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.locals.contains_key(name))
+            .map_or((&mut self.globals, &mut self.global_charges), |frame| {
+                (&mut frame.locals, &mut frame.local_charges)
+            });
+        values.remove(name);
+        charges.remove(name);
+        retain_value(&self.budget, &result.value, &mut result.retained)?;
+        values.insert(name.to_owned(), result.value);
+        charges.insert(name.to_owned(), result.retained);
         Ok(())
     }
 
@@ -446,10 +444,10 @@ impl Evaluator<'_> {
             frame.local_charges.remove(name);
             let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
             frame.locals.insert(name.to_owned(), value);
-            frame.local_charges.insert(name.to_owned(), charge);
+            frame.local_charges.insert(name.to_owned(), vec![charge]);
             return Ok(());
         }
-        self.assign(name, value)
+        self.assign(name, CommandResult::value(value))
     }
 
     fn positional(&self) -> &[Value] {
@@ -598,7 +596,10 @@ impl Evaluator<'_> {
         let mut body_status = ExitCode::SUCCESS;
         for item in items {
             self.budget.charge_step_with(self.invoker)?;
-            self.assign(&statement.variable, Value::String(item))?;
+            self.assign(
+                &statement.variable,
+                CommandResult::value(Value::String(item)),
+            )?;
             let flow = self.execute_program(&statement.body)?;
             body_status = self.last_status;
             match flow {
@@ -737,7 +738,7 @@ impl Evaluator<'_> {
         let fields = split_read_fields(&line, names.len());
         for (index, name) in names.iter().enumerate() {
             let field = fields.get(index).copied().unwrap_or_default();
-            self.assign(name, Value::String(field.to_owned()))?;
+            self.assign(name, CommandResult::value(Value::String(field.to_owned())))?;
         }
         Ok(CommandResult::status(ExitCode::SUCCESS))
     }
@@ -1003,8 +1004,9 @@ impl Evaluator<'_> {
                 Ok(Executed::Result(CommandResult::status(result.status)))
             }
             Sink::Buffer { name, .. } => {
-                self.append_buffer(&name, result.value)?;
-                Ok(Executed::Result(CommandResult::status(result.status)))
+                let status = result.status;
+                self.append_buffer(&name, result)?;
+                Ok(Executed::Result(CommandResult::status(status)))
             }
         }
     }
@@ -1067,18 +1069,17 @@ impl Evaluator<'_> {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
 
-        let mut here_doc_charge = None;
+        let mut here_doc_charges = Vec::new();
+        let start = self.expansion_charges.len();
         let input = match &command.here_doc {
             None => input,
             Some(body) => match self.expand_quoted(&body.parts) {
                 Ok(text) => {
                     let value = Value::String(text);
-                    match self.budget.charge_value_bytes(value_bytes(&value)) {
-                        Ok(charge) => here_doc_charge = Some(charge),
-                        Err(limit) => {
-                            self.restore_all(restore);
-                            return Err(limit.into());
-                        }
+                    here_doc_charges = self.expansion_charges.split_off(start);
+                    if let Err(limit) = retain_value(&self.budget, &value, &mut here_doc_charges) {
+                        self.restore_all(restore);
+                        return Err(limit.into());
                     }
                     Some(Rc::new(value))
                 }
@@ -1113,7 +1114,7 @@ impl Evaluator<'_> {
             .map(StderrCapture::finish)
             .unwrap_or_default();
         self.restore_all(restore);
-        drop(here_doc_charge);
+        drop(here_doc_charges);
         let executed = executed?;
         let Executed::Result(mut result) = executed else {
             self.route_diagnostics(diagnostics, &stderr)?;
@@ -1142,8 +1143,9 @@ impl Evaluator<'_> {
                 Ok(Executed::Result(CommandResult::status(result.status)))
             }
             Sink::Buffer { name, .. } => {
-                self.append_buffer(&name, result.value)?;
-                Ok(Executed::Result(CommandResult::status(result.status)))
+                let status = result.status;
+                self.append_buffer(&name, result)?;
+                Ok(Executed::Result(CommandResult::status(status)))
             }
         }
     }
@@ -1220,7 +1222,7 @@ impl Evaluator<'_> {
             }
             Sink::Buffer { name, .. } => {
                 let name = name.clone();
-                self.append_buffer(&name, value::from_lines(diagnostics))?;
+                self.append_buffer(&name, CommandResult::value(value::from_lines(diagnostics)))?;
             }
         }
         Ok(())
@@ -1232,15 +1234,20 @@ impl Evaluator<'_> {
         }
     }
 
-    fn append_buffer(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
-        if value.is_null() {
+    fn append_buffer(
+        &mut self,
+        name: &str,
+        mut result: CommandResult,
+    ) -> Result<(), LimitExceeded> {
+        if result.value.is_null() {
             return Ok(());
         }
-        let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
+        retain_value(&self.budget, &result.value, &mut result.retained)?;
         self.buffer_charges
             .entry(name.to_owned())
             .or_default()
-            .push(charge);
+            .extend(result.retained);
+        let value = result.value;
         match self.buffers.remove(name) {
             None | Some(Value::Null) => {
                 self.buffers.insert(name.to_owned(), value);
@@ -1686,28 +1693,25 @@ impl Evaluator<'_> {
     /// Assigning a variable from a whole command substitution or another whole variable keeps its
     /// structured value instead of flattening it to text, a deliberate deviation from real shells
     /// that lets a script later index into what it captured.
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
-    fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
+    fn assignment_value(&mut self, word: &Word) -> Result<CommandResult, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
-        if word.parts.is_empty() {
-            return Ok(Value::String(String::new()));
+        if let [WordPart::CommandSubstitution(program)] = word.parts.as_slice() {
+            return self.run_substitution(program);
         }
-        if let [part] = word.parts.as_slice() {
-            match part {
-                WordPart::CommandSubstitution(program) => {
-                    let (value, status) = self.run_substitution(program)?;
-                    self.last_substitution_status = status;
-                    return Ok(value);
-                }
-                WordPart::Parameter(parameter) => return self.parameter_value(parameter),
-                _ => {}
-            }
-        }
-        let expanded = self.expand_word(word)?;
-        Ok(Value::String(expanded.join(" ")))
+        let start = self.expansion_charges.len();
+        let value = match word.parts.as_slice() {
+            [WordPart::Parameter(parameter)] => self.parameter_value(parameter)?,
+            _ => Value::String(self.expand_word(word)?.join(" ")),
+        };
+        let mut result = CommandResult::value(value);
+        result.retained = self.expansion_charges.split_off(start);
+        Ok(result)
+    }
+
+    fn expansion_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
+        let result = self.assignment_value(word)?;
+        self.expansion_charges.extend(result.retained);
+        Ok(result.value)
     }
 
     fn expand_word(&mut self, word: &Word) -> Result<Vec<String>, CommandFailure> {
@@ -1741,8 +1745,9 @@ impl Evaluator<'_> {
                     produced |= spread(&mut fields, &value);
                 }
                 WordPart::CommandSubstitution(program) => {
-                    let (value, _) = self.run_substitution(program)?;
-                    produced |= spread(&mut fields, &value);
+                    let result = self.run_substitution(program)?;
+                    produced |= spread(&mut fields, &result.value);
+                    self.expansion_charges.extend(result.retained);
                 }
             }
         }
@@ -1798,8 +1803,9 @@ impl Evaluator<'_> {
                     append(&mut fields, &quoted_text(&value));
                 }
                 WordPart::CommandSubstitution(program) => {
-                    let (value, _) = self.run_substitution(program)?;
-                    append(&mut fields, &quoted_text(&value));
+                    let result = self.run_substitution(program)?;
+                    append(&mut fields, &quoted_text(&result.value));
+                    self.expansion_charges.extend(result.retained);
                 }
             }
         }
@@ -1889,7 +1895,7 @@ impl Evaluator<'_> {
             Modifier::None => value,
             Modifier::Default { colon, word } => {
                 if absent(*colon) {
-                    self.assignment_value(word)?
+                    self.expansion_value(word)?
                 } else {
                     value
                 }
@@ -1903,8 +1909,8 @@ impl Evaluator<'_> {
                         "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
                     )));
                 }
-                let substitute = self.assignment_value(word)?;
-                self.assign(name, substitute.clone())?;
+                let substitute = self.expansion_value(word)?;
+                self.assign(name, CommandResult::value(substitute.clone()))?;
                 substitute
             }
             Modifier::Require { colon, word } => {
@@ -1923,7 +1929,7 @@ impl Evaluator<'_> {
                 if absent(*colon) {
                     Value::Null
                 } else {
-                    self.assignment_value(word)?
+                    self.expansion_value(word)?
                 }
             }
             Modifier::StripPrefix(pattern) => {
@@ -2023,7 +2029,7 @@ impl Evaluator<'_> {
         Ok(builtins::misc::evaluate_test("[[", &operands)?.status)
     }
 
-    fn run_substitution(&mut self, program: &Program) -> Result<(Value, ExitCode), CommandFailure> {
+    fn run_substitution(&mut self, program: &Program) -> Result<CommandResult, CommandFailure> {
         self.captures.push(Vec::new());
         let flow = self.execute_program(program);
         let mut captured = self.captures.pop().unwrap_or_default();
@@ -2037,16 +2043,17 @@ impl Evaluator<'_> {
             ))));
         }
 
-        let status = self.last_status;
         let retained = capture_charges(&mut captured);
         let value = reduce_captured(captured);
-        let charged: u64 = retained.iter().map(crate::RetainedBytes::bytes).sum();
-        self.expansion_charges.extend(retained);
-        let missing = value_bytes(&value).saturating_sub(charged);
-        let charge = self.budget.charge_value_bytes(missing)?;
-        self.expansion_charges.push(charge);
-        self.last_substitution_status = status;
-        Ok((value, status))
+        let mut result = CommandResult {
+            value,
+            status: self.last_status,
+            suppress_newline: false,
+            retained,
+        };
+        retain_value(&self.budget, &result.value, &mut result.retained)?;
+        self.last_substitution_status = result.status;
+        Ok(result)
     }
 
     #[expect(
@@ -2181,9 +2188,19 @@ fn invert(status: ExitCode) -> ExitCode {
     }
 }
 
-/// A capture is still a stream of individual writes, so joining them must respect a result that
-/// explicitly suppressed its own line ending, or a value a script assembled piece by piece would
-/// silently gain an unwanted newline.
+fn retain_value(
+    budget: &Budget,
+    value: &Value,
+    charges: &mut Vec<crate::RetainedBytes>,
+) -> Result<(), LimitExceeded> {
+    let charged: u64 = charges.iter().map(crate::RetainedBytes::bytes).sum();
+    let missing = value_bytes(value).saturating_sub(charged);
+    if missing > 0 {
+        charges.push(budget.charge_value_bytes(missing)?);
+    }
+    Ok(())
+}
+
 fn capture_charges(captured: &mut [CommandResult]) -> Vec<crate::RetainedBytes> {
     captured
         .iter_mut()

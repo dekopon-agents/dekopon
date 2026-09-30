@@ -434,6 +434,8 @@ mod tests {
     struct RecordingInvoker {
         secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
         scripts_finished: AtomicU32,
+        tree: Option<TreeContext>,
+        retained: Mutex<Vec<u64>>,
     }
 
     impl CapabilityInvoker for RecordingInvoker {
@@ -454,7 +456,7 @@ mod tests {
         }
 
         fn has_command_word(&self, word: &str) -> bool {
-            word == "gh-extra"
+            matches!(word, "gh-extra" | "retained" | "render")
         }
 
         fn run_command(
@@ -463,6 +465,22 @@ mod tests {
             argv: &[String],
             stdin: Option<&str>,
         ) -> Option<CommandRun> {
+            if matches!(word, "retained" | "render") {
+                let stdout = if word == "retained" {
+                    self.retained
+                        .lock()
+                        .unwrap()
+                        .push(self.tree.as_ref()?.value_bytes());
+                    String::new()
+                } else {
+                    "abcdefgh".to_owned()
+                };
+                return Some(CommandRun::Rendered {
+                    stdout,
+                    stderr: String::new(),
+                    status: 0,
+                });
+            }
             Some(CommandRun::Proposed {
                 capability: word.to_owned(),
                 input: json!({ "argv": argv, "stdin": stdin }),
@@ -607,6 +625,42 @@ mod tests {
         let next = interpreter.run_with_tree(&script, &invoker, &tree);
         assert_eq!(next.exit_code, ExitCode::SUCCESS, "{}", next.output);
         assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn storage_adopts_moved_charges_and_refunds_unset_and_replacement() {
+        for (maximum, script, expected) in [
+            (
+                32,
+                "x=$(printf abcdefgh); retained; x=a; retained; unset x; retained",
+                vec![24, 17, 0],
+            ),
+            (
+                31,
+                "printf abcdefgh > buf; retained; : > buf; retained; render >> buf; retained; : > buf; retained",
+                vec![24, 0, 24, 0],
+            ),
+            (
+                48,
+                "render > buf; retained; render >> buf; retained; : > buf; retained",
+                vec![24, 48, 0],
+            ),
+            (32, "cat <<EOF\n$(printf abcdefgh)\nEOF\nretained", vec![0]),
+        ] {
+            let limits = Limits {
+                max_value_bytes: maximum,
+                ..Limits::default()
+            };
+            let tree = TreeContext::new(limits, CallBudget::new(1));
+            let invoker = RecordingInvoker {
+                tree: Some(tree.clone()),
+                ..RecordingInvoker::default()
+            };
+            let outcome = Interpreter::new(limits).run_with_tree(script, &invoker, &tree);
+            assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+            assert_eq!(*invoker.retained.lock().unwrap(), expected, "{script}");
+            assert_eq!(tree.value_bytes(), 0);
+        }
     }
 
     fn proposal() -> SecretUseProposal {
