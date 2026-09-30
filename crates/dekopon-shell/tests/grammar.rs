@@ -77,6 +77,11 @@ impl CapabilityInvoker for Fixture {
                     message: "probe: object takes --key value pairs".to_owned(),
                 },
             },
+            ["json-text"] => CommandRun::Rendered {
+                stdout: "{\"headSha\":\"0123456789012345678901234567890123456789\"}\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            },
             ["list"] => proposal("fixture.list", json!({})),
             ["null"] => proposal("fixture.null", json!({})),
             ["fetch"] => proposal("http-probe.fetch", json!({})),
@@ -355,7 +360,7 @@ fn binary_base64_passes_through_cat_but_not_text_boundaries() {
 #[test]
 fn a_function_redirect_captures_its_body() {
     assert_eq!(output("f() { printf ab; }; f > buf; cat buf"), "ab");
-    assert_eq!(output("f() { echo hi; }; f > buf; cat buf"), "hi\n");
+    assert_eq!(output("f() { echo hi; }; f > buf; cat buf | wc -c"), "3");
 }
 
 #[test]
@@ -506,7 +511,10 @@ fn grep_and_sed_stream_fragmented_lines_without_adding_newlines() {
 
 #[test]
 fn a_redirected_grep_count_keeps_zero_bytes_when_status_is_one() {
-    assert_eq!(output("printf x | grep -c z > count; cat count"), "0\n");
+    assert_eq!(
+        output("printf x | grep -c z > count; cat count | wc -c"),
+        "2"
+    );
     assert_eq!(
         output("printf x | grep -c z > count; echo ${PIPESTATUS[1]}"),
         "1"
@@ -629,18 +637,15 @@ fn a_discarded_line_stream_does_not_use_the_retained_byte_budget() {
 #[test]
 fn line_selections_honor_named_buffer_redirection() {
     assert_eq!(
-        output("printf 'a\\nb\\nc' | head -n 2 > buf; cat buf"),
-        "a\nb\n"
+        output("printf 'a\\nb\\nc' | head -n 2 > buf; cat buf | wc -c"),
+        "4"
     );
     assert_eq!(
         output("printf 'a\\nb\\nc' | tail -n +2 > buf; cat buf"),
         "b\nc"
     );
     assert_eq!(output("printf 'a\\nb\\nc' | tail -n 1 > buf; cat buf"), "c");
-    assert_eq!(
-        output("printf 'a\\nb' | { head -1 > buf; cat buf; }"),
-        "a\n"
-    );
+    assert_eq!(output("printf 'a\\nb' | { head -1 > buf; cat buf; }"), "a");
 }
 
 #[test]
@@ -867,6 +872,10 @@ fn division_by_zero_is_recoverable_not_fatal() {
 #[test]
 fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
     assert_eq!(
+        output("pr=$(probe json-text); printf '%s' \"${pr[headSha]}\""),
+        "0123456789012345678901234567890123456789"
+    );
+    assert_eq!(
         output(r#"r=$(probe object --status 200); echo ${r[status]}"#),
         "200"
     );
@@ -943,6 +952,140 @@ fn redirection_writes_and_cat_reads_named_buffers() {
         "{}",
         outcome.output
     );
+}
+
+#[test]
+fn named_buffers_append_exact_bytes_and_refund_on_replacement() {
+    assert_eq!(output("printf a > buf; printf b >> buf; cat buf"), "ab");
+    assert_eq!(
+        output("echo a > buf; printf b >> buf; cat buf | wc -c"),
+        "3"
+    );
+    assert_eq!(output("echo old > buf; printf x > buf; cat buf"), "x");
+    assert_eq!(
+        output("printf '/w==' | base64 -d > buf; cat buf | base64"),
+        "/w=="
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d > first; cat first > second; cat second | base64"),
+        "/w=="
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d | cat > buf; cat buf | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn compound_redirects_keep_terminators_and_binary_bytes_exact() {
+    assert_eq!(
+        output("{ printf a; printf b; } > buf; cat buf | wc -c"),
+        "2"
+    );
+    assert_eq!(
+        output("printf '/w==' | base64 -d > src; { cat src; } > buf; cat buf | base64"),
+        "/w=="
+    );
+}
+
+#[test]
+fn named_buffer_growth_is_refused_before_retaining_past_the_limit() {
+    let outcome = run_with(
+        "printf 12345678 > buf; printf 12345678 >> buf; printf 12345678 >> buf",
+        Limits {
+            max_value_bytes: 20,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn copying_a_named_buffer_charges_only_the_destination_without_a_snapshot() {
+    let outcome = run_with(
+        "printf 12345678 > src; cat src > dst; cat dst",
+        Limits {
+            max_value_bytes: 20,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(outcome.output, "12345678");
+    let self_append = run_with(
+        "printf 12345678 > src; cat src >> src; cat src",
+        Limits {
+            max_value_bytes: 20,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(self_append.exit_code, ExitCode::SUCCESS, "{self_append:?}");
+    assert_eq!(self_append.output, "1234567812345678");
+}
+
+#[test]
+fn a_nonfinal_named_cat_routes_diagnostics_to_its_stage_capture() {
+    let outcome = run("printf 'producer\\n' > buf; cat buf >&2 | probe errored");
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    let producer = outcome.output.find("producer").expect("cat stderr");
+    let consumer = outcome
+        .output
+        .find("could not connect")
+        .expect("consumer stderr");
+    assert!(producer < consumer, "{outcome:?}");
+}
+
+#[test]
+fn a_large_binary_buffer_to_stderr_is_rendered_only_up_to_the_capture_bound() {
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(vec![0xff; 64 * 1024]);
+    let script = format!("printf '{encoded}' | base64 -d > buf; cat buf >&2 | cat");
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_output_bytes: 512,
+            max_output_lines: 4,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(
+        outcome.output.contains("redirected diagnostics truncated"),
+        "{outcome:?}"
+    );
+    assert!(outcome.output.len() < 1024, "{outcome:?}");
+}
+
+#[test]
+fn pipeline_diagnostics_follow_stage_order_even_if_the_consumer_fails_first() {
+    let outcome = run("probe decline | probe errored");
+    let producer = outcome
+        .output
+        .find("probe: declined")
+        .expect("producer diagnostic");
+    let consumer = outcome
+        .output
+        .find("could not connect")
+        .expect("consumer diagnostic");
+    assert!(producer < consumer, "{outcome:?}");
+}
+
+#[test]
+fn a_binary_named_buffer_refuses_text_capture_and_provider_stdin() {
+    let capture = run("printf '/w==' | base64 -d > buf; v=$(cat buf)");
+    assert_ne!(capture.exit_code, ExitCode::SUCCESS, "{capture:?}");
+    assert!(capture.output.contains("not valid UTF-8"), "{capture:?}");
+    let provider = run("printf '/w==' | base64 -d > buf; cat buf | probe upper");
+    assert_ne!(provider.exit_code, ExitCode::SUCCESS, "{provider:?}");
+    assert!(provider.output.contains("not valid UTF-8"), "{provider:?}");
+}
+
+#[test]
+fn substitution_trims_only_trailing_line_feeds_and_splits_on_lines() {
+    assert_eq!(output("v=$(printf 'x\\n\\n'); printf '%s' \"$v\""), "x");
+    assert_eq!(output("count() { echo $#; }; count $(printf 'a b')"), "1");
+    assert_eq!(output("count() { echo $#; }; count $(printf 'a\\nb')"), "2");
 }
 
 #[test]

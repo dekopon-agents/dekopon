@@ -126,9 +126,11 @@ variable a piped `while` loop assigns remains set after the loop — the opposit
 assignment is thrown away with the subshell and is the single most notorious trap in the language.
 The obvious script does the obvious thing.
 
-A stage feeding a pipe, a redirection, or a `$( )` has its emissions collected into one value, since
-each statement inside emits separately and `{ echo a; echo b; } | wc -l` must see both. That is the
-same collection a command substitution already performed.
+Pipeline stages exchange bytes; named redirection buffers append exact bytes, including invalid
+UTF-8, and `cat` copies those bytes to another pipe or buffer. Expanding buffer bytes into text or
+passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
+a whole assignment from JSON object or array text retains its structure, while unquoted text
+substitutions split on newlines rather than spaces.
 
 `{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
 unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.

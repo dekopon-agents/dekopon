@@ -507,7 +507,10 @@ impl Builtin for Cat {
                     "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
                 )));
             };
-            values.push(value.clone());
+            let text = std::str::from_utf8(value).map_err(|_invalid| {
+                CommandFailure::failed("standard input is not valid UTF-8 text")
+            })?;
+            values.push(Value::String(text.to_owned()));
         }
 
         if let [single] = values.as_slice()
@@ -786,7 +789,7 @@ mod tests {
     #[test]
     fn cat_reads_only_named_in_memory_buffers() {
         let mut buffers = std::collections::BTreeMap::new();
-        buffers.insert("buf".to_owned(), json!("hi"));
+        buffers.insert("buf".to_owned(), b"hi".to_vec());
         let result = run_builtin_with(&Cat, &["buf"], None, Limits::default(), &mut buffers)
             .expect("cat runs");
         assert_eq!(result.value, json!("hi"));

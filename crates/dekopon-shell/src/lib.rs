@@ -629,6 +629,44 @@ mod tests {
     }
 
     #[test]
+    fn substitution_refunds_trailing_line_feeds_before_the_next_capture() {
+        let limits = Limits {
+            max_value_bytes: 41,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let invoker = RecordingInvoker {
+            tree: Some(tree.clone()),
+            ..RecordingInvoker::default()
+        };
+        let outcome = Interpreter::new(limits).run_with_tree(
+            "v=$(printf 'x\\n\\n'); retained; w=$(printf 12345678); retained",
+            &invoker,
+            &tree,
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+        assert_eq!(*invoker.retained.lock().unwrap(), vec![17, 41]);
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
+    fn redirect_keeps_source_charge_while_copying_to_a_buffer() {
+        let limits = Limits {
+            max_value_bytes: 15,
+            ..Limits::default()
+        };
+        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let invoker = RecordingInvoker {
+            tree: Some(tree.clone()),
+            ..RecordingInvoker::default()
+        };
+        let outcome = Interpreter::new(limits).run_with_tree("render > buf", &invoker, &tree);
+        assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+        assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+        assert_eq!(tree.value_bytes(), 0);
+    }
+
+    #[test]
     fn storage_adopts_moved_charges_and_refunds_unset_and_replacement() {
         for (maximum, script, expected) in [
             (
@@ -639,12 +677,12 @@ mod tests {
             (
                 31,
                 "printf abcdefgh > buf; retained; : > buf; retained; render >> buf; retained; : > buf; retained",
-                vec![24, 0, 24, 0],
+                vec![8, 0, 8, 0],
             ),
             (
                 48,
                 "render > buf; retained; render >> buf; retained; : > buf; retained",
-                vec![24, 48, 0],
+                vec![8, 16, 0],
             ),
             (32, "cat <<EOF\n$(printf abcdefgh)\nEOF\nretained", vec![0]),
         ] {

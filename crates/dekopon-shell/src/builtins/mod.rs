@@ -1,7 +1,3 @@
-//! Builtins are text-shaped (grep, sed, cut, sort, uniq, wc, base64: lines in and out) or
-//! value-shaped (jq, cap, cat: JSON-native); every name here is reserved, so a provider declaring
-//! one is refused at load rather than shadowed.
-
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -107,7 +103,7 @@ pub(crate) struct BuiltinContext<'a> {
     pub budget: &'a mut Budget,
     /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
     /// a real filesystem path.
-    pub buffers: &'a BTreeMap<String, Value>,
+    pub buffers: &'a BTreeMap<String, Vec<u8>>,
 }
 
 impl BuiltinContext<'_> {
@@ -323,7 +319,7 @@ pub(crate) mod test_support {
         arguments: &[&str],
         input: Option<Value>,
         limits: Limits,
-        buffers: &mut BTreeMap<String, Value>,
+        buffers: &mut BTreeMap<String, Vec<u8>>,
     ) -> Result<CommandResult, CommandFailure> {
         let invoker = NoCapabilities;
         let mut budget = Budget::start(limits);

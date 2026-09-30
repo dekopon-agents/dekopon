@@ -68,6 +68,12 @@ impl RetainedBytes {
         self.bytes
     }
 
+    pub(crate) fn shrink(&mut self, bytes: u64) {
+        debug_assert!(bytes <= self.bytes);
+        self.bytes -= bytes;
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn grow(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {

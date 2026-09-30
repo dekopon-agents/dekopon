@@ -151,6 +151,27 @@ impl StderrCapture {
         self.lines.push(line.to_owned());
     }
 
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let room = self.max_bytes.saturating_sub(self.bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        if room == 0 || self.lines.len() >= self.max_lines {
+            self.truncated = true;
+            return;
+        }
+        let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(room)]);
+        let mut end = prefix.len().min(room);
+        while !prefix.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = prefix[..end].strip_suffix('\n').unwrap_or(&prefix[..end]);
+        self.push(text);
+        if bytes.len() > room || end < prefix.len() {
+            self.truncated = true;
+        }
+    }
+
     fn finish(mut self) -> Vec<String> {
         if self.truncated {
             self.lines
@@ -227,6 +248,7 @@ pub(crate) fn run_with_tree(
         function_names: BTreeSet::new(),
         buffers: Arc::new(BTreeMap::new()),
         captures: Vec::new(),
+        active_buffer: None,
         discard_capture_depth: None,
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
@@ -286,8 +308,9 @@ struct Evaluator<'a> {
     frames: Vec<Frame>,
     functions: BTreeMap<String, Arc<Program>>,
     function_names: BTreeSet<String>,
-    buffers: Arc<BTreeMap<String, Value>>,
+    buffers: Arc<BTreeMap<String, Vec<u8>>>,
     captures: Vec<Vec<CommandResult>>,
+    active_buffer: Option<(String, usize)>,
     discard_capture_depth: Option<usize>,
     expansion_charges: Vec<crate::RetainedBytes>,
     stdin: Vec<PipeReader>,
@@ -356,18 +379,30 @@ impl<'a> Evaluator<'a> {
         self.output.push_block(line);
     }
 
+    fn active_buffer_name(&self) -> Option<&str> {
+        self.active_buffer
+            .as_ref()
+            .filter(|(_, depth)| *depth == self.captures.len())
+            .map(|(name, _)| name.as_str())
+    }
+
     fn output_discarded(&self) -> bool {
         self.discard_capture_depth
             .is_some_and(|depth| self.captures.len() <= depth)
     }
 
-    fn emit(&mut self, result: CommandResult) {
+    fn emit(&mut self, mut result: CommandResult) -> Result<(), LimitExceeded> {
         if result.value.is_null() || self.output_discarded() {
-            return;
+            return Ok(());
+        }
+        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
+            self.append_buffer(&name, result)?;
+            return Ok(());
         }
         if let Some(capture) = self.captures.last_mut() {
+            retain_value(&self.budget, &result.value, &mut result.retained)?;
             capture.push(result);
-            return;
+            return Ok(());
         }
         if let Some(stdout) = self.stdout.as_mut() {
             let written = match write_display(stdout, &result.value) {
@@ -378,7 +413,7 @@ impl<'a> Evaluator<'a> {
                 WriteOutcome::Accepted => {}
                 WriteOutcome::ReaderGone => self.reader_gone = true,
             }
-            return;
+            return Ok(());
         }
         let text = display(&result.value);
         if result.suppress_newline {
@@ -386,6 +421,7 @@ impl<'a> Evaluator<'a> {
         } else {
             self.output.push_block(&text);
         }
+        Ok(())
     }
 
     /// Whether a command produced no value has to be recognized before it reaches a capture, not
@@ -479,7 +515,7 @@ impl<'a> Evaluator<'a> {
 
     fn unshare_buffers(&mut self) -> Result<(), LimitExceeded> {
         if Arc::strong_count(&self.buffers) > 1 {
-            let bytes = self.buffers.values().map(value_bytes).sum();
+            let bytes = self.buffers.values().map(|bytes| bytes.len() as u64).sum();
             self.shared_charges
                 .push(self.budget.charge_value_bytes(bytes)?);
         }
@@ -973,7 +1009,7 @@ impl<'a> Evaluator<'a> {
             return Ok((ExitCode::SUCCESS, None));
         };
 
-        let (outcomes, executed) = thread::scope(|scope| {
+        let (outcomes, diagnostics, executed) = thread::scope(|scope| {
             let mut input = StageInput::Inherited;
             let mut running = Vec::with_capacity(producers.len());
             for (index, command) in producers.iter().enumerate() {
@@ -981,11 +1017,19 @@ impl<'a> Evaluator<'a> {
                 let stage_input = std::mem::replace(&mut input, StageInput::Piped(reader));
                 running.push(self.spawn_stage(scope, index, command, stage_input, writer));
             }
+            if !producers.is_empty() {
+                self.stderr_capture.push(StderrCapture::new(&self.limits));
+            }
             let executed = self.tested(pipeline.negated, |evaluator| {
                 evaluator.execute_command(last, input, false)
             });
+            let diagnostics = (!producers.is_empty())
+                .then(|| self.stderr_capture.pop())
+                .flatten()
+                .map(StderrCapture::finish)
+                .unwrap_or_default();
             let outcomes = running.into_iter().map(Stage::join).collect::<Vec<_>>();
-            (outcomes, executed)
+            (outcomes, diagnostics, executed)
         });
         self.shared_charges.clear();
 
@@ -1015,6 +1059,9 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
+        for line in diagnostics {
+            self.write_line(&line);
+        }
         let executed = executed.map_err(|error| fatal.take().unwrap_or(error))?;
         if let Some(error) = fatal {
             return Err(error);
@@ -1038,7 +1085,7 @@ impl<'a> Evaluator<'a> {
         if pipeline.negated {
             status = invert(status);
         }
-        self.emit(last);
+        self.emit(last)?;
         Ok((status, None))
     }
 
@@ -1091,7 +1138,7 @@ impl<'a> Evaluator<'a> {
                     let status = match executed {
                         Executed::Result(result) => {
                             let status = result.status;
-                            stage.emit(result);
+                            stage.emit(result)?;
                             status
                         }
                         Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => status,
@@ -1157,6 +1204,7 @@ impl<'a> Evaluator<'a> {
             function_names: self.function_names.clone(),
             buffers: Arc::clone(&self.buffers),
             captures: Vec::new(),
+            active_buffer: None,
             discard_capture_depth: None,
             expansion_charges: Vec::new(),
             options: self.options,
@@ -1174,6 +1222,27 @@ impl<'a> Evaluator<'a> {
     }
 
     fn copy_stdin(&mut self, input: StageInput) -> Result<CommandResult, CommandFailure> {
+        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
+            let mut piped = match input {
+                StageInput::Piped(reader) => Some(reader),
+                StageInput::Inherited => None,
+            };
+            loop {
+                let chunk = if let Some(reader) = piped.as_mut() {
+                    reader.read(&self.budget, self.invoker)?
+                } else if let Some(reader) = self.stdin.last_mut() {
+                    reader.read(&self.budget, self.invoker)?
+                } else {
+                    break;
+                };
+                let ReadOutcome::Bytes(chunk) = chunk else {
+                    break;
+                };
+                self.budget.charge_step_with(self.invoker)?;
+                self.append_buffer_bytes(&name, &chunk)?;
+            }
+            return Ok(CommandResult::status(ExitCode::SUCCESS));
+        }
         let Self {
             stdin,
             stdout,
@@ -1281,7 +1350,16 @@ impl<'a> Evaluator<'a> {
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
         };
-        let collect = capture_output || stdout != Sink::Value;
+        let collect =
+            !matches!(stdout, Sink::Buffer { .. }) && (capture_output || stdout != Sink::Value);
+        self.open_buffers(&[&stdout, &stderr])?;
+        let previous_buffer = match &stdout {
+            Sink::Buffer { name, .. } => self
+                .active_buffer
+                .replace((name.clone(), self.captures.len())),
+            Sink::Value => None,
+            Sink::Diagnostics | Sink::Discard => self.active_buffer.take(),
+        };
 
         let capturing = stderr != Sink::Diagnostics;
         if capturing {
@@ -1299,6 +1377,9 @@ impl<'a> Evaluator<'a> {
         }
 
         let flow = self.execute_statement(statement);
+        if stdout != Sink::Value {
+            self.active_buffer = previous_buffer;
+        }
 
         let mut captured = if collect {
             self.captures.pop().unwrap_or_default()
@@ -1336,10 +1417,15 @@ impl<'a> Evaluator<'a> {
             retained,
         };
         if stderr == Sink::Value {
-            result.value = merge_diagnostics(result.value, diagnostics);
-            diagnostics = Vec::new();
+            if let Sink::Buffer { name, .. } = &stdout {
+                for line in diagnostics.drain(..) {
+                    self.append_buffer_bytes(name, format!("{line}\n").as_bytes())?;
+                }
+            } else {
+                result.value = merge_diagnostics(result.value, diagnostics);
+                diagnostics = Vec::new();
+            }
         }
-        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1349,11 +1435,7 @@ impl<'a> Evaluator<'a> {
                 self.write_redirected_diagnostics(&result);
                 Ok(Executed::Result(CommandResult::status(result.status)))
             }
-            Sink::Buffer { name, .. } => {
-                let status = result.status;
-                self.append_buffer(&name, result)?;
-                Ok(Executed::Result(CommandResult::status(status)))
-            }
+            Sink::Buffer { .. } => Ok(Executed::Result(CommandResult::status(result.status))),
         }
     }
 
@@ -1447,6 +1529,7 @@ impl<'a> Evaluator<'a> {
             }
         };
 
+        self.open_buffers(&[&stdout, &stderr])?;
         let capturing = stderr != Sink::Diagnostics;
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
@@ -1457,7 +1540,16 @@ impl<'a> Evaluator<'a> {
         };
         let redirected = self.stdout_redirected;
         self.stdout_redirected |= stdout != Sink::Value;
+        let active_buffer = (stdout != Sink::Value)
+            .then(|| self.active_buffer.take())
+            .flatten();
+        if let Sink::Buffer { name, .. } = &stdout {
+            self.active_buffer = Some((name.clone(), self.captures.len()));
+        }
         let executed = self.run_argv(&argv, input, capture_output, literal_help, &stdout);
+        if stdout != Sink::Value {
+            self.active_buffer = active_buffer;
+        }
         self.stdout_redirected = redirected;
         if let Some(writer) = stage_stdout {
             self.stdout = Some(writer);
@@ -1486,7 +1578,6 @@ impl<'a> Evaluator<'a> {
         // A redirect truncates its target once, when it is set up, not on every write, so combining
         // a value redirect with a merged stderr redirect cannot let one silently overwrite the
         // other depending on order.
-        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1512,7 +1603,7 @@ impl<'a> Evaluator<'a> {
             } = sink
             {
                 self.unshare_buffers()?;
-                Arc::make_mut(&mut self.buffers).insert(name.clone(), Value::Null);
+                Arc::make_mut(&mut self.buffers).insert(name.clone(), Vec::new());
                 self.buffer_charges.remove(name);
             }
         }
@@ -1578,7 +1669,9 @@ impl<'a> Evaluator<'a> {
             }
             Sink::Buffer { name, .. } => {
                 let name = name.clone();
-                self.append_buffer(&name, CommandResult::value(value::from_lines(diagnostics)))?;
+                for line in diagnostics {
+                    self.append_buffer_bytes(&name, format!("{line}\n").as_bytes())?;
+                }
             }
         }
         Ok(())
@@ -1590,35 +1683,51 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn append_buffer(
-        &mut self,
-        name: &str,
-        mut result: CommandResult,
-    ) -> Result<(), LimitExceeded> {
+    fn append_buffer(&mut self, name: &str, result: CommandResult) -> Result<(), LimitExceeded> {
         if result.value.is_null() {
             return Ok(());
         }
-        retain_value(&self.budget, &result.value, &mut result.retained)?;
-        self.buffer_charges
-            .entry(name.to_owned())
-            .or_default()
-            .extend(result.retained);
-        let value = result.value;
-        self.unshare_buffers()?;
-        let buffers = Arc::make_mut(&mut self.buffers);
-        match buffers.remove(name) {
-            None | Some(Value::Null) => {
-                buffers.insert(name.to_owned(), value);
-            }
-            Some(Value::Array(mut existing)) => {
-                existing.push(value);
-                buffers.insert(name.to_owned(), Value::Array(existing));
-            }
-            Some(existing) => {
-                buffers.insert(name.to_owned(), Value::Array(vec![existing, value]));
-            }
+        let suppress_newline = result.suppress_newline;
+        let text = match result.value {
+            Value::String(text) => text,
+            value @ (Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::Array(_)
+            | Value::Object(_)) => display(&value),
+        };
+        self.append_buffer_bytes(name, text.as_bytes())?;
+        if !suppress_newline {
+            self.append_buffer_bytes(name, b"\n")?;
         }
         Ok(())
+    }
+
+    fn append_buffer_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), LimitExceeded> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
+        self.append_charged_buffer_bytes(name, bytes, vec![charge])
+    }
+
+    fn append_charged_buffer_bytes(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        charges: Vec<crate::RetainedBytes>,
+    ) -> Result<(), LimitExceeded> {
+        append_charged_buffer(
+            &self.budget,
+            BufferStorage {
+                buffers: &mut self.buffers,
+                charges: &mut self.buffer_charges,
+                shared_charges: &mut self.shared_charges,
+            },
+            name,
+            bytes,
+            charges,
+        )
     }
 
     fn run_argv(
@@ -1707,6 +1816,7 @@ impl<'a> Evaluator<'a> {
         let mut utf8_pending = Vec::new();
         let retention_budget = self.budget.fork();
         let discard = self.output_discarded();
+        let active_buffer = self.active_buffer_name().map(str::to_owned);
         let outcome = crate::builtins::encode::stream(
             arguments,
             &mut reader,
@@ -1726,6 +1836,23 @@ impl<'a> Evaluator<'a> {
                     });
                 }
                 if matches!(stdout_sink, Sink::Value) && discard {
+                    return Ok(true);
+                }
+                if matches!(stdout_sink, Sink::Value)
+                    && let Some(name) = active_buffer.as_deref()
+                {
+                    let charge = retention_budget.charge_value_bytes(chunk.len() as u64)?;
+                    append_charged_buffer(
+                        &retention_budget,
+                        BufferStorage {
+                            buffers: &mut self.buffers,
+                            charges: &mut self.buffer_charges,
+                            shared_charges: &mut self.shared_charges,
+                        },
+                        name,
+                        chunk,
+                        vec![charge],
+                    )?;
                     return Ok(true);
                 }
                 if matches!(stdout_sink, Sink::Value) && !capture_output && self.captures.is_empty()
@@ -1751,6 +1878,10 @@ impl<'a> Evaluator<'a> {
                 .push_fragment(&String::from_utf8_lossy(&utf8_pending));
         }
         if bytes.is_empty() || status != ExitCode::SUCCESS {
+            return Ok(Executed::Result(CommandResult::status(status)));
+        }
+        if let Sink::Buffer { name, .. } = stdout_sink {
+            self.append_charged_buffer_bytes(name, &bytes, charges)?;
             return Ok(Executed::Result(CommandResult::status(status)));
         }
         let text = match String::from_utf8(bytes) {
@@ -1800,6 +1931,7 @@ impl<'a> Evaluator<'a> {
                 .unwrap_or_default(),
         };
         let discard = self.output_discarded();
+        let active_buffer = self.active_buffer_name().map(str::to_owned);
         let mut emit = |line: &[u8]| {
             if matches!(stdout_sink, Sink::Discard) {
                 return Ok(true);
@@ -1814,6 +1946,21 @@ impl<'a> Evaluator<'a> {
                 }
             }
             if matches!(stdout_sink, Sink::Value) && discard {
+                return Ok(true);
+            }
+            if matches!(stdout_sink, Sink::Value)
+                && let Some(name) = active_buffer.as_deref()
+            {
+                append_stream_buffer(
+                    &retention_budget,
+                    BufferStorage {
+                        buffers: &mut self.buffers,
+                        charges: &mut self.buffer_charges,
+                        shared_charges: &mut self.shared_charges,
+                    },
+                    name,
+                    line,
+                )?;
                 return Ok(true);
             }
             if !matches!(stdout_sink, Sink::Value) {
@@ -1898,6 +2045,10 @@ impl<'a> Evaluator<'a> {
             }
         }
         if !redirected_bytes.is_empty() {
+            if let Sink::Buffer { name, .. } = stdout_sink {
+                self.append_charged_buffer_bytes(name, &redirected_bytes, redirect_charges)?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
             let text = String::from_utf8(redirected_bytes).map_err(|_invalid_utf8| {
                 FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
             })?;
@@ -1907,6 +2058,102 @@ impl<'a> Evaluator<'a> {
             return Ok(Executed::Result(result));
         }
         Ok(Executed::Result(CommandResult::status(status)))
+    }
+
+    fn append_named_buffer(
+        &mut self,
+        source: &str,
+        destination: &str,
+    ) -> Result<(), LimitExceeded> {
+        self.unshare_buffers()?;
+        let length = self.buffers.get(source).map_or(0, Vec::len);
+        let charge = self.budget.charge_value_bytes(length as u64)?;
+        let buffers = Arc::make_mut(&mut self.buffers);
+        if source == destination {
+            if let Some(bytes) = buffers.get_mut(source) {
+                bytes.extend_from_within(..length);
+            }
+        } else {
+            let mut target = buffers.remove(destination).unwrap_or_default();
+            if let Some(bytes) = buffers.get(source) {
+                target.extend_from_slice(bytes);
+            }
+            buffers.insert(destination.to_owned(), target);
+        }
+        self.buffer_charges
+            .entry(destination.to_owned())
+            .or_default()
+            .push(charge);
+        Ok(())
+    }
+
+    fn run_named_cat(&mut self, arguments: &[String], sink: &Sink) -> Result<Executed, FatalError> {
+        for name in arguments {
+            if name.starts_with('-') && name.len() > 1 {
+                let status = self.absorb(CommandFailure::usage(format!(
+                    "cat: unsupported flag {name}"
+                )))?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
+            if name == DEV_NULL {
+                continue;
+            }
+            let Some(bytes) = self.buffers.get(name) else {
+                let status = self.absorb(CommandFailure::failed(format!(
+                    "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
+                )))?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            };
+            match sink {
+                Sink::Buffer {
+                    name: destination, ..
+                } => self.append_named_buffer(name, destination)?,
+                Sink::Discard => {}
+                Sink::Diagnostics => {
+                    if let Some(capture) = self.stderr_capture.last_mut() {
+                        capture.push_bytes(bytes);
+                    } else {
+                        push_lossy_bytes(&mut self.output, bytes);
+                    }
+                }
+                Sink::Value => {
+                    if let Some(destination) = self.active_buffer_name().map(str::to_owned) {
+                        self.append_named_buffer(name, &destination)?;
+                        continue;
+                    }
+                    if let Some(writer) = self.stdout.as_mut() {
+                        if writer.write(bytes) == WriteOutcome::ReaderGone {
+                            self.reader_gone = true;
+                            break;
+                        }
+                    } else {
+                        let text = match std::str::from_utf8(bytes) {
+                            Ok(text) => text,
+                            Err(_) if self.captures.is_empty() => {
+                                push_lossy_bytes(&mut self.output, bytes);
+                                continue;
+                            }
+                            Err(_) => {
+                                let status = self.absorb(CommandFailure::failed(
+                                    "standard input is not valid UTF-8 text",
+                                ))?;
+                                return Ok(Executed::Result(CommandResult::status(status)));
+                            }
+                        };
+                        if let Some(capture) = self.captures.last_mut() {
+                            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
+                            let mut result = CommandResult::value(Value::String(text.to_owned()))
+                                .without_newline();
+                            result.retained.push(charge);
+                            capture.push(result);
+                        } else {
+                            self.output.push_fragment(text);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS)))
     }
 
     fn run_simple_builtin(
@@ -1927,7 +2174,9 @@ impl<'a> Evaluator<'a> {
             && arguments.is_empty()
             && !capture_output
             && self.captures.is_empty()
-            && (self.stdout.is_some() || !self.stdout_redirected)
+            && (self.stdout.is_some()
+                || !self.stdout_redirected
+                || self.active_buffer_name().is_some())
         {
             return match self.copy_stdin(input) {
                 Ok(result) => Ok(Executed::Result(result)),
@@ -1992,7 +2241,11 @@ impl<'a> Evaluator<'a> {
                 self.call_function(command, arguments, input, capture_output, stdout_sink)
             }
             Resolution::Builtin(BuiltinKind::Simple(builtin)) => {
-                self.run_simple_builtin(builtin, arguments, input, capture_output, literal_help)
+                if builtin.name() == "cat" && !arguments.is_empty() && !literal_help {
+                    self.run_named_cat(arguments, stdout_sink)
+                } else {
+                    self.run_simple_builtin(builtin, arguments, input, capture_output, literal_help)
+                }
             }
             Resolution::Builtin(BuiltinKind::Jq) => self.run_lines(
                 StreamCommand::Jq,
@@ -2772,10 +3025,20 @@ impl<'a> Evaluator<'a> {
             ))));
         }
 
-        let retained = capture_charges(&mut captured);
+        let mut retained = capture_charges(&mut captured);
         let mut value = reduce_captured(captured);
         if let Value::String(text) = &mut value {
-            *text = text.trim_end_matches('\n').to_owned();
+            let length = text.trim_end_matches('\n').len();
+            let mut refund = (text.len() - length) as u64;
+            text.truncate(length);
+            for charge in retained.iter_mut().rev() {
+                let bytes = refund.min(charge.bytes());
+                charge.shrink(bytes);
+                refund -= bytes;
+                if refund == 0 {
+                    break;
+                }
+            }
         }
         let mut result = CommandResult {
             value,
@@ -2925,6 +3188,51 @@ fn invert(status: ExitCode) -> ExitCode {
     }
 }
 
+fn append_stream_buffer(
+    budget: &Budget,
+    storage: BufferStorage<'_>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LimitExceeded> {
+    let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+    append_charged_buffer(budget, storage, name, bytes, vec![charge])
+}
+
+struct BufferStorage<'a> {
+    buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
+    charges: &'a mut BTreeMap<String, Vec<crate::RetainedBytes>>,
+    shared_charges: &'a mut Vec<crate::RetainedBytes>,
+}
+
+fn append_charged_buffer(
+    budget: &Budget,
+    storage: BufferStorage<'_>,
+    name: &str,
+    bytes: &[u8],
+    charges: Vec<crate::RetainedBytes>,
+) -> Result<(), LimitExceeded> {
+    if Arc::strong_count(storage.buffers) > 1 {
+        let length: u64 = storage
+            .buffers
+            .values()
+            .map(|value| value.len() as u64)
+            .sum();
+        storage
+            .shared_charges
+            .push(budget.charge_value_bytes(length)?);
+    }
+    Arc::make_mut(storage.buffers)
+        .entry(name.to_owned())
+        .or_default()
+        .extend_from_slice(bytes);
+    storage
+        .charges
+        .entry(name.to_owned())
+        .or_default()
+        .extend(charges);
+    Ok(())
+}
+
 fn retain_value(
     budget: &Budget,
     value: &Value,
@@ -2943,6 +3251,21 @@ fn capture_charges(captured: &mut [CommandResult]) -> Vec<crate::RetainedBytes> 
         .iter_mut()
         .flat_map(|result| std::mem::take(&mut result.retained))
         .collect()
+}
+
+fn push_lossy_bytes(output: &mut OutputBuffer, bytes: &[u8]) {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = bytes.len().min(offset + 4096);
+        let complete = lossy_complete_prefix(&bytes[offset..end]);
+        let length = if complete == 0 {
+            bytes.len().min(offset + 4) - offset
+        } else {
+            complete
+        };
+        output.push_fragment(&String::from_utf8_lossy(&bytes[offset..offset + length]));
+        offset += length;
+    }
 }
 
 fn lossy_complete_prefix(bytes: &[u8]) -> usize {
