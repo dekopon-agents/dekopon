@@ -39,13 +39,11 @@ with HTTP 400 (moderation_blocked)`. The classification is what the exit status 
 the provider's sentence, and it is how an upstream refusal reaches the model at all rather than
 being guessed at.
 
-The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them.
+A provider receives its own pipe's bytes as UTF-8 text; invalid UTF-8 fails that stage rather than being replaced. `echo hello | gh issue create -` supplies `hello\n`, while a provider without its own pipe or here-document receives `None`.
 
 ## Value model
 
-Every variable is a `serde_json::Value`, not bash text. Capability inputs and outputs therefore need no marshaling, and JSON, arrays, maps, and arithmetic are native rather than emulated. `|` hands one structured value to the next command, closer to `jq`'s own `|` than to byte-stream piping.
-
-A here-document lands in that model as a plain string: a block of literal text is what a string is here, and no byte stream is involved anywhere. `cat <<EOF` prints that string as-is even when its body looks like JSON — auto-parsing would make `cat <<EOF` mean two different things depending on its contents. `jq` is the one builtin that crosses over on its own: a piped or here-document string that parses as a JSON object or array is filtered as that value — `jq . <<EOF` agrees with the same body reaching `jq` through a real pipe — while a string holding a scalar (or text that does not parse at all) is still indexed as the plain string it is. The newline ending the last body line is dropped, matching the rule that values here are not newline-terminated (`echo hi` produces `"hi"`, and emitting a value is what adds the line ending), so `cat <<EOF` prints what bash prints rather than a trailing blank line.
+Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `echo` appends a newline, `printf` does not, and a here-document supplies its literal text. `jq` parses each input JSON document, including scalars, with a depth limit; invalid input exits with status 2. It emits each filter result as a separate compact JSON line, quoting strings unless `-r` is set; `-c` changes nothing. An empty result emits no document. `-n` runs once on null without reading stdin; `-s` retains the document array against the value-byte budget and runs once, including on empty input (`[]`). Its worker compiles the filter once per stage and emits the first result without waiting for the end of stdin. A downstream stage that closes early kills and joins the worker.
 
 ## Grammar
 
@@ -60,8 +58,9 @@ A here-document lands in that model as a plain string: a block of literal text i
 ## `read`
 
 `read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
-place input is *consumed*. Everywhere else a piped value is *offered*: every pipeline in a body sees
-it, so a condition that never looks at it cannot swallow it before the command that does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
+place input is *consumed*. A compound stage owns one input stream: a command that does not read it
+leaves it for the next stdin-reading builtin in that stage. `read` advances the enclosing stream
+and reports failure at end of input,
 which is what ends the loop. End of input is a status and not a diagnostic, because a message there
 would be one per loop, every loop.
 
@@ -123,14 +122,18 @@ that, so the parser translates them back.
 They parse through the same production either way, and carry their own redirections:
 `{ a; b; } 2> log`.
 
-A compound stage runs in the **current scope**. There are no subshells here to run it in, so a
-variable a piped `while` loop assigns remains set after the loop — the opposite of bash, where that
-assignment is thrown away with the subshell and is the single most notorious trap in the language.
-The obvious script does the obvious thing.
+The last stage runs in the current scope, retaining assignments. Every earlier stage, including a
+compound, function, or `xargs`, runs on its own thread from a scope snapshot: assignments and
+named-buffer redirects there do not change the parent. `exit`, `return`, and `break` in a non-final
+stage end only that stage. Inside a compound, `read`, `cat`, and stdin-reading builtins share its
+one-shot input stream; provider commands do not inherit that stream.
 
-A stage feeding a pipe, a redirection, or a `$( )` has its emissions collected into one value, since
-each statement inside emits separately and `{ echo a; echo b; } | wc -l` must see both. That is the
-same collection a command substitution already performed.
+Pipeline stages exchange bytes; `xargs` runs one input line at a time and emits each command's
+output before reading the next line. Named redirection buffers append exact bytes, including invalid
+UTF-8, and `cat` copies those bytes to another pipe or buffer. Expanding buffer bytes into text or
+passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
+a whole assignment from JSON object or array text retains its structure, while unquoted text
+substitutions split on newlines rather than spaces.
 
 `{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
 unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.
@@ -196,7 +199,9 @@ inside a script; what a caller receives is the transcript a terminal would have 
 
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+
+`head` and `tail` select lines from standard input (10 by default): `-n N` or `-N` selects a count, and `tail -n +N` starts at line N. `head -n 0` closes input without reading. Neither accepts file operands, `-c`, or `-f`.
 
 Every builtin answers `--help` on stdout at exit 0, naming the flags it accepts (`true`, `false`, `sleep`, `cat`, and `printf` take none, so theirs reads `no flags`); the interpreter intercepts `--help` before the builtin's own argument parsing ever runs, so it wins even over a call that is otherwise malformed, such as `[ --help` with no closing `]`. The same accepted-subset text `--help` prints is what `unsupported_flag` appends to a refusal: `grep: option not yet supported: -q (supported: -v -i -c -n -E)`.
 
@@ -237,10 +242,12 @@ telemetry code.
 telemetry protocol — the embedding binary's subscriber decides where spans go. Spans must therefore
 be assumed to leave the process, and they carry the whole command: its word — whoever wrote it, a
 model-authored function name included — its resolution kind (`control`, `function`, `builtin`,
-`provider-command`, `rejected`, or `not-found`), its argument count, a duration, an exit code, and a
-stable outcome label, beside three payloads. `shell.command.arguments` is the argv after the word as
-a JSON array, `shell.command.stdin` the piped value as the command received it (present only when a
-value was piped), and `shell.command.output` what the command produced. Each payload passes through
+`provider-command`, `compound` for a compound pipeline stage, `rejected`, or `not-found`), its argument count, a duration, an exit code, and a
+stable outcome label, beside three payloads. A pipeline id and zero-based stage index identify
+concurrent stages; input/output byte counts, elapsed nanoseconds, and `end` or `reader_gone`
+record their stream outcome. Spawned command spans inherit the script span. `shell.command.arguments`
+is the argv after the word as a JSON array, `shell.command.stdin` the drained input for a provider or a non-streaming
+stdin-reading builtin when recorded (not the bytes passing through a streaming builtin), and `shell.command.output` the command's rendered result. Each payload passes through
 `dekopon_core::bounded_attribute`, which cuts a value past its byte cap on a character boundary and
 marks the cut, and carries a `.bytes` sibling with its full length, so a truncated attribute still
 says how much there was ([goal 2](../../docs/design.md#constitution)). A secret reference in argv is

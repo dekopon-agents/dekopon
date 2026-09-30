@@ -1,66 +1,41 @@
-use regex_bites::{NoExpand, Regex};
-use serde_json::Value;
+use regex_bites::Regex;
 
 use crate::{
-    builtins::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag},
-    value::to_lines,
+    CapabilityInvoker,
+    builtins::{CommandFailure, unsupported_flag},
+    limits::Budget,
+    pipe::CHUNK_BYTES,
 };
 
 const HELP: &str = "-e -E";
 
-pub(crate) struct Sed;
-
-impl Builtin for Sed {
-    fn name(&self) -> &'static str {
-        "sed"
-    }
-
-    fn help(&self) -> &'static str {
-        HELP
-    }
-
-    fn reads_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut script = None;
-        let mut extended = false;
-        for argument in arguments {
-            match argument.as_str() {
-                "-e" | "--expression" => {}
-                "-E" | "--regexp-extended" => extended = true,
-                flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("sed", flag, HELP));
+pub(crate) fn parse_arguments(arguments: &[String]) -> Result<Substitution, CommandFailure> {
+    let mut script = None;
+    let mut extended = false;
+    for argument in arguments {
+        match argument.as_str() {
+            "-e" | "--expression" => {}
+            "-E" | "--regexp-extended" => extended = true,
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(unsupported_flag("sed", flag, HELP));
+            }
+            literal => {
+                if script.is_some() {
+                    return Err(CommandFailure::usage(
+                        "sed: exactly one substitution script is supported",
+                    ));
                 }
-                literal => {
-                    if script.is_some() {
-                        return Err(CommandFailure::usage(
-                            "sed: exactly one substitution script is supported",
-                        ));
-                    }
-                    script = Some(literal.to_owned());
-                }
+                script = Some(literal.to_owned());
             }
         }
-        let Some(script) = script else {
-            return Err(CommandFailure::usage(
-                "sed: a substitution script is required, formatted as s/pattern/replacement/flags",
-            ));
-        };
-
-        let substitution = Substitution::parse(&script, extended)?;
-        let lines = to_lines(&input.unwrap_or(Value::Null))
-            .into_iter()
-            .map(|line| substitution.apply(&line))
-            .collect::<Vec<_>>();
-        Ok(CommandResult::lines(lines))
     }
+    let Some(script) = script else {
+        return Err(CommandFailure::usage(
+            "sed: a substitution script is required, formatted as s/pattern/replacement/flags",
+        ));
+    };
+
+    Substitution::parse(&script, extended)
 }
 
 #[derive(Clone, Debug)]
@@ -135,7 +110,11 @@ impl Substitution {
                 )));
             }
             Matcher::Literal {
-                needle: super::literal_pattern("sed", &fields[0])?,
+                needle: if ignore_case {
+                    super::literal_pattern("sed", &fields[0])?.to_lowercase()
+                } else {
+                    super::literal_pattern("sed", &fields[0])?
+                },
                 ignore_case,
             }
         };
@@ -161,57 +140,98 @@ impl Substitution {
         })
     }
 
-    pub(crate) fn apply(&self, line: &str) -> String {
-        let (needle, ignore_case) = match &self.matcher {
-            // The replacement text is inserted without the regex engine's own dollar-number
-            // interpolation, so a literal dollar sign the script wrote stays a dollar sign in both
-            // the literal and extended modes.
-            Matcher::Extended(regex) => {
-                let replaced = if self.global {
-                    regex.replace_all(line, NoExpand(&self.replacement))
-                } else {
-                    regex.replace(line, NoExpand(&self.replacement))
-                };
-                return replaced.into_owned();
-            }
+    pub(crate) fn emit(
+        &self,
+        line: &str,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<bool, CommandFailure> {
+        match &self.matcher {
+            Matcher::Extended(regex) => self.emit_matches(
+                line,
+                regex
+                    .find_iter(line)
+                    .map(|found| found.start()..found.end()),
+                budget,
+                invoker,
+                emit,
+            ),
             Matcher::Literal {
                 needle,
-                ignore_case,
-            } => (needle, *ignore_case),
-        };
-        if ignore_case {
-            return self.apply_case_insensitive(line, needle);
+                ignore_case: false,
+            } => self.emit_matches(
+                line,
+                line.match_indices(needle)
+                    .map(|(start, _)| start..start + needle.len()),
+                budget,
+                invoker,
+                emit,
+            ),
+            Matcher::Literal {
+                needle,
+                ignore_case: true,
+            } => {
+                let folded_len = line
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                let _charge = budget.charge_value_bytes(folded_len as u64)?;
+                let folded = line.to_lowercase();
+                self.emit_matches(
+                    line,
+                    folded
+                        .match_indices(needle)
+                        .map(|(start, _)| start..start + needle.len())
+                        .take_while(|range| {
+                            line.is_char_boundary(range.start) && line.is_char_boundary(range.end)
+                        }),
+                    budget,
+                    invoker,
+                    emit,
+                )
+            }
         }
-        if self.global {
-            return line.replace(needle, &self.replacement);
-        }
-        line.replacen(needle, &self.replacement, 1)
     }
 
-    fn apply_case_insensitive(&self, line: &str, pattern: &str) -> String {
-        let haystack = line.to_lowercase();
-        let needle = pattern.to_lowercase();
-        let mut output = String::with_capacity(line.len());
+    fn emit_matches(
+        &self,
+        line: &str,
+        matches: impl Iterator<Item = std::ops::Range<usize>>,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<bool, CommandFailure> {
         let mut cursor = 0;
-        while cursor <= line.len() {
-            let Some(offset) = haystack.get(cursor..).and_then(|rest| rest.find(&needle)) else {
-                break;
-            };
-            let start = cursor + offset;
-            let end = start + needle.len();
-            if !line.is_char_boundary(start) || !line.is_char_boundary(end) {
-                break;
+        for found in matches {
+            if !emit_chunks(&line.as_bytes()[cursor..found.start], budget, invoker, emit)?
+                || !emit_chunks(self.replacement.as_bytes(), budget, invoker, emit)?
+            {
+                return Ok(false);
             }
-            output.push_str(&line[cursor..start]);
-            output.push_str(&self.replacement);
-            cursor = end;
+            cursor = found.end;
             if !self.global {
                 break;
             }
         }
-        output.push_str(line.get(cursor..).unwrap_or_default());
-        output
+        emit_chunks(&line.as_bytes()[cursor..], budget, invoker, emit)
     }
+}
+
+pub(crate) fn emit_chunks(
+    bytes: &[u8],
+    budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
+    emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<bool, CommandFailure> {
+    for chunk in bytes.chunks(CHUNK_BYTES) {
+        budget.charge_step_with(invoker)?;
+        if !emit(chunk)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn group_reference(replacement: &str) -> Option<char> {
@@ -293,12 +313,15 @@ fn split_unescaped(body: &str, delimiter: char) -> Vec<String> {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::builtins::{CommandResult, test_support::run_builtin};
+    use crate::builtins::{
+        CommandResult,
+        text::stream::{TextStream, run_test},
+    };
 
-    use super::{Sed, Substitution};
+    use super::Substitution;
 
     fn sed(arguments: &[&str], input: Value) -> CommandResult {
-        run_builtin(&Sed, arguments, Some(input)).expect("sed runs")
+        run_test(TextStream::Sed, arguments, input).expect("sed runs")
     }
 
     #[test]
@@ -317,9 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn operates_line_by_line_over_arrays() {
+    fn operates_line_by_line_over_text() {
         assert_eq!(
-            sed(&["s/o/0/g"], json!(["foo", "bop"])).value,
+            sed(&["s/o/0/g"], json!("foo\nbop")).value,
             json!("f00\nb0p")
         );
     }
@@ -384,7 +407,7 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_rejected_by_name() {
-        let failure = run_builtin(&Sed, &["-n", "s/a/b/"], Some(json!("a")))
+        let failure = run_test(TextStream::Sed, &["-n", "s/a/b/"], json!("a"))
             .expect_err("-n is not supported");
         assert!(format!("{failure:?}").contains("-n"), "{failure:?}");
     }
@@ -408,7 +431,7 @@ mod tests {
             json!("X X")
         );
         assert_eq!(
-            sed(&["-E", "s/o$/0/"], json!(["foo", "of"])).value,
+            sed(&["-E", "s/o$/0/"], json!("foo\nof")).value,
             json!("fo0\nof")
         );
     }
@@ -429,13 +452,13 @@ mod tests {
     #[test]
     fn without_the_e_flag_a_regex_is_still_refused_by_name() {
         let failure =
-            run_builtin(&Sed, &["s/^ *//"], Some(json!("  x"))).expect_err("literal by default");
+            run_test(TextStream::Sed, &["s/^ *//"], json!("  x")).expect_err("literal by default");
         assert!(format!("{failure:?}").contains("anchors"), "{failure:?}");
     }
 
     #[test]
     fn an_uncompilable_e_pattern_fails_rather_than_matching_nothing() {
-        let failure = run_builtin(&Sed, &["-E", "s/a(/x/"], Some(json!("a(")))
+        let failure = run_test(TextStream::Sed, &["-E", "s/a(/x/"], json!("a("))
             .expect_err("an unclosed group is not a literal");
         assert!(
             format!("{failure:?}").contains("closing ')'"),

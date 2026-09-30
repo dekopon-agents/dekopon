@@ -888,7 +888,7 @@ withholds half of it serves nobody the constitution recognizes ([goal
 |---|---|
 | `broker.authorize` | `input` and `input.bytes` — the untrusted proposal payload |
 | `provider.invoke` | `input` and `input.bytes` — the payload passed to the component |
-| `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — the argv after the word, the piped value, and the command's stdout |
+| `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — argv, drained provider or buffered-builtin input when recorded, and the rendered command result |
 | `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
 | model/tool log events | the verbatim transcript; see below |
@@ -948,7 +948,7 @@ logs the configuration itself. The credential-free meta result appears as a tool
 next `agent.model.prompt` transcript, just as script output does — once per session, because a
 repeated inspection is answered with a short pointer at the copy already in the conversation.
 Per-command detail lives on the `shell.command` span: the command word, its kind, its arguments, the
-value piped into it, its output, its exit code, and its outcome — and, in constant size, on the
+drained provider or buffered-builtin input when recorded, its rendered result, its exit code, and its outcome — and, in constant size, on the
 `shell.script` span's counters.
 
 A mounted skill takes the same route as that meta result. The listing the model sees — names and
@@ -1010,9 +1010,9 @@ a public telemetry contract. Broker component spans and their bounds are describ
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so
 `prompt.script` is the span for a whole unit of model-requested work rather than for a single
 capability invocation. Inside it, the interpreter opens one `shell.script` span per run, and inside
-*that*, `shell.command` is one span per command word the script actually ran, in execution order — a
-builtin, a provider command word, a shell function, a word this shell refuses, or a word that
-resolved to nothing. A trace therefore reads as the ordered list of commands a script executed, and the reading
+*that*, `shell.command` is one span per command word the script actually ran; pipeline stages run concurrently, so their spans need not close in source order — a
+builtin, a provider command word, a shell function, a compound pipeline stage, a word this shell refuses, or a word that
+resolved to nothing. A trace therefore reads as the commands a script executed, with pipeline ids and stage indices preserving source order, and the reading
 survives constructs where one script word drives several executions: `xargs` mapping a command over
 ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as
 plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is named in this file's trace
@@ -1021,14 +1021,17 @@ and log filters. Each command span carries:
 | Attribute | Value |
 |---|---|
 | `shell.command.name` | The command word, whoever wrote it |
-| `shell.command.kind` | `builtin`, `provider-command`, `function`, `control`, `rejected`, or `not-found` |
+| `shell.command.kind` | `builtin`, `provider-command`, `function`, `compound` (a multi-stage pipeline's compound stage), `control`, `rejected`, or `not-found` |
 | `shell.command.arguments` | The arguments after the word as a JSON array of strings, [bounded](#span-payloads) |
 | `shell.command.arguments.bytes` | The uncut length of that array |
 | `shell.command.argument_count` | How many arguments the word received |
-| `shell.command.stdin` | The piped value's display text, bounded; absent when nothing was piped |
-| `shell.command.stdin.bytes` | The uncut length of the piped value |
-| `shell.command.output` | What the command wrote to stdout, bounded |
-| `shell.command.output.bytes` | The uncut length of that output |
+| `shell.command.stdin` | Bounded drained input for provider commands and non-streaming stdin-reading builtins; absent on stream-copying builtins |
+| `shell.command.stdin.bytes` | The uncut length of that recorded input |
+| `shell.command.output` | The rendered command result, bounded |
+| `shell.command.output.bytes` | The uncut length of that recorded result |
+| `shell.command.pipeline_id`, `shell.command.stage_index` | Shared pipeline id and zero-based position in it |
+| `shell.command.input.bytes`, `shell.command.stdout.bytes` | Bytes read from the stream and accepted by the next stage or terminal output |
+| `shell.command.duration_ns`, `shell.command.close_reason` | Stage elapsed nanoseconds and `end` or `reader_gone` |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, `cancelled`, or `rejected` |
 

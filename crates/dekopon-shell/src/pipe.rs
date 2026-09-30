@@ -1,12 +1,49 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+    },
     time::Duration,
 };
 
-use crate::{CapabilityInvoker, limits::Budget, limits::LimitExceeded};
+use crate::{
+    CapabilityInvoker, RetainedBytes,
+    interp::telemetry::{self, StageMeter},
+    limits::Budget,
+    limits::LimitExceeded,
+};
 
-const CHUNK_BYTES: usize = 4 * 1024;
+pub(crate) struct ChargedBytes {
+    pub(crate) bytes: Vec<u8>,
+    charges: Vec<RetainedBytes>,
+}
+
+impl ChargedBytes {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<RetainedBytes>) {
+        (self.bytes, self.charges)
+    }
+
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            charges: Vec::new(),
+        }
+    }
+
+    fn extend(
+        &mut self,
+        chunk: impl IntoIterator<Item = u8>,
+        len: usize,
+        budget: &Budget,
+    ) -> Result<(), LimitExceeded> {
+        self.charges.push(budget.charge_value_bytes(len as u64)?);
+        self.bytes.extend(chunk);
+        Ok(())
+    }
+}
+
+pub(crate) const CHUNK_BYTES: usize = 4 * 1024;
 
 const CAPACITY_CHUNKS: usize = 16;
 
@@ -28,14 +65,22 @@ pub(crate) enum WriteOutcome {
 #[derive(Debug)]
 pub(crate) struct PipeWriter {
     sender: SyncSender<Vec<u8>>,
+    meter: Option<Arc<StageMeter>>,
 }
 
 impl PipeWriter {
+    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
     pub(crate) fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
         for chunk in bytes.chunks(CHUNK_BYTES) {
             if self.sender.send(chunk.to_vec()).is_err() {
+                telemetry::stage_write(0, false, self.meter.as_ref());
                 return WriteOutcome::ReaderGone;
             }
+            telemetry::stage_write(chunk.len(), true, self.meter.as_ref());
         }
         WriteOutcome::Accepted
     }
@@ -52,6 +97,7 @@ pub(crate) struct PipeReader {
     source: Source,
     pending: VecDeque<u8>,
     ended: bool,
+    meter: Option<Arc<StageMeter>>,
 }
 
 impl Default for PipeReader {
@@ -61,11 +107,17 @@ impl Default for PipeReader {
 }
 
 impl PipeReader {
+    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             source: Source::Fixed,
             pending: bytes.into(),
             ended: true,
+            meter: None,
         }
     }
 
@@ -75,7 +127,11 @@ impl PipeReader {
         invoker: &dyn CapabilityInvoker,
     ) -> Result<ReadOutcome, LimitExceeded> {
         if !self.pending.is_empty() {
-            let bytes: Vec<u8> = self.pending.drain(..).collect();
+            let bytes: Vec<u8> = self
+                .pending
+                .drain(..self.pending.len().min(CHUNK_BYTES))
+                .collect();
+            telemetry::stage_read(bytes.len(), self.meter.as_ref());
             return Ok(ReadOutcome::Bytes(bytes));
         }
         loop {
@@ -94,6 +150,7 @@ impl PipeReader {
             match receiver.recv_timeout(wait) {
                 Ok(bytes) if bytes.is_empty() => {}
                 Ok(bytes) => {
+                    telemetry::stage_read(bytes.len(), self.meter.as_ref());
                     return Ok(ReadOutcome::Bytes(bytes));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -106,18 +163,19 @@ impl PipeReader {
         &mut self,
         budget: &Budget,
         invoker: &dyn CapabilityInvoker,
-    ) -> Result<Option<Vec<u8>>, LimitExceeded> {
-        let mut line = Vec::new();
+    ) -> Result<Option<ChargedBytes>, LimitExceeded> {
+        let mut line = ChargedBytes::new();
         loop {
             if let Some(offset) = self.pending.iter().position(|byte| *byte == b'\n') {
-                line.extend(self.pending.drain(..offset));
+                line.extend(self.pending.drain(..offset), offset, budget)?;
                 self.pending.pop_front();
                 return Ok(Some(line));
             }
-            line.extend(self.pending.drain(..));
+            let len = self.pending.len();
+            line.extend(self.pending.drain(..), len, budget)?;
             match self.read_more(budget, invoker)? {
                 true => {}
-                false if line.is_empty() => return Ok(None),
+                false if line.bytes.is_empty() => return Ok(None),
                 false => {
                     return Ok(Some(line));
                 }
@@ -129,10 +187,11 @@ impl PipeReader {
         &mut self,
         budget: &Budget,
         invoker: &dyn CapabilityInvoker,
-    ) -> Result<Vec<u8>, LimitExceeded> {
-        let mut bytes = Vec::new();
+    ) -> Result<ChargedBytes, LimitExceeded> {
+        let mut bytes = ChargedBytes::new();
         while let ReadOutcome::Bytes(chunk) = self.read(budget, invoker)? {
-            bytes.extend(chunk);
+            let len = chunk.len();
+            bytes.extend(chunk, len, budget)?;
         }
         Ok(bytes)
     }
@@ -155,11 +214,15 @@ impl PipeReader {
 pub(crate) fn pipe() -> (PipeWriter, PipeReader) {
     let (sender, receiver) = sync_channel(CAPACITY_CHUNKS);
     (
-        PipeWriter { sender },
+        PipeWriter {
+            sender,
+            meter: None,
+        },
         PipeReader {
             source: Source::Channel(receiver),
             pending: VecDeque::new(),
             ended: false,
+            meter: None,
         },
     )
 }
@@ -188,7 +251,10 @@ mod tests {
         assert_eq!(writer.write(b"a\nbc"), WriteOutcome::Accepted);
         drop(writer);
         assert_eq!(
-            reader.read_line(&budget, &Idle).expect("reads"),
+            reader
+                .read_line(&budget, &Idle)
+                .expect("reads")
+                .map(|line| line.bytes),
             Some(b"a".to_vec())
         );
         assert_eq!(
@@ -199,6 +265,30 @@ mod tests {
             reader.read(&budget, &Idle).expect("reads"),
             ReadOutcome::End
         );
+    }
+
+    #[test]
+    fn a_growing_line_and_drain_are_charged_before_appending() {
+        let budget = Budget::start(Limits {
+            max_value_bytes: 12,
+            ..Limits::default()
+        });
+        let (mut writer, mut reader) = pipe();
+        assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
+        drop(writer);
+        assert!(matches!(
+            reader.read_line(&budget, &Idle),
+            Err(LimitExceeded::ValueBytes { maximum: 12 })
+        ));
+        assert_eq!(budget.value_bytes(), 0);
+        let (mut writer, mut reader) = pipe();
+        assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
+        drop(writer);
+        assert!(matches!(
+            reader.drain(&budget, &Idle),
+            Err(LimitExceeded::ValueBytes { maximum: 12 })
+        ));
+        assert_eq!(budget.value_bytes(), 0);
     }
 
     #[test]

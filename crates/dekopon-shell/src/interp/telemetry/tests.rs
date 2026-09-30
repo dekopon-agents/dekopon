@@ -230,6 +230,151 @@ fn assert_recorded(span: &Captured, field: &str, recorded: &str, total: usize) {
 }
 
 #[test]
+fn pipeline_stage_spans_share_an_id_count_bytes_and_inherit_the_script_span() {
+    let telemetry = capture("echo hello | head -1");
+    let producer = telemetry.command_spans("echo")[0];
+    let consumer = telemetry.command_spans("head")[0];
+    assert_eq!(telemetry.outcome.exit_code.get(), 0);
+    assert_eq!(producer.field("shell.command.stage_index"), Some("0"));
+    assert_eq!(consumer.field("shell.command.stage_index"), Some("1"));
+    assert_eq!(
+        producer.field("shell.command.pipeline_id"),
+        consumer.field("shell.command.pipeline_id")
+    );
+    assert!(producer.field("shell.command.pipeline_id").is_some());
+    assert_eq!(producer.field("shell.command.stdout.bytes"), Some("6"));
+    assert_eq!(consumer.field("shell.command.input.bytes"), Some("6"));
+    assert_eq!(consumer.field("shell.command.stdin"), None);
+    assert_eq!(consumer.field("shell.command.stdout.bytes"), Some("6"));
+    for span in [producer, consumer] {
+        assert_eq!(span.field("shell.command.close_reason"), Some("end"));
+        assert!(span.field("shell.command.duration_ns").is_some());
+        assert!(span.parents.iter().any(|parent| parent == SCRIPT_SPAN));
+    }
+}
+
+#[test]
+fn compound_stage_records_its_outer_pipeline_boundary_not_its_inner_pipeline() {
+    for script in ["echo payload | { cat; }", "echo payload | { cat | cat; }"] {
+        let telemetry = capture(script);
+        assert_eq!(telemetry.outcome.exit_code.get(), 0, "{script}");
+        let outer = telemetry.command_spans("echo")[0];
+        let compound = telemetry.command_spans("{ ...; }")[0];
+        assert_eq!(compound.field("shell.command.kind"), Some("compound"));
+        assert_eq!(compound.field("shell.command.stage_index"), Some("1"));
+        assert_eq!(
+            compound.field("shell.command.pipeline_id"),
+            outer.field("shell.command.pipeline_id")
+        );
+        assert_eq!(
+            compound.field("shell.command.input.bytes"),
+            Some("8"),
+            "{script}"
+        );
+        assert_eq!(
+            compound.field("shell.command.stdout.bytes"),
+            Some("8"),
+            "{script}"
+        );
+        assert!(compound.parents.iter().any(|parent| parent == SCRIPT_SPAN));
+        let cat = telemetry.command_spans("cat")[0];
+        assert_ne!(
+            cat.field("shell.command.pipeline_id"),
+            compound.field("shell.command.pipeline_id")
+        );
+    }
+}
+
+#[test]
+fn last_stage_duration_excludes_the_wait_to_join_a_slow_producer() {
+    let telemetry = capture("sleep 0.25 | echo done");
+    let producer = telemetry.command_spans("sleep")[0];
+    let consumer = telemetry.command_spans("echo")[0];
+    let duration = |span: &Captured| {
+        span.field("shell.command.duration_ns")
+            .expect("stage duration")
+            .parse::<u64>()
+            .expect("nanoseconds")
+    };
+    assert_eq!(telemetry.outcome.exit_code.get(), 0);
+    assert_eq!(consumer.field("shell.command.stdout.bytes"), Some("5"));
+    assert!(
+        duration(consumer) < duration(producer),
+        "{consumer:?}, {producer:?}"
+    );
+}
+
+#[test]
+fn a_fatal_producer_suppresses_the_last_stages_pending_output() {
+    let telemetry = capture_with(
+        "while true; do :; done | echo visible",
+        Limits {
+            max_steps: 30,
+            ..Limits::default()
+        },
+        false,
+    );
+    assert_ne!(telemetry.outcome.exit_code.get(), 0);
+    assert!(
+        !telemetry.outcome.output.contains("visible"),
+        "{}",
+        telemetry.outcome.output
+    );
+}
+
+#[test]
+fn a_fatal_producer_still_emits_its_diagnostics_before_the_consumers() {
+    let telemetry = capture_with(
+        "{ echo producer >&2; sleep 0.05; recurse() { recurse; }; recurse; } | echo consumer >&2",
+        Limits {
+            max_recursion_depth: 8,
+            ..Limits::default()
+        },
+        false,
+    );
+    assert_ne!(telemetry.outcome.exit_code.get(), 0);
+    let producer = telemetry
+        .outcome
+        .output
+        .find("producer")
+        .expect("producer diagnostic");
+    let consumer = telemetry
+        .outcome
+        .output
+        .find("consumer")
+        .expect("consumer diagnostic");
+    assert!(producer < consumer, "{}", telemetry.outcome.output);
+    assert!(
+        telemetry.outcome.output.contains("nested deeper"),
+        "{}",
+        telemetry.outcome.output
+    );
+}
+
+#[test]
+fn a_provider_records_its_drained_stdin_but_a_stream_copy_does_not() {
+    let telemetry = capture("echo payload | probe upper -");
+    let provider = telemetry.command_spans("probe")[0];
+    assert_recorded(provider, "shell.command.stdin", "payload\n", 8);
+    assert_eq!(provider.field("shell.command.input.bytes"), Some("8"));
+    let streamed = capture("echo payload | cat");
+    let cat = streamed.command_spans("cat")[0];
+    assert_eq!(cat.field("shell.command.stdin"), None);
+    assert_eq!(cat.field("shell.command.input.bytes"), Some("8"));
+}
+
+#[test]
+fn early_consumer_close_records_reader_gone_on_the_producer() {
+    let telemetry = capture("while true; do echo y; done | head -n 0");
+    let producer = telemetry.command_spans("echo")[0];
+    assert_eq!(
+        producer.field("shell.command.close_reason"),
+        Some("reader_gone")
+    );
+    assert_eq!(producer.field("shell.command.stage_index"), Some("0"));
+}
+
+#[test]
 fn every_command_produces_exactly_one_span() {
     let telemetry =
         capture("greet() { echo hi; }\ngreet\ntrue\nprobe upper --text two\nnosuchcommand\n:");
