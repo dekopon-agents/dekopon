@@ -1,10 +1,18 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+    },
     time::Duration,
 };
 
-use crate::{CapabilityInvoker, RetainedBytes, limits::Budget, limits::LimitExceeded};
+use crate::{
+    CapabilityInvoker, RetainedBytes,
+    interp::telemetry::{self, StageMeter},
+    limits::Budget,
+    limits::LimitExceeded,
+};
 
 pub(crate) struct ChargedBytes {
     pub(crate) bytes: Vec<u8>,
@@ -57,14 +65,22 @@ pub(crate) enum WriteOutcome {
 #[derive(Debug)]
 pub(crate) struct PipeWriter {
     sender: SyncSender<Vec<u8>>,
+    meter: Option<Arc<StageMeter>>,
 }
 
 impl PipeWriter {
+    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
     pub(crate) fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
         for chunk in bytes.chunks(CHUNK_BYTES) {
             if self.sender.send(chunk.to_vec()).is_err() {
+                telemetry::stage_write(0, false, self.meter.as_ref());
                 return WriteOutcome::ReaderGone;
             }
+            telemetry::stage_write(chunk.len(), true, self.meter.as_ref());
         }
         WriteOutcome::Accepted
     }
@@ -81,6 +97,7 @@ pub(crate) struct PipeReader {
     source: Source,
     pending: VecDeque<u8>,
     ended: bool,
+    meter: Option<Arc<StageMeter>>,
 }
 
 impl Default for PipeReader {
@@ -90,11 +107,17 @@ impl Default for PipeReader {
 }
 
 impl PipeReader {
+    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             source: Source::Fixed,
             pending: bytes.into(),
             ended: true,
+            meter: None,
         }
     }
 
@@ -108,6 +131,7 @@ impl PipeReader {
                 .pending
                 .drain(..self.pending.len().min(CHUNK_BYTES))
                 .collect();
+            telemetry::stage_read(bytes.len(), self.meter.as_ref());
             return Ok(ReadOutcome::Bytes(bytes));
         }
         loop {
@@ -126,6 +150,7 @@ impl PipeReader {
             match receiver.recv_timeout(wait) {
                 Ok(bytes) if bytes.is_empty() => {}
                 Ok(bytes) => {
+                    telemetry::stage_read(bytes.len(), self.meter.as_ref());
                     return Ok(ReadOutcome::Bytes(bytes));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -189,11 +214,15 @@ impl PipeReader {
 pub(crate) fn pipe() -> (PipeWriter, PipeReader) {
     let (sender, receiver) = sync_channel(CAPACITY_CHUNKS);
     (
-        PipeWriter { sender },
+        PipeWriter {
+            sender,
+            meter: None,
+        },
         PipeReader {
             source: Source::Channel(receiver),
             pending: VecDeque::new(),
             ended: false,
+            meter: None,
         },
     )
 }

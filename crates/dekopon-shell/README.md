@@ -58,8 +58,9 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 ## `read`
 
 `read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
-place input is *consumed*. Everywhere else a piped value is *offered*: every pipeline in a body sees
-it, so a condition that never looks at it cannot swallow it before the command that does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
+place input is *consumed*. A compound stage owns one input stream: a command that does not read it
+leaves it for the next stdin-reading builtin in that stage. `read` advances the enclosing stream
+and reports failure at end of input,
 which is what ends the loop. End of input is a status and not a diagnostic, because a message there
 would be one per loop, every loop.
 
@@ -241,10 +242,12 @@ telemetry code.
 telemetry protocol — the embedding binary's subscriber decides where spans go. Spans must therefore
 be assumed to leave the process, and they carry the whole command: its word — whoever wrote it, a
 model-authored function name included — its resolution kind (`control`, `function`, `builtin`,
-`provider-command`, `rejected`, or `not-found`), its argument count, a duration, an exit code, and a
-stable outcome label, beside three payloads. `shell.command.arguments` is the argv after the word as
-a JSON array, `shell.command.stdin` the piped value as the command received it (present only when a
-value was piped), and `shell.command.output` what the command produced. Each payload passes through
+`provider-command`, `compound` for a compound pipeline stage, `rejected`, or `not-found`), its argument count, a duration, an exit code, and a
+stable outcome label, beside three payloads. A pipeline id and zero-based stage index identify
+concurrent stages; input/output byte counts, elapsed nanoseconds, and `end` or `reader_gone`
+record their stream outcome. Spawned command spans inherit the script span. `shell.command.arguments`
+is the argv after the word as a JSON array, `shell.command.stdin` the drained input for a provider or a non-streaming
+stdin-reading builtin when recorded (not the bytes passing through a streaming builtin), and `shell.command.output` the command's rendered result. Each payload passes through
 `dekopon_core::bounded_attribute`, which cuts a value past its byte cap on a character boundary and
 marks the cut, and carries a `.bytes` sibling with its full length, so a truncated attribute still
 says how much there was ([goal 2](../../docs/design.md#constitution)). A secret reference in argv is

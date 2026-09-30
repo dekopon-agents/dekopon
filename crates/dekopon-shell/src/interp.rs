@@ -87,15 +87,50 @@ struct BuiltinInput {
 /// join, so the default budget admits sixteen concurrent producers.
 const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+struct StagePosition {
+    pipeline: u64,
+    index: usize,
+}
+
+struct StageSetup {
+    position: StagePosition,
+    meter: Arc<telemetry::StageMeter>,
+}
+
+fn stage_compound_span(command: &Command) -> Option<tracing::Span> {
+    matches!(command, Command::Compound { .. })
+        .then(|| telemetry::command_span("{ ...; }", CommandKind::Compound, 0))
+}
+
+fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Executed, FatalError>) {
+    let Some(span) = span else { return };
+    let (status, outcome) = match executed {
+        Ok(Executed::Result(result)) => (result.status, telemetry::outcome_label(result.status)),
+        Ok(Executed::Flow(Flow::Exit(status) | Flow::Return(status))) => {
+            (*status, telemetry::outcome_label(*status))
+        }
+        Ok(Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_))) => {
+            (ExitCode::SUCCESS, "succeeded")
+        }
+        Err(error) => (
+            telemetry::fatal_exit_code(error),
+            telemetry::fatal_outcome(error),
+        ),
+    };
+    span.record("shell.command.exit_code", status.get());
+    span.record("outcome", outcome);
+}
+
 struct StageOutcome {
-    status: ExitCode,
+    status: Result<ExitCode, FatalError>,
     diagnostics: Vec<String>,
     enclosing: Option<PipeReader>,
 }
 
 enum Stage<'scope> {
     Running {
-        handle: ScopedJoinHandle<'scope, Result<StageOutcome, FatalError>>,
+        handle: ScopedJoinHandle<'scope, StageOutcome>,
         _stack: crate::RetainedBytes,
     },
     Refused {
@@ -105,7 +140,6 @@ enum Stage<'scope> {
 
 enum StageFailure {
     Refused(String),
-    Fatal(FatalError),
 }
 
 impl Stage<'_> {
@@ -113,7 +147,7 @@ impl Stage<'_> {
         match self {
             Self::Refused { message } => Err(StageFailure::Refused(message)),
             Self::Running { handle, _stack } => match handle.join() {
-                Ok(outcome) => outcome.map_err(StageFailure::Fatal),
+                Ok(outcome) => Ok(outcome),
                 Err(panic) => std::panic::resume_unwind(panic),
             },
         }
@@ -416,6 +450,11 @@ impl<'a> Evaluator<'a> {
             return Ok(());
         }
         let text = display(&result.value);
+        telemetry::stage_write(
+            text.len() + usize::from(!result.suppress_newline),
+            true,
+            None,
+        );
         if result.suppress_newline {
             self.output.push_fragment(&text);
         } else {
@@ -1009,27 +1048,61 @@ impl<'a> Evaluator<'a> {
             return Ok((ExitCode::SUCCESS, None));
         };
 
-        let (outcomes, diagnostics, executed) = thread::scope(|scope| {
+        let pipeline_id = telemetry::next_pipeline();
+        let meters = (0..pipeline.commands.len())
+            .map(|_| Arc::new(telemetry::StageMeter::default()))
+            .collect::<Vec<_>>();
+        let (outcomes, diagnostics, executed, last_trace) = thread::scope(|scope| {
             let mut input = StageInput::Inherited;
             let mut running = Vec::with_capacity(producers.len());
             for (index, command) in producers.iter().enumerate() {
                 let (writer, reader) = pipe::pipe();
-                let stage_input = std::mem::replace(&mut input, StageInput::Piped(reader));
-                running.push(self.spawn_stage(scope, index, command, stage_input, writer));
+                let stage_input = std::mem::replace(
+                    &mut input,
+                    StageInput::Piped(reader.with_meter(Arc::clone(&meters[index + 1]))),
+                );
+                running.push(self.spawn_stage(
+                    scope,
+                    StageSetup {
+                        position: StagePosition {
+                            pipeline: pipeline_id,
+                            index,
+                        },
+                        meter: Arc::clone(&meters[index]),
+                    },
+                    command,
+                    stage_input,
+                    writer.with_meter(Arc::clone(&meters[index])),
+                ));
             }
             if !producers.is_empty() {
                 self.stderr_capture.push(StderrCapture::new(&self.limits));
             }
+            let last_trace = telemetry::StageTrace::enter(
+                pipeline_id,
+                producers.len(),
+                Arc::clone(&meters[producers.len()]),
+            );
+            let compound_span = (!producers.is_empty())
+                .then(|| stage_compound_span(last))
+                .flatten();
+            if let Some(span) = &compound_span {
+                telemetry::record_compound_stage(span);
+            }
+            let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
             let executed = self.tested(pipeline.negated, |evaluator| {
                 evaluator.execute_command(last, input, false)
             });
+            record_compound_outcome(compound_span.as_ref(), &executed);
+            drop(_entered_compound);
+            last_trace.pause();
             let diagnostics = (!producers.is_empty())
                 .then(|| self.stderr_capture.pop())
                 .flatten()
                 .map(StderrCapture::finish)
                 .unwrap_or_default();
             let outcomes = running.into_iter().map(Stage::join).collect::<Vec<_>>();
-            (outcomes, diagnostics, executed)
+            (outcomes, diagnostics, executed, last_trace)
         });
         self.shared_charges.clear();
 
@@ -1041,20 +1114,24 @@ impl<'a> Evaluator<'a> {
                     for line in outcome.diagnostics {
                         self.write_line(&line);
                     }
-                    if index == 0
-                        && let (Some(slot), Some(reader)) =
-                            (self.stdin.last_mut(), outcome.enclosing)
-                    {
-                        *slot = reader;
+                    match outcome.status {
+                        Ok(status) => {
+                            if index == 0
+                                && let (Some(slot), Some(reader)) =
+                                    (self.stdin.last_mut(), outcome.enclosing)
+                            {
+                                *slot = reader;
+                            }
+                            stages.push(status);
+                        }
+                        Err(error) => {
+                            fatal.get_or_insert(error);
+                            stages.push(ExitCode::FAILURE);
+                        }
                     }
-                    stages.push(outcome.status);
                 }
                 Err(StageFailure::Refused(message)) => {
                     self.write_line(&message);
-                    stages.push(ExitCode::FAILURE);
-                }
-                Err(StageFailure::Fatal(error)) => {
-                    fatal.get_or_insert(error);
                     stages.push(ExitCode::FAILURE);
                 }
             }
@@ -1085,7 +1162,9 @@ impl<'a> Evaluator<'a> {
         if pipeline.negated {
             status = invert(status);
         }
+        last_trace.resume();
         self.emit(last)?;
+        drop(last_trace);
         Ok((status, None))
     }
 
@@ -1094,7 +1173,7 @@ impl<'a> Evaluator<'a> {
     fn spawn_stage<'scope, 'env>(
         &mut self,
         scope: &'scope Scope<'scope, 'env>,
-        index: usize,
+        setup: StageSetup,
         command: &'env Command,
         input: StageInput,
         writer: PipeWriter,
@@ -1103,7 +1182,10 @@ impl<'a> Evaluator<'a> {
         'a: 'env,
     {
         let refused = |reason: &dyn std::fmt::Display| Stage::Refused {
-            message: format!("dekopon-shell: pipeline stage {index}: {reason}"),
+            message: format!(
+                "dekopon-shell: pipeline stage {}: {reason}",
+                setup.position.index
+            ),
         };
         let stack = match self.budget.charge_value_bytes(STAGE_STACK_BYTES as u64) {
             Ok(stack) => stack,
@@ -1124,28 +1206,42 @@ impl<'a> Evaluator<'a> {
         let span = tracing::Span::current();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let spawned = thread::Builder::new()
-            .name(format!("dekopon-shell-stage-{index}"))
+            .name(format!("dekopon-shell-stage-{}", setup.position.index))
             .stack_size(STAGE_STACK_BYTES)
             .spawn_scoped(scope, move || {
                 tracing::dispatcher::with_default(&dispatcher, || {
                     let _entered = span.enter();
+                    let _stage_trace = telemetry::StageTrace::enter(
+                        setup.position.pipeline,
+                        setup.position.index,
+                        setup.meter,
+                    );
+                    let compound_span = stage_compound_span(command);
+                    if let Some(span) = &compound_span {
+                        telemetry::record_compound_stage(span);
+                    }
+                    let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
                     let inherited = enclosing.is_some();
                     if let Some(reader) = enclosing {
                         stage.stdin.push(reader);
                     }
-                    let executed =
-                        stage.tested(true, |stage| stage.execute_command(command, input, false))?;
-                    let status = match executed {
-                        Executed::Result(result) => {
-                            let status = result.status;
-                            stage.emit(result)?;
-                            status
+                    let status = (|| {
+                        let executed = stage
+                            .tested(true, |stage| stage.execute_command(command, input, false));
+                        record_compound_outcome(compound_span.as_ref(), &executed);
+                        let executed = executed?;
+                        match executed {
+                            Executed::Result(result) => {
+                                let status = result.status;
+                                stage.emit(result)?;
+                                Ok(status)
+                            }
+                            Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => Ok(status),
+                            Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
+                                Ok(stage.last_status)
+                            }
                         }
-                        Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => status,
-                        Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
-                            stage.last_status
-                        }
-                    };
+                    })();
                     stage.stdout = None;
                     let enclosing = if inherited { stage.stdin.pop() } else { None };
                     let diagnostics = stage
@@ -1153,11 +1249,11 @@ impl<'a> Evaluator<'a> {
                         .pop()
                         .map(StderrCapture::finish)
                         .unwrap_or_default();
-                    Ok(StageOutcome {
+                    StageOutcome {
                         status,
                         diagnostics,
                         enclosing,
-                    })
+                    }
                 })
             });
         match spawned {
@@ -1267,6 +1363,7 @@ impl<'a> Evaluator<'a> {
         while let ReadOutcome::Bytes(chunk) = reader.read(budget, *invoker)? {
             budget.charge_step_with(*invoker)?;
             let Some(writer) = stdout.as_mut() else {
+                telemetry::stage_write(chunk.len(), true, None);
                 partial.extend_from_slice(&chunk);
                 let complete = lossy_complete_prefix(&partial);
                 output.push_fragment(&String::from_utf8_lossy(&partial[..complete]));
@@ -1785,6 +1882,9 @@ impl<'a> Evaluator<'a> {
         if traced && let Ok(Executed::Result(result)) = &executed {
             telemetry::record_output(&span, &result.value);
         }
+        if traced {
+            telemetry::record_stage_command(&span);
+        }
         self.counters.record_status(status);
         executed
     }
@@ -1857,6 +1957,7 @@ impl<'a> Evaluator<'a> {
                 }
                 if matches!(stdout_sink, Sink::Value) && !capture_output && self.captures.is_empty()
                 {
+                    telemetry::stage_write(chunk.len(), true, None);
                     utf8_pending.extend_from_slice(chunk);
                     let complete = lossy_complete_prefix(&utf8_pending);
                     self.output
@@ -1969,6 +2070,7 @@ impl<'a> Evaluator<'a> {
                 redirect_charges.push(charge);
                 return Ok(true);
             }
+            telemetry::stage_terminal_write(line.len(), self.captures.is_empty());
             utf8_pending.extend_from_slice(line);
             let complete = match std::str::from_utf8(&utf8_pending) {
                 Ok(text) => text.len(),
