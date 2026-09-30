@@ -36,6 +36,10 @@ impl Builtin for Jq {
         HELP
     }
 
+    fn reads_stdin(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         context: &mut BuiltinContext<'_>,
@@ -81,7 +85,10 @@ fn parse_string_input(input: Option<Value>) -> Value {
     match input {
         Some(Value::String(text)) => match serde_json::from_str(&text) {
             Ok(parsed @ (Value::Object(_) | Value::Array(_))) => parsed,
-            _ => Value::String(text),
+            _ => Value::String(match text.strip_suffix('\n') {
+                Some(line) => line.to_owned(),
+                None => text,
+            }),
         },
         Some(other) => other,
         None => Value::Null,

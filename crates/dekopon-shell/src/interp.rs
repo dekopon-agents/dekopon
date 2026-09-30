@@ -5,7 +5,8 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    rc::Rc,
+    sync::Arc,
+    thread::{self, Scope, ScopedJoinHandle},
 };
 
 use serde_json::Value;
@@ -27,6 +28,7 @@ use crate::{
         expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
         pattern_metacharacter,
     },
+    pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome},
     value::{self, display},
 };
 
@@ -63,37 +65,46 @@ enum Sink {
     Buffer { name: String, append: bool },
 }
 
-#[derive(Debug, Default)]
-struct StdinSource {
-    value: Option<Rc<Value>>,
-    /// The read command consumes piped input one line at a time through a cursor, while other
-    /// commands see the whole value unconsumed each time, which is what lets a while-read loop
-    /// terminate instead of repeating the first line forever.
-    lines: Option<Vec<String>>,
-    position: usize,
+#[derive(Debug)]
+enum StageInput {
+    Inherited,
+    Piped(PipeReader),
 }
 
-impl StdinSource {
-    fn new(value: Option<Rc<Value>>) -> Self {
-        Self {
-            value,
-            lines: None,
-            position: 0,
-        }
-    }
+/// Each non-final stage thread reserves this much stack, charged against retained bytes until its
+/// join, so the default budget admits sixteen concurrent producers.
+const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
 
-    fn next_line(&mut self) -> Option<String> {
-        let lines = self.lines.get_or_insert_with(|| {
-            self.value
-                .as_deref()
-                .map(value::to_lines)
-                .unwrap_or_default()
-        });
-        let line = lines.get(self.position).cloned();
-        if line.is_some() {
-            self.position += 1;
+struct StageOutcome {
+    status: ExitCode,
+    diagnostics: Vec<String>,
+    enclosing: Option<PipeReader>,
+}
+
+enum Stage<'scope> {
+    Running {
+        handle: ScopedJoinHandle<'scope, Result<StageOutcome, FatalError>>,
+        _stack: crate::RetainedBytes,
+    },
+    Refused {
+        message: String,
+    },
+}
+
+enum StageFailure {
+    Refused(String),
+    Fatal(FatalError),
+}
+
+impl Stage<'_> {
+    fn join(self) -> Result<StageOutcome, StageFailure> {
+        match self {
+            Self::Refused { message } => Err(StageFailure::Refused(message)),
+            Self::Running { handle, _stack } => match handle.join() {
+                Ok(outcome) => outcome.map_err(StageFailure::Fatal),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
         }
-        line
     }
 }
 
@@ -192,21 +203,26 @@ pub(crate) fn run_with_tree(
         budget: Budget::start_tree(limits, tree.clone()),
         limits,
         output: OutputBuffer::new(&limits),
-        globals: prev
-            .map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
-            .into_iter()
-            .collect(),
+        globals: Arc::new(
+            prev.map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
+                .into_iter()
+                .collect(),
+        ),
         global_charges: BTreeMap::new(),
         buffer_charges: BTreeMap::new(),
         frames: Vec::new(),
         functions: BTreeMap::new(),
         function_names: BTreeSet::new(),
-        buffers: BTreeMap::new(),
+        buffers: Arc::new(BTreeMap::new()),
         captures: Vec::new(),
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
         testing_status: 0,
         stdin: Vec::new(),
+        stdout: None,
+        reader_gone: false,
+        stdout_redirected: false,
+        shared_charges: Vec::new(),
         stderr_capture: Vec::new(),
         counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
@@ -251,19 +267,20 @@ struct Evaluator<'a> {
     budget: Budget,
     limits: Limits,
     output: OutputBuffer,
-    globals: BTreeMap<String, Value>,
+    globals: Arc<BTreeMap<String, Value>>,
     global_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
     buffer_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
     frames: Vec<Frame>,
-    functions: BTreeMap<String, Rc<Program>>,
+    functions: BTreeMap<String, Arc<Program>>,
     function_names: BTreeSet<String>,
-    buffers: BTreeMap<String, Value>,
+    buffers: Arc<BTreeMap<String, Value>>,
     captures: Vec<Vec<CommandResult>>,
     expansion_charges: Vec<crate::RetainedBytes>,
-    /// Unlike a function call, a pipeline stage receiving piped input does not open a new variable
-    /// scope, so piping into a while-read loop can still leave a variable set afterward, unlike a
-    /// real shell subshell.
-    stdin: Vec<StdinSource>,
+    stdin: Vec<PipeReader>,
+    stdout: Option<PipeWriter>,
+    reader_gone: bool,
+    stdout_redirected: bool,
+    shared_charges: Vec<crate::RetainedBytes>,
     options: ShellOptions,
     testing_status: u32,
     stderr_capture: Vec<StderrCapture>,
@@ -272,7 +289,7 @@ struct Evaluator<'a> {
     last_substitution_status: ExitCode,
 }
 
-impl Evaluator<'_> {
+impl<'a> Evaluator<'a> {
     fn report_fatal(&mut self, fatal: &FatalError) -> ExitCode {
         let message = match fatal {
             FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
@@ -315,6 +332,17 @@ impl Evaluator<'_> {
         }
         if let Some(capture) = self.captures.last_mut() {
             capture.push(result);
+            return;
+        }
+        if let Some(stdout) = self.stdout.as_mut() {
+            let written = match write_display(stdout, &result.value) {
+                WriteOutcome::Accepted if !result.suppress_newline => stdout.write(b"\n"),
+                written @ (WriteOutcome::Accepted | WriteOutcome::ReaderGone) => written,
+            };
+            match written {
+                WriteOutcome::Accepted => {}
+                WriteOutcome::ReaderGone => self.reader_gone = true,
+            }
             return;
         }
         let text = display(&result.value);
@@ -380,19 +408,47 @@ impl Evaluator<'_> {
     }
 
     fn assign(&mut self, name: &str, mut result: CommandResult) -> Result<(), LimitExceeded> {
+        if !self
+            .frames
+            .iter()
+            .any(|frame| frame.locals.contains_key(name))
+        {
+            self.unshare_globals()?;
+        }
         let (values, charges) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(name))
-            .map_or((&mut self.globals, &mut self.global_charges), |frame| {
-                (&mut frame.locals, &mut frame.local_charges)
-            });
+            .map_or(
+                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
+                |frame| (&mut frame.locals, &mut frame.local_charges),
+            );
         values.remove(name);
         charges.remove(name);
         retain_value(&self.budget, &result.value, &mut result.retained)?;
         values.insert(name.to_owned(), result.value);
         charges.insert(name.to_owned(), result.retained);
+        Ok(())
+    }
+
+    fn unshare_globals(&mut self) -> Result<(), LimitExceeded> {
+        if Arc::strong_count(&self.globals) > 1 {
+            let bytes = self.globals.values().map(value_bytes).sum();
+            self.shared_charges
+                .push(self.budget.charge_value_bytes(bytes)?);
+        }
+        Arc::make_mut(&mut self.globals);
+        Ok(())
+    }
+
+    fn unshare_buffers(&mut self) -> Result<(), LimitExceeded> {
+        if Arc::strong_count(&self.buffers) > 1 {
+            let bytes = self.buffers.values().map(value_bytes).sum();
+            self.shared_charges
+                .push(self.budget.charge_value_bytes(bytes)?);
+        }
+        Arc::make_mut(&mut self.buffers);
         Ok(())
     }
 
@@ -420,14 +476,28 @@ impl Evaluator<'_> {
             value,
             charge,
         } = saved;
+        let in_frame = self
+            .frames
+            .iter()
+            .any(|frame| frame.locals.contains_key(&name));
+        if !in_frame
+            && Arc::strong_count(&self.globals) > 1
+            && self.globals.get(&name) == value.as_ref()
+        {
+            if let Some(charge) = charge {
+                self.global_charges.insert(name, charge);
+            }
+            return;
+        }
         let (values, charges) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(&name))
-            .map_or((&mut self.globals, &mut self.global_charges), |frame| {
-                (&mut frame.locals, &mut frame.local_charges)
-            });
+            .map_or(
+                (Arc::make_mut(&mut self.globals), &mut self.global_charges),
+                |frame| (&mut frame.locals, &mut frame.local_charges),
+            );
         values.remove(&name);
         charges.remove(&name);
         if let Some(value) = value {
@@ -497,7 +567,7 @@ impl Evaluator<'_> {
             Statement::Function(definition) => {
                 self.function_names.insert(definition.name.clone());
                 self.functions
-                    .insert(definition.name.clone(), Rc::new(definition.body.clone()));
+                    .insert(definition.name.clone(), Arc::new(definition.body.clone()));
                 self.last_status = ExitCode::SUCCESS;
                 Ok(Flow::Normal)
             }
@@ -701,8 +771,7 @@ impl Evaluator<'_> {
     fn run_read(
         &mut self,
         arguments: &[String],
-        input: Option<Rc<Value>>,
-        from_pipe: bool,
+        input: StageInput,
     ) -> Result<CommandResult, CommandFailure> {
         let mut names = arguments;
         if names.first().is_some_and(|first| first == "-r") {
@@ -726,14 +795,18 @@ impl Evaluator<'_> {
             }
         }
 
-        let line = if from_pipe {
-            StdinSource::new(input).next_line()
-        } else {
-            self.stdin.last_mut().and_then(StdinSource::next_line)
+        let line = match input {
+            StageInput::Piped(mut reader) => reader.read_line(&self.budget, self.invoker)?,
+            StageInput::Inherited => match self.stdin.last_mut() {
+                Some(reader) => reader.read_line(&self.budget, self.invoker)?,
+                None => None,
+            },
         };
         let Some(line) = line else {
             return Ok(CommandResult::status(ExitCode::FAILURE));
         };
+        let line = String::from_utf8(line)
+            .map_err(|_not_utf8| CommandFailure::failed("read: input is not valid UTF-8 text"))?;
 
         let fields = split_read_fields(&line, names.len());
         for (index, name) in names.iter().enumerate() {
@@ -814,8 +887,9 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) {
-        self.globals.insert(
+    fn record_pipe_statuses(&mut self, stages: Vec<ExitCode>) -> Result<(), LimitExceeded> {
+        self.unshare_globals()?;
+        Arc::make_mut(&mut self.globals).insert(
             "PIPESTATUS".to_owned(),
             Value::Array(
                 stages
@@ -824,6 +898,7 @@ impl Evaluator<'_> {
                     .collect(),
             ),
         );
+        Ok(())
     }
 
     fn tested<T>(
@@ -856,33 +931,64 @@ impl Evaluator<'_> {
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
         self.budget.charge_step_with(self.invoker)?;
-        let mut input: Option<Rc<Value>> =
-            self.stdin.last().and_then(|source| source.value.clone());
-        let mut last = CommandResult::status(ExitCode::SUCCESS);
-        let mut input_charges = Vec::new();
-        let commands = pipeline.commands.len();
-        let mut stages = Vec::with_capacity(commands);
+        if self.reader_gone && self.captures.is_empty() {
+            return Ok((self.last_status, Some(Flow::Exit(self.last_status))));
+        }
+        let Some((last, producers)) = pipeline.commands.split_last() else {
+            return Ok((ExitCode::SUCCESS, None));
+        };
 
-        for (index, command) in pipeline.commands.iter().enumerate() {
-            let piped = index + 1 < commands;
-            let from_pipe = index > 0;
-            match self.tested(pipeline.negated || piped, |evaluator| {
-                evaluator.execute_command(command, input.take(), piped, from_pipe)
-            })? {
-                Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
-                Executed::Result(result) => {
-                    input_charges.clear();
-                    stages.push(result.status);
-                    if piped {
-                        last = CommandResult::status(result.status);
-                        input = Some(Rc::new(result.value));
-                        input_charges = result.retained;
-                    } else {
-                        last = result;
+        let (outcomes, executed) = thread::scope(|scope| {
+            let mut input = StageInput::Inherited;
+            let mut running = Vec::with_capacity(producers.len());
+            for (index, command) in producers.iter().enumerate() {
+                let (writer, reader) = pipe::pipe();
+                let stage_input = std::mem::replace(&mut input, StageInput::Piped(reader));
+                running.push(self.spawn_stage(scope, index, command, stage_input, writer));
+            }
+            let executed = self.tested(pipeline.negated, |evaluator| {
+                evaluator.execute_command(last, input, false)
+            });
+            let outcomes = running.into_iter().map(Stage::join).collect::<Vec<_>>();
+            (outcomes, executed)
+        });
+        self.shared_charges.clear();
+
+        let mut stages = Vec::with_capacity(pipeline.commands.len());
+        let mut fatal = None;
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                Ok(outcome) => {
+                    for line in outcome.diagnostics {
+                        self.write_line(&line);
                     }
+                    if index == 0
+                        && let (Some(slot), Some(reader)) =
+                            (self.stdin.last_mut(), outcome.enclosing)
+                    {
+                        *slot = reader;
+                    }
+                    stages.push(outcome.status);
+                }
+                Err(StageFailure::Refused(message)) => {
+                    self.write_line(&message);
+                    stages.push(ExitCode::FAILURE);
+                }
+                Err(StageFailure::Fatal(error)) => {
+                    fatal.get_or_insert(error);
+                    stages.push(ExitCode::FAILURE);
                 }
             }
         }
+        let executed = executed.map_err(|error| fatal.take().unwrap_or(error))?;
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+        let last = match executed {
+            Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
+            Executed::Result(result) => result,
+        };
+        stages.push(last.status);
 
         let mut status = last.status;
         if self.options.pipefail
@@ -893,7 +999,7 @@ impl Evaluator<'_> {
         {
             status = *failed;
         }
-        self.record_pipe_statuses(stages);
+        self.record_pipe_statuses(stages)?;
         if pipeline.negated {
             status = invert(status);
         }
@@ -901,18 +1007,223 @@ impl Evaluator<'_> {
         Ok((status, None))
     }
 
+    /// The enclosing compound's stream moves into the first stage for the stage's lifetime and
+    /// comes back at its join, so whatever it leaves unread is still there for the next command.
+    fn spawn_stage<'scope, 'env>(
+        &mut self,
+        scope: &'scope Scope<'scope, 'env>,
+        index: usize,
+        command: &'env Command,
+        input: StageInput,
+        writer: PipeWriter,
+    ) -> Stage<'scope>
+    where
+        'a: 'env,
+    {
+        let refused = |reason: &dyn std::fmt::Display| Stage::Refused {
+            message: format!("dekopon-shell: pipeline stage {index}: {reason}"),
+        };
+        let stack = match self.budget.charge_value_bytes(STAGE_STACK_BYTES as u64) {
+            Ok(stack) => stack,
+            Err(_limit) => {
+                return refused(&format_args!(
+                    "cannot reserve {STAGE_STACK_BYTES} bytes of stack within the retained-value budget"
+                ));
+            }
+        };
+        let mut stage = match self.snapshot(writer) {
+            Ok(stage) => stage,
+            Err(limit) => return refused(&format_args!("{limit:?}")),
+        };
+        let enclosing = match input {
+            StageInput::Inherited => self.stdin.last_mut().map(std::mem::take),
+            StageInput::Piped(_) => None,
+        };
+        let span = tracing::Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let spawned = thread::Builder::new()
+            .name(format!("dekopon-shell-stage-{index}"))
+            .stack_size(STAGE_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    let _entered = span.enter();
+                    let inherited = enclosing.is_some();
+                    if let Some(reader) = enclosing {
+                        stage.stdin.push(reader);
+                    }
+                    let executed =
+                        stage.tested(true, |stage| stage.execute_command(command, input, false))?;
+                    let status = match executed {
+                        Executed::Result(result) => {
+                            let status = result.status;
+                            stage.emit(result);
+                            status
+                        }
+                        Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => status,
+                        Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
+                            stage.last_status
+                        }
+                    };
+                    stage.stdout = None;
+                    let enclosing = if inherited { stage.stdin.pop() } else { None };
+                    let diagnostics = stage
+                        .stderr_capture
+                        .pop()
+                        .map(StderrCapture::finish)
+                        .unwrap_or_default();
+                    Ok(StageOutcome {
+                        status,
+                        diagnostics,
+                        enclosing,
+                    })
+                })
+            });
+        match spawned {
+            Ok(handle) => Stage::Running {
+                handle,
+                _stack: stack,
+            },
+            Err(error) => refused(&error),
+        }
+    }
+
+    fn snapshot(&mut self, writer: PipeWriter) -> Result<Evaluator<'a>, LimitExceeded> {
+        let mut frames = Vec::with_capacity(self.frames.len());
+        for frame in &self.frames {
+            let mut local_charges = BTreeMap::new();
+            for (name, value) in &frame.locals {
+                local_charges.insert(
+                    name.clone(),
+                    vec![self.budget.charge_value_bytes(value_bytes(value))?],
+                );
+            }
+            let positional_charges = frame
+                .positional
+                .iter()
+                .map(|value| self.budget.charge_value_bytes(value_bytes(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            frames.push(Frame {
+                locals: frame.locals.clone(),
+                positional: frame.positional.clone(),
+                local_charges,
+                _positional_charges: positional_charges,
+            });
+        }
+        Ok(Evaluator {
+            invoker: self.invoker,
+            budget: self.budget.fork(),
+            limits: self.limits,
+            output: OutputBuffer::new(&self.limits),
+            globals: Arc::clone(&self.globals),
+            global_charges: BTreeMap::new(),
+            buffer_charges: BTreeMap::new(),
+            frames,
+            functions: self.functions.clone(),
+            function_names: self.function_names.clone(),
+            buffers: Arc::clone(&self.buffers),
+            captures: Vec::new(),
+            expansion_charges: Vec::new(),
+            options: self.options,
+            testing_status: 0,
+            stdin: Vec::new(),
+            stdout: Some(writer),
+            reader_gone: false,
+            stdout_redirected: false,
+            shared_charges: Vec::new(),
+            stderr_capture: vec![StderrCapture::new(&self.limits)],
+            counters: telemetry::ScriptCounters::default(),
+            last_status: self.last_status,
+            last_substitution_status: ExitCode::SUCCESS,
+        })
+    }
+
+    fn copy_stdin(&mut self, input: StageInput) -> Result<CommandResult, CommandFailure> {
+        let Self {
+            stdin,
+            stdout,
+            output,
+            budget,
+            invoker,
+            reader_gone,
+            ..
+        } = self;
+        let mut piped;
+        let reader = match input {
+            StageInput::Piped(reader) => {
+                piped = reader;
+                &mut piped
+            }
+            StageInput::Inherited => match stdin.last_mut() {
+                Some(reader) => reader,
+                None => return Ok(CommandResult::status(ExitCode::SUCCESS)),
+            },
+        };
+        let not_text = || CommandFailure::failed("standard input is not valid UTF-8 text");
+        let mut partial = Vec::new();
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget, *invoker)? {
+            budget.charge_step_with(*invoker)?;
+            let Some(writer) = stdout.as_mut() else {
+                partial.extend_from_slice(&chunk);
+                let complete = match std::str::from_utf8(&partial) {
+                    Ok(text) => text.len(),
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(_) => return Err(not_text()),
+                };
+                output.push_fragment(
+                    std::str::from_utf8(&partial[..complete]).map_err(|_not_utf8| not_text())?,
+                );
+                partial.drain(..complete);
+                continue;
+            };
+            match writer.write(&chunk) {
+                WriteOutcome::Accepted => {}
+                WriteOutcome::ReaderGone => {
+                    *reader_gone = true;
+                    break;
+                }
+            }
+        }
+        if !partial.is_empty() {
+            return Err(not_text());
+        }
+        Ok(CommandResult::status(ExitCode::SUCCESS))
+    }
+
+    fn builtin_input(
+        &mut self,
+        reads_stdin: bool,
+        input: StageInput,
+    ) -> Result<Option<Value>, CommandFailure> {
+        let bytes = match input {
+            StageInput::Piped(mut reader) if reads_stdin => {
+                reader.drain(&self.budget, self.invoker)?
+            }
+            StageInput::Inherited if reads_stdin => match self.stdin.last_mut() {
+                Some(reader) => reader.drain(&self.budget, self.invoker)?,
+                None => return Ok(None),
+            },
+            StageInput::Piped(_) | StageInput::Inherited => return Ok(None),
+        };
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let text = String::from_utf8(bytes).map_err(|_not_utf8| {
+            CommandFailure::failed("standard input is not valid UTF-8 text")
+        })?;
+        let value = Value::String(text);
+        telemetry::record_stdin(&tracing::Span::current(), &value);
+        Ok(Some(value))
+    }
+
     fn execute_command(
         &mut self,
         command: &Command,
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
-        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         let parent = std::mem::take(&mut self.expansion_charges);
         let result = match command {
-            Command::Simple(command) => {
-                self.execute_simple_command(command, input, capture_output, from_pipe)
-            }
+            Command::Simple(command) => self.execute_simple_command(command, input, capture_output),
             Command::Compound {
                 statement,
                 redirects,
@@ -930,7 +1241,7 @@ impl Evaluator<'_> {
         &mut self,
         statement: &Statement,
         redirects: &[Redirect],
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let (stdout, stderr) = match self.resolve_redirects(redirects) {
@@ -946,7 +1257,13 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        self.stdin.push(StdinSource::new(input));
+        let piped = match input {
+            StageInput::Piped(reader) => {
+                self.stdin.push(reader);
+                true
+            }
+            StageInput::Inherited => false,
+        };
         if collect {
             self.captures.push(Vec::new());
         }
@@ -958,7 +1275,9 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
-        self.stdin.pop();
+        if piped {
+            self.stdin.pop();
+        }
         let mut diagnostics = capturing
             .then(|| self.stderr_capture.pop())
             .flatten()
@@ -990,7 +1309,7 @@ impl Evaluator<'_> {
             result.value = merge_diagnostics(result.value, diagnostics);
             diagnostics = Vec::new();
         }
-        self.open_buffers(&[&stdout, &stderr]);
+        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1014,9 +1333,8 @@ impl Evaluator<'_> {
     fn execute_simple_command(
         &mut self,
         command: &SimpleCommand,
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
-        from_pipe: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step_with(self.invoker)?;
 
@@ -1075,13 +1393,15 @@ impl Evaluator<'_> {
             None => input,
             Some(body) => match self.expand_quoted(&body.parts) {
                 Ok(text) => {
-                    let value = Value::String(text);
                     here_doc_charges = self.expansion_charges.split_off(start);
-                    if let Err(limit) = retain_value(&self.budget, &value, &mut here_doc_charges) {
-                        self.restore_all(restore);
-                        return Err(limit.into());
+                    match self.budget.charge_value_bytes(text.len() as u64) {
+                        Ok(charge) => here_doc_charges.push(charge),
+                        Err(limit) => {
+                            self.restore_all(restore);
+                            return Err(limit.into());
+                        }
                     }
-                    Some(Rc::new(value))
+                    StageInput::Piped(PipeReader::from_bytes(text.into_bytes()))
                 }
                 Err(failure) => {
                     self.restore_all(restore);
@@ -1104,7 +1424,17 @@ impl Evaluator<'_> {
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
         }
-        let executed = self.run_argv(&argv, input, capture_output, from_pipe, literal_help);
+        let stage_stdout = match stdout {
+            Sink::Value => None,
+            Sink::Diagnostics | Sink::Discard | Sink::Buffer { .. } => self.stdout.take(),
+        };
+        let redirected = self.stdout_redirected;
+        self.stdout_redirected |= stdout != Sink::Value;
+        let executed = self.run_argv(&argv, input, capture_output, literal_help);
+        self.stdout_redirected = redirected;
+        if let Some(writer) = stage_stdout {
+            self.stdout = Some(writer);
+        }
         // The stderr capture is removed before the fallible step that follows can return early, so
         // a fatal error can never leave a capture installed that silently swallows the rest of the
         // script's diagnostics.
@@ -1129,7 +1459,7 @@ impl Evaluator<'_> {
         // A redirect truncates its target once, when it is set up, not on every write, so combining
         // a value redirect with a merged stderr redirect cannot let one silently overwrite the
         // other depending on order.
-        self.open_buffers(&[&stdout, &stderr]);
+        self.open_buffers(&[&stdout, &stderr])?;
         self.route_diagnostics(diagnostics, &stderr)?;
 
         match stdout {
@@ -1150,17 +1480,19 @@ impl Evaluator<'_> {
         }
     }
 
-    fn open_buffers(&mut self, sinks: &[&Sink]) {
+    fn open_buffers(&mut self, sinks: &[&Sink]) -> Result<(), LimitExceeded> {
         for sink in sinks {
             if let Sink::Buffer {
                 name,
                 append: false,
             } = sink
             {
-                self.buffers.insert(name.clone(), Value::Null);
+                self.unshare_buffers()?;
+                Arc::make_mut(&mut self.buffers).insert(name.clone(), Value::Null);
                 self.buffer_charges.remove(name);
             }
         }
+        Ok(())
     }
 
     fn resolve_redirects(
@@ -1248,17 +1580,18 @@ impl Evaluator<'_> {
             .or_default()
             .extend(result.retained);
         let value = result.value;
-        match self.buffers.remove(name) {
+        self.unshare_buffers()?;
+        let buffers = Arc::make_mut(&mut self.buffers);
+        match buffers.remove(name) {
             None | Some(Value::Null) => {
-                self.buffers.insert(name.to_owned(), value);
+                buffers.insert(name.to_owned(), value);
             }
             Some(Value::Array(mut existing)) => {
                 existing.push(value);
-                self.buffers.insert(name.to_owned(), Value::Array(existing));
+                buffers.insert(name.to_owned(), Value::Array(existing));
             }
             Some(existing) => {
-                self.buffers
-                    .insert(name.to_owned(), Value::Array(vec![existing, value]));
+                buffers.insert(name.to_owned(), Value::Array(vec![existing, value]));
             }
         }
         Ok(())
@@ -1267,9 +1600,8 @@ impl Evaluator<'_> {
     fn run_argv(
         &mut self,
         argv: &[String],
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
-        from_pipe: bool,
         literal_help: bool,
     ) -> Result<Executed, FatalError> {
         let command = argv[0].as_str();
@@ -1287,9 +1619,6 @@ impl Evaluator<'_> {
         let traced = !span.is_disabled();
         if traced {
             telemetry::record_arguments(&span, arguments);
-            if let Some(piped) = input.as_deref() {
-                telemetry::record_stdin(&span, piped);
-            }
         }
 
         let executed = self.dispatch_command(
@@ -1298,7 +1627,6 @@ impl Evaluator<'_> {
             resolution,
             input,
             capture_output,
-            from_pipe,
             literal_help,
         );
         let (status, outcome) = match &executed {
@@ -1336,13 +1664,12 @@ impl Evaluator<'_> {
         command: &str,
         arguments: &[String],
         resolution: Option<Resolution>,
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
-        from_pipe: bool,
         literal_help: bool,
     ) -> Result<Executed, FatalError> {
         let Some(resolution) = resolution else {
-            if let Some(executed) = self.run_control_word(command, arguments, input, from_pipe)? {
+            if let Some(executed) = self.run_control_word(command, arguments, input)? {
                 return Ok(executed);
             }
             self.write_line(&format!("dekopon-shell: {command}: command not found"));
@@ -1359,13 +1686,34 @@ impl Evaluator<'_> {
                         builtin.help(),
                     )));
                 }
+                if builtin.copies_stdin()
+                    && arguments.is_empty()
+                    && !capture_output
+                    && self.captures.is_empty()
+                    && (self.stdout.is_some() || !self.stdout_redirected)
+                {
+                    return match self.copy_stdin(input) {
+                        Ok(result) => Ok(Executed::Result(result)),
+                        Err(failure) => {
+                            let status = self.absorb(failure)?;
+                            Ok(Executed::Result(CommandResult::status(status)))
+                        }
+                    };
+                }
+                let input = match self.builtin_input(builtin.reads_stdin(), input) {
+                    Ok(input) => input,
+                    Err(failure) => {
+                        let status = self.absorb(failure)?;
+                        return Ok(Executed::Result(CommandResult::status(status)));
+                    }
+                };
                 let outcome = {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
                         budget: &mut self.budget,
-                        buffers: &mut self.buffers,
+                        buffers: &self.buffers,
                     };
-                    builtin.run(&mut context, arguments, own(input))
+                    builtin.run(&mut context, arguments, input)
                 };
                 match outcome {
                     Ok(result) => Ok(Executed::Result(result)),
@@ -1385,7 +1733,16 @@ impl Evaluator<'_> {
                 self.run_xargs(arguments, input)
             }
             Resolution::ProviderCommand => {
-                let stdin = input.as_deref().map(display);
+                let stdin = match input {
+                    StageInput::Piped(_) => match self.builtin_input(true, input) {
+                        Ok(stdin) => stdin.as_ref().map(display),
+                        Err(failure) => {
+                            let status = self.absorb(failure)?;
+                            return Ok(Executed::Result(CommandResult::status(status)));
+                        }
+                    },
+                    StageInput::Inherited => None,
+                };
                 self.budget.check_deadline()?;
                 let run = self
                     .invoker
@@ -1442,12 +1799,12 @@ impl Evaluator<'_> {
                     let mut context = BuiltinContext {
                         invoker: self.invoker,
                         budget: &mut self.budget,
-                        buffers: &mut self.buffers,
+                        buffers: &self.buffers,
                     };
                     context.invoke_proposal(proposal)
                 };
                 match outcome {
-                    Ok(result) => Ok(Executed::Result(result)),
+                    Ok(result) => Ok(Executed::Result(self.provider_value(result))),
                     Err(failure) => {
                         let status = self.absorb(failure)?;
                         Ok(Executed::Result(CommandResult::status(status)))
@@ -1461,12 +1818,18 @@ impl Evaluator<'_> {
         }
     }
 
+    fn provider_value(&self, mut result: CommandResult) -> CommandResult {
+        if result.value.is_null() && self.stdout.is_some() && self.captures.is_empty() {
+            result.value = Value::String(String::new());
+        }
+        result
+    }
+
     fn run_control_word(
         &mut self,
         command: &str,
         arguments: &[String],
-        input: Option<Rc<Value>>,
-        from_pipe: bool,
+        input: StageInput,
     ) -> Result<Option<Executed>, FatalError> {
         let executed = match command {
             "break" | "continue" => {
@@ -1516,7 +1879,7 @@ impl Evaluator<'_> {
                 };
                 Executed::Flow(Flow::Exit(status))
             }
-            "read" => match self.run_read(arguments, input, from_pipe) {
+            "read" => match self.run_read(arguments, input) {
                 Ok(result) => Executed::Result(result),
                 Err(failure) => {
                     let status = self.absorb(failure)?;
@@ -1563,8 +1926,9 @@ impl Evaluator<'_> {
                 }
             }
             "unset" => {
+                self.unshare_globals()?;
                 for name in arguments {
-                    self.globals.remove(name);
+                    Arc::make_mut(&mut self.globals).remove(name);
                     self.global_charges.remove(name);
                     for frame in &mut self.frames {
                         frame.locals.remove(name);
@@ -1583,7 +1947,7 @@ impl Evaluator<'_> {
         &mut self,
         name: &str,
         arguments: &[String],
-        input: Option<Rc<Value>>,
+        input: StageInput,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let Some(body) = self.functions.get(name).cloned() else {
@@ -1607,7 +1971,13 @@ impl Evaluator<'_> {
             local_charges: BTreeMap::new(),
             _positional_charges: positional_charges,
         });
-        self.stdin.push(StdinSource::new(input));
+        let piped = match input {
+            StageInput::Piped(reader) => {
+                self.stdin.push(reader);
+                true
+            }
+            StageInput::Inherited => false,
+        };
         if capture_output {
             self.captures.push(Vec::new());
         }
@@ -1618,7 +1988,9 @@ impl Evaluator<'_> {
         } else {
             Vec::new()
         };
-        self.stdin.pop();
+        if piped {
+            self.stdin.pop();
+        }
         self.frames.pop();
         self.budget.leave_call();
 
@@ -1648,9 +2020,12 @@ impl Evaluator<'_> {
     fn run_xargs(
         &mut self,
         arguments: &[String],
-        input: Option<Rc<Value>>,
+        input: StageInput,
     ) -> Result<Executed, FatalError> {
-        let plan = match xargs::plan(arguments, input.as_deref()) {
+        let plan = match self
+            .builtin_input(true, input)
+            .and_then(|input| xargs::plan(arguments, input.as_ref()))
+        {
             Ok(plan) => plan,
             Err(failure) => {
                 let status = self.absorb(failure)?;
@@ -1663,7 +2038,12 @@ impl Evaluator<'_> {
         let mut status = ExitCode::SUCCESS;
         for invocation in plan.invocations {
             self.budget.charge_step_with(self.invoker)?;
-            match self.run_argv(&invocation, None, true, false, false)? {
+            match self.run_argv(
+                &invocation,
+                StageInput::Piped(PipeReader::default()),
+                true,
+                false,
+            )? {
                 Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
                 Executed::Result(result) => {
                     if result.status != ExitCode::SUCCESS {
@@ -2176,8 +2556,13 @@ fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     value::from_lines(lines)
 }
 
-fn own(input: Option<Rc<Value>>) -> Option<Value> {
-    input.map(Rc::unwrap_or_clone)
+fn write_display(stdout: &mut PipeWriter, value: &Value) -> WriteOutcome {
+    match value {
+        Value::String(text) => stdout.write(text.as_bytes()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            stdout.write(display(value).as_bytes())
+        }
+    }
 }
 
 fn invert(status: ExitCode) -> ExitCode {
