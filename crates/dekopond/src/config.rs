@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dekopon_agent::prompt::HistoryLimits;
@@ -33,6 +33,7 @@ use crate::{
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/dekopond/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 4;
+pub const DEFAULT_MAX_JOBS: usize = 2;
 pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
 pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 30_000;
@@ -366,7 +367,7 @@ fn deserialize_collection_millis<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u32, D::Error> {
     let millis = u32::deserialize(deserializer)?;
-    if std::time::Instant::now()
+    if Instant::now()
         .checked_add(Duration::from_millis(u64::from(millis)))
         .is_none()
     {
@@ -539,6 +540,8 @@ pub struct RouteLimits {
     pub max_duration_ms: Option<u64>,
     #[serde(default)]
     pub script_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub job_timeout_ms: Option<u64>,
 }
 
 impl Default for RouteLimits {
@@ -548,6 +551,7 @@ impl Default for RouteLimits {
             max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
             max_duration_ms: None,
             script_timeout_ms: None,
+            job_timeout_ms: None,
         }
     }
 }
@@ -790,6 +794,8 @@ pub struct SessionsConfig {
     pub reply_on_busy: bool,
     #[serde(default = "default_max_conversations")]
     pub max_conversations: usize,
+    #[serde(default = "default_max_jobs")]
+    pub max_jobs: usize,
     #[serde(default)]
     pub journal: Option<JournalConfig>,
     #[serde(default)]
@@ -803,6 +809,7 @@ impl Default for SessionsConfig {
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
+            max_jobs: DEFAULT_MAX_JOBS,
             journal: None,
             wakes: None,
         }
@@ -820,6 +827,10 @@ const fn default_max_concurrent() -> usize {
 
 const fn default_max_conversations() -> usize {
     DEFAULT_MAX_CONVERSATIONS
+}
+
+const fn default_max_jobs() -> usize {
+    DEFAULT_MAX_JOBS
 }
 
 const fn default_reply_on_busy() -> bool {
@@ -1351,6 +1362,24 @@ pub(crate) fn resolve(
                 agent: route.agent.to_string(),
             });
         }
+        match route.limits.job_timeout_ms {
+            Some(0) => problems.push(ConfigProblem::InvalidJobTimeout {
+                agent: route.agent.to_string(),
+            }),
+            // `job.deadline_ms` is recorded as an OpenTelemetry int64.
+            Some(milliseconds)
+                if i64::try_from(milliseconds).is_err()
+                    || Instant::now()
+                        .checked_add(Duration::from_millis(milliseconds))
+                        .is_none() =>
+            {
+                problems.push(ConfigProblem::UnrepresentableJobTimeout {
+                    agent: route.agent.to_string(),
+                    job_timeout_ms: milliseconds,
+                });
+            }
+            Some(_) | None => {}
+        }
         if let (Some(script_timeout_ms), Some(max_duration_ms)) =
             (route.limits.script_timeout_ms, route.limits.max_duration_ms)
             && script_timeout_ms > max_duration_ms
@@ -1476,6 +1505,9 @@ pub(crate) fn resolve(
     }
     if config.sessions.max_conversations == 0 {
         problems.push(ConfigProblem::InvalidMaxConversations);
+    }
+    if config.sessions.max_jobs == 0 {
+        problems.push(ConfigProblem::InvalidMaxJobs);
     }
     let wakes = config.sessions.wakes.as_ref().map(|wakes| {
         if wakes.max_per_subject == 0 || wakes.min_interval_ms == 0 || wakes.max_horizon_ms == 0 {
@@ -2064,6 +2096,18 @@ pub enum ConfigProblem {
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
     InvalidSessionLimits,
+    #[error(
+        "sessions.maxJobs is 0, which refuses every job; omit it for the {DEFAULT_MAX_JOBS} default"
+    )]
+    InvalidMaxJobs,
+    #[error(
+        "route for agent {agent:?} sets limits.jobTimeoutMs to 0, which ends every job the instant it starts; omit it to turn jobs off"
+    )]
+    InvalidJobTimeout { agent: String },
+    #[error(
+        "route for agent {agent:?} sets limits.jobTimeoutMs to {job_timeout_ms}, a deadline this host or its job records cannot represent"
+    )]
+    UnrepresentableJobTimeout { agent: String, job_timeout_ms: u64 },
     #[error(
         "route for agent {agent:?} declares a persistent memory window with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
     )]

@@ -48,6 +48,7 @@ use crate::{
         ResolvedLiveness, Steering,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    jobs::JobContext,
     journal::{self, Journal},
     progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
@@ -735,6 +736,7 @@ pub(crate) struct SessionRunner {
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
+    pub jobs: Arc<crate::jobs::Jobs>,
 }
 
 struct RecalledWindow {
@@ -1400,6 +1402,22 @@ async fn session(
     let mut leg = leg.with_progress(Arc::clone(&progress_sink), calls.clone());
     if progress_notes {
         leg = leg.with_progress_notes();
+    }
+    if let Some((timeout, anchor)) = route
+        .job_timeout
+        .zip(Anchor::for_job(message, &route.agent))
+    {
+        leg = leg.with_job_control(Arc::new(JobContext::for_turn(
+            Arc::clone(&runner.jobs),
+            message,
+            anchor,
+            runner.broker.clone(),
+            ShellLimits {
+                max_capability_calls: limits.max_capability_calls,
+                timeout,
+                ..ShellLimits::default()
+            },
+        )));
     }
     drop(sink);
     let wakes = route

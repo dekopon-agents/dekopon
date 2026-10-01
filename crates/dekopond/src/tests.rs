@@ -821,6 +821,54 @@ async fn invalid_configurations_fail_closed_at_startup() {
 }
 
 #[tokio::test]
+async fn job_bounds_that_end_every_job_or_cannot_be_represented_fail_boot_together() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    let mut second = document["routes"][0].clone();
+    second["conversation"] = json!({"kind": ["channel"]});
+    document["routes"][0]["limits"] = json!({"jobTimeoutMs": 0});
+    second["limits"] = json!({"jobTimeoutMs": u64::MAX});
+    document["routes"]
+        .as_array_mut()
+        .expect("routes")
+        .push(second);
+    document["sessions"] = json!({"maxJobs": 0});
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("three job mistakes");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal: {error:?}");
+    };
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::InvalidMaxJobs
+    )));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::InvalidJobTimeout { .. }
+    )));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::UnrepresentableJobTimeout { job_timeout_ms, .. } if *job_timeout_ms == u64::MAX
+    )));
+    assert!(
+        error
+            .to_string()
+            .contains("limits.jobTimeoutMs to 18446744073709551615")
+    );
+
+    let mut document = self::document(directory.path());
+    document["routes"][0]["limits"] = json!({"jobTimeoutMs": 21_600_000});
+    let config = load(directory.path(), &document)
+        .await
+        .expect("a six-hour job deadline loads");
+    assert_eq!(config.routes[0].limits.job_timeout_ms, Some(21_600_000));
+    assert_eq!(config.sessions.max_jobs, crate::config::DEFAULT_MAX_JOBS);
+}
+
+#[tokio::test]
 async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -2512,6 +2560,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         },
         max_duration: None,
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
+        job_timeout: None,
         progress_detail: ProgressDetail::Plain,
         steering: crate::config::Steering::Abort,
         progress_notes: false,
@@ -2747,6 +2796,7 @@ fn runner_tracking(
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         wakes: None,
+        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
     })
 }
 
@@ -13759,6 +13809,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/jobs_e2e.rs"]
+mod jobs_e2e;
 #[path = "tests/steering.rs"]
 mod steering;
 #[path = "tests/steering_e2e.rs"]
@@ -13789,6 +13841,7 @@ fn journaled_runner(
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         wakes: None,
+        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
     })
 }
 

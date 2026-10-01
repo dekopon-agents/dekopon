@@ -48,6 +48,12 @@ impl Anchor {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
             return None;
         }
+        Self::for_job(message, agent)
+    }
+
+    /// A job ends inside the process that started it, so a local connection number is still the
+    /// client it names.
+    pub(crate) fn for_job(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         Some(Self {
             transport: message.transport.parse().ok()?,
             kind: message.transport_kind,

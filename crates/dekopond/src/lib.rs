@@ -18,6 +18,7 @@ mod cache_key;
 mod collection;
 mod config;
 mod conversation;
+mod jobs;
 mod journal;
 mod progress;
 mod routes;
@@ -171,6 +172,7 @@ where
         liveness: config.liveness.clone(),
         thread_ownership,
         wakes,
+        jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
     });
 
     tracing::info!(
