@@ -425,9 +425,9 @@ fn notice_for(inbound: &InboundMessage, id: u64) -> InboundMessage {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_user_text() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![
+    let journal = temporary();
+    let delivered = || {
+        [
             memory_surface_response(),
             ResponseEnvelope::invocation(
                 record_result(InvocationOutcome::Succeeded, None),
@@ -435,13 +435,26 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
                 Vec::new(),
                 Vec::new(),
             ),
-        ],
+        ]
+    };
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        delivered().into_iter().cycle().take(6).collect(),
     )
     .await;
-    let models = InterruptibleModel::new(vec![answer("draft"), answer("finished")]);
-    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let models = InterruptibleModel::new(vec![
+        answer("draft"),
+        answer("finished"),
+        answer("remembered"),
+        answer("recalled"),
+    ]);
+    let factory = || Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>;
+    let runner = journaled_runner(broker.clone(), factory(), journal.path());
     let driver = Arc::new(RecordingDriver::default());
-    let mut route = job_route(Duration::from_secs(10), Duration::from_secs(10));
+    let mut route = crate::routes::BoundRoute {
+        job_timeout: Some(Duration::from_secs(10)),
+        ..persistent_route(model_config(), recall_window(RecallSource::Journal))
+    };
     route.steering = crate::config::Steering::Abort;
     let held = tokio::spawn(run_session(
         Arc::clone(&runner),
@@ -452,7 +465,7 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     models.wait_until_entered().await;
     run_session(
         Arc::clone(&runner),
-        route,
+        route.clone(),
         notice_for(&message("start"), 8),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
@@ -476,6 +489,47 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
         panic!("expected a delivered turn: {record:?}");
     };
     assert_eq!(turn.user(), "person said this");
+
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        message("what did I say?"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let restarted = journaled_runner(broker, factory(), journal.path());
+    run_session(
+        restarted,
+        route,
+        message("and before that?"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let window = |index: usize| models.prompt(index)[1..].to_vec();
+    let turns = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(role, text)| ((*role).to_owned(), (*text).to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        window(2),
+        turns(&[
+            ("user", "person said this"),
+            ("assistant", "finished"),
+            ("user", "what did I say?"),
+        ])
+    );
+    assert_eq!(
+        window(3),
+        turns(&[
+            ("user", "person said this"),
+            ("assistant", "finished"),
+            ("user", "what did I say?"),
+            ("assistant", "remembered"),
+            ("user", "and before that?"),
+        ])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -792,8 +846,8 @@ async fn jobs_wait_and_kill_restrict_rows_to_the_person_who_started_them() {
         Err(dekopon_shell::JobRefusal::NotYours)
     );
     assert_eq!(
-        runner.jobs.wait(&foreign, JobId::new(1), &|| true),
-        Err(dekopon_shell::JobRefusal::NotYours)
+        runner.jobs.wait(&foreign, &[JobId::new(1)], &|| true),
+        [Err(dekopon_shell::JobRefusal::NotYours)]
     );
     assert_eq!(finished(&runner.jobs.list(&owner)[0]).0, JobOutcome::Killed);
 }
@@ -1030,7 +1084,7 @@ fn a_panicking_wait_callback_releases_its_waiter_slot() {
     let id = jobs.list(&owner)[0].id;
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(jobs.wait(&owner, id, &|| panic!("caller panicked")).is_ok());
+            jobs.wait(&owner, &[id], &|| panic!("caller panicked"));
         }))
         .is_err()
     );
@@ -1052,7 +1106,7 @@ fn a_finished_job_keeps_its_row_while_a_wait_is_reading_it() {
     let (table, owner) = (&jobs, &owner);
     std::thread::scope(|scope| {
         let waiter = scope.spawn(move || {
-            table.wait(owner, id, &|| {
+            table.wait(owner, &[id], &|| {
                 parked.send(()).ok();
                 on_release.recv().ok();
                 true
@@ -1064,7 +1118,7 @@ fn a_finished_job_keeps_its_row_while_a_wait_is_reading_it() {
         drop(release);
         assert_eq!(
             waiter.join().expect("the waiter"),
-            Ok(JobWait::Exited(ExitCode::FAILURE))
+            [Ok(JobWait::Exited(ExitCode::FAILURE))]
         );
         drop(next);
     });
@@ -1213,7 +1267,7 @@ async fn one_stop_word_ends_its_persons_running_turn_and_job_but_not_anothers_jo
         "{:?}",
         driver.rendered()
     );
-    runner.jobs.cancel_all();
+    runner.jobs.seal();
 }
 
 #[test]
@@ -1455,7 +1509,7 @@ async fn another_persons_jobs_kill_and_wait_refuse_with_the_same_message() {
     assert!(output.contains("kill=1"), "{output}");
     assert!(output.contains("wait=1"), "{output}");
     assert!(running(&runner.jobs.list(&owned_by("a"))));
-    runner.jobs.cancel_all();
+    runner.jobs.seal();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1501,7 +1555,7 @@ async fn wait_ends_at_the_scripts_deadline_while_the_job_runs_on() {
     assert!(running(
         &runner.jobs.list(&JobOwner::of(&message("deadline")))
     ));
-    runner.jobs.cancel_all();
+    runner.jobs.seal();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1572,4 +1626,225 @@ async fn jobs_lists_running_rows_and_a_new_start_drops_the_oldest_finished_one()
         "{output}"
     );
     assert!(second[1].ends_with(" echo C"), "{output}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe() {
+    let directory = temporary();
+    let routes = job_routes(directory.path(), Some(60_000)).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 2; sleep 5 & echo status=$?"),
+        answer("drained"),
+    ]);
+    let runner = runner_with_jobs(broker.clone(), Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let (transport, receiver) = mpsc::channel(4);
+    let service = tokio::spawn(crate::serve(
+        Arc::clone(&runner),
+        routes,
+        Arc::new(BTreeMap::new()),
+        drivers,
+        Arc::new(Vec::new()),
+        receiver,
+        async move {
+            stopped.await.ok();
+        },
+        Duration::from_secs(10),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    transport
+        .send(TransportEvent::Message(Box::new(message("late"))))
+        .await
+        .expect("serve receives");
+    until(Duration::from_secs(10), || models.requests() == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(()).expect("serve is listening");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), service)
+        .await
+        .expect("serve drains the turn within its grace")
+        .expect("serve joins");
+    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert_eq!(driver.replies(), ["drained"]);
+    let output = tool_message(&models, 1);
+    assert!(output.contains(dekopon_shell::JOBS_OFF), "{output}");
+    assert!(output.contains("status=1"), "{output}");
+    let owner = JobOwner::of(&message("late"));
+    assert!(runner.jobs.list(&owner).is_empty());
+
+    let inbound = message("late");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let probe = JobContext::for_turn(
+        Arc::clone(&runner.jobs),
+        &inbound,
+        anchor,
+        broker,
+        dekopon_shell::Limits::default(),
+    )
+    .for_probe();
+    let probed = tokio::task::spawn_blocking(move || {
+        dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+            .run("true & echo status=$?", &ProbeInvoker(probe))
+    })
+    .await
+    .expect("the probe script joins");
+    assert_eq!(
+        probed.output,
+        format!("{}\nstatus=1", dekopon_shell::JOBS_OFF)
+    );
+    assert!(runner.jobs.list(&owner).is_empty());
+    assert_eq!(runner.jobs.free_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let inbound = message("stop");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let (run, signal) = runner
+        .jobs
+        .admit(JobOwner::of(&inbound), anchor, None, Arc::from("sleep 5"))
+        .unwrap();
+    let held = std::iter::from_fn(|| runner.gate.refusal()).collect::<Vec<_>>();
+    assert!(!held.is_empty());
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut collector = crate::collection::Collector::new(&[], 4);
+    for _ in 0..3 {
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &["stop".to_owned()],
+            &mut sessions,
+            &mut collector,
+            inbound.clone(),
+        );
+    }
+    assert!(signal.is_cancelled());
+    assert!(sessions.is_empty());
+    drop(held);
+    crate::dispatch(
+        &runner,
+        &routes,
+        &BTreeMap::new(),
+        &drivers,
+        &["stop".to_owned()],
+        &mut sessions,
+        &mut collector,
+        inbound,
+    );
+    while sessions.join_next().await.is_some() {}
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    drop(run);
+}
+
+#[test]
+fn a_multi_job_wait_holds_every_target_against_notices_and_eviction() {
+    let jobs = Arc::new(Jobs::new(2));
+    let mut notices = jobs.take_notices();
+    let first = admitted(&jobs, "a", "first").expect("slot");
+    let second = admitted(&jobs, "a", "second").expect("slot");
+    let owner = owned_by("a");
+    let ids = jobs
+        .list(&owner)
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let (parked, on_park) = std::sync::mpsc::channel();
+    let (table, owner, targets) = (&jobs, &owner, &ids);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(move || {
+            table.wait(owner, targets, &|| {
+                parked.send(()).ok();
+                true
+            })
+        });
+        on_park.recv().expect("the wait parks");
+        drop(second);
+        assert_eq!(
+            admitted(&jobs, "b", "evictor").err(),
+            Some(dekopon_shell::JobRefusal::Full { maximum: 2 })
+        );
+        drop(first);
+        assert_eq!(
+            waiter.join().expect("the waiter"),
+            [
+                Ok(JobWait::Exited(ExitCode::FAILURE)),
+                Ok(JobWait::Exited(ExitCode::FAILURE))
+            ]
+        );
+    });
+    assert!(notices.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
+    use tracing_subscriber::prelude::*;
+
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let jobs = Arc::new(Jobs::new(4));
+    let inbound = message("deadline");
+    let anchor = || crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let limits = |seconds| dekopon_shell::Limits {
+        timeout: Duration::from_secs(seconds),
+        ..dekopon_shell::Limits::default()
+    };
+    let probe = JobContext::for_turn(
+        Arc::clone(&jobs),
+        &inbound,
+        anchor(),
+        broker.clone(),
+        limits(3600),
+    )
+    .for_probe();
+    let turn = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor(), broker, limits(3));
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            dekopon_shell::Interpreter::new(limits(1)).run("true &", &ProbeInvoker(probe));
+            dekopon_shell::Interpreter::new(limits(30))
+                .run("{ sleep 1; true & } &", &ProbeInvoker(turn));
+        });
+    })
+    .await
+    .expect("the scripts join");
+    let owner = JobOwner::of(&inbound);
+    until(Duration::from_secs(10), || {
+        let rows = jobs.list(&owner);
+        rows.len() == 3 && !running(&rows)
+    })
+    .await;
+    let deadlines = capture
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            dekopon_test_support::Record::Event { fields, .. } => {
+                let field = |name: &str| {
+                    fields
+                        .split_whitespace()
+                        .find_map(|token| token.strip_prefix(name))
+                        .and_then(|value| value.parse::<u64>().ok())
+                };
+                Some((field("job.id=")?, field("job.deadline_ms=")?))
+            }
+            dekopon_test_support::Record::Span { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let [probe, root, nested] = [1, 2, 3].map(|id| deadlines[&id]);
+    assert!(probe <= 1_000, "{deadlines:?}");
+    assert!((2_000..=3_000).contains(&root), "{deadlines:?}");
+    assert!(nested <= 2_000, "{deadlines:?}");
 }

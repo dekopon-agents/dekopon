@@ -3098,9 +3098,15 @@ impl JobControl for StubJobs {
             .collect()
     }
 
-    fn wait(&self, id: JobId, _keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
-        self.waited.lock().push(id);
-        Ok(JobWait::Exited(ExitCode::SUCCESS))
+    fn wait(
+        &self,
+        ids: &[JobId],
+        _keep_waiting: &dyn Fn() -> bool,
+    ) -> Vec<Result<JobWait, JobRefusal>> {
+        self.waited.lock().extend_from_slice(ids);
+        ids.iter()
+            .map(|_| Ok(JobWait::Exited(ExitCode::SUCCESS)))
+            .collect()
     }
 
     fn kill(&self, _id: JobId) -> Result<(), JobRefusal> {
@@ -3226,8 +3232,8 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
         fn list(&self) -> Vec<JobSummary> {
             Vec::new()
         }
-        fn wait(&self, _: JobId, _: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
-            Ok(JobWait::Interrupted)
+        fn wait(&self, ids: &[JobId], _: &dyn Fn() -> bool) -> Vec<Result<JobWait, JobRefusal>> {
+            ids.iter().map(|_| Ok(JobWait::Interrupted)).collect()
         }
         fn kill(&self, _: JobId) -> Result<(), JobRefusal> {
             Ok(())

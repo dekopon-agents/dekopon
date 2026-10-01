@@ -88,6 +88,8 @@ pub enum JobRefusal {
     NotYours,
     #[error("no such job")]
     Finished,
+    #[error("{}", JOBS_OFF)]
+    Off,
 }
 
 /// Every call answers for the person and conversation the control was built for; an id another
@@ -97,8 +99,14 @@ pub trait JobControl: Send + Sync {
 
     fn list(&self) -> Vec<JobSummary>;
 
-    /// `keep_waiting` is asked at least once a second; the call returns once it answers false.
-    fn wait(&self, id: JobId, keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal>;
+    /// Every owned id is held before any is awaited, so none sends a notice or loses its row while
+    /// another is still awaited. `keep_waiting` is asked at least once a second; the call returns
+    /// once it answers false. One answer per id, in order.
+    fn wait(
+        &self,
+        ids: &[JobId],
+        keep_waiting: &dyn Fn() -> bool,
+    ) -> Vec<Result<JobWait, JobRefusal>>;
 
     fn kill(&self, id: JobId) -> Result<(), JobRefusal>;
 }

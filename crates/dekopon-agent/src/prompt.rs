@@ -113,9 +113,16 @@ pub trait CancellationProbe: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Steer {
+    Person(String),
+    /// Reaches the model but never the recorded turn: it is not the person's words.
+    Notice(String),
+}
+
 pub trait SteerSource: Send + Sync {
     /// Moves every queued steer out, oldest first, as finished user text. Empty when none.
-    fn drain(&self) -> Vec<String>;
+    fn drain(&self) -> Vec<Steer>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,8 +497,13 @@ fn drain_steers(
     let steers = steering.map(SteerSource::drain).unwrap_or_default();
     let any = !steers.is_empty();
     for steer in steers {
-        messages.push(ModelMessage::user(&steer));
-        consumed.push(steer);
+        match steer {
+            Steer::Person(text) => {
+                messages.push(ModelMessage::user(&text));
+                consumed.push(text);
+            }
+            Steer::Notice(text) => messages.push(ModelMessage::user(&text)),
+        }
     }
     any
 }
@@ -1650,7 +1662,7 @@ mod tests {
         DEFAULT_MAX_TURNS, FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
-        ScriptRuntime, SessionInputs, SteerSource, agent_config_tool, format_script_outcome,
+        ScriptRuntime, SessionInputs, Steer, SteerSource, agent_config_tool, format_script_outcome,
         run_prompt, run_prompt_session, run_prompt_with_history,
         run_prompt_with_history_and_options, script_tool,
     };
@@ -2019,8 +2031,8 @@ mod tests {
     }
 
     impl SteerSource for QueuedSteers {
-        fn drain(&self) -> Vec<String> {
-            self.0.lock().drain(..).collect()
+        fn drain(&self) -> Vec<Steer> {
+            self.0.lock().drain(..).map(Steer::Person).collect()
         }
     }
 
@@ -2233,7 +2245,7 @@ mod tests {
         )
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
         assert!(!sink.events.lock().iter().any(|event| matches!(
             event,
             ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
@@ -2252,7 +2264,7 @@ mod tests {
         )
         .expect("the final step answers");
         assert_eq!(outcome.answer, "done");
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
         assert_eq!(history.turns()[0].user(), "msg1");
     }
 
@@ -2326,7 +2338,7 @@ mod tests {
         )
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
     }
 
     #[test]

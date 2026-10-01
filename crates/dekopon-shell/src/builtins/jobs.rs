@@ -110,10 +110,11 @@ impl Builtin for Wait {
         };
         let mut status = ExitCode::SUCCESS;
         let mut refusal = None;
-        for id in ids {
-            match control.wait(id, &|| {
-                !context.invoker.cancelled() && context.budget.check_deadline().is_ok()
-            }) {
+        let answers = control.wait(&ids, &|| {
+            !context.invoker.cancelled() && context.budget.check_deadline().is_ok()
+        });
+        for answer in answers {
+            match answer {
                 Ok(JobWait::Exited(exit)) => status = exit,
                 Ok(JobWait::Interrupted) => {
                     context.budget.charge_step_with(context.invoker)?;

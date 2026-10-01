@@ -1047,11 +1047,15 @@ mod tests {
 
         fn wait(
             &self,
-            id: dekopon_shell::JobId,
+            ids: &[dekopon_shell::JobId],
             _keep_waiting: &dyn Fn() -> bool,
-        ) -> Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal> {
-            self.calls.lock().push(format!("wait {id}"));
-            Ok(dekopon_shell::JobWait::Interrupted)
+        ) -> Vec<Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal>> {
+            ids.iter()
+                .map(|id| {
+                    self.calls.lock().push(format!("wait {id}"));
+                    Ok(dekopon_shell::JobWait::Interrupted)
+                })
+                .collect()
         }
 
         fn kill(&self, id: dekopon_shell::JobId) -> Result<(), dekopon_shell::JobRefusal> {
@@ -1088,8 +1092,8 @@ mod tests {
         let id = dekopon_shell::JobId::new(7);
         assert!(jobs.list().is_empty());
         assert_eq!(
-            jobs.wait(id, &|| false),
-            Ok(dekopon_shell::JobWait::Interrupted)
+            jobs.wait(&[id], &|| false),
+            [Ok(dekopon_shell::JobWait::Interrupted)]
         );
         assert_eq!(jobs.kill(id), Ok(()));
         assert_eq!(

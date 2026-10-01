@@ -17,7 +17,7 @@ use dekopon_agent::{
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, ConversationTurn, History, PromptError, ReplyDisposition, SessionInputs,
-        SteerSource, run_prompt_session,
+        Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -1042,7 +1042,10 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
-    let is_unattended = !matches!(message.message_id, MessageId::Native(_));
+    let is_unattended = match message.message_id {
+        MessageId::Native(_) => false,
+        MessageId::Wake { .. } | MessageId::Job { .. } => true,
+    };
     let notice = crate::jobs::Notice::of(&message);
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
@@ -1143,13 +1146,13 @@ struct SessionSteers {
 }
 
 impl SteerSource for SessionSteers {
-    fn drain(&self) -> Vec<String> {
+    fn drain(&self) -> Vec<Steer> {
         self.gate
             .take_steers(&self.key)
             .into_iter()
             .map(|steer| {
                 match steer.message_id {
-                    MessageId::Job { .. } => return steer.text,
+                    MessageId::Job { .. } => return Steer::Notice(steer.text),
                     MessageId::Native(_) | MessageId::Wake { .. } => {}
                 }
                 let seconds = steer
@@ -1174,7 +1177,7 @@ impl SteerSource for SessionSteers {
                     text = attributed_prompt(&steer.subject, &text);
                 }
                 self.raw_texts.lock().push(steer.text);
-                text
+                Steer::Person(text)
             })
             .collect()
     }

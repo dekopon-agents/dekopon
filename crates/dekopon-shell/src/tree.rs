@@ -163,7 +163,7 @@ impl TreeContext {
     }
 
     #[must_use]
-    pub(crate) fn remaining(&self) -> Duration {
+    pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 

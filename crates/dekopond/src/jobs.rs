@@ -72,6 +72,19 @@ struct Row {
 }
 
 impl Row {
+    fn stop_running(&mut self) -> bool {
+        match self.state {
+            RowState::Running => {
+                self.stop.get_or_insert(Stop::Cancelled);
+                if let Some(handle) = &self.cancel {
+                    handle.cancel();
+                }
+                true
+            }
+            RowState::Finished { .. } => false,
+        }
+    }
+
     fn summary(&self, now: Instant) -> JobSummary {
         JobSummary {
             id: self.id,
@@ -97,6 +110,7 @@ impl Row {
 struct Table {
     rows: VecDeque<Row>,
     next: u64,
+    sealed: bool,
 }
 
 impl Table {
@@ -135,6 +149,7 @@ impl Jobs {
             table: Mutex::new(Table {
                 rows: VecDeque::with_capacity(maximum),
                 next: 1,
+                sealed: false,
             }),
             ended: Condvar::new(),
             permits: Arc::new(Semaphore::new(maximum)),
@@ -167,6 +182,9 @@ impl Jobs {
         };
         let (handle, signal) = CancelSignal::pair();
         let mut table = self.table.lock();
+        if table.sealed {
+            return Err(JobRefusal::Off);
+        }
         if table.rows.len() >= self.maximum && !table.evict_finished() {
             return Err(full);
         }
@@ -259,12 +277,11 @@ impl Jobs {
                 job.waited = waited,
                 job.output.bytes = ended.output.len(),
             );
-            if !waited
-                && matches!(
-                    outcome,
-                    JobOutcome::Succeeded | JobOutcome::Failed | JobOutcome::Deadline
-                )
-            {
+            let noticed = match outcome {
+                JobOutcome::Succeeded | JobOutcome::Failed | JobOutcome::Deadline => !waited,
+                JobOutcome::Cancelled | JobOutcome::Killed => false,
+            };
+            if noticed {
                 let body = format!(
                     "[gateway: job {id} finished, exit {}, after {}s]\n{text}\n{}",
                     ended.exit.get(),
@@ -305,29 +322,59 @@ impl Jobs {
     pub(crate) fn wait(
         &self,
         owner: &JobOwner,
-        id: JobId,
+        ids: &[JobId],
         keep_waiting: &dyn Fn() -> bool,
-    ) -> Result<JobWait, JobRefusal> {
+    ) -> Vec<Result<JobWait, JobRefusal>> {
+        let mut answers = Vec::with_capacity(ids.len());
+        let mut held = Vec::with_capacity(ids.len());
         let mut table = self.table.lock();
-        table.owned(owner, id)?.waiters += 1;
+        for &id in ids {
+            match table.owned(owner, id) {
+                Ok(row) => {
+                    row.waiters += 1;
+                    held.push(id);
+                    answers.push(None);
+                }
+                Err(refusal) => answers.push(Some(Err(refusal))),
+            }
+        }
         drop(table);
-        let _waiter = Waiter {
+        let _waiters = Waiters {
             jobs: self,
             owner,
-            id,
+            ids: held,
         };
         let mut table = self.table.lock();
         loop {
-            let row = table.owned(owner, id)?;
-            if let RowState::Finished { exit, .. } = row.state {
-                row.waited = true;
-                return Ok(JobWait::Exited(exit));
+            let mut pending = false;
+            for (answer, &id) in answers.iter_mut().zip(ids) {
+                if answer.is_some() {
+                    continue;
+                }
+                match table.owned(owner, id) {
+                    Ok(row) => match row.state {
+                        RowState::Finished { exit, .. } => {
+                            row.waited = true;
+                            *answer = Some(Ok(JobWait::Exited(exit)));
+                        }
+                        RowState::Running => pending = true,
+                    },
+                    Err(refusal) => *answer = Some(Err(refusal)),
+                }
+            }
+            if !pending {
+                break;
             }
             if !parking_lot::MutexGuard::unlocked(&mut table, keep_waiting) {
-                return Ok(JobWait::Interrupted);
+                break;
             }
             self.ended.wait_for(&mut table, WAIT_SLICE);
         }
+        drop(table);
+        answers
+            .into_iter()
+            .map(|answer| answer.unwrap_or(Ok(JobWait::Interrupted)))
+            .collect()
     }
 
     pub(crate) fn cancel_owner(&self, request: &CancelRequest) -> bool {
@@ -337,27 +384,18 @@ impl Jobs {
             if row.owner.transport == request.transport
                 && row.owner.conversation == request.conversation_id
                 && row.owner.subject == request.subject
-                && matches!(row.state, RowState::Running)
             {
-                row.stop.get_or_insert(Stop::Cancelled);
-                if let Some(handle) = &row.cancel {
-                    handle.cancel();
-                }
-                stopped = true;
+                stopped |= row.stop_running();
             }
         }
         stopped
     }
 
-    pub(crate) fn cancel_all(&self) {
+    pub(crate) fn seal(&self) {
         let mut table = self.table.lock();
+        table.sealed = true;
         for row in &mut table.rows {
-            if matches!(row.state, RowState::Running) {
-                row.stop.get_or_insert(Stop::Cancelled);
-                if let Some(handle) = &row.cancel {
-                    handle.cancel();
-                }
-            }
+            row.stop_running();
         }
     }
 
@@ -406,16 +444,19 @@ impl Notice {
     }
 }
 
-struct Waiter<'a> {
+struct Waiters<'a> {
     jobs: &'a Jobs,
     owner: &'a JobOwner,
-    id: JobId,
+    ids: Vec<JobId>,
 }
 
-impl Drop for Waiter<'_> {
+impl Drop for Waiters<'_> {
     fn drop(&mut self) {
-        if let Ok(row) = self.jobs.table.lock().owned(self.owner, self.id) {
-            row.waiters -= 1;
+        let mut table = self.jobs.table.lock();
+        for &id in &self.ids {
+            if let Ok(row) = table.owned(self.owner, id) {
+                row.waiters -= 1;
+            }
         }
     }
 }
@@ -575,7 +616,17 @@ impl JobContext {
         )
     }
 
-    fn run(&self, seed: JobSeed, signal: CancelSignal) -> Ended {
+    fn tree(&self, seed: &JobSeed) -> TreeContext {
+        match self.origin {
+            Origin::Turn => TreeContext::new(
+                self.limits,
+                CallBudget::new(self.limits.max_capability_calls),
+            ),
+            Origin::Tree(_) => seed.tree().clone(),
+        }
+    }
+
+    fn run(&self, seed: JobSeed, tree: &TreeContext, signal: CancelSignal) -> Ended {
         let Some(leg) = self.connect(signal) else {
             return Ended {
                 exit: ExitCode::FAILURE,
@@ -583,14 +634,7 @@ impl JobContext {
                 ending: Ending::Ran { expired: false },
             };
         };
-        let tree = match self.origin {
-            Origin::Turn => TreeContext::new(
-                self.limits,
-                CallBudget::new(self.limits.max_capability_calls),
-            ),
-            Origin::Tree(_) => seed.tree().clone(),
-        };
-        let outcome = Interpreter::new(self.limits).run_seed(seed, &leg, &tree);
+        let outcome = Interpreter::new(self.limits).run_seed(seed, &leg, tree);
         Ended {
             exit: outcome.exit_code,
             output: outcome.output,
@@ -605,6 +649,7 @@ struct Started {
     context: JobContext,
     run: JobRun,
     seed: JobSeed,
+    tree: TreeContext,
     signal: CancelSignal,
 }
 
@@ -614,6 +659,7 @@ impl Started {
             context,
             run,
             seed,
+            tree,
             signal,
         } = self;
         let span = tracing::info_span!(
@@ -634,7 +680,7 @@ impl Started {
         }
         let parent = span.in_scope(current_trace_parent);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            span.in_scope(|| context.run(seed, signal))
+            span.in_scope(|| context.run(seed, &tree, signal))
         }));
         match result {
             Ok(ended) => run.finish_with_trace(ended, parent, span),
@@ -663,10 +709,11 @@ impl JobControl for JobContext {
             Arc::clone(seed.text()),
         )?;
         let id = run.id;
+        let tree = self.tree(&seed);
         let text = seed.text();
         tracing::info!(name: "job.started", target: "job", {
             job.id = %id,
-            job.deadline_ms = self.limits.timeout.as_millis() as u64,
+            job.deadline_ms = tree.remaining().as_millis() as u64,
             job.script.head = %dekopon_core::bounded_display(text).text(),
             job.script.bytes = text.len(),
             agent = %self.anchor.agent(),
@@ -677,6 +724,7 @@ impl JobControl for JobContext {
             context: self.clone(),
             run,
             seed,
+            tree,
             signal,
         };
         let _runtime = self.runtime.enter();
@@ -691,8 +739,12 @@ impl JobControl for JobContext {
         self.jobs.list(&self.owner)
     }
 
-    fn wait(&self, id: JobId, keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
-        self.jobs.wait(&self.owner, id, keep_waiting)
+    fn wait(
+        &self,
+        ids: &[JobId],
+        keep_waiting: &dyn Fn() -> bool,
+    ) -> Vec<Result<JobWait, JobRefusal>> {
+        self.jobs.wait(&self.owner, ids, keep_waiting)
     }
 
     fn kill(&self, id: JobId) -> Result<(), JobRefusal> {

@@ -458,7 +458,7 @@ where
 
     drop(notices);
     collector.shutdown();
-    runner.jobs.cancel_all();
+    runner.jobs.seal();
 
     // A tick that fires here has already retired its row, so its wake must still start.
     if timeout(grace, async {
@@ -560,14 +560,19 @@ fn dispatch(
             }
             CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
         }
-        if jobs_stopped && let Some(driver) = drivers.get(&message.transport).cloned() {
-            let receipt = message.receive_span.clone();
-            sessions.spawn(
-                async move {
-                    session::answer(&driver, &message, session::STOPPED_REPLY).await;
-                }
-                .instrument(receipt),
-            );
+        if jobs_stopped {
+            if let Some(driver) = drivers.get(&message.transport).cloned()
+                && let Some(reply) = runner.gate.refusal()
+            {
+                let receipt = message.receive_span.clone();
+                sessions.spawn(
+                    async move {
+                        let _reply = reply;
+                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                    }
+                    .instrument(receipt),
+                );
+            }
             return;
         }
     }
