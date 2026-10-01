@@ -15,18 +15,21 @@
 use std::fmt;
 
 pub use dekopon_capability::EffectKind;
-pub use dekopon_core::{CapabilityId, ProviderId, RiskLevel, SecretDrn, SecretUseProposal};
+pub use dekopon_core::{
+    CapabilityId, IdentifierError, ProviderId, RiskLevel, SecretDrn, SecretUseProposal,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[cfg(feature = "clap")]
 pub use clap;
+pub use schemars;
 
 pub mod asset;
 #[cfg(feature = "clap")]
 pub mod cli;
 #[cfg(feature = "host")]
 pub mod host;
+pub mod provider;
 
 pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 
