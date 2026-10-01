@@ -114,7 +114,6 @@ impl Default for Scope {
     }
 }
 
-/// Builds a [`FixtureHost`]. Start with [`FixtureHost::builder`].
 #[derive(Clone, Debug)]
 pub struct FixtureHostBuilder {
     component: Option<PathBuf>,
@@ -152,7 +151,6 @@ impl Default for FixtureHostBuilder {
 }
 
 impl FixtureHostBuilder {
-    /// Sets the compiled component to load. Required.
     #[must_use]
     pub fn component(mut self, path: impl Into<PathBuf>) -> Self {
         self.component = Some(path.into());
@@ -167,7 +165,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Grants storage on one interface. Omit entirely for an import-free component.
     #[must_use]
     pub fn storage(mut self, interface: StorageInterface, access: StorageAccess) -> Self {
         self.storage = Some((interface, access));
@@ -182,7 +179,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Overrides the Wasmtime host limits.
     #[must_use]
     pub fn host_limits(mut self, limits: BrokerHostLimits) -> Self {
         self.host_limits = limits;
@@ -198,14 +194,12 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Overrides the continuity policy. The default is [`ContinuityPolicy::Stable`].
     #[must_use]
     pub fn continuity(mut self, continuity: ContinuityPolicy) -> Self {
         self.continuity = continuity;
         self
     }
 
-    /// Overrides the agent identity every proposal is attributed to.
     #[must_use]
     pub fn agent(mut self, agent: impl Into<String>) -> Self {
         self.scope.agent = agent.into();
@@ -325,7 +319,6 @@ pub struct FixtureHost {
 }
 
 impl FixtureHost {
-    /// Starts building a fake broker.
     #[must_use]
     pub fn builder() -> FixtureHostBuilder {
         FixtureHostBuilder::default()
@@ -428,7 +421,6 @@ impl FixtureHost {
         &self.root
     }
 
-    /// Returns the loaded registry, for assertions the harness does not wrap.
     #[must_use]
     pub const fn registry(&self) -> &BrokerProviderRegistry {
         &self.registry
