@@ -101,7 +101,7 @@ impl Table {
     fn evict_finished(&mut self) -> bool {
         let Some(index) = self.rows.iter().position(|row| match row.state {
             RowState::Running => false,
-            RowState::Finished { .. } => true,
+            RowState::Finished { .. } => row.waiters == 0,
         }) else {
             return false;
         };
@@ -233,7 +233,7 @@ impl Jobs {
             .collect()
     }
 
-    fn wait(
+    pub(crate) fn wait(
         &self,
         owner: &JobOwner,
         id: JobId,

@@ -3,6 +3,7 @@ use crate::jobs::{JobContext, JobOwner, Jobs};
 use dekopon_broker_protocol::Trigger;
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, ExitCode, JobId, JobOutcome, JobState, JobSummary,
+    JobWait,
 };
 
 fn job_route(script_timeout: Duration, job_timeout: Duration) -> crate::routes::BoundRoute {
@@ -288,4 +289,34 @@ fn a_full_table_evicts_its_oldest_finished_row_and_never_a_running_one() {
     assert_eq!(texts("a"), ["c"]);
     assert_eq!(texts("b"), ["b"]);
     drop((second, third));
+}
+
+#[test]
+fn a_finished_job_keeps_its_row_while_a_wait_is_reading_it() {
+    let jobs = Arc::new(Jobs::new(2));
+    let waited = admitted(&jobs, "a", "waited").expect("slot");
+    drop(admitted(&jobs, "a", "spare").expect("slot"));
+    let owner = owned_by("a");
+    let id = jobs.list(&owner)[0].id;
+    let (parked, on_park) = std::sync::mpsc::channel();
+    let (release, on_release) = std::sync::mpsc::channel::<()>();
+    let (table, owner) = (&jobs, &owner);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(move || {
+            table.wait(owner, id, &|| {
+                parked.send(()).ok();
+                on_release.recv().ok();
+                true
+            })
+        });
+        on_park.recv().expect("the wait parks");
+        drop(waited);
+        let next = admitted(&jobs, "a", "next").expect("the released slot");
+        drop(release);
+        assert_eq!(
+            waiter.join().expect("the waiter"),
+            Ok(JobWait::Exited(ExitCode::FAILURE))
+        );
+        drop(next);
+    });
 }

@@ -122,15 +122,6 @@ impl JobSeed {
     }
 }
 
-impl fmt::Debug for JobSeed {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("JobSeed")
-            .field("text", &self.text)
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ScriptJobs {
     pub(crate) started: Vec<JobId>,
