@@ -176,15 +176,15 @@ impl Jobs {
         let full = JobRefusal::Full {
             maximum: self.maximum,
         };
+        let mut table = self.table.lock();
+        if table.sealed {
+            return Err(JobRefusal::Off);
+        }
         let permit = match Arc::clone(&self.permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => return Err(full),
         };
         let (handle, signal) = CancelSignal::pair();
-        let mut table = self.table.lock();
-        if table.sealed {
-            return Err(JobRefusal::Off);
-        }
         if table.rows.len() >= self.maximum && !table.evict_finished() {
             return Err(full);
         }

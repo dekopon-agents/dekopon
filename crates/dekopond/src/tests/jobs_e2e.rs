@@ -1848,3 +1848,15 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
     assert!((2_000..=3_000).contains(&root), "{deadlines:?}");
     assert!(nested <= 2_000, "{deadlines:?}");
 }
+
+#[test]
+fn a_start_after_the_seal_is_off_even_with_every_permit_held() {
+    let jobs = Arc::new(Jobs::new(1));
+    let held = admitted(&jobs, "a", "sleep 9").expect("slot");
+    jobs.seal();
+    assert_eq!(
+        admitted(&jobs, "a", "late").err(),
+        Some(dekopon_shell::JobRefusal::Off)
+    );
+    drop(held);
+}
