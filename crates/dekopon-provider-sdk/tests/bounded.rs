@@ -30,11 +30,13 @@ fn multibyte_over_byte_limit_is_rejected_in_json_and_clap() {
 
 #[test]
 fn truncation_stays_on_unicode_boundary_and_records_cut() {
-    let parsed: Input = serde_json::from_value(json!({"text":"éé", "excerpt":"ééa"})).unwrap();
+    let parsed: Input = serde_json::from_value(json!({"text":"éé", "excerpt":"ééa"}))
+        .expect("bounded input should parse");
     assert_eq!(parsed.text.as_str(), "éé");
     assert_eq!(parsed.excerpt.as_str(), "éé");
     assert!(parsed.excerpt.was_cut());
-    let args = Args::try_parse_from(["test", "--text", "éé", "--excerpt", "ééa"]).unwrap();
+    let args = Args::try_parse_from(["test", "--text", "éé", "--excerpt", "ééa"])
+        .expect("bounded argv should parse");
     assert_eq!(args.excerpt.as_str(), "éé");
     assert!(args.excerpt.was_cut());
     assert_eq!(Truncated::<1>::new("éa").as_str(), "");
@@ -43,12 +45,16 @@ fn truncation_stays_on_unicode_boundary_and_records_cut() {
 
 #[test]
 fn typed_roundtrip_and_schema_are_closed_and_character_bounded() {
-    let input: Input = serde_json::from_value(json!({"text":"éé", "excerpt":"é"})).unwrap();
-    let encoded = serde_json::to_value(&input).unwrap();
-    let decoded: Input = serde_json::from_value(encoded.clone()).unwrap();
-    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    let input: Input = serde_json::from_value(json!({"text":"éé", "excerpt":"é"}))
+        .expect("bounded input should parse");
+    let encoded = serde_json::to_value(&input).expect("input should serialize");
+    let decoded: Input = serde_json::from_value(encoded.clone()).expect("input should roundtrip");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("input should serialize"),
+        encoded
+    );
     let schema = schemars::schema_for!(Input);
-    let schema = serde_json::to_value(schema).unwrap();
+    let schema = serde_json::to_value(schema).expect("schema should serialize");
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["properties"]["text"]["maxLength"], 4);
     assert_eq!(schema["properties"]["text"]["type"], "string");
