@@ -1147,13 +1147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-provider-storage"
-version = "0.30.0"
-dependencies = [
- "wit-bindgen 0.62.0",
-]
-
-[[package]]
 name = "dekopon-shell"
 version = "0.30.0"
 dependencies = [

@@ -1,6 +1,5 @@
 # Public workspace crates in package-dependency order.
 dekopon-core
-dekopon-provider-storage
 dekopon-telemetry
 dekopon-capability
 dekopon-storage-host

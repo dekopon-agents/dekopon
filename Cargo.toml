@@ -13,7 +13,6 @@ members = [
     "crates/dekopon-policy",
     "crates/dekopon-provider-sdk",
     "crates/dekopon-provider-sdk-testkit",
-    "crates/dekopon-provider-storage",
     "crates/dekopon-process",
     "crates/dekopon-protocol",
     "crates/dekopon-shell",
@@ -114,7 +113,6 @@ dekopon-model = { version = "0.30.0", path = "crates/dekopon-model" }
 dekopon-policy = { version = "0.30.0", path = "crates/dekopon-policy" }
 dekopon-provider-sdk = { version = "0.30.0", path = "crates/dekopon-provider-sdk" }
 dekopon-provider-sdk-testkit = { version = "0.30.0", path = "crates/dekopon-provider-sdk-testkit" }
-dekopon-provider-storage = { version = "0.30.0", path = "crates/dekopon-provider-storage" }
 dekopon-process = { version = "0.30.0", path = "crates/dekopon-process" }
 dekopon-protocol = { version = "0.30.0", path = "crates/dekopon-protocol", default-features = false }
 dekopon-shell = { version = "0.30.0", path = "crates/dekopon-shell" }
