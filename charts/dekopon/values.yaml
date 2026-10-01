@@ -105,6 +105,7 @@ paths:
   runtimeDir: /run/dekopon
   stateDir: /var/lib/dekopon
   catalogDir: /etc/dekopon-catalog
+  skillsDir: /etc/dekopon-skills
 
 # ---------------------------------------------------------------------------------------------
 # Broker
@@ -375,6 +376,17 @@ gateway:
     existingConfigMapKey: dekopon.yaml
     # Filename the catalog is mounted as, and therefore the leaf your catalogPath must name.
     fileName: dekopon.yaml
+
+  # Project nested skill paths, then copy to regular files before the gateway starts.
+  # ConfigMap symlinks are not accepted by the skill loader. These are public model text,
+  # never credentials; mount read-only at paths.skillsDir in gateway and console, not broker.
+  skills:
+    configMap: ""
+    items: []
+    # - key: review-skill
+    #   path: pull-request-review/SKILL.md
+    # - key: review-reference
+    #   path: pull-request-review/references/review.md
 
   resources:
     requests:

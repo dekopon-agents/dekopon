@@ -38,7 +38,9 @@ docker() {
     local name
     name="$resource-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
     echo "$name" >> "$work/containers"
-    command docker run --name "$name" "$@"
+    command docker run --name "$name" --label campaign=dekopon "$@"
+  elif [ "$1" = volume ] && [ "$2" = create ]; then
+    command docker volume create --label campaign=dekopon "$3"
   else
     command docker "$@"
   fi
@@ -47,6 +49,7 @@ docker() {
 platform=${PLATFORM:-linux/arm64}
 busybox=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 python_image=python:3.13-alpine
+skills_mounts=()
 
 # --------------------------------------------------------------------------------------------
 # Helpers
@@ -100,6 +103,10 @@ expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
           "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",
           "state":"/var/lib/dekopon"}
 expected.update({"broker-assets": "/var/lib/dekopon-assets"})
+if "skills" in volumes:
+    expected.update({"skills-source":"/dekopon-skills-source", "skills":"/etc/dekopon-skills"})
+    assert gm["skills"] == {"name":"skills", "mountPath":"/etc/dekopon-skills", "readOnly":True}
+    assert "skills" not in bm and "skills-source" not in gm and "skills-source" not in bm
 if "provider-storage" in bm:
     expected.update({"provider-storage":"/var/lib/dekopon-provider-storage"})
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
@@ -140,6 +147,7 @@ run_init() {
     -v "${resource}-run":/run/dekopon -v "${resource}-state":/var/lib/dekopon \
     -v "${resource}-storage":/var/lib/dekopon-provider-storage \
     -v "${resource}-assets":/var/lib/dekopon-assets \
+    ${skills_mounts[@]+"${skills_mounts[@]}"} \
     "$busybox" /bin/sh -c "$(cat "$1")"
 }
 
@@ -831,6 +839,40 @@ if helm template shadow-set "$chart_dir" -f "$values" \
   exit 1
 fi
 echo "PASS the provider-set mount cannot shadow another of the broker's mounts"
+
+echo "==> materializing nested skills from a projected ConfigMap"
+for suffix in skills-src skills; do
+  v="${resource}-${suffix}"
+  if docker volume inspect "$v" >/dev/null 2>&1; then
+    echo "refusing preexisting test volume: $v" >&2
+    exit 1
+  fi
+  echo "$v" >> "$work/volumes"
+  docker volume create "$v" >/dev/null
+done
+skills_mounts=(-v "${resource}-skills-src:/dekopon-skills-source:ro" -v "${resource}-skills:/etc/dekopon-skills")
+docker run --rm -v "${resource}-skills-src:/s" "$busybox" sh -c '
+  mkdir -p /s/..fixture/review/references
+  printf "%s\n" "review body" > /s/..fixture/review/SKILL.md
+  printf "%s\n" "module.exports = 42;" > /s/..fixture/review/references/review.cjs
+  chmod 0400 /s/..fixture/review/SKILL.md /s/..fixture/review/references/review.cjs
+  ln -s ..fixture /s/..data
+  ln -s ..data/review /s/review'
+render_init "$work/skills-init.sh" --set gateway.skills.configMap=dekopon-skills \
+  --set 'gateway.skills.items[0].key=review-skill,gateway.skills.items[0].path=review/SKILL.md' \
+  --set 'gateway.skills.items[1].key=review-reference,gateway.skills.items[1].path=review/references/review.cjs'
+run_init "$work/skills-init.sh"
+run_init "$work/skills-init.sh"
+docker run --rm --user 65533:65533 --cap-drop=ALL --read-only \
+  -v "${resource}-skills:/etc/dekopon-skills:ro" "$busybox" sh -c '
+  set -eu
+  test -z "$(find /etc/dekopon-skills -type l)"
+  test ! -e /etc/dekopon-skills/..data
+  test "$(cat /etc/dekopon-skills/review/SKILL.md)" = "review body"
+  test "$(cat /etc/dekopon-skills/review/references/review.cjs)" = "module.exports = 42;"
+  test "$(stat -c "%u:%g:%a:%h" /etc/dekopon-skills/review/SKILL.md)" = "0:0:644:1"
+  if touch /etc/dekopon-skills/review/new 2>/dev/null; then exit 1; fi'
+echo "PASS nested skills are regular, gateway-readable, read-only, and survive init reruns"
 
 echo
 echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only; the managed provider set is broker-only, owned by 65532, and survives a restart."

@@ -21,6 +21,9 @@ stub = """#!/usr/bin/env python3
 import json, os, pathlib, signal, sys
 root = pathlib.Path(os.environ['CLEANUP_FIXTURE'])
 args = sys.argv[1:]
+if args[:2] == ['volume', 'create']:
+    assert args[2:4] == ['--label', 'campaign=dekopon'], args
+    args = args[:2] + args[4:]
 assert len(args) == 3 and args[0] == 'volume', args
 operation, name = args[1:]
 assert name.startswith('dekopon-init-') and '/' not in name, name

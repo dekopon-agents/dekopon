@@ -617,7 +617,14 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
 
-{{- $chartPaths := dict "brokerAssets.rootPath" .Values.brokerAssets.rootPath "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
+{{- if and .Values.gateway.skills.configMap (not .Values.gateway.skills.items) -}}
+{{- fail "gateway.skills.configMap requires gateway.skills.items mapping keys to nested skill paths" -}}
+{{- end -}}
+{{- if and .Values.gateway.skills.items (not .Values.gateway.skills.configMap) -}}
+{{- fail "gateway.skills.items requires gateway.skills.configMap" -}}
+{{- end -}}
+
+{{- $chartPaths := dict "paths.skillsDir" .Values.paths.skillsDir "brokerAssets.rootPath" .Values.brokerAssets.rootPath "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
 {{- range $name, $path := $chartPaths -}}
 {{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $path)) (ne (clean $path) $path) -}}
 {{- fail (printf "%s must be a canonical absolute path of safe non-dot segments with no repeated or trailing slash, got %q" $name $path) -}}
@@ -653,7 +660,7 @@ broker that lands mid-invocation. */}}
 {{- $_ := set $bootstrapNames .file true -}}
 {{- end -}}
 
-{{- $secretSourceNames := dict "broker-config-directory" true "gateway-config-directory" true "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true -}}
+{{- $secretSourceNames := dict "broker-config-directory" true "gateway-config-directory" true "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "skills" true "skills-source" true -}}
 {{- range .Values.broker.secretSourceVolumes -}}
 {{- $source := . -}}
 {{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
@@ -674,7 +681,7 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "broker secret source %s mountPath %s overlaps %s (%s)" $source.name $source.mountPath $pathName $path) -}}
 {{- end -}}
 {{- end -}}
-{{- range $pathName, $path := dict "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- range $pathName, $path := dict "skills projection source" "/dekopon-skills-source" "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- if or (eq (clean $source.mountPath) $path) (hasPrefix (printf "%s/" (clean $source.mountPath)) $path) (hasPrefix (printf "%s/" $path) (clean $source.mountPath)) -}}
 {{- fail (printf "broker secret source %s mountPath %s overlaps chart/image-owned %s (%s)" $source.name $source.mountPath $pathName $path) -}}
 {{- end -}}
@@ -708,6 +715,8 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 {{- end -}}
 {{- $ownedMounts := dict "brokerAssets.rootPath" (clean .Values.brokerAssets.rootPath) "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "broker configuration directory source" "/dekopon-broker-d-source" "gateway configuration directory source" "/dekopon-gateway-d-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- $_ := set $ownedMounts "paths.skillsDir" (clean .Values.paths.skillsDir) -}}
+{{- $_ := set $ownedMounts "skills projection source" "/dekopon-skills-source" -}}
 {{- range $ownedName, $ownedPath := $ownedMounts -}}
 {{- if or (eq (clean $storagePath) $ownedPath) (hasPrefix (printf "%s/" (clean $storagePath)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $storagePath)) -}}
 {{- fail (printf "providerStorage.rootPath (%s) must not equal, contain, or be contained by chart-owned %s (%s); overlapping volume mounts shadow files" $storagePath $ownedName $ownedPath) -}}
@@ -716,7 +725,7 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 
 {{- range $pathName, $path := $chartPaths -}}
-{{- range $ownedName, $ownedPath := dict "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "broker configuration directory source" "/dekopon-broker-d-source" "gateway configuration directory source" "/dekopon-gateway-d-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- range $ownedName, $ownedPath := dict "skills projection source" "/dekopon-skills-source" "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "broker configuration directory source" "/dekopon-broker-d-source" "gateway configuration directory source" "/dekopon-gateway-d-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- if or (eq (clean $path) $ownedPath) (hasPrefix (printf "%s/" (clean $path)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $path)) -}}
 {{- fail (printf "%s (%s) must not overlap chart/image-owned %s (%s)" $pathName $path $ownedName $ownedPath) -}}
 {{- end -}}
