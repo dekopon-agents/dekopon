@@ -94,9 +94,34 @@ impl Anchor {
         )
     }
 
+    pub(crate) fn job_inbound(
+        &self,
+        id: dekopon_shell::JobId,
+        text: String,
+        job: Option<TraceParent>,
+    ) -> InboundMessage {
+        self.inbound_message(
+            MessageId::Job {
+                id,
+                agent: self.agent.clone(),
+            },
+            text,
+            job,
+        )
+    }
+
     pub(crate) fn inbound(&self, id: WakeId, text: String, notice: String) -> InboundMessage {
+        self.inbound_message(MessageId::Wake { id, notice }, text, self.scheduled_in)
+    }
+
+    fn inbound_message(
+        &self,
+        message_id: MessageId,
+        text: String,
+        parent: Option<TraceParent>,
+    ) -> InboundMessage {
         let span = receive_span(self.kind);
-        if let Some(parent) = self.scheduled_in {
+        if let Some(parent) = parent {
             dekopon_telemetry::link_remote(
                 &span,
                 dekopon_telemetry::TraceContextParts {
@@ -111,7 +136,7 @@ impl Anchor {
             transport_kind: self.kind,
             subject: self.subject.clone(),
             conversation: self.conversation.clone(),
-            message_id: MessageId::Wake { id, notice },
+            message_id,
             text,
             assets: Vec::new(),
             asset_overflow: false,

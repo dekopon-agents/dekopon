@@ -381,6 +381,10 @@ impl SessionGate {
                 record_admission(&message, "steered", depth + 1, None);
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
+                    && !matches!(
+                        running.steers.back().map(|steer| &steer.message_id),
+                        Some(MessageId::Job { .. })
+                    )
                     && usize::from(running.aborts) < MAILBOX_CAPACITY
                 {
                     running.aborts += 1;
@@ -520,16 +524,26 @@ impl SessionAdmission {
                 return None;
             };
             // Fold before changing subject: leftover steers must never drain into another sender's run.
-            if let Some(mut message) = running.steers.pop_front() {
-                let text = bound_inbound(&crate::collection::combined_text(
-                    std::iter::once(&message).chain(running.steers.iter()),
-                ));
-                for next in running.steers.drain(..) {
-                    message.assets.extend(next.assets);
-                    message.constituents.extend(next.constituents);
-                    message.receive_span = next.receive_span;
+            while let Some(mut message) = running.steers.pop_front() {
+                if !matches!(message.message_id, MessageId::Job { .. }) {
+                    let mut grouped = Vec::new();
+                    while matches!(
+                        running.steers.front().map(|steer| &steer.message_id),
+                        Some(MessageId::Native(_))
+                    ) {
+                        if let Some(next) = running.steers.pop_front() {
+                            grouped.push(next);
+                        }
+                    }
+                    message.text = bound_inbound(&crate::collection::combined_text(
+                        std::iter::once(&message).chain(grouped.iter()),
+                    ));
+                    for next in grouped {
+                        message.assets.extend(next.assets);
+                        message.constituents.extend(next.constituents);
+                        message.receive_span = next.receive_span;
+                    }
                 }
-                message.text = text;
                 running.follow_ups.push_back(FollowUp {
                     route: (*self.route).clone(),
                     receipts: crate::collection::Dispositions(message.constituents.clone()),
@@ -804,7 +818,7 @@ async fn recall_window(
                     &message.conversation,
                     match &message.message_id {
                         MessageId::Native(id) => Some(id),
-                        MessageId::Wake { .. } => None,
+                        MessageId::Wake { .. } | MessageId::Job { .. } => None,
                     },
                     limit,
                 ),
@@ -1016,27 +1030,47 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
-    let is_wake = matches!(message.message_id, MessageId::Wake { .. });
+    let is_unattended = matches!(
+        message.message_id,
+        MessageId::Wake { .. } | MessageId::Job { .. }
+    );
+    let notice_id = match message.message_id {
+        MessageId::Job { id, .. } => Some(id),
+        MessageId::Native(_) | MessageId::Wake { .. } => None,
+    };
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
+            if let Some(id) = notice_id {
+                crate::jobs::record_notice(id, "new-turn");
+            }
             Some(run_admitted(runner, route, message, driver, receipts, admission).await)
         }
         Admit::Steered(receipts) => {
+            if let Some(id) = notice_id {
+                crate::jobs::record_notice(id, "steered");
+            }
             tracing::Span::current().record("outcome", "steered");
             receipts.finish("steered");
             acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             None
         }
         Admit::Queued => {
+            if let Some(id) = notice_id {
+                crate::jobs::record_notice(id, "queued");
+            }
             tracing::Span::current().record("outcome", "queued");
-            if !is_wake {
+            if !is_unattended {
                 acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             }
             None
         }
         Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
+            if let Some(id) = notice_id {
+                crate::jobs::record_notice(id, "dropped");
+            }
             tracing::info!(event = "gateway_session_rejected", reason = "busy");
-            if (runner.reply_on_busy || !message.constituents.is_empty())
+            if notice_id.is_none()
+                && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
             {
                 answer(driver, &message, BUSY_REPLY).await;
@@ -1108,6 +1142,9 @@ impl SteerSource for SessionSteers {
             .take_steers(&self.key)
             .into_iter()
             .map(|steer| {
+                if matches!(steer.message_id, MessageId::Job { .. }) {
+                    return steer.text;
+                }
                 let seconds = steer
                     .received_at
                     .saturating_duration_since(self.received_at)

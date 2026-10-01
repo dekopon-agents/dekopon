@@ -105,6 +105,335 @@ async fn a_job_outlives_its_turn_and_the_turns_script_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
+    let directory = temporary();
+    let routes = job_routes(directory.path(), Some(10_000)).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 1 && echo finished &"),
+        answer("started"),
+        answer("noticed"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (sender, receiver) = mpsc::channel(4);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let service = tokio::spawn(crate::serve(
+        Arc::clone(&runner),
+        routes,
+        Arc::new(BTreeMap::new()),
+        drivers,
+        Arc::new(Vec::new()),
+        receiver,
+        async move {
+            stopped.await.ok();
+        },
+        Duration::from_secs(2),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    sender
+        .send(TransportEvent::Message(Box::new(message("start"))))
+        .await
+        .unwrap();
+    until(Duration::from_secs(10), || driver.replies().len() == 2).await;
+    assert_eq!(
+        driver.replies(),
+        ["started", "noticed"],
+        "requests={} prompt1={:?}",
+        models.requests(),
+        models.prompt(1)
+    );
+    let prompt = models.prompt(2);
+    assert!(
+        prompt.iter().any(|(role, text)| role == "user"
+            && text.starts_with("[gateway: job 1 finished, exit 0, after")
+            && text.contains("sleep 1 && echo finished\nfinished")),
+        "{prompt:?}"
+    );
+    stop.send(()).unwrap();
+    service.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_or_stopped_job_sends_no_notice_but_keeps_its_outcome() {
+    let jobs = Arc::new(Jobs::new(2));
+    let mut notices = jobs.take_notices();
+    let killed = admitted(&jobs, "a", "sleep 9").unwrap();
+    let cancelled = admitted(&jobs, "b", "sleep 9").unwrap();
+    let owner = owned_by("a");
+    jobs.kill(&owner, jobs.list(&owner)[0].id).unwrap();
+    let request = crate::transport::CancelRequest {
+        transport: "dev".to_owned(),
+        conversation_id: message("x").conversation.key(),
+        subject: subject_named("b").canonical(),
+        via: dekopon_agent::CancelVia::StopReply,
+    };
+    assert!(jobs.cancel_owner(&request));
+    drop((killed, cancelled));
+    assert_eq!(finished(&jobs.list(&owner)[0]).0, JobOutcome::Killed);
+    assert_eq!(
+        finished(&jobs.list(&owned_by("b"))[0]).0,
+        JobOutcome::Cancelled
+    );
+    assert!(notices.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notice_with_a_large_output_is_bounded_to_sixteen_kibibytes() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call(
+            "i=0; while [ $i -lt 1800 ]; do echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ; i=$((i+1)); done &",
+        ),
+        answer("started"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let mut notices = runner.jobs.take_notices();
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("start"),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let notice = tokio::time::timeout(Duration::from_secs(10), notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        notice
+            .text
+            .starts_with("[gateway: job 1 finished, exit 0, after")
+    );
+    assert_eq!(notice.text.len(), crate::transport::MAX_INBOUND_TEXT_BYTES);
+}
+
+fn notice_for(inbound: &InboundMessage, id: u64) -> InboundMessage {
+    let anchor = crate::wake::Anchor::for_job(inbound, &route(model_config()).agent).unwrap();
+    anchor.job_inbound(
+        JobId::new(id),
+        format!("[gateway: job {id} finished, exit 0, after 1s]\necho done\ndone"),
+        None,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_user_text() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = InterruptibleModel::new(vec![answer("finished")]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = job_route(Duration::from_secs(10), Duration::from_secs(10));
+    route.steering = crate::config::Steering::Abort;
+    let held = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        message("person said this"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    models.wait_until_entered().await;
+    run_session(
+        Arc::clone(&runner),
+        route,
+        notice_for(&message("start"), 8),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        models.interrupted.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    models.release();
+    held.await.unwrap();
+    assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
+        && text.starts_with("[gateway: job 8 finished")
+        && !text.contains("sent while you were working")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_notice_drops_without_a_busy_reply() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = BlockedModel::new("done");
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let held = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("holding"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    models.wait_until_entered().await;
+    let mut foreign = message("foreign");
+    foreign.conversation.id = "different".to_owned();
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        notice_for(&foreign, 9),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert!(driver.replies().is_empty());
+    let records = capture.events_text();
+    assert_eq!(
+        records.matches("job.notice.delivery=\"dropped\"").count(),
+        1,
+        "{records}"
+    );
+    models.release();
+    held.await.unwrap();
+    assert_eq!(driver.replies(), ["done"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_without_job_opt_in_drops_the_notice_once() {
+    use tracing::instrument::WithSubscriber as _;
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let routes = job_routes(directory.path(), None).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (_sender, receiver) = mpsc::channel(4);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let service = tokio::spawn(
+        crate::serve(
+            Arc::clone(&runner),
+            routes,
+            Arc::new(BTreeMap::new()),
+            drivers,
+            Arc::new(Vec::new()),
+            receiver,
+            async move {
+                stopped.await.ok();
+            },
+            Duration::from_secs(2),
+            crate::collection::Collector::new(&[], 4),
+        )
+        .with_current_subscriber(),
+    );
+    drop(admitted(&runner.jobs, "a", "job").unwrap());
+    until(Duration::from_secs(2), || {
+        capture
+            .events_text()
+            .contains("job.notice.delivery=\"dropped\"")
+    })
+    .await;
+    assert_eq!(
+        capture
+            .events_text()
+            .matches("job.notice.delivery=\"dropped\"")
+            .count(),
+        1
+    );
+    assert!(driver.replies().is_empty());
+    assert_eq!(models.requests(), 0);
+    stop.send(()).unwrap();
+    service.await.unwrap();
+}
+
+#[test]
+fn a_full_notice_channel_drops_once_without_blocking_job_completion() {
+    let (capture, _guard) = capture_spans();
+    let jobs = Arc::new(Jobs::new(1));
+    drop(admitted(&jobs, "a", "first").unwrap());
+    drop(admitted(&jobs, "a", "second").unwrap());
+    let text = capture.events_text();
+    assert_eq!(
+        text.matches("job.notice.delivery=\"dropped\"").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(jobs.free_permits(), 1);
+}
+
+#[test]
+fn leftover_notices_and_person_steers_become_separate_followups() {
+    let gate = crate::session::SessionGate::new(1);
+    let route = job_route(Duration::from_secs(10), Duration::from_secs(10));
+    let original = message("person");
+    let admission = match gate.admit(
+        &route,
+        original,
+        crate::collection::Dispositions(Vec::new()),
+    ) {
+        crate::session::Admit::Admitted(admission, _, _) => admission,
+        crate::session::Admit::Steered(_)
+        | crate::session::Admit::Queued
+        | crate::session::Admit::Full(..)
+        | crate::session::Admit::Saturated(..) => panic!("original admitted"),
+    };
+    let notice = notice_for(&message("person"), 11);
+    assert!(matches!(
+        gate.admit(&route, notice, crate::collection::Dispositions(Vec::new())),
+        crate::session::Admit::Steered(_)
+    ));
+    assert!(matches!(
+        gate.admit(
+            &route,
+            message("person's steer"),
+            crate::collection::Dispositions(Vec::new())
+        ),
+        crate::session::Admit::Steered(_)
+    ));
+    let (admission, first) = admission.next_or_release().expect("the notice follows");
+    assert!(matches!(first.message.message_id, MessageId::Job { .. }));
+    assert!(!first.message.text.contains("person's steer"));
+    let (admission, second) = admission
+        .next_or_release()
+        .expect("the person follows separately");
+    assert!(matches!(second.message.message_id, MessageId::Native(_)));
+    assert!(second.message.text.contains("person's steer"));
+    assert!(!second.message.text.contains("[gateway: job"));
+    assert!(admission.next_or_release().is_none());
+}
+
+#[test]
+fn another_persons_notice_queues_behind_the_running_turn() {
+    let gate = crate::session::SessionGate::new(1);
+    let route = job_route(Duration::from_secs(10), Duration::from_secs(10));
+    let admission = match gate.admit(
+        &route,
+        from("a", "running"),
+        crate::collection::Dispositions(Vec::new()),
+    ) {
+        crate::session::Admit::Admitted(admission, _, _) => admission,
+        crate::session::Admit::Steered(_)
+        | crate::session::Admit::Queued
+        | crate::session::Admit::Full(..)
+        | crate::session::Admit::Saturated(..) => panic!("first person admitted"),
+    };
+    let second = from("b", "starting job");
+    let notice = notice_for(&second, 12);
+    assert!(matches!(
+        gate.admit(&route, notice, crate::collection::Dispositions(Vec::new())),
+        crate::session::Admit::Queued
+    ));
+    let (_, followup) = admission
+        .next_or_release()
+        .expect("other person's notice follows");
+    assert!(matches!(followup.message.message_id, MessageId::Job { .. }));
+    assert_eq!(followup.message.subject, second.subject);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_start_past_max_jobs_fails_at_once_without_taking_a_session_permit() {
     let directory = temporary();
     let (broker, _observed) =
@@ -180,6 +509,31 @@ async fn wait_returns_the_last_jobs_exit_and_bare_wait_covers_all_started_jobs()
     assert!(output.contains("status=0"), "{output}");
     assert!(output.contains("first=1"), "{output}");
     assert_eq!(runner.jobs.free_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_waited_while_running_sends_no_notice() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 1 && echo done & wait $!"),
+        answer("waited"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 1);
+    let mut notices = runner.jobs.take_notices();
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("wait"),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert!(notices.try_recv().is_err());
+    assert_eq!(
+        finished(&runner.jobs.list(&JobOwner::of(&message("wait")))[0]).0,
+        JobOutcome::Succeeded
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

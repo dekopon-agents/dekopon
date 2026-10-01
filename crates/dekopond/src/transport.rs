@@ -75,7 +75,14 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
-    Wake { id: WakeId, notice: String },
+    Wake {
+        id: WakeId,
+        notice: String,
+    },
+    Job {
+        id: dekopon_shell::JobId,
+        agent: dekopon_core::AgentId,
+    },
 }
 
 impl MessageId {
@@ -83,6 +90,7 @@ impl MessageId {
         match self {
             Self::Native(_) => Trigger::Message,
             Self::Wake { .. } => Trigger::Wake,
+            Self::Job { .. } => Trigger::Job,
         }
     }
 }
@@ -92,6 +100,7 @@ impl fmt::Display for MessageId {
         match self {
             Self::Native(id) => formatter.write_str(id),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
+            Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }
     }
 }

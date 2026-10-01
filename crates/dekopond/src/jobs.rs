@@ -12,11 +12,13 @@ use dekopon_shell::{
     JobState, JobSummary, JobWait, Limits as ShellLimits, TreeContext,
 };
 use parking_lot::{Condvar, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 use crate::{
     config::ResolvedBroker,
-    transport::{CancelRequest, InboundMessage},
+    transport::{
+        CancelRequest, InboundMessage, MAX_INBOUND_TEXT_BYTES, bound_inbound, floor_boundary,
+    },
     wake::Anchor,
 };
 
@@ -120,10 +122,13 @@ pub(crate) struct Jobs {
     ended: Condvar,
     permits: Arc<Semaphore>,
     maximum: usize,
+    notices: mpsc::Sender<InboundMessage>,
+    notice_receiver: Mutex<Option<mpsc::Receiver<InboundMessage>>>,
 }
 
 impl Jobs {
     pub(crate) fn new(maximum: usize) -> Self {
+        let (notices, receiver) = mpsc::channel(maximum);
         Self {
             table: Mutex::new(Table {
                 rows: VecDeque::with_capacity(maximum),
@@ -132,7 +137,16 @@ impl Jobs {
             ended: Condvar::new(),
             permits: Arc::new(Semaphore::new(maximum)),
             maximum,
+            notices,
+            notice_receiver: Mutex::new(Some(receiver)),
         }
+    }
+
+    pub(crate) fn take_notices(&self) -> mpsc::Receiver<InboundMessage> {
+        self.notice_receiver
+            .lock()
+            .take()
+            .expect("one serve loop owns job notices")
     }
 
     pub(crate) fn admit(
@@ -175,6 +189,7 @@ impl Jobs {
                 anchor,
                 starter,
                 permit: Some(permit),
+                completed_trace: None,
             },
             signal,
         ))
@@ -198,18 +213,24 @@ impl Jobs {
                 }
                 (None, Ending::Ran { .. }) => JobOutcome::Failed,
             };
+            let now = Instant::now();
             row.state = RowState::Finished {
                 outcome,
                 exit: ended.exit,
-                ended: Instant::now(),
+                ended: now,
             };
             row.cancel = None;
             row.waited |= row.waiters > 0;
-            (outcome, row.waited)
+            (
+                outcome,
+                row.waited,
+                Arc::clone(&row.text),
+                now.saturating_duration_since(row.started),
+            )
         });
         drop(table);
         self.ended.notify_all();
-        if let Some((outcome, waited)) = finished {
+        if let Some((outcome, waited, text, after)) = finished {
             tracing::debug!(
                 event = "gateway_job_finished",
                 job.id = id.get(),
@@ -219,6 +240,27 @@ impl Jobs {
                 job.waited = waited,
                 job.output.bytes = ended.output.len(),
             );
+            if !waited
+                && matches!(
+                    outcome,
+                    JobOutcome::Succeeded | JobOutcome::Failed | JobOutcome::Deadline
+                )
+            {
+                let body = format!(
+                    "[gateway: job {id} finished, exit {}, after {}s]\n{text}\n{}",
+                    ended.exit.get(),
+                    after.as_secs(),
+                    ended.output
+                );
+                let mut bounded = bound_inbound(&body);
+                if bounded.len() > MAX_INBOUND_TEXT_BYTES {
+                    bounded.truncate(floor_boundary(&bounded, MAX_INBOUND_TEXT_BYTES));
+                }
+                let message = run.anchor.job_inbound(id, bounded, run.completed_trace);
+                if self.notices.try_send(message).is_err() {
+                    record_notice(id, "dropped");
+                }
+            }
         }
         drop(permit);
     }
@@ -314,6 +356,10 @@ impl Jobs {
     }
 }
 
+pub(crate) fn record_notice(id: JobId, delivery: &'static str) {
+    tracing::info!(name: "job.notice", target: "job", { job.id = id.get(), job.notice.delivery = delivery }, "job.notice");
+}
+
 struct Waiter<'a> {
     jobs: &'a Jobs,
     owner: &'a JobOwner,
@@ -349,10 +395,12 @@ pub(crate) struct JobRun {
     anchor: Anchor,
     starter: Option<TraceParent>,
     permit: Option<OwnedSemaphorePermit>,
+    completed_trace: Option<TraceParent>,
 }
 
 impl JobRun {
-    fn finish(mut self, ended: Ended) {
+    fn finish_with_trace(mut self, ended: Ended, trace: Option<TraceParent>) {
+        self.completed_trace = trace;
         if let Some(permit) = self.permit.take() {
             self.jobs.finish(&self, ended, permit);
         }
@@ -536,9 +584,25 @@ impl Started {
                 },
             );
         }
-        let ended = span.in_scope(|| context.run(seed, signal));
+        let parent = span.in_scope(current_trace_parent);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            span.in_scope(|| context.run(seed, signal))
+        }));
         drop(span);
-        run.finish(ended);
+        match result {
+            Ok(ended) => run.finish_with_trace(ended, parent),
+            Err(panic) => {
+                run.finish_with_trace(
+                    Ended {
+                        exit: ExitCode::FAILURE,
+                        output: "[gateway: the job stopped before it could finish]".to_owned(),
+                        ending: Ending::Abandoned,
+                    },
+                    parent,
+                );
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 }
 

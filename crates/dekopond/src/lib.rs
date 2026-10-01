@@ -348,6 +348,7 @@ where
     let mut sessions = JoinSet::new();
     let mut ticks = JoinSet::new();
     let mut wakes = runner.wakes.clone();
+    let mut notices = runner.jobs.take_notices();
     tokio::pin!(shutdown);
     let mut outcome = ServeOutcome::Shutdown;
 
@@ -407,6 +408,20 @@ where
                     start_session(&runner, &routes, &drivers, &mut sessions, message);
                 }
             },
+            Some(message) = notices.recv() => {
+                let (id, agent) = match &message.message_id {
+                    MessageId::Job { id, agent } => (*id, agent),
+                    MessageId::Native(_) | MessageId::Wake { .. } => continue,
+                };
+                let answering = routes.route(&message).is_some_and(|route| {
+                    route.job_timeout.is_some() && &route.agent == agent
+                });
+                if answering && drivers.contains_key(&message.transport) {
+                    start_session(&runner, &routes, &drivers, &mut sessions, message);
+                } else {
+                    jobs::record_notice(id, "dropped");
+                }
+            },
             event = receiver.recv() => {
                 let Some(event) = event else {
                     outcome = ServeOutcome::TransportsLost;
@@ -442,6 +457,7 @@ where
         }
     }
 
+    drop(notices);
     collector.shutdown();
     runner.jobs.cancel_all();
 
