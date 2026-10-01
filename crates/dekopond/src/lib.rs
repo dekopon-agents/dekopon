@@ -490,19 +490,9 @@ fn dispatch(
     collector: &mut collection::Collector,
     message: InboundMessage,
 ) {
-    let Some((route_id, _)) = routes.route_index(&message) else {
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "unrouted",
-            conversation.kind = message.conversation.kind.as_str(),
-            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
-        );
-        return;
-    };
-    // Checked before the addressed filter, since a channel stop word like the bot mention plus stop
-    // would otherwise be dropped as unaddressed before the matcher saw it; only this sender's
-    // running or pending input may be stopped.
+    // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
+    // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
+    // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
     if transport::is_stop_word(
         identities.get(&message.transport),
         &message.text,
@@ -566,6 +556,16 @@ fn dispatch(
             return;
         }
     }
+    let Some((route_id, _)) = routes.route_index(&message) else {
+        tracing::debug!(
+            event = "gateway_message_ignored",
+            transport = %message.transport,
+            reason = "unrouted",
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
+        );
+        return;
+    };
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)

@@ -3071,18 +3071,29 @@ impl JobControl for StubJobs {
     }
 
     fn list(&self) -> Vec<JobSummary> {
+        let waited = self.waited.lock();
         self.seeds
             .lock()
             .iter()
             .enumerate()
-            .map(|(index, text)| JobSummary {
-                id: JobId::new(index as u64 + 1),
-                state: dekopon_shell::JobState::Finished {
-                    outcome: dekopon_shell::JobOutcome::Succeeded,
-                    exit: ExitCode::SUCCESS,
-                    after: Duration::from_secs(1),
-                },
-                text: text.clone().into(),
+            .map(|(index, text)| {
+                let id = JobId::new(index as u64 + 1);
+                let state = if waited.contains(&id) {
+                    dekopon_shell::JobState::Finished {
+                        outcome: dekopon_shell::JobOutcome::Succeeded,
+                        exit: ExitCode::SUCCESS,
+                        after: Duration::from_secs(1),
+                    }
+                } else {
+                    dekopon_shell::JobState::Running {
+                        elapsed: Duration::from_secs(12),
+                    }
+                };
+                JobSummary {
+                    id,
+                    state,
+                    text: text.clone().into(),
+                }
             })
             .collect()
     }
@@ -3171,7 +3182,11 @@ fn jobs_rejects_operands_and_accepts_listing_options() {
         interpreter.run("jobs -l; jobs -p", &invoker).exit_code,
         ExitCode::SUCCESS
     );
-    let listing = interpreter.run("echo hi & jobs; jobs -p", &invoker);
+    let listing = interpreter.run("echo hi & jobs; wait; jobs; jobs -p", &invoker);
+    assert!(
+        listing.output.contains("[1] running 12s echo hi\n"),
+        "{listing:?}"
+    );
     assert!(
         listing
             .output

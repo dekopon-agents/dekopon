@@ -22,7 +22,7 @@ impl dekopon_shell::CapabilityInvoker for NoProviders {
     }
 }
 
-fn wake_store(directory: &Path) -> Arc<WakeStore> {
+pub(super) fn wake_store(directory: &Path) -> Arc<WakeStore> {
     Arc::new(
         WakeStore::open(&ResolvedWakes {
             path: directory.join("wakes").join("wakes.jsonl"),
@@ -36,7 +36,7 @@ fn wake_store(directory: &Path) -> Arc<WakeStore> {
     )
 }
 
-fn slack_message(text: &str) -> InboundMessage {
+pub(super) fn slack_message(text: &str) -> InboundMessage {
     let mut message = message(text);
     message.transport_kind = dekopon_broker_protocol::ChatTransportKind::Slack;
     message.reply = ReplyTarget::Slack {
@@ -67,7 +67,7 @@ fn runner_with_wakes(
     Arc::new(runner)
 }
 
-fn wake_call(arguments: &Value) -> AssistantTurn {
+pub(super) fn wake_call(arguments: &Value) -> AssistantTurn {
     AssistantTurn::new(
         None,
         vec![ModelToolCall {
