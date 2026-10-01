@@ -621,6 +621,25 @@ one private or shared conversation's turns; it is emitted on its own event so th
 canonical subject never share a record, which keeps a reader who needs only one of them from seeing
 both.
 
+### Detached-job traces and records
+
+`job.started` is a log record in the starting script's trace with `job.id`,
+`job.deadline_ms`, `job.script.head` and `job.script.bytes`. A detached job has
+its own `gateway.job` root span (`job.id`), with no parent and a link to the
+starter's trace. Its `shell.script` and broker calls are descendants of that
+root. `job.finished` is recorded inside the job trace with `job.id`,
+`job.outcome`, `job.exit_code` and `duration_ms`. The completion notice starts
+a separate linked message trace; `job.notice` records `job.id` and
+`job.notice.delivery` (`steered`, `queued`, `new-turn`, or `dropped`) exactly
+where delivery is decided. A notice dropped before admission has no trace.
+These records also carry conversation and subject context where available.
+
+The store rejects an individual root span that lives longer than five hours;
+its finished child spans and job records survive. A job with no `job.finished`
+three minutes past `job.started` plus `job.deadline_ms` is **unknown** even if
+telemetry health continues. The deadline is not reduced to fit the store's
+span limit: serving takes precedence over recording.
+
 ## Broker execution spans
 
 `broker.invocation` is not a flat bar. Beneath it the broker's own crates emit the spans below.

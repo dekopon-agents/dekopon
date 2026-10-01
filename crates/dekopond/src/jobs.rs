@@ -190,6 +190,7 @@ impl Jobs {
                 starter,
                 permit: Some(permit),
                 completed_trace: None,
+                completed_span: None,
             },
             signal,
         ))
@@ -231,6 +232,22 @@ impl Jobs {
         drop(table);
         self.ended.notify_all();
         if let Some((outcome, waited, text, after)) = finished {
+            let record = || {
+                tracing::info!(name: "job.finished", target: "job", {
+                        job.id = %id,
+                        job.outcome = outcome.as_str(),
+                        job.exit_code = ended.exit.get(),
+                        agent = %run.anchor.agent(),
+                        conversation.id = %run.anchor.conversation().key(),
+                        subject = %run.anchor.subject().canonical(),
+                        duration_ms = after.as_millis() as u64,
+                    }, "job.finished");
+            };
+            if let Some(span) = &run.completed_span {
+                span.in_scope(record);
+            } else {
+                record();
+            }
             tracing::debug!(
                 event = "gateway_job_finished",
                 job.id = id.get(),
@@ -357,7 +374,7 @@ impl Jobs {
 }
 
 pub(crate) fn record_notice(id: JobId, delivery: &'static str) {
-    tracing::info!(name: "job.notice", target: "job", { job.id = id.get(), job.notice.delivery = delivery }, "job.notice");
+    tracing::info!(name: "job.notice", target: "job", { job.id = %id, job.notice.delivery = delivery }, "job.notice");
 }
 
 struct Waiter<'a> {
@@ -396,11 +413,13 @@ pub(crate) struct JobRun {
     starter: Option<TraceParent>,
     permit: Option<OwnedSemaphorePermit>,
     completed_trace: Option<TraceParent>,
+    completed_span: Option<tracing::Span>,
 }
 
 impl JobRun {
-    fn finish_with_trace(mut self, ended: Ended, trace: Option<TraceParent>) {
+    fn finish_with_trace(mut self, ended: Ended, trace: Option<TraceParent>, span: tracing::Span) {
         self.completed_trace = trace;
+        self.completed_span = Some(span);
         if let Some(permit) = self.permit.take() {
             self.jobs.finish(&self, ended, permit);
         }
@@ -588,9 +607,8 @@ impl Started {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             span.in_scope(|| context.run(seed, signal))
         }));
-        drop(span);
         match result {
-            Ok(ended) => run.finish_with_trace(ended, parent),
+            Ok(ended) => run.finish_with_trace(ended, parent, span),
             Err(panic) => {
                 run.finish_with_trace(
                     Ended {
@@ -599,6 +617,7 @@ impl Started {
                         ending: Ending::Abandoned,
                     },
                     parent,
+                    span,
                 );
                 std::panic::resume_unwind(panic);
             }
@@ -615,6 +634,16 @@ impl JobControl for JobContext {
             Arc::clone(seed.text()),
         )?;
         let id = run.id;
+        let text = seed.text();
+        tracing::info!(name: "job.started", target: "job", {
+            job.id = %id,
+            job.deadline_ms = self.limits.timeout.as_millis() as u64,
+            job.script.head = %dekopon_core::bounded_display(text).text(),
+            job.script.bytes = text.len(),
+            agent = %self.anchor.agent(),
+            conversation.id = %self.anchor.conversation().key(),
+            subject = %self.anchor.subject().canonical(),
+        }, "job.started");
         let started = Started {
             context: self.clone(),
             run,
@@ -622,7 +651,10 @@ impl JobControl for JobContext {
             signal,
         };
         let _runtime = self.runtime.enter();
-        drop(tokio::task::spawn_blocking(move || started.run()));
+        let subscriber = tracing::dispatcher::get_default(Clone::clone);
+        drop(tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&subscriber, || started.run());
+        }));
         Ok(id)
     }
 

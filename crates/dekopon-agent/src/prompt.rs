@@ -1415,6 +1415,12 @@ buffers all behave the way you expect. Everything outside that curated set fails
 name: `eval`, backticks, subshells, and `<<<` are errors, never silent no-ops. If a script ran, it \
 did what it said.
 
+`cmd &` starts a detached job that outlives this script and turn when the route sets a job deadline. \
+It prints `[N]` on stderr and sets `$!` to N. Use `jobs` to list, `wait %N` to wait, and \
+`kill %N` to stop it; there is no `fg` or `bg`. Completion arrives as a `[gateway: job ...]` \
+message. A job's variables and buffers die with it; only what it prints reaches that notice \
+(the first 16 KiB). A job cannot send files or images. It ends at its job deadline, and \
+jobs are lost on gateway restart.\n
 Five things genuinely differ from a real shell:
 
 1. There are no processes, no filesystem, no environment variables, and no network reachable \
@@ -1453,7 +1459,7 @@ Builtins: `jq` (`-r` raw strings, `-c` compact, `-n` null input, `-s` slurp; one
 document per output line, strings quoted unless `-r`), `cap`, `cat`, `echo`, `printf`, \
 `test`/`[`, `true`, `false`, `sleep`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, \
 `head`/`tail` (default 10 lines, `-n N` or `-N`; `tail -n +N` starts at N; no file \
-operands), `base64`, `xargs`. Any provider command words this session has \
+operands), `base64`, `xargs`, `jobs`, `wait`, `kill`. Any provider command words this session has \
 are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \
@@ -3329,6 +3335,24 @@ mod tests {
             .split(", ")
             .map(|name| name.strip_prefix("and ").unwrap_or(name))
             .collect()
+    }
+
+    #[test]
+    fn bash_description_explains_detached_jobs_and_their_delivery_limits() {
+        for phrase in [
+            "`cmd &`",
+            "`$!`",
+            "`jobs`",
+            "`wait %N`",
+            "`kill %N`",
+            "variables and buffers die with it",
+            "cannot send files or images",
+            "job deadline",
+            "lost on gateway restart",
+        ] {
+            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
+        }
+        assert!(!refusal_list().iter().any(|name| name.contains('&')));
     }
 
     #[test]

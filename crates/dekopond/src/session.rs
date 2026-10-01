@@ -1493,55 +1493,58 @@ async fn session(
         });
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
+    let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let result = tokio::task::spawn_blocking(move || {
-        let _entered = blocking_span.enter();
-        let model = match models.client(&model_config, model_runtime, model_cancel) {
-            Ok(model) => model,
-            Err(error) => return (Err(error), None, Vec::new()),
-        };
-        let runtime = ShellRuntime {
-            invoker: leg,
-            limits: shell,
-            calls,
-        };
-        let mut history = seeded;
-        let mut inputs = SessionInputs::new(&text, limits)
-            .with_system(instructions.as_deref())
-            .with_skills(&skills)
-            .with_agent(&agent)
-            .with_options(&options)
-            .with_assets(assets.as_ref())
-            .with_reply_assets(&session_attachments)
-            .with_cancellation(&prompt_cancellation)
-            .with_steering(session_steers.as_ref())
-            .with_progress(Arc::clone(&progress_sink));
-        // Withholding the agent-config view here removes the structured dump but not the underlying
-        // instructions, which are still the system prompt, so this is not secrecy from a determined
-        // user.
-        if inspect_agent_config {
-            inputs = inputs.with_agent_config(&agent_config);
-        }
-        if progress_notes {
-            inputs = inputs.with_progress_notes();
-        }
-        if reply_optional {
-            inputs = inputs.with_optional_reply();
-        }
-        if let Some(wakes) = wakes.as_ref() {
-            inputs = inputs.with_wakes(wakes);
-        }
-        let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
-            .map_err(SessionError::from);
-        let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
-            _ => history.turns().last().cloned(),
-        };
-        let images = if outcome.is_ok() {
-            session_attachments.take()
-        } else {
-            Vec::new()
-        };
-        (outcome, turn, images)
+        tracing::dispatcher::with_default(&subscriber, || {
+            let _entered = blocking_span.enter();
+            let model = match models.client(&model_config, model_runtime, model_cancel) {
+                Ok(model) => model,
+                Err(error) => return (Err(error), None, Vec::new()),
+            };
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits: shell,
+                calls,
+            };
+            let mut history = seeded;
+            let mut inputs = SessionInputs::new(&text, limits)
+                .with_system(instructions.as_deref())
+                .with_skills(&skills)
+                .with_agent(&agent)
+                .with_options(&options)
+                .with_assets(assets.as_ref())
+                .with_reply_assets(&session_attachments)
+                .with_cancellation(&prompt_cancellation)
+                .with_steering(session_steers.as_ref())
+                .with_progress(Arc::clone(&progress_sink));
+            // Withholding the agent-config view here removes the structured dump but not the underlying
+            // instructions, which are still the system prompt, so this is not secrecy from a determined
+            // user.
+            if inspect_agent_config {
+                inputs = inputs.with_agent_config(&agent_config);
+            }
+            if progress_notes {
+                inputs = inputs.with_progress_notes();
+            }
+            if reply_optional {
+                inputs = inputs.with_optional_reply();
+            }
+            if let Some(wakes) = wakes.as_ref() {
+                inputs = inputs.with_wakes(wakes);
+            }
+            let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+                .map_err(SessionError::from);
+            let turn = match &outcome {
+                Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
+                _ => history.turns().last().cloned(),
+            };
+            let images = if outcome.is_ok() {
+                session_attachments.take()
+            } else {
+                Vec::new()
+            };
+            (outcome, turn, images)
+        })
     })
     .await;
 

@@ -160,6 +160,55 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_detached_job_records_its_start_root_finish_and_notice() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("echo finished &"),
+        answer("started"),
+        answer("noticed"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(5), Duration::from_secs(10)),
+        message("start"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .with_subscriber(subscriber.clone())
+    .await;
+    let mut notices = runner.jobs.take_notices();
+    let notice = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+        .await
+        .expect("job finishes")
+        .expect("notice arrives");
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(5), Duration::from_secs(10)),
+        notice,
+        driver as Arc<dyn ChatDriver>,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    let records = capture.records();
+    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Span { name: "gateway.job", parent: None, fields } if fields.contains("job.id=1"))), "{records:?}");
+    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Span { name: "shell.script", parent: Some(parent), .. } if parent == "gateway.job")), "{records:?}");
+    for (field, parent) in [
+        ("job.deadline_ms=", Some("shell.script")),
+        ("job.outcome=\"succeeded\"", Some("gateway.job")),
+        ("job.notice.delivery=\"new-turn\"", Some("gateway.message")),
+    ] {
+        assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { fields, parent: actual, .. } if fields.contains("job.id=1") && fields.contains(field) && actual.as_deref() == parent)), "{field}: {records:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_killed_or_stopped_job_sends_nothing_after_its_reply_and_keeps_its_outcome() {
     use tracing::instrument::WithSubscriber as _;
     let (capture, _guard) = capture_spans();
