@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::Path};
 
-use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
+use dekopon_broker_host::{BrokerHostLimits, CommandRunOutcome};
 use dekopon_provider_sdk::{
     ProviderManifest,
     provider::{self, Capabilities, ImportSet, Provider},
@@ -148,10 +148,8 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
         });
     }
     let native = provider::manifest::<P>()?;
-    let registry = super::typed::runtime().block_on(BrokerProviderRegistry::load(
-        [path.to_path_buf()],
-        BrokerHostLimits::default(),
-    ))?;
+    let registry =
+        super::typed::cached_registry::<P>(path.canonicalize()?, BrokerHostLimits::default())?;
     let real = registry
         .manifests()
         .next()

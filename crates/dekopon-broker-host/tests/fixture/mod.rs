@@ -29,42 +29,27 @@ pub use dekopon_core::{
 };
 pub use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageHostError, StorageLimits};
 
-/// Anything that can stop a fake invocation, kept distinguishable so a test can assert on cause.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FixtureHostError {
-    /// [`FixtureHostBuilder::component`] was never called.
     #[error("no component path was configured")]
     NoComponent,
-    /// [`FixtureHostBuilder::provider`] was never called.
     #[error("no provider id was configured")]
     NoProvider,
-    /// The component path does not exist, usually because it is an untracked build artifact that
-    /// has not been built yet via build.sh.
     #[error("provider component {} does not exist; build it first", path.display())]
-    ComponentMissing {
-        /// The path that was configured.
-        path: PathBuf,
-    },
-    /// A configured identifier is not a valid Dekopon identifier.
+    ComponentMissing { path: PathBuf },
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
-    /// The configured external subject is malformed.
     #[error("invalid external subject: {0}")]
     Subject(#[from] SubjectError),
-    /// Creating the temporary root failed.
     #[error("preparing the temporary storage root failed: {0}")]
     Io(#[from] std::io::Error),
-    /// The storage host refused to open the root or to mint a grant.
     #[error(transparent)]
     Storage(#[from] StorageHostError),
-    /// The component failed to compile, load, or expose the requested capability.
     #[error(transparent)]
     Host(#[from] BrokerHostError),
-    /// The synthesized authorization was itself invalid.
     #[error(transparent)]
     Authorization(#[from] AuthorizationError),
-    /// The invocation ran and failed.
     #[error("invocation failed: {0}")]
     Invocation(#[source] Box<BrokerInvocationFailure>),
 }
@@ -157,8 +142,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Sets the provider id the authorization binds to. Required, and must match the id in the
-    /// component's own manifest or the host refuses the invocation.
     #[must_use]
     pub fn provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = Some(provider.into());
@@ -185,9 +168,7 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Uses immutable, boot-verified, mmap-backed compiled components from a trusted directory; do
-    /// not modify mapped artifacts while a harness is alive, since errors fail loading with no
-    /// fallback.
+    /// Do not modify mapped artifacts while the harness is alive; loading fails without fallback.
     #[must_use]
     pub fn compile_cache(mut self, directory: impl Into<PathBuf>) -> Self {
         self.host_options.cwasm_dir = Some(directory.into());
@@ -233,12 +214,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Creates the temporary root, opens the storage host, and compiles the component.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FixtureHostError`] if required fields are unset, the component is missing or fails
-    /// to compile, an identifier is invalid, or the storage root cannot be opened.
     pub async fn build(self) -> Result<FixtureHost, FixtureHostError> {
         let component = self.component.ok_or(FixtureHostError::NoComponent)?;
         if !component.exists() {
@@ -324,22 +299,10 @@ impl FixtureHost {
         FixtureHostBuilder::default()
     }
 
-    /// Invokes one capability and returns the provider's JSON output.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FixtureHostError`] if the capability id is invalid, the grant cannot be minted, or
-    /// the invocation fails. Use [`FixtureHostError::provider_failure`] to distinguish a failure
-    /// the provider itself declared from one the host imposed.
     pub async fn invoke(&self, capability: &str, input: Value) -> Result<Value, FixtureHostError> {
         Ok(self.invoke_full(capability, input).await?.output)
     }
 
-    /// Invokes one capability and returns the full output, including storage evidence.
-    ///
-    /// # Errors
-    ///
-    /// As [`FixtureHost::invoke`].
     pub async fn invoke_full(
         &self,
         capability: &str,
@@ -402,8 +365,7 @@ impl FixtureHost {
             .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))
     }
 
-    /// Runs one command word as the sandboxed shell would, returning what the guest declared;
-    /// nothing is authorized here, so run the resulting proposal through invoke to execute it.
+    /// A command proposal has no authority; pass it through invoke to execute it.
     pub async fn run_command(
         &self,
         word: &str,
@@ -413,9 +375,7 @@ impl FixtureHost {
         Ok(self.registry.run_command(word, argv, stdin).await?)
     }
 
-    /// Returns the storage root on disk; StorageEvidence counts bytes moved, not final file sizes,
-    /// and every path component is an opaque SHA-256 token, so walk the tree rather than guessing
-    /// names.
+    /// StorageEvidence counts bytes moved, not final file sizes; walk the opaque SHA-256 paths.
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root

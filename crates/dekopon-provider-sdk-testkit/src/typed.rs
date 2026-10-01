@@ -31,6 +31,23 @@ type ComponentCache =
     Mutex<HashMap<CacheKey, Vec<(BrokerHostLimits, Arc<BrokerProviderRegistry>)>>>;
 static COMPONENTS: OnceLock<ComponentCache> = OnceLock::new();
 
+pub(crate) fn cached_registry<P: Provider>(
+    component: PathBuf,
+    limits: BrokerHostLimits,
+) -> Result<Arc<BrokerProviderRegistry>, dekopon_broker_host::BrokerHostError> {
+    let key = (TypeId::of::<P>(), component.clone());
+    let cache = COMPONENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = cache.lock();
+    let configurations = entries.entry(key).or_default();
+    if let Some((_, cached)) = configurations.iter().find(|(cached, _)| *cached == limits) {
+        return Ok(Arc::clone(cached));
+    }
+    let loaded =
+        Arc::new(runtime().block_on(BrokerProviderRegistry::load([component], limits.clone()))?);
+    configurations.push((limits, Arc::clone(&loaded)));
+    Ok(loaded)
+}
+
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -159,25 +176,7 @@ impl<P: Provider> Run<P> {
         input: Value,
     ) -> Result<dekopon_broker_host::BrokerInvocationOutput, HarnessError> {
         let component = self.component.canonicalize()?;
-        let key = (TypeId::of::<P>(), component.clone());
-        let cache = COMPONENTS.get_or_init(|| Mutex::new(HashMap::new()));
-        let registry = {
-            let mut entries = cache.lock();
-            let configurations = entries.entry(key).or_default();
-            if let Some((_, cached)) = configurations
-                .iter()
-                .find(|(limits, _)| *limits == self.limits)
-            {
-                Arc::clone(cached)
-            } else {
-                let loaded = Arc::new(runtime().block_on(BrokerProviderRegistry::load(
-                    [component],
-                    self.limits.clone(),
-                ))?);
-                configurations.push((self.limits.clone(), Arc::clone(&loaded)));
-                loaded
-            }
-        };
+        let registry = cached_registry::<P>(component, self.limits.clone())?;
         let mut imports = TestImports {
             clock: self.clock,
             ..TestImports::default()

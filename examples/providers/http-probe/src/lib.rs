@@ -351,6 +351,10 @@ impl Capability for Purge {
     }
 }
 
+fn catch_write_error<E>(write: impl FnOnce() -> Result<(), E>) -> Value {
+    json!({"caught":write().is_err()})
+}
+
 fn asset_probe(
     mode: &str,
     input: &FetchInput,
@@ -387,8 +391,7 @@ fn asset_probe(
             )
             .map_err(asset_failed)?;
         let bytes = input.bytes.unwrap_or(1025).min(65536) as usize;
-        writer.write_all(&vec![b'x'; bytes]).map_err(asset_failed)?;
-        return Ok(json!({"caught":false}));
+        return Ok(catch_write_error(|| writer.write_all(&vec![b'x'; bytes])));
     }
     if mode == "stream" {
         let handles = input
@@ -589,6 +592,14 @@ mod tests {
             matches!(&outcome, ComponentResponse::Failed { error }
             if error.code == "request-too-large" && error.message == "host rejected streamed request"),
             "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn budget_write_error_is_caught_as_successful_guest_output() {
+        assert_eq!(
+            catch_write_error(|| Err::<(), _>("over budget")),
+            json!({"caught":true})
         );
     }
 

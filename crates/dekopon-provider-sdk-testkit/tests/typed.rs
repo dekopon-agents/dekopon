@@ -185,6 +185,7 @@ fn cached_real_component_and_native_dispatch_agree() {
         }
     );
     let component = cli_component();
+    conformance::<Cli>(&component).unwrap();
     for _ in 0..2 {
         assert_eq!(
             Harness::<Cli>::get(&component)

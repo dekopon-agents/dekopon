@@ -41,8 +41,8 @@ whose capabilities no word reaches:
   `fetch`, `conditional-write`, and `purge` from flags. Its `conditional-write` capability keeps
   two-call host budgets, per-call evidence, and etag-guarded writes covered without public
   network access.
-- [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free typed memory
-  fixture plus a separate raw adversarial escape fixture; neither is packaged.
+- [`memory-reservation-probe/`](memory-reservation-probe/) is a single import-free raw-bindings
+  adversarial fixture for memory-route escape; it is never packaged.
 - [`storage-probe/`](storage-probe/) is the typed SDK durable-files conformance fixture;
   its `storageprobe` word proposes the run. It is never packaged in a scanned image directory.
 
