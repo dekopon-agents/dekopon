@@ -1,14 +1,18 @@
+use std::convert::Infallible;
 use std::fmt;
+use std::marker::PhantomData;
 
 use clap::{Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Capability, Code, Failure, Proposal, Provider, SdkFailure, Usage, call, command, manifest,
+    Capability, Code, Failure, ManifestError, Proposal, Provider, SchemaFault, SdkFailure, Usage,
+    call, command, manifest,
 };
 use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind, RiskLevel,
     SecretUseProposal,
 };
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -399,4 +403,75 @@ fn a_proposal_for_an_unlisted_capability_is_refused() {
         panic!("an unlisted capability cannot be proposed");
     };
     assert_eq!(error.code, SdkFailure::UnknownCapability.code().as_str());
+}
+
+#[derive(Parser)]
+#[command(name = "faulty")]
+struct NoArgs;
+
+struct Faulty<I>(PhantomData<I>);
+
+impl<I: Faulted> Provider for Faulty<I> {
+    const ID: &'static str = "faulty";
+    const COMMAND_WORDS: &'static [&'static str] = &["faulty"];
+    const DESCRIPTION: &'static str = "Declares an input schema the SDK refuses";
+    type Args = NoArgs;
+    type Capabilities = (Take<I>,);
+
+    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Err(Usage::new("faulty takes no proposal"))
+    }
+}
+
+trait Faulted: DeserializeOwned + Serialize + JsonSchema + 'static {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct Open {
+    text: String,
+}
+
+impl Faulted for Open {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Tree {
+    children: Vec<Tree>,
+}
+
+impl Faulted for Tree {}
+
+struct Take<I>(PhantomData<I>);
+
+impl<I: Faulted> Capability for Take<I> {
+    type Provider = Faulty<I>;
+    const NAME: &'static str = "take";
+    const DESCRIPTION: &'static str = "Takes the input";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = I;
+    type Needs = ();
+    type Output = ();
+    type Error = Infallible;
+
+    fn run(_: I, (): ()) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_manifest_refuses_an_input_schema_that_is_open_or_holds_a_reference() {
+    assert!(matches!(
+        manifest::<Faulty<Open>>(),
+        Err(ManifestError::Schema {
+            capability: "take",
+            fault: SchemaFault::Open
+        })
+    ));
+    assert!(matches!(
+        manifest::<Faulty<Tree>>(),
+        Err(ManifestError::Schema {
+            capability: "take",
+            fault: SchemaFault::Reference
+        })
+    ));
 }

@@ -1,6 +1,3 @@
-//! The typed provider contract: a provider declares its capabilities once, and the manifest, input
-//! schemas, help, argv parsing and dispatch are derived from those declarations.
-
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fmt;
@@ -212,7 +209,7 @@ impl<P: Provider> Proposal<P> {
 pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {}
 
 mod sealed {
-    use super::{Capability, ComponentResponse, IdentifierError, Provider, ProviderCapability};
+    use super::{Capability, ComponentResponse, ManifestError, Provider, ProviderCapability};
 
     pub trait Needs: Sized {
         fn grant() -> Self;
@@ -223,7 +220,7 @@ mod sealed {
     }
 
     pub trait Capabilities<P: Provider> {
-        fn describe(provider: &str) -> Result<Vec<ProviderCapability>, IdentifierError>;
+        fn describe(provider: &str) -> Result<Vec<ProviderCapability>, ManifestError>;
         fn lists(name: &str) -> bool;
         fn call(name: &str, input: &str) -> Option<ComponentResponse>;
     }
@@ -233,7 +230,7 @@ mod sealed {
             impl<P: Provider, $($capability: Capability<Provider = P>),+> Capabilities<P>
                 for ($($capability,)+)
             {
-                fn describe(provider: &str) -> Result<Vec<ProviderCapability>, IdentifierError> {
+                fn describe(provider: &str) -> Result<Vec<ProviderCapability>, ManifestError> {
                     Ok(vec![$(super::describe::<$capability>(provider)?),+])
                 }
 
@@ -273,13 +270,20 @@ fn capability_id(provider: &str, name: &str) -> Result<CapabilityId, IdentifierE
     format!("{provider}.{name}").parse()
 }
 
-fn describe<C: Capability>(provider: &str) -> Result<ProviderCapability, IdentifierError> {
+fn describe<C: Capability>(provider: &str) -> Result<ProviderCapability, ManifestError> {
+    let input_schema = input_schema::<C::Input>();
+    if let Some(fault) = schema_fault(&input_schema) {
+        return Err(ManifestError::Schema {
+            capability: C::NAME,
+            fault,
+        });
+    }
     Ok(ProviderCapability {
-        id: capability_id(provider, C::NAME)?,
+        id: capability_id(provider, C::NAME).map_err(ManifestError::Identifier)?,
         description: C::DESCRIPTION.to_owned(),
         effect: C::EFFECT,
         risk: C::RISK,
-        input_schema: input_schema::<C::Input>(),
+        input_schema,
     })
 }
 
@@ -290,6 +294,27 @@ fn input_schema<T: JsonSchema>() -> Value {
     let mut schema = settings.into_generator().into_root_schema_for::<T>();
     schema.remove("title");
     schema.to_value()
+}
+
+fn schema_fault(schema: &Value) -> Option<SchemaFault> {
+    match schema {
+        Value::Object(object) => {
+            if object.contains_key("$ref") {
+                return Some(SchemaFault::Reference);
+            }
+            let object_typed = match object.get("type") {
+                Some(Value::String(kind)) => kind == "object",
+                Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+                _ => false,
+            };
+            if object_typed && object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Some(SchemaFault::Open);
+            }
+            object.values().find_map(schema_fault)
+        }
+        Value::Array(items) => items.iter().find_map(schema_fault),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
 }
 
 fn failure(failure: &impl Failure) -> ComponentFailure {
@@ -318,11 +343,57 @@ fn run<C: Capability>(input: &str) -> ComponentResponse {
     }
 }
 
-/// The manifest derived from `P`'s declarations, or the error naming an invalid identifier.
-pub fn manifest<P: Provider>() -> Result<ProviderManifest, IdentifierError> {
+/// Why an input schema cannot be published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchemaFault {
+    /// An object schema accepts properties it does not list; use `#[serde(deny_unknown_fields)]`.
+    Open,
+    /// A subschema is a reference, which inlining could not resolve (a recursive type).
+    Reference,
+}
+
+/// Why a manifest cannot be derived from a provider's declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManifestError {
+    /// The provider id or a derived capability id is invalid.
+    Identifier(IdentifierError),
+    /// A capability's input schema is not closed and inline.
+    Schema {
+        /// The capability name.
+        capability: &'static str,
+        /// What is wrong with the schema.
+        fault: SchemaFault,
+    },
+}
+
+impl fmt::Display for ManifestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identifier(error) => error.fmt(formatter),
+            Self::Schema {
+                capability,
+                fault: SchemaFault::Open,
+            } => write!(formatter, "the input schema of {capability} is not closed"),
+            Self::Schema {
+                capability,
+                fault: SchemaFault::Reference,
+            } => write!(
+                formatter,
+                "the input schema of {capability} has a reference"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {}
+
+/// The manifest derived from `P`'s declarations, or why it cannot be derived.
+pub fn manifest<P: Provider>() -> Result<ProviderManifest, ManifestError> {
     Ok(ProviderManifest {
         api_version: ProviderApiVersion::V1Alpha1,
-        id: P::ID.parse::<ProviderId>()?,
+        id: P::ID
+            .parse::<ProviderId>()
+            .map_err(ManifestError::Identifier)?,
         description: P::DESCRIPTION.to_owned(),
         capabilities: <P::Capabilities as sealed::Capabilities<P>>::describe(P::ID)?,
         command_words: P::COMMAND_WORDS
