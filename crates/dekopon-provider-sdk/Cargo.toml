@@ -15,9 +15,6 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [features]
 default = []
-# Host-side plumbing consumed by `dekopon-broker-host` and external embeddings. It pulls in
-# Wasmtime, so it is off by default and no `wasm32-unknown-unknown` guest build enables it.
-host = ["dep:thiserror", "dep:wasmtime"]
 # The `cli` module over the untyped `Provider::run_command`; clap itself is always present.
 clap = []
 
@@ -35,8 +32,6 @@ wit-bindgen.workspace = true
 # multiple-versions rule holds.
 clap = { version = "4.6.4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 schemars.workspace = true
-thiserror = { workspace = true, optional = true }
-wasmtime = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ use wasmtime::component::types::{ComponentFunc, ComponentItem};
 use wasmtime::component::{Component, Type};
 use wasmtime::{Config, Engine, StoreLimitsBuilder};
 
-use crate::ProviderManifest;
+use dekopon_provider_sdk::ProviderManifest;
 
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_TABLE_ELEMENTS: usize = 100_000;
@@ -479,7 +479,7 @@ mod tests {
         bounded_signature, check_command_export, command_input_bytes, validate_limits,
         validate_manifest,
     };
-    use crate::{ProviderApiVersion, ProviderCapability, ProviderManifest};
+    use dekopon_provider_sdk::{ProviderApiVersion, ProviderCapability, ProviderManifest};
 
     fn manifest(id: &str, capability: &str, effect: EffectKind) -> ProviderManifest {
         ProviderManifest {

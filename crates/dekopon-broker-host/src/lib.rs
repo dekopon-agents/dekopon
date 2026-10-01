@@ -21,17 +21,16 @@ use std::{
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
-use dekopon_provider_sdk::host::CommandExport;
-pub use dekopon_provider_sdk::host::ProviderConflicts;
-use dekopon_provider_sdk::host::{
-    self, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT, StoreLimits,
-    check_command_export, command_export, command_input_bytes,
-};
 pub use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
     ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
+pub use host::ProviderConflicts;
+use host::{
+    CommandExport, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT,
+    StoreLimits, check_command_export, command_export, command_input_bytes,
+};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -43,6 +42,7 @@ use wasmtime::{Engine, Store};
 pub mod asset;
 mod clock;
 mod cwasm;
+pub mod host;
 mod http;
 mod memory;
 mod metadata;
@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn failed_invocation_with_budget_refusal_maps_to_host_memory_budget() {
         let mut limiter = super::memory::MemoryLimiter::new(
-            dekopon_provider_sdk::host::StoreLimits {
+            host::StoreLimits {
                 max_memory_bytes: 4 * 65_536,
                 ..Default::default()
             },

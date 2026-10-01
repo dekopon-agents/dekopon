@@ -135,11 +135,9 @@ The clock is readable only in an invocation's store; a read during a description
 traps.
 The host does not authenticate callers, evaluate policy, or construct authorization.
 
-The SDK's optional `host` feature retains manifest validation, complete conflicting-provider-set
-reports, store bounds, engine construction, and the seven shared `DEFAULT_MAX_*` constants, which
-live only there. These SDK APIs also serve external embeddings. The feature is off by default and
-pulls in Wasmtime, so guest builds must not
-enable it. Check wasm32 both with default features and with `--features clap`; the optional
+`dekopon-broker-host::host` owns manifest validation, complete conflicting-provider-set
+reports, store bounds, engine construction, and the seven shared `DEFAULT_MAX_*` constants.
+The guest SDK has no Wasmtime host feature. Check wasm32 both with default features and with `--features clap`; the optional
 `cli::run_command` adapter is built without `env` or `color`. The broker owns its linker and
 yields on fuel so a Tokio deadline can cancel a call.
 

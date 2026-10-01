@@ -1131,8 +1131,6 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "thiserror",
- "wasmtime",
  "wit-bindgen 0.62.0",
 ]
 

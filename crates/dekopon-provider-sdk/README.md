@@ -81,18 +81,11 @@ guest and returns an echo-scanned response `Handle`. Buffered HTTP `send` remain
 small requests. Import the asset interface beside HTTP as above; imports are available only in
 `invoke`, never the pure `run-command` phase.
 
-## Host feature
+## Host helpers
 
-Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build
-never compiles it. The optional `host` feature adds `dekopon_provider_sdk::host`: the Wasmtime
-plumbing consumed by `dekopon-broker-host` and external embeddings — manifest validation, the report
-a whole provider set fails with (duplicated identities, colliding command words, and providers
-declaring capabilities with no command word), the bounds on one store, the engine constructor, and
-the command-export plumbing: `command_export` reads whether a compiled component offers
-`run-command` and with what type, `check_command_export` is the load gate a manifest declaring
-`commandWords` must pass, and `command_input_bytes` is what a host counts against its input bound
-for one run. It pulls in Wasmtime. Each host owns its own linker and its own way of interrupting a guest that runs too
-long.
+Wasmtime host helpers live in `dekopon_broker_host::host`, not in the guest SDK. They validate
+manifests, scan provider conflicts, bound stores and command input, construct the engine, and check
+command exports. Guest builds do not compile Wasmtime.
 
 ## WIT package
 

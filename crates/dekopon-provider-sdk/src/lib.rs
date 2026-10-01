@@ -28,8 +28,6 @@ pub mod asset;
 #[cfg(feature = "clap")]
 pub mod cli;
 mod clock;
-#[cfg(feature = "host")]
-pub mod host;
 mod http;
 pub mod provider;
 mod storage;
