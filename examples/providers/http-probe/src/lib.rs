@@ -1,8 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_provider_sdk::clap::{Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Assets, Capability, Code, Failure, Header, Http, Part, Proposal, Provider, Request,
-    StreamedRequest, Usage,
+    Assets, Capability, Code, Failure, Header, Http, HttpBuildError, HttpError, Part, Proposal,
+    Provider, Request, StreamedRequest, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel, SecretDrn, SecretUseProposal};
 use schemars::JsonSchema;
@@ -113,36 +113,59 @@ struct PurgeInput {
     uri: String,
 }
 #[derive(Debug)]
-struct ProbeError {
-    code: Code,
-    message: String,
-}
-impl ProbeError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code: Code::new(code),
-            message: message.into(),
-        }
-    }
+enum ProbeError {
+    UriRequired,
+    UnknownAssetMode,
+    InvalidRequest(HttpBuildError),
+    HttpFailed(HttpError),
+    StreamHttp(HttpError),
+    Asset(dekopon_provider_sdk::asset::AssetError),
+    PreconditionFailed { expected: String, observed: String },
+    AssetTestFailure,
 }
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            Self::UriRequired => f.write_str("uri must be a string"),
+            Self::UnknownAssetMode => f.write_str("unknown asset test mode"),
+            Self::InvalidRequest(error) => write!(f, "{error}"),
+            Self::HttpFailed(error) => write!(f, "{error}"),
+            Self::StreamHttp(error) => f.write_str(&error.message),
+            Self::Asset(error) => f.write_str(&error.message),
+            Self::PreconditionFailed { expected, observed } => {
+                write!(
+                    f,
+                    "resource moved: expected {expected:?}, observed {observed:?}"
+                )
+            }
+            Self::AssetTestFailure => f.write_str("failure after attach"),
+        }
     }
 }
 impl Failure for ProbeError {
     fn code(&self) -> Code {
-        self.code
+        Code::new(match self {
+            Self::UriRequired | Self::UnknownAssetMode => "invalid-input",
+            Self::InvalidRequest(_) => "invalid-request",
+            Self::HttpFailed(_) => "http-failed",
+            Self::StreamHttp(error) => error.code.as_str(),
+            Self::Asset(error) => error.code.as_str(),
+            Self::PreconditionFailed { .. } => "precondition-failed",
+            Self::AssetTestFailure => "asset-test-failure",
+        })
     }
 }
-fn invalid_request(error: impl std::fmt::Display) -> ProbeError {
-    ProbeError::new("invalid-request", error.to_string())
+fn invalid_request(error: HttpBuildError) -> ProbeError {
+    ProbeError::InvalidRequest(error)
 }
-fn http_failed(error: impl std::fmt::Display) -> ProbeError {
-    ProbeError::new("http-failed", error.to_string())
+fn http_failed(error: HttpError) -> ProbeError {
+    ProbeError::HttpFailed(error)
+}
+fn stream_failed(error: HttpError) -> ProbeError {
+    ProbeError::StreamHttp(error)
 }
 fn asset_failed(error: dekopon_provider_sdk::asset::AssetError) -> ProbeError {
-    ProbeError::new(error.code.as_str(), error.message)
+    ProbeError::Asset(error)
 }
 
 impl Provider for HttpProbe {
@@ -222,9 +245,7 @@ impl Capability for Fetch {
         if let Some(mode) = input.asset_mode.as_deref() {
             return asset_probe(mode, &input, &http, &assets);
         }
-        let uri = input
-            .uri
-            .ok_or_else(|| ProbeError::new("invalid-input", "uri must be a string"))?;
+        let uri = input.uri.ok_or(ProbeError::UriRequired)?;
         let mut request =
             Request::new(input.method.as_deref().unwrap_or("GET"), uri).map_err(invalid_request)?;
         for header in input.headers.unwrap_or_default() {
@@ -271,10 +292,7 @@ impl Capability for ConditionalWrite {
         if let Some(expected) = input.expected_etag
             && expected != observed
         {
-            return Err(ProbeError::new(
-                "precondition-failed",
-                format!("resource moved: expected {expected:?}, observed {observed:?}"),
-            ));
+            return Err(ProbeError::PreconditionFailed { expected, observed });
         }
         let request = Request::new("POST", &input.uri)
             .map_err(invalid_request)?
@@ -350,7 +368,7 @@ fn asset_probe(
         if input.catch_stream_error.unwrap_or(false) {
             return Ok(json!({"caught":response.is_err()}));
         }
-        let response = response.map_err(http_failed)?;
+        let response = response.map_err(stream_failed)?;
         let writer = assets
             .allocate(
                 "text/plain",
@@ -389,12 +407,9 @@ fn asset_probe(
         "timeout" => loop {
             std::hint::spin_loop();
         },
-        "fail" => Err(ProbeError::new(
-            "asset-test-failure",
-            "failure after attach",
-        )),
+        "fail" => Err(ProbeError::AssetTestFailure),
         "attach" => Ok(json!({"ok":true})),
-        _ => Err(ProbeError::new("invalid-input", "unknown asset test mode")),
+        _ => Err(ProbeError::UnknownAssetMode),
     }
 }
 fn describe_response(status: u16, body: &[u8], header_count: usize) -> Value {
@@ -459,6 +474,101 @@ mod tests {
             matches!(provider::call::<HttpProbe>("http-probe.fetch", r#"{"unknown":true}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
         );
     }
+    #[test]
+    fn streamed_host_failure_code_reaches_the_provider_response() {
+        use dekopon_provider_sdk::provider::{
+            HttpError, HttpErrorCode, Port, Response, StreamedResponse,
+        };
+
+        struct StreamHost;
+        struct StreamProbe;
+        struct Stream;
+        impl Provider for StreamProbe {
+            const ID: &'static str = "stream-host-test";
+            const COMMAND_WORDS: &'static [&'static str] = &["streamtest"];
+            const DESCRIPTION: &'static str = "streamed host failure witness";
+            type Args = Command;
+            type Capabilities = (Stream,);
+            fn propose(_: Command, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+                Err(Usage::new("no proposal"))
+            }
+        }
+        impl Capability for Stream {
+            type Provider = StreamProbe;
+            const NAME: &'static str = "stream";
+            const DESCRIPTION: &'static str = "stream request host failure";
+            const EFFECT: EffectKind = EffectKind::ReadOnly;
+            const RISK: RiskLevel = RiskLevel::Low;
+            type Input = PurgeInput;
+            type Needs = Http;
+            type Output = Value;
+            type Error = ProbeError;
+            fn run(input: PurgeInput, http: Http) -> Result<Value, ProbeError> {
+                let request = StreamedRequest::new("POST", input.uri).map_err(invalid_request)?;
+                let response = http.stream(request).map_err(stream_failed)?;
+                Ok(json!({"status": response.status}))
+            }
+        }
+        impl Port for StreamHost {
+            fn now_unix_millis(&mut self) -> u64 {
+                0
+            }
+            fn settings(&mut self) -> Option<String> {
+                None
+            }
+            fn send(&mut self, _: Request) -> Result<Response, HttpError> {
+                Err(HttpError {
+                    code: HttpErrorCode::Denied,
+                    message: "unexpected buffered request".into(),
+                })
+            }
+            fn stream(&mut self, _: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
+                Err(HttpError {
+                    code: HttpErrorCode::RequestTooLarge,
+                    message: "host rejected streamed request".into(),
+                })
+            }
+        }
+        let outcome = provider::with_port(StreamHost, || {
+            provider::call::<StreamProbe>(
+                "stream-host-test.stream",
+                r#"{"uri":"https://example.test/path"}"#,
+            )
+        });
+        assert!(
+            matches!(&outcome, ComponentResponse::Failed { error }
+            if error.code == "request-too-large" && error.message == "host rejected streamed request"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn buffered_and_asset_failures_keep_their_distinct_codes_and_messages() {
+        use dekopon_provider_sdk::asset::{AssetError, AssetErrorCode};
+        use dekopon_provider_sdk::provider::HttpErrorCode;
+
+        let buffered = http_failed(HttpError {
+            code: HttpErrorCode::Connect,
+            message: "connection refused".into(),
+        });
+        assert!(matches!(buffered, ProbeError::HttpFailed(_)));
+        assert_eq!(buffered.code(), Code::new("http-failed"));
+        assert_eq!(buffered.to_string(), "connect: connection refused");
+
+        let asset = asset_failed(AssetError {
+            code: AssetErrorCode::OverBudget,
+            message: "asset budget exhausted".into(),
+        });
+        assert!(matches!(asset, ProbeError::Asset(_)));
+        assert_eq!(asset.code(), Code::new("over-budget"));
+        assert_eq!(asset.to_string(), "asset budget exhausted");
+        assert_eq!(ProbeError::UriRequired.code(), Code::new("invalid-input"));
+        assert_eq!(
+            ProbeError::AssetTestFailure.code(),
+            Code::new("asset-test-failure")
+        );
+    }
+
     #[test]
     fn secret_flags_propose_only_secret_use_not_credentials_in_input() {
         let uri = "https://example.test/records/1";
