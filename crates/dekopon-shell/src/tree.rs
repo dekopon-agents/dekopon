@@ -158,6 +158,11 @@ impl TreeContext {
     }
 
     #[must_use]
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    #[must_use]
     pub(crate) fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }

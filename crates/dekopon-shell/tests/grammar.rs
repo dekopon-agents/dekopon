@@ -4,8 +4,9 @@ use std::{sync::mpsc, time::Duration};
 use serde_json::{Value, json};
 
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
-    Interpreter, Limits, ScriptOutcome,
+    CallBudget, CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
+    ExitCode, Interpreter, JOBS_OFF, JobControl, JobId, JobRefusal, JobSeed, JobSummary, JobWait,
+    Limits, ScriptOutcome, TreeContext,
 };
 
 const PROBE: &str = "probe";
@@ -1349,18 +1350,6 @@ fn brace_and_tilde_expansion_are_dropped_and_stay_literal() {
     assert_eq!(output("echo {a,b,c}"), "{a,b,c}");
     assert_eq!(output("echo ~"), "~");
     assert_eq!(output("echo ~/x"), "~/x");
-}
-
-#[test]
-fn backgrounding_is_a_hard_parse_error() {
-    let outcome = run("sleep 1 &\necho after");
-    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(
-        outcome.output.contains("backgrounding"),
-        "{}",
-        outcome.output
-    );
-    assert!(!outcome.output.contains("after"), "{}", outcome.output);
 }
 
 #[test]
@@ -3060,4 +3049,138 @@ fn the_last_stage_copying_shared_globals_is_refunded_at_join() {
     let outcome = run_with(&script, limits);
     assert_eq!(outcome.output, "a");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+}
+
+#[derive(Default)]
+struct StubJobs {
+    seeds: Mutex<Vec<String>>,
+    outputs: Mutex<Vec<String>>,
+}
+
+impl JobControl for StubJobs {
+    fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal> {
+        let mut seeds = self.seeds.lock();
+        seeds.push(seed.text().to_string());
+        let id = JobId::new(seeds.len() as u64);
+        drop(seeds);
+        let outcome = Interpreter::new(Limits::default()).run_seed(
+            seed,
+            &Fixture::default(),
+            &TreeContext::new(Limits::default(), CallBudget::new(4)),
+        );
+        self.outputs.lock().push(outcome.output);
+        Ok(id)
+    }
+
+    fn list(&self) -> Vec<JobSummary> {
+        Vec::new()
+    }
+
+    fn wait(&self, _id: JobId, _keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
+        Ok(JobWait::Exited(ExitCode::SUCCESS))
+    }
+
+    fn kill(&self, _id: JobId) -> Result<(), JobRefusal> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct WithJobs {
+    fixture: Fixture,
+    jobs: StubJobs,
+}
+
+impl CapabilityInvoker for WithJobs {
+    fn granted(&self) -> Vec<String> {
+        self.fixture.granted()
+    }
+
+    fn job_control(&self) -> Option<&dyn JobControl> {
+        Some(&self.jobs)
+    }
+
+    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        self.fixture.invoke(proposal)
+    }
+}
+
+#[test]
+fn an_ampersand_without_job_control_fails_that_statement_and_the_script_continues() {
+    let outcome = run("true & ; echo $?; echo after");
+    assert_eq!(
+        outcome.output,
+        format!("{JOBS_OFF}\n1\nafter"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_started_job_reports_its_id_on_stderr_and_in_last_job() {
+    let invoker = WithJobs::default();
+    let outcome = Interpreter::new(Limits::default()).run("echo a & echo $!", &invoker);
+    assert_eq!(outcome.output, "[1]\n1");
+    assert_eq!(*invoker.jobs.seeds.lock(), ["echo a"]);
+    assert_eq!(*invoker.jobs.outputs.lock(), ["a"]);
+
+    let invoker = WithJobs::default();
+    let outcome = Interpreter::new(Limits::default())
+        .run("echo \"[$!]\"; x=$(true &); echo \"x=$x\"", &invoker);
+    assert_eq!(outcome.output, "[]\n[1]\nx=");
+}
+
+#[test]
+fn a_job_seed_carries_the_functions_and_globals_set_before_it() {
+    let invoker = WithJobs::default();
+    let outcome = Interpreter::new(Limits::default()).run("g=1; f() { echo $g; }; f &", &invoker);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(*invoker.jobs.seeds.lock(), ["f"]);
+    assert_eq!(*invoker.jobs.outputs.lock(), ["1"]);
+}
+
+#[test]
+fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
+    struct Tight(Fixture);
+    impl JobControl for Tight {
+        fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal> {
+            let limits = Limits {
+                max_value_bytes: 1024,
+                ..Limits::default()
+            };
+            let outcome = Interpreter::new(limits).run_seed(
+                seed,
+                &self.0,
+                &TreeContext::new(limits, CallBudget::new(1)),
+            );
+            assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+            assert!(outcome.output.contains("1024 bytes"), "{outcome:?}");
+            Ok(JobId::new(1))
+        }
+        fn list(&self) -> Vec<JobSummary> {
+            Vec::new()
+        }
+        fn wait(&self, _: JobId, _: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
+            Ok(JobWait::Interrupted)
+        }
+        fn kill(&self, _: JobId) -> Result<(), JobRefusal> {
+            Ok(())
+        }
+    }
+    struct Invoker(Tight);
+    impl CapabilityInvoker for Invoker {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn job_control(&self) -> Option<&dyn JobControl> {
+            Some(&self.0)
+        }
+        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+    let outcome = Interpreter::new(Limits::default()).run(
+        &format!("big={}; echo never &", "x".repeat(2048)),
+        &Invoker(Tight(Fixture::default())),
+    );
+    assert_eq!(outcome.output, "[1]");
 }

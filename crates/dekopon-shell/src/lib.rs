@@ -132,6 +132,10 @@ mod ast;
 mod builtins;
 mod dispatch;
 mod interp;
+mod job;
+pub use job::{
+    JOBS_OFF, JobControl, JobId, JobOutcome, JobRefusal, JobSeed, JobState, JobSummary, JobWait,
+};
 mod jq_worker;
 mod lexer;
 pub use jq_worker::{run_jq_worker_if_requested, set_jq_worker_executable};
@@ -246,6 +250,10 @@ pub trait CapabilityInvoker: Send + Sync {
 
     fn script_finished(&self) {}
 
+    fn job_control(&self) -> Option<&dyn JobControl> {
+        None
+    }
+
     fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult;
 }
 
@@ -295,6 +303,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn script_finished(&self) {
         self.as_ref().script_finished();
+    }
+
+    fn job_control(&self) -> Option<&dyn JobControl> {
+        self.as_ref().job_control()
     }
 
     fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult {
@@ -396,6 +408,15 @@ impl Interpreter {
         tree: &TreeContext,
     ) -> ScriptOutcome {
         interp::run_with_tree(script, None, invoker, self.limits, tree)
+    }
+
+    pub fn run_seed(
+        &self,
+        seed: JobSeed,
+        invoker: &dyn CapabilityInvoker,
+        tree: &TreeContext,
+    ) -> ScriptOutcome {
+        interp::run_seed(seed, invoker, self.limits, tree)
     }
 
     pub fn run_with_prev(

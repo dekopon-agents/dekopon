@@ -34,7 +34,7 @@ use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter,
+    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, JobControl,
     Limits as ShellLimits, ScriptOutcome, TreeContext,
 };
 use serde_json::Value;
@@ -199,6 +199,12 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
             broker.script_finished();
         }
     }
+
+    fn job_control(&self) -> Option<&dyn JobControl> {
+        self.direct
+            .job_control()
+            .or_else(|| self.broker.as_ref()?.job_control())
+    }
 }
 
 #[must_use]
@@ -298,6 +304,7 @@ pub struct BrokerLeg {
     notes_enabled: bool,
     notes: AtomicU32,
     calls: CallBudget,
+    jobs: Option<Arc<dyn JobControl>>,
 }
 
 #[cfg(unix)]
@@ -344,12 +351,19 @@ impl BrokerLeg {
             notes_enabled: false,
             notes: AtomicU32::new(0),
             calls: CallBudget::new(0),
+            jobs: None,
         })
     }
 
     #[must_use]
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_job_control(mut self, jobs: Arc<dyn JobControl>) -> Self {
+        self.jobs = Some(jobs);
         self
     }
 
@@ -687,6 +701,10 @@ impl CapabilityInvoker for BrokerLeg {
     fn script_finished(&self) {
         self.notes.store(0, Ordering::Relaxed);
     }
+
+    fn job_control(&self) -> Option<&dyn JobControl> {
+        self.jobs.as_deref()
+    }
 }
 
 #[cfg(unix)]
@@ -1006,6 +1024,83 @@ mod tests {
             invoker.direct.secret_uses.lock().is_empty(),
             "the direct leg was handed a proposal it cannot authorize"
         );
+    }
+
+    #[derive(Default)]
+    struct JobsLeg {
+        calls: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl dekopon_shell::JobControl for JobsLeg {
+        fn start(
+            &self,
+            seed: dekopon_shell::JobSeed,
+        ) -> Result<dekopon_shell::JobId, dekopon_shell::JobRefusal> {
+            self.calls.lock().push(format!("start {}", seed.text()));
+            Ok(dekopon_shell::JobId::new(7))
+        }
+
+        fn list(&self) -> Vec<dekopon_shell::JobSummary> {
+            self.calls.lock().push("list".to_owned());
+            Vec::new()
+        }
+
+        fn wait(
+            &self,
+            id: dekopon_shell::JobId,
+            _keep_waiting: &dyn Fn() -> bool,
+        ) -> Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal> {
+            self.calls.lock().push(format!("wait {id}"));
+            Ok(dekopon_shell::JobWait::Interrupted)
+        }
+
+        fn kill(&self, id: dekopon_shell::JobId) -> Result<(), dekopon_shell::JobRefusal> {
+            self.calls.lock().push(format!("kill {id}"));
+            Ok(())
+        }
+    }
+
+    impl CapabilityInvoker for JobsLeg {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn job_control(&self) -> Option<&dyn dekopon_shell::JobControl> {
+            Some(self)
+        }
+
+        fn invoke(&self, _: CommandProposal) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+
+    #[test]
+    fn a_session_invoker_reaches_the_job_control_of_its_broker_leg() {
+        let leg = std::sync::Arc::new(JobsLeg::default());
+        let invoker = SessionInvoker {
+            direct: FakeLeg::new("cli-probe.upper", "direct"),
+            broker: Some(Box::new(std::sync::Arc::clone(&leg))),
+        };
+        let outcome = dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+            .run("echo a &", &invoker);
+        assert_eq!(outcome.output, "[7]");
+        let jobs = invoker.job_control().expect("the broker leg's job control");
+        let id = dekopon_shell::JobId::new(7);
+        assert!(jobs.list().is_empty());
+        assert_eq!(
+            jobs.wait(id, &|| false),
+            Ok(dekopon_shell::JobWait::Interrupted)
+        );
+        assert_eq!(jobs.kill(id), Ok(()));
+        assert_eq!(
+            *leg.calls.lock(),
+            ["start echo a", "list", "wait 7", "kill 7"]
+        );
+        let without = SessionInvoker {
+            direct: FakeLeg::new("cli-probe.upper", "direct"),
+            broker: None,
+        };
+        assert!(without.job_control().is_none());
     }
 
     struct CommandLeg {
@@ -1437,6 +1532,7 @@ mod tests {
                 notes_enabled: false,
                 notes: AtomicU32::new(0),
                 calls: dekopon_shell::CallBudget::new(0),
+                jobs: None,
             }
         }
 

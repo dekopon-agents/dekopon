@@ -73,6 +73,10 @@ impl Budget {
         }
     }
 
+    pub(crate) const fn tree(&self) -> &TreeContext {
+        &self.tree
+    }
+
     pub(crate) fn fork(&self) -> Self {
         Self {
             limits: self.limits,

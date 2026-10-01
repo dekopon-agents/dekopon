@@ -1,5 +1,7 @@
-//! Constructs deliberately dropped, such as backgrounding, subshells, process substitution, and
-//! eval, have no representation here, so no evaluator path can accidentally implement one.
+//! Constructs deliberately dropped, such as subshells, process substitution, and eval, have no
+//! representation here, so no evaluator path can accidentally implement one.
+
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
@@ -16,6 +18,13 @@ pub enum Statement {
     Group(Program),
     Conditional(Conditional),
     Function(FunctionDefinition),
+    Background(Background),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Background {
+    pub statement: Arc<Statement>,
+    pub text: Arc<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,6 +202,7 @@ pub enum Parameter {
     AllPositionalJoined,
     PositionalCount,
     LastStatus,
+    LastJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

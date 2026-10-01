@@ -12,17 +12,19 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CallBudget, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome, TreeContext,
+    CallBudget, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed, ScriptOutcome,
+    TreeContext,
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, CasePattern, CaseStatement,
-        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
-        Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget, SimpleCommand, Statement,
-        Stream, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
+        CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
+        Index, Modifier, Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget,
+        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
         self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
     },
     dispatch::{self, Resolution},
+    job::ScriptJobs,
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
     parser::{
         expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
@@ -272,7 +274,7 @@ pub(crate) fn run_with_tree(
         }
     };
 
-    let mut evaluator = Evaluator {
+    let evaluator = Evaluator {
         invoker,
         budget: Budget::start_tree(limits, tree.clone()),
         limits,
@@ -304,12 +306,69 @@ pub(crate) fn run_with_tree(
         counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
+        jobs: ScriptJobs::default(),
     };
+    conclude(evaluator, calls_before, |evaluator| {
+        evaluator.execute_program(&program)
+    })
+}
 
+pub(crate) fn run_seed(
+    seed: JobSeed,
+    invoker: &dyn CapabilityInvoker,
+    limits: Limits,
+    tree: &TreeContext,
+) -> ScriptOutcome {
+    let calls_before = tree.calls().used();
+    let JobSeed {
+        statement, scope, ..
+    } = seed;
+    let mut evaluator = Evaluator {
+        invoker,
+        budget: Budget::start_tree(limits, tree.clone()),
+        limits,
+        output: OutputBuffer::new(&limits),
+        globals: scope.globals,
+        global_charges: BTreeMap::new(),
+        buffer_charges: BTreeMap::new(),
+        frames: Vec::new(),
+        functions: scope.functions,
+        function_names: scope.function_names,
+        buffers: scope.buffers,
+        captures: Vec::new(),
+        active_buffer: None,
+        discard_capture_depth: None,
+        diagnostics_depth: None,
+        expansion_charges: Vec::new(),
+        options: scope.options,
+        testing_status: 0,
+        stdin: Vec::new(),
+        stdout: None,
+        reader_gone: false,
+        stdout_redirected: false,
+        shared_charges: Vec::new(),
+        stderr_capture: Vec::new(),
+        counters: telemetry::ScriptCounters::default(),
+        last_status: scope.last_status,
+        last_substitution_status: ExitCode::SUCCESS,
+        jobs: ScriptJobs::default(),
+    };
+    let charged = evaluator.adopt(scope.frames);
+    conclude(evaluator, calls_before, |evaluator| {
+        charged.map_err(FatalError::Limit)?;
+        evaluator.execute_statement(&statement)
+    })
+}
+
+fn conclude(
+    mut evaluator: Evaluator<'_>,
+    calls_before: u32,
+    body: impl FnOnce(&mut Evaluator<'_>) -> Result<Flow, FatalError>,
+) -> ScriptOutcome {
     let script = telemetry::script_span();
     let exit_code = {
         let _entered = script.enter();
-        match evaluator.execute_program(&program) {
+        match body(&mut evaluator) {
             Ok(Flow::Exit(code)) | Ok(Flow::Return(code)) => {
                 script.record("outcome", telemetry::outcome_label(code));
                 code
@@ -367,6 +426,17 @@ struct Evaluator<'a> {
     counters: telemetry::ScriptCounters,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
+    jobs: ScriptJobs,
+}
+
+pub(crate) struct JobScope {
+    globals: Arc<BTreeMap<String, Value>>,
+    buffers: Arc<BTreeMap<String, Vec<u8>>>,
+    functions: BTreeMap<String, Arc<Program>>,
+    function_names: BTreeSet<String>,
+    frames: Vec<(BTreeMap<String, Value>, Vec<Value>)>,
+    options: ShellOptions,
+    last_status: ExitCode,
 }
 
 impl<'a> Evaluator<'a> {
@@ -705,6 +775,10 @@ impl<'a> Evaluator<'a> {
                 self.functions
                     .insert(definition.name.clone(), Arc::new(definition.body.clone()));
                 self.last_status = ExitCode::SUCCESS;
+                Ok(Flow::Normal)
+            }
+            Statement::Background(background) => {
+                self.last_status = self.start_job(background);
                 Ok(Flow::Normal)
             }
         }
@@ -1343,7 +1417,83 @@ impl<'a> Evaluator<'a> {
             counters: telemetry::ScriptCounters::default(),
             last_status: self.last_status,
             last_substitution_status: ExitCode::SUCCESS,
+            jobs: self.jobs.clone(),
         })
+    }
+
+    fn adopt(
+        &mut self,
+        frames: Vec<(BTreeMap<String, Value>, Vec<Value>)>,
+    ) -> Result<(), LimitExceeded> {
+        for (name, value) in self.globals.iter() {
+            let charge = self.budget.charge_value_bytes(value_bytes(value))?;
+            self.global_charges.insert(name.clone(), vec![charge]);
+        }
+        for (name, bytes) in self.buffers.iter() {
+            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
+            self.buffer_charges.insert(name.clone(), vec![charge]);
+        }
+        for (locals, positional) in frames {
+            let mut local_charges = BTreeMap::new();
+            for (name, value) in &locals {
+                local_charges.insert(
+                    name.clone(),
+                    vec![self.budget.charge_value_bytes(value_bytes(value))?],
+                );
+            }
+            let positional_charges = positional
+                .iter()
+                .map(|value| self.budget.charge_value_bytes(value_bytes(value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.frames.push(Frame {
+                locals,
+                positional,
+                local_charges,
+                _positional_charges: positional_charges,
+            });
+        }
+        Ok(())
+    }
+
+    fn scope(&self) -> JobScope {
+        JobScope {
+            globals: Arc::clone(&self.globals),
+            buffers: Arc::clone(&self.buffers),
+            functions: self.functions.clone(),
+            function_names: self.function_names.clone(),
+            frames: self
+                .frames
+                .iter()
+                .map(|frame| (frame.locals.clone(), frame.positional.clone()))
+                .collect(),
+            options: self.options,
+            last_status: self.last_status,
+        }
+    }
+
+    fn start_job(&mut self, background: &Background) -> ExitCode {
+        let Some(control) = self.invoker.job_control() else {
+            self.write_line(JOBS_OFF);
+            return ExitCode::FAILURE;
+        };
+        let seed = JobSeed {
+            statement: Arc::clone(&background.statement),
+            text: Arc::clone(&background.text),
+            scope: self.scope(),
+            tree: self.budget.tree().clone(),
+        };
+        match control.start(seed) {
+            Ok(id) => {
+                self.write_line(&format!("[{id}]"));
+                self.jobs.started.push(id);
+                self.jobs.last = Some(id);
+                ExitCode::SUCCESS
+            }
+            Err(refusal) => {
+                self.write_line(&refusal.to_string());
+                ExitCode::FAILURE
+            }
+        }
     }
 
     fn copy_stdin(
@@ -3115,6 +3265,10 @@ impl<'a> Evaluator<'a> {
             ),
             Parameter::PositionalCount => Value::from(self.positional().len()),
             Parameter::LastStatus => Value::from(self.last_status.get()),
+            Parameter::LastJob => self
+                .jobs
+                .last
+                .map_or_else(|| Value::String(String::new()), |id| Value::from(id.get())),
         })
     }
 

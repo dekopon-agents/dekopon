@@ -1,9 +1,10 @@
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, CaseClause,
-        CasePattern, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, Background,
+        CaseClause, CasePattern, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
         FunctionDefinition, IfStatement, Index, Modifier, Parameter, Pattern, Pipeline, Program,
         Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
@@ -88,7 +89,7 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 
 fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser::new(tokens, depth);
+    let mut parser = Parser::new(source, tokens, depth);
     let program = parser.parse_program(&[])?;
     if let Some(token) = parser.peek() {
         let line = token.line;
@@ -136,15 +137,17 @@ fn too_deep(line: usize, construct: &str) -> ParseError {
     )
 }
 
-struct Parser {
+struct Parser<'a> {
+    source: &'a str,
     tokens: Vec<Token>,
     position: usize,
     depth: u32,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>, depth: u32) -> Self {
+impl<'a> Parser<'a> {
+    fn new(source: &'a str, tokens: Vec<Token>, depth: u32) -> Self {
         Self {
+            source,
             tokens,
             position: 0,
             depth,
@@ -250,7 +253,13 @@ impl Parser {
             {
                 break;
             }
-            statements.push(self.parse_statement()?);
+            let start = self.peek().map_or(0, |token| token.offset);
+            let statement = self.parse_statement()?;
+            if matches!(self.peek_kind(), Some(TokenKind::Ampersand)) {
+                statements.push(self.background(statement, start)?);
+                continue;
+            }
+            statements.push(statement);
             match self.peek_kind() {
                 None
                 | Some(
@@ -271,6 +280,26 @@ impl Parser {
             }
         }
         Ok(Program { statements })
+    }
+
+    fn background(&mut self, statement: Statement, start: usize) -> Result<Statement, ParseError> {
+        let line = self.line();
+        if let Statement::Function(definition) = &statement {
+            return Err(ParseError::syntax(
+                line,
+                format!(
+                    "`&` cannot follow the function definition `{}() {{ ... }}`: define the function, then start it as a job with `{} &`",
+                    definition.name, definition.name
+                ),
+            ));
+        }
+        let end = self.peek().map_or(self.source.len(), |token| token.offset);
+        self.position += 1;
+        let text = self.source.get(start..end).unwrap_or_default().trim();
+        Ok(Statement::Background(Background {
+            statement: Arc::new(statement),
+            text: Arc::from(text),
+        }))
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
@@ -861,10 +890,6 @@ impl Parser {
         true
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut assignments = Vec::new();
         let mut words = Vec::new();
@@ -939,16 +964,6 @@ impl Parser {
                         source,
                         target: RedirectTarget::Stream(target),
                     });
-                }
-                // A trailing `&` must never be silently discarded, since a model reading back its
-                // own script would otherwise believe backgrounded work happened that this shell
-                // cannot do.
-                Some(TokenKind::Ampersand) => {
-                    let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "backgrounding with `&` is not supported: this shell has no job control, so `&` can only mean something it cannot do",
-                    ));
                 }
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
@@ -1186,6 +1201,7 @@ fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Para
         RawParameter::AllPositionalJoined => Parameter::AllPositionalJoined,
         RawParameter::PositionalCount => Parameter::PositionalCount,
         RawParameter::LastStatus => Parameter::LastStatus,
+        RawParameter::LastJob => Parameter::LastJob,
     })
 }
 
@@ -1754,10 +1770,38 @@ mod tests {
     }
 
     #[test]
-    fn backgrounding_is_a_hard_parse_error() {
-        let message = syntax_error("sleep 1 &");
-        assert!(message.contains("backgrounding"), "{message}");
-        assert!(message.contains("job control"), "{message}");
+    fn an_ampersand_starts_a_job_and_separates_like_a_semicolon() {
+        let program = parse("sleep 1 & echo hi").expect("valid script");
+        let [Statement::Background(job), Statement::List(_)] = program.statements.as_slice() else {
+            panic!("expected a job then a list: {program:?}");
+        };
+        assert!(matches!(*job.statement, Statement::List(_)));
+        assert_eq!(&*job.text, "sleep 1");
+        for source in [
+            "true & ;",
+            "{ echo a; } &",
+            "true && false &",
+            "while false; do :; done &",
+            "a | b &\necho c",
+        ] {
+            let program = parse(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert!(
+                matches!(program.statements[0], Statement::Background(_)),
+                "{source}: {program:?}"
+            );
+        }
+        parse("if true; then echo a & fi").expect("a job inside a branch");
+        let program = parse("while false; do\n  :\ndone &").expect("valid script");
+        let Statement::Background(job) = &program.statements[0] else {
+            panic!("expected a job");
+        };
+        assert_eq!(&*job.text, "while false; do\n  :\ndone");
+    }
+
+    #[test]
+    fn a_function_definition_cannot_be_started_as_a_job() {
+        let message = syntax_error("f() { echo x; } &");
+        assert!(message.contains("function definition `f()"), "{message}");
     }
 
     #[test]
