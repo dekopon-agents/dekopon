@@ -1147,7 +1147,6 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
- "dekopon-storage-host",
  "dekopon-test-support",
  "parking_lot",
  "rcgen",

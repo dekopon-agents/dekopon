@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-provider-sdk-testkit"
-description = "In-process fake broker for testing Dekopon provider components against a real storage host"
+description = "Typed native and real-component provider conformance harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,11 +19,7 @@ dekopon-provider-sdk.workspace = true
 dekopon-http-host.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
-dekopon-storage-host.workspace = true
 serde_json.workspace = true
-# Not a dev-dependency: the temporary root is part of the API surface. A `FakeBroker` owns its
-# `TempDir` so the storage root outlives every invocation made against it.
-tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
@@ -33,6 +29,7 @@ tokio-rustls = { version = "0.26.4", default-features = false }
 wasmparser = { version = "=0.254.0", default-features = false, features = ["component-model"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 schemars = { version = "1.2.2", features = ["derive"] }
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true

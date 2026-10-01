@@ -13,11 +13,6 @@ keywords = ["agents", "wasm", "components", "capabilities", "sdk"]
 categories = ["wasm", "api-bindings"]
 include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
-[features]
-default = []
-# The `cli` module over the untyped `Provider::run_command`; clap itself is always present.
-clap = []
-
 [dependencies]
 # Only re-exported here (EffectKind, CapabilityId, ProviderId, RiskLevel).
 dekopon-capability.workspace = true
