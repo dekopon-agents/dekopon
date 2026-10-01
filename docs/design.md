@@ -139,10 +139,8 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, reference validation, and bounded in-memory `Skill` loading from `SKILL.md` directories | **Current** |
 | `dekopon-capability` | Capability metadata and proposal/authorization invocation states | **Current**, consumed by broker libraries and service |
-| `dekopon-provider-sdk` | Rust guest trait, provider manifests/responses, and default or caller-generated WIT world export adapters | **Current**, experimental component contract |
-| `dekopon-provider-http` | Rust guest facade for `dekopon:http@1.1.0`: unchanged buffered `send` and asset-backed `stream`; contains no transport or authority | **Current**, bindings only |
-| `dekopon-provider-clock` | Rust guest facade for the `dekopon:clock@1.0.0` wall clock import, readable during `invoke` only; contains no clock of its own | **Current**, bindings only |
-| `dekopon-provider-storage` | Feature-gated JSONL and durable-files guest bindings; contains no path, namespace, transaction, SQL, or authority API | **Current**, bindings only |
+| `dekopon-provider-sdk` | Typed guest provider/capability declarations, derived manifests and dispatch, SDK-owned WIT export and HTTP/asset/clock/settings/storage import handles; no authority of its own | **Current**, experimental component contract |
+| `dekopon-provider-sdk-testkit` | Native and real-component typed harness with conformance checks; raw external/storage fixture integration stays in broker-host tests | **Current** testing library |
 | `dekopon-http-host` | Statically linked native buffered and asset-streamed HTTP engine consuming exact grants beneath independent ceilings; contains no WIT or Wasmtime integration | **Current** library |
 | `dekopon-storage-host` | Wasmtime-independent opaque namespace derivation, key/root hygiene, logical quotas, leases, direct invocation handles, JSONL, and durable-files imports | **Current** privileged library |
 | `dekopon-broker-host` | Privileged async Wasmtime adapter consuming authorized invocations and exact optional storage grants, linking only versioned Dekopon HTTP/asset/storage/clock imports (including buffered HTTP@1.0.0 compatibility), and emitting bounded metadata | **Current** library used by the separate broker process |

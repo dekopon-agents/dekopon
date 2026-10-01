@@ -9,7 +9,6 @@ fn vendored_asset_contract_matches_the_canonical_package() {
 fn asset_dependency_mirrors_match_the_canonical_package() {
     for mirror in [
         include_str!("../../../wit/http/deps/asset.wit"),
-        include_str!("../../dekopon-provider-http/wit/deps/asset.wit"),
         include_str!("../../dekopon-broker-host/wit/deps/asset.wit"),
         include_str!("../wit/deps/asset.wit"),
         include_str!("../../../examples/providers/http-probe/wit/deps/asset.wit"),

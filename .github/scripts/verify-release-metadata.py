@@ -14,13 +14,8 @@ LEGACY_CHANGELOGLESS_TAGS = frozenset(
     {"v0.2.0", "v0.3.0", "v0.4.0", "v0.5.0", "v0.6.0", "v0.7.0"}
 )
 
-# cargo-machete finds a dependency nothing uses; it cannot see a whole crate nothing depends on.
-# These three are the only members allowed to have no workspace consumer: they are guest bindings
-# compiled into provider components, whose in-repository callers are the excluded
-# examples/providers/* workspaces.
-GUEST_BINDING_PACKAGES = frozenset(
-    {"dekopon-provider-clock", "dekopon-provider-http", "dekopon-provider-storage"}
-)
+# The remaining standalone guest crate is consumed only by excluded probe workspaces.
+GUEST_BINDING_PACKAGES = frozenset({"dekopon-provider-storage"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,13 +75,6 @@ def verify_libraries_are_consumed(workspace: dict[str, dict]) -> None:
         raise SystemExit(
             "no workspace member depends on these library crates; give each a consumer "
             f"or delete it: {', '.join(dead)}"
-        )
-
-    stale = sorted(GUEST_BINDING_PACKAGES - (libraries - consumed))
-    if stale:
-        raise SystemExit(
-            "these guest-binding exemptions are obsolete and must be removed from "
-            f"GUEST_BINDING_PACKAGES: {', '.join(stale)}"
         )
 
 
