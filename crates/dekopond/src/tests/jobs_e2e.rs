@@ -160,27 +160,94 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_killed_or_stopped_job_sends_no_notice_but_keeps_its_outcome() {
-    let jobs = Arc::new(Jobs::new(2));
-    let mut notices = jobs.take_notices();
-    let killed = admitted(&jobs, "a", "sleep 9").unwrap();
-    let cancelled = admitted(&jobs, "b", "sleep 9").unwrap();
-    let owner = owned_by("a");
-    jobs.kill(&owner, jobs.list(&owner)[0].id).unwrap();
-    let request = crate::transport::CancelRequest {
-        transport: "dev".to_owned(),
-        conversation_id: message("x").conversation.key(),
-        subject: subject_named("b").canonical(),
-        via: dekopon_agent::CancelVia::StopReply,
-    };
-    assert!(jobs.cancel_owner(&request));
-    drop((killed, cancelled));
-    assert_eq!(finished(&jobs.list(&owner)[0]).0, JobOutcome::Killed);
-    assert_eq!(
-        finished(&jobs.list(&owned_by("b"))[0]).0,
-        JobOutcome::Cancelled
+async fn a_killed_or_stopped_job_sends_nothing_after_its_reply_and_keeps_its_outcome() {
+    use tracing::instrument::WithSubscriber as _;
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let routes = job_routes(directory.path(), Some(3_600_000)).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(6, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 3600 &"),
+        answer("one started"),
+        script_call("kill %1"),
+        answer("killed"),
+        script_call("sleep 3600 &"),
+        answer("two started"),
+        script_call("jobs"),
+        answer("listed"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (sender, receiver) = mpsc::channel(4);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let service = tokio::spawn(
+        crate::serve(
+            Arc::clone(&runner),
+            routes,
+            Arc::new(BTreeMap::new()),
+            drivers,
+            Arc::new(vec!["stop".to_owned()]),
+            receiver,
+            async move {
+                stopped.await.ok();
+            },
+            Duration::from_secs(2),
+            crate::collection::Collector::new(&[], 4),
+        )
+        .with_current_subscriber(),
     );
-    assert!(notices.try_recv().is_err());
+    let owner = JobOwner::of(&message("start"));
+    for (text, replies) in [
+        ("start one", 1),
+        ("kill it", 2),
+        ("start two", 3),
+        ("stop", 4),
+    ] {
+        sender
+            .send(TransportEvent::Message(Box::new(message(text))))
+            .await
+            .unwrap();
+        until(Duration::from_secs(10), || {
+            driver.replies().len() == replies
+        })
+        .await;
+    }
+    let rows = settled(&runner.jobs, &owner, Duration::from_secs(5)).await;
+    let outcomes = rows.iter().map(|row| finished(row).0).collect::<Vec<_>>();
+    assert_eq!(outcomes, [JobOutcome::Killed, JobOutcome::Cancelled]);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        driver.replies(),
+        [
+            "one started",
+            "killed",
+            "two started",
+            crate::session::STOPPED_REPLY
+        ]
+    );
+    assert_eq!(models.requests(), 6);
+    assert!(
+        !capture.events_text().contains("job.notice"),
+        "{}",
+        capture.events_text()
+    );
+    sender
+        .send(TransportEvent::Message(Box::new(message("list"))))
+        .await
+        .unwrap();
+    until(Duration::from_secs(10), || driver.replies().len() == 5).await;
+    let listing = tool_message(&models, 7);
+    assert!(
+        listing.contains("[1] killed") && listing.contains("[2] cancelled"),
+        "{listing}"
+    );
+    stop.send(()).unwrap();
+    service.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -227,9 +294,20 @@ fn notice_for(inbound: &InboundMessage, id: u64) -> InboundMessage {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_user_text() {
     let directory = temporary();
-    let (broker, _observed) =
-        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
-    let models = InterruptibleModel::new(vec![answer("finished")]);
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    )
+    .await;
+    let models = InterruptibleModel::new(vec![answer("draft"), answer("finished")]);
     let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
     let driver = Arc::new(RecordingDriver::default());
     let mut route = job_route(Duration::from_secs(10), Duration::from_secs(10));
@@ -257,6 +335,16 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
         && text.starts_with("[gateway: job 8 finished")
         && !text.contains("sent while you were working")));
+    assert_eq!(driver.replies(), ["finished"]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    let record = observed.recv().await.expect("the delivered turn's record");
+    let BrokerRequest::RecordDeliveredTurn { turn, .. } = record.request else {
+        panic!("expected a delivered turn: {record:?}");
+    };
+    assert_eq!(turn.user(), "person said this");
 }
 
 #[tokio::test(flavor = "multi_thread")]

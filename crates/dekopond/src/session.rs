@@ -375,16 +375,20 @@ impl SessionGate {
                 return Admit::Full(message, receipts);
             }
             if message.subject == running.subject
-                && !matches!(message.message_id, MessageId::Wake { .. })
+                && match message.message_id {
+                    MessageId::Native(_) | MessageId::Job { .. } => true,
+                    MessageId::Wake { .. } => false,
+                }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
+                let interrupts = match message.message_id {
+                    MessageId::Native(_) | MessageId::Wake { .. } => true,
+                    MessageId::Job { .. } => false,
+                };
                 record_admission(&message, "steered", depth + 1, None);
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
-                    && !matches!(
-                        running.steers.back().map(|steer| &steer.message_id),
-                        Some(MessageId::Job { .. })
-                    )
+                    && interrupts
                     && usize::from(running.aborts) < MAILBOX_CAPACITY
                 {
                     running.aborts += 1;
@@ -525,12 +529,20 @@ impl SessionAdmission {
             };
             // Fold before changing subject: leftover steers must never drain into another sender's run.
             while let Some(mut message) = running.steers.pop_front() {
-                if !matches!(message.message_id, MessageId::Job { .. }) {
+                let folds = match message.message_id {
+                    MessageId::Native(_) | MessageId::Wake { .. } => true,
+                    MessageId::Job { .. } => false,
+                };
+                if folds {
                     let mut grouped = Vec::new();
-                    while matches!(
-                        running.steers.front().map(|steer| &steer.message_id),
-                        Some(MessageId::Native(_))
-                    ) {
+                    while running
+                        .steers
+                        .front()
+                        .is_some_and(|steer| match steer.message_id {
+                            MessageId::Native(_) => true,
+                            MessageId::Wake { .. } | MessageId::Job { .. } => false,
+                        })
+                    {
                         if let Some(next) = running.steers.pop_front() {
                             grouped.push(next);
                         }
@@ -1030,13 +1042,10 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
-    let is_unattended = matches!(
-        message.message_id,
-        MessageId::Wake { .. } | MessageId::Job { .. }
-    );
-    let notice_id = match message.message_id {
-        MessageId::Job { id, .. } => Some(id),
-        MessageId::Native(_) | MessageId::Wake { .. } => None,
+    let (is_unattended, notice_id) = match message.message_id {
+        MessageId::Native(_) => (false, None),
+        MessageId::Wake { .. } => (true, None),
+        MessageId::Job { id, .. } => (true, Some(id)),
     };
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
@@ -1142,8 +1151,9 @@ impl SteerSource for SessionSteers {
             .take_steers(&self.key)
             .into_iter()
             .map(|steer| {
-                if matches!(steer.message_id, MessageId::Job { .. }) {
-                    return steer.text;
+                match steer.message_id {
+                    MessageId::Job { .. } => return steer.text,
+                    MessageId::Native(_) | MessageId::Wake { .. } => {}
                 }
                 let seconds = steer
                     .received_at
