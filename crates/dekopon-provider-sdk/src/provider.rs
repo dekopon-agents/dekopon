@@ -294,7 +294,10 @@ impl<P: Provider> Proposal<P> {
 }
 
 /// The capabilities a provider lists: a tuple of up to 19 [`Capability`] types.
-pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {}
+pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {
+    /// The union of imports declared by the capabilities in this tuple.
+    const IMPORTS: ImportSet;
+}
 
 mod sealed {
     use super::{Capability, ComponentResponse, ManifestError, Provider, ProviderCapability};
@@ -339,6 +342,7 @@ mod sealed {
             impl<P: Provider, $($capability: Capability<Provider = P>),+> super::Capabilities<P>
                 for ($($capability,)+)
             {
+                const IMPORTS: super::ImportSet = super::ImportSet::EMPTY$(.union(<$capability::Needs as super::Needs>::IMPORTS))+;
             }
         };
     }

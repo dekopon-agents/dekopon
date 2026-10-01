@@ -31,7 +31,7 @@ type ComponentCache =
     Mutex<HashMap<CacheKey, Vec<(BrokerHostLimits, Arc<BrokerProviderRegistry>)>>>;
 static COMPONENTS: OnceLock<ComponentCache> = OnceLock::new();
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()

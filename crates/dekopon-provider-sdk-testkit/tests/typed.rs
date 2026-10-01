@@ -11,10 +11,12 @@ fn cli_component() -> PathBuf {
 
 use dekopon_provider_sdk::{
     ComponentResponse, EffectKind, RiskLevel,
-    clap::Parser,
+    clap::{Parser, Subcommand},
     provider::{Capability, Clock, Header, Http, Proposal, Provider, Request, Response, Usage},
 };
-use dekopon_provider_sdk_testkit::{BrokerHostLimits, Harness, HarnessError, HttpScript, Native};
+use dekopon_provider_sdk_testkit::{
+    BrokerHostLimits, Harness, HarnessError, HttpScript, Native, conformance,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +26,20 @@ struct NoArgs {}
 
 struct Cli;
 struct Upper;
+struct Count;
+struct Reverse;
+#[derive(Parser)]
+#[command(name = "probe")]
+struct CliArgs {
+    #[command(subcommand)]
+    transform: CliTransform,
+}
+#[derive(Subcommand)]
+enum CliTransform {
+    Upper,
+    Count,
+    Reverse,
+}
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Text {
@@ -33,12 +49,17 @@ impl Provider for Cli {
     const ID: &'static str = "cli-probe";
     const COMMAND_WORDS: &'static [&'static str] = &["probe"];
     const DESCRIPTION: &'static str = "typed test of checked cli-probe";
-    type Args = NoArgs;
-    type Capabilities = (Upper,);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
-        Ok(Proposal::to::<Upper>(Text {
+    type Args = CliArgs;
+    type Capabilities = (Upper, Count, Reverse);
+    fn propose(args: CliArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        let text = Text {
             text: "abc".to_owned(),
-        }))
+        };
+        Ok(match args.transform {
+            CliTransform::Upper => Proposal::to::<Upper>(text),
+            CliTransform::Count => Proposal::to::<Count>(text),
+            CliTransform::Reverse => Proposal::to::<Reverse>(text),
+        })
     }
 }
 impl Capability for Upper {
@@ -54,6 +75,53 @@ impl Capability for Upper {
     fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
         Ok(json!({"text": input.text.to_uppercase()}))
     }
+}
+
+impl Capability for Count {
+    type Provider = Cli;
+    const NAME: &'static str = "count";
+    const DESCRIPTION: &'static str = "Count characters";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = Text;
+    type Needs = ();
+    type Output = Value;
+    type Error = std::convert::Infallible;
+    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
+        Ok(json!({"characters":input.text.chars().count()}))
+    }
+}
+impl Capability for Reverse {
+    type Provider = Cli;
+    const NAME: &'static str = "reverse";
+    const DESCRIPTION: &'static str = "Reverse text";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = Text;
+    type Needs = ();
+    type Output = Value;
+    type Error = std::convert::Infallible;
+    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
+        Ok(json!({"text":input.text.chars().rev().collect::<String>()}))
+    }
+}
+
+#[test]
+fn conformance_accepts_checked_cli_probe() {
+    conformance::<Cli>(&cli_component()).unwrap();
+}
+
+#[test]
+fn conformance_refuses_an_inconsistent_component_declaration() {
+    let error =
+        conformance::<OtherCli>(&cli_component()).expect_err("partial capability list is refused");
+    assert!(
+        matches!(
+            error,
+            dekopon_provider_sdk_testkit::ConformanceError::CapabilityIds { .. }
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

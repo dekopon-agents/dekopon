@@ -52,7 +52,9 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+mod conformance;
 mod typed;
+pub use conformance::{ConformanceError, conformance};
 pub use typed::{Harness, HarnessError, HttpScript, Native, Run};
 
 use std::{
