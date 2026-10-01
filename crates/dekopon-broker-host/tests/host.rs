@@ -652,7 +652,7 @@ async fn injected_guest_clock_does_not_change_host_timeouts() {
         .invoke(
             authorized_for(
                 "clock-probe",
-                "clock.now".parse().expect("capability"),
+                "clock-probe.now".parse().expect("capability"),
                 json!({}),
                 ExecutionConstraints {
                     http: None,
@@ -836,7 +836,7 @@ async fn a_loopback_pin_does_not_disable_tls_hostname_verification() {
 #[tokio::test(flavor = "multi_thread")]
 async fn run_command_reading_the_clock_traps() {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("clock-probe-provider.wasm")],
+        [provider_fixture("clock-raw-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -864,7 +864,7 @@ async fn run_command_reading_the_clock_traps() {
         matches!(
             error,
             BrokerHostError::RunCommandUsedHostImport { ref path }
-                if path.ends_with("clock-probe-provider.wasm")
+                if path.ends_with("clock-raw-probe-provider.wasm")
         ),
         "expected the host-import tripwire, got {error:?}"
     );
