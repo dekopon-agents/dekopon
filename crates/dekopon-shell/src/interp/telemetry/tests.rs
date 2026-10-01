@@ -363,11 +363,11 @@ fn a_provider_records_its_drained_stdin_but_a_stream_copy_does_not() {
 #[test]
 fn early_consumer_close_records_reader_gone_on_the_producer() {
     let telemetry = capture("while true; do echo y; done | head -n 0");
-    let producer = telemetry.command_spans("echo")[0];
-    assert_eq!(
-        producer.field("shell.command.close_reason"),
-        Some("reader_gone")
-    );
+    let producer = telemetry
+        .command_spans("echo")
+        .into_iter()
+        .find(|span| span.field("shell.command.close_reason") == Some("reader_gone"))
+        .expect("a producer write observes the closed reader");
     assert_eq!(producer.field("shell.command.stage_index"), Some("0"));
 }
 

@@ -113,9 +113,16 @@ pub trait CancellationProbe: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Steer {
+    Person(String),
+    /// Reaches the model but never the recorded turn: it is not the person's words.
+    Notice(String),
+}
+
 pub trait SteerSource: Send + Sync {
     /// Moves every queued steer out, oldest first, as finished user text. Empty when none.
-    fn drain(&self) -> Vec<String>;
+    fn drain(&self) -> Vec<Steer>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,8 +497,13 @@ fn drain_steers(
     let steers = steering.map(SteerSource::drain).unwrap_or_default();
     let any = !steers.is_empty();
     for steer in steers {
-        messages.push(ModelMessage::user(&steer));
-        consumed.push(steer);
+        match steer {
+            Steer::Person(text) => {
+                messages.push(ModelMessage::user(&text));
+                consumed.push(text);
+            }
+            Steer::Notice(text) => messages.push(ModelMessage::user(&text)),
+        }
     }
     any
 }
@@ -1412,9 +1424,15 @@ functions with `$1`/`$@`/`$#`/`shift`/`local`, `read`, `$NAME`, `${NAME[index]}`
 both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and redirection of \
 either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into named in-memory \
 buffers all behave the way you expect. Everything outside that curated set fails loudly and by \
-name: `eval`, backticks, subshells, `<<<`, and `&` backgrounding are errors, never silent no-ops. \
-If a script ran, it did what it said.
+name: `eval`, backticks, subshells, and `<<<` are errors, never silent no-ops. If a script ran, it \
+did what it said.
 
+`cmd &` starts a detached job that outlives this script and turn when the route sets a job deadline. \
+It prints `[N]` on stderr and sets `$!` to N. Use `jobs` to list, `wait %N` to wait, and \
+`kill %N` to stop it; there is no `fg` or `bg`. Completion arrives as a `[gateway: job ...]` \
+message. A job's variables and buffers die with it; only what it prints reaches that notice \
+(the first 16 KiB). A job cannot send files or images. It ends at its job deadline, and \
+jobs are lost on gateway restart.\n
 Five things genuinely differ from a real shell:
 
 1. There are no processes, no filesystem, no environment variables, and no network reachable \
@@ -1453,7 +1471,7 @@ Builtins: `jq` (`-r` raw strings, `-c` compact, `-n` null input, `-s` slurp; one
 document per output line, strings quoted unless `-r`), `cap`, `cat`, `echo`, `printf`, \
 `test`/`[`, `true`, `false`, `sleep`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, \
 `head`/`tail` (default 10 lines, `-n N` or `-N`; `tail -n +N` starts at N; no file \
-operands), `base64`, `xargs`. Any provider command words this session has \
+operands), `base64`, `xargs`, `jobs`, `wait`, `kill`. Any provider command words this session has \
 are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \
@@ -1644,7 +1662,7 @@ mod tests {
         DEFAULT_MAX_TURNS, FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
-        ScriptRuntime, SessionInputs, SteerSource, agent_config_tool, format_script_outcome,
+        ScriptRuntime, SessionInputs, Steer, SteerSource, agent_config_tool, format_script_outcome,
         run_prompt, run_prompt_session, run_prompt_with_history,
         run_prompt_with_history_and_options, script_tool,
     };
@@ -2013,8 +2031,8 @@ mod tests {
     }
 
     impl SteerSource for QueuedSteers {
-        fn drain(&self) -> Vec<String> {
-            self.0.lock().drain(..).collect()
+        fn drain(&self) -> Vec<Steer> {
+            self.0.lock().drain(..).map(Steer::Person).collect()
         }
     }
 
@@ -2227,7 +2245,7 @@ mod tests {
         )
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
         assert!(!sink.events.lock().iter().any(|event| matches!(
             event,
             ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
@@ -2246,7 +2264,7 @@ mod tests {
         )
         .expect("the final step answers");
         assert_eq!(outcome.answer, "done");
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
         assert_eq!(history.turns()[0].user(), "msg1");
     }
 
@@ -2320,7 +2338,7 @@ mod tests {
         )
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
-        assert_eq!(model.steers.drain(), ["msg2"]);
+        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
     }
 
     #[test]
@@ -3332,17 +3350,30 @@ mod tests {
     }
 
     #[test]
+    fn bash_description_explains_detached_jobs_and_their_delivery_limits() {
+        for phrase in [
+            "`cmd &`",
+            "`$!`",
+            "`jobs`",
+            "`wait %N`",
+            "`kill %N`",
+            "variables and buffers die with it",
+            "cannot send files or images",
+            "job deadline",
+            "lost on gateway restart",
+        ] {
+            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
+        }
+        assert!(!refusal_list().iter().any(|name| name.contains('&')));
+    }
+
+    #[test]
     fn every_construct_the_description_calls_an_error_is_refused_by_the_shell() {
         let refused = [
             ("`eval`", "eval 'echo hi'", "eval"),
             ("backticks", "echo `echo hi`", "backtick"),
             ("subshells", "(echo hi)", "subshells"),
             ("`<<<`", "cat <<<\"hi\"", "here-string"),
-            (
-                "`&` backgrounding",
-                "sleep 1 &\necho after",
-                "backgrounding",
-            ),
         ];
 
         assert_eq!(

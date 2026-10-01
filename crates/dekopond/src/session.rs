@@ -17,7 +17,7 @@ use dekopon_agent::{
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, ConversationTurn, History, PromptError, ReplyDisposition, SessionInputs,
-        SteerSource, run_prompt_session,
+        Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -48,6 +48,7 @@ use crate::{
         ResolvedLiveness, Steering,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    jobs::JobContext,
     journal::{self, Journal},
     progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
@@ -374,12 +375,20 @@ impl SessionGate {
                 return Admit::Full(message, receipts);
             }
             if message.subject == running.subject
-                && !matches!(message.message_id, MessageId::Wake { .. })
+                && match message.message_id {
+                    MessageId::Native(_) | MessageId::Job { .. } => true,
+                    MessageId::Wake { .. } => false,
+                }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
+                let interrupts = match message.message_id {
+                    MessageId::Native(_) | MessageId::Wake { .. } => true,
+                    MessageId::Job { .. } => false,
+                };
                 record_admission(&message, "steered", depth + 1, None);
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
+                    && interrupts
                     && usize::from(running.aborts) < MAILBOX_CAPACITY
                 {
                     running.aborts += 1;
@@ -519,16 +528,34 @@ impl SessionAdmission {
                 return None;
             };
             // Fold before changing subject: leftover steers must never drain into another sender's run.
-            if let Some(mut message) = running.steers.pop_front() {
-                let text = bound_inbound(&crate::collection::combined_text(
-                    std::iter::once(&message).chain(running.steers.iter()),
-                ));
-                for next in running.steers.drain(..) {
-                    message.assets.extend(next.assets);
-                    message.constituents.extend(next.constituents);
-                    message.receive_span = next.receive_span;
+            while let Some(mut message) = running.steers.pop_front() {
+                let folds = match message.message_id {
+                    MessageId::Native(_) | MessageId::Wake { .. } => true,
+                    MessageId::Job { .. } => false,
+                };
+                if folds {
+                    let mut grouped = Vec::new();
+                    while running
+                        .steers
+                        .front()
+                        .is_some_and(|steer| match steer.message_id {
+                            MessageId::Native(_) => true,
+                            MessageId::Wake { .. } | MessageId::Job { .. } => false,
+                        })
+                    {
+                        if let Some(next) = running.steers.pop_front() {
+                            grouped.push(next);
+                        }
+                    }
+                    message.text = bound_inbound(&crate::collection::combined_text(
+                        std::iter::once(&message).chain(grouped.iter()),
+                    ));
+                    for next in grouped {
+                        message.assets.extend(next.assets);
+                        message.constituents.extend(next.constituents);
+                        message.receive_span = next.receive_span;
+                    }
                 }
-                message.text = text;
                 running.follow_ups.push_back(FollowUp {
                     route: (*self.route).clone(),
                     receipts: crate::collection::Dispositions(message.constituents.clone()),
@@ -735,6 +762,7 @@ pub(crate) struct SessionRunner {
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
+    pub jobs: Arc<crate::jobs::Jobs>,
 }
 
 struct RecalledWindow {
@@ -802,7 +830,7 @@ async fn recall_window(
                     &message.conversation,
                     match &message.message_id {
                         MessageId::Native(id) => Some(id),
-                        MessageId::Wake { .. } => None,
+                        MessageId::Wake { .. } | MessageId::Job { .. } => None,
                     },
                     limit,
                 ),
@@ -1014,27 +1042,44 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
-    let is_wake = matches!(message.message_id, MessageId::Wake { .. });
+    let is_unattended = match message.message_id {
+        MessageId::Native(_) => false,
+        MessageId::Wake { .. } | MessageId::Job { .. } => true,
+    };
+    let notice = crate::jobs::Notice::of(&message);
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
+            if let Some(notice) = &notice {
+                notice.record("new-turn");
+            }
             Some(run_admitted(runner, route, message, driver, receipts, admission).await)
         }
         Admit::Steered(receipts) => {
+            if let Some(notice) = &notice {
+                notice.record("steered");
+            }
             tracing::Span::current().record("outcome", "steered");
             receipts.finish("steered");
             acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             None
         }
         Admit::Queued => {
+            if let Some(notice) = &notice {
+                notice.record("queued");
+            }
             tracing::Span::current().record("outcome", "queued");
-            if !is_wake {
+            if !is_unattended {
                 acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
             }
             None
         }
         Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
+            if let Some(notice) = &notice {
+                notice.record("dropped");
+            }
             tracing::info!(event = "gateway_session_rejected", reason = "busy");
-            if (runner.reply_on_busy || !message.constituents.is_empty())
+            if notice.is_none()
+                && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
             {
                 answer(driver, &message, BUSY_REPLY).await;
@@ -1101,11 +1146,15 @@ struct SessionSteers {
 }
 
 impl SteerSource for SessionSteers {
-    fn drain(&self) -> Vec<String> {
+    fn drain(&self) -> Vec<Steer> {
         self.gate
             .take_steers(&self.key)
             .into_iter()
             .map(|steer| {
+                match steer.message_id {
+                    MessageId::Job { .. } => return Steer::Notice(steer.text),
+                    MessageId::Native(_) | MessageId::Wake { .. } => {}
+                }
                 let seconds = steer
                     .received_at
                     .saturating_duration_since(self.received_at)
@@ -1128,7 +1177,7 @@ impl SteerSource for SessionSteers {
                     text = attributed_prompt(&steer.subject, &text);
                 }
                 self.raw_texts.lock().push(steer.text);
-                text
+                Steer::Person(text)
             })
             .collect()
     }
@@ -1401,6 +1450,22 @@ async fn session(
     if progress_notes {
         leg = leg.with_progress_notes();
     }
+    if let Some((timeout, anchor)) = route
+        .job_timeout
+        .zip(Anchor::for_job(message, &route.agent))
+    {
+        leg = leg.with_job_control(Arc::new(JobContext::for_turn(
+            Arc::clone(&runner.jobs),
+            message,
+            anchor,
+            runner.broker.clone(),
+            ShellLimits {
+                max_capability_calls: limits.max_capability_calls,
+                timeout,
+                ..ShellLimits::default()
+            },
+        )));
+    }
     drop(sink);
     let wakes = route
         .wakes
@@ -1414,59 +1479,72 @@ async fn session(
                 runner.broker.clone(),
                 tokio::runtime::Handle::current(),
                 shell,
+                route.job_timeout.map(|timeout| {
+                    (
+                        Arc::clone(&runner.jobs),
+                        ShellLimits {
+                            max_capability_calls: limits.max_capability_calls,
+                            timeout,
+                            ..ShellLimits::default()
+                        },
+                    )
+                }),
             )
         });
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
+    let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let result = tokio::task::spawn_blocking(move || {
-        let _entered = blocking_span.enter();
-        let model = match models.client(&model_config, model_runtime, model_cancel) {
-            Ok(model) => model,
-            Err(error) => return (Err(error), None, Vec::new()),
-        };
-        let runtime = ShellRuntime {
-            invoker: leg,
-            limits: shell,
-            calls,
-        };
-        let mut history = seeded;
-        let mut inputs = SessionInputs::new(&text, limits)
-            .with_system(instructions.as_deref())
-            .with_skills(&skills)
-            .with_agent(&agent)
-            .with_options(&options)
-            .with_assets(assets.as_ref())
-            .with_reply_assets(&session_attachments)
-            .with_cancellation(&prompt_cancellation)
-            .with_steering(session_steers.as_ref())
-            .with_progress(Arc::clone(&progress_sink));
-        // Withholding the agent-config view here removes the structured dump but not the underlying
-        // instructions, which are still the system prompt, so this is not secrecy from a determined
-        // user.
-        if inspect_agent_config {
-            inputs = inputs.with_agent_config(&agent_config);
-        }
-        if progress_notes {
-            inputs = inputs.with_progress_notes();
-        }
-        if reply_optional {
-            inputs = inputs.with_optional_reply();
-        }
-        if let Some(wakes) = wakes.as_ref() {
-            inputs = inputs.with_wakes(wakes);
-        }
-        let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
-            .map_err(SessionError::from);
-        let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
-            _ => history.turns().last().cloned(),
-        };
-        let images = if outcome.is_ok() {
-            session_attachments.take()
-        } else {
-            Vec::new()
-        };
-        (outcome, turn, images)
+        tracing::dispatcher::with_default(&subscriber, || {
+            let _entered = blocking_span.enter();
+            let model = match models.client(&model_config, model_runtime, model_cancel) {
+                Ok(model) => model,
+                Err(error) => return (Err(error), None, Vec::new()),
+            };
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits: shell,
+                calls,
+            };
+            let mut history = seeded;
+            let mut inputs = SessionInputs::new(&text, limits)
+                .with_system(instructions.as_deref())
+                .with_skills(&skills)
+                .with_agent(&agent)
+                .with_options(&options)
+                .with_assets(assets.as_ref())
+                .with_reply_assets(&session_attachments)
+                .with_cancellation(&prompt_cancellation)
+                .with_steering(session_steers.as_ref())
+                .with_progress(Arc::clone(&progress_sink));
+            // Withholding the agent-config view here removes the structured dump but not the underlying
+            // instructions, which are still the system prompt, so this is not secrecy from a determined
+            // user.
+            if inspect_agent_config {
+                inputs = inputs.with_agent_config(&agent_config);
+            }
+            if progress_notes {
+                inputs = inputs.with_progress_notes();
+            }
+            if reply_optional {
+                inputs = inputs.with_optional_reply();
+            }
+            if let Some(wakes) = wakes.as_ref() {
+                inputs = inputs.with_wakes(wakes);
+            }
+            let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+                .map_err(SessionError::from);
+            let turn = match &outcome {
+                Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
+                _ => history.turns().last().cloned(),
+            };
+            let images = if outcome.is_ok() {
+                session_attachments.take()
+            } else {
+                Vec::new()
+            };
+            (outcome, turn, images)
+        })
     })
     .await;
 

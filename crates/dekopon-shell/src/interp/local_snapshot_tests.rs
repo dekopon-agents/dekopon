@@ -65,6 +65,7 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
         counters: telemetry::ScriptCounters::default(),
         last_status: crate::ExitCode::SUCCESS,
         last_substitution_status: crate::ExitCode::SUCCESS,
+        jobs: crate::job::ScriptJobs::default(),
     };
     let (writer, _reader) = pipe::pipe();
     let mut snapshot = parent.snapshot(writer).expect("snapshot");

@@ -11,6 +11,7 @@ use crate::ast::Stream;
 pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +120,7 @@ pub enum RawParameter {
     AllPositionalJoined,
     PositionalCount,
     LastStatus,
+    LastJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +225,8 @@ struct Lexer<'a> {
     literal: String,
     word_started: bool,
     word_line: usize,
+    word_offset: usize,
+    token_offset: usize,
     pending_here_docs: Vec<PendingHereDoc>,
     depth: u32,
 }
@@ -238,6 +242,8 @@ impl<'a> Lexer<'a> {
             literal: String::new(),
             word_started: false,
             word_line: 1,
+            word_offset: 0,
+            token_offset: 0,
             pending_here_docs: Vec::new(),
             depth,
         }
@@ -245,6 +251,7 @@ impl<'a> Lexer<'a> {
 
     fn run(mut self) -> Result<Vec<Token>, LexError> {
         while let Some((index, character)) = self.chars.next() {
+            self.token_offset = index;
             match character {
                 '\n' => {
                     self.finish_word();
@@ -288,7 +295,8 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, kind: TokenKind) {
         let line = self.line;
-        self.tokens.push(Token { kind, line });
+        let offset = self.token_offset;
+        self.tokens.push(Token { kind, line, offset });
     }
 
     fn push_literal(&mut self, character: char) {
@@ -300,6 +308,7 @@ impl<'a> Lexer<'a> {
         if !self.word_started {
             self.word_started = true;
             self.word_line = self.line;
+            self.word_offset = self.token_offset;
         }
     }
 
@@ -327,6 +336,7 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token {
             kind: TokenKind::Word(RawWord { parts }),
             line,
+            offset: self.word_offset,
         });
     }
 
@@ -486,6 +496,7 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token {
             kind: TokenKind::HereDoc(RawWord { parts: Vec::new() }),
             line,
+            offset: self.token_offset,
         });
         self.pending_here_docs.push(PendingHereDoc {
             delimiter,
@@ -572,10 +583,7 @@ impl<'a> Lexer<'a> {
             } else {
                 vec![RawPart::Literal(body)]
             };
-            self.tokens[specification.token] = Token {
-                kind: TokenKind::HereDoc(RawWord { parts }),
-                line: specification.line,
-            };
+            self.tokens[specification.token].kind = TokenKind::HereDoc(RawWord { parts });
         }
         Ok(())
     }
@@ -658,6 +666,10 @@ impl<'a> Lexer<'a> {
             '?' => {
                 self.chars.next();
                 Ok(Some(RawPart::Parameter(RawParameter::LastStatus)))
+            }
+            '!' => {
+                self.chars.next();
+                Ok(Some(RawPart::Parameter(RawParameter::LastJob)))
             }
             '@' => {
                 self.chars.next();

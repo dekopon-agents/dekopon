@@ -229,6 +229,22 @@ mod reserved {
         parser::{REJECTED_COMMANDS, RESERVED_WORDS},
     };
 
+    #[test]
+    fn detached_jobs_have_builtins_and_no_stale_job_control_refusals() {
+        let names = builtins::names();
+        for name in ["wait", "jobs", "kill"] {
+            assert!(names.contains(&name));
+            assert!(!REJECTED_COMMANDS.iter().any(|(word, _)| *word == name));
+        }
+        for name in ["fg", "bg", "trap"] {
+            let (_, reason) = REJECTED_COMMANDS
+                .iter()
+                .find(|(word, _)| *word == name)
+                .unwrap();
+            assert!(!reason.contains("job control"));
+        }
+    }
+
     /// This crate's word tables and the core crate's reserved command word list must agree in both
     /// directions, or a provider could claim a name the shell secretly shadows, or an unused
     /// reservation could block a provider's own name forever.

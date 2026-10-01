@@ -153,11 +153,12 @@ routes:                                       # first match wins; order matters
     progressDetail: plain                     # optional: off | plain (default) | detailed
     progressNotes: false                      # optional; true lets the model write one bounded note on the progress line
     steering: abort                           # optional: abort (default) | boundary
-    limits:                                   # maxDurationMs and scriptTimeoutMs are optional
+    limits:                                   # maxDurationMs, scriptTimeoutMs and jobTimeoutMs are optional
       maxSteps: 8
       maxCapabilityCalls: 16
       maxDurationMs: 300000                   # whole-session wall clock; omitted means none, 0 refused
       scriptTimeoutMs: 240000                 # one script's deadline; default 30000, 0 refused
+      jobTimeoutMs: 3600000                   # optional; enables detached jobs on this route, 0 refused
     memory:                                   # optional; default { mode: persistent }
       mode: persistent                        # oneShot | persistent
       scope: privateConversation              # privateConversation (default) | sharedConversation
@@ -170,6 +171,7 @@ routes:                                       # first match wins; order matters
 
 sessions:
   maxConcurrent: 4                            # optional, default 4
+  maxJobs: 2                                  # optional, default 2; 0 refused
   replyOnBusy: true                           # default true; saturation or a full mailbox only
   maxConversations: 1024                      # optional, default 1024 tracked
   assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
@@ -948,6 +950,25 @@ answer. Once the loop claims completion, a stop cannot cancel that answer, even 
 pending input. A stop word that removes pending input can receive `Stopped.` through the bounded
 refusal-reply path; buttons/native Stop acknowledge through their transport. With nothing pending,
 a stop during completion is ignored with reason `already-ended`.
+
+## Detached jobs
+
+A route opts into jobs with `limits.jobTimeoutMs`; without it, `&`, `jobs`, `wait` and
+`kill` report that jobs are off. `cmd &` starts a job that outlives its script and turn,
+prints `[N]`, and sets `$!`. `jobs` lists the person's jobs in that conversation;
+`wait %N` waits without a completion notice, and `kill %N` stops one. A finished job
+not waited for sends a bounded notice as a separate turn or a steer; a busy gateway
+may drop it, so `jobs` is the fallback. `sessions.maxJobs` (default 2) bounds running
+jobs and retained rows across the process. Jobs and their rows are lost at restart.
+
+A job inherits its starting scope, but its variables and buffers die with it; only its
+printed output reaches the notice (at most 16 KiB of inbound text). Jobs have no chat
+asset inputs or reply attachment slot and cannot send files or images. A job started
+by a probe remains read-only; the broker refuses write capabilities under trigger
+`probe`. A notice turn carries trigger `job` and may itself start jobs: on a route
+with `jobTimeoutMs`, an agent can keep itself alive through successive notices.
+The route key is the explicit opt-in; the person's stop word cancels their running
+jobs in that conversation, including when no turn is active.
 
 ## Sessions
 

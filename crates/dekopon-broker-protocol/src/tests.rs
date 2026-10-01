@@ -2230,3 +2230,23 @@ fn an_unknown_sibling_of_the_provider_detail_is_refused_rather_than_ignored() {
 
     assert!(serde_json::from_value::<InvocationResult>(document).is_err());
 }
+
+#[test]
+fn every_trigger_round_trips_as_its_wire_name() {
+    for (trigger, name) in [
+        (Trigger::Message, "message"),
+        (Trigger::Wake, "wake"),
+        (Trigger::Probe, "probe"),
+        (Trigger::Job, "job"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(trigger).expect("serializes"),
+            json!(name)
+        );
+        assert_eq!(
+            serde_json::from_value::<Trigger>(json!(name)).expect("parses"),
+            trigger
+        );
+        assert_eq!(trigger.as_str(), name);
+    }
+}
