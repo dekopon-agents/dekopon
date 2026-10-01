@@ -11,8 +11,33 @@ fn asset_dependency_mirrors_match_the_canonical_package() {
         include_str!("../../../wit/http/deps/asset.wit"),
         include_str!("../../dekopon-provider-http/wit/deps/asset.wit"),
         include_str!("../../dekopon-broker-host/wit/deps/asset.wit"),
+        include_str!("../wit/deps/asset.wit"),
         include_str!("../../../examples/providers/http-probe/wit/deps/asset.wit"),
     ] {
         assert_eq!(ASSET_WIT, mirror);
+    }
+}
+
+#[test]
+fn sdk_import_packages_match_broker_host_byte_for_byte() {
+    for (sdk, broker) in [
+        (
+            include_str!("../wit/deps/http.wit"),
+            include_str!("../../dekopon-broker-host/wit/deps/http.wit"),
+        ),
+        (
+            include_str!("../wit/deps/clock.wit"),
+            include_str!("../../dekopon-broker-host/wit/deps/clock.wit"),
+        ),
+        (
+            include_str!("../wit/deps/settings.wit"),
+            include_str!("../../dekopon-broker-host/wit/deps/settings.wit"),
+        ),
+        (
+            include_str!("../wit/deps/storage.wit"),
+            include_str!("../../dekopon-broker-host/wit/deps/storage.wit"),
+        ),
+    ] {
+        assert_eq!(sdk, broker);
     }
 }
