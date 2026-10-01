@@ -218,6 +218,35 @@ impl NonPublicHttpsAuthority {
     }
 }
 
+/// Explicit HTTPS test destination pinned to loopback and a dedicated trust root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopbackHttpsPin {
+    authority: String,
+    address: SocketAddr,
+    ca_pem: Vec<u8>,
+}
+
+impl LoopbackHttpsPin {
+    pub fn new(
+        authority: &str,
+        address: SocketAddr,
+        ca_pem: Vec<u8>,
+    ) -> Result<Self, &'static str> {
+        let target = NonPublicHttpsAuthority::new(authority)?;
+        if !address.ip().is_loopback()
+            || address.port().to_string() != authority.rsplit(':').next().unwrap_or("")
+            || ca_pem.is_empty()
+        {
+            return Err("test pin requires an exact loopback HTTPS authority and CA");
+        }
+        Ok(Self {
+            authority: target.authority,
+            address,
+            ca_pem,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpHostCeilings {
     pub max_requests: u32,
@@ -228,6 +257,7 @@ pub struct HttpHostCeilings {
     pub plaintext_hosts: PlaintextHosts,
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
     pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
+    pub loopback_https_pin: Option<LoopbackHttpsPin>,
 }
 
 impl Default for HttpHostCeilings {
@@ -241,6 +271,7 @@ impl Default for HttpHostCeilings {
             plaintext_hosts: PlaintextHosts::default(),
             extra_ca_bundles: Arc::new(Vec::new()),
             non_public_https: Arc::new(Vec::new()),
+            loopback_https_pin: None,
         }
     }
 }
@@ -1141,11 +1172,20 @@ impl BufferedHttpClient {
                 reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", which \
                           the Timeout message already states"
             )]
-            let addresses = timeout(remaining, resolve_destination(&host, port))
-                .await
-                .map_err(|_| {
-                    http_error(ErrorCode::Timeout, "destination resolution timed out")
-                })??;
+            let addresses = if let Some(pin) = self
+                .ceilings
+                .loopback_https_pin
+                .as_ref()
+                .filter(|pin| pin.authority == authority && url.scheme() == "https")
+            {
+                vec![pin.address]
+            } else {
+                timeout(remaining, resolve_destination(&host, port))
+                    .await
+                    .map_err(|_| {
+                        http_error(ErrorCode::Timeout, "destination resolution timed out")
+                    })??
+            };
             self.resolved.insert(authority.clone(), addresses.clone());
             addresses
         };
@@ -1169,7 +1209,12 @@ impl BufferedHttpClient {
                 .non_public_https
                 .iter()
                 .any(|entry| entry.authority == authority);
-            if !https_addresses_permitted(non_public, &addresses) {
+            let pinned_loopback = self
+                .ceilings
+                .loopback_https_pin
+                .as_ref()
+                .is_some_and(|pin| pin.authority == authority && addresses == [pin.address]);
+            if !pinned_loopback && !https_addresses_permitted(non_public, &addresses) {
                 return Err(http_error(
                     ErrorCode::Denied,
                     if non_public {
@@ -1309,7 +1354,22 @@ impl BufferedHttpClient {
             .connect_timeout(budget)
             .timeout(budget)
             .resolve_to_addrs(host, addresses);
-        for pem in self.ceilings.extra_ca_bundles.iter() {
+        let pinned_ca = self
+            .ceilings
+            .loopback_https_pin
+            .as_ref()
+            .filter(|pin| {
+                pin.authority == canonical_authority(host, addresses[0].port())
+                    && addresses == [pin.address]
+            })
+            .map(|pin| pin.ca_pem.as_slice());
+        for pem in self
+            .ceilings
+            .extra_ca_bundles
+            .iter()
+            .map(Vec::as_slice)
+            .chain(pinned_ca)
+        {
             for cert in reqwest::Certificate::from_pem_bundle(pem)
                 .map_err(|_error| http_error(ErrorCode::Denied, "invalid configured CA bundle"))?
             {

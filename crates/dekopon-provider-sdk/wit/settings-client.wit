@@ -1,0 +1,5 @@
+package dekopon:provider@0.3.0;
+
+world settings-client {
+    import dekopon:settings/config@0.1.0;
+}

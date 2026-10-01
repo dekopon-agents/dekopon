@@ -6,24 +6,18 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[package.metadata.cargo-machete]
+ignored = ["clap"]
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
 dekopon-provider-sdk = { path = "../../../crates/dekopon-provider-sdk" }
-dekopon-provider-storage = { path = "../../../crates/dekopon-provider-storage", default-features = false, features = ["durable-files"] }
+clap = { version = "4.6.0", features = ["derive"] }
+schemars = { version = "1.2.2", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-# Component toolchain pin. Do not touch this unless you are moving all of these in lockstep:
-#   rust-toolchain.toml            one Rust for the workspace, the fixtures and every CI job
-#   Cargo.toml rust-version        the same number, kept for crates.io metadata
-#   Cargo.toml wasmtime, wit-bindgen, and the five examples/providers/*/Cargo.toml wit-bindgen pins
-#   ci/toolchain.env               wasm-tools and wkg, with their sha256
-#   deny.toml [[skip]]             wasm-encoder / wasmparser / wit-parser versions
-# then rebuild every examples/providers/*.wasm on the pinned CI image.
-# wit-bindgen's generated code must agree with the wasm-tools CLI and with Wasmtime's component
-# model crates. History: #206; #191 is the lone wit-bindgen bump that could not build.
-wit-bindgen = { version = "0.62.0", default-features = false, features = ["macros", "realloc"] }
-
 # Each provider example is its own workspace, so the repository's [workspace.lints] table cannot
 # reach guest code. This is the reachable part of it. `unsafe_code` is deliberately absent: a
 # provider that generates its own bindings expands wit-bindgen's `export!` into `unsafe extern "C"`

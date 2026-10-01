@@ -220,7 +220,8 @@ an invariant other code relies on that the types do not enforce, the security re
 restriction that looks arbitrary, an upstream workaround with its link, or why the obvious simpler
 alternative is wrong here. One sentence, at the site. `///` and `//!` follow the same rule; the
 exceptions are one-or-two-sentence docs on the public items of `dekopon-provider-sdk` and its
-testkit, clap `///` (it is the `--help` text), `compile_fail` doctests, and `// SAFETY:`.
+testkit, clap `///` (it is the `--help` text), `///` on `JsonSchema` input fields (it is the
+model-facing schema description), `compile_fail` doctests, and `// SAFETY:`.
 
 - Yes: `// The descriptor closes before accounting is released; unlink alone is not disk reclamation.`
 - No: a `///` that restates the item's name or signature; a module overview; `// step 1: open the file`; `// handle error`; `// TODO: clean this up`; history (`// previously…`, `// now uses…`, `// replaces the old…`); plan, finding or PR IDs (`// D18`, `// W2-E`, `// see #187`); a comment narrating what a test asserts; three lines where one sentence carries the constraint.

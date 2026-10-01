@@ -97,7 +97,8 @@ beside the capability and input:
 ```
 
 `httpBasic` adds `username`, and `secretUse` is absent when the proposal names no secret. A provider
-sets it through `CommandInvocation::secret_use`, which needs `dekopon-provider-sdk` 0.15.0.
+sets it with the typed SDK's `Proposal::with_secret_use`. Providers still using the previously
+published `dekopon-provider-sdk` 0.15.0 set the historical `CommandInvocation::secret_use` field.
 
 *Committed direction:* the out-of-tree `curl` provider takes the word `curl` and accepts the two
 credential forms the retired shell builtin did:

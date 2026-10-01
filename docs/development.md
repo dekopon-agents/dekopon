@@ -25,10 +25,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Trace context (always built) and OTLP exporter settings and subscriber wiring (`exporter` feature) | `crates/dekopon-telemetry/src/lib.rs`; `crates/dekopon-telemetry/src/exporter.rs` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
 | Isolated model auth commands | `crates/dekopond/src/{cli,auth,auth_result,auth_render,auth_output}.rs` | `crates/dekopond/tests/auth.rs` and inline parser/renderer/export-guard tests |
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
-| Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
-| Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
-| Provider storage WIT and guest facade | `wit/storage/`, `crates/dekopon-provider-storage/` | Feature/import inspection, mirror comparisons, package workflow |
-| Host wall clock WIT and guest facade | `wit/clock/`, `crates/dekopon-provider-clock/` | Mirror comparison, `clock-probe` import inspection, package workflow |
+| Typed provider SDK, guest imports and adapter | `crates/dekopon-provider-sdk/src/`, `crates/dekopon-provider-sdk/wit/` | Typed dispatch, handles, schema and WIT mirror tests; `wit/{http,storage,clock}/` publication packages |
 | Native provider storage | `crates/dekopon-storage-host/src/{config,key,layout,namespace,quota,handle,jsonl,vfs,metrics}.rs` | Path/key/quota/direct-write/startup/continuity tests plus broker-host component integration |
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/`, `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, clock-refusal, and loopback tests, and `crates/dekopon-broker-host/tests/spans.rs` for store, instantiation, fuel, and `provider_clock_read` telemetry |
@@ -40,7 +37,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Tokio process lifecycle | `crates/dekopon-process/src/` | Inline typed-result, Tokio task-panic, cooperative-cancellation, and payload-free tracing tests plus a public doctest; consumed by `dekopon-agent`'s cancellable `broker-command` node |
 | Shared prompt loop, the safe agent-configuration meta view, session capability dispatch, descriptor-backed asset integration, mounted skills, and improvement suggestions | `crates/dekopon-agent/src/`; the typed-output intake and `chat-asset:` reference discovery in `attachment.rs`, the skills listing and `read_skill` tool in `skills.rs`, the `suggest_improvement` tool and its bounds in `improvement.rs` | Inline prompt/meta-tool, explicit-send slot and descriptor-reference, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests, plus inline listing/argument and suggestion-validation tests in those two modules |
 | Chat gateway configuration, text/attachment transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, explicit asset delivery and descriptor inputs, route-mounted skills read on demand, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
-| Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving the exact fetched `memory-chat` release plus the checked `storage-probe` and `cli-probe` fixtures |
+| Typed provider test harness | `crates/dekopon-provider-sdk-testkit/src/` | `tests/typed.rs` parity and conformance; broker-host `tests/fixture_host.rs` drives fetched `memory-chat` and checked storage/CLI components under exact grants |
 | Rust provider fixtures | `examples/providers/cli-probe/`, `clock-probe/`, `http-probe/`, `memory-reservation-probe/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, broker-host validation, loopback mocks, and broker/VFS tests; exact standalone JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | Agent skill example | `examples/catalog/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/catalog/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs` |
@@ -92,21 +89,21 @@ The SDK and host provider WIT files are mirrored and must remain byte-identical:
 The HTTP 1.1 WIT package (unchanged buffered `send` plus asset-backed `stream`) and guest/host copies are also mirrored:
 
 - `wit/http/http.wit`
-- `crates/dekopon-provider-http/wit/deps/http.wit`
+- `crates/dekopon-provider-sdk/wit/deps/http.wit`
 - `crates/dekopon-broker-host/wit/deps/http.wit`
 - `examples/providers/http-probe/wit/deps/http.wit`
 
 The storage package is mirrored byte-for-byte at:
 
 - `wit/storage/storage.wit`
-- `crates/dekopon-provider-storage/wit/deps/storage.wit`
+- `crates/dekopon-provider-sdk/wit/deps/storage.wit`
 - `crates/dekopon-broker-host/wit/deps/storage.wit`
 - `examples/providers/storage-probe/wit/deps/storage.wit`
 
 The wall clock package is mirrored byte-for-byte at:
 
 - `wit/clock/clock.wit`
-- `crates/dekopon-provider-clock/wit/deps/clock.wit`
+- `crates/dekopon-provider-sdk/wit/deps/clock.wit`
 - `crates/dekopon-broker-host/wit/deps/clock.wit`
 - `examples/providers/clock-probe/wit/deps/clock.wit`
 
@@ -135,12 +132,9 @@ The clock is readable only in an invocation's store; a read during a description
 traps.
 The host does not authenticate callers, evaluate policy, or construct authorization.
 
-The SDK's optional `host` feature retains manifest validation, complete conflicting-provider-set
-reports, store bounds, engine construction, and the seven shared `DEFAULT_MAX_*` constants, which
-live only there. These SDK APIs also serve external embeddings. The feature is off by default and
-pulls in Wasmtime, so guest builds must not
-enable it. Check wasm32 both with default features and with `--features clap`; the optional
-`cli::run_command` adapter is built without `env` or `color`. The broker owns its linker and
+`dekopon-broker-host::host` owns manifest validation, complete conflicting-provider-set
+reports, store bounds, engine construction, and the seven shared `DEFAULT_MAX_*` constants.
+The guest SDK has no Wasmtime host feature. Its mandatory clap dependency is built without `env` or `color`; check the SDK on wasm32. The broker owns its linker and
 yields on fuel so a Tokio deadline can cancel a call.
 
 The repository-owned checked components are generated:
@@ -153,7 +147,7 @@ The repository-owned checked components are generated:
 | `examples/providers/memory-reservation-probe/src/lib.rs` | `examples/providers/memory-reservation-probe/build.sh` | `examples/providers/memory-reservation-probe-provider.wasm` |
 | `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. JSONPlaceholder and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored fixtures — the release tag, checksum, and size pinned per provider in that script — after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (the [`rust-toolchain.toml`](../rust-toolchain.toml) compiler and the [`ci/toolchain.env`](../ci/toolchain.env) wasm-tools) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` decodes to HTTP `client@1.1.0` and asset `asset@0.1.0` imports; the unchanged fetched JSONPlaceholder fixture retains only buffered HTTP `client@1.0.0`. `clock-probe` (a hand-rolled `run-command` guest) decodes to exactly the wall clock import and three provider exports. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` (the `clap`-layer guest: three provider exports including `run-command`) and `memory-reservation-probe` (the hand-rolled `run-command` guest, same three exports) are import-free; `storage-probe` decodes to durable-files only and the same three exports. None may import WASI. Broker-host tests enforce the exact supported imports and reject WASI.
+Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. JSONPlaceholder and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored fixtures — the release tag, checksum, and size pinned per provider in that script — after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (the [`rust-toolchain.toml`](../rust-toolchain.toml) compiler and the [`ci/toolchain.env`](../ci/toolchain.env) wasm-tools) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` decodes to HTTP `client@1.1.0` and asset `asset@0.1.0` imports; the unchanged fetched JSONPlaceholder fixture retains only buffered HTTP `client@1.0.0`. `clock-probe` decodes to exactly the wall clock import and three provider exports; its separate raw fixture checks clock refusal during `run-command`. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` and `memory-reservation-probe` are import-free; the latter's raw fixture retains adversarial escape behavior; `storage-probe` decodes to durable-files only and the same three exports. None may import WASI. Broker-host tests enforce the exact supported imports and reject WASI.
 
 ### Dependencies, crates, CI, or releases
 
@@ -268,15 +262,9 @@ cargo machete
   fi
 )
 python3 .github/scripts/test_daemon_dependency_gates.py
-# The guest host-interface bindings must compile for Wasm, each storage feature on its own.
+# The SDK-owned guest bindings must compile for Wasm.
 rustup target add wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-sdk --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-sdk --features clap --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-clock --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-http --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-storage --no-default-features --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown
-cargo check --locked -p dekopon-provider-storage --no-default-features --features durable-files --target wasm32-unknown-unknown
 # The repository shell scripts.
 shellcheck ci/fetch-external-provider-components.sh \
   examples/otel-traces/smoke-test.sh examples/providers/build-component.sh examples/providers/*/build.sh

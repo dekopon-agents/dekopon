@@ -1205,7 +1205,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
 
     let mut invocation = request("caught-over-budget");
     invocation.capability = capability.clone();
-    invocation.input = json!({"assetMode": "direct-write", "bytes": 1025});
+    invocation.input = json!({"assetMode": "budget-write", "bytes": 1025});
     let refused = client
         .invoke(Some(session()), invocation, InvokeAssets::default())
         .await

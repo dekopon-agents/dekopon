@@ -23,7 +23,7 @@ Correlated tracing from receipt to execution:
 
 Extensibility through Wasm providers:
 
-- A Rust provider SDK, a bounded Wasmtime component host with a fresh store per call, and an in-process fake-broker testkit (`dekopon-provider-sdk-testkit`) that runs a provider component against real storage.
+- A Rust provider SDK, a bounded Wasmtime component host with a fresh store per call, and a typed native/real-component testkit (`dekopon-provider-sdk-testkit`); broker-host fixture tests run external and storage components against exact grants.
 - A published buffered `dekopon:http@1.0.0` contract, a guest Rust facade, a bounded native HTTP engine, an asynchronous broker component host, a deny-by-default authorization core, and a bounded identity-free Unix protocol.
 - Broker-owned JSONL and durable-file provider storage, plus optional on-demand durable chat memory: model-queryable only under an effective all-three grant, recorded once after gateway-attested transport acceptance, never automatically replayed into a prompt.
 - An offline `dekopon-brokerd provider` manager for exact fully qualified OCI tags or manifest digests: strict desired and generated-lock files, a content-addressed component store, complete provider-set validation before atomic activation, offline list and verify, and a startup comparison of locked digest, length, and provider ID against the exact Wasmtime input buffer. It adds no daemon-startup network path.

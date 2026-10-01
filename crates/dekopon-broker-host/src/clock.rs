@@ -8,7 +8,7 @@ use crate::bindings::dekopon::clock::wall;
 
 #[derive(Debug)]
 pub(crate) enum ClockState {
-    Granted,
+    Granted { fixed: Option<SystemTime> },
     Refused { attempted: bool },
 }
 
@@ -17,8 +17,8 @@ impl ClockState {
         Self::Refused { attempted: false }
     }
 
-    pub(crate) const fn invoke() -> Self {
-        Self::Granted
+    pub(crate) const fn invoke(fixed: Option<SystemTime>) -> Self {
+        Self::Granted { fixed }
     }
 
     pub(crate) const fn attempted(&self) -> bool {
@@ -35,7 +35,11 @@ impl wall::Host for StoreState {
             *attempted = true;
             return Err(wasmtime::Error::msg(CLOCK_REFUSED));
         }
-        let unix_millis = unix_millis(SystemTime::now());
+        let now = match self.clock {
+            ClockState::Granted { fixed } => fixed.unwrap_or_else(SystemTime::now),
+            ClockState::Refused { .. } => unreachable!("refused clock returned above"),
+        };
+        let unix_millis = unix_millis(now);
         tracing::info!(event = "provider_clock_read", unix_millis);
         Ok(unix_millis)
     }
@@ -71,7 +75,7 @@ mod tests {
 
     #[test]
     fn only_a_refused_read_counts_as_attempted() {
-        assert!(!ClockState::invoke().attempted());
+        assert!(!ClockState::invoke(None).attempted());
         assert!(!ClockState::describe().attempted());
         assert!(ClockState::Refused { attempted: true }.attempted());
     }

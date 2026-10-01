@@ -1,108 +1,74 @@
-use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
-    ProviderError, ProviderManifest, RiskLevel,
-};
+use dekopon_provider_sdk::clap::Parser;
+use dekopon_provider_sdk::provider::{Capability, Clock, Code, Failure, Proposal, Provider, Usage};
+use dekopon_provider_sdk::{EffectKind, RiskLevel};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-mod bindings {
-    wit_bindgen::generate!({
-        path: "wit",
-        world: "provider",
-        generate_all,
-        pub_export_macro: true,
-    });
+struct ClockProbe;
+struct Now;
+
+#[derive(Parser)]
+#[command(name = "date")]
+struct Date {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+#[derive(Debug)]
+struct ClockError(u64);
+impl std::fmt::Display for ClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the host clock reads {} ms, past 9999-12-31T23:59:59.999Z",
+            self.0
+        )
+    }
+}
+impl Failure for ClockError {
+    fn code(&self) -> Code {
+        Code::new("clock-out-of-range")
+    }
 }
 
-struct ClockProbe;
+impl Provider for ClockProbe {
+    const ID: &'static str = "clock-probe";
+    const COMMAND_WORDS: &'static [&'static str] = &["date"];
+    const DESCRIPTION: &'static str =
+        "Clock provider fixture: the date word and the host wall clock";
+    type Args = Date;
+    type Capabilities = (Now,);
+    fn propose(_: Date, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<Now>(Empty {}))
+    }
+}
 
-const NOW: &str = "clock.now";
-
-const CLOCK_IN_RUN_COMMAND: &str = "--clock-in-run-command";
-
-const HELP: &str = "Usage: date\n\
-\n\
-Prints the broker host's current time in UTC by proposing `clock.now`.\n\
-\n\
-Options:\n\
-\x20     --help  Print help\n";
+impl Capability for Now {
+    type Provider = ClockProbe;
+    const NAME: &'static str = "now";
+    const DESCRIPTION: &'static str = "Reads the broker host's wall clock in UTC";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = Empty;
+    type Needs = Clock;
+    type Output = Value;
+    type Error = ClockError;
+    fn run(_: Empty, clock: Clock) -> Result<Value, ClockError> {
+        reading(clock.now_unix_millis())
+    }
+}
 
 const MAX_RFC3339_UNIX_MILLIS: u64 = 253_402_300_799_999;
 
-impl Provider for ClockProbe {
-    fn manifest() -> ProviderManifest {
-        ProviderManifest {
-            api_version: ProviderApiVersion::V1Alpha1,
-            id: "clock-probe".parse().expect("static provider ID"),
-            description: "Clock provider fixture: the date word and the host wall clock".to_owned(),
-            command_words: vec!["date".to_owned()],
-            capabilities: vec![ProviderCapability {
-                id: NOW.parse().expect("static capability ID"),
-                description: "Reads the broker host's wall clock in UTC".to_owned(),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                input_schema: json!({"type": "object", "additionalProperties": false}),
-            }],
-        }
-    }
-
-    fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError> {
-        if capability.as_str() != NOW {
-            return Err(ProviderError::new(
-                "unsupported",
-                format!("clock-probe does not implement {}", capability.as_str()),
-            ));
-        }
-        match input.as_object() {
-            Some(object) if object.is_empty() => {}
-            Some(object) => {
-                let field = object.keys().next().map_or("", String::as_str);
-                return Err(ProviderError::new(
-                    "invalid-input",
-                    format!("unexpected input field `{field}`"),
-                ));
-            }
-            None => {
-                return Err(ProviderError::new(
-                    "invalid-input",
-                    "input must be an empty object",
-                ));
-            }
-        }
-        reading(dekopon_provider_clock::now_unix_millis())
-    }
-
-    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        match argv {
-            [] => Ok(CommandRun::proposal(
-                NOW.parse().expect("static capability ID"),
-                json!({}),
-            )),
-            [flag] if flag == "--help" => Ok(CommandRun::rendered(HELP, 0)),
-            [flag] if flag == CLOCK_IN_RUN_COMMAND => Ok(CommandRun::rendered(
-                format!("{}\n", dekopon_provider_clock::now_unix_millis()),
-                0,
-            )),
-            [first, rest @ ..] => {
-                let unexpected = rest.first().filter(|_| first == "--help").unwrap_or(first);
-                Ok(CommandRun::rendered_error(
-                    format!("date: unexpected argument '{unexpected}'\n\n{HELP}"),
-                    2,
-                ))
-            }
-        }
-    }
-}
-
-fn reading(unix_millis: u64) -> Result<Value, ProviderError> {
+fn reading(unix_millis: u64) -> Result<Value, ClockError> {
     Ok(json!({"unixMillis": unix_millis, "rfc3339": rfc3339(unix_millis)?}))
 }
 
-fn rfc3339(unix_millis: u64) -> Result<String, ProviderError> {
+fn rfc3339(unix_millis: u64) -> Result<String, ClockError> {
     if unix_millis > MAX_RFC3339_UNIX_MILLIS {
-        return Err(ProviderError::new(
-            "clock-out-of-range",
-            format!("the host clock reads {unix_millis} ms, past 9999-12-31T23:59:59.999Z"),
-        ));
+        return Err(ClockError(unix_millis));
     }
     let seconds = unix_millis / 1_000;
     let (year, month, day) = civil_from_days(seconds / 86_400);
@@ -133,113 +99,47 @@ const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-dekopon_provider_sdk::export_provider_with_cli!(ClockProbe, bindings);
+dekopon_provider_sdk::export!(ClockProbe);
 
 #[cfg(test)]
 mod tests {
-    use dekopon_provider_sdk::{CommandRun, Provider};
-    use serde_json::json;
-
-    use super::{ClockProbe, HELP, MAX_RFC3339_UNIX_MILLIS, NOW, reading, rfc3339};
-
-    fn argv(words: &[&str]) -> Vec<String> {
-        words.iter().map(|word| (*word).to_owned()).collect()
-    }
+    use super::*;
+    use dekopon_provider_sdk::provider;
+    use dekopon_provider_sdk::{CommandRunOutcome, ComponentResponse};
 
     #[test]
-    fn manifest_declares_the_date_word_and_one_read_only_capability() {
-        let manifest = ClockProbe::manifest();
-        assert_eq!(manifest.id.as_str(), "clock-probe");
-        assert_eq!(manifest.command_words, ["date"]);
-        assert_eq!(
-            manifest
-                .capabilities
-                .iter()
-                .map(|capability| capability.id.as_str())
-                .collect::<Vec<_>>(),
-            [NOW]
+    fn date_proposes_clock_now_and_refuses_other_arguments() {
+        assert!(
+            matches!(provider::command::<ClockProbe>(&[], Some("piped")), CommandRunOutcome::Proposed { capability, input, .. } if capability.as_str() == "clock-probe.now" && input == json!({}))
         );
-    }
-
-    #[test]
-    fn the_bare_word_proposes_clock_now_with_an_empty_input() {
-        let run = ClockProbe::run_command(&[], Some("piped")).expect("the word proposes");
-        assert_eq!(
-            run,
-            CommandRun::proposal(NOW.parse().expect("static capability"), json!({}))
+        assert!(
+            matches!(provider::command::<ClockProbe>(&["--help".into()], None), CommandRunOutcome::Rendered { status: 0, stdout, .. } if !stdout.contains('\u{1b}'))
         );
-    }
-
-    #[test]
-    fn help_renders_on_stdout_at_status_zero() {
-        let run = ClockProbe::run_command(&argv(&["--help"]), None).expect("help renders");
-        assert_eq!(run, CommandRun::rendered(HELP, 0));
-    }
-
-    #[test]
-    fn any_other_argument_is_a_usage_error_on_stderr_at_status_two() {
-        for (words, unexpected) in [
-            (&["-u"][..], "-u"),
-            (&["+%s"][..], "+%s"),
-            (&["--help", "extra"][..], "extra"),
-        ] {
-            let run = ClockProbe::run_command(&argv(words), None).expect("a usage error renders");
-            let CommandRun::Rendered {
-                stdout,
-                stderr,
-                status,
-            } = run
-            else {
-                panic!("expected a rendered usage error for {words:?}, got {run:?}");
-            };
-            assert_eq!(status, 2, "{words:?}");
-            assert!(stdout.is_empty(), "{stdout:?}");
-            assert!(
-                stderr.starts_with(&format!("date: unexpected argument '{unexpected}'")),
-                "{stderr:?}"
-            );
-        }
+        assert!(matches!(
+            provider::command::<ClockProbe>(&["-u".into()], None),
+            CommandRunOutcome::Rendered { status: 2, .. }
+        ));
+        assert!(
+            matches!(provider::call::<ClockProbe>("clock-probe.now", r#"{"zone":"UTC"}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
+        );
     }
 
     #[test]
     fn rfc3339_renders_utc_to_the_second_across_leap_days() {
-        for (unix_millis, expected) in [
+        for (millis, expected) in [
             (0, "1970-01-01T00:00:00Z"),
             (951_782_400_000, "2000-02-29T00:00:00Z"),
             (1_789_000_000_123, "2026-09-10T00:26:40Z"),
             (MAX_RFC3339_UNIX_MILLIS, "9999-12-31T23:59:59Z"),
         ] {
-            assert_eq!(rfc3339(unix_millis).expect("in range"), expected);
+            assert_eq!(rfc3339(millis).unwrap(), expected);
         }
-    }
-
-    #[test]
-    fn a_reading_past_year_9999_is_refused_naming_it() {
-        let error = rfc3339(MAX_RFC3339_UNIX_MILLIS + 1).expect_err("no four-digit year");
-        assert_eq!(error.code(), "clock-out-of-range");
-        assert!(error.message().contains("253402300800000"), "{error:?}");
-    }
-
-    #[test]
-    fn a_reading_carries_both_the_millis_and_the_timestamp() {
+        let error = rfc3339(MAX_RFC3339_UNIX_MILLIS + 1).unwrap_err();
+        assert_eq!(error.code().as_str(), "clock-out-of-range");
+        assert!(matches!(error, ClockError(millis) if millis == MAX_RFC3339_UNIX_MILLIS + 1));
         assert_eq!(
-            reading(951_782_400_000).expect("in range"),
+            reading(951_782_400_000).unwrap(),
             json!({"unixMillis": 951_782_400_000_u64, "rfc3339": "2000-02-29T00:00:00Z"})
         );
-    }
-
-    #[test]
-    fn invoke_refuses_other_capabilities_and_non_empty_input_before_reading_the_clock() {
-        let other = "clock.later".parse().expect("capability");
-        let error = ClockProbe::invoke(&other, json!({})).expect_err("unsupported");
-        assert_eq!(error.code(), "unsupported");
-
-        let now = NOW.parse().expect("capability");
-        let error = ClockProbe::invoke(&now, json!({"zone": "UTC"})).expect_err("extra field");
-        assert_eq!(error.code(), "invalid-input");
-        assert!(error.message().contains("`zone`"), "{error:?}");
-
-        let error = ClockProbe::invoke(&now, json!("now")).expect_err("not an object");
-        assert_eq!(error.code(), "invalid-input");
     }
 }

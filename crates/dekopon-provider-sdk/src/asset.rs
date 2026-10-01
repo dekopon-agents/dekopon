@@ -4,8 +4,7 @@
 
 use std::{error::Error, fmt};
 
-#[doc(hidden)]
-pub mod bindings {
+pub(crate) mod bindings {
     wit_bindgen::generate!({
         path: "wit",
         world: "asset-client",
@@ -119,13 +118,13 @@ impl From<wit::Error> for AssetError {
 pub struct Handle(wit::Handle);
 
 impl Handle {
-    #[doc(hidden)]
-    pub fn as_inner(&self) -> &wit::Handle {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn as_inner(&self) -> &wit::Handle {
         &self.0
     }
 
-    #[doc(hidden)]
-    pub fn from_inner(handle: wit::Handle) -> Self {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn from_inner(handle: wit::Handle) -> Self {
         Self(handle)
     }
 
@@ -165,35 +164,29 @@ impl Writer {
     }
 }
 
-/// Opens a reference passed by the gateway for this invocation.
-pub fn open(reference: &str) -> Result<Handle, AssetError> {
+pub(crate) fn open(reference: &str) -> Result<Handle, AssetError> {
     wit::open(reference).map(Handle).map_err(Into::into)
 }
 
-/// Allocates an output with the stated content type and stored encoding.
-pub fn allocate(content_type: &str, encoding: Encoding) -> Result<Writer, AssetError> {
+pub(crate) fn allocate(content_type: &str, encoding: Encoding) -> Result<Writer, AssetError> {
     wit::allocate(content_type, encoding)
         .map(Writer)
         .map_err(Into::into)
 }
 
-/// Joins the conversation's temp files, consuming the writer. This does not send it.
-pub fn attach(writer: Writer) -> Result<Handle, AssetError> {
+pub(crate) fn attach(writer: Writer) -> Result<Handle, AssetError> {
     wit::attach(writer.0).map(Handle).map_err(Into::into)
 }
 
-/// Returns the conversation's metadata table, not authority to open unreferenced assets.
-pub fn list() -> Vec<Info> {
+pub(crate) fn list() -> Vec<Info> {
     wit::list()
 }
 
-/// Removes an unsent asset when the invocation grants removal.
-pub fn remove(handle: &Handle) -> Result<(), AssetError> {
+pub(crate) fn remove(handle: &Handle) -> Result<(), AssetError> {
     wit::remove(&handle.0).map_err(Into::into)
 }
 
-/// Marks an asset for delivery on this turn's reply when the invocation grants sending.
-pub fn send(handle: &Handle) -> Result<(), AssetError> {
+pub(crate) fn send(handle: &Handle) -> Result<(), AssetError> {
     wit::send(&handle.0).map_err(Into::into)
 }
 

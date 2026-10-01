@@ -102,6 +102,16 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
     .await
     .unwrap();
     registry.set_assets(directory.clone());
+    let mut raw_registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-raw-probe-provider.wasm")],
+        BrokerHostLimits {
+            fuel: 1_000_000_000,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    raw_registry.set_assets(directory.clone());
     let constraints = ExecutionConstraints {
         asset: Some(AssetConstraints {
             attach: true,
@@ -110,7 +120,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
         ..Default::default()
     };
     for bytes in [65536, 65537, 8 * 1024 * 1024] {
-        let result = registry
+        let result = raw_registry
             .invoke(
                 authorized(
                     "http-probe.fetch".parse().unwrap(),
@@ -206,12 +216,13 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
 
     let tight_directory = AssetDirectory::new(root.path().to_owned(), 1);
     registry.set_assets(tight_directory.clone());
+    raw_registry.set_assets(tight_directory.clone());
     for after in ["return", "spin", "http-denied"] {
         let mut bounded = constraints.clone();
         if after == "spin" {
             bounded.timeout_ms = 50;
         }
-        let result = registry
+        let result = raw_registry
             .invoke(
                 authorized(
                     "http-probe.fetch".parse().unwrap(),

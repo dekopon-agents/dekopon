@@ -1,75 +1,13 @@
 # dekopon-provider-sdk-testkit
 
-An in-process fake broker for testing [Dekopon](https://github.com/dekopon-agents/dekopon) provider
-components.
+The typed test kit runs a provider against the same SDK dispatch in two modes:
+`Native<P>` with injected ports and `Harness::<P>::get(path)` against a checked
+WebAssembly component loaded by the real broker host. `conformance::<P>(path)`
+checks the component manifest, help and usage, decoded imports against the
+provider's declared `Needs`, and closed input schemas. `Run` can script a
+loopback HTTPS origin, inject a guest clock and narrow host limits.
 
-A provider's behavior only fully exists when its compiled component runs against a host. HTTP
-providers can approximate that natively by injecting a transport closure; storage providers cannot,
-because `dekopon-provider-storage` exposes free functions that call the WIT import directly and
-those bindings expand to `unreachable!()` off `wasm32`. This crate runs the real component.
-
-It is a *fake broker*, not a fake host. Cedar policy and the owner-authored constraint catalog are
-skipped — `FakeBroker` mints its own authorization through `AuthorizationGate`, which is the
-allow-all equivalent, since Dekopon has no wildcard grant spelling. Everything below that line is
-real: the same Wasmtime host, the same `StorageHost`, and by default the same `StorageLimits` a
-deployment runs. A quota a test trips here is a quota production would have tripped.
-
-```rust,no_run
-use dekopon_provider_sdk_testkit::{FakeBroker, StorageAccess, StorageInterface};
-use serde_json::json;
-
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let broker = FakeBroker::builder()
-    .component("turso-sql-provider.wasm")
-    .provider("turso")
-    .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
-    .build()
-    .await?;
-
-broker
-    .invoke("turso.exec", json!({"statements": ["CREATE TABLE t(a INTEGER)"]}))
-    .await?;
-
-// A separate invocation reaches the same durable namespace.
-let rows = broker
-    .invoke("turso.exec", json!({"statements": ["SELECT count(*) FROM t"]}))
-    .await?;
-# let _ = rows;
-# Ok(())
-# }
-```
-
-A provider that contributes command words is driven the same way: `broker.run_command("probe",
-&argv, Some("piped"))` returns the `CommandRunOutcome` the broker host decodes from the guest — a
-page it rendered itself (help, a version, a usage error) with its exit status, a capability
-proposal, or a decline. A proposal is the rewrite, not its result; pass it to `invoke` to close the
-loop.
-
-## Things it does for you that are easy to get wrong
-
-- **Continuity is selectable and defaults to `Stable`.** `ContinuityPolicy`'s own default is
-  `AuthorityBound`, which mints a fresh non-reusing generation whenever the *effective authority
-  commitment* changes. This harness holds that commitment constant, so `AuthorityBound` addresses
-  one generation here exactly as `Stable` does; `.continuity(…)` selects either. `Stable` survives
-  an authority change, so a harness that grows a varying authority surface keeps addressing one
-  namespace instead of silently starting over.
-- **A grant is minted per invocation and consumed by it.** Successive calls get fresh invocation
-  ids and identical scope material, which is what keeps them addressing one namespace.
-- **The harness grants `StorageScope::PrivateConversation`.** Its transport, channel, conversation, and subject are pre-filled; production broker configuration may instead select shared-conversation or agent scope.
-- **The storage root lives in a `TempDir` the `FakeBroker` owns.** It is deleted when the broker is
-  dropped.
-
-## Requirements
-
-Tests must use a multi-thread runtime — `#[tokio::test(flavor = "multi_thread")]`. The storage path
-dispatches to `spawn_blocking`, and a current-thread runtime deadlocks waiting for a namespace
-lease.
-
-Pass `.compile_cache(dir)` when a suite loads the same component repeatedly. This now uses trusted,
-immutable, content-addressed cwasm mapped from files, not Wasmtime's compressed cache. Hashes are
-verified once per harness startup. Keep files unchanged while a harness lives and serialize cache
-publishers; errors fail loading without fallback. Omit the option to compile without cache I/O.
-
-## License
-
-MIT OR Apache-2.0
+Storage and external components have no native typed provider; their fixture
+integration tests live in `dekopon-broker-host/tests/fixture_host.rs` and use
+exact authorized grants against the real storage host. Neither harness grants
+production authority or evaluates policy.

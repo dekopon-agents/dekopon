@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use dekopon_provider_sdk::host::StoreLimits;
+use crate::host::StoreLimits;
 use wasmtime::ResourceLimiter;
 
 pub(super) struct MemoryBudget {

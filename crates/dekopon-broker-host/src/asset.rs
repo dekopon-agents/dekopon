@@ -931,7 +931,7 @@ mod tests {
                 "test-provider",
                 http,
                 StorageState::disabled(),
-                ClockState::invoke(),
+                ClockState::invoke(None),
                 SettingsState::invoke(None),
             )
             .unwrap()
@@ -1756,7 +1756,7 @@ mod tests {
                 "test-provider",
                 http,
                 StorageState::disabled(),
-                ClockState::invoke(),
+                ClockState::invoke(None),
                 SettingsState::invoke(None),
             )
             .unwrap();
