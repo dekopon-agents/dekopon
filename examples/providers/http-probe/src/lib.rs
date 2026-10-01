@@ -108,9 +108,16 @@ struct WriteInput {
     expected_etag: Option<String>,
 }
 #[derive(Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PurgeInput {
-    uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
 }
 #[derive(Debug)]
 enum ProbeError {
@@ -227,7 +234,12 @@ impl Provider for HttpProbe {
                 uri: write.uri.uri,
                 expected_etag: write.expected_etag,
             })),
-            Action::Purge(uri) => Ok(Proposal::to::<Purge>(PurgeInput { uri: uri.uri })),
+            Action::Purge(uri) => Ok(Proposal::to::<Purge>(PurgeInput {
+                uri: Some(uri.uri),
+                asset_mode: None,
+                reference: None,
+                bytes: None,
+            })),
         }
     }
 }
@@ -311,12 +323,29 @@ impl Capability for Purge {
     const EFFECT: EffectKind = EffectKind::ExternalWrite;
     const RISK: RiskLevel = RiskLevel::High;
     type Input = PurgeInput;
-    type Needs = Http;
+    type Needs = (Http, Assets);
     type Output = Value;
     type Error = ProbeError;
-    fn run(input: PurgeInput, http: Http) -> Result<Value, ProbeError> {
+    fn run(input: PurgeInput, (http, assets): (Http, Assets)) -> Result<Value, ProbeError> {
+        if let Some(mode) = input.asset_mode.as_deref() {
+            let asset_input = FetchInput {
+                uri: input.uri,
+                method: None,
+                headers: None,
+                body: None,
+                catch_error: None,
+                asset_mode: None,
+                bytes: input.bytes,
+                after_write_error: None,
+                reference: input.reference,
+                references: None,
+                catch_stream_error: None,
+            };
+            return asset_probe(mode, &asset_input, &http, &assets);
+        }
+        let uri = input.uri.ok_or(ProbeError::UriRequired)?;
         let response = http
-            .send(Request::new("DELETE", input.uri).map_err(invalid_request)?)
+            .send(Request::new("DELETE", uri).map_err(invalid_request)?)
             .map_err(http_failed)?;
         Ok(json!({"status":response.status}))
     }
@@ -349,6 +378,17 @@ fn asset_probe(
             .map_err(asset_failed)?;
         assets.send(&handle).map_err(asset_failed)?;
         return Ok(json!({"sent":true}));
+    }
+    if mode == "budget-write" {
+        let writer = assets
+            .allocate(
+                "text/plain",
+                dekopon_provider_sdk::asset::Encoding::Identity,
+            )
+            .map_err(asset_failed)?;
+        let bytes = input.bytes.unwrap_or(1025).min(65536) as usize;
+        writer.write_all(&vec![b'x'; bytes]).map_err(asset_failed)?;
+        return Ok(json!({"caught":false}));
     }
     if mode == "stream" {
         let handles = input
@@ -473,6 +513,14 @@ mod tests {
         assert!(
             matches!(provider::call::<HttpProbe>("http-probe.fetch", r#"{"unknown":true}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
         );
+        assert_eq!(
+            manifest.capabilities[2].input_schema["additionalProperties"],
+            false
+        );
+        assert!(matches!(provider::command::<HttpProbe>(
+            &["purge".into(), "--uri".into(), "https://example.test/".into()], None,
+        ), CommandRunOutcome::Proposed { capability, input, .. }
+            if capability.as_str() == "http-probe.purge" && input == json!({"uri":"https://example.test/"})));
     }
     #[test]
     fn streamed_host_failure_code_reaches_the_provider_response() {
@@ -504,7 +552,9 @@ mod tests {
             type Output = Value;
             type Error = ProbeError;
             fn run(input: PurgeInput, http: Http) -> Result<Value, ProbeError> {
-                let request = StreamedRequest::new("POST", input.uri).map_err(invalid_request)?;
+                let request =
+                    StreamedRequest::new("POST", input.uri.ok_or(ProbeError::UriRequired)?)
+                        .map_err(invalid_request)?;
                 let response = http.stream(request).map_err(stream_failed)?;
                 Ok(json!({"status": response.status}))
             }

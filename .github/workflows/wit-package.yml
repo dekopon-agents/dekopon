@@ -135,8 +135,8 @@ jobs:
 
             expected=''
             case "$provider" in
-              clock-probe) expected='dekopon:clock/wall@1.0.0' ;;
-              http-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
+              clock-probe|clock-raw-probe) expected='dekopon:clock/wall@1.0.0' ;;
+              http-probe|http-raw-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"

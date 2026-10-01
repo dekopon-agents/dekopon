@@ -129,7 +129,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]
