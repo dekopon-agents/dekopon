@@ -113,14 +113,19 @@ file rather than a broker that starts and then refuses to serve.
   roots), which both daemons read as `OTEL_EXPORTER_OTLP_CERTIFICATE`.
 - **The agent catalog.** Tier E. `dekopond` reads `catalogPath` with a plain `read_to_string`, so a
   ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
-  for the catalog file alone. An agent that declares `skills:` needs a daemon binary carrying the
-  skills loader, which the `appVersion` default does not select — pin `image.tag` or `image.digest`
-  — and needs each skill directory readable in the pod (a relative path resolves against the catalog
-  file's own directory); `dekopond` refuses the catalog at startup when one cannot be read.
-  `gateway.catalog` projects a single key to a single file and the chart offers no operator-supplied
-  volume mount for the gateway, so a catalog with skills cannot come from `gateway.catalog`: bake
-  the catalog and its skill directories into an image of your own (skill paths must be real
-  directories and files, not symlinks) and name that path as `catalogPath` in `dekopond.yaml`.
+  for the catalog files alone. For agents declaring `spec.skills`, use `gateway.skills.configMap`
+  and `gateway.skills.items` to map flat ConfigMap keys to nested paths such as
+  `pull-request-review/SKILL.md` and `pull-request-review/references/review.md`. The init container
+  dereferences the projection into fresh regular files in a memory-backed emptyDir, bounded by
+  `volumeSizes.config`. Public skill text is root-owned, with 0755 directories and 0644 files;
+  the gateway and console mount it read-only at `paths.skillsDir` (default `/etc/dekopon-skills`).
+  Neither the broker nor either runtime container mounts the symlinked source. Credentials must
+  never be placed in this ConfigMap. An Agent can mount `/etc/dekopon-skills/pull-request-review`
+  without changing its existing catalog mount or widening any broker grant. `dekopond` still
+  refuses unreadable, invalid or symlinked skill resources at startup.
+  Like other externally supplied startup files, skill changes need a pod rollout; configure
+  your existing ConfigMap reloader or roll the pod explicitly. The chart cannot checksum an
+  external ConfigMap.
 - **Provider components.** The image already bakes `/opt/dekopon/providers/*.wasm` owned by
   `65532:65532` under a `65532`-owned `0755` directory, which is what Tier B wants.
 - **The ChatGPT credentials**, for the opposite reason from all of these. `load_credentials` is a

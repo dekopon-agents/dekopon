@@ -130,6 +130,18 @@ spec:
               fi
 {{- end }}
               rm -f {{ $cfg }}/* {{ $gcfg }}/*
+{{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
+
+              # Only visible entries: do not copy the projection's ..data/timestamp aliases.
+              mkdir -p {{ .Values.paths.skillsDir }}
+              rm -rf {{ .Values.paths.skillsDir }}/*
+              for entry in /dekopon-skills-source/*; do
+                [ -e "$entry" ] || continue
+                cp -RL "$entry" {{ .Values.paths.skillsDir }}/
+              done
+              find {{ .Values.paths.skillsDir }} -type d -exec chmod 0755 {} +
+              find {{ .Values.paths.skillsDir }} -type f -exec chmod 0644 {} +
+{{- end }}
 
               # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
               # 0600, owner $uid — no symlink for O_NOFOLLOW to reject, no root ownership for the
@@ -340,6 +352,13 @@ spec:
               mountPath: {{ $src }}
               readOnly: true
 {{- end }}
+{{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
+            - name: skills-source
+              mountPath: /dekopon-skills-source
+              readOnly: true
+            - name: skills
+              mountPath: {{ .Values.paths.skillsDir }}
+{{- end }}
 {{- range $configDirs }}
             - name: {{ .volume }}
               mountPath: {{ .src }}
@@ -425,6 +444,11 @@ spec:
             - name: catalog
               mountPath: {{ .Values.paths.catalogDir }}
               readOnly: true
+{{- if .Values.gateway.skills.configMap }}
+            - name: skills
+              mountPath: {{ .Values.paths.skillsDir }}
+              readOnly: true
+{{- end }}
 {{- if include "dekopon.chatgptEnabled" . }}
             # Only the gateway-owned credential subdirectory, writable for token rotation.
             # The broker mounts its separate sibling, never this directory or the claim root.
@@ -481,6 +505,11 @@ spec:
             - name: catalog
               mountPath: {{ .Values.paths.catalogDir }}
               readOnly: true
+{{- if .Values.gateway.skills.configMap }}
+            - name: skills
+              mountPath: {{ .Values.paths.skillsDir }}
+              readOnly: true
+{{- end }}
             - name: console-tmp
               mountPath: /tmp
 {{- end }}
@@ -507,6 +536,18 @@ spec:
                     - key: {{ .key }}
                       path: {{ default .file .source }}
               {{- end }}
+{{- end }}
+{{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
+        - name: skills-source
+          configMap:
+            name: {{ .Values.gateway.skills.configMap }}
+            defaultMode: 0400
+            items:
+              {{- toYaml .Values.gateway.skills.items | nindent 14 }}
+        - name: skills
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.config }}
 {{- end }}
 {{- range $configDirs }}
         - name: {{ .volume }}

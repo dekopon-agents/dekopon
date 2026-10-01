@@ -13,6 +13,13 @@ gateway:
   catalog:
     existingConfigMap: dekopon-agents
     existingConfigMapKey: dekopon.yaml
+  skills:
+    configMap: dekopon-skills
+    items:
+      - key: review-skill
+        path: pull-request-review/SKILL.md
+      - key: review-reference
+        path: pull-request-review/references/review.cjs
 
 drainBudget:
   assumedBrokerShutdownGraceMs: 120000
