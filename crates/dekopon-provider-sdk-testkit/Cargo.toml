@@ -15,6 +15,8 @@ include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 dekopon-broker-host.workspace = true
+dekopon-provider-sdk.workspace = true
+dekopon-http-host.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 dekopon-storage-host.workspace = true
@@ -23,8 +25,16 @@ serde_json.workspace = true
 # `TempDir` so the storage root outlives every invocation made against it.
 tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
 
 [dev-dependencies]
+schemars = { version = "1.2.2", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
 dekopon-test-support = { path = "../dekopon-test-support" }
 tokio.workspace = true
 

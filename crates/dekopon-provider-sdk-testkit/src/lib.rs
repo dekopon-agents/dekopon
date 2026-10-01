@@ -52,6 +52,9 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+mod typed;
+pub use typed::{Harness, HarnessError, HttpScript, Native, Run};
+
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},

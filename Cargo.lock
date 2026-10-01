@@ -919,13 +919,16 @@ dependencies = [
  "dekopon-storage-host",
  "dekopon-test-support",
  "parking_lot",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "wasmtime",
@@ -1138,15 +1141,24 @@ dependencies = [
 name = "dekopon-provider-sdk-testkit"
 version = "0.30.0"
 dependencies = [
+ "clap",
  "dekopon-broker-host",
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-http-host",
+ "dekopon-provider-sdk",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "parking_lot",
+ "rcgen",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
