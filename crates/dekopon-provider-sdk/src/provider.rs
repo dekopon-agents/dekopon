@@ -1,5 +1,7 @@
 mod bounded;
 mod handles;
+#[cfg(not(target_arch = "wasm32"))]
+mod port;
 pub use crate::http::{
     BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, Part, Request, Response,
     StreamedRequest, StreamedResponse, method,
@@ -7,6 +9,8 @@ pub use crate::http::{
 pub use crate::storage::{durable_files, jsonl};
 pub use bounded::{Bounded, TooLong, Truncated};
 pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Settings, Storage};
+#[cfg(not(target_arch = "wasm32"))]
+pub use port::{Port, with_port};
 
 use std::borrow::Cow;
 use std::convert::Infallible;

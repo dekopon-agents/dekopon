@@ -17,6 +17,7 @@ pub mod method {
     pub const TRACE: &str = "TRACE";
 }
 
+#[cfg(target_arch = "wasm32")]
 mod bindings {
     wit_bindgen::generate!({
         path: "wit",
@@ -242,6 +243,7 @@ impl Error for BuildError {}
 
 /// Calling this confers no authority; the host validates the request against the current authorized
 /// invocation and may refuse it with Denied.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
     let request = bindings::dekopon::http::client::Request {
         method: request.method,
@@ -278,6 +280,7 @@ pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
 
 /// Grants no authority; the broker enforces HTTP and asset bounds and must have its asset directory
 /// configured before it will spool a response.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
     use bindings::dekopon::http::client as wit;
     let request = wit::StreamedRequest {
@@ -322,6 +325,7 @@ pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, H
         })
 }
 
+#[cfg(target_arch = "wasm32")]
 fn map_error_code(code: bindings::dekopon::http::client::ErrorCode) -> HttpErrorCode {
     use bindings::dekopon::http::client::ErrorCode as Wit;
     match code {

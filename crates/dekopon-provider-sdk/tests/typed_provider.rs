@@ -184,6 +184,78 @@ impl Capability for Stray {
     }
 }
 
+struct ClockFixture;
+
+#[derive(Parser)]
+struct ClockArgs {}
+
+impl Provider for ClockFixture {
+    const ID: &'static str = "clock-fixture";
+    const COMMAND_WORDS: &'static [&'static str] = &["clock-fixture"];
+    const DESCRIPTION: &'static str = "Clock fixture";
+    type Args = ClockArgs;
+    type Capabilities = (ClockRead,);
+    fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<ClockRead>(ClockInput {}))
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClockInput {}
+
+struct ClockRead;
+impl Capability for ClockRead {
+    type Provider = ClockFixture;
+    const NAME: &'static str = "read";
+    const DESCRIPTION: &'static str = "Reads the clock";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = ClockInput;
+    type Needs = dekopon_provider_sdk::provider::Clock;
+    type Output = u64;
+    type Error = Infallible;
+    fn run(_: ClockInput, clock: Self::Needs) -> Result<u64, Infallible> {
+        Ok(clock.now_unix_millis())
+    }
+}
+
+#[test]
+fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
+    use dekopon_provider_sdk::provider::{Port, with_port};
+    struct Fake;
+    impl Port for Fake {
+        fn now_unix_millis(&mut self) -> u64 {
+            123
+        }
+        fn settings(&mut self) -> Option<String> {
+            None
+        }
+        fn send(
+            &mut self,
+            _: dekopon_provider_sdk::provider::Request,
+        ) -> Result<
+            dekopon_provider_sdk::provider::Response,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            unreachable!()
+        }
+        fn stream(
+            &mut self,
+            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
+        ) -> Result<
+            dekopon_provider_sdk::provider::StreamedResponse,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            unreachable!()
+        }
+    }
+    assert_eq!(
+        with_port(Fake, || call::<ClockFixture>("clock-fixture.read", "{}")),
+        ComponentResponse::Succeeded { output: json!(123) }
+    );
+}
+
 fn run(words: &[&str], stdin: Option<&str>) -> CommandRunOutcome {
     let argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
     command::<Fixture>(&argv, stdin)

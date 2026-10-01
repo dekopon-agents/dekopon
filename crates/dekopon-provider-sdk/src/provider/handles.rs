@@ -13,7 +13,14 @@ impl Http {
         &self,
         request: crate::http::Request,
     ) -> Result<crate::http::Response, crate::http::HttpError> {
-        crate::http::send(request)
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::http::send(request)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::port::send(request)
+        }
     }
 
     /// Sends an asset-backed request and returns a spooled response body.
@@ -21,7 +28,14 @@ impl Http {
         &self,
         request: crate::http::StreamedRequest<'_>,
     ) -> Result<crate::http::StreamedResponse, crate::http::HttpError> {
-        crate::http::stream(request)
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::http::stream(request)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::port::stream(request)
+        }
     }
 }
 
@@ -41,7 +55,14 @@ impl Clock {
     /// Reads the wall clock during an authorized call.
     #[must_use]
     pub fn now_unix_millis(&self) -> u64 {
-        crate::clock::now_unix_millis()
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::clock::now_unix_millis()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::port::now_unix_millis()
+        }
     }
 }
 impl sealed::Needs for Clock {
@@ -66,8 +87,11 @@ impl<T> Settings<T> {
 }
 impl<T: DeserializeOwned> sealed::Needs for Settings<T> {
     fn grant() -> Result<Self, SdkFailure> {
-        parse_settings(settings_bindings::dekopon::settings::config::get())
-            .map(|value| Self { value })
+        #[cfg(target_arch = "wasm32")]
+        let json = settings_bindings::dekopon::settings::config::get();
+        #[cfg(not(target_arch = "wasm32"))]
+        let json = super::port::settings();
+        parse_settings(json).map(|value| Self { value })
     }
 }
 impl<T: DeserializeOwned> Needs for Settings<T> {
@@ -111,6 +135,7 @@ mod tests {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 mod settings_bindings {
     wit_bindgen::generate!({ path: "wit", world: "settings-client", generate_all });
 }

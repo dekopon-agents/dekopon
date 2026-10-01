@@ -27,10 +27,71 @@ pub use schemars;
 pub mod asset;
 #[cfg(feature = "clap")]
 pub mod cli;
+#[cfg(target_arch = "wasm32")]
 mod clock;
 mod http;
 pub mod provider;
 mod storage;
+
+#[doc(hidden)]
+pub mod export_bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "provider-cli",
+        pub_export_macro: true,
+    });
+}
+
+#[macro_export]
+macro_rules! export {
+    ($provider:ty) => {
+        struct __DekoponTypedProviderComponent;
+
+        impl $crate::export_bindings::Guest for __DekoponTypedProviderComponent {
+            fn describe() -> ::std::string::String {
+                $crate::__typed_describe::<$provider>()
+            }
+
+            fn invoke(capability: ::std::string::String, input_json: ::std::string::String) -> ::std::string::String {
+                $crate::__typed_invoke::<$provider>(&capability, &input_json)
+            }
+
+            fn run_command(argv: ::std::vec::Vec<::std::string::String>, stdin: ::std::option::Option<::std::string::String>) -> ::std::string::String {
+                $crate::__typed_run_command::<$provider>(&argv, stdin.as_deref())
+            }
+        }
+
+        $crate::export_bindings::export!(__DekoponTypedProviderComponent with_types_in $crate::export_bindings);
+    };
+}
+
+#[doc(hidden)]
+pub fn __typed_describe<P: provider::Provider>() -> String {
+    match provider::manifest::<P>() {
+        Ok(manifest) => {
+            serde_json::to_string(&manifest).unwrap_or_else(|error| describe_fallback(&error))
+        }
+        Err(error) => serde_json::json!({
+            "apiVersion": "dekopon.dev/provider/v1alpha1",
+            "id": "invalid",
+            "description": format!("manifest derivation failed: {error}"),
+            "capabilities": []
+        })
+        .to_string(),
+    }
+}
+
+#[doc(hidden)]
+pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> String {
+    serde_json::to_string(&provider::call::<P>(capability, input))
+        .unwrap_or_else(|_| INVOKE_SERIALIZATION_FALLBACK.to_owned())
+}
+
+#[doc(hidden)]
+pub fn __typed_run_command<P: provider::Provider>(argv: &[String], stdin: Option<&str>) -> String {
+    serde_json::to_string(&provider::command::<P>(argv, stdin))
+        .unwrap_or_else(|_| RUN_SERIALIZATION_FALLBACK.to_owned())
+}
 
 pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 

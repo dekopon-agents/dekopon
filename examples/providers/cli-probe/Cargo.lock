@@ -73,6 +73,8 @@ name = "dekopon-cli-probe-provider"
 version = "0.1.0"
 dependencies = [
  "dekopon-provider-sdk",
+ "schemars",
+ "serde",
  "serde_json",
  "wit-bindgen",
 ]
