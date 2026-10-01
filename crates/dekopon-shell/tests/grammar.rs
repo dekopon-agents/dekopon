@@ -1372,9 +1372,6 @@ fn ambient_authority_commands_are_rejected_by_name() {
         ("source other.sh", "source"),
         (". other.sh", "source"),
         ("trap x INT", "trap"),
-        ("wait", "wait"),
-        ("jobs", "jobs"),
-        ("kill 1", "kill"),
         ("declare -A m", "declare"),
         ("export X=1", "export"),
     ] {
@@ -3055,6 +3052,7 @@ fn the_last_stage_copying_shared_globals_is_refunded_at_join() {
 struct StubJobs {
     seeds: Mutex<Vec<String>>,
     outputs: Mutex<Vec<String>>,
+    waited: Mutex<Vec<JobId>>,
 }
 
 impl JobControl for StubJobs {
@@ -3073,10 +3071,24 @@ impl JobControl for StubJobs {
     }
 
     fn list(&self) -> Vec<JobSummary> {
-        Vec::new()
+        self.seeds
+            .lock()
+            .iter()
+            .enumerate()
+            .map(|(index, text)| JobSummary {
+                id: JobId::new(index as u64 + 1),
+                state: dekopon_shell::JobState::Finished {
+                    outcome: dekopon_shell::JobOutcome::Succeeded,
+                    exit: ExitCode::SUCCESS,
+                    after: Duration::from_secs(1),
+                },
+                text: text.clone().into(),
+            })
+            .collect()
     }
 
-    fn wait(&self, _id: JobId, _keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
+    fn wait(&self, id: JobId, _keep_waiting: &dyn Fn() -> bool) -> Result<JobWait, JobRefusal> {
+        self.waited.lock().push(id);
         Ok(JobWait::Exited(ExitCode::SUCCESS))
     }
 
@@ -3127,6 +3139,46 @@ fn a_started_job_reports_its_id_on_stderr_and_in_last_job() {
     let outcome = Interpreter::new(Limits::default())
         .run("echo \"[$!]\"; x=$(true &); echo \"x=$x\"", &invoker);
     assert_eq!(outcome.output, "[]\n[1]\nx=");
+}
+
+#[test]
+fn a_pipeline_snapshot_waits_for_the_job_started_before_it() {
+    let invoker = WithJobs::default();
+    let outcome =
+        Interpreter::new(Limits::default()).run("sleep 1 & { wait; echo $?; } | cat", &invoker);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert_eq!(*invoker.jobs.waited.lock(), [JobId::new(1)]);
+}
+
+#[test]
+fn job_builtins_refuse_a_route_without_job_control() {
+    for command in ["jobs", "wait", "kill 1"] {
+        let outcome = run(command);
+        assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+        assert_eq!(outcome.output, JOBS_OFF);
+    }
+}
+
+#[test]
+fn jobs_rejects_operands_and_accepts_listing_options() {
+    let invoker = WithJobs::default();
+    let interpreter = Interpreter::new(Limits::default());
+    assert_eq!(
+        interpreter.run("jobs 1", &invoker).exit_code,
+        ExitCode::SYNTAX
+    );
+    assert_eq!(
+        interpreter.run("jobs -l; jobs -p", &invoker).exit_code,
+        ExitCode::SUCCESS
+    );
+    let listing = interpreter.run("echo hi & jobs; jobs -p", &invoker);
+    assert!(
+        listing
+            .output
+            .contains("[1] succeeded exit 0 after 1s echo hi"),
+        "{listing:?}"
+    );
+    assert!(listing.output.ends_with("\n1"), "{listing:?}");
 }
 
 #[test]

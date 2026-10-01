@@ -186,6 +186,7 @@ async fn a_watch_interval_longer_than_its_run_is_refused_before_any_probe() {
         },
         tokio::runtime::Handle::current(),
         dekopon_shell::Limits::default(),
+        None,
     );
     let refused = tokio::task::spawn_blocking(move || {
         wakes.schedule(WakeRequest::Watch {
@@ -387,6 +388,7 @@ echo "after $PREV""#;
                     &broker,
                     &runtime,
                     Some(dekopon_shell::Limits::default()),
+                    None,
                 )
             })
             .await

@@ -1432,6 +1432,16 @@ async fn session(
                 runner.broker.clone(),
                 tokio::runtime::Handle::current(),
                 shell,
+                route.job_timeout.map(|timeout| {
+                    (
+                        Arc::clone(&runner.jobs),
+                        ShellLimits {
+                            max_capability_calls: limits.max_capability_calls,
+                            timeout,
+                            ..ShellLimits::default()
+                        },
+                    )
+                }),
             )
         });
     let model_runtime = tokio::runtime::Handle::current();

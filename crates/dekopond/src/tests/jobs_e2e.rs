@@ -154,6 +154,140 @@ async fn a_start_past_max_jobs_fails_at_once_without_taking_a_session_permit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wait_returns_the_last_jobs_exit_and_bare_wait_covers_all_started_jobs() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(4, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 1 && false & sleep 1 & wait; echo status=$?; wait %1; echo first=$?"),
+        answer("done"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("wait"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let output = models
+        .prompt(1)
+        .into_iter()
+        .find(|(role, _)| role == "tool")
+        .unwrap()
+        .1;
+    assert!(output.contains("status=0"), "{output}");
+    assert!(output.contains("first=1"), "{output}");
+    assert_eq!(runner.jobs.free_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_wait_and_kill_restrict_rows_to_the_person_who_started_them() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(4, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        script_call("sleep 5 & jobs -p; kill -9 $!; wait $!; jobs"),
+        answer("done"),
+    ]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("control"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["done"]);
+    let output = models
+        .prompt(1)
+        .into_iter()
+        .find(|(role, _)| role == "tool")
+        .unwrap()
+        .1;
+    assert!(output.contains("[1]\n1\n"), "{output}");
+    assert!(output.contains("[1] killed exit"), "{output}");
+    let owner = JobOwner::of(&message("control"));
+    let mut foreign = message("control");
+    foreign.subject = subject_named("foreign");
+    let foreign = JobOwner::of(&foreign);
+    assert!(runner.jobs.list(&foreign).is_empty());
+    assert_eq!(
+        runner.jobs.kill(&foreign, JobId::new(1)),
+        Err(dekopon_shell::JobRefusal::NotYours)
+    );
+    assert_eq!(
+        runner.jobs.wait(&foreign, JobId::new(1), &|| true),
+        Err(dekopon_shell::JobRefusal::NotYours)
+    );
+    assert_eq!(finished(&runner.jobs.list(&owner)[0]).0, JobOutcome::Killed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_persons_jobs_does_not_stop_someone_elses() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(4, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([script_call("sleep 5 &"), answer("done")]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(10)),
+        message("start"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let request = crate::transport::CancelRequest {
+        transport: message("start").transport,
+        conversation_id: message("start").conversation.key(),
+        subject: message("start").subject.canonical(),
+        via: dekopon_agent::CancelVia::NativeStop,
+    };
+    crate::cancel_session(&runner, &request);
+    let rows = settled(
+        &runner.jobs,
+        &JobOwner::of(&message("start")),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
+    assert_eq!(runner.jobs.free_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_running_jobs_and_returns_all_permits() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(4, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([script_call("sleep 3600 &"), answer("done")]);
+    let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        job_route(Duration::from_secs(10), Duration::from_secs(3600)),
+        message("start"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let owner = JobOwner::of(&message("start"));
+    assert!(matches!(
+        runner.jobs.list(&owner)[0].state,
+        JobState::Running { .. }
+    ));
+    runner.jobs.cancel_all();
+    let rows = settled(&runner.jobs, &owner, Duration::from_secs(2)).await;
+    assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runner.jobs.free_permits() != 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(runner.jobs.free_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_self_restarting_job_chain_ends_at_the_root_jobs_deadline() {
     let directory = temporary();
     let (broker, _observed) =
@@ -261,6 +395,35 @@ fn owned_by(subject_text: &str) -> JobOwner {
     JobOwner::of(&inbound)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let inbound = message("stop");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let (run, signal) = runner
+        .jobs
+        .admit(JobOwner::of(&inbound), anchor, None, Arc::from("sleep 5"))
+        .unwrap();
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut sessions = tokio::task::JoinSet::new();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &BTreeMap::new(),
+        &drivers,
+        &["stop".to_owned()],
+        &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
+        inbound,
+    );
+    assert!(signal.is_cancelled());
+    while sessions.join_next().await.is_some() {}
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    drop(run);
+}
+
 #[test]
 fn dropping_an_unfinished_run_fails_its_row_and_returns_the_permit() {
     let jobs = Arc::new(Jobs::new(1));
@@ -289,6 +452,44 @@ fn a_full_table_evicts_its_oldest_finished_row_and_never_a_running_one() {
     assert_eq!(texts("a"), ["c"]);
     assert_eq!(texts("b"), ["b"]);
     drop((second, third));
+}
+
+#[test]
+fn a_finished_job_stays_listed_until_a_new_start_needs_its_slot() {
+    let jobs = Arc::new(Jobs::new(2));
+    let owner = owned_by("a");
+    let a = admitted(&jobs, "a", "A").unwrap();
+    drop(a);
+    let b = admitted(&jobs, "a", "B").unwrap();
+    let texts = || {
+        jobs.list(&owner)
+            .into_iter()
+            .map(|row| row.text.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(texts(), ["A", "B"]);
+    drop(b);
+    let c = admitted(&jobs, "a", "C").unwrap();
+    assert_eq!(texts(), ["B", "C"]);
+    drop(c);
+}
+
+#[test]
+fn a_panicking_wait_callback_releases_its_waiter_slot() {
+    let jobs = Arc::new(Jobs::new(1));
+    let run = admitted(&jobs, "a", "first").expect("slot");
+    let owner = owned_by("a");
+    let id = jobs.list(&owner)[0].id;
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(jobs.wait(&owner, id, &|| panic!("caller panicked")).is_ok());
+        }))
+        .is_err()
+    );
+    drop(run);
+    let next = admitted(&jobs, "a", "next").expect("waiter no longer pins the row");
+    assert_eq!(jobs.list(&owner).len(), 1);
+    drop(next);
 }
 
 #[test]

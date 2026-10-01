@@ -2617,6 +2617,7 @@ impl<'a> Evaluator<'a> {
                 invoker: self.invoker,
                 budget: &mut self.budget,
                 buffers: &self.buffers,
+                started_jobs: &self.jobs.started,
             };
             builtin.run(&mut context, arguments, None)
         };
@@ -2777,6 +2778,7 @@ impl<'a> Evaluator<'a> {
                         invoker: self.invoker,
                         budget: &mut self.budget,
                         buffers: &self.buffers,
+                        started_jobs: &self.jobs.started,
                     };
                     context.invoke_proposal(proposal)
                 };

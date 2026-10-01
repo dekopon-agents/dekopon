@@ -36,20 +36,14 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
         ".",
         "`.` (source) is excluded: there is no filesystem to read scripts from",
     ),
+    ("trap", "`trap` is excluded: this shell has no signals"),
     (
-        "trap",
-        "`trap` is excluded: this shell has no signals or job control",
+        "fg",
+        "`fg` is excluded: jobs run detached and report when they finish; use `wait %N`",
     ),
     (
-        "wait",
-        "`wait` is excluded: this shell has no job control, so nothing can be waiting",
-    ),
-    ("jobs", "`jobs` is excluded: this shell has no job control"),
-    ("fg", "`fg` is excluded: this shell has no job control"),
-    ("bg", "`bg` is excluded: this shell has no job control"),
-    (
-        "kill",
-        "`kill` is excluded: this shell has no processes or signals",
+        "bg",
+        "`bg` is excluded: jobs run detached and report when they finish; use `wait %N`",
     ),
     (
         "declare",

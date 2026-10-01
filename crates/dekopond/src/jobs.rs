@@ -14,7 +14,11 @@ use dekopon_shell::{
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use crate::{config::ResolvedBroker, transport::InboundMessage, wake::Anchor};
+use crate::{
+    config::ResolvedBroker,
+    transport::{CancelRequest, InboundMessage},
+    wake::Anchor,
+};
 
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 
@@ -38,6 +42,7 @@ impl JobOwner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stop {
     Killed,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,8 +187,9 @@ impl Jobs {
         let mut table = self.table.lock();
         let finished = table.rows.iter_mut().find(|row| row.id == id).map(|row| {
             let outcome = match (row.stop, ended.ending) {
-                (_, Ending::Abandoned) => JobOutcome::Failed,
-                (Some(Stop::Killed), Ending::Ran { .. }) => JobOutcome::Killed,
+                (Some(Stop::Killed), _) => JobOutcome::Killed,
+                (Some(Stop::Cancelled), _) => JobOutcome::Cancelled,
+                (None, Ending::Abandoned) => JobOutcome::Failed,
                 (None, Ending::Ran { .. }) if ended.exit == ExitCode::SUCCESS => {
                     JobOutcome::Succeeded
                 }
@@ -241,18 +247,54 @@ impl Jobs {
     ) -> Result<JobWait, JobRefusal> {
         let mut table = self.table.lock();
         table.owned(owner, id)?.waiters += 1;
+        drop(table);
+        let _waiter = Waiter {
+            jobs: self,
+            owner,
+            id,
+        };
+        let mut table = self.table.lock();
         loop {
             let row = table.owned(owner, id)?;
             if let RowState::Finished { exit, .. } = row.state {
-                row.waiters -= 1;
                 row.waited = true;
                 return Ok(JobWait::Exited(exit));
             }
             if !parking_lot::MutexGuard::unlocked(&mut table, keep_waiting) {
-                table.owned(owner, id)?.waiters -= 1;
                 return Ok(JobWait::Interrupted);
             }
             self.ended.wait_for(&mut table, WAIT_SLICE);
+        }
+    }
+
+    pub(crate) fn cancel_owner(&self, request: &CancelRequest) -> bool {
+        let mut table = self.table.lock();
+        let mut stopped = false;
+        for row in &mut table.rows {
+            if row.owner.transport == request.transport
+                && row.owner.conversation == request.conversation_id
+                && row.owner.subject == request.subject
+                && matches!(row.state, RowState::Running)
+            {
+                row.stop.get_or_insert(Stop::Cancelled);
+                if let Some(handle) = &row.cancel {
+                    handle.cancel();
+                }
+                stopped = true;
+            }
+        }
+        stopped
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        let mut table = self.table.lock();
+        for row in &mut table.rows {
+            if matches!(row.state, RowState::Running) {
+                row.stop.get_or_insert(Stop::Cancelled);
+                if let Some(handle) = &row.cancel {
+                    handle.cancel();
+                }
+            }
         }
     }
 
@@ -268,6 +310,20 @@ impl Jobs {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+struct Waiter<'a> {
+    jobs: &'a Jobs,
+    owner: &'a JobOwner,
+    id: JobId,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        if let Ok(row) = self.jobs.table.lock().owned(self.owner, self.id) {
+            row.waiters -= 1;
         }
     }
 }
@@ -360,6 +416,29 @@ impl JobContext {
         Self {
             origin: Origin::Tree(Trigger::Probe),
             ..self
+        }
+    }
+
+    pub(crate) fn from_probe(
+        jobs: Arc<Jobs>,
+        anchor: Anchor,
+        broker: ResolvedBroker,
+        runtime: tokio::runtime::Handle,
+        limits: ShellLimits,
+    ) -> Self {
+        let owner = JobOwner {
+            transport: anchor.transport().to_string(),
+            conversation: anchor.conversation().key(),
+            subject: anchor.subject().canonical(),
+        };
+        Self {
+            jobs,
+            owner,
+            anchor,
+            broker,
+            runtime,
+            limits,
+            origin: Origin::Tree(Trigger::Probe),
         }
     }
 

@@ -443,6 +443,7 @@ where
     }
 
     collector.shutdown();
+    runner.jobs.cancel_all();
 
     // A tick that fires here has already retired its row, so its wake must still start.
     if timeout(grace, async {
@@ -516,6 +517,7 @@ fn dispatch(
         let stopped = runner.gate.cancel(&request);
         let pending_cancelled = collector.cancel(&request) || stopped.dropped;
         let active_outcome = stopped.running;
+        let jobs_stopped = runner.jobs.cancel_owner(&request);
         if pending_cancelled {
             if matches!(
                 active_outcome,
@@ -552,6 +554,16 @@ fn dispatch(
                 return;
             }
             CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
+        }
+        if jobs_stopped && let Some(driver) = drivers.get(&message.transport).cloned() {
+            let receipt = message.receive_span.clone();
+            sessions.spawn(
+                async move {
+                    session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                }
+                .instrument(receipt),
+            );
+            return;
         }
     }
     let addressed = message.addressed.unwrap_or_else(|| {
@@ -685,15 +697,31 @@ fn spawn_tick(
             timeout: route.script_timeout,
             ..dekopon_shell::Limits::default()
         });
+    let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
+        route.job_timeout.map(|timeout| dekopon_shell::Limits {
+            max_capability_calls: route.limits.max_capability_calls,
+            timeout,
+            ..dekopon_shell::Limits::default()
+        })
+    });
+    let jobs = Arc::clone(&runner.jobs);
     let broker = runner.broker.clone();
     let runtime = tokio::runtime::Handle::current();
     ticks.spawn_blocking(move || {
         let _admission = admission;
-        wake::run_tick(tick, &store, &broker, &runtime, limits)
+        wake::run_tick(
+            tick,
+            &store,
+            &broker,
+            &runtime,
+            limits,
+            job_limits.map(|limits| (jobs, limits)),
+        )
     });
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
+    runner.jobs.cancel_owner(request);
     match runner.gate.cancel(request).running.ignored_reason() {
         None => tracing::info!(
             event = "gateway_session_stop_requested",
