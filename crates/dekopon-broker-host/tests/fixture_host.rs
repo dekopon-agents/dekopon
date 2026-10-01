@@ -1,10 +1,12 @@
 #![allow(clippy::unwrap_used)]
 
-use dekopon_provider_sdk_testkit::{
-    BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FakeBroker,
-    FakeBrokerError, StorageAccess, StorageInterface, StorageLimits,
-};
+mod fixture;
+
 use dekopon_test_support::provider_fixture;
+use fixture::{
+    BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FixtureHost,
+    FixtureHostError, StorageAccess, StorageInterface, StorageLimits,
+};
 use serde_json::{Value, json};
 
 fn record(id: &str, user: &str, assistant: &str) -> Value {
@@ -21,8 +23,8 @@ fn record(id: &str, user: &str, assistant: &str) -> Value {
     })
 }
 
-async fn memory_chat() -> FakeBroker {
-    FakeBroker::builder()
+async fn memory_chat() -> FixtureHost {
+    FixtureHost::builder()
         .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
@@ -33,7 +35,7 @@ async fn memory_chat() -> FakeBroker {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_a_storage_backed_component_against_a_real_storage_host() {
-    let broker = FakeBroker::builder()
+    let broker = FixtureHost::builder()
         .component(provider_fixture("storage-probe-provider.wasm"))
         .provider("storage-probe")
         .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
@@ -105,7 +107,7 @@ async fn two_subjects_do_not_share_a_namespace() {
         .await
         .expect("records");
 
-    let second = FakeBroker::builder()
+    let second = FixtureHost::builder()
         .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
@@ -132,7 +134,7 @@ async fn two_subjects_do_not_share_a_namespace() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_renders_its_help_page_and_proposes() {
-    let broker = FakeBroker::builder()
+    let broker = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .build()
@@ -186,14 +188,14 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
         .await
         .expect_err("a word the component did not declare is refused");
     assert!(
-        matches!(error, FakeBrokerError::Host(BrokerHostError::UnknownCommandWord { ref word }) if word == "recall"),
+        matches!(error, FixtureHostError::Host(BrokerHostError::UnknownCommandWord { ref word }) if word == "recall"),
         "{error:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_free_component_needs_no_storage() {
-    let broker = FakeBroker::builder()
+    let broker = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .build()
@@ -240,7 +242,7 @@ async fn a_provider_declared_failure_is_distinguishable_from_a_host_refusal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_component_names_the_path() {
-    let error = FakeBroker::builder()
+    let error = FixtureHost::builder()
         .component("definitely-not-here.wasm")
         .provider("nobody")
         .build()
@@ -248,31 +250,31 @@ async fn a_missing_component_names_the_path() {
         .expect_err("a missing component cannot load");
 
     assert!(
-        matches!(error, FakeBrokerError::ComponentMissing { .. }),
+        matches!(error, FixtureHostError::ComponentMissing { .. }),
         "{error}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_builder_missing_its_component_or_provider_says_which() {
-    let error = FakeBroker::builder()
+    let error = FixtureHost::builder()
         .provider("cli-probe")
         .build()
         .await
         .expect_err("no component");
-    assert!(matches!(error, FakeBrokerError::NoComponent), "{error}");
+    assert!(matches!(error, FixtureHostError::NoComponent), "{error}");
 
-    let error = FakeBroker::builder()
+    let error = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .build()
         .await
         .expect_err("no provider");
-    assert!(matches!(error, FakeBrokerError::NoProvider), "{error}");
+    assert!(matches!(error, FixtureHostError::NoProvider), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
-    let narrowed = FakeBroker::builder()
+    let narrowed = FixtureHost::builder()
         .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
@@ -289,7 +291,7 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
         .invoke("memory.chat.record", record("turn-1", "question", "answer"))
         .await
         .expect_err("a one-byte write budget cannot record a turn");
-    let FakeBrokerError::Invocation(failure) = &error else {
+    let FixtureHostError::Invocation(failure) = &error else {
         panic!("expected an invocation failure: {error:?}");
     };
     assert!(
@@ -310,7 +312,7 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here() {
-    let broker = FakeBroker::builder()
+    let broker = FixtureHost::builder()
         .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
@@ -353,7 +355,7 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
     reason = "reshaped by the unit that next rewrites this"
 )]
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
-    FakeBroker::builder()
+    FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .host_limits(BrokerHostLimits::default())
@@ -361,7 +363,7 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
         .await
         .expect("cli-probe loads under the default host limits");
 
-    let error = FakeBroker::builder()
+    let error = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .host_limits(BrokerHostLimits {
@@ -373,7 +375,7 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
         .expect_err("one unit of fuel cannot load the component");
 
     let source = match &error {
-        FakeBrokerError::Host(
+        FixtureHostError::Host(
             BrokerHostError::Instantiate { source, .. } | BrokerHostError::Describe { source, .. },
         ) => source,
         _ => panic!("expected load-time fuel exhaustion, got {error:?}"),

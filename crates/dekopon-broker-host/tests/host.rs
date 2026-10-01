@@ -5,6 +5,8 @@
 )]
 #![allow(clippy::unwrap_used)]
 
+mod fixture;
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -1683,7 +1685,7 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
-    let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
+    let broker = fixture::FixtureHost::builder()
         .component(provider_fixture("storage-probe-provider.wasm"))
         .provider("storage-probe")
         .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
