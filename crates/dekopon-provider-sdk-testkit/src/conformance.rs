@@ -55,7 +55,7 @@ fn closed(schema: &Value) -> bool {
                 return false;
             }
             map.iter().all(|(key, value)| match key.as_str() {
-                "properties" | "patternProperties" => value
+                "properties" | "patternProperties" | "dependentSchemas" | "$defs" => value
                     .as_object()
                     .is_some_and(|properties| properties.values().all(closed)),
                 "items" | "additionalProperties" | "not" | "if" | "then" | "else" => closed(value),
@@ -174,6 +174,13 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
             });
         }
     }
+    for &word in P::COMMAND_WORDS {
+        if !real.command_words.iter().any(|declared| declared == word) {
+            return Err(ConformanceError::HelpUsage {
+                word: word.to_owned(),
+            });
+        }
+    }
     for word in &real.command_words {
         for (argv, help) in [
             (&["--help".to_owned()][..], true),
@@ -183,7 +190,9 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
             let real_outcome =
                 super::typed::runtime().block_on(registry.run_command(word, argv, None))?;
             if !rendered(&native_outcome, help) || !rendered(&real_outcome, help) {
-                return Err(ConformanceError::HelpUsage { word: word.clone() });
+                return Err(ConformanceError::HelpUsage {
+                    word: word.to_owned(),
+                });
             }
         }
     }
@@ -203,6 +212,15 @@ mod tests {
         assert!(closed(
             &json!({"type":"object","additionalProperties":false,"properties":{"child":{"type":"object","additionalProperties":false}}})
         ));
+    }
+
+    #[test]
+    fn dependent_and_definition_object_schemas_must_be_closed() {
+        for keyword in ["dependentSchemas", "$defs"] {
+            let mut schema = json!({"type":"object","additionalProperties":false});
+            schema[keyword] = json!({"nested":{"type":"object"}});
+            assert!(!closed(&schema), "open nested object under {keyword}");
+        }
     }
 
     #[test]

@@ -124,6 +124,53 @@ fn conformance_refuses_an_inconsistent_component_declaration() {
     );
 }
 
+struct MissingWord;
+struct MissingUpper;
+struct MissingCount;
+struct MissingReverse;
+impl Provider for MissingWord {
+    const ID: &'static str = "cli-probe";
+    const COMMAND_WORDS: &'static [&'static str] = &["missing"];
+    const DESCRIPTION: &'static str = "word mismatch fixture";
+    type Args = CliArgs;
+    type Capabilities = (MissingUpper, MissingCount, MissingReverse);
+    fn propose(_: CliArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<MissingUpper>(Text {
+            text: "abc".to_owned(),
+        }))
+    }
+}
+macro_rules! missing_capability {
+    ($capability:ident, $name:literal) => {
+        impl Capability for $capability {
+            type Provider = MissingWord;
+            const NAME: &'static str = $name;
+            const DESCRIPTION: &'static str = "command mismatch fixture";
+            const EFFECT: EffectKind = EffectKind::ReadOnly;
+            const RISK: RiskLevel = RiskLevel::Low;
+            type Input = Text;
+            type Needs = ();
+            type Output = Value;
+            type Error = std::convert::Infallible;
+            fn run(_: Text, (): ()) -> Result<Value, Self::Error> {
+                Ok(json!({}))
+            }
+        }
+    };
+}
+missing_capability!(MissingUpper, "upper");
+missing_capability!(MissingCount, "count");
+missing_capability!(MissingReverse, "reverse");
+
+#[test]
+fn conformance_refuses_a_declared_word_the_component_does_not_advertise() {
+    let error = conformance::<MissingWord>(&cli_component()).expect_err("missing word refused");
+    assert!(
+        matches!(error, dekopon_provider_sdk_testkit::ConformanceError::HelpUsage { ref word } if word == "missing"),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn cached_real_component_and_native_dispatch_agree() {
     let input = json!({"text":"hello"});
