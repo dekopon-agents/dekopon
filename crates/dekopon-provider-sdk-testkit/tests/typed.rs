@@ -12,7 +12,10 @@ fn cli_component() -> PathBuf {
 use dekopon_provider_sdk::{
     ComponentResponse, EffectKind, RiskLevel,
     clap::{Parser, Subcommand},
-    provider::{Capability, Clock, Header, Http, Proposal, Provider, Request, Response, Usage},
+    provider::{
+        Capability, Clock, DurableFiles, Header, Http, Proposal, Provider, Request, Response,
+        Storage, Usage,
+    },
 };
 use dekopon_provider_sdk_testkit::{
     BrokerHostLimits, Harness, HarnessError, HttpScript, Native, conformance,
@@ -250,14 +253,98 @@ impl Capability for OtherUpper {
     }
 }
 
+struct TypedStorage;
+struct StorageRun;
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StorageInput {
+    mode: Option<String>,
+}
+impl Provider for TypedStorage {
+    const ID: &'static str = "storage-probe";
+    const COMMAND_WORDS: &'static [&'static str] = &["storageprobe"];
+    const DESCRIPTION: &'static str = "Durable files conformance fixture";
+    type Args = NoArgs;
+    type Capabilities = (StorageRun,);
+    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<StorageRun>(StorageInput { mode: None }))
+    }
+}
+impl Capability for StorageRun {
+    type Provider = TypedStorage;
+    const NAME: &'static str = "run";
+    const DESCRIPTION: &'static str = "Durable files";
+    const EFFECT: EffectKind = EffectKind::LocalWrite;
+    const RISK: RiskLevel = RiskLevel::Medium;
+    type Input = StorageInput;
+    type Needs = Storage<DurableFiles>;
+    type Output = Value;
+    type Error = std::convert::Infallible;
+    fn run(_: StorageInput, _: Storage<DurableFiles>) -> Result<Value, Self::Error> {
+        Ok(json!({}))
+    }
+}
+#[test]
+fn typed_storage_component_matches_durable_files_imports() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/storage-probe-provider.wasm");
+    conformance::<TypedStorage>(path).unwrap();
+}
+
+struct TypedClock;
+struct ClockNow;
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EmptyInput {}
+impl Provider for TypedClock {
+    const ID: &'static str = "clock-probe";
+    const COMMAND_WORDS: &'static [&'static str] = &["date"];
+    const DESCRIPTION: &'static str = "Clock provider fixture";
+    type Args = NoArgs;
+    type Capabilities = (ClockNow,);
+    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<ClockNow>(EmptyInput {}))
+    }
+}
+impl Capability for ClockNow {
+    type Provider = TypedClock;
+    const NAME: &'static str = "now";
+    const DESCRIPTION: &'static str = "Reads the broker wall clock";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = EmptyInput;
+    type Needs = Clock;
+    type Output = Value;
+    type Error = std::convert::Infallible;
+    fn run(_: EmptyInput, clock: Clock) -> Result<Value, Self::Error> {
+        Ok(json!({"unixMillis":clock.now_unix_millis()}))
+    }
+}
+
+#[test]
+fn typed_clock_component_matches_imports_and_uses_injected_clock() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/clock-probe-provider.wasm");
+    conformance::<TypedClock>(&path).unwrap();
+    let instant = UNIX_EPOCH + Duration::from_millis(951_782_400_123);
+    let output = Harness::<TypedClock>::get(path)
+        .clock(instant)
+        .call("clock-probe.now", json!({}))
+        .unwrap();
+    assert_eq!(
+        output,
+        json!({"unixMillis":951_782_400_123_u64,"rfc3339":"2000-02-29T00:00:00Z"})
+    );
+}
+
 struct RawHttp;
 struct Fetch;
 impl Provider for RawHttp {
     const ID: &'static str = "http-probe";
     const COMMAND_WORDS: &'static [&'static str] = &["httpprobe"];
-    const DESCRIPTION: &'static str = "native counterpart for the raw HTTP fixture";
+    const DESCRIPTION: &'static str = "native counterpart for the typed HTTP fixture";
     type Args = NoArgs;
-    type Capabilities = (Fetch,);
+    type Capabilities = (Fetch, ConditionalWrite, Purge);
     fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Fetch>(UrlInput {
             uri: "https://fixture.example.test/path".to_owned(),
@@ -280,8 +367,38 @@ impl Capability for Fetch {
     }
 }
 
+struct ConditionalWrite;
+struct Purge;
+macro_rules! http_route {
+    ($type:ident, $name:literal) => {
+        impl Capability for $type {
+            type Provider = RawHttp;
+            const NAME: &'static str = $name;
+            const DESCRIPTION: &'static str = $name;
+            const EFFECT: EffectKind = EffectKind::ExternalWrite;
+            const RISK: RiskLevel = RiskLevel::High;
+            type Input = UrlInput;
+            type Needs = Http;
+            type Output = Value;
+            type Error = std::convert::Infallible;
+            fn run(_: UrlInput, _: Http) -> Result<Value, Self::Error> {
+                Ok(json!({}))
+            }
+        }
+    };
+}
+http_route!(ConditionalWrite, "conditional-write");
+http_route!(Purge, "purge");
+
 #[test]
-fn scripted_response_headers_match_native_and_raw_component() {
+fn typed_http_component_matches_http_and_asset_imports() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/http-probe-provider.wasm");
+    conformance::<RawHttp>(path).unwrap();
+}
+
+#[test]
+fn scripted_response_headers_match_native_and_typed_component() {
     let response = Response {
         status: 200,
         headers: vec![

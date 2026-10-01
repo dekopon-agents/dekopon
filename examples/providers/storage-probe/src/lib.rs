@@ -18,6 +18,7 @@ struct Args {}
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Input {
+    #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<Mode>,
 }
 
@@ -266,12 +267,16 @@ dekopon_provider_sdk::export!(StorageProbe);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dekopon_provider_sdk::CommandRunOutcome;
     use dekopon_provider_sdk::provider;
     #[test]
     fn typed_dispatch_and_closed_modes() {
         let manifest = provider::manifest::<StorageProbe>().unwrap();
         assert_eq!(manifest.capabilities[0].id.as_str(), "storage-probe.run");
         assert_eq!(manifest.command_words, ["storageprobe"]);
+        assert!(
+            matches!(provider::command::<StorageProbe>(&[], None), CommandRunOutcome::Proposed { input, .. } if input == json!({}))
+        );
         assert_eq!(
             manifest.capabilities[0].input_schema["additionalProperties"],
             false

@@ -71,17 +71,27 @@ struct FetchArgs {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct FetchInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<Vec<HeaderInput>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     catch_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     asset_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     after_write_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     references: Option<Vec<String>>,
-    #[serde(rename = "catch_stream_error")]
+    #[serde(rename = "catch_stream_error", skip_serializing_if = "Option::is_none")]
     catch_stream_error: Option<bool>,
 }
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -94,6 +104,7 @@ struct HeaderInput {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WriteInput {
     uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     expected_etag: Option<String>,
 }
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -447,6 +458,63 @@ mod tests {
         assert!(
             matches!(provider::call::<HttpProbe>("http-probe.fetch", r#"{"unknown":true}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
         );
+    }
+    #[test]
+    fn secret_flags_propose_only_secret_use_not_credentials_in_input() {
+        let uri = "https://example.test/records/1";
+        let drn = "drn:com.xrl:secret:test:http-probe/token";
+        for (flags, expected) in [
+            (vec!["--bearer", drn], "httpBearer"),
+            (vec!["--basic", "user-a", drn], "httpBasic"),
+        ] {
+            let mut words = vec!["fetch", "--uri", uri];
+            words.extend(flags);
+            let argv = words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            let CommandRunOutcome::Proposed {
+                capability,
+                input,
+                secret_use,
+            } = provider::command::<HttpProbe>(&argv, None)
+            else {
+                panic!("valid secret flag must propose");
+            };
+            assert_eq!(capability.as_str(), "http-probe.fetch");
+            assert_eq!(input, json!({"uri":uri}));
+            assert!(input.get("secret").is_none());
+            assert_eq!(serde_json::to_value(secret_use).unwrap()["kind"], expected);
+        }
+    }
+    #[test]
+    fn invalid_secret_and_incomplete_arguments_do_not_propose() {
+        let uri = "https://example.test/records/1";
+        for words in [
+            vec!["fetch", "--uri", uri, "--bearer", "not-a-drn"],
+            vec!["fetch", "--uri", uri, "--basic", "user-a", "not-a-drn"],
+        ] {
+            let argv = words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            assert!(matches!(provider::command::<HttpProbe>(&argv, None),
+                CommandRunOutcome::Failed { error } if error.code == "usage"));
+        }
+        for words in [
+            vec!["purge"],
+            vec!["bogus"],
+            vec!["fetch", "--uri", uri, "--header", "accept"],
+        ] {
+            let argv = words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                provider::command::<HttpProbe>(&argv, None),
+                CommandRunOutcome::Rendered { status: 2, .. }
+            ));
+        }
     }
     #[test]
     fn body_rendering_stays_bounded_and_preserves_binary() {
