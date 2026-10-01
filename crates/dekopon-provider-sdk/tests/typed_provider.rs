@@ -256,6 +256,79 @@ fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
     );
 }
 
+macro_rules! refused_native_import {
+    ($provider:ident, $capability:ident, $needs:ty) => {
+        struct $provider;
+        struct $capability;
+        impl Provider for $provider {
+            const ID: &'static str = "native-import";
+            const COMMAND_WORDS: &'static [&'static str] = &["native-import"];
+            const DESCRIPTION: &'static str = "Native import fixture";
+            type Args = ClockArgs;
+            type Capabilities = ($capability,);
+            fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+                Ok(Proposal::to::<$capability>(ClockInput {}))
+            }
+        }
+        impl Capability for $capability {
+            type Provider = $provider;
+            const NAME: &'static str = "read";
+            const DESCRIPTION: &'static str = "Import request";
+            const EFFECT: EffectKind = EffectKind::ReadOnly;
+            const RISK: RiskLevel = RiskLevel::Low;
+            type Input = ClockInput;
+            type Needs = $needs;
+            type Output = ();
+            type Error = Infallible;
+            fn run(_: ClockInput, _: Self::Needs) -> Result<(), Infallible> {
+                panic!("the unsupported native import must be rejected before run")
+            }
+        }
+    };
+}
+refused_native_import!(
+    JsonlFixture,
+    JsonlCall,
+    dekopon_provider_sdk::provider::Storage<dekopon_provider_sdk::provider::Jsonl>
+);
+refused_native_import!(
+    DurableFixture,
+    DurableCall,
+    dekopon_provider_sdk::provider::Storage<dekopon_provider_sdk::provider::DurableFiles>
+);
+refused_native_import!(
+    AssetsFixture,
+    AssetsCall,
+    dekopon_provider_sdk::provider::Assets
+);
+refused_native_import!(
+    TupleFixture,
+    TupleCall,
+    (
+        dekopon_provider_sdk::provider::Settings<String>,
+        dekopon_provider_sdk::provider::Assets
+    )
+);
+
+#[test]
+fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple() {
+    fn requires_harness<P: Provider>() {
+        let error = failed(call::<P>("native-import.read", "{}"));
+        assert_eq!(
+            error.code,
+            SdkFailure::ComponentHarnessRequired.code().as_str()
+        );
+        assert_eq!(
+            error.message,
+            "this capability needs the component harness (Harness<P>)"
+        );
+    }
+    requires_harness::<JsonlFixture>();
+    requires_harness::<DurableFixture>();
+    requires_harness::<AssetsFixture>();
+    requires_harness::<TupleFixture>();
+}
+
 fn run(words: &[&str], stdin: Option<&str>) -> CommandRunOutcome {
     let argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
     command::<Fixture>(&argv, stdin)

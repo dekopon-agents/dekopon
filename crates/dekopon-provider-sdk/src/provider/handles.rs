@@ -162,7 +162,14 @@ mod storage_kind {
 pub struct Storage<K: storage_kind::Kind>(PhantomData<K>);
 impl<K: storage_kind::Kind> sealed::Needs for Storage<K> {
     fn grant() -> Result<Self, SdkFailure> {
-        Ok(Self(PhantomData))
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self(PhantomData))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Err(SdkFailure::ComponentHarnessRequired)
+        }
     }
 }
 impl<K: storage_kind::Kind + 'static> Needs for Storage<K> {
@@ -296,7 +303,14 @@ impl Assets {
 }
 impl sealed::Needs for Assets {
     fn grant() -> Result<Self, SdkFailure> {
-        Ok(Self(PhantomData))
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self(PhantomData))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Err(SdkFailure::ComponentHarnessRequired)
+        }
     }
 }
 impl Needs for Assets {

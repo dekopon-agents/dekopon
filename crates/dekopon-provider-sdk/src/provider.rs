@@ -173,6 +173,8 @@ impl Code {
     pub const INVALID_INPUT: Self = Self::new("invalid-input");
     /// The operator's settings do not match the capability's settings type.
     pub const INVALID_SETTINGS: Self = Self::new("invalid-settings");
+    /// This import requires execution through the real component host.
+    pub const COMPONENT_HARNESS_REQUIRED: Self = Self::new("component-harness-required");
     /// A provider declined parsed arguments.
     pub const USAGE: Self = Self::new("usage");
     /// The output or proposal input could not be serialized.
@@ -217,6 +219,8 @@ pub enum SdkFailure {
     InvalidInput,
     /// The operator's settings do not match the capability's settings type.
     InvalidSettings,
+    /// Native execution cannot supply storage or asset imports.
+    ComponentHarnessRequired,
     /// The output or proposal input could not be serialized.
     SerializationFailed,
 }
@@ -227,6 +231,9 @@ impl fmt::Display for SdkFailure {
             Self::UnknownCapability => "the provider has no such capability",
             Self::InvalidInput => "the input does not match the capability's input schema",
             Self::InvalidSettings => "the provider settings do not match their schema",
+            Self::ComponentHarnessRequired => {
+                "this capability needs the component harness (Harness<P>)"
+            }
             Self::SerializationFailed => "the provider could not serialize its result",
         })
     }
@@ -238,6 +245,7 @@ impl Failure for SdkFailure {
             Self::UnknownCapability => Code::UNKNOWN_CAPABILITY,
             Self::InvalidInput => Code::INVALID_INPUT,
             Self::InvalidSettings => Code::INVALID_SETTINGS,
+            Self::ComponentHarnessRequired => Code::COMPONENT_HARNESS_REQUIRED,
             Self::SerializationFailed => Code::SERIALIZATION_FAILED,
         }
     }
@@ -420,10 +428,22 @@ fn run<C: Capability>(input: &str) -> ComponentResponse {
             error: failure(&SdkFailure::InvalidInput),
         };
     };
-    let Ok(needs) = <C::Needs as sealed::Needs>::grant() else {
+    #[cfg(not(target_arch = "wasm32"))]
+    if C::Needs::IMPORTS.contains(ImportSet::ASSETS)
+        || C::Needs::IMPORTS.contains(ImportSet::JSONL)
+        || C::Needs::IMPORTS.contains(ImportSet::DURABLE_FILES)
+    {
         return ComponentResponse::Failed {
-            error: failure(&SdkFailure::InvalidSettings),
+            error: failure(&SdkFailure::ComponentHarnessRequired),
         };
+    }
+    let needs = match <C::Needs as sealed::Needs>::grant() {
+        Ok(needs) => needs,
+        Err(error) => {
+            return ComponentResponse::Failed {
+                error: failure(&error),
+            };
+        }
     };
     match C::run(input, needs) {
         Ok(output) => match serde_json::to_value(output) {

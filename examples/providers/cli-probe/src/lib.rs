@@ -128,31 +128,32 @@ impl Provider for CliProbe {
     type Capabilities = (Upper, Count, Reverse);
 
     fn propose(args: Probe, stdin: Option<&str>) -> Result<Proposal<Self>, Usage> {
-        let (source, name) = match args.transform {
-            Transform::Upper(source) => (source, "upper"),
-            Transform::Count(source) => (source, "count"),
-            Transform::Reverse(source) => (source, "reverse"),
-        };
-        let text = match (source.text, source.piped) {
-            (Some(text), _) => text,
-            (None, Some(_)) => Bounded::new(
-                stdin.ok_or_else(|| Usage::new(format!("probe {name} -: nothing was piped in")))?,
-            )
-            .map_err(|error| Usage::new(error.to_string()))?,
-            (None, None) => {
-                return Err(Usage::new(format!(
-                    "probe {name} takes `--text <TEXT>` or `-`"
-                )));
-            }
-        };
-        let input = TextInput { text };
-        Ok(match name {
-            "upper" => Proposal::to::<Upper>(input),
-            "count" => Proposal::to::<Count>(input),
-            "reverse" => Proposal::to::<Reverse>(input),
-            _ => unreachable!(),
-        })
+        match args.transform {
+            Transform::Upper(source) => propose_text::<Upper>(source, stdin, "upper"),
+            Transform::Count(source) => propose_text::<Count>(source, stdin, "count"),
+            Transform::Reverse(source) => propose_text::<Reverse>(source, stdin, "reverse"),
+        }
     }
+}
+
+fn propose_text<C: Capability<Provider = CliProbe, Input = TextInput>>(
+    source: TextSource,
+    stdin: Option<&str>,
+    name: &str,
+) -> Result<Proposal<CliProbe>, Usage> {
+    let text = match (source.text, source.piped) {
+        (Some(text), _) => text,
+        (None, Some(_)) => Bounded::new(
+            stdin.ok_or_else(|| Usage::new(format!("probe {name} -: nothing was piped in")))?,
+        )
+        .map_err(|error| Usage::new(error.to_string()))?,
+        (None, None) => {
+            return Err(Usage::new(format!(
+                "probe {name} takes `--text <TEXT>` or `-`"
+            )));
+        }
+    };
+    Ok(Proposal::to::<C>(TextInput { text }))
 }
 
 dekopon_provider_sdk::export!(CliProbe);
