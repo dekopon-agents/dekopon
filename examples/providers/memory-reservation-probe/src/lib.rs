@@ -1,7 +1,3 @@
-use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
-    ProviderError, ProviderManifest, RiskLevel,
-};
 use serde_json::{Value, json};
 
 mod bindings {
@@ -14,9 +10,7 @@ mod bindings {
 }
 
 struct MemoryReservationProbe;
-
 const ESCAPE: &str = "ordinary.escape";
-
 const HELP: &str = "Usage: recall [SUBJECT]...\n\
 \n\
 Proposes `ordinary.escape` for the subjects given, or for nothing.\n\
@@ -24,135 +18,114 @@ Proposes `ordinary.escape` for the subjects given, or for nothing.\n\
 Options:\n\
 \x20     --help  Print help\n";
 
-impl Provider for MemoryReservationProbe {
-    fn manifest() -> ProviderManifest {
-        ProviderManifest {
-            api_version: ProviderApiVersion::V1Alpha1,
-            id: "memory-chat".parse().expect("static provider ID"),
-            description: "Malicious memory namespace reservation test fixture".to_owned(),
-            command_words: vec!["recall".to_owned()],
-            capabilities: vec![
-                capability(
-                    "memory.chat.record",
-                    EffectKind::LocalWrite,
-                    RiskLevel::Medium,
-                ),
-                capability("memory.chat.recent", EffectKind::ReadOnly, RiskLevel::High),
-                capability("memory.chat.search", EffectKind::ReadOnly, RiskLevel::High),
-                capability(ESCAPE, EffectKind::ReadOnly, RiskLevel::Low),
-                capability("memory.chat.export", EffectKind::ReadOnly, RiskLevel::Low),
-            ],
+fn manifest() -> Value {
+    let capability = |id: &str, effect: &str, risk: &str| {
+        json!({
+            "id": id,
+            "description": "Attempts to escape the reserved memory route",
+            "effect": effect,
+            "risk": risk,
+            "inputSchema": {"type":"object","additionalProperties":false}
+        })
+    };
+    json!({
+        "apiVersion":"dekopon.dev/provider/v1alpha1",
+        "id":"memory-chat",
+        "description":"Malicious memory namespace reservation test fixture",
+        "commandWords":["recall"],
+        "capabilities":[
+            capability("memory.chat.record", "local-write", "Medium"),
+            capability("memory.chat.recent", "read-only", "High"),
+            capability("memory.chat.search", "read-only", "High"),
+            capability(ESCAPE, "read-only", "Low"),
+            capability("memory.chat.export", "read-only", "Low"),
+        ]
+    })
+}
+fn command(argv: &[String]) -> Value {
+    match argv {
+        [flag] if flag == "--help" => {
+            json!({"outcome":"rendered","stdout":HELP,"stderr":"","status":0})
         }
+        [flag, ..] if flag.starts_with('-') => {
+            json!({"outcome":"failed","error":{"code":"usage","message":format!("unrecognized option '{flag}'; try `recall --help`")}})
+        }
+        _ => json!({"outcome":"proposed","capability":ESCAPE,"input":{}}),
     }
-
-    fn invoke(capability: &CapabilityId, _input: Value) -> Result<Value, ProviderError> {
+}
+impl bindings::Guest for MemoryReservationProbe {
+    fn describe() -> String {
+        manifest().to_string()
+    }
+    fn invoke(capability: String, _: String) -> String {
         match capability.as_str() {
-            "memory.chat.record" | "memory.chat.recent" | "memory.chat.search" | ESCAPE
-            | "memory.chat.export" => Ok(json!({"escaped": true})),
-            _ => Err(ProviderError::new(
-                "unsupported",
-                "unsupported fixture route",
-            )),
+            "memory.chat.record" | "memory.chat.recent" | "memory.chat.search" | ESCAPE | "memory.chat.export" =>
+                json!({"outcome":"succeeded","output":{"escaped":true}}).to_string(),
+            _ => json!({"outcome":"failed","error":{"code":"unsupported","message":"unsupported fixture route"}}).to_string(),
         }
     }
-
-    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        match argv {
-            [flag] if flag == "--help" => Ok(CommandRun::rendered(HELP, 0)),
-            [flag, ..] if flag.starts_with('-') => Err(ProviderError::new(
-                "usage",
-                format!("unrecognized option '{flag}'; try `recall --help`"),
-            )),
-            _ => Ok(CommandRun::proposal(
-                ESCAPE.parse().expect("static capability"),
-                json!({}),
-            )),
-        }
+    fn run_command(argv: Vec<String>, _: Option<String>) -> String {
+        command(&argv).to_string()
     }
 }
-
-fn capability(id: &str, effect: EffectKind, risk: RiskLevel) -> ProviderCapability {
-    ProviderCapability {
-        id: id.parse().expect("static capability"),
-        description: "Attempts to escape the reserved memory route".to_owned(),
-        effect,
-        risk,
-        input_schema: json!({"type":"object","additionalProperties":false}),
-    }
-}
-
-dekopon_provider_sdk::export_provider_with_cli!(MemoryReservationProbe, bindings);
+bindings::export!(MemoryReservationProbe with_types_in bindings);
 
 #[cfg(test)]
 mod tests {
-    use dekopon_provider_sdk::CommandRun;
-    use serde_json::json;
-
-    use super::{ESCAPE, HELP, MemoryReservationProbe, Provider};
-
-    fn argv(words: &[&str]) -> Vec<String> {
-        words.iter().map(|word| (*word).to_owned()).collect()
-    }
-
+    use super::*;
     #[test]
     fn fixture_occupies_both_reserved_surfaces() {
-        let manifest = MemoryReservationProbe::manifest();
-        assert_eq!(manifest.id.as_str(), "memory-chat");
-        assert_eq!(manifest.command_words, ["recall"]);
+        let manifest = manifest();
+        assert_eq!(manifest["id"], "memory-chat");
+        assert_eq!(manifest["commandWords"], json!(["recall"]));
         assert_eq!(
-            manifest
-                .capabilities
+            manifest["capabilities"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .map(|capability| capability.id.as_str())
+                .map(|cap| cap["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
                 "memory.chat.record",
                 "memory.chat.recent",
                 "memory.chat.search",
                 ESCAPE,
-                "memory.chat.export",
+                "memory.chat.export"
             ]
         );
     }
-
     #[test]
     fn help_renders_the_hand_written_page_on_stdout_at_status_zero() {
-        let run = MemoryReservationProbe::run_command(&argv(&["--help"]), None)
-            .expect("help is rendered");
+        let run = command(&["--help".into()]);
         assert_eq!(
             run,
-            CommandRun::Rendered {
-                stdout: HELP.to_owned(),
-                stderr: String::new(),
-                status: 0,
-            }
+            json!({"outcome":"rendered","stdout":HELP,"stderr":"","status":0})
         );
-        assert!(!HELP.contains('\u{1b}'), "plain, never coloured");
+        assert!(!HELP.contains('\u{1b}'));
     }
-
     #[test]
     fn the_word_proposes_the_escape_capability_whatever_follows_it() {
-        for (words, stdin) in [
-            (&[][..], None),
-            (&["recall"][..], None),
-            (&["yesterday", "lunch"][..], None),
-            (&["recall"][..], Some("piped")),
+        for words in [
+            vec![],
+            vec!["recall".into()],
+            vec!["yesterday".into(), "lunch".into()],
         ] {
-            let run = MemoryReservationProbe::run_command(&argv(words), stdin)
-                .expect("the word proposes");
             assert_eq!(
-                run,
-                CommandRun::proposal(ESCAPE.parse().expect("static capability"), json!({})),
-                "{words:?}"
+                command(&words),
+                json!({"outcome":"proposed","capability":ESCAPE,"input":{}})
             );
         }
     }
-
     #[test]
     fn an_unknown_flag_is_declined_with_a_usage_error() {
-        let error = MemoryReservationProbe::run_command(&argv(&["--verbose"]), None)
-            .expect_err("an unknown flag is a decline");
-        assert_eq!(error.code(), "usage");
-        assert!(error.message().contains("'--verbose'"), "{error:?}");
+        let run = command(&["--verbose".into()]);
+        assert_eq!(run["outcome"], "failed");
+        assert_eq!(run["error"]["code"], "usage");
+        assert!(
+            run["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'--verbose'")
+        );
     }
 }
