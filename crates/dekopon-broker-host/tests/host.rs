@@ -5,6 +5,8 @@
 )]
 #![allow(clippy::unwrap_used)]
 
+mod fixture;
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -634,9 +636,209 @@ fn broker_bindings_mirror_the_immutable_packages() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn injected_guest_clock_does_not_change_host_timeouts() {
+    let fixed = std::time::UNIX_EPOCH + Duration::from_millis(951_782_400_123);
+    let options = BrokerHostOptions {
+        test_clock: Some(fixed),
+        ..Default::default()
+    };
+    let registry = BrokerProviderRegistry::load_with_options(
+        [provider_fixture("clock-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("clock provider loads");
+    let output = registry
+        .invoke(
+            authorized_for(
+                "clock-probe",
+                "clock-probe.now".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints {
+                    http: None,
+                    ..http_constraints("example.test".to_owned(), "GET")
+                },
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("injected clock is available during invoke");
+    assert_eq!(output.output["unixMillis"], 951_782_400_123_u64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_https_uses_exact_grant_and_verifies_tls_authority() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let certified = rcgen::generate_simple_self_signed(vec!["fixture.example.test".to_owned()])
+        .expect("TLS fixture");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("TLS versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certified.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
+    )
+    .expect("TLS configuration");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback");
+    let address = listener.local_addr().expect("port");
+    let authority = format!("fixture.example.test:{}", address.port());
+    let pin = dekopon_http_host::LoopbackHttpsPin::new(
+        &authority,
+        address,
+        certified.cert.pem().into_bytes(),
+    )
+    .expect("explicit pin");
+    assert!(
+        dekopon_http_host::LoopbackHttpsPin::new(
+            &authority,
+            "1.1.1.1:443".parse().unwrap(),
+            vec![1]
+        )
+        .is_err()
+    );
+    assert!(dekopon_http_host::LoopbackHttpsPin::new(&authority, address, Vec::new()).is_err());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("connection");
+        let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+            .accept(stream)
+            .await
+            .expect("TLS handshake");
+        let mut request = [0; 2048];
+        let count = tls.read(&mut request).await.expect("request");
+        assert!(request[..count].starts_with(b"GET /resource HTTP/1.1"));
+        tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("response");
+        tls.shutdown().await.expect("close");
+    });
+    let options = BrokerHostOptions {
+        loopback_https_pin: Some(pin),
+        ..Default::default()
+    };
+    let registry = BrokerProviderRegistry::load_with_options(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("provider loads");
+    let denied = registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri": format!("https://{authority}/resource"), "method": "GET"}),
+                http_constraints("other.example.test:443".to_owned(), "GET"),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("a pin cannot widen the exact grant");
+    assert!(matches!(
+        denied.error.as_ref(),
+        BrokerHostError::HostCallRejected {
+            reason: "denied",
+            ..
+        }
+    ));
+    let output = registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri": format!("https://{authority}/resource"), "method": "GET"}),
+                http_constraints(authority.clone(), "GET"),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("TLS fixture is reached with exact host grant");
+    assert_eq!(output.output["status"], 200);
+    assert_eq!(output.http_calls[0].authority, authority);
+    server.await.expect("server finishes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loopback_pin_does_not_disable_tls_hostname_verification() {
+    let certified = rcgen::generate_simple_self_signed(vec!["wrong.example.test".to_owned()])
+        .expect("TLS fixture");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("TLS versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certified.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
+    )
+    .expect("TLS configuration");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback");
+    let address = listener.local_addr().expect("port");
+    let authority = format!("fixture.example.test:{}", address.port());
+    let pin = dekopon_http_host::LoopbackHttpsPin::new(
+        &authority,
+        address,
+        certified.cert.pem().into_bytes(),
+    )
+    .expect("pin");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("connection");
+        let result = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+            .accept(stream)
+            .await;
+        assert!(
+            result.is_err(),
+            "client must refuse a different TLS identity"
+        );
+    });
+    let options = BrokerHostOptions {
+        loopback_https_pin: Some(pin),
+        ..Default::default()
+    };
+    let registry = BrokerProviderRegistry::load_with_options(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("provider loads");
+    let failure = registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri": format!("https://{authority}/resource"), "method": "GET"}),
+                http_constraints(authority, "GET"),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("pinned address and CA do not bypass hostname verification");
+    assert!(
+        matches!(failure.error.as_ref(), BrokerHostError::ProviderFailure { code, .. } if code == "http-failed"),
+        "{failure:?}"
+    );
+    assert_eq!(failure.http_calls[0].status, None);
+    server.await.expect("TLS server finishes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn run_command_reading_the_clock_traps() {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("clock-probe-provider.wasm")],
+        [provider_fixture("clock-raw-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
@@ -664,7 +866,7 @@ async fn run_command_reading_the_clock_traps() {
         matches!(
             error,
             BrokerHostError::RunCommandUsedHostImport { ref path }
-                if path.ends_with("clock-probe-provider.wasm")
+                if path.ends_with("clock-raw-probe-provider.wasm")
         ),
         "expected the host-import tripwire, got {error:?}"
     );
@@ -1483,7 +1685,7 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
-    let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
+    let broker = fixture::FixtureHost::builder()
         .component(provider_fixture("storage-probe-provider.wasm"))
         .provider("storage-probe")
         .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)

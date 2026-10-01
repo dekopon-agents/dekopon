@@ -20,7 +20,7 @@ dekopon-core = { workspace = true, features = ["native"] }
 dekopon-broker-protocol.workspace = true
 rustix.workspace = true
 dekopon-http-host.workspace = true
-dekopon-provider-sdk = { workspace = true, features = ["host"] }
+dekopon-provider-sdk.workspace = true
 dekopon-storage-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -41,6 +41,9 @@ dekopon-test-support = { path = "../dekopon-test-support" }
 dekopon-provider-sdk-testkit = { path = "../dekopon-provider-sdk-testkit" }
 sha2.workspace = true
 tracing-subscriber.workspace = true
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
 
 [lints]
 workspace = true

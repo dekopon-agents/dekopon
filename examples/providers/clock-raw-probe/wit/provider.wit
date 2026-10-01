@@ -1,0 +1,7 @@
+package dekopon:clock-probe@0.1.0;
+
+/// Provider fixture whose `date` word reads the broker host's wall clock.
+world provider {
+    include dekopon:provider/provider-cli@0.3.0;
+    import dekopon:clock/wall@1.0.0;
+}

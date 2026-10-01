@@ -1,0 +1,394 @@
+mod jsonl_bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "jsonl-client",
+        generate_all,
+    });
+}
+
+mod durable_bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "durable-files-client",
+        generate_all,
+    });
+}
+
+pub mod jsonl {
+    //! Curated JSONL operations. Writes take effect per host call without invocation-wide rollback.
+
+    use std::{error::Error, fmt};
+
+    use super::jsonl_bindings::dekopon::storage::jsonl as wit;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Chunk {
+        pub bytes: Vec<u8>,
+        pub next_offset: u64,
+        pub eof: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum StorageError {
+        NotFound,
+        AlreadyExists,
+        InvalidName,
+        InvalidArgument,
+        PermissionDenied,
+        QuotaExceeded,
+        Busy,
+        Timeout,
+        Unsupported,
+        Corrupt,
+        Io,
+    }
+
+    impl fmt::Display for StorageError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{}",
+                match self {
+                    Self::NotFound => "not found",
+                    Self::AlreadyExists => "already exists",
+                    Self::InvalidName => "invalid logical name",
+                    Self::InvalidArgument => "invalid argument",
+                    Self::PermissionDenied => "permission denied",
+                    Self::QuotaExceeded => "quota exceeded",
+                    Self::Busy => "busy",
+                    Self::Timeout => "timeout",
+                    Self::Unsupported => "unsupported",
+                    Self::Corrupt => "corrupt",
+                    Self::Io => "storage I/O failed",
+                }
+            )
+        }
+    }
+
+    impl Error for StorageError {}
+
+    pub(crate) fn size(name: &str) -> Result<u64, StorageError> {
+        wit::size(name).map_err(map_error)
+    }
+
+    pub(crate) fn read_chunk(
+        name: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Chunk, StorageError> {
+        wit::read_chunk(name, offset, max_bytes)
+            .map(|chunk| Chunk {
+                bytes: chunk.bytes,
+                next_offset: chunk.next_offset,
+                eof: chunk.eof,
+            })
+            .map_err(map_error)
+    }
+
+    pub(crate) fn append(
+        name: &str,
+        expected_size: u64,
+        record: &[u8],
+    ) -> Result<u64, StorageError> {
+        wit::append(name, expected_size, record).map_err(map_error)
+    }
+
+    pub(crate) fn replace(
+        name: &str,
+        expected_size: u64,
+        contents: &[u8],
+    ) -> Result<(), StorageError> {
+        wit::replace(name, expected_size, contents).map_err(map_error)
+    }
+
+    fn map_error(error: wit::StorageError) -> StorageError {
+        match error {
+            wit::StorageError::NotFound => StorageError::NotFound,
+            wit::StorageError::AlreadyExists => StorageError::AlreadyExists,
+            wit::StorageError::InvalidName => StorageError::InvalidName,
+            wit::StorageError::InvalidArgument => StorageError::InvalidArgument,
+            wit::StorageError::PermissionDenied => StorageError::PermissionDenied,
+            wit::StorageError::QuotaExceeded => StorageError::QuotaExceeded,
+            wit::StorageError::Busy => StorageError::Busy,
+            wit::StorageError::Timeout => StorageError::Timeout,
+            wit::StorageError::Unsupported => StorageError::Unsupported,
+            wit::StorageError::Corrupt => StorageError::Corrupt,
+            wit::StorageError::Io => StorageError::Io,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StorageError, map_error, wit};
+
+        #[test]
+        fn every_wit_error_maps_to_its_own_variant() {
+            let table = [
+                (wit::StorageError::NotFound, StorageError::NotFound),
+                (
+                    wit::StorageError::AlreadyExists,
+                    StorageError::AlreadyExists,
+                ),
+                (wit::StorageError::InvalidName, StorageError::InvalidName),
+                (
+                    wit::StorageError::InvalidArgument,
+                    StorageError::InvalidArgument,
+                ),
+                (
+                    wit::StorageError::PermissionDenied,
+                    StorageError::PermissionDenied,
+                ),
+                (
+                    wit::StorageError::QuotaExceeded,
+                    StorageError::QuotaExceeded,
+                ),
+                (wit::StorageError::Busy, StorageError::Busy),
+                (wit::StorageError::Timeout, StorageError::Timeout),
+                (wit::StorageError::Unsupported, StorageError::Unsupported),
+                (wit::StorageError::Corrupt, StorageError::Corrupt),
+                (wit::StorageError::Io, StorageError::Io),
+            ];
+            assert_eq!(table.len(), 11, "every WIT failure class must be covered");
+            for (wire, expected) in table {
+                assert_eq!(map_error(wire), expected, "{wire:?} must not be remapped");
+            }
+        }
+    }
+}
+
+pub mod durable_files {
+
+    use std::{error::Error, fmt};
+
+    use super::durable_bindings::dekopon::storage::durable_files as wit;
+
+    /// Validated open intent. At least one of read or write must be selected.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
+    pub struct OpenOptions {
+        pub read: bool,
+        pub write: bool,
+        pub create: bool,
+        pub create_new: bool,
+        pub delete_on_close: bool,
+    }
+
+    impl OpenOptions {
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
+                read: false,
+                write: false,
+                create: false,
+                create_new: false,
+                delete_on_close: false,
+            }
+        }
+
+        #[must_use]
+        pub const fn read(mut self, enabled: bool) -> Self {
+            self.read = enabled;
+            self
+        }
+        #[must_use]
+        pub const fn write(mut self, enabled: bool) -> Self {
+            self.write = enabled;
+            self
+        }
+        #[must_use]
+        pub const fn create(mut self, enabled: bool) -> Self {
+            self.create = enabled;
+            self
+        }
+        #[must_use]
+        pub const fn create_new(mut self, enabled: bool) -> Self {
+            self.create_new = enabled;
+            self
+        }
+        #[must_use]
+        pub const fn delete_on_close(mut self, enabled: bool) -> Self {
+            self.delete_on_close = enabled;
+            self
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Durability {
+        Data,
+        DataAndMetadata,
+        Full,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct FileStat {
+        pub size: u64,
+        pub identity: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum StorageError {
+        NotFound,
+        AlreadyExists,
+        InvalidName,
+        InvalidArgument,
+        PermissionDenied,
+        QuotaExceeded,
+        Busy,
+        Timeout,
+        Unsupported,
+        Corrupt,
+        Io,
+    }
+
+    impl fmt::Display for StorageError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{}",
+                match self {
+                    Self::NotFound => "not found",
+                    Self::AlreadyExists => "already exists",
+                    Self::InvalidName => "invalid logical name",
+                    Self::InvalidArgument => "invalid argument",
+                    Self::PermissionDenied => "permission denied",
+                    Self::QuotaExceeded => "quota exceeded",
+                    Self::Busy => "busy",
+                    Self::Timeout => "timeout",
+                    Self::Unsupported => "unsupported",
+                    Self::Corrupt => "corrupt",
+                    Self::Io => "storage I/O failed",
+                }
+            )
+        }
+    }
+
+    impl Error for StorageError {}
+
+    pub struct File(wit::File);
+
+    impl File {
+        pub fn read_at(&self, offset: u64, max_bytes: u32) -> Result<Vec<u8>, StorageError> {
+            self.0.read_at(offset, max_bytes).map_err(map_error)
+        }
+        pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
+            self.0.write_at(offset, bytes).map_err(map_error)
+        }
+        pub fn size(&self) -> Result<u64, StorageError> {
+            self.0.size().map_err(map_error)
+        }
+        pub fn truncate(&self, size: u64) -> Result<(), StorageError> {
+            self.0.truncate(size).map_err(map_error)
+        }
+        pub fn sync(&self, mode: Durability) -> Result<(), StorageError> {
+            self.0.sync(map_durability(mode)).map_err(map_error)
+        }
+    }
+
+    pub(crate) fn open(name: &str, options: OpenOptions) -> Result<File, StorageError> {
+        let mut flags = wit::OpenFlags::empty();
+        flags.set(wit::OpenFlags::READ, options.read);
+        flags.set(wit::OpenFlags::WRITE, options.write);
+        flags.set(wit::OpenFlags::CREATE, options.create);
+        flags.set(wit::OpenFlags::CREATE_NEW, options.create_new);
+        flags.set(wit::OpenFlags::DELETE_ON_CLOSE, options.delete_on_close);
+        wit::open(name, flags).map(File).map_err(map_error)
+    }
+
+    pub(crate) fn stat(name: &str) -> Result<Option<FileStat>, StorageError> {
+        wit::stat(name)
+            .map(|value| {
+                value.map(|stat| FileStat {
+                    size: stat.size,
+                    identity: stat.identity,
+                })
+            })
+            .map_err(map_error)
+    }
+
+    pub(crate) fn remove(name: &str, mode: Durability) -> Result<(), StorageError> {
+        wit::remove(name, map_durability(mode)).map_err(map_error)
+    }
+
+    pub(crate) fn rename_atomic(
+        from: &str,
+        to: &str,
+        replace: bool,
+        mode: Durability,
+    ) -> Result<(), StorageError> {
+        wit::rename_atomic(from, to, replace, map_durability(mode)).map_err(map_error)
+    }
+
+    pub(crate) fn random_bytes(length: u32) -> Result<Vec<u8>, StorageError> {
+        wit::random_bytes(length).map_err(map_error)
+    }
+    pub(crate) fn monotonic_time_ns() -> Result<u64, StorageError> {
+        wit::monotonic_time_ns().map_err(map_error)
+    }
+    pub(crate) fn wall_time_ms() -> Result<u64, StorageError> {
+        wit::wall_time_ms().map_err(map_error)
+    }
+
+    fn map_durability(value: Durability) -> wit::Durability {
+        match value {
+            Durability::Data => wit::Durability::Data,
+            Durability::DataAndMetadata => wit::Durability::DataAndMetadata,
+            Durability::Full => wit::Durability::Full,
+        }
+    }
+    fn map_error(error: wit::StorageError) -> StorageError {
+        match error {
+            wit::StorageError::NotFound => StorageError::NotFound,
+            wit::StorageError::AlreadyExists => StorageError::AlreadyExists,
+            wit::StorageError::InvalidName => StorageError::InvalidName,
+            wit::StorageError::InvalidArgument => StorageError::InvalidArgument,
+            wit::StorageError::PermissionDenied => StorageError::PermissionDenied,
+            wit::StorageError::QuotaExceeded => StorageError::QuotaExceeded,
+            wit::StorageError::Busy => StorageError::Busy,
+            wit::StorageError::Timeout => StorageError::Timeout,
+            wit::StorageError::Unsupported => StorageError::Unsupported,
+            wit::StorageError::Corrupt => StorageError::Corrupt,
+            wit::StorageError::Io => StorageError::Io,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StorageError, map_error, wit};
+
+        #[test]
+        fn every_wit_error_maps_to_its_own_variant() {
+            let table = [
+                (wit::StorageError::NotFound, StorageError::NotFound),
+                (
+                    wit::StorageError::AlreadyExists,
+                    StorageError::AlreadyExists,
+                ),
+                (wit::StorageError::InvalidName, StorageError::InvalidName),
+                (
+                    wit::StorageError::InvalidArgument,
+                    StorageError::InvalidArgument,
+                ),
+                (
+                    wit::StorageError::PermissionDenied,
+                    StorageError::PermissionDenied,
+                ),
+                (
+                    wit::StorageError::QuotaExceeded,
+                    StorageError::QuotaExceeded,
+                ),
+                (wit::StorageError::Busy, StorageError::Busy),
+                (wit::StorageError::Timeout, StorageError::Timeout),
+                (wit::StorageError::Unsupported, StorageError::Unsupported),
+                (wit::StorageError::Corrupt, StorageError::Corrupt),
+                (wit::StorageError::Io, StorageError::Io),
+            ];
+            assert_eq!(table.len(), 11, "every WIT failure class must be covered");
+            for (wire, expected) in table {
+                assert_eq!(map_error(wire), expected, "{wire:?} must not be remapped");
+            }
+        }
+    }
+}

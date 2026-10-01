@@ -1,0 +1,7 @@
+package dekopon:provider@0.3.0;
+
+/// Guest binding world for Dekopon's broker-mediated HTTP client.
+world http-client {
+    import dekopon:asset/asset@0.1.0;
+    import dekopon:http/client@1.1.0;
+}

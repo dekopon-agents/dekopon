@@ -967,6 +967,8 @@ async fn resolve(
             extra_ca_bundles: Arc::new(extra_ca_bundles),
             non_public_https: Arc::new(non_public_https),
             provider_settings: Arc::new(provider_settings),
+            test_clock: None,
+            loopback_https_pin: None,
         },
         plaintext_hosts,
         broker_limits: config.broker_limits,

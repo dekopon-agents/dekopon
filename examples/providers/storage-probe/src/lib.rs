@@ -1,117 +1,141 @@
-use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
-    ProviderError, ProviderManifest, RiskLevel,
+use dekopon_provider_sdk::clap::Parser;
+use dekopon_provider_sdk::provider::{
+    Capability, Code, DurableFiles, Failure, Proposal, Provider, Storage, Usage,
+    durable_files::{Durability, OpenOptions, StorageError},
 };
-use dekopon_provider_storage::durable_files::{
-    self as storage, Durability, OpenOptions, StorageError,
-};
+use dekopon_provider_sdk::{EffectKind, RiskLevel};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-mod bindings {
-    wit_bindgen::generate!({
-        path: "wit",
-        world: "provider",
-        generate_all,
-        pub_export_macro: true,
-    });
+struct StorageProbe;
+struct Run;
+
+#[derive(Parser)]
+#[command(name = "storageprobe")]
+struct Args {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Input {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<Mode>,
 }
 
-struct StorageProbe;
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum Mode {
+    Success,
+    ReadOnlyDenial,
+    WrongInterfaceDenial,
+    QuotaDenial,
+    BudgetDenial,
+    DropAfterDenial,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProbeError {
+    StorageError,
+    ShortRead,
+    SparseWrite,
+    Stat,
+    Identity,
+    RecreatedStat,
+    IdentityReused,
+    DeleteOnClose,
+    Entropy,
+    UnexpectedPresentFile,
+    UnexpectedResult,
+}
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage probe failed")
+    }
+}
+impl Failure for ProbeError {
+    fn code(&self) -> Code {
+        Code::new(match self {
+            Self::StorageError => "storage-error",
+            Self::ShortRead => "short-read",
+            Self::SparseWrite => "sparse-write",
+            Self::Stat => "stat",
+            Self::Identity => "identity",
+            Self::RecreatedStat => "recreated-stat",
+            Self::IdentityReused => "identity-reused",
+            Self::DeleteOnClose => "delete-on-close",
+            Self::Entropy => "entropy",
+            Self::UnexpectedPresentFile => "unexpected-present-file",
+            Self::UnexpectedResult => "unexpected-result",
+        })
+    }
+}
+fn map(_: StorageError) -> ProbeError {
+    ProbeError::StorageError
+}
 
 impl Provider for StorageProbe {
-    fn manifest() -> ProviderManifest {
-        ProviderManifest {
-            api_version: ProviderApiVersion::V1Alpha1,
-            id: "storage-probe".parse().expect("static provider"),
-            description: "Exercises every durable-files contract family".to_owned(),
-            command_words: vec!["storageprobe".to_owned()],
-            capabilities: vec![ProviderCapability {
-                id: "storage-probe.run".parse().expect("static capability"),
-                description: "Runs the durable-file conformance sequence".to_owned(),
-                effect: EffectKind::LocalWrite,
-                risk: RiskLevel::Medium,
-                input_schema: json!({
-                    "type":"object",
-                    "properties": {
-                        "mode": {
-                            "type":"string",
-                            "enum":[
-                                "success", "read-only-denial", "wrong-interface-denial",
-                                "quota-denial", "budget-denial", "drop-after-denial"
-                            ]
-                        }
-                    },
-                    "additionalProperties":false
-                }),
-            }],
-        }
+    const ID: &'static str = "storage-probe";
+    const COMMAND_WORDS: &'static [&'static str] = &["storageprobe"];
+    const DESCRIPTION: &'static str = "Exercises every durable-files contract family";
+    type Args = Args;
+    type Capabilities = (Run,);
+    fn propose(_: Args, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<Run>(Input { mode: None }))
     }
-
-    fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError> {
-        if capability.as_str() != "storage-probe.run" {
-            return Err(failure("invalid-input"));
+}
+impl Capability for Run {
+    type Provider = StorageProbe;
+    const NAME: &'static str = "run";
+    const DESCRIPTION: &'static str = "Runs the durable-file conformance sequence";
+    const EFFECT: EffectKind = EffectKind::LocalWrite;
+    const RISK: RiskLevel = RiskLevel::Medium;
+    type Input = Input;
+    type Needs = Storage<DurableFiles>;
+    type Output = Value;
+    type Error = ProbeError;
+    fn run(input: Input, storage: Storage<DurableFiles>) -> Result<Value, ProbeError> {
+        match input.mode.unwrap_or(Mode::Success) {
+            Mode::Success => run(&storage),
+            Mode::ReadOnlyDenial => catch_read_only_denial(&storage),
+            Mode::WrongInterfaceDenial => catch_wrong_interface_denial(&storage),
+            Mode::QuotaDenial => catch_quota_denial(&storage),
+            Mode::BudgetDenial => catch_budget_denial(&storage),
+            Mode::DropAfterDenial => drop_after_denial(&storage),
         }
-        let object = input.as_object().ok_or_else(|| failure("invalid-input"))?;
-        if object.len() > 1 || object.keys().any(|key| key != "mode") {
-            return Err(failure("invalid-input"));
-        }
-        match object
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("success")
-        {
-            "success" => run(),
-            "read-only-denial" => catch_read_only_denial(),
-            "wrong-interface-denial" => catch_wrong_interface_denial(),
-            "quota-denial" => catch_quota_denial(),
-            "budget-denial" => catch_budget_denial(),
-            "drop-after-denial" => drop_after_denial(),
-            _ => Err(failure("invalid-input")),
-        }
-    }
-
-    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        if !argv.is_empty() {
-            return Err(failure("invalid-command"));
-        }
-        Ok(CommandRun::proposal(
-            "storage-probe.run".parse().expect("static capability"),
-            json!({}),
-        ))
     }
 }
 
-fn run() -> Result<Value, ProviderError> {
-    exercise_open_flags()?;
+fn run(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    exercise_open_flags(storage)?;
     expect(
-        storage::open("probe.db", OpenOptions::new()),
+        storage.open("probe.db", OpenOptions::new()),
         StorageError::InvalidArgument,
     )?;
     expect(
-        storage::open("probe.db", OpenOptions::new().read(true).create(true)),
+        storage.open("probe.db", OpenOptions::new().read(true).create(true)),
         StorageError::InvalidArgument,
     )?;
     expect(
-        storage::open(
+        storage.open(
             "probe.db",
             OpenOptions::new().write(true).create(true).create_new(true),
         ),
         StorageError::InvalidArgument,
     )?;
-
-    let first = storage::open(
-        "probe.db",
-        OpenOptions::new().read(true).write(true).create_new(true),
-    )
-    .map_err(map)?;
+    let first = storage
+        .open(
+            "probe.db",
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
+        .map_err(map)?;
     first.write_at(0, b"abc").map_err(map)?;
     let short = first.read_at(0, 16).map_err(map)?;
     if short != b"abc" {
-        return Err(failure("short-read"));
+        return Err(ProbeError::ShortRead);
     }
     first.write_at(8, b"z").map_err(map)?;
     if first.size().map_err(map)? != 9 {
-        return Err(failure("sparse-write"));
+        return Err(ProbeError::SparseWrite);
     }
     first.truncate(16).map_err(map)?;
     for mode in [
@@ -121,113 +145,106 @@ fn run() -> Result<Value, ProviderError> {
     ] {
         first.sync(mode).map_err(map)?;
     }
-
     expect(
-        storage::rename_atomic("probe.db", "renamed.db", false, Durability::Full),
+        storage.rename_atomic("probe.db", "renamed.db", false, Durability::Full),
         StorageError::Busy,
     )?;
     expect(
-        storage::remove("probe.db", Durability::Full),
+        storage.remove("probe.db", Durability::Full),
         StorageError::Busy,
     )?;
     drop(first);
-    storage::rename_atomic("probe.db", "renamed.db", false, Durability::Full).map_err(map)?;
-    let identity = storage::stat("renamed.db")
+    storage
+        .rename_atomic("probe.db", "renamed.db", false, Durability::Full)
+        .map_err(map)?;
+    let identity = storage
+        .stat("renamed.db")
         .map_err(map)?
-        .ok_or_else(|| failure("stat"))?
+        .ok_or(ProbeError::Stat)?
         .identity;
     if identity == 0 {
-        return Err(failure("identity"));
+        return Err(ProbeError::Identity);
     }
-    let recreated = storage::open(
-        "probe.db",
-        OpenOptions::new().read(true).write(true).create_new(true),
-    )
-    .map_err(map)?;
+    let recreated = storage
+        .open(
+            "probe.db",
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
+        .map_err(map)?;
     drop(recreated);
-    let recreated_identity = storage::stat("probe.db")
+    let recreated_identity = storage
+        .stat("probe.db")
         .map_err(map)?
-        .ok_or_else(|| failure("recreated-stat"))?
+        .ok_or(ProbeError::RecreatedStat)?
         .identity;
     if recreated_identity == identity {
-        return Err(failure("identity-reused"));
+        return Err(ProbeError::IdentityReused);
     }
-    storage::remove("probe.db", Durability::Full).map_err(map)?;
-
-    let deleting = storage::open(
-        "delete.tmp",
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .delete_on_close(true),
-    )
-    .map_err(map)?;
+    storage.remove("probe.db", Durability::Full).map_err(map)?;
+    let deleting = storage
+        .open(
+            "delete.tmp",
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .delete_on_close(true),
+        )
+        .map_err(map)?;
     drop(deleting);
-    if storage::stat("delete.tmp").map_err(map)?.is_some() {
-        return Err(failure("delete-on-close"));
+    if storage.stat("delete.tmp").map_err(map)?.is_some() {
+        return Err(ProbeError::DeleteOnClose);
     }
-
-    let entropy = storage::random_bytes(32).map_err(map)?;
+    let entropy = storage.random_bytes(32).map_err(map)?;
     if entropy.len() != 32 {
-        return Err(failure("entropy"));
+        return Err(ProbeError::Entropy);
     }
-    let _monotonic = storage::monotonic_time_ns().map_err(map)?;
-    let _wall = storage::wall_time_ms().map_err(map)?;
-    Ok(json!({
-        "shortReadBytes": short.len(),
-        "identityNonzero": identity != 0,
-        "entropyBytes": entropy.len(),
-        "clocksCalled": true,
-    }))
-}
-
-fn catch_read_only_denial() -> Result<Value, ProviderError> {
-    expect(
-        storage::open("denied.db", OpenOptions::new().write(true).create_new(true)),
-        StorageError::PermissionDenied,
-    )?;
-    Ok(json!({"caught": "read-only"}))
-}
-
-fn catch_wrong_interface_denial() -> Result<Value, ProviderError> {
-    expect(
-        storage::stat("wrong-interface.db"),
-        StorageError::PermissionDenied,
-    )?;
-    Ok(json!({"caught": "wrong-interface"}))
-}
-
-fn catch_quota_denial() -> Result<Value, ProviderError> {
-    expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
-    Ok(json!({"caught": "quota"}))
-}
-
-fn catch_budget_denial() -> Result<Value, ProviderError> {
-    if storage::stat("missing.db").map_err(map)?.is_some() {
-        return Err(failure("unexpected-present-file"));
-    }
-    expect(storage::stat("missing.db"), StorageError::QuotaExceeded)?;
-    Ok(json!({"caught": "budget"}))
-}
-
-fn drop_after_denial() -> Result<Value, ProviderError> {
-    let deleting = storage::open(
-        "drop-denied.tmp",
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .delete_on_close(true),
+    let _monotonic = storage.monotonic_time_ns().map_err(map)?;
+    let _wall = storage.wall_time_ms().map_err(map)?;
+    Ok(
+        json!({"shortReadBytes":short.len(),"identityNonzero":identity != 0,"entropyBytes":entropy.len(),"clocksCalled":true}),
     )
-    .map_err(map)?;
-    deleting.write_at(0, b"provisional").map_err(map)?;
-    expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
-    // Drop runs after the quota error is caught; it may free native accounting but must never
-    // authorize the denied delete.
-    drop(deleting);
-    Ok(json!({"caught": "drop-after-denial"}))
 }
-
-fn exercise_open_flags() -> Result<(), ProviderError> {
+fn catch_read_only_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    expect(
+        storage.open("denied.db", OpenOptions::new().write(true).create_new(true)),
+        StorageError::PermissionDenied,
+    )?;
+    Ok(json!({"caught":"read-only"}))
+}
+fn catch_wrong_interface_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    expect(
+        storage.stat("wrong-interface.db"),
+        StorageError::PermissionDenied,
+    )?;
+    Ok(json!({"caught":"wrong-interface"}))
+}
+fn catch_quota_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    expect(storage.random_bytes(257), StorageError::QuotaExceeded)?;
+    Ok(json!({"caught":"quota"}))
+}
+fn catch_budget_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    if storage.stat("missing.db").map_err(map)?.is_some() {
+        return Err(ProbeError::UnexpectedPresentFile);
+    }
+    expect(storage.stat("missing.db"), StorageError::QuotaExceeded)?;
+    Ok(json!({"caught":"budget"}))
+}
+fn drop_after_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
+    let deleting = storage
+        .open(
+            "drop-denied.tmp",
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .delete_on_close(true),
+        )
+        .map_err(map)?;
+    deleting.write_at(0, b"provisional").map_err(map)?;
+    expect(storage.random_bytes(257), StorageError::QuotaExceeded)?;
+    drop(deleting);
+    Ok(json!({"caught":"drop-after-denial"}))
+}
+fn exercise_open_flags(storage: &Storage<DurableFiles>) -> Result<(), ProbeError> {
     for mask in 0_u8..32 {
         let read = mask & 1 != 0;
         let write = mask & 2 != 0;
@@ -244,14 +261,14 @@ fn exercise_open_flags() -> Result<(), ProviderError> {
         let invalid = (!read && !write)
             || (create && create_new)
             || ((create || create_new || delete_on_close) && !write);
-        let result = storage::open(&name, options);
+        let result = storage.open(&name, options);
         if invalid {
             expect(result, StorageError::InvalidArgument)?;
         } else if create || create_new {
             let file = result.map_err(map)?;
             drop(file);
             if !delete_on_close {
-                storage::remove(&name, Durability::Full).map_err(map)?;
+                storage.remove(&name, Durability::Full).map_err(map)?;
             }
         } else {
             expect(result, StorageError::NotFound)?;
@@ -259,18 +276,44 @@ fn exercise_open_flags() -> Result<(), ProviderError> {
     }
     Ok(())
 }
-
-fn expect<T>(result: Result<T, StorageError>, expected: StorageError) -> Result<(), ProviderError> {
+fn expect<T>(result: Result<T, StorageError>, expected: StorageError) -> Result<(), ProbeError> {
     match result {
         Err(actual) if actual == expected => Ok(()),
-        _ => Err(failure("unexpected-result")),
+        _ => Err(ProbeError::UnexpectedResult),
     }
 }
-fn map(_error: StorageError) -> ProviderError {
-    failure("storage-error")
-}
-fn failure(code: &str) -> ProviderError {
-    ProviderError::new(code, "storage probe failed")
-}
 
-dekopon_provider_sdk::export_provider_with_cli!(StorageProbe, bindings);
+dekopon_provider_sdk::export!(StorageProbe);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dekopon_provider_sdk::CommandRunOutcome;
+    use dekopon_provider_sdk::provider;
+    #[test]
+    fn storage_failures_keep_distinct_typed_codes() {
+        assert_eq!(ProbeError::ShortRead.code(), Code::new("short-read"));
+        assert_eq!(
+            ProbeError::UnexpectedResult.code(),
+            Code::new("unexpected-result")
+        );
+        assert!(matches!(
+            map(StorageError::PermissionDenied),
+            ProbeError::StorageError
+        ));
+    }
+
+    #[test]
+    fn typed_dispatch_and_closed_modes() {
+        let manifest = provider::manifest::<StorageProbe>().unwrap();
+        assert_eq!(manifest.capabilities[0].id.as_str(), "storage-probe.run");
+        assert_eq!(manifest.command_words, ["storageprobe"]);
+        assert!(
+            matches!(provider::command::<StorageProbe>(&[], None), CommandRunOutcome::Proposed { input, .. } if input == json!({}))
+        );
+        assert_eq!(
+            manifest.capabilities[0].input_schema["additionalProperties"],
+            false
+        );
+    }
+}

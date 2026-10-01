@@ -135,8 +135,8 @@ jobs:
 
             expected=''
             case "$provider" in
-              clock-probe) expected='dekopon:clock/wall@1.0.0' ;;
-              http-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
+              clock-probe|clock-raw-probe) expected='dekopon:clock/wall@1.0.0' ;;
+              http-probe|http-raw-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
@@ -175,15 +175,11 @@ jobs:
           for mirror in \
             wit/http/deps/asset.wit \
             crates/dekopon-provider-sdk/wit/deps/asset.wit \
-            crates/dekopon-provider-http/wit/deps/asset.wit \
             crates/dekopon-broker-host/wit/deps/asset.wit \
             examples/providers/http-probe/wit/deps/asset.wit
           do
             cmp wit/asset/asset.wit "$mirror"
           done
-          cmp \
-            wit/http/http.wit \
-            crates/dekopon-provider-http/wit/deps/http.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/http.wit \
             examples/providers/http-probe/wit/deps/http.wit
@@ -191,14 +187,12 @@ jobs:
             cmp wit/http/http.wit "$mirror"
           done
           for mirror in \
-            crates/dekopon-provider-clock/wit/deps/clock.wit \
             crates/dekopon-broker-host/wit/deps/clock.wit \
             examples/providers/clock-probe/wit/deps/clock.wit
           do
             cmp wit/clock/clock.wit "$mirror"
           done
           for mirror in \
-            crates/dekopon-provider-storage/wit/deps/storage.wit \
             crates/dekopon-broker-host/wit/deps/storage.wit \
             examples/providers/storage-probe/wit/deps/storage.wit
           do

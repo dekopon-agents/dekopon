@@ -21,17 +21,16 @@ use std::{
 
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
-use dekopon_provider_sdk::host::CommandExport;
-pub use dekopon_provider_sdk::host::ProviderConflicts;
-use dekopon_provider_sdk::host::{
-    self, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT, StoreLimits,
-    check_command_export, command_export, command_input_bytes,
-};
 pub use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
     ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
+pub use host::ProviderConflicts;
+use host::{
+    CommandExport, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT,
+    StoreLimits, check_command_export, command_export, command_input_bytes,
+};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -43,6 +42,7 @@ use wasmtime::{Engine, Store};
 pub mod asset;
 mod clock;
 mod cwasm;
+pub mod host;
 mod http;
 mod memory;
 mod metadata;
@@ -129,6 +129,12 @@ impl Default for BrokerHostLimits {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestImports {
+    pub clock: Option<std::time::SystemTime>,
+    pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
     /// None compiles without a cache; the operator must not modify these mapped files while the
@@ -141,6 +147,9 @@ pub struct BrokerHostOptions {
     pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
     /// JSON settings keyed by provider ID; readable only by that provider during invoke.
     pub provider_settings: Arc<BTreeMap<ProviderId, String>>,
+    /// Fixed guest clock for test invocations; host deadlines remain monotonic.
+    pub test_clock: Option<std::time::SystemTime>,
+    pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
 }
 
 impl Default for BrokerHostOptions {
@@ -152,6 +161,8 @@ impl Default for BrokerHostOptions {
             extra_ca_bundles: Arc::new(Vec::new()),
             non_public_https: Arc::new(Vec::new()),
             provider_settings: Arc::new(BTreeMap::new()),
+            test_clock: None,
+            loopback_https_pin: None,
         }
     }
 }
@@ -320,6 +331,8 @@ struct Runtime {
     extra_ca_bundles: Arc<Vec<Vec<u8>>>,
     non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
     provider_settings: Arc<BTreeMap<ProviderId, String>>,
+    test_clock: Option<std::time::SystemTime>,
+    loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
 }
 
 impl Runtime {
@@ -359,6 +372,8 @@ impl Runtime {
             extra_ca_bundles: Arc::clone(&options.extra_ca_bundles),
             non_public_https: Arc::clone(&options.non_public_https),
             provider_settings: Arc::clone(&options.provider_settings),
+            test_clock: options.test_clock,
+            loopback_https_pin: options.loopback_https_pin.clone(),
         })
     }
 
@@ -408,6 +423,7 @@ impl Runtime {
             plaintext_hosts: self.plaintext_hosts.clone(),
             extra_ca_bundles: Arc::clone(&self.extra_ca_bundles),
             non_public_https: Arc::clone(&self.non_public_https),
+            loopback_https_pin: self.loopback_https_pin.clone(),
         }
     }
 }
@@ -1009,6 +1025,7 @@ impl BrokerWasmProvider {
     )]
     async fn invoke(
         &self,
+        test_imports: Option<&TestImports>,
         capability: &CapabilityId,
         input: &Value,
         constraints: &ExecutionConstraints,
@@ -1048,11 +1065,15 @@ impl BrokerWasmProvider {
         }
 
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
+        let mut ceilings = self.runtime.http_ceilings();
+        if let Some(pin) = test_imports.and_then(|imports| imports.loopback_https_pin.as_ref()) {
+            ceilings.loopback_https_pin = Some(pin.clone());
+        }
         let http = match HttpState::invoke(
             constraints.http.clone(),
             constraints.secret_use.clone(),
             credential,
-            self.runtime.http_ceilings(),
+            ceilings,
             operation_timeout,
         ) {
             Ok(http) => http,
@@ -1066,7 +1087,11 @@ impl BrokerWasmProvider {
             self.manifest.id.as_str(),
             http,
             storage_state,
-            ClockState::invoke(),
+            ClockState::invoke(
+                test_imports
+                    .and_then(|imports| imports.clock)
+                    .or(self.runtime.test_clock),
+            ),
             SettingsState::invoke(
                 self.runtime
                     .provider_settings
@@ -1580,6 +1605,18 @@ impl BrokerProviderRegistry {
         storage_grant: Option<StorageGrant>,
         assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
+        self.invoke_with_test_imports(authorized, credential, storage_grant, assets, None)
+            .await
+    }
+
+    pub async fn invoke_with_test_imports(
+        &self,
+        authorized: AuthorizedInvocation,
+        credential: Option<BoundCredential>,
+        storage_grant: Option<StorageGrant>,
+        assets: asset::AssetInputs,
+        test_imports: Option<&TestImports>,
+    ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         let storage_backed = authorized.constraints().storage.is_some();
         let proposal = authorized.proposal();
         let provider_index = self
@@ -1661,6 +1698,7 @@ impl BrokerProviderRegistry {
         }
         provider
             .invoke(
+                test_imports,
                 &proposal.capability,
                 &proposal.input,
                 authorized.constraints(),
@@ -2153,7 +2191,7 @@ mod tests {
     #[test]
     fn failed_invocation_with_budget_refusal_maps_to_host_memory_budget() {
         let mut limiter = super::memory::MemoryLimiter::new(
-            dekopon_provider_sdk::host::StoreLimits {
+            super::host::StoreLimits {
                 max_memory_bytes: 4 * 65_536,
                 ..Default::default()
             },

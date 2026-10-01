@@ -1,0 +1,9 @@
+package dekopon:provider@0.3.0;
+
+world jsonl-client {
+    import dekopon:storage/jsonl@0.1.1;
+}
+
+world durable-files-client {
+    import dekopon:storage/durable-files@0.1.1;
+}

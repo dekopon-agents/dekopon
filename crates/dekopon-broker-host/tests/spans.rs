@@ -654,7 +654,9 @@ async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
     )
     .await
     .expect("clock provider loads");
-    let capability = "clock.now".parse::<CapabilityId>().expect("capability");
+    let capability = "clock-probe.now"
+        .parse::<CapabilityId>()
+        .expect("capability");
 
     let before = unix_millis_now();
     let output = registry
