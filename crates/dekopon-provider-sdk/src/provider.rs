@@ -310,7 +310,15 @@ fn schema_fault(schema: &Value) -> Option<SchemaFault> {
             if object_typed && object.get("additionalProperties") != Some(&Value::Bool(false)) {
                 return Some(SchemaFault::Open);
             }
-            object.values().find_map(schema_fault)
+            object
+                .iter()
+                .find_map(|(keyword, value)| match keyword.as_str() {
+                    "default" | "examples" | "const" | "enum" => None,
+                    "properties" | "patternProperties" => value
+                        .as_object()
+                        .and_then(|properties| properties.values().find_map(schema_fault)),
+                    _ => schema_fault(value),
+                })
         }
         Value::Array(items) => items.iter().find_map(schema_fault),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,

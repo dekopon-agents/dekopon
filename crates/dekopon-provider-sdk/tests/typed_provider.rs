@@ -475,3 +475,27 @@ fn a_manifest_refuses_an_input_schema_that_is_open_or_holds_a_reference() {
         })
     ));
 }
+
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Link {
+    #[serde(rename = "$ref")]
+    target: String,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Linked {
+    #[serde(default)]
+    link: Link,
+}
+
+impl Faulted for Linked {}
+
+#[test]
+fn a_ref_named_property_or_default_is_data_not_a_reference() {
+    let manifest = manifest::<Faulty<Linked>>().expect("a closed inline schema is published");
+    let link = &manifest.capabilities[0].input_schema["properties"]["link"];
+    assert_eq!(link["default"], json!({"$ref": ""}));
+    assert_eq!(link["properties"]["$ref"]["type"], "string");
+}
