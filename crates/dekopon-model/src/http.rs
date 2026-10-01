@@ -475,7 +475,7 @@ mod tests {
         };
         let recorded = bytes.min(MAX_ERROR_BODY_BYTES as usize + 1);
         assert_eq!(capture.field("response.bytes"), Some(recorded.to_string()));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
         error
     }
 

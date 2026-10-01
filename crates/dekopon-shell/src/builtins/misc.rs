@@ -524,10 +524,8 @@ impl Builtin for Cat {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::Duration};
 
     use serde_json::{Value, json};
 
@@ -555,7 +553,7 @@ mod tests {
         }
 
         fn note(&self, text: &str, eta: Option<Duration>) {
-            self.0.lock().unwrap().push((text.to_owned(), eta));
+            self.0.lock().push((text.to_owned(), eta));
         }
     }
 
@@ -571,7 +569,7 @@ mod tests {
             assert_eq!(result.value, Value::Null);
         }
         assert_eq!(
-            *notes.0.lock().unwrap(),
+            *notes.0.lock(),
             vec![(" <@rendering> ".to_owned(), Some(Duration::from_secs(40))); 2]
         );
     }
@@ -584,7 +582,7 @@ mod tests {
                 run_builtin_with_invoker(&Progress, &["x", "--eta", seconds], &notes).unwrap();
             assert_eq!(result.status, ExitCode::SUCCESS);
         }
-        assert_eq!(*notes.0.lock().unwrap(), vec![("x".to_owned(), None); 5]);
+        assert_eq!(*notes.0.lock(), vec![("x".to_owned(), None); 5]);
     }
 
     #[test]
@@ -605,7 +603,7 @@ mod tests {
                 })
             ));
         }
-        assert!(notes.0.lock().unwrap().is_empty());
+        assert!(notes.0.lock().is_empty());
     }
 
     #[test]
@@ -615,7 +613,7 @@ mod tests {
         assert_eq!(result.exit_code, ExitCode::SUCCESS);
         assert_eq!(result.output, "done");
         assert_eq!(result.capability_calls, 0);
-        assert_eq!(*notes.0.lock().unwrap(), vec![("x".to_owned(), None)]);
+        assert_eq!(*notes.0.lock(), vec![("x".to_owned(), None)]);
     }
 
     #[test]

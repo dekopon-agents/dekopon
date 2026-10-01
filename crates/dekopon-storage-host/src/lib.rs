@@ -45,12 +45,13 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -453,11 +454,7 @@ impl StorageHost {
         let mut namespace_reservation = Some({
             // The observation lock is dropped before any base lease wait, preserving concurrency
             // between distinct namespaces.
-            let _observation = self
-                .inner
-                .namespace_observation_lock
-                .lock()
-                .expect("storage namespace observation lock");
+            let _observation = self.inner.namespace_observation_lock.lock();
             let observed_namespaces = self
                 .inner
                 .layout
@@ -488,11 +485,7 @@ impl StorageHost {
             .reserve_root(plan.reserved_bytes(), plan.reserved_entries())?;
         // This critical section must stay free of lease waits, or it would serialize an unrelated
         // namespace behind a blocked lease.
-        let _observation = self
-            .inner
-            .namespace_observation_lock
-            .lock()
-            .expect("storage namespace observation lock");
+        let _observation = self.inner.namespace_observation_lock.lock();
         self.inner.ledger.observe_namespaces(
             self.inner
                 .layout
@@ -593,14 +586,11 @@ fn lock_before(
 ) -> Result<MutexGuard<'_, ()>, StorageHostError> {
     loop {
         match lock.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Some(guard) => return Ok(guard),
+            None if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(TryLockError::WouldBlock) => return Err(StorageHostError::Timeout),
-            Err(TryLockError::Poisoned(_)) => {
-                panic!("storage namespace housekeeping lock poisoned")
-            }
+            None => return Err(StorageHostError::Timeout),
         }
     }
 }
@@ -609,7 +599,7 @@ fn namespace_lock(
     registry: &Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     base: &str,
 ) -> Arc<Mutex<()>> {
-    let mut locks = registry.lock().expect("storage namespace lock registry");
+    let mut locks = registry.lock();
     locks.retain(|_, lock| Arc::strong_count(lock) > 1);
     Arc::clone(
         locks

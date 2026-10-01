@@ -6,10 +6,11 @@ mod media;
 #[cfg(test)]
 pub(crate) mod tests_media;
 
+use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     io,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -154,11 +155,7 @@ impl RefusalLog {
 }
 
 fn refuse(state: &WebhookState, refusal: Refusal, status: StatusCode) -> Response {
-    // A poisoned refusal log must not silence the refusal it exists to record.
-    let admitted = match state.refusals.lock() {
-        Ok(mut log) => log.admit(refusal, Instant::now()),
-        Err(_) => Some(0),
-    };
+    let admitted = state.refusals.lock().admit(refusal, Instant::now());
     if let Some(suppressed) = admitted {
         tracing::warn!(
             event = "gateway_whatsapp_webhook_refused",

@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     fs,
@@ -6,7 +7,7 @@ use std::{
     os::unix::fs::PermissionsExt as _,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -86,7 +87,7 @@ impl TokenApi {
                         break;
                     }
                 }
-                let mut all = recorded.lock().expect("requests");
+                let mut all = recorded.lock();
                 all.push(String::from_utf8(request).expect("HTTP request"));
                 let (status, body) = reply(all.len(), all.last().expect("recorded request"));
                 drop(all);
@@ -106,7 +107,7 @@ impl TokenApi {
     }
 
     fn requests(&self) -> Vec<String> {
-        self.requests.lock().expect("requests").clone()
+        self.requests.lock().clone()
     }
 }
 

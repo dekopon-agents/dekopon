@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     io::{BufRead as _, Write as _},
     process::{Command, Stdio},
-    sync::{Mutex, mpsc},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -193,7 +194,6 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
         fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
             self.release
                 .lock()
-                .expect("release lock")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("release producer after first result");
             CapabilityCallResult::Succeeded(Value::Null)

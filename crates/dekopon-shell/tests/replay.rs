@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Limits,
@@ -26,7 +26,7 @@ impl CapabilityInvoker for Replay {
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        self.calls.lock().expect("calls").push(json!({
+        self.calls.lock().push(json!({
             "word": word, "argv": argv, "stdin": stdin,
         }));
         let output = match (word, argv.first().map(String::as_str)) {
@@ -270,11 +270,6 @@ fn deployed_recipes_run_offline_with_exact_arguments_stdin_and_order() {
         let result = Interpreter::new(Limits::default()).run(case.script, &replay);
         assert_eq!(result.exit_code.get(), 0, "{}: {result:?}", case.name);
         assert_eq!(result.output, case.output, "{}", case.name);
-        assert_eq!(
-            *replay.calls.lock().expect("calls"),
-            case.calls,
-            "{}",
-            case.name
-        );
+        assert_eq!(*replay.calls.lock(), case.calls, "{}", case.name);
     }
 }

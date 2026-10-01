@@ -20,6 +20,7 @@ name = "chat_fixtures"
 required-features = ["agent-runtime"]
 
 [dependencies]
+parking_lot.workspace = true
 # The three crates whose boundaries the shared doubles stand on: the prompt loop's script runtime,
 # the model client's streaming contract, and the script outcome both of them speak. Every one of
 # them is already a normal dependency of `dekopond`, and this crate reaches every consumer as a

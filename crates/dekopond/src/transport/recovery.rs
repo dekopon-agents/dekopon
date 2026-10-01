@@ -129,7 +129,8 @@ impl ChatTransport for RecoveringTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
 
     use async_trait::async_trait;
 
@@ -157,7 +158,7 @@ mod tests {
         }
         fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
             Box::pin(async move {
-                self.attempts.lock().expect("attempts").push(Instant::now());
+                self.attempts.lock().push(Instant::now());
                 let Some((delay, success)) = self.opens.pop_front() else {
                     return std::future::pending().await;
                 };
@@ -208,7 +209,7 @@ mod tests {
         assert!(
             matches!(error, TransportError::RecoveryExhausted { failures: 10, ref source } if matches!(**source, TransportError::Closed))
         );
-        let attempts = attempts.lock().expect("attempts");
+        let attempts = attempts.lock();
         assert_eq!(attempts.len(), 10);
         for (index, pair) in attempts.windows(2).enumerate() {
             let floor = Duration::from_millis(500)

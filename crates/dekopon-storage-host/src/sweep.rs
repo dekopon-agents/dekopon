@@ -61,9 +61,8 @@ impl StorageHost {
         }
         let mutex = crate::namespace_lock(&self.inner.namespace_locks, token);
         let _guard = match mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(StorageHostError::Io),
+            Some(guard) => guard,
+            None => return Ok(false),
         };
         let lease = base.open_private("base.lock", false)?;
         match lease.try_lock() {
@@ -96,11 +95,7 @@ impl StorageHost {
         })();
         // Other bases can make progress while the bounded tree is removed; observation fences only
         // unlink of the namespace pathname and the matching ledger/slot update.
-        let _observation = self
-            .inner
-            .namespace_observation_lock
-            .lock()
-            .expect("storage namespace observation lock");
+        let _observation = self.inner.namespace_observation_lock.lock();
         let deletion = deletion.and_then(|()| {
             base.remove_file_if_exists("current")?;
             base.remove_file("last-used")?;

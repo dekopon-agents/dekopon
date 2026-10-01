@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -81,7 +82,7 @@ impl StorageState {
         };
         let transaction = Arc::clone(&active.transaction);
         let result = match tokio::task::spawn_blocking(move || {
-            let mut slot = transaction.lock().expect("storage transaction");
+            let mut slot = transaction.lock();
             let transaction = slot
                 .as_mut()
                 .ok_or(StorageHostError::corrupt("finalized-transaction"))?;
@@ -130,7 +131,6 @@ impl StorageState {
         let finished = tokio::task::spawn_blocking(move || {
             let transaction = transaction
                 .lock()
-                .expect("storage transaction")
                 .take()
                 .ok_or(StorageHostError::corrupt("finalized-transaction"))?;
             if commit && !rejected && Instant::now() >= deadline {

@@ -1,10 +1,11 @@
 //! A session holds no authority of its own; it opens an attested broker leg naming the sender, and
 //! an empty grant ends it before any model token is spent, whatever the message text says.
 
+use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -136,12 +137,7 @@ impl ConfiguredModels {
     ) -> Result<Arc<dekopon_model::chatgpt::CredentialFile>, InferenceError> {
         use dekopon_model::{chatgpt, error::AuthError};
         let path = chatgpt::resolve_auth_path(auth_file).map_err(AuthError::Credential)?;
-        let cached = self
-            .chatgpt_credentials
-            .lock()
-            .expect("gateway chatgpt credentials")
-            .get(&path)
-            .cloned();
+        let cached = self.chatgpt_credentials.lock().get(&path).cloned();
         if let Some(credential) = cached {
             return Ok(credential);
         }
@@ -149,10 +145,7 @@ impl ConfiguredModels {
         // wins and is the one handed to every later model.
         let opened =
             Arc::new(chatgpt::CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?);
-        let mut credentials = self
-            .chatgpt_credentials
-            .lock()
-            .expect("gateway chatgpt credentials");
+        let mut credentials = self.chatgpt_credentials.lock();
         Ok(Arc::clone(credentials.entry(path).or_insert(opened)))
     }
 
@@ -242,17 +235,12 @@ impl ModelFactory for ConfiguredModels {
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
-        let cached = self
-            .clients
-            .lock()
-            .expect("gateway model clients")
-            .get(model.name())
-            .cloned();
+        let cached = self.clients.lock().get(model.name()).cloned();
         let client = match cached {
             Some(client) => client,
             None => {
                 let built = self.construct(model)?;
-                let mut clients = self.clients.lock().expect("gateway model clients");
+                let mut clients = self.clients.lock();
                 Arc::clone(clients.entry(model.name().to_owned()).or_insert(built))
             }
         };
@@ -373,7 +361,7 @@ impl SessionGate {
         receipts: Dispositions,
     ) -> Admit {
         let key = (message.transport.clone(), message.conversation.key());
-        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let mut entries = self.in_flight.lock();
         if let Some(holder) = entries.get_mut(&key) {
             let Holder::Session(running) = holder else {
                 record_admission(&message, "busy", 0, Some("saturated"));
@@ -428,7 +416,7 @@ impl SessionGate {
     }
 
     pub(crate) fn admit_probe(&self, key: AdmissionKey) -> Option<ProbeAdmission> {
-        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let mut entries = self.in_flight.lock();
         if entries.contains_key(&key) {
             return None;
         }
@@ -442,7 +430,7 @@ impl SessionGate {
     }
 
     pub(crate) fn take_steers(&self, key: &AdmissionKey) -> Vec<InboundMessage> {
-        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let mut entries = self.in_flight.lock();
         let Some(Holder::Session(running)) = entries.get_mut(key) else {
             return Vec::new();
         };
@@ -452,7 +440,7 @@ impl SessionGate {
 
     pub(crate) fn cancel(&self, request: &CancelRequest) -> StopOutcome {
         let key = (request.transport.clone(), request.conversation_id.clone());
-        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let mut entries = self.in_flight.lock();
         let Some(Holder::Session(running)) = entries.get_mut(&key) else {
             return StopOutcome {
                 running: CancelOutcome::NoSession,
@@ -526,7 +514,7 @@ impl SessionAdmission {
 
     pub(crate) fn next_or_release(mut self) -> Option<(Self, FollowUp)> {
         let next = {
-            let mut entries = self.in_flight.lock().expect("session in-flight registry");
+            let mut entries = self.in_flight.lock();
             let Some(Holder::Session(running)) = entries.get_mut(&self.key) else {
                 return None;
             };
@@ -567,7 +555,7 @@ impl SessionAdmission {
 
 impl Drop for SessionAdmission {
     fn drop(&mut self) {
-        let mut entries = self.in_flight.lock().expect("session in-flight registry");
+        let mut entries = self.in_flight.lock();
         if matches!(entries.get(&self.key), Some(Holder::Session(running))
             if Arc::ptr_eq(&running.cancellation.state, &self.cancellation.state))
         {
@@ -584,10 +572,7 @@ pub(crate) struct ProbeAdmission {
 
 impl Drop for ProbeAdmission {
     fn drop(&mut self) {
-        self.in_flight
-            .lock()
-            .expect("session in-flight registry")
-            .remove(&self.key);
+        self.in_flight.lock().remove(&self.key);
     }
 }
 
@@ -624,7 +609,7 @@ impl SessionCancellation {
 
     pub(crate) fn rearm_model(&self) {
         // Serialize with session cancellation so draining can never clear a stop.
-        let _source = self.source.lock().expect("session cancellation source");
+        let _source = self.source.lock();
         if self.state.load(Ordering::Acquire) != SESSION_CANCELLED {
             self.model.send_replace(false);
         }
@@ -651,7 +636,7 @@ impl SessionCancellation {
     /// prior absence.
     pub(crate) fn cancel(&self, source: CancelSource) -> bool {
         let cancelled = {
-            let mut recorded = self.source.lock().expect("session cancellation source");
+            let mut recorded = self.source.lock();
             let won = self
                 .state
                 .compare_exchange(
@@ -675,7 +660,7 @@ impl SessionCancellation {
     }
 
     pub(crate) fn source(&self) -> Option<CancelSource> {
-        *self.source.lock().expect("session cancellation source")
+        *self.source.lock()
     }
 
     pub(crate) async fn cancelled(&self) {
@@ -1142,10 +1127,7 @@ impl SteerSource for SessionSteers {
                 if self.scope == Some(MemoryScope::SharedConversation) {
                     text = attributed_prompt(&steer.subject, &text);
                 }
-                self.raw_texts
-                    .lock()
-                    .expect("consumed steers")
-                    .push(steer.text);
+                self.raw_texts.lock().push(steer.text);
                 text
             })
             .collect()
@@ -1155,7 +1137,7 @@ impl SteerSource for SessionSteers {
 impl SessionSteers {
     fn user_text(&self, prompt: &str) -> String {
         let mut text = prompt.to_owned();
-        for steer in self.raw_texts.lock().expect("consumed steers").iter() {
+        for steer in self.raw_texts.lock().iter() {
             text.push_str("\n\n");
             text.push_str(steer);
         }
@@ -1997,16 +1979,16 @@ mod model_factory_tests {
                 .unwrap()
         };
         let first = bind("one");
-        let first_pool = Arc::clone(factory.clients.lock().unwrap().get("one").unwrap());
+        let first_pool = Arc::clone(factory.clients.lock().get("one").unwrap());
         let again = bind("one");
         let other = bind("two");
         assert!(!Arc::ptr_eq(&first, &again));
-        let clients = factory.clients.lock().unwrap();
+        let clients = factory.clients.lock();
         assert!(Arc::ptr_eq(&first_pool, clients.get("one").unwrap()));
         assert!(!Arc::ptr_eq(&first_pool, clients.get("two").unwrap()));
         drop(clients);
         assert!(!Arc::ptr_eq(&first, &other));
-        assert_eq!(factory.clients.lock().unwrap().len(), 2);
+        assert_eq!(factory.clients.lock().len(), 2);
     }
 
     #[test]
@@ -2027,12 +2009,12 @@ mod model_factory_tests {
             bind(),
             Err(SessionError::Model(InferenceError::Authentication(_)))
         ));
-        assert!(factory.clients.lock().unwrap().is_empty());
+        assert!(factory.clients.lock().is_empty());
         std::fs::write(path, serde_json::to_vec(&serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"})).unwrap()).unwrap();
         let first = bind().unwrap();
         let again = bind().unwrap();
         assert!(!Arc::ptr_eq(&first, &again));
-        let cache = factory.clients.lock().unwrap();
+        let cache = factory.clients.lock();
         assert_eq!(cache.len(), 1);
         assert!(matches!(
             cache.get("codex"),
@@ -2061,9 +2043,9 @@ mod model_factory_tests {
                 )
                 .unwrap();
         }
-        assert_eq!(factory.clients.lock().unwrap().len(), 3);
+        assert_eq!(factory.clients.lock().len(), 3);
         assert_eq!(
-            factory.chatgpt_credentials.lock().unwrap().len(),
+            factory.chatgpt_credentials.lock().len(),
             2,
             "one credential per auth file, not per model"
         );

@@ -239,7 +239,7 @@ impl ChatDriver for HeldReplyDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let release = self.release.lock().expect("reply release").take();
+        let release = self.release.lock().take();
         if let Some(release) = release {
             self.entered.notify_one();
             release.await.expect("first reply released");

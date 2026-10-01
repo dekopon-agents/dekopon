@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     io::{BufRead as _, BufReader, Read as _, Write as _},
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -159,7 +160,7 @@ impl MockServer {
                 let Some(request) = read_request(&mut stream) else {
                     continue;
                 };
-                thread_requests.lock().expect("request lock").push(request);
+                thread_requests.lock().push(request);
                 if response.hang_up {
                     continue;
                 }
@@ -190,7 +191,7 @@ impl MockServer {
     }
 
     pub(crate) fn requests(&self) -> Vec<String> {
-        self.requests.lock().expect("request lock").clone()
+        self.requests.lock().clone()
     }
 }
 

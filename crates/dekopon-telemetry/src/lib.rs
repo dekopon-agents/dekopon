@@ -111,14 +111,15 @@ mod aggregation_tests {
         error::OTelSdkResult,
         trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use tracing_subscriber::prelude::*;
 
     #[derive(Clone, Debug, Default)]
     struct Exported(Arc<Mutex<Vec<SpanData>>>);
     impl SpanExporter for Exported {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().expect("exported spans").extend(batch);
+            self.0.lock().extend(batch);
             Ok(())
         }
     }
@@ -141,7 +142,7 @@ mod aggregation_tests {
             }
         });
         provider.force_flush().expect("flush");
-        let spans = exported.0.lock().expect("exported spans");
+        let spans = exported.0.lock();
         let execution = spans
             .iter()
             .find(|span| span.name == "gateway.message")

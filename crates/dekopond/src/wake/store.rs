@@ -1,9 +1,9 @@
+use parking_lot::Mutex;
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -254,7 +254,7 @@ impl WakeStore {
             ),
         };
         let maximum = self.bounds.max_per_subject;
-        let mut state = self.state.lock().expect("wake store");
+        let mut state = self.state.lock();
         let pending = state
             .wakes
             .iter()
@@ -293,7 +293,7 @@ impl WakeStore {
     }
 
     pub(crate) fn list(&self, subject: &ExternalSubject, now: SystemTime) -> Vec<WakeSummary> {
-        let state = self.state.lock().expect("wake store");
+        let state = self.state.lock();
         state
             .wakes
             .iter()
@@ -303,7 +303,7 @@ impl WakeStore {
     }
 
     pub(crate) fn next_at(&self) -> Option<SystemTime> {
-        let state = self.state.lock().expect("wake store");
+        let state = self.state.lock();
         state.wakes.iter().map(|wake| wake.next_at).min()
     }
 
@@ -340,7 +340,7 @@ impl WakeStore {
         &self,
         change: impl FnOnce(&mut Vec<Wake>) -> Result<T, WakeStoreError>,
     ) -> Result<T, WakeStoreError> {
-        let mut state = self.state.lock().expect("wake store");
+        let mut state = self.state.lock();
         let mut wakes = state.wakes.clone();
         let result = change(&mut wakes)?;
         write(&self.path, &wakes)?;

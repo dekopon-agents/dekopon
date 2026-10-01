@@ -121,8 +121,8 @@ impl DiscordTransport {
                 http,
                 production,
                 rest_lock: Mutex::new(()),
-                rest_cooldown_until: std::sync::Mutex::new(None),
-                liveness_cooldown_until: std::sync::Mutex::new(None),
+                rest_cooldown_until: parking_lot::Mutex::new(None),
+                liveness_cooldown_until: parking_lot::Mutex::new(None),
                 bot_user: OnceLock::new(),
             }),
             gateway_url: None,
@@ -902,8 +902,8 @@ pub(crate) struct DiscordDriver {
     /// This lock is held across one request only, because sleeping under it for a whole reply
     /// blocked every other session's answer and any in-flight attachment fetch.
     rest_lock: Mutex<()>,
-    rest_cooldown_until: std::sync::Mutex<Option<Instant>>,
-    liveness_cooldown_until: std::sync::Mutex<Option<Instant>>,
+    rest_cooldown_until: parking_lot::Mutex<Option<Instant>>,
+    liveness_cooldown_until: parking_lot::Mutex<Option<Instant>>,
     bot_user: OnceLock<String>,
 }
 
@@ -1271,7 +1271,6 @@ impl DiscordDriver {
     fn cooling_down(&self) -> bool {
         self.liveness_cooldown_until
             .lock()
-            .expect("Discord liveness cooldown")
             .is_some_and(|until| until > Instant::now())
     }
 
@@ -1299,19 +1298,13 @@ impl DiscordDriver {
                 .map_err(TransportError::MalformedResponse)?;
             let retry = retry_after_from_body(&body, MAX_LIVENESS_COOLDOWN)
                 .ok_or(TransportError::Response)?;
-            *self
-                .liveness_cooldown_until
-                .lock()
-                .expect("Discord liveness cooldown") = Some(Instant::now() + retry.wait);
+            *self.liveness_cooldown_until.lock() = Some(Instant::now() + retry.wait);
             return Err(TransportError::Service {
                 code: "http-429".to_owned(),
             });
         }
         if response.status().is_success() {
-            *self
-                .liveness_cooldown_until
-                .lock()
-                .expect("Discord liveness cooldown") = None;
+            *self.liveness_cooldown_until.lock() = None;
         }
         Ok(response)
     }
@@ -1582,17 +1575,11 @@ impl DiscordDriver {
     }
 
     fn publish_rest_cooldown(&self, wait: Duration) {
-        *self
-            .rest_cooldown_until
-            .lock()
-            .expect("Discord REST cooldown") = Some(Instant::now() + wait);
+        *self.rest_cooldown_until.lock() = Some(Instant::now() + wait);
     }
 
     fn rest_cooldown(&self) -> Option<Duration> {
-        let until = (*self
-            .rest_cooldown_until
-            .lock()
-            .expect("Discord REST cooldown"))?;
+        let until = (*self.rest_cooldown_until.lock())?;
         until.checked_duration_since(Instant::now())
     }
 
@@ -2109,8 +2096,8 @@ mod unit_tests {
             http: client().expect("the shared client builds"),
             production: false,
             rest_lock: Mutex::new(()),
-            rest_cooldown_until: std::sync::Mutex::new(None),
-            liveness_cooldown_until: std::sync::Mutex::new(None),
+            rest_cooldown_until: parking_lot::Mutex::new(None),
+            liveness_cooldown_until: parking_lot::Mutex::new(None),
             bot_user: std::sync::OnceLock::from(BOT_USER.to_owned()),
         }
     }
@@ -2322,7 +2309,8 @@ mod unit_tests {
 
     #[tokio::test]
     async fn progress_finalization_clears_the_stored_suppression_flag() {
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let states = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&states);
@@ -2337,7 +2325,7 @@ mod unit_tests {
                 if let Some(updated) = request.body["flags"].as_u64() {
                     flags = updated;
                 }
-                observed.lock().unwrap().push(flags);
+                observed.lock().push(flags);
             },
         );
         let driver = driver(&endpoint);
@@ -2354,7 +2342,7 @@ mod unit_tests {
             assert_eq!(request.body["flags"], 4);
             assert_eq!(request.body["allowed_mentions"]["parse"], json!([]));
         }
-        assert_eq!(*states.lock().unwrap(), [4, 4, 0]);
+        assert_eq!(*states.lock(), [4, 4, 0]);
     }
 
     #[tokio::test]

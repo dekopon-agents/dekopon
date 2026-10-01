@@ -6,6 +6,7 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
+use parking_lot::{Condvar, Mutex};
 use std::{
     fs,
     io::{BufRead as _, BufReader, Read as _, Write as _},
@@ -13,7 +14,7 @@ use std::{
     os::unix::{fs::PermissionsExt as _, net::UnixStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -272,10 +273,7 @@ fn spawn_model(
             let Some(request) = read_request(&mut stream) else {
                 return;
             };
-            recorded
-                .lock()
-                .expect("recorded model requests")
-                .push(request);
+            recorded.lock().push(request);
             if index == 0 {
                 thread::sleep(first_answer_delay);
                 if let Some(hold) = &first_answer_hold {
@@ -603,7 +601,7 @@ impl Fixture {
     }
 
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
-        let prompts = self.model_prompts.lock().expect("recorded model requests");
+        let prompts = self.model_prompts.lock();
         let request = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
@@ -715,9 +713,9 @@ impl ModelHold {
     fn wait(&self) {
         let (released, ready, entered) = &*self.0;
         entered.notify_one();
-        let mut released = released.lock().expect("the model hold locks");
+        let mut released = released.lock();
         while !*released {
-            released = ready.wait(released).expect("the model hold locks");
+            ready.wait(&mut released);
         }
     }
 
@@ -729,7 +727,7 @@ impl ModelHold {
 
     fn release(&self) {
         let (released, ready, _) = &*self.0;
-        *released.lock().expect("the model hold locks") = true;
+        *released.lock() = true;
         ready.notify_all();
     }
 }

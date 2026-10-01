@@ -1,6 +1,7 @@
 //! The caller-declared subject is only a claim: the broker still needs an attestor grant and owner
 //! mapping to resolve it, and the socket's 0600 mode restricts access to the owner's UID.
 
+use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     fs,
@@ -9,7 +10,7 @@ use std::{
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -359,17 +360,11 @@ impl serde::Serialize for Base64Data<'_> {
 
 impl LocalDriver {
     fn register(&self, connection: u64, sender: mpsc::Sender<LocalWrite>) {
-        self.connections
-            .lock()
-            .expect("local connection registry")
-            .insert(connection, sender);
+        self.connections.lock().insert(connection, sender);
     }
 
     fn forget(&self, connection: u64) {
-        self.connections
-            .lock()
-            .expect("local connection registry")
-            .remove(&connection);
+        self.connections.lock().remove(&connection);
     }
 
     #[allow(
@@ -382,12 +377,7 @@ impl LocalDriver {
     where
         T: serde::Serialize + ?Sized,
     {
-        let sender = self
-            .connections
-            .lock()
-            .expect("local connection registry")
-            .get(&connection)
-            .cloned();
+        let sender = self.connections.lock().get(&connection).cloned();
         let Some(sender) = sender else {
             return Err(TransportError::Closed);
         };
@@ -776,12 +766,8 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt as _,
-        path::PathBuf,
-        sync::{Arc, Mutex},
-    };
+    use parking_lot::Mutex;
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf, sync::Arc};
 
     use dekopon_agent::CancelVia;
     use serde_json::{Value, json};
@@ -844,7 +830,6 @@ mod unit_tests {
             while let Some(write) = receiver.recv().await {
                 recorded
                     .lock()
-                    .expect("recorded lines")
                     .push(serde_json::from_slice::<Value>(&write.line).expect("a JSON line"));
                 #[allow(
                     clippy::let_underscore_must_use,
@@ -867,10 +852,7 @@ mod unit_tests {
             .seen(&LivenessTarget::Local { connection: 7 })
             .await
             .expect("line written");
-        assert_eq!(
-            *lines.lock().expect("recorded lines"),
-            [json!({ "reaction": true })]
-        );
+        assert_eq!(*lines.lock(), [json!({ "reaction": true })]);
     }
 
     #[tokio::test]
@@ -932,7 +914,7 @@ mod unit_tests {
             .await
             .expect("the line is written");
 
-        let lines = lines.lock().expect("recorded lines").clone();
+        let lines = lines.lock().clone();
         assert_eq!(
             lines,
             vec![
@@ -981,7 +963,7 @@ mod unit_tests {
             .expect("the line is written");
 
         assert_eq!(
-            lines.lock().expect("recorded lines").clone(),
+            lines.lock().clone(),
             vec![json!({
                 "delta": {
                     "id": "m1",
@@ -1142,10 +1124,7 @@ mod unit_tests {
             .expect_err("a Telegram callback query is not a local acknowledgement");
         assert_eq!(refused.category(), "response");
 
-        assert!(
-            lines.lock().expect("recorded lines").is_empty(),
-            "a refused call writes nothing"
-        );
+        assert!(lines.lock().is_empty(), "a refused call writes nothing");
     }
 
     #[tokio::test]

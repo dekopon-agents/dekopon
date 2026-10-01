@@ -96,7 +96,7 @@ impl TelegramTransport {
                 endpoint,
                 token: Redacted::new(token),
                 http,
-                liveness_cooldown_until: std::sync::Mutex::new(None),
+                liveness_cooldown_until: parking_lot::Mutex::new(None),
             }),
             offset: 0,
             pending: VecDeque::new(),
@@ -467,7 +467,7 @@ pub(crate) struct TelegramDriver {
     endpoint: String,
     token: Redacted<String>,
     http: reqwest::Client,
-    liveness_cooldown_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+    liveness_cooldown_until: parking_lot::Mutex<Option<tokio::time::Instant>>,
 }
 
 #[async_trait]
@@ -655,7 +655,6 @@ impl TelegramDriver {
         if self
             .liveness_cooldown_until
             .lock()
-            .expect("Telegram liveness cooldown")
             .is_some_and(|until| until > tokio::time::Instant::now())
         {
             return Err(TransportError::Service {
@@ -680,18 +679,11 @@ impl TelegramDriver {
         let body =
             serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
         if body["ok"] == Value::Bool(true) {
-            *self
-                .liveness_cooldown_until
-                .lock()
-                .expect("Telegram liveness cooldown") = None;
+            *self.liveness_cooldown_until.lock() = None;
             return Ok(body);
         }
         if let Some(retry) = retry_after_from_body(&body["parameters"], MAX_LIVENESS_COOLDOWN) {
-            *self
-                .liveness_cooldown_until
-                .lock()
-                .expect("Telegram liveness cooldown") =
-                Some(tokio::time::Instant::now() + retry.wait);
+            *self.liveness_cooldown_until.lock() = Some(tokio::time::Instant::now() + retry.wait);
             return Err(TransportError::Service {
                 code: "retry-after".to_owned(),
             });
@@ -1086,14 +1078,13 @@ mod tests {
 
     struct BotApi {
         base: String,
-        calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        calls: Arc<parking_lot::Mutex<Vec<(String, Value)>>>,
     }
 
     impl BotApi {
         fn methods(&self) -> Vec<String> {
             self.calls
                 .lock()
-                .expect("mock call log")
                 .iter()
                 .map(|(method, _)| method.clone())
                 .collect()
@@ -1102,7 +1093,6 @@ mod tests {
         fn bodies(&self, method: &str) -> Vec<Value> {
             self.calls
                 .lock()
-                .expect("mock call log")
                 .iter()
                 .filter(|(called, _)| called == method)
                 .map(|(_, body)| body.clone())
@@ -1131,7 +1121,7 @@ mod tests {
             .set_nonblocking(true)
             .expect("mock endpoint is pollable");
         let listener = tokio::net::TcpListener::from_std(listener).expect("mock endpoint adopts");
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
         tokio::spawn(async move {
             let handler = Arc::new(handler);
@@ -1155,10 +1145,7 @@ mod tests {
                         .unwrap_or_default()
                         .to_owned();
                     let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-                    recorded
-                        .lock()
-                        .expect("mock call log")
-                        .push((method.clone(), body.clone()));
+                    recorded.lock().push((method.clone(), body.clone()));
                     let encoded = serde_json::to_vec(&(*handler)(&method, &body))
                         .expect("mock response serializes");
                     let head = format!(
@@ -1222,7 +1209,7 @@ mod tests {
             http: credential_client(Duration::from_secs(5))
                 .build()
                 .expect("test client builds"),
-            liveness_cooldown_until: std::sync::Mutex::new(None),
+            liveness_cooldown_until: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1421,7 +1408,8 @@ mod tests {
 
     #[tokio::test]
     async fn progress_finalization_restores_the_apis_default_preview_state() {
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let states = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&states);
@@ -1429,7 +1417,7 @@ mod tests {
             let disabled = body["link_preview_options"]["is_disabled"]
                 .as_bool()
                 .unwrap_or(false);
-            observed.lock().unwrap().push(disabled);
+            observed.lock().push(disabled);
             posting(method, body)
         });
         let driver = driver(&api.base);
@@ -1458,7 +1446,7 @@ mod tests {
             json!({"is_disabled": true})
         );
         assert!(edits[1].get("link_preview_options").is_none());
-        assert_eq!(*states.lock().unwrap(), [true, true, false]);
+        assert_eq!(*states.lock(), [true, true, false]);
     }
 
     #[tokio::test]

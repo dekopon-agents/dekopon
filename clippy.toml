@@ -23,6 +23,11 @@ disallowed-methods = [
     { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded mpsc::channel(N) and name the full-queue policy", allow-invalid = true },
     { path = "std::sync::mpsc::channel", reason = "use a bounded channel and name the full-queue policy", allow-invalid = true },
 ]
+allow-expect-in-tests = true
+
 disallowed-types = [
-    { path = "std::sync::Condvar", reason = "a hand-rolled drain; the owner's lock or a JoinSet already is one", allow-invalid = true },
+    { path = "std::sync::Mutex", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
+    { path = "std::sync::RwLock", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
+    { path = "std::sync::Condvar", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
+
 ]

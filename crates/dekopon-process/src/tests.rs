@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     io,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 
 use tokio::sync::oneshot;
@@ -91,7 +92,6 @@ impl CaptureLayer {
             .0
             .terminal_waiters
             .lock()
-            .expect("terminal waiter lock")
             .insert(kind.to_owned(), sender);
         assert!(previous.is_none(), "one terminal waiter per process kind");
         receiver
@@ -132,21 +132,13 @@ where
         let mut fields = FieldCapture::default();
         attributes.record(&mut fields);
         if let Some(kind) = fields.process_kind {
-            self.0
-                .kinds
-                .lock()
-                .expect("span kind lock")
-                .insert(id.clone(), kind);
+            self.0.kinds.lock().insert(id.clone(), kind);
         }
-        self.0
-            .records
-            .lock()
-            .expect("capture layer lock")
-            .push(format!(
-                "{};{}",
-                attributes.metadata().name(),
-                fields.rendered
-            ));
+        self.0.records.lock().push(format!(
+            "{};{}",
+            attributes.metadata().name(),
+            fields.rendered
+        ));
     }
 
     fn on_record(
@@ -158,38 +150,22 @@ where
         let mut fields = FieldCapture::default();
         values.record(&mut fields);
         let terminal = fields.rendered.contains("process.outcome=");
-        let kind = self
-            .0
-            .kinds
-            .lock()
-            .expect("span kind lock")
-            .get(span)
-            .cloned();
+        let kind = self.0.kinds.lock().get(span).cloned();
         let rendered = match &kind {
             Some(kind) => format!("process.kind={kind:?};{}", fields.rendered),
             None => fields.rendered,
         };
-        self.0
-            .records
-            .lock()
-            .expect("capture layer lock")
-            .push(rendered);
+        self.0.records.lock().push(rendered);
         if !terminal {
             return;
         }
-        if let Some(sender) = kind.and_then(|kind| {
-            self.0
-                .terminal_waiters
-                .lock()
-                .expect("terminal waiter lock")
-                .remove(&kind)
-        }) {
+        if let Some(sender) = kind.and_then(|kind| self.0.terminal_waiters.lock().remove(&kind)) {
             assert!(sender.send(()).is_ok(), "terminal waiter remains");
         }
     }
 
     fn on_close(&self, id: tracing::span::Id, _context: Context<'_, Registry>) {
-        self.0.kinds.lock().expect("span kind lock").remove(&id);
+        self.0.kinds.lock().remove(&id);
     }
 }
 
@@ -210,12 +186,7 @@ async fn trace_fields_are_fixed_and_payload_free() {
         ProcessOutcome::Completed(Ok(()))
     ));
 
-    let trace = capture
-        .0
-        .records
-        .lock()
-        .expect("capture layer lock")
-        .join("\n");
+    let trace = capture.0.records.lock().join("\n");
     assert!(trace.contains("process.run"), "{trace}");
     assert!(trace.contains("process.node"), "{trace}");
     assert!(trace.contains("run.id="), "{trace}");
@@ -247,12 +218,7 @@ async fn trace_fields_are_fixed_and_payload_free() {
     ));
     drop(handle);
 
-    let trace = capture
-        .0
-        .records
-        .lock()
-        .expect("capture layer lock")
-        .join("\n");
+    let trace = capture.0.records.lock().join("\n");
     assert!(
         trace.contains(
             "process.kind=\"trace-cancellable-test\";process.interruptibility=\"cancellable\";"
@@ -270,12 +236,7 @@ async fn trace_fields_are_fixed_and_payload_free() {
 }
 
 fn joined_trace(capture: &CaptureLayer) -> String {
-    capture
-        .0
-        .records
-        .lock()
-        .expect("capture layer lock")
-        .join("\n")
+    capture.0.records.lock().join("\n")
 }
 
 #[tokio::test]

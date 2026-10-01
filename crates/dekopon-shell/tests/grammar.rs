@@ -1,7 +1,5 @@
-use std::{
-    sync::{Mutex, mpsc},
-    time::Duration,
-};
+use parking_lot::Mutex;
+use std::{sync::mpsc, time::Duration};
 
 use serde_json::{Value, json};
 
@@ -122,7 +120,6 @@ impl CapabilityInvoker for Fixture {
         }
         self.calls
             .lock()
-            .expect("fixture calls")
             .push((capability.to_owned(), input.clone()));
         match capability {
             "cli-probe.upper" => match input.get("text").and_then(Value::as_str) {
@@ -1223,10 +1220,7 @@ fn xargs_never_invokes_its_command_for_empty_input() {
             "{script}: {outcome:?}"
         );
         assert_eq!(outcome.capability_calls, 0, "{script}: {outcome:?}");
-        assert!(
-            fixture.calls.lock().expect("fixture calls").is_empty(),
-            "{script}"
-        );
+        assert!(fixture.calls.lock().is_empty(), "{script}");
     }
 }
 
@@ -1240,7 +1234,7 @@ fn xargs_maps_a_command_over_a_list() {
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(outcome.capability_calls, 3);
     assert_eq!(
-        *fixture.calls.lock().expect("fixture calls"),
+        *fixture.calls.lock(),
         vec![
             ("fixture.object".to_owned(), json!({"a": "a", "b": "b"})),
             ("cli-probe.upper".to_owned(), json!({"text": "a"})),
@@ -1293,7 +1287,7 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
          dekopon-shell: cli-probe.upper: command not found\n127"
     );
     assert!(
-        fixture.calls.lock().expect("fixture calls").is_empty(),
+        fixture.calls.lock().is_empty(),
         "a capability-shaped word invoked a capability"
     );
     assert_eq!(outcome.capability_calls, 0);
@@ -2395,10 +2389,7 @@ fn a_provider_command_help_page_is_stdout_exit_0_and_capturable() {
         "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text"
     );
     assert_eq!(outcome.capability_calls, 0);
-    assert!(
-        fixture.calls.lock().expect("fixture calls").is_empty(),
-        "help invoked a capability"
-    );
+    assert!(fixture.calls.lock().is_empty(), "help invoked a capability");
 
     let captured = run("h=$(probe --help); echo \"[$?]\"; echo \"$h\"");
     assert_eq!(
@@ -2431,7 +2422,7 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(
-        *fixture.calls.lock().expect("fixture calls"),
+        *fixture.calls.lock(),
         vec![
             ("cli-probe.upper".to_owned(), json!({"text": "hello\n"})),
             ("fixture.object".to_owned(), json!({"a": 1})),
@@ -2456,10 +2447,7 @@ fn a_provider_command_proposal_still_needs_the_grant() {
         "dekopon-shell: probe: requires capability nothing.granted, which is not granted in this \
          session"
     );
-    assert!(
-        fixture.calls.lock().expect("fixture calls").is_empty(),
-        "an ungranted proposal ran"
-    );
+    assert!(fixture.calls.lock().is_empty(), "an ungranted proposal ran");
     assert_eq!(outcome.capability_calls, 0);
 }
 
@@ -2597,7 +2585,7 @@ fn echo_writes_its_newline_into_the_pipe() {
     let fixture = Fixture::default();
     Interpreter::new(Limits::default()).run("echo hi | probe upper -", &fixture);
     assert_eq!(
-        *fixture.calls.lock().expect("fixture calls"),
+        *fixture.calls.lock(),
         vec![("cli-probe.upper".to_owned(), json!({"text": "hi\n"}))]
     );
 }
@@ -2782,7 +2770,7 @@ fn a_provider_list_crosses_the_pipe_as_one_json_document() {
     let fixture = Fixture::default();
     Interpreter::new(Limits::default()).run("probe list | probe upper -", &fixture);
     assert_eq!(
-        fixture.calls.lock().expect("fixture calls").last(),
+        fixture.calls.lock().last(),
         Some(&(
             "cli-probe.upper".to_owned(),
             json!({"text": "[\"a\",\"b\"]\n"})
@@ -2886,7 +2874,6 @@ impl CapabilityInvoker for OrderedFixture {
         if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
             self.released
                 .lock()
-                .expect("release receiver")
                 .recv_timeout(Duration::from_secs(2))
                 .expect("consumer observed first output before producer supplied second line");
         }
@@ -2960,10 +2947,7 @@ impl CapabilityInvoker for StdinFixture {
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        self.received
-            .lock()
-            .expect("received")
-            .push(stdin.map(str::to_owned));
+        self.received.lock().push(stdin.map(str::to_owned));
         self.fixture.run_command(word, argv, stdin)
     }
 
@@ -3023,10 +3007,7 @@ fn a_compound_read_does_not_pass_its_stream_to_a_provider() {
         &fixture,
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
-    assert_eq!(
-        *fixture.received.lock().expect("received"),
-        vec![None, None]
-    );
+    assert_eq!(*fixture.received.lock(), vec![None, None]);
 }
 
 #[test]

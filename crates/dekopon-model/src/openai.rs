@@ -1637,7 +1637,7 @@ mod tests {
             assert!(shown.contains("[REDACTED]"));
             assert!(!shown.contains(token));
             assert!(trace.text().contains("model.complete"));
-            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            assert_eq!(server.requests.lock().len(), 1);
         }
     }
 

@@ -1,10 +1,11 @@
 //! The envelope is acknowledged before processing begins because Slack resends after about three
 //! seconds while a session runs much longer; a bounded ring absorbs the redeliveries.
 
+use parking_lot::Mutex;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime},
@@ -934,13 +935,7 @@ impl InboundReaction for SlackReplier {
         };
         let key = format!("{channel_id}:{message_ts}");
         if !present {
-            if self
-                .added_reactions
-                .lock()
-                .expect("Slack reaction registry")
-                .take(&key)
-                .is_none()
-            {
+            if self.added_reactions.lock().take(&key).is_none() {
                 return Ok(());
             }
             return match self
@@ -966,10 +961,7 @@ impl InboundReaction for SlackReplier {
             .await
         {
             Ok(()) => {
-                self.added_reactions
-                    .lock()
-                    .expect("Slack reaction registry")
-                    .insert(key, ());
+                self.added_reactions.lock().insert(key, ());
                 Ok(())
             }
             Err(TransportError::Service { code }) if code == "already_reacted" => Ok(()),
@@ -1368,10 +1360,7 @@ impl SlackReplier {
     }
 
     fn begin_cooldown(&self, wait: Duration) {
-        *self
-            .progress_cooldown_until
-            .lock()
-            .expect("Slack progress cooldown") = Some(Instant::now() + wait);
+        *self.progress_cooldown_until.lock() = Some(Instant::now() + wait);
     }
 
     async fn liveness_call(&self, method: &str, body: &Value) -> Result<Value, TransportError> {
@@ -1439,10 +1428,7 @@ impl SlackReplier {
     }
 
     fn progress_cooldown(&self) -> Option<Duration> {
-        let until = (*self
-            .progress_cooldown_until
-            .lock()
-            .expect("Slack progress cooldown"))?;
+        let until = (*self.progress_cooldown_until.lock())?;
         until.checked_duration_since(Instant::now())
     }
 }
@@ -1529,28 +1515,19 @@ impl SlackThreadOwnership {
 
     fn owns(&self, claim: &ThreadClaim) -> bool {
         let key = SlackThreadKey::from_claim(claim);
-        self.owned
-            .lock()
-            .expect("Slack thread ownership registry")
-            .contains(&key)
+        self.owned.lock().contains(&key)
     }
 }
 
 impl ThreadOwnership for SlackThreadOwnership {
     fn claim(&self, claim: ThreadClaim) {
         let key = SlackThreadKey::from_claim(&claim);
-        self.owned
-            .lock()
-            .expect("Slack thread ownership registry")
-            .claim(key);
+        self.owned.lock().claim(key);
     }
 
     fn revoke(&self, claim: &ThreadClaim) {
         let key = SlackThreadKey::from_claim(claim);
-        self.owned
-            .lock()
-            .expect("Slack thread ownership registry")
-            .revoke(&key);
+        self.owned.lock().revoke(&key);
     }
 }
 
@@ -1863,7 +1840,8 @@ async fn check_ok(response: reqwest::Response) -> Result<Value, TransportError> 
 
 #[cfg(test)]
 mod driver_tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use parking_lot::Mutex;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use dekopon_agent::{CancelVia, attachment::GeneratedImage};
     use dekopon_broker_protocol::ChatTransportKind;
@@ -2009,7 +1987,7 @@ mod driver_tests {
 
     impl SlackMock {
         fn calls(&self) -> Vec<(String, Value)> {
-            self.calls.lock().expect("mock call log").clone()
+            self.calls.lock().clone()
         }
 
         fn body(&self, path: &str) -> Value {
@@ -2060,10 +2038,7 @@ mod driver_tests {
                         serde_json::from_str::<Value>(&body)
                             .expect("every call with a body carries a JSON one")
                     };
-                    recorded
-                        .lock()
-                        .expect("mock call log")
-                        .push((path.clone(), body.clone()));
+                    recorded.lock().push((path.clone(), body.clone()));
                     let (status, response) = handler(&path, &body);
                     let payload = serde_json::to_vec(&response).expect("mock response serializes");
                     let mut head = format!(

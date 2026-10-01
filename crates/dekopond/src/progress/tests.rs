@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
@@ -65,11 +66,11 @@ struct Recorder {
 
 impl Recorder {
     fn push(&self, call: Call) {
-        self.calls.lock().expect("recorder").push(call);
+        self.calls.lock().push(call);
     }
 
     fn calls(&self) -> Vec<Call> {
-        self.calls.lock().expect("recorder").clone()
+        self.calls.lock().clone()
     }
 
     #[expect(
@@ -526,7 +527,7 @@ async fn producer_events(
     struct Notes(Mutex<Vec<ProgressEvent>>);
     impl ProgressSink for Notes {
         fn emit(&self, event: ProgressEvent) {
-            self.0.lock().unwrap().push(event);
+            self.0.lock().push(event);
         }
     }
     let directory = tempfile::tempdir().unwrap();
@@ -573,7 +574,7 @@ async fn producer_events(
         }
     };
     tokio::join!(producer, server);
-    std::mem::take(&mut *notes.0.lock().unwrap())
+    std::mem::take(&mut *notes.0.lock())
 }
 
 #[tokio::test]

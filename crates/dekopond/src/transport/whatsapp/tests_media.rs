@@ -35,7 +35,7 @@ impl MediaPeer {
                 let bytes = to_bytes(body, 6_000_000)
                     .await
                     .expect("bounded fixture request");
-                let mut records = records.lock().expect("requests");
+                let mut records = records.lock();
                 let index = records.len();
                 records.push(MediaRequest {
                     path: parts.uri.to_string(),
@@ -225,7 +225,7 @@ async fn png_and_jpeg_downloads_validate_metadata_signature_and_phone_scope() {
             bytes
         );
         {
-            let requests = peer.requests.lock().expect("requests");
+            let requests = peer.requests.lock();
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[0].path, "/v25.0/789?phone_number_id=456");
             for request in requests.iter() {
@@ -261,7 +261,7 @@ async fn hostile_metadata_urls_never_receive_a_token_or_second_request() {
             .expect_err("host trap refused");
         assert!(error.to_string().contains("media-destination"), "{error:?}");
         assert!(!format!("{error:?}").contains(url));
-        assert_eq!(peer.requests.lock().expect("requests").len(), 1);
+        assert_eq!(peer.requests.lock().len(), 1);
         peer.finish().await;
     }
 }
@@ -289,10 +289,7 @@ async fn redirects_at_metadata_and_download_are_not_followed() {
             .expect_err("redirect refused");
         assert!(error.to_string().contains("http-302"));
         assert!(!format!("{error:?}").contains("secret"));
-        assert_eq!(
-            peer.requests.lock().expect("requests").len(),
-            redirect_at + 1
-        );
+        assert_eq!(peer.requests.lock().len(), redirect_at + 1);
         peer.finish().await;
     }
 }
@@ -371,7 +368,7 @@ async fn image_upload_is_multipart_and_only_message_acceptance_is_delivery() {
             .await
             .expect("image accepted");
         {
-            let requests = peer.requests.lock().expect("requests");
+            let requests = peer.requests.lock();
             assert_eq!(requests[0].path, "/v25.0/456/media");
             assert!(
                 requests[0].headers["content-type"]
@@ -436,11 +433,7 @@ async fn upload_success_is_not_delivery_and_later_failures_are_partial() {
             fail_at >= 2,
             "failure at {fail_at}: {error}"
         );
-        assert_eq!(
-            peer.requests.lock().expect("requests").len(),
-            fail_at + 1,
-            "no retry"
-        );
+        assert_eq!(peer.requests.lock().len(), fail_at + 1, "no retry");
         peer.finish().await;
     }
 }
@@ -479,7 +472,7 @@ async fn identity_and_base64_outputs_at_the_decoded_ceiling_upload_identical_byt
             .await
             .unwrap();
         {
-            let requests = peer.requests.lock().unwrap();
+            let requests = peer.requests.lock();
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[0].path, "/v25.0/456/media");
             let body = &requests[0].body;
@@ -520,7 +513,7 @@ async fn identity_and_base64_outputs_one_decoded_byte_over_refuse_before_any_upl
             matches!(error, TransportError::Service { ref code } if code == "image-too-large"),
             "{error:?}"
         );
-        assert!(peer.requests.lock().unwrap().is_empty());
+        assert!(peer.requests.lock().is_empty());
         peer.finish().await;
     }
 }
@@ -659,6 +652,6 @@ async fn a_stalled_download_times_out_without_exposing_the_signed_url() {
         !debug.contains("URL_SENTINEL") && !debug.contains("TOKEN_SENTINEL"),
         "{debug}"
     );
-    assert_eq!(peer.requests.lock().expect("requests").len(), 2);
+    assert_eq!(peer.requests.lock().len(), 2);
     drop(peer);
 }

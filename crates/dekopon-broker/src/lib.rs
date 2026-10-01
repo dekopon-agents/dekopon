@@ -1589,7 +1589,7 @@ pub trait AuditLog: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryAuditLog {
     maximum: usize,
-    state: std::sync::Mutex<Vec<AuditEvent>>,
+    state: parking_lot::Mutex<Vec<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {
@@ -1599,18 +1599,18 @@ impl InMemoryAuditLog {
         }
         Ok(Self {
             maximum,
-            state: std::sync::Mutex::new(Vec::new()),
+            state: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
     pub fn records(&self) -> Vec<AuditEvent> {
-        self.state.lock().expect("in-memory audit log").clone()
+        self.state.lock().clone()
     }
 }
 
 impl AuditLog for InMemoryAuditLog {
     async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
-        let mut records = self.state.lock().expect("in-memory audit log");
+        let mut records = self.state.lock();
         if records.len() >= self.maximum {
             return Err(AuditError::Full {
                 maximum: self.maximum,

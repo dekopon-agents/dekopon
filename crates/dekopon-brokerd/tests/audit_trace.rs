@@ -5,10 +5,11 @@
 )]
 #![allow(clippy::unwrap_used)]
 
+use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -87,13 +88,12 @@ struct Probe {
 
 impl Probe {
     fn audits(&self) -> Vec<Captured> {
-        self.audits.lock().expect("probe sink").clone()
+        self.audits.lock().clone()
     }
 
     fn parents_ended(&self, name: &str) -> Vec<String> {
         self.ended
             .lock()
-            .expect("probe sink")
             .iter()
             .filter(|ended| ended.name == name)
             .map(|ended| ended.parent_span_id.clone())
@@ -103,7 +103,6 @@ impl Probe {
     fn traces_entered(&self, name: &str) -> Vec<String> {
         self.entered
             .lock()
-            .expect("probe sink")
             .iter()
             .filter(|entered| entered.name == name)
             .map(|entered| entered.trace_id.clone())
@@ -113,7 +112,6 @@ impl Probe {
     fn span_fields(&self, name: &str) -> Vec<String> {
         self.fields
             .lock()
-            .expect("probe sink")
             .iter()
             .filter(|(span, _)| *span == name)
             .map(|(_, fields)| fields.clone())
@@ -137,10 +135,7 @@ where
         }
         let mut fields = String::new();
         attributes.record(&mut Visitor(&mut fields));
-        self.fields
-            .lock()
-            .expect("probe sink")
-            .push((metadata.name(), fields));
+        self.fields.lock().push((metadata.name(), fields));
     }
 
     fn on_record(
@@ -157,10 +152,7 @@ where
         }
         let mut fields = String::new();
         values.record(&mut Visitor(&mut fields));
-        self.fields
-            .lock()
-            .expect("probe sink")
-            .push((span.metadata().name(), fields));
+        self.fields.lock().push((span.metadata().name(), fields));
     }
 
     fn on_enter(&self, id: &tracing::span::Id, context: tracing_subscriber::layer::Context<'_, S>) {
@@ -175,7 +167,7 @@ where
             .span_context()
             .trace_id()
             .to_string();
-        self.entered.lock().expect("probe sink").push(Entered {
+        self.entered.lock().push(Entered {
             name: span.metadata().name(),
             trace_id,
         });
@@ -199,7 +191,7 @@ where
             .flat_map(|span| span.scope())
             .map(|span| span.metadata().name().to_owned())
             .collect();
-        self.audits.lock().expect("probe sink").push(Captured {
+        self.audits.lock().push(Captured {
             fields,
             trace_id,
             scope,
@@ -219,7 +211,7 @@ impl opentelemetry_sdk::trace::SpanProcessor for Probe {
     fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &opentelemetry::Context) {}
 
     fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
-        self.ended.lock().expect("probe sink").push(Ended {
+        self.ended.lock().push(Ended {
             name: span.name.into_owned(),
             parent_span_id: span.parent_span_id.to_string(),
         });

@@ -1,9 +1,9 @@
+use parking_lot::Mutex;
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -115,7 +115,7 @@ impl Journal {
         window: MemoryWindow,
         now: SystemTime,
     ) -> Result<Recalled, JournalError> {
-        let _lock = self.lock.lock().expect("journal lock");
+        let _lock = self.lock.lock();
         self.expire(now)?;
         let mut lines = match read_lines(&self.path(stem)) {
             Ok(lines) => lines,
@@ -182,7 +182,7 @@ impl Journal {
         entry: &Entry<'_>,
         window: MemoryWindow,
     ) -> Result<(), JournalError> {
-        let _lock = self.lock.lock().expect("journal lock");
+        let _lock = self.lock.lock();
         let path = self.path(stem);
         let line = Line {
             at_ms: millis(entry.at),

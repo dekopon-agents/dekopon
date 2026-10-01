@@ -1,9 +1,10 @@
+use parking_lot::Mutex;
 use std::{
     fmt,
     fs::File,
     io::{self, Write},
     os::{fd::OwnedFd, unix::fs::FileExt},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
@@ -120,10 +121,7 @@ impl DiskBlob {
                 len: bytes.len(),
             };
             {
-                let mut guard = owner
-                    .file
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = owner.file.lock();
                 let Some(BlobFile::Path(file)) = guard.as_mut() else {
                     return Err(BlobError::Reclaimed);
                 };
@@ -156,11 +154,7 @@ impl DiskBlob {
     /// The returned descriptor may be duplicated only because every consumer reads positionally; a
     /// seek-based reader would race the shared file offset.
     pub fn descriptor(&self) -> Result<OwnedFd, BlobError> {
-        let guard = self
-            .0
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.0.file.lock();
         let file = guard.as_ref().ok_or(BlobError::Reclaimed)?;
         let descriptor = match file {
             BlobFile::Path(file) => File::open(file.path())?,
@@ -173,11 +167,7 @@ impl DiskBlob {
     }
 
     pub fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> Result<(), BlobError> {
-        let guard = self
-            .0
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.0.file.lock();
         let file = guard.as_ref().ok_or(BlobError::Reclaimed)?.as_file();
         if file.metadata()?.len() != self.len() as u64 {
             return Err(BlobError::LengthChanged);
@@ -196,11 +186,7 @@ impl DiskBlob {
             return Err(BlobError::Capacity);
         }
         operation("reclaim", self.len(), || {
-            let mut file = self
-                .0
-                .file
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut file = self.0.file.lock();
             if let Some(BlobFile::Path(owned)) = file.as_ref() {
                 match std::fs::remove_file(owned.path()) {
                     Ok(()) => (),
@@ -299,11 +285,7 @@ impl From<DiskBlob> for BlobReference {
 impl Drop for Owner {
     fn drop(&mut self) {
         operation("cleanup", self.len, || {
-            let file = self
-                .file
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let file = self.file.get_mut().take();
             let file_result = file.map_or(Ok(()), BlobFile::close);
             let directory_result = self.directory.take().map_or(Ok(()), TempDir::close);
             file_result?;
@@ -372,7 +354,7 @@ mod tests {
         }
         blob.reclaim().unwrap();
         assert_eq!(blob.read(), Err(BlobError::Reclaimed));
-        assert!(blob.0.file.lock().unwrap().is_none());
+        assert!(blob.0.file.lock().is_none());
     }
 
     #[test]
@@ -423,7 +405,7 @@ mod tests {
     fn truncated_files_fail_and_unlinked_files_still_read_the_owned_descriptor() {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         {
-            let file = blob.0.file.lock().unwrap();
+            let file = blob.0.file.lock();
             let BlobFile::Path(file) = file.as_ref().unwrap() else {
                 panic!("path fixture")
             };
@@ -433,7 +415,6 @@ mod tests {
         blob.0
             .file
             .lock()
-            .unwrap()
             .as_ref()
             .unwrap()
             .as_file()
@@ -446,7 +427,7 @@ mod tests {
     fn an_unreadable_descriptor_is_a_sanitized_io_failure() {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         {
-            let mut guard = blob.0.file.lock().unwrap();
+            let mut guard = blob.0.file.lock();
             let BlobFile::Path(owned) = guard.take().unwrap() else {
                 panic!("path fixture")
             };
@@ -467,7 +448,7 @@ mod tests {
         let mut other = NamedTempFile::new().unwrap();
         other.write_all(b"not the image").unwrap();
         {
-            let guard = blob.0.file.lock().unwrap();
+            let guard = blob.0.file.lock();
             let BlobFile::Path(file) = guard.as_ref().unwrap() else {
                 panic!("path fixture")
             };
@@ -501,7 +482,7 @@ mod tests {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         let directory = blob.0.directory.as_ref().unwrap().path().to_owned();
         let path = {
-            let guard = blob.0.file.lock().unwrap();
+            let guard = blob.0.file.lock();
             let BlobFile::Path(file) = guard.as_ref().unwrap() else {
                 panic!("path fixture")
             };
@@ -540,7 +521,6 @@ mod tests {
             blob.0
                 .file
                 .lock()
-                .unwrap()
                 .as_ref()
                 .unwrap()
                 .as_file()

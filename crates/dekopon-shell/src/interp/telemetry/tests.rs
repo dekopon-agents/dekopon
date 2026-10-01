@@ -1,8 +1,5 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use tracing::{
     Subscriber,
@@ -157,7 +154,7 @@ where
             .get::<Fields>()
             .map(|fields| fields.0.clone())
             .unwrap_or_default();
-        self.spans.lock().expect("span lock").push(Captured {
+        self.spans.lock().push(Captured {
             span: Some(span.name().to_owned()),
             parents: span
                 .scope()
@@ -215,7 +212,7 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
         Interpreter::new(limits).run(script, &Fixture)
     });
 
-    let spans = spans.lock().expect("span lock").clone();
+    let spans = spans.lock().clone();
     Telemetry { outcome, spans }
 }
 
