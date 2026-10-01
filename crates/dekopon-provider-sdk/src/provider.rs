@@ -1,3 +1,6 @@
+mod bounded;
+pub use bounded::{Bounded, TooLong, Truncated};
+
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fmt;
