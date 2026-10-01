@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-01
+
+### Added
+
+- Shell scripts accept `cmd &` and `$!`: a statement followed by `&` starts as a background job
+  when the gateway gives the script job control, and otherwise fails with exit 1 naming
+  `limits.jobTimeoutMs`. See [upgrading](docs/upgrading.md#background-jobs-0300).
+- dekopond runs `cmd &` as a background job that outlives the script and the turn on routes that
+  set `limits.jobTimeoutMs`, bounded by the new `sessions.maxJobs` (default 2); jobs are lost at
+  restart.
+- Manage detached shell jobs with `jobs`, `wait` and `kill`; stop requests also cancel owned jobs.
+- Finished detached jobs notify their originating chat with bounded output on routes that enable
+  jobs.
+- Record detached job starts, outcomes and notice delivery in correlated telemetry.
+- The broker protocol's chat-scope trigger gains the value `job`.
+
+### Changed
+
+- Explain detached job control, deadlines, delivery and attachment limits in the bash tool and
+  gateway documentation.
+- Locks use parking_lot; a panic while holding a lock no longer poisons it for later callers.
+
 ## [dekopon-chart-0.19.0] - 2026-10-01
 
 ### Added
