@@ -8,6 +8,30 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Background jobs (0.30.0)
+
+Jobs are off until a route opts in. With no configuration change, 0.30.0 behaves as 0.29.0 except
+that `&`, `jobs`, `wait` and `kill` now exit 1 with a message naming `limits.jobTimeoutMs`
+instead of being refused as unsupported shell syntax.
+
+- **`limits.jobTimeoutMs`** (per route, optional): turns on detached jobs for that route and sets
+  each job's deadline. Absent means jobs are off; 0 or a value too large to be a deadline fails
+  boot naming the key.
+- **`sessions.maxJobs`** (optional, default 2): the most jobs running at once across the gateway,
+  and the most job rows it keeps. 0 fails boot.
+
+Add either key only after the 0.30.0 image runs: 0.29.0 refuses configuration it does not
+understand. Jobs are lost at restart, cannot send files or images, and a job started by a probe
+stays read-only. A notice turn may start further jobs, so on a route with `jobTimeoutMs` an agent
+can keep itself alive through successive notices; the person's stop word ends them. See
+[detached jobs](dekopond.md#detached-jobs).
+
+Library consumers: `CapabilityInvoker` gains a job-control method whose default reports no job
+control, and the broker protocol's `Trigger` gains `Job`.
+
+Chart 0.19.0 defaults to application 0.28.0; set `image.tag: v0.30.0` (or the release's
+`image.digest`) to deploy 0.30.0. No chart release accompanies it.
+
 ## The shell speaks bytes (0.29.0)
 
 No broker or gateway configuration changes. Scripts the model writes, and any recipe an operator
