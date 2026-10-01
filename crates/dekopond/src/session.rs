@@ -1042,21 +1042,18 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
-    let (is_unattended, notice_id) = match message.message_id {
-        MessageId::Native(_) => (false, None),
-        MessageId::Wake { .. } => (true, None),
-        MessageId::Job { id, .. } => (true, Some(id)),
-    };
+    let is_unattended = !matches!(message.message_id, MessageId::Native(_));
+    let notice = crate::jobs::Notice::of(&message);
     match runner.gate.admit(route, message, receipts) {
         Admit::Admitted(admission, message, receipts) => {
-            if let Some(id) = notice_id {
-                crate::jobs::record_notice(id, "new-turn");
+            if let Some(notice) = &notice {
+                notice.record("new-turn");
             }
             Some(run_admitted(runner, route, message, driver, receipts, admission).await)
         }
         Admit::Steered(receipts) => {
-            if let Some(id) = notice_id {
-                crate::jobs::record_notice(id, "steered");
+            if let Some(notice) = &notice {
+                notice.record("steered");
             }
             tracing::Span::current().record("outcome", "steered");
             receipts.finish("steered");
@@ -1064,8 +1061,8 @@ async fn execute(
             None
         }
         Admit::Queued => {
-            if let Some(id) = notice_id {
-                crate::jobs::record_notice(id, "queued");
+            if let Some(notice) = &notice {
+                notice.record("queued");
             }
             tracing::Span::current().record("outcome", "queued");
             if !is_unattended {
@@ -1074,11 +1071,11 @@ async fn execute(
             None
         }
         Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
-            if let Some(id) = notice_id {
-                crate::jobs::record_notice(id, "dropped");
+            if let Some(notice) = &notice {
+                notice.record("dropped");
             }
             tracing::info!(event = "gateway_session_rejected", reason = "busy");
-            if notice_id.is_none()
+            if notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
             {

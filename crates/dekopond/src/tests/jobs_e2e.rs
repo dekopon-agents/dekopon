@@ -161,10 +161,34 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_detached_job_records_its_start_root_finish_and_notice() {
+    use opentelemetry::trace::{TraceId, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
     let capture = dekopon_test_support::CaptureLayer::workspace();
-    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let subscriber = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("job-trace-test"))),
+    );
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
@@ -206,6 +230,64 @@ async fn a_detached_job_records_its_start_root_finish_and_notice() {
     ] {
         assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { fields, parent: actual, .. } if fields.contains("job.id=1") && fields.contains(field) && actual.as_deref() == parent)), "{field}: {records:?}");
     }
+    let context = [
+        format!("conversation.id={}", message("start").conversation.key()),
+        format!("subject={}", subject().canonical()),
+        "agent=".to_owned(),
+    ];
+    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { fields, .. } if fields.contains("job.notice.delivery") && context.iter().all(|field| fields.contains(field.as_str())))), "{context:?}: {records:?}");
+
+    provider.force_flush().unwrap();
+    let spans = exported.0.lock().clone();
+    provider.shutdown().unwrap();
+    let in_trace = |trace: TraceId, name: &str| {
+        spans
+            .iter()
+            .any(|span| span.span_context.trace_id() == trace && span.name == name)
+    };
+    let linked = |span: &SpanData| -> Vec<(TraceId, opentelemetry::trace::SpanId)> {
+        span.links
+            .links
+            .iter()
+            .map(|link| (link.span_context.trace_id(), link.span_context.span_id()))
+            .collect()
+    };
+    let job = spans
+        .iter()
+        .find(|span| span.name == "gateway.job")
+        .expect("gateway.job exported");
+    let job_trace = job.span_context.trace_id();
+    let [(starter_trace, starter_span)] = linked(job)[..] else {
+        panic!("gateway.job links once to its starter: {:?}", job.links);
+    };
+    assert_ne!(starter_trace, job_trace, "{spans:#?}");
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.span_context.span_id() == starter_span
+                && span.span_context.trace_id() == starter_trace),
+        "the job links to an exported span of its starter: {spans:#?}"
+    );
+    assert!(in_trace(starter_trace, "gateway.message"), "{spans:#?}");
+    assert!(in_trace(job_trace, "shell.script"), "{spans:#?}");
+    let notice = spans
+        .iter()
+        .find(|span| linked(span).iter().any(|(trace, _)| *trace == job_trace))
+        .expect("the notice links to its job");
+    let notice_trace = notice.span_context.trace_id();
+    assert_ne!(notice_trace, job_trace, "{spans:#?}");
+    assert_ne!(notice_trace, starter_trace, "{spans:#?}");
+    assert!(in_trace(notice_trace, "gateway.message"), "{spans:#?}");
+    assert!(
+        linked(notice)
+            .iter()
+            .all(|(trace, span_id)| *trace == job_trace
+                && spans
+                    .iter()
+                    .any(|span| span.span_context.span_id() == *span_id
+                        && span.span_context.trace_id() == job_trace)),
+        "the notice links to an exported span of the job: {spans:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

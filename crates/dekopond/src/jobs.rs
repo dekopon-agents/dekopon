@@ -6,6 +6,7 @@ use std::{
 
 use dekopon_agent::{BrokerLeg, current_trace_parent};
 use dekopon_broker_protocol::{BrokerClient, TraceParent, Trigger};
+use dekopon_core::AgentId;
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{
     CallBudget, ExitCode, Interpreter, JobControl, JobId, JobOutcome, JobRefusal, JobSeed,
@@ -17,7 +18,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use crate::{
     config::ResolvedBroker,
     transport::{
-        CancelRequest, InboundMessage, MAX_INBOUND_TEXT_BYTES, bound_inbound, floor_boundary,
+        CancelRequest, InboundMessage, MAX_INBOUND_TEXT_BYTES, MessageId, bound_inbound,
+        floor_boundary,
     },
     wake::Anchor,
 };
@@ -274,8 +276,10 @@ impl Jobs {
                     bounded.truncate(floor_boundary(&bounded, MAX_INBOUND_TEXT_BYTES));
                 }
                 let message = run.anchor.job_inbound(id, bounded, run.completed_trace);
-                if self.notices.try_send(message).is_err() {
-                    record_notice(id, "dropped");
+                if let Err(error) = self.notices.try_send(message)
+                    && let Some(notice) = Notice::of(&error.into_inner())
+                {
+                    notice.record("dropped");
                 }
             }
         }
@@ -373,8 +377,33 @@ impl Jobs {
     }
 }
 
-pub(crate) fn record_notice(id: JobId, delivery: &'static str) {
-    tracing::info!(name: "job.notice", target: "job", { job.id = %id, job.notice.delivery = delivery }, "job.notice");
+pub(crate) struct Notice {
+    id: JobId,
+    agent: AgentId,
+    owner: JobOwner,
+}
+
+impl Notice {
+    pub(crate) fn of(message: &InboundMessage) -> Option<Self> {
+        match &message.message_id {
+            MessageId::Job { id, agent } => Some(Self {
+                id: *id,
+                agent: agent.clone(),
+                owner: JobOwner::of(message),
+            }),
+            MessageId::Native(_) | MessageId::Wake { .. } => None,
+        }
+    }
+
+    pub(crate) fn record(&self, delivery: &'static str) {
+        tracing::info!(name: "job.notice", target: "job", {
+            job.id = %self.id,
+            job.notice.delivery = delivery,
+            agent = %self.agent,
+            conversation.id = %self.owner.conversation,
+            subject = %self.owner.subject,
+        }, "job.notice");
+    }
 }
 
 struct Waiter<'a> {

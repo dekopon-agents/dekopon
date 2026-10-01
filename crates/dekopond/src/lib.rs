@@ -409,17 +409,16 @@ where
                 }
             },
             Some(message) = notices.recv() => {
-                let (id, agent) = match &message.message_id {
-                    MessageId::Job { id, agent } => (*id, agent),
-                    MessageId::Native(_) | MessageId::Wake { .. } => continue,
+                let MessageId::Job { agent, .. } = &message.message_id else {
+                    continue;
                 };
                 let answering = routes.route(&message).is_some_and(|route| {
                     route.job_timeout.is_some() && &route.agent == agent
                 });
                 if answering && drivers.contains_key(&message.transport) {
                     start_session(&runner, &routes, &drivers, &mut sessions, message);
-                } else {
-                    jobs::record_notice(id, "dropped");
+                } else if let Some(notice) = jobs::Notice::of(&message) {
+                    notice.record("dropped");
                 }
             },
             event = receiver.recv() => {
