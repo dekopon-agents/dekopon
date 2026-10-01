@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn failed_invocation_with_budget_refusal_maps_to_host_memory_budget() {
         let mut limiter = super::memory::MemoryLimiter::new(
-            host::StoreLimits {
+            super::host::StoreLimits {
                 max_memory_bytes: 4 * 65_536,
                 ..Default::default()
             },
