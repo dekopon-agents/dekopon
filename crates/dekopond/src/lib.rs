@@ -18,6 +18,7 @@ mod cache_key;
 mod collection;
 mod config;
 mod conversation;
+mod jobs;
 mod journal;
 mod progress;
 mod routes;
@@ -171,6 +172,7 @@ where
         liveness: config.liveness.clone(),
         thread_ownership,
         wakes,
+        jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
     });
 
     tracing::info!(
@@ -346,6 +348,7 @@ where
     let mut sessions = JoinSet::new();
     let mut ticks = JoinSet::new();
     let mut wakes = runner.wakes.clone();
+    let mut notices = runner.jobs.take_notices();
     tokio::pin!(shutdown);
     let mut outcome = ServeOutcome::Shutdown;
 
@@ -405,6 +408,19 @@ where
                     start_session(&runner, &routes, &drivers, &mut sessions, message);
                 }
             },
+            Some(message) = notices.recv() => {
+                let MessageId::Job { agent, .. } = &message.message_id else {
+                    continue;
+                };
+                let answering = routes.route(&message).is_some_and(|route| {
+                    route.job_timeout.is_some() && &route.agent == agent
+                });
+                if answering && drivers.contains_key(&message.transport) {
+                    start_session(&runner, &routes, &drivers, &mut sessions, message);
+                } else if let Some(notice) = jobs::Notice::of(&message) {
+                    notice.record("dropped");
+                }
+            },
             event = receiver.recv() => {
                 let Some(event) = event else {
                     outcome = ServeOutcome::TransportsLost;
@@ -440,7 +456,9 @@ where
         }
     }
 
+    drop(notices);
     collector.shutdown();
+    runner.jobs.seal();
 
     // A tick that fires here has already retired its row, so its wake must still start.
     if timeout(grace, async {
@@ -487,19 +505,9 @@ fn dispatch(
     collector: &mut collection::Collector,
     message: InboundMessage,
 ) {
-    let Some((route_id, _)) = routes.route_index(&message) else {
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "unrouted",
-            conversation.kind = message.conversation.kind.as_str(),
-            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
-        );
-        return;
-    };
-    // Checked before the addressed filter, since a channel stop word like the bot mention plus stop
-    // would otherwise be dropped as unaddressed before the matcher saw it; only this sender's
-    // running or pending input may be stopped.
+    // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
+    // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
+    // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
     if transport::is_stop_word(
         identities.get(&message.transport),
         &message.text,
@@ -514,6 +522,7 @@ fn dispatch(
         let stopped = runner.gate.cancel(&request);
         let pending_cancelled = collector.cancel(&request) || stopped.dropped;
         let active_outcome = stopped.running;
+        let jobs_stopped = runner.jobs.cancel_owner(&request);
         if pending_cancelled {
             if matches!(
                 active_outcome,
@@ -551,7 +560,32 @@ fn dispatch(
             }
             CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
         }
+        if jobs_stopped {
+            if let Some(driver) = drivers.get(&message.transport).cloned()
+                && let Some(reply) = runner.gate.refusal()
+            {
+                let receipt = message.receive_span.clone();
+                sessions.spawn(
+                    async move {
+                        let _reply = reply;
+                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                    }
+                    .instrument(receipt),
+                );
+            }
+            return;
+        }
     }
+    let Some((route_id, _)) = routes.route_index(&message) else {
+        tracing::debug!(
+            event = "gateway_message_ignored",
+            transport = %message.transport,
+            reason = "unrouted",
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
+        );
+        return;
+    };
     let addressed = message.addressed.unwrap_or_else(|| {
         identities
             .get(&message.transport)
@@ -683,15 +717,31 @@ fn spawn_tick(
             timeout: route.script_timeout,
             ..dekopon_shell::Limits::default()
         });
+    let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
+        route.job_timeout.map(|timeout| dekopon_shell::Limits {
+            max_capability_calls: route.limits.max_capability_calls,
+            timeout,
+            ..dekopon_shell::Limits::default()
+        })
+    });
+    let jobs = Arc::clone(&runner.jobs);
     let broker = runner.broker.clone();
     let runtime = tokio::runtime::Handle::current();
     ticks.spawn_blocking(move || {
         let _admission = admission;
-        wake::run_tick(tick, &store, &broker, &runtime, limits)
+        wake::run_tick(
+            tick,
+            &store,
+            &broker,
+            &runtime,
+            limits,
+            job_limits.map(|limits| (jobs, limits)),
+        )
     });
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
+    runner.jobs.cancel_owner(request);
     match runner.gate.cancel(request).running.ignored_reason() {
         None => tracing::info!(
             event = "gateway_session_stop_requested",

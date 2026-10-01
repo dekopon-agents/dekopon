@@ -2679,6 +2679,7 @@ where
             capability = %request.capability,
             subject = tracing::field::Empty,
             via = tracing::field::Empty,
+            trigger = tracing::field::Empty,
             outcome = tracing::field::Empty,
             policy.errors_present = tracing::field::Empty,
             input = tracing::field::Empty,
@@ -2689,6 +2690,9 @@ where
         }
         if let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
+        }
+        if let Some(scope) = context.chat_scope() {
+            authorize.record("trigger", scope.trigger.as_str());
         }
         let input = dekopon_core::bounded_display(&request.input);
         authorize.record("input", tracing::field::display(input.text()));

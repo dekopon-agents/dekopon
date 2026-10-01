@@ -9,6 +9,7 @@ use crate::{
 
 pub(crate) mod cap;
 pub(crate) mod encode;
+pub(crate) mod jobs;
 pub(crate) mod jq;
 pub(crate) mod misc;
 pub(crate) mod text;
@@ -104,6 +105,7 @@ pub(crate) struct BuiltinContext<'a> {
     /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
     /// a real filesystem path.
     pub buffers: &'a BTreeMap<String, Vec<u8>>,
+    pub started_jobs: &'a [crate::JobId],
 }
 
 impl BuiltinContext<'_> {
@@ -179,6 +181,9 @@ pub(crate) enum BuiltinKind {
 }
 
 const REGISTRY: &[&dyn Builtin] = &[
+    &jobs::Jobs,
+    &jobs::Wait,
+    &jobs::Kill,
     &misc::Sleep,
     &misc::Progress,
     &misc::Echo,
@@ -302,6 +307,7 @@ pub(crate) mod test_support {
             invoker,
             budget: &mut budget,
             buffers: &mut buffers,
+            started_jobs: &[],
         };
         let arguments = arguments
             .iter()
@@ -323,6 +329,7 @@ pub(crate) mod test_support {
             invoker: &invoker,
             budget: &mut budget,
             buffers,
+            started_jobs: &[],
         };
         let arguments = arguments
             .iter()
@@ -350,7 +357,9 @@ mod tests {
             "false",
             "grep",
             "head",
+            "jobs",
             "jq",
+            "kill",
             "printf",
             "progress",
             "sed",
@@ -360,6 +369,7 @@ mod tests {
             "test",
             "true",
             "uniq",
+            "wait",
             "wc",
             xargs::NAME,
         ];

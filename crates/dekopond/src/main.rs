@@ -36,6 +36,9 @@ use tokio::signal::unix::{SignalKind, signal};
 
 /// Category targets run at the standard level.
 #[cfg(unix)]
+const OTEL_LOG_FILTER: &str = "job=debug";
+
+#[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
 /// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
@@ -169,6 +172,10 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         "dekopond",
     );
 
+    let logger_provider = dekopon_telemetry::optional_logger_provider(
+        settings.as_ref().map(|telemetry| &telemetry.settings),
+        "dekopond",
+    );
     let mut install = Install::new(Console {
         format: ConsoleFormat::Json,
         writer: ConsoleWriter::Stdout,
@@ -176,6 +183,9 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
     });
     if let Some(provider) = tracer_provider {
         install = install.with_traces(provider, "dekopond", OTEL_TRACE_FILTER);
+    }
+    if let Some(provider) = logger_provider {
+        install = install.with_logs(provider, OTEL_LOG_FILTER);
     }
     let telemetry = match install.install() {
         Ok(guard) => guard,

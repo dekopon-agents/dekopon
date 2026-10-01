@@ -13,14 +13,16 @@ use std::sync::Arc;
 
 use dekopon_broker::{
     AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    InvocationRequest, PolicyEngine, PolicyWorld,
+    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
+    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{Actor, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tokio::sync::{Notify, mpsc};
+use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
@@ -112,6 +114,66 @@ fn caller() -> AuthenticatedContext {
         },
     )
     .expect("caller context binds")
+}
+
+#[tokio::test]
+async fn a_job_leg_authorization_records_its_trigger() {
+    let captured = CaptureLayer::workspace();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let (entered, _receiver) = mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let broker = broker(Arc::new(GatedAudit {
+        inner: InMemoryAuditLog::new(8).expect("audit bound"),
+        entered,
+        release: Arc::clone(&release),
+    }))
+    .await;
+    let scope = ChatScopeClaim {
+        transport: "slack".parse().expect("transport"),
+        kind: ChatTransportKind::Slack,
+        conversation: Conversation {
+            kind: ConversationKind::Channel,
+            container: None,
+            id: "c0123abc".to_owned(),
+            thread: None,
+        },
+        trigger: Trigger::Job,
+    };
+    let context = AuthenticatedContext::attested_chat(
+        principal("caller"),
+        Actor::Service {
+            principal: principal("caller"),
+        },
+        principal("gateway"),
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        scope,
+    )
+    .expect("job context");
+    release.notify_one();
+    broker
+        .invoke(
+            &context,
+            None,
+            None,
+            InvocationRequest {
+                id: "job-call".parse().expect("invocation"),
+                capability: "cli-probe.upper".parse().expect("capability"),
+                trace_parent: TRACE_PARENT.parse().expect("traceparent"),
+                input: serde_json::json!({"text": "denied"}),
+                secret_use: None,
+            },
+            Default::default(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .expect("denial is accounted");
+    let authorize = captured
+        .spans()
+        .into_iter()
+        .find(|(name, fields)| *name == "broker.authorize" && fields.contains("trigger=\"job\""))
+        .expect("authorization span with job trigger")
+        .1;
+    assert!(authorize.contains("trigger=\"job\""), "{authorize}");
 }
 
 #[tokio::test]

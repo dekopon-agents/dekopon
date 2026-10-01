@@ -270,6 +270,7 @@ pub enum Trigger {
     Message,
     Wake,
     Probe,
+    Job,
 }
 
 impl Trigger {
@@ -279,6 +280,7 @@ impl Trigger {
             Self::Message => "message",
             Self::Wake => "wake",
             Self::Probe => "probe",
+            Self::Job => "job",
         }
     }
 }

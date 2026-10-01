@@ -48,6 +48,12 @@ impl Anchor {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
             return None;
         }
+        Self::for_job(message, agent)
+    }
+
+    /// A job ends inside the process that started it, so a local connection number is still the
+    /// client it names.
+    pub(crate) fn for_job(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         Some(Self {
             transport: message.transport.parse().ok()?,
             kind: message.transport_kind,
@@ -88,9 +94,34 @@ impl Anchor {
         )
     }
 
+    pub(crate) fn job_inbound(
+        &self,
+        id: dekopon_shell::JobId,
+        text: String,
+        job: Option<TraceParent>,
+    ) -> InboundMessage {
+        self.inbound_message(
+            MessageId::Job {
+                id,
+                agent: self.agent.clone(),
+            },
+            text,
+            job,
+        )
+    }
+
     pub(crate) fn inbound(&self, id: WakeId, text: String, notice: String) -> InboundMessage {
+        self.inbound_message(MessageId::Wake { id, notice }, text, self.scheduled_in)
+    }
+
+    fn inbound_message(
+        &self,
+        message_id: MessageId,
+        text: String,
+        parent: Option<TraceParent>,
+    ) -> InboundMessage {
         let span = receive_span(self.kind);
-        if let Some(parent) = self.scheduled_in {
+        if let Some(parent) = parent {
             dekopon_telemetry::link_remote(
                 &span,
                 dekopon_telemetry::TraceContextParts {
@@ -105,7 +136,7 @@ impl Anchor {
             transport_kind: self.kind,
             subject: self.subject.clone(),
             conversation: self.conversation.clone(),
-            message_id: MessageId::Wake { id, notice },
+            message_id,
             text,
             assets: Vec::new(),
             asset_overflow: false,
@@ -208,6 +239,7 @@ pub(crate) struct SessionWakes {
     runtime: tokio::runtime::Handle,
     limits: ShellLimits,
     started: SystemTime,
+    job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 }
 
 impl SessionWakes {
@@ -217,8 +249,10 @@ impl SessionWakes {
         broker: ResolvedBroker,
         runtime: tokio::runtime::Handle,
         limits: ShellLimits,
+        job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
     ) -> Self {
         Self {
+            job_control,
             bounds: store.bounds(),
             anchor,
             store,
@@ -278,10 +312,19 @@ impl WakeRegistrar for SessionWakes {
                         minimum: self.bounds.min_interval,
                     });
                 }
-                let leg = self
+                let mut leg = self
                     .anchor
                     .probe_leg(&self.broker, &self.runtime)
                     .ok_or(WakeRefusal::Unavailable)?;
+                if let Some((jobs, limits)) = self.job_control.as_ref() {
+                    leg = leg.with_job_control(Arc::new(crate::jobs::JobContext::from_probe(
+                        Arc::clone(jobs),
+                        self.anchor.clone(),
+                        self.broker.clone(),
+                        self.runtime.clone(),
+                        *limits,
+                    )));
+                }
                 let probe = Probe::baseline(script, &leg, self.limits)?;
                 self.store.register(
                     self.anchor.clone(),
@@ -326,6 +369,7 @@ pub(crate) fn run_tick(
     broker: &ResolvedBroker,
     runtime: &tokio::runtime::Handle,
     limits: Option<ShellLimits>,
+    job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 ) -> Option<Fired> {
     let verdict = match limits {
         None => Verdict::Failed {
@@ -333,7 +377,18 @@ pub(crate) fn run_tick(
             output: "[gateway: no route answers this chat as this agent with wakes on]".to_owned(),
         },
         Some(limits) => match tick.anchor().probe_leg(broker, runtime) {
-            Some(leg) => tick.run(&leg, limits),
+            Some(mut leg) => {
+                if let Some((jobs, job_limits)) = job_control {
+                    leg = leg.with_job_control(Arc::new(crate::jobs::JobContext::from_probe(
+                        jobs,
+                        tick.anchor().clone(),
+                        broker.clone(),
+                        runtime.clone(),
+                        job_limits,
+                    )));
+                }
+                tick.run(&leg, limits)
+            }
             None => Verdict::Failed {
                 exit: ExitCode::DENIED,
                 output: "[gateway: the broker could not be reached to run the probe]".to_owned(),
