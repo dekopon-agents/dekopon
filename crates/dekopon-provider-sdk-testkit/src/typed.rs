@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     marker::PhantomData,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +17,7 @@ use dekopon_http_host::LoopbackHttpsPin;
 use dekopon_provider_sdk::{
     ComponentResponse,
     provider::{
-        self, HttpError, HttpErrorCode, Port, Provider, Request, Response, StreamedRequest,
+        self, Header, HttpError, HttpErrorCode, Port, Provider, Request, Response, StreamedRequest,
         StreamedResponse,
     },
 };
@@ -26,8 +26,9 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-type CacheKey = (TypeId, PathBuf, String);
-type ComponentCache = Mutex<HashMap<CacheKey, Arc<BrokerProviderRegistry>>>;
+type CacheKey = (TypeId, PathBuf);
+type ComponentCache =
+    Mutex<HashMap<CacheKey, Vec<(BrokerHostLimits, Arc<BrokerProviderRegistry>)>>>;
 static COMPONENTS: OnceLock<ComponentCache> = OnceLock::new();
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -60,6 +61,7 @@ impl HttpScript {
 
 /// A test invocation builder for a real checked provider component.
 pub struct Run<P: Provider> {
+    component: PathBuf,
     limits: BrokerHostLimits,
     clock: Option<SystemTime>,
     http: Option<Result<ScriptServer, HarnessError>>,
@@ -70,10 +72,11 @@ pub struct Run<P: Provider> {
 pub struct Harness<P: Provider>(PhantomData<P>);
 
 impl<P: Provider> Harness<P> {
-    /// Returns a fresh invocation builder; the compiled component is shared per binary and provider type.
+    /// Binds a caller-supplied artifact; the compiled component is shared per binary and provider type.
     #[must_use]
-    pub fn get() -> Run<P> {
+    pub fn get(component: impl AsRef<Path>) -> Run<P> {
         Run {
+            component: component.as_ref().to_path_buf(),
             limits: BrokerHostLimits::default(),
             clock: None,
             http: None,
@@ -155,25 +158,23 @@ impl<P: Provider> Run<P> {
         capability: &str,
         input: Value,
     ) -> Result<dekopon_broker_host::BrokerInvocationOutput, HarnessError> {
-        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/providers")
-            .join(format!("{}-provider.wasm", P::ID));
-        let key = (
-            TypeId::of::<P>(),
-            component.clone(),
-            format!("{:?}", self.limits),
-        );
+        let component = self.component.canonicalize()?;
+        let key = (TypeId::of::<P>(), component.clone());
         let cache = COMPONENTS.get_or_init(|| Mutex::new(HashMap::new()));
         let registry = {
             let mut entries = cache.lock();
-            if let Some(cached) = entries.get(&key) {
+            let configurations = entries.entry(key).or_default();
+            if let Some((_, cached)) = configurations
+                .iter()
+                .find(|(limits, _)| *limits == self.limits)
+            {
                 Arc::clone(cached)
             } else {
                 let loaded = Arc::new(runtime().block_on(BrokerProviderRegistry::load(
                     [component],
                     self.limits.clone(),
                 ))?);
-                entries.insert(key, Arc::clone(&loaded));
+                configurations.push((self.limits.clone(), Arc::clone(&loaded)));
                 loaded
             }
         };
@@ -255,7 +256,49 @@ impl Drop for ScriptServer {
     }
 }
 
+fn response_head(response: &Response) -> Result<Vec<u8>, HarnessError> {
+    let mut bytes = format!("HTTP/1.1 {} OK\r\n", response.status).into_bytes();
+    let expected_length = response.body.len().to_string();
+    let mut has_length = false;
+    for header in &response.headers {
+        Header::new(header.name.as_str(), header.value.as_slice())
+            .map_err(|_error| HarnessError::Fixture("invalid scripted response header"))?;
+        let name = header.name.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "transfer-encoding"
+                | "trailer"
+                | "upgrade"
+                | "proxy-connection"
+                | "keep-alive"
+        ) {
+            return Err(HarnessError::Fixture(
+                "scripted response cannot set hop-by-hop headers",
+            ));
+        }
+        if name == "content-length" {
+            if has_length || header.value != expected_length.as_bytes() {
+                return Err(HarnessError::Fixture(
+                    "scripted content length must match the body",
+                ));
+            }
+            has_length = true;
+        }
+        bytes.extend_from_slice(header.name.as_bytes());
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(&header.value);
+        bytes.extend_from_slice(b"\r\n");
+    }
+    if !has_length {
+        bytes.extend_from_slice(format!("Content-Length: {expected_length}\r\n").as_bytes());
+    }
+    bytes.extend_from_slice(b"Connection: close\r\n\r\n");
+    Ok(bytes)
+}
+
 fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
+    let response_head = response_head(&script.response)?;
     if script.hostname.is_empty()
         || !script
             .hostname
@@ -291,12 +334,7 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
                 let mut request = [0; 4096];
                 if tls.read(&mut request).await.is_ok() {
                     let body = &script.response.body;
-                    let response = format!(
-                        "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        script.response.status,
-                        body.len()
-                    );
-                    if tls.write_all(response.as_bytes()).await.is_ok()
+                    if tls.write_all(&response_head).await.is_ok()
                         && tls.write_all(body).await.is_ok()
                     {
                         drop(tls.shutdown().await);
