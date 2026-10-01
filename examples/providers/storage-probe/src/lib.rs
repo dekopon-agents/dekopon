@@ -33,8 +33,20 @@ enum Mode {
     DropAfterDenial,
 }
 
-#[derive(Debug)]
-struct ProbeError(&'static str);
+#[derive(Debug, Eq, PartialEq)]
+enum ProbeError {
+    StorageError,
+    ShortRead,
+    SparseWrite,
+    Stat,
+    Identity,
+    RecreatedStat,
+    IdentityReused,
+    DeleteOnClose,
+    Entropy,
+    UnexpectedPresentFile,
+    UnexpectedResult,
+}
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("storage probe failed")
@@ -42,14 +54,23 @@ impl std::fmt::Display for ProbeError {
 }
 impl Failure for ProbeError {
     fn code(&self) -> Code {
-        Code::new(self.0)
+        Code::new(match self {
+            Self::StorageError => "storage-error",
+            Self::ShortRead => "short-read",
+            Self::SparseWrite => "sparse-write",
+            Self::Stat => "stat",
+            Self::Identity => "identity",
+            Self::RecreatedStat => "recreated-stat",
+            Self::IdentityReused => "identity-reused",
+            Self::DeleteOnClose => "delete-on-close",
+            Self::Entropy => "entropy",
+            Self::UnexpectedPresentFile => "unexpected-present-file",
+            Self::UnexpectedResult => "unexpected-result",
+        })
     }
 }
-fn failure(code: &'static str) -> ProbeError {
-    ProbeError(code)
-}
 fn map(_: StorageError) -> ProbeError {
-    failure("storage-error")
+    ProbeError::StorageError
 }
 
 impl Provider for StorageProbe {
@@ -110,11 +131,11 @@ fn run(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
     first.write_at(0, b"abc").map_err(map)?;
     let short = first.read_at(0, 16).map_err(map)?;
     if short != b"abc" {
-        return Err(failure("short-read"));
+        return Err(ProbeError::ShortRead);
     }
     first.write_at(8, b"z").map_err(map)?;
     if first.size().map_err(map)? != 9 {
-        return Err(failure("sparse-write"));
+        return Err(ProbeError::SparseWrite);
     }
     first.truncate(16).map_err(map)?;
     for mode in [
@@ -139,10 +160,10 @@ fn run(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
     let identity = storage
         .stat("renamed.db")
         .map_err(map)?
-        .ok_or_else(|| failure("stat"))?
+        .ok_or(ProbeError::Stat)?
         .identity;
     if identity == 0 {
-        return Err(failure("identity"));
+        return Err(ProbeError::Identity);
     }
     let recreated = storage
         .open(
@@ -154,10 +175,10 @@ fn run(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
     let recreated_identity = storage
         .stat("probe.db")
         .map_err(map)?
-        .ok_or_else(|| failure("recreated-stat"))?
+        .ok_or(ProbeError::RecreatedStat)?
         .identity;
     if recreated_identity == identity {
-        return Err(failure("identity-reused"));
+        return Err(ProbeError::IdentityReused);
     }
     storage.remove("probe.db", Durability::Full).map_err(map)?;
     let deleting = storage
@@ -171,11 +192,11 @@ fn run(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
         .map_err(map)?;
     drop(deleting);
     if storage.stat("delete.tmp").map_err(map)?.is_some() {
-        return Err(failure("delete-on-close"));
+        return Err(ProbeError::DeleteOnClose);
     }
     let entropy = storage.random_bytes(32).map_err(map)?;
     if entropy.len() != 32 {
-        return Err(failure("entropy"));
+        return Err(ProbeError::Entropy);
     }
     let _monotonic = storage.monotonic_time_ns().map_err(map)?;
     let _wall = storage.wall_time_ms().map_err(map)?;
@@ -203,7 +224,7 @@ fn catch_quota_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeErr
 }
 fn catch_budget_denial(storage: &Storage<DurableFiles>) -> Result<Value, ProbeError> {
     if storage.stat("missing.db").map_err(map)?.is_some() {
-        return Err(failure("unexpected-present-file"));
+        return Err(ProbeError::UnexpectedPresentFile);
     }
     expect(storage.stat("missing.db"), StorageError::QuotaExceeded)?;
     Ok(json!({"caught":"budget"}))
@@ -258,7 +279,7 @@ fn exercise_open_flags(storage: &Storage<DurableFiles>) -> Result<(), ProbeError
 fn expect<T>(result: Result<T, StorageError>, expected: StorageError) -> Result<(), ProbeError> {
     match result {
         Err(actual) if actual == expected => Ok(()),
-        _ => Err(failure("unexpected-result")),
+        _ => Err(ProbeError::UnexpectedResult),
     }
 }
 
@@ -269,6 +290,19 @@ mod tests {
     use super::*;
     use dekopon_provider_sdk::CommandRunOutcome;
     use dekopon_provider_sdk::provider;
+    #[test]
+    fn storage_failures_keep_distinct_typed_codes() {
+        assert_eq!(ProbeError::ShortRead.code(), Code::new("short-read"));
+        assert_eq!(
+            ProbeError::UnexpectedResult.code(),
+            Code::new("unexpected-result")
+        );
+        assert!(matches!(
+            map(StorageError::PermissionDenied),
+            ProbeError::StorageError
+        ));
+    }
+
     #[test]
     fn typed_dispatch_and_closed_modes() {
         let manifest = provider::manifest::<StorageProbe>().unwrap();

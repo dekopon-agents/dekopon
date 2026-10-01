@@ -136,7 +136,7 @@ mod tests {
         }
         let error = rfc3339(MAX_RFC3339_UNIX_MILLIS + 1).unwrap_err();
         assert_eq!(error.code().as_str(), "clock-out-of-range");
-        assert!(error.to_string().contains("253402300800000"));
+        assert!(matches!(error, ClockError(millis) if millis == MAX_RFC3339_UNIX_MILLIS + 1));
         assert_eq!(
             reading(951_782_400_000).unwrap(),
             json!({"unixMillis": 951_782_400_000_u64, "rfc3339": "2000-02-29T00:00:00Z"})
