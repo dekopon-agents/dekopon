@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.19.0] - 2026-10-01
+
+### Added
+
+- Materialize operator skill directories from a ConfigMap for gateway and console catalogs.
+  `gateway.skills.configMap` and `items` map keys to nested paths at `paths.skillsDir`
+  (default `/etc/dekopon-skills`). The init container copies regular files into a bounded
+  memory-backed volume; runtime readers mount it read-only and the broker receives no mount.
+  Native symlink checks remain unchanged. External skill updates require a pod rollout.
+
 ## [0.29.0] - 2026-09-30
 
 ### Added
