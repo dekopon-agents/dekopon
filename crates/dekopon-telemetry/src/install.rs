@@ -326,7 +326,8 @@ pub struct ShutdownError(String);
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use tracing_subscriber::{Layer as _, layer::Context, layer::SubscriberExt as _, registry};
 
@@ -337,7 +338,7 @@ mod tests {
 
     impl std::io::Write for Output {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("output").extend_from_slice(bytes);
+            self.0.lock().extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -371,8 +372,7 @@ mod tests {
                 let _entered = span.enter();
                 let native = crate::current_trace_context();
                 tracing::info!(retained = 9, "inside");
-                let text = String::from_utf8(output.0.lock().expect("output").clone())
-                    .expect("UTF-8 JSON");
+                let text = String::from_utf8(output.0.lock().clone()).expect("UTF-8 JSON");
                 let lines: Vec<_> = text.lines().collect();
                 assert_eq!(lines.len(), 2);
                 assert!(!lines[0].contains("trace_id"));
@@ -467,10 +467,7 @@ mod tests {
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordTargets {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
-            self.0
-                .lock()
-                .expect("target log")
-                .push(event.metadata().target().to_owned());
+            self.0.lock().push(event.metadata().target().to_owned());
         }
     }
 
@@ -492,7 +489,7 @@ mod tests {
             });
 
             assert_eq!(
-                *recorded.0.lock().expect("target log"),
+                *recorded.0.lock(),
                 vec!["dekopond".to_owned()],
                 "{directive}"
             );

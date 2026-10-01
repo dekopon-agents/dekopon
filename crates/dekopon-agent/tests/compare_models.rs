@@ -11,9 +11,10 @@ use dekopon_model::{
 };
 use dekopon_shell::{ExitCode, ScriptOutcome};
 use dekopon_test_support::LoopbackServer;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,7 +26,7 @@ impl ScriptRuntime for SyntheticRuntime {
     }
 
     fn run_script(&self, script: &str) -> ScriptOutcome {
-        self.0.lock().unwrap().push(script.to_owned());
+        self.0.lock().push(script.to_owned());
         ScriptOutcome {
             output: "synthetic-result".into(),
             exit_code: ExitCode::SUCCESS,
@@ -118,7 +119,7 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
                 &mut History::default(),
             )
             .unwrap();
-            (outcome, runtime.0.into_inner().unwrap())
+            (outcome, runtime.0.into_inner())
         })
         .await
         .unwrap();

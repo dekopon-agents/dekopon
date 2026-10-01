@@ -6,13 +6,9 @@ use dekopon_core::{
     chat_asset_marker,
 };
 use dekopon_model::asset::{BlobError, DiskBlob};
+use parking_lot::Mutex;
 use serde_json::Value;
-use std::{
-    fmt,
-    io::Read,
-    os::fd::OwnedFd,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, io::Read, os::fd::OwnedFd, sync::Arc};
 use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
@@ -187,29 +183,13 @@ impl ReplyAttachments {
         }
     }
     pub fn remaining(&self) -> u8 {
-        self.limit.saturating_sub(
-            self.queued
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .spent,
-        )
+        self.limit.saturating_sub(self.queued.lock().spent)
     }
     pub fn has_queued(&self) -> bool {
-        !self
-            .queued
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .images
-            .is_empty()
+        !self.queued.lock().images.is_empty()
     }
     pub fn take(&self) -> Vec<GeneratedImage> {
-        std::mem::take(
-            &mut self
-                .queued
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .images,
-        )
+        std::mem::take(&mut self.queued.lock().images)
     }
     #[expect(
         clippy::too_many_arguments,
@@ -233,10 +213,7 @@ impl ReplyAttachments {
         for id in sent {
             match self.registrar.send(id) {
                 Ok(Some(image)) => {
-                    let mut queued = self
-                        .queued
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut queued = self.queued.lock();
                     if queued.spent < self.limit {
                         queued.spent += 1;
                         queued.ids.push(id);
@@ -255,10 +232,7 @@ impl ReplyAttachments {
                     note.push_str(&format!(
                         "[gateway: chat-asset:{id} was not queued: {error}]\n"
                     ));
-                    let mut queued = self
-                        .queued
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut queued = self.queued.lock();
                     // This accepted send spent broker allowance even though no upload can start.
                     queued.spent = queued.spent.saturating_add(1);
                     self.registrar.delivery_failed();
@@ -277,10 +251,7 @@ impl ReplyAttachments {
         note
     }
     pub fn finish(&self, disposition: AssetDeliveryDisposition) {
-        let mut queued = self
-            .queued
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queued = self.queued.lock();
         if queued.finished {
             return;
         }

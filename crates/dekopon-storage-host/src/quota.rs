@@ -1,7 +1,5 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{StorageHostError, StorageLimits, layout::Usage};
 
@@ -43,7 +41,7 @@ impl QuotaLedger {
         bytes: u64,
         entries: u64,
     ) -> Result<RootReservation, StorageHostError> {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         let total_bytes = state
             .root_used
             .checked_add(state.root_reserved)
@@ -76,7 +74,7 @@ impl QuotaLedger {
     }
 
     pub(crate) fn observe_namespaces(&self, observed: impl IntoIterator<Item = String>) {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         state.namespace_slots.extend(observed);
     }
 
@@ -85,7 +83,7 @@ impl QuotaLedger {
         namespace: String,
         observed: std::collections::BTreeSet<String>,
     ) -> Result<NamespaceReservation, StorageHostError> {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         // Observations can race another namespace's creation; unioning stays conservative, while
         // replacing the set with a stale snapshot could admit the root above maxNamespaces.
         state.namespace_slots.extend(observed);
@@ -120,7 +118,7 @@ impl QuotaLedger {
         namespace: String,
         namespace_usage: Usage,
     ) -> Result<Reservation, StorageHostError> {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         if state.active_invocations >= self.limits.max_active_invocations {
             return Err(StorageHostError::Busy);
         }
@@ -158,7 +156,7 @@ impl QuotaLedger {
             .entries
             .checked_sub(after.entries)
             .ok_or(StorageHostError::Arithmetic)?;
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         state.root_used = state
             .root_used
             .checked_sub(bytes)
@@ -181,7 +179,7 @@ impl QuotaLedger {
     }
 
     pub(crate) fn acquire_handle(&self) -> Result<(), StorageHostError> {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         if state.open_handles >= self.limits.max_open_handles {
             return Err(StorageHostError::QuotaExceeded);
         }
@@ -193,7 +191,7 @@ impl QuotaLedger {
     }
 
     pub(crate) fn release_handle(&self) {
-        let mut state = self.state.lock().expect("storage quota ledger");
+        let mut state = self.state.lock();
         state.open_handles = state.open_handles.saturating_sub(1);
     }
 }
@@ -209,7 +207,7 @@ pub(crate) struct NamespaceReservation {
 impl NamespaceReservation {
     pub(crate) fn commit(mut self) {
         if self.newly_reserved {
-            let mut state = self.ledger.state.lock().expect("storage quota ledger");
+            let mut state = self.ledger.state.lock();
             state.pending_namespace_slots.remove(&self.namespace);
             state.namespace_slots.insert(self.namespace.clone());
         }
@@ -222,7 +220,7 @@ impl Drop for NamespaceReservation {
         if self.finalized || !self.newly_reserved {
             return;
         }
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         state.pending_namespace_slots.remove(&self.namespace);
         self.finalized = true;
     }
@@ -238,7 +236,7 @@ pub(crate) struct RootReservation {
 
 impl RootReservation {
     pub(crate) fn commit(mut self, before: Usage, after: Usage) -> Result<(), StorageHostError> {
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         let byte_growth = after.bytes.saturating_sub(before.bytes);
         let entry_growth = after.entries.saturating_sub(before.entries);
         if byte_growth > self.bytes || entry_growth > self.entries {
@@ -287,7 +285,7 @@ impl Drop for RootReservation {
         if self.finalized {
             return;
         }
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         release_root_locked(&mut state, self.bytes, self.entries);
         self.finalized = true;
     }
@@ -313,7 +311,7 @@ impl Reservation {
         }
         let additional = desired.saturating_sub(self.reserved);
         let additional_entries = desired_entries.saturating_sub(self.entries_reserved);
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         let root_total = state
             .root_used
             .checked_add(state.root_reserved)
@@ -356,7 +354,7 @@ impl Reservation {
     }
 
     pub(crate) fn observe_direct(&mut self, final_usage: Usage) -> Result<(), StorageHostError> {
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         let old = *state.namespace_used.get(&self.namespace).unwrap_or(&0);
         let old_entries = *state.namespace_entries.get(&self.namespace).unwrap_or(&0);
         state.root_used = if final_usage.bytes >= old {
@@ -393,7 +391,7 @@ impl Reservation {
     }
 
     pub(crate) fn abort(mut self) {
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         release_locked(
             &mut state,
             &self.namespace,
@@ -415,7 +413,7 @@ impl Drop for Reservation {
         if self.finalized {
             return;
         }
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
+        let mut state = self.ledger.state.lock();
         release_locked(
             &mut state,
             &self.namespace,

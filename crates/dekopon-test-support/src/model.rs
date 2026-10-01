@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::{
     ops::ControlFlow,
     sync::{
-        Mutex,
         atomic::{AtomicU32, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
@@ -87,11 +87,7 @@ impl ScriptedStreamModel {
             reason = "this fixture's own deadline elapsing is the outcome the parked-stream \
                       test asserts on rather than an error"
         )]
-        let _ = self
-            .gate
-            .lock()
-            .expect("stream gate")
-            .recv_timeout(self.deadline);
+        let _ = self.gate.lock().recv_timeout(self.deadline);
     }
 }
 
@@ -104,7 +100,7 @@ impl ChatModel for ScriptedStreamModel {
         on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         self.asked.notify_one();
-        let scripted = std::mem::take(&mut *self.events.lock().expect("scripted events"));
+        let scripted = std::mem::take(&mut *self.events.lock());
         for event in scripted {
             self.wait_for_release();
             let flow = on_event(event);

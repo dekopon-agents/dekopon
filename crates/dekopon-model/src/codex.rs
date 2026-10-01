@@ -1213,7 +1213,7 @@ mod tests {
             error,
             InferenceError::Protocol(ProtocolFailure::ContinuationMismatch)
         ));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
         assert!(matches!(
             client.with_loopback_endpoint("http://localhost:8000"),
             Err(InferenceError::InvalidRequest(
@@ -1233,7 +1233,7 @@ mod tests {
             generate(&client, &control()).await,
             Err(InferenceError::Authentication(AuthError::Provider(_)))
         ));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     fn write_credential(directory: &TempDir, suffix: &str, expires_at: u64) {
@@ -1322,7 +1322,7 @@ mod tests {
             assert_redacted(&error, &trace, &sentinels);
             assert!(trace.text().contains("provider.request_id"));
             assert_eq!(
-                server.requests.lock().unwrap().len(),
+                server.requests.lock().len(),
                 if status == 401 { 2 } else { 1 }
             );
         }
@@ -1353,7 +1353,7 @@ mod tests {
             &["synthetic-access-initial", "synthetic-access-rotated"],
         );
         assert!(trace.text().contains("model.returned"));
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1402,7 +1402,7 @@ mod tests {
             &trace,
             &["synthetic-access-initial", "synthetic-refresh-initial"],
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().len(), 2);
     }
 
     #[test]
@@ -1437,7 +1437,7 @@ mod tests {
         let (_directory, server, client) = fixture(vec![MockResponse::sse(body).split(1)]);
         let turn = generate(&client, &control()).await.unwrap();
         assert_eq!(turn.content.as_deref(), Some("🍊"));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1460,7 +1460,7 @@ mod tests {
             .unwrap();
         release.send(()).unwrap();
         assert!(matches!(result, Err(InferenceError::Cancelled)));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1481,7 +1481,7 @@ mod tests {
             .unwrap();
         release.send(()).unwrap();
         assert!(matches!(result, Err(InferenceError::DeadlineExceeded)));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1493,7 +1493,7 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(InferenceError::Cancelled)));
-        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(server.requests.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1584,7 +1584,7 @@ mod tests {
         write_credential(&directory, "rotated", u64::MAX);
         let result = generate(&client, &control()).await;
         assert!(matches!(result, Err(InferenceError::Authentication(_))));
-        let requests = server.requests.lock().unwrap();
+        let requests = server.requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].split_once("\r\n\r\n").unwrap().1,
@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(error.0.retry_after, Some(Duration::from_secs(7)));
         assert_eq!(error.0.request_id.as_deref(), Some("req-1"));
         assert_eq!(error.0.code.as_deref(), Some("quota"));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1660,7 +1660,7 @@ mod tests {
                     | (InferenceError::Transport(_), Expected::Transport)
                     | (InferenceError::Authentication(_), Expected::Authentication)
             ));
-            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            assert_eq!(server.requests.lock().len(), 1);
         }
     }
 
@@ -1748,7 +1748,7 @@ mod tests {
                 ProtocolFailure::ContinuationMismatch
             ))
         ));
-        assert!(other_server.requests.lock().unwrap().is_empty());
+        assert!(other_server.requests.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1777,7 +1777,7 @@ mod tests {
                 ProtocolFailure::ContinuationMismatch
             ))
         ));
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1792,7 +1792,7 @@ mod tests {
         assert_eq!(error.status, Some(200));
         assert_eq!(error.code.as_deref(), Some("refused"));
         assert_eq!(error.request_id.as_deref(), Some("stream-request"));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(server.requests.lock().len(), 1);
     }
 
     #[test]

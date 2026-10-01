@@ -2,13 +2,14 @@
 //! attachment reference is reading already-authenticated data, not deciding whether an effect may
 //! happen.
 
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
     io::Read,
     os::fd::OwnedFd,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -128,10 +129,7 @@ impl AssetFence {
     }
 
     pub fn deactivate(&self) {
-        let _gate = self
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = self.gate.lock();
         self.active.store(false, Ordering::Release);
     }
 
@@ -189,10 +187,7 @@ impl AssetAccess {
         let Some(fence) = self.fence.as_ref() else {
             return Some(operation(&self.key));
         };
-        let _gate = fence
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = fence.gate.lock();
         fence.is_active().then(|| operation(&self.key))
     }
 
@@ -277,10 +272,7 @@ impl AssetStore {
     ) -> Registered {
         access
             .with_active(|state_key| {
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.entries.lock();
                 Self::expire(&mut entries, self.idle_timeout, now);
                 let mut arrived = Vec::with_capacity(arriving.len());
                 if !arriving.is_empty() {
@@ -313,7 +305,6 @@ impl AssetStore {
                         let evicted = entry.assets.remove(0);
                         self.retention
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .evict(&(state_key.clone(), evicted.id));
                     }
                     Self::enforce_ceiling(&mut entries, self.conversations);
@@ -350,10 +341,7 @@ impl AssetStore {
             return;
         }
         access.with_active(|state_key| {
-            let mut entries = self
-                .entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut entries = self.entries.lock();
             Self::expire(&mut entries, self.idle_timeout, now);
             let entry = entries
                 .entry(state_key.clone())
@@ -399,10 +387,7 @@ impl AssetStore {
     pub fn get_access(&self, access: &AssetAccess, id: u64, now: Instant) -> Option<AssetRef> {
         access
             .with_active(|state_key| {
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.entries.lock();
                 Self::expire(&mut entries, self.idle_timeout, now);
                 let entry = entries.get_mut(state_key)?;
                 entry.touched = now;
@@ -441,10 +426,7 @@ impl AssetStore {
 
 impl fmt::Debug for AssetStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = self.entries.lock();
         formatter
             .debug_struct("AssetStore")
             .field("conversations", &entries.len())
@@ -643,10 +625,7 @@ impl AssetSource for SessionAssets {
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
         {
-            let mut spent = self
-                .spent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut spent = self.spent.lock();
             if *spent >= MAX_FETCHES_PER_SESSION {
                 return Err(format!(
                     "This session has already opened {MAX_FETCHES_PER_SESSION} attachments, which is the limit. Answer with what you have."
@@ -971,10 +950,7 @@ impl AssetStore {
             .inventory
     }
     fn check_size(&self, id: u64, bytes: usize) -> Result<(), BlobError> {
-        self.retention
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .check_size(id, bytes)
+        self.retention.lock().check_size(id, bytes)
     }
     fn pin(
         &self,
@@ -984,18 +960,12 @@ impl AssetStore {
     ) -> Result<Option<DiskBlob>, BlobError> {
         access
             .with_active(|key| {
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.entries.lock();
                 Self::expire(&mut entries, self.idle_timeout, Instant::now());
                 let asset = entries
                     .get(key)
                     .and_then(|entry| entry.assets.iter().find(|asset| asset.id == id));
-                let mut retention = self
-                    .retention
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut retention = self.retention.lock();
                 let cache_key = (key.clone(), id);
                 let Some(asset) = asset else {
                     let reclaimed = retention.released.contains(&cache_key);
@@ -1024,24 +994,15 @@ impl AssetStore {
                 }
             })
             .unwrap_or_else(|| {
-                self.retention
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .miss(id, 0, "unauthorized");
+                self.retention.lock().miss(id, 0, "unauthorized");
                 Err(BlobError::Unauthorized)
             })
     }
     fn admit(&self, access: &AssetAccess, id: u64, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
         access
             .with_active(|key| {
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut retention = self
-                    .retention
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.entries.lock();
+                let mut retention = self.retention.lock();
                 // The completed download is recorded before any fallible size, cleanup, or
                 // admission check, since a successfully downloaded input must never silently be
                 // fetched twice.
@@ -1124,8 +1085,8 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
         // authoritative even when it does not match what was sniffed.
         let detected = sniff(&data, metadata.encoding)?;
         self.access.with_active(|key| {
-            let mut entries = self.store.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut retention = self.store.retention.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut entries = self.store.entries.lock();
+            let mut retention = self.store.retention.lock();
             let id = self.access.allocate_id(&self.store.next_one_shot_id);
             let data = retention.admit_with((key.clone(), id), len, || Ok(data))?;
             drop(data);
@@ -1152,11 +1113,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
     fn remove(&self, id: u64) -> Result<(), BlobError> {
         self.access
             .with_active(|key| {
-                let mut entries = self
-                    .store
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.store.entries.lock();
                 let entry = entries.get_mut(key).ok_or(BlobError::Unknown)?;
                 let index = entry
                     .assets
@@ -1166,11 +1123,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 if entry.assets[index].sent {
                     return Err(BlobError::Unauthorized);
                 }
-                self.store
-                    .retention
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&(key.clone(), id))?;
+                self.store.retention.lock().remove(&(key.clone(), id))?;
                 entry.assets.remove(index);
                 Ok(())
             })
@@ -1179,11 +1132,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
     fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError> {
         self.access
             .with_active(|key| {
-                let mut entries = self
-                    .store
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut entries = self.store.entries.lock();
                 let asset = entries
                     .get_mut(key)
                     .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
@@ -1194,11 +1143,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 // Mark an asset sent once, even if its retained file becomes unavailable; never
                 // retry the send implicitly.
                 asset.sent = true;
-                let retention = self
-                    .store
-                    .retention
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let retention = self.store.retention.lock();
                 let data = retention
                     .resident
                     .get(&(key.clone(), id))
@@ -1215,13 +1160,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
     }
     fn delivery_failed(&self) {
         self.access.with_active(|key| {
-            if let Some(entry) = self
-                .store
-                .entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(key)
-            {
+            if let Some(entry) = self.store.entries.lock().get_mut(key) {
                 entry.delivery_failed = true;
             }
         });
@@ -1230,7 +1169,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
 impl AssetStore {
     pub fn take_delivery_notice(&self, access: &AssetAccess) -> Option<&'static str> {
         access.with_active(|key| {
-            let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut entries = self.entries.lock();
             let entry = entries.get_mut(key)?;
             std::mem::take(&mut entry.delivery_failed).then_some("[gateway: a previous asset send did not complete. Sent flags remain set; no automatic retry was made.]")
         }).flatten()
@@ -1358,7 +1297,7 @@ mod retention_tests {
         assert!(store.pin(&access, a, false).unwrap().is_some());
         assert_eq!(store.pin(&access, b, true), Err(BlobError::Reclaimed));
         assert!(store.pin(&access, c, false).unwrap().is_some());
-        assert_eq!(store.retention.lock().unwrap().bytes, 6);
+        assert_eq!(store.retention.lock().bytes, 6);
     }
 
     #[test]
@@ -1381,14 +1320,14 @@ mod retention_tests {
                 store.get_inventory(&access).len(),
                 MAX_ASSETS_PER_CONVERSATION
             );
-            assert_eq!(store.retention.lock().unwrap().bytes, 3);
+            assert_eq!(store.retention.lock().bytes, 3);
             register(&store, &access);
             assert_eq!(
                 store.get_inventory(&access).len(),
                 MAX_ASSETS_PER_CONVERSATION
             );
             assert!(store.get_access(&access, first, Instant::now()).is_none());
-            let retained = store.retention.lock().unwrap();
+            let retained = store.retention.lock();
             assert_eq!(retained.resident.len(), usize::from(pinned));
             assert_eq!(retained.bytes, if pinned { 3 } else { 0 });
             if let Some(pin) = pin {
@@ -1418,7 +1357,7 @@ mod retention_tests {
                 }
             }
             assert_eq!(
-                store.retention.lock().unwrap().resident.len(),
+                store.retention.lock().resident.len(),
                 MAX_ASSETS_PER_CONVERSATION
             );
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
@@ -1431,7 +1370,7 @@ mod retention_tests {
                     .get_access(&access, first.unwrap(), Instant::now())
                     .is_none()
             );
-            let retained = store.retention.lock().unwrap();
+            let retained = store.retention.lock();
             let expected = MAX_ASSETS_PER_CONVERSATION + usize::from(pinned);
             assert_eq!(retained.resident.len(), expected);
             assert_eq!(retained.bytes, 3 * expected);
@@ -1451,14 +1390,14 @@ mod retention_tests {
         assert_eq!(store.admit(&access, b, b"bbbb"), Err(BlobError::TooLarge));
         assert_eq!(store.admit(&access, b, b"bbb"), Err(BlobError::Capacity));
         assert_eq!(pin.read().unwrap(), b"aaa");
-        assert_eq!(store.retention.lock().unwrap().bytes, 3);
+        assert_eq!(store.retention.lock().bytes, 3);
         drop(pin);
         drop(store.admit(&access, b, b"bbb").unwrap());
-        assert_eq!(store.retention.lock().unwrap().bytes, 3);
+        assert_eq!(store.retention.lock().bytes, 3);
         let zero = AssetStore::with_retention(8, Duration::from_secs(600), 0);
         let c = register(&zero, &access);
         assert_eq!(zero.admit(&access, c, b""), Err(BlobError::Disabled));
-        assert_eq!(zero.retention.lock().unwrap().bytes, 0);
+        assert_eq!(zero.retention.lock().bytes, 0);
     }
 
     #[test]
@@ -1488,7 +1427,7 @@ mod retention_tests {
         );
         drop(pin);
         drop(store.admit(&second, b, b"bbb").unwrap());
-        assert_eq!(store.retention.lock().unwrap().bytes, 3);
+        assert_eq!(store.retention.lock().bytes, 3);
         assert_eq!(store.pin(&second, a + 10, true), Err(BlobError::Unknown));
     }
 
@@ -1500,7 +1439,7 @@ mod retention_tests {
             let id = register(&store, &access);
             drop(store.admit(&access, id, b"x").unwrap());
         }
-        let cache = store.retention.lock().unwrap();
+        let cache = store.retention.lock();
         assert_eq!(cache.released.len(), MAX_RELEASE_TOMBSTONES);
         assert_eq!(cache.bytes, 1);
         assert_eq!(cache.resident.len(), 1);
@@ -1530,7 +1469,7 @@ mod retention_tests {
             store.admit(&access, id, b"aaa"),
             Err(BlobError::Io(_))
         ));
-        let cache = store.retention.lock().unwrap();
+        let cache = store.retention.lock();
         assert_eq!(cache.bytes, 0);
         assert!(cache.resident.is_empty());
     }
@@ -1625,7 +1564,6 @@ mod retention_tests {
             store
                 .retention
                 .lock()
-                .unwrap()
                 .remove(&(access.key.clone(), id))
                 .unwrap();
             assert_eq!(
@@ -1642,7 +1580,6 @@ mod retention_tests {
             store
                 .retention
                 .lock()
-                .unwrap()
                 .remove(&(access.key.clone(), empty_id))
                 .unwrap();
             assert_eq!(
@@ -1704,7 +1641,7 @@ mod retention_tests {
                 );
                 assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
                 assert_eq!(session.rows()[0].bytes, Some(3));
-                let cache = store.retention.lock().unwrap();
+                let cache = store.retention.lock();
                 assert_eq!(cache.bytes, 0);
                 assert!(cache.resident.is_empty());
             })
@@ -1798,7 +1735,7 @@ mod retention_tests {
                 !capture.records()[before..].iter().any(is_write),
                 "PNG validation must not spool before budget admission"
             );
-            assert_eq!(store.retention.lock().unwrap().bytes, PNG.len());
+            assert_eq!(store.retention.lock().bytes, PNG.len());
             assert_eq!(pin.read().unwrap(), PNG);
             assert!(
                 session
@@ -1810,7 +1747,7 @@ mod retention_tests {
         .await
         .unwrap();
         assert_eq!(
-            peer.requests.lock().unwrap().len(),
+            peer.requests.lock().len(),
             2,
             "one metadata lookup and one download"
         );
@@ -1968,7 +1905,7 @@ mod retention_tests {
             matches!(store.get_access(&access, id, Instant::now()).unwrap().source,
             Some(AssetSourceRef::Generated { capability, invocation }) if capability == "image.edit" && invocation == "invocation-2")
         );
-        assert_eq!(store.retention.lock().unwrap().bytes, png.len());
+        assert_eq!(store.retention.lock().bytes, png.len());
         let slot = ReplyAttachments::new(
             MAX_SENDS_PER_TURN,
             Arc::<SessionAssets>::clone(&session),
@@ -1999,7 +1936,7 @@ mod retention_tests {
             .register(fd, &metadata, "asset.attach", "invocation")
             .unwrap();
         session.remove(id).unwrap();
-        assert_eq!(store.retention.lock().unwrap().bytes, 0);
+        assert_eq!(store.retention.lock().bytes, 0);
         assert!(session.rows().is_empty());
         let disabled = Arc::new(AssetStore::with_retention(8, Duration::from_secs(600), 0));
         let disabled_session = SessionAssets::new(
@@ -2032,7 +1969,7 @@ mod retention_tests {
                 .unwrap();
             references.push(format!("chat-asset:{id}"));
         }
-        assert_eq!(store.retention.lock().unwrap().bytes, 5 * encoded.len());
+        assert_eq!(store.retention.lock().bytes, 5 * encoded.len());
         let inputs = ChatAssetInputs::new(Arc::<SessionAssets>::clone(&session));
         let (assets, pins) = inputs.prepare(&json!(references), 4).unwrap();
         assert_eq!(assets.descriptors.len(), 5);

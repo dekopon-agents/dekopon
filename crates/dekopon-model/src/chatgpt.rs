@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use std::{
     env,
     ffi::OsString,
@@ -5,7 +6,6 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -165,19 +165,13 @@ impl CredentialFile {
     /// The credential lock must not be held across a request; holding it while streaming would
     /// serialize every caller on one client.
     fn snapshot(&self) -> ChatGptCredentials {
-        self.credentials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.credentials.lock().clone()
     }
 
     /// install() must only be called while holding the refresh lock, since publication must finish
     /// before another caller can rotate or adopt.
     fn install(&self, credentials: &ChatGptCredentials) {
-        let mut stored = self
-            .credentials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stored = self.credentials.lock();
         *stored = credentials.clone();
     }
 
@@ -1685,7 +1679,7 @@ mod tests {
         .await
         .expect("keyed turn");
 
-        let requests = server.requests.lock().expect("request lock");
+        let requests = server.requests.lock();
         assert!(
             !requests[0].contains("prompt_cache_key"),
             "complete sent a cache key nobody asked for"
@@ -1860,7 +1854,7 @@ mod tests {
         assert_eq!(credentials.refresh.expose(), "refresh-1");
         let output = String::from_utf8(output).expect("UTF-8 login output");
         assert!(output.contains("CODE-1234"));
-        let requests = server.requests.lock().expect("request lock");
+        let requests = server.requests.lock();
         assert!(requests[2].contains("grant_type=authorization_code"));
         assert!(requests[2].contains("code_verifier=verifier-1"));
     }
@@ -1921,7 +1915,7 @@ mod tests {
 
         assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
         assert_eq!(answer.usage.expect("usage").input_tokens, Some(23));
-        let requests = server.requests.lock().expect("request lock");
+        let requests = server.requests.lock();
         assert_eq!(requests.len(), 2);
         let bodies = requests
             .iter()
@@ -1997,7 +1991,7 @@ mod tests {
         let credentials = load_credentials(&path).expect("refreshed credentials persisted");
         assert_eq!(credentials.account_id, "acct-refreshed");
         assert_eq!(credentials.refresh.expose(), "refresh-new");
-        let requests = server.requests.lock().expect("request lock");
+        let requests = server.requests.lock();
         assert!(requests[0].contains("grant_type=refresh_token"));
         assert!(requests[1].contains("chatgpt-account-id: acct-refreshed"));
     }
@@ -2346,7 +2340,7 @@ mod tests {
         .expect("model turn");
 
         assert_eq!(turn.content.as_deref(), Some("hello"));
-        let request = server.requests.lock().expect("request lock")[0].clone();
+        let request = server.requests.lock()[0].clone();
         assert!(request.contains("authorization: Bearer header."));
         assert!(request.contains("chatgpt-account-id: acct-test"));
         assert!(request.contains("originator: dekopon"));

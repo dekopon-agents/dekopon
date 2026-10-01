@@ -5,13 +5,14 @@
 )]
 #![allow(clippy::unwrap_used)]
 
+use parking_lot::Mutex;
 use std::{
     fs,
     io::{BufRead as _, BufReader},
     os::unix::fs::PermissionsExt as _,
     path::Path,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -106,7 +107,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
     let collected = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            collected.lock().expect("stdout sink").push(line);
+            collected.lock().push(line);
         }
     });
 
@@ -115,7 +116,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
         assert!(
             broker.0.try_wait().expect("inspect broker").is_none(),
             "the broker exited before it bound its socket: {:?}",
-            lines.lock().expect("stdout sink")
+            lines.lock()
         );
         assert!(Instant::now() < until, "broker socket readiness deadline");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -150,7 +151,6 @@ permit(principal == Dekopon::Principal::"cpetersen",
     let records = loop {
         let records = lines
             .lock()
-            .expect("stdout sink")
             .iter()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|record| record["invocation.id"] == "invoke-stdout")
@@ -161,7 +161,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
         assert!(
             Instant::now() < until,
             "the broker's stdout carried no audit record: {:?}",
-            lines.lock().expect("stdout sink")
+            lines.lock()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };

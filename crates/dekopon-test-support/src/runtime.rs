@@ -1,8 +1,6 @@
+use parking_lot::Mutex;
 use std::{
-    sync::{
-        Mutex,
-        mpsc::{Receiver, Sender, channel},
-    },
+    sync::mpsc::{Receiver, Sender, channel},
     time::Duration,
 };
 
@@ -56,7 +54,7 @@ impl BlockedRuntime {
     }
 
     pub fn release(&self) {
-        if let Some(sender) = self.release.lock().expect("release lock").take() {
+        if let Some(sender) = self.release.lock().take() {
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "a runtime whose parked script already gave up is bounded by its own \
@@ -68,7 +66,7 @@ impl BlockedRuntime {
 
     #[must_use]
     pub fn scripts(&self) -> Vec<String> {
-        self.scripts.lock().expect("script lock").clone()
+        self.scripts.lock().clone()
     }
 }
 
@@ -78,12 +76,9 @@ impl ScriptRuntime for BlockedRuntime {
     }
 
     fn run_script(&self, script: &str) -> ScriptOutcome {
-        self.scripts
-            .lock()
-            .expect("script lock")
-            .push(script.to_owned());
+        self.scripts.lock().push(script.to_owned());
         self.entered.notify_one();
-        if let Some(receiver) = self.release_signal.lock().expect("release lock").take() {
+        if let Some(receiver) = self.release_signal.lock().take() {
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "both outcomes end the park: a delivered release is the test proceeding, \

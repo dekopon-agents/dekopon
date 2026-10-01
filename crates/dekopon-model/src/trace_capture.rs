@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tracing::{
     Subscriber,
     field::{Field, Visit},
@@ -15,7 +16,7 @@ impl TraceCapture {
     }
 
     pub(crate) fn text(&self) -> String {
-        self.0.lock().unwrap().clone()
+        self.0.lock().clone()
     }
 
     pub(crate) fn field(&self, name: &str) -> Option<String> {
@@ -67,7 +68,7 @@ impl TraceCapture {
 impl Visit for TraceCapture {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         use std::fmt::Write as _;
-        writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name()).unwrap();
+        writeln!(self.0.lock(), "{}={value:?}", field.name()).unwrap();
     }
 }
 
@@ -75,7 +76,6 @@ impl<S: Subscriber> Layer<S> for TraceCapture {
     fn on_new_span(&self, attributes: &Attributes<'_>, _: &tracing::Id, _: Context<'_, S>) {
         self.0
             .lock()
-            .unwrap()
             .push_str(&format!("{}\n", attributes.metadata().name()));
         attributes.record(&mut self.clone());
     }

@@ -18,6 +18,7 @@ name = "dekopon-shell-jq-worker"
 path = "src/bin/dekopon-shell-jq-worker.rs"
 
 [dependencies]
+parking_lot.workspace = true
 base64.workspace = true
 dekopon-core.workspace = true
 jaq-core.workspace = true

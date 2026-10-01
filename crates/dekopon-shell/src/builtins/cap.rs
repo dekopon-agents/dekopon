@@ -64,7 +64,7 @@ impl Builtin for Cap {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use serde_json::json;
 
@@ -97,7 +97,7 @@ mod tests {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
-            self.invoked.lock().unwrap().push(proposal.capability);
+            self.invoked.lock().push(proposal.capability);
             CapabilityCallResult::NotFound
         }
     }
@@ -168,7 +168,7 @@ mod tests {
         );
         assert_eq!(outcome.capability_calls, 0);
         assert!(
-            fixture.invoked.lock().unwrap().is_empty(),
+            fixture.invoked.lock().is_empty(),
             "cap invoked a capability"
         );
     }
@@ -197,7 +197,7 @@ mod tests {
             assert!(message.contains(cause), "{arguments:?}: {message}");
         }
         assert!(
-            fixture.invoked.lock().unwrap().is_empty(),
+            fixture.invoked.lock().is_empty(),
             "cap invoked a capability"
         );
     }

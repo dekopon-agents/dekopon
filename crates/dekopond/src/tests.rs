@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
@@ -6,7 +7,7 @@ use std::{
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -1816,7 +1817,6 @@ impl ModelScript {
     fn tool_names(&self, index: usize) -> Vec<String> {
         self.tools
             .lock()
-            .expect("recorded tools")
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1))
             .iter()
@@ -1825,7 +1825,7 @@ impl ModelScript {
     }
 
     fn cache_key(&self, index: usize) -> String {
-        let keys = self.cache_keys.lock().expect("recorded cache keys");
+        let keys = self.cache_keys.lock();
         keys.get(index)
             .cloned()
             .flatten()
@@ -1833,7 +1833,7 @@ impl ModelScript {
     }
 
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
-        let prompts = self.prompts.lock().expect("recorded prompts");
+        let prompts = self.prompts.lock();
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
@@ -1873,26 +1873,16 @@ impl ChatModel for ScriptedModel {
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
-        self.0
-            .prompts
-            .lock()
-            .expect("recorded prompts")
-            .push(messages.to_vec());
-        self.0
-            .tools
-            .lock()
-            .expect("recorded tools")
-            .push(tools.to_vec());
+        self.0.prompts.lock().push(messages.to_vec());
+        self.0.tools.lock().push(tools.to_vec());
         self.0
             .cache_keys
             .lock()
-            .expect("recorded cache keys")
             .push(options.prompt_cache_key().map(ToOwned::to_owned));
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         self.0
             .turns
             .lock()
-            .expect("scripted turn lock")
             .pop_front()
             .flatten()
             .ok_or(InferenceError::Protocol(
@@ -2293,14 +2283,11 @@ struct RecordingThreadOwnership {
 
 impl ThreadOwnership for RecordingThreadOwnership {
     fn claim(&self, claim: ThreadClaim) {
-        self.claimed.lock().expect("claim lock").push(claim);
+        self.claimed.lock().push(claim);
     }
 
     fn revoke(&self, claim: &ThreadClaim) {
-        self.revoked
-            .lock()
-            .expect("revoke lock")
-            .push(claim.clone());
+        self.revoked.lock().push(claim.clone());
     }
 }
 
@@ -2314,14 +2301,11 @@ struct DelayedStatusDriver {
 
 impl DelayedStatusDriver {
     fn events(&self) -> Vec<&'static str> {
-        self.events.lock().expect("delayed driver events").clone()
+        self.events.lock().clone()
     }
 
     fn push(&self, event: &'static str) {
-        self.events
-            .lock()
-            .expect("delayed driver events")
-            .push(event);
+        self.events.lock().push(event);
     }
 }
 
@@ -2799,7 +2783,6 @@ impl InterruptibleModel {
     fn release(&self) {
         self.release
             .lock()
-            .expect("release")
             .take()
             .expect("one release")
             .send(())
@@ -2807,7 +2790,7 @@ impl InterruptibleModel {
     }
 
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
-        self.prompts.lock().expect("prompts")[index]
+        self.prompts.lock()[index]
             .iter()
             .map(|message| {
                 let value = serde_json::to_value(message).expect("message");
@@ -2820,11 +2803,11 @@ impl InterruptibleModel {
     }
 
     fn requests(&self) -> usize {
-        self.prompts.lock().expect("prompts").len()
+        self.prompts.lock().len()
     }
 
     fn tool_names(&self, index: usize) -> Vec<String> {
-        self.tools.lock().expect("tools")[index].clone()
+        self.tools.lock()[index].clone()
     }
 }
 
@@ -2857,22 +2840,12 @@ impl ChatModel for InterruptibleHandle {
         _options: &CompletionOptions,
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
-        self.model
-            .prompts
-            .lock()
-            .expect("prompts")
-            .push(messages.to_vec());
+        self.model.prompts.lock().push(messages.to_vec());
         self.model
             .tools
             .lock()
-            .expect("tools")
             .push(tools.iter().map(|tool| tool.name.clone()).collect());
-        let release = self
-            .model
-            .release_signal
-            .lock()
-            .expect("release receiver")
-            .take();
+        let release = self.model.release_signal.lock().take();
         if let Some(release) = release {
             let mut cancel = self.cancel.clone();
             self.model.entered.notify_one();
@@ -2897,13 +2870,7 @@ impl ChatModel for InterruptibleHandle {
                 return Err(InferenceError::Cancelled);
             }
         }
-        Ok(self
-            .model
-            .turns
-            .lock()
-            .expect("turns")
-            .pop_front()
-            .expect("scripted turn"))
+        Ok(self.model.turns.lock().pop_front().expect("scripted turn"))
     }
 }
 
@@ -2942,7 +2909,7 @@ impl BlockedModel {
     }
 
     fn release(&self) {
-        if let Some(sender) = self.release.lock().expect("release lock").take() {
+        if let Some(sender) = self.release.lock().take() {
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "a blocked model that already gave up on being released fails the test at \
@@ -2979,10 +2946,10 @@ impl ChatModel for BlockedHandle {
         _options: &CompletionOptions,
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
-        if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
+        if let Some(sender) = self.0.entered.lock().take() {
             let _ = sender.send(());
         }
-        if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
+        if let Some(receiver) = self.0.release_signal.lock().take() {
             let _ = receiver.recv_timeout(Duration::from_secs(30));
         }
         Ok(self.0.turn.clone())
@@ -3279,8 +3246,8 @@ async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
     )
     .await;
 
-    assert_eq!(*ownership.claimed.lock().expect("claim lock"), [expected]);
-    assert!(ownership.revoked.lock().expect("revoke lock").is_empty());
+    assert_eq!(*ownership.claimed.lock(), [expected]);
+    assert!(ownership.revoked.lock().is_empty());
     assert_eq!(driver.replies(), ["Claimed."]);
 }
 
@@ -3315,8 +3282,8 @@ async fn a_revoked_sender_loses_owned_thread_continuation() {
     )
     .await;
 
-    assert!(ownership.claimed.lock().expect("claim lock").is_empty());
-    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
+    assert!(ownership.claimed.lock().is_empty());
+    assert_eq!(*ownership.revoked.lock(), [expected]);
     assert_eq!(driver.replies(), [UNAUTHORIZED_REPLY]);
     assert_eq!(models.requests(), 0);
 }
@@ -4506,7 +4473,7 @@ async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
     .await;
 
     assert_eq!(driver.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
-    assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
+    assert_eq!(*ownership.revoked.lock(), [expected]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -6674,11 +6641,11 @@ struct HttpMock {
 
 impl HttpMock {
     fn calls(&self) -> Vec<(String, String)> {
-        self.calls.lock().expect("mock call log").clone()
+        self.calls.lock().clone()
     }
 
     fn headers(&self) -> Vec<String> {
-        self.headers.lock().expect("mock header log").clone()
+        self.headers.lock().clone()
     }
 }
 
@@ -6715,14 +6682,8 @@ where
                 let Some((path, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
-                recorded
-                    .lock()
-                    .expect("mock call log")
-                    .push((path.clone(), body.clone()));
-                recorded_headers
-                    .lock()
-                    .expect("mock header log")
-                    .push(headers);
+                recorded.lock().push((path.clone(), body.clone()));
+                recorded_headers.lock().push(headers);
                 let response = handler(&path, &body);
                 let encoded = serde_json::to_vec(&response).expect("mock response serializes");
                 let headers = format!(
@@ -6751,7 +6712,7 @@ struct RawHttpMock {
 
 impl RawHttpMock {
     fn calls(&self) -> Vec<(String, String)> {
-        self.calls.lock().expect("raw mock call log").clone()
+        self.calls.lock().clone()
     }
 }
 
@@ -6786,10 +6747,7 @@ where
                 else {
                     return;
                 };
-                recorded
-                    .lock()
-                    .expect("raw mock call log")
-                    .push((path.clone(), headers));
+                recorded.lock().push((path.clone(), headers));
                 let (status, content_type, response) = handler(&path);
                 let reason = if status == 200 { "OK" } else { "Not Found" };
                 let headers = format!(
@@ -6840,10 +6798,7 @@ where
                 else {
                     return;
                 };
-                recorded
-                    .lock()
-                    .expect("redirecting mock call log")
-                    .push((path.clone(), headers));
+                recorded.lock().push((path.clone(), headers));
                 let (status, extra, response) = handler(&path);
                 let reason = match status {
                     200 => "OK",
@@ -7071,11 +7026,7 @@ fn slack_handler(sockets: Vec<String>) -> impl Fn(&str, &str) -> Value + Send + 
     move |path, _body| match path {
         "/api/auth.test" => json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}),
         "/api/apps.connections.open" => {
-            let url = sockets
-                .lock()
-                .expect("socket url queue")
-                .pop_front()
-                .unwrap_or_default();
+            let url = sockets.lock().pop_front().unwrap_or_default();
             json!({"ok": true, "url": url})
         }
         "/api/chat.postMessage" => json!({"ok": true, "ts": "1700000000.000100"}),
@@ -8293,7 +8244,7 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
     let api = spawn_http_mock(move |path, _body| match path {
         "/api/files.getUploadURLExternal" => json!({
             "ok": true,
-            "upload_url": format!("{}/upload", response_base.lock().expect("base lock")),
+            "upload_url": format!("{}/upload", response_base.lock()),
             "file_id": "f-generated"
         }),
         "/upload" => json!({"uploaded": true}),
@@ -8302,7 +8253,7 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
         }
         other => panic!("unexpected Slack image call: {other}"),
     });
-    *base.lock().expect("base lock") = api.base.clone();
+    *base.lock() = api.base.clone();
     let driver = slack(&api.base).driver();
 
     driver
@@ -8366,7 +8317,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
     let api = spawn_http_mock(move |path, _body| match path {
         "/api/files.getUploadURLExternal" => json!({
             "ok": true,
-            "upload_url": format!("{}/upload", response_base.lock().expect("base lock")),
+            "upload_url": format!("{}/upload", response_base.lock()),
             "file_id": "f-generated"
         }),
         "/upload" => json!({"uploaded": true}),
@@ -8375,7 +8326,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
         }
         other => panic!("unexpected Slack image call: {other}"),
     });
-    *base.lock().expect("base lock") = api.base.clone();
+    *base.lock() = api.base.clone();
     let driver = slack(&api.base).driver();
 
     driver
@@ -8941,7 +8892,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
             _source: &AssetSourceRef,
             _max_bytes: u64,
         ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
-            let entered = self.entered.lock().expect("fetch entry signal").take();
+            let entered = self.entered.lock().take();
             let release = Arc::clone(&self.release);
             Box::pin(async move {
                 if let Some(entered) = entered {
@@ -9378,10 +9329,7 @@ async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
             302,
             vec![(
                 "location".to_owned(),
-                format!(
-                    "{}/f/F0123/shot.png",
-                    response_base.lock().expect("base lock")
-                ),
+                format!("{}/f/F0123/shot.png", response_base.lock()),
             )],
             Vec::new(),
         ),
@@ -9392,7 +9340,7 @@ async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
         ),
         other => panic!("unexpected Slack file call: {other}"),
     });
-    *base.lock().expect("base lock") = files.base.clone();
+    *base.lock() = files.base.clone();
     let transport = slack(&files.base);
     let fetcher = transport
         .asset_fetcher()
@@ -11141,7 +11089,7 @@ fn retained_asset_does_not_hold_its_session_span_open() {
 
     impl SpanExporter for Exported {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().unwrap().extend(batch);
+            self.0.lock().extend(batch);
             Ok(())
         }
     }
@@ -11162,7 +11110,7 @@ fn retained_asset_does_not_hold_its_session_span_open() {
     provider.force_flush().unwrap();
 
     {
-        let spans = exported.0.lock().unwrap();
+        let spans = exported.0.lock();
         for name in ["gateway.message", "gateway.session"] {
             assert!(
                 spans.iter().any(|span| span.name == name),
@@ -11280,7 +11228,7 @@ async fn gateway_session_exports_the_configured_agent_invocation_under_the_messa
 
     impl SpanExporter for Exported {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().unwrap().extend(batch);
+            self.0.lock().extend(batch);
             Ok(())
         }
     }
@@ -11297,7 +11245,7 @@ async fn gateway_session_exports_the_configured_agent_invocation_under_the_messa
     provider.force_flush().unwrap();
 
     {
-        let spans = exported.0.lock().unwrap();
+        let spans = exported.0.lock();
         let invocation = spans
             .iter()
             .find(|span| span.name == "gateway.session")
@@ -11478,7 +11426,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
     struct Exported(Arc<Mutex<Vec<SpanData>>>);
     impl SpanExporter for Exported {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().unwrap().extend(batch);
+            self.0.lock().extend(batch);
             Ok(())
         }
     }
@@ -11573,7 +11521,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
     drop(transport);
     provider.force_flush().unwrap();
     {
-        let spans = exported.0.lock().unwrap();
+        let spans = exported.0.lock();
         let attribute = |span: &SpanData, key: &str| {
             span.attributes
                 .iter()
@@ -11855,7 +11803,7 @@ struct ParkedReplyDriver {
 
 impl ParkedReplyDriver {
     fn delivered(&self) -> Vec<String> {
-        self.delivered.lock().expect("delivered replies").clone()
+        self.delivered.lock().clone()
     }
 }
 
@@ -11868,10 +11816,7 @@ impl ChatDriver for ParkedReplyDriver {
     ) -> Result<(), TransportError> {
         self.delivering.notify_one();
         self.release.notified().await;
-        self.delivered
-            .lock()
-            .expect("delivered replies")
-            .push(reply.text);
+        self.delivered.lock().push(reply.text);
         Ok(())
     }
 }
@@ -11991,7 +11936,7 @@ impl ParkedBuild {
     }
 
     fn release(&self) {
-        if let Some(sender) = self.release.lock().expect("release lock").take() {
+        if let Some(sender) = self.release.lock().take() {
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "a parked build that already gave up on being released fails the test at \
@@ -12018,10 +11963,10 @@ impl ModelFactory for Arc<ParkedBuild> {
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
-        if let Some(sender) = self.entered.lock().expect("entered lock").take() {
+        if let Some(sender) = self.entered.lock().take() {
             let _ = sender.send(());
         }
-        if let Some(receiver) = self.release_signal.lock().expect("release lock").take() {
+        if let Some(receiver) = self.release_signal.lock().take() {
             let _ = receiver.recv_timeout(Duration::from_secs(30));
         }
         Ok(Arc::new(ParkedBuildHandle(Arc::clone(self))))
@@ -12654,10 +12599,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         })
         .await;
         let (transport, inbound) = admitted_photo(&peer.origin, mime, caption).await;
-        assert!(
-            peer.requests.lock().expect("requests").is_empty(),
-            "admission must be lazy"
-        );
+        assert!(peer.requests.lock().is_empty(), "admission must be lazy");
         let directory = temporary();
         let (broker,mut observed)=stub_broker_assets(directory.path(), (0..3).flat_map(|edit| vec![
             plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()], BTreeMap::new())),
@@ -12775,7 +12717,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
         {
-            let prompts = models.prompts.lock().expect("prompts");
+            let prompts = models.prompts.lock();
             for edit in 0..3 {
                 let data = prompts[edit * 4 + 1]
                     .iter()
@@ -12797,7 +12739,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             }
         }
         {
-            let requests = peer.requests.lock().expect("requests");
+            let requests = peer.requests.lock();
             assert_eq!(
                 requests.len(),
                 8,
@@ -12872,7 +12814,7 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
             assert!(observed.try_recv().is_err());
         }
         assert_eq!(models.requests(), 0);
-        assert!(peer.requests.lock().expect("requests").is_empty());
+        assert!(peer.requests.lock().is_empty());
         peer.finish().await;
     }
 }
@@ -12920,7 +12862,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
             .await
             .expect("scope check");
     }
-    assert!(peer.requests.lock().expect("requests").is_empty());
+    assert!(peer.requests.lock().is_empty());
     peer.finish().await;
 }
 
@@ -13973,7 +13915,6 @@ impl crate::transport::ChatHistory for HistoryDriver {
     ) -> Result<Vec<crate::transport::PastMessage>, TransportError> {
         self.asked
             .lock()
-            .expect("asked")
             .push((before.unwrap_or_default().to_owned(), limit));
         self.past.clone().map_err(|()| TransportError::Response)
     }
@@ -14019,10 +13960,7 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     )
     .await;
 
-    assert_eq!(
-        driver.asked.lock().expect("asked").as_slice(),
-        [(trigger, 24)]
-    );
+    assert_eq!(driver.asked.lock().as_slice(), [(trigger, 24)]);
     let prompt = models.prompt(0);
     assert_eq!(
         prompt[1..3],

@@ -861,7 +861,7 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
 struct ScriptedRefreshingCredential {
     destinations: Vec<String>,
     resolutions: Arc<std::sync::atomic::AtomicUsize>,
-    script: std::sync::Mutex<Vec<Result<&'static str, CredentialRefreshError>>>,
+    script: parking_lot::Mutex<Vec<Result<&'static str, CredentialRefreshError>>>,
 }
 
 impl ScriptedRefreshingCredential {
@@ -872,7 +872,7 @@ impl ScriptedRefreshingCredential {
         Arc::new(Self {
             destinations,
             resolutions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            script: std::sync::Mutex::new(script),
+            script: parking_lot::Mutex::new(script),
         })
     }
 }
@@ -887,7 +887,7 @@ impl RefreshingCredential for ScriptedRefreshingCredential {
         self.resolutions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let next = {
-            let mut script = self.script.lock().expect("script lock");
+            let mut script = self.script.lock();
             assert!(
                 !script.is_empty(),
                 "the broker resolved more times than the script allows"

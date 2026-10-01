@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use tracing::{
     Metadata,
@@ -76,12 +77,12 @@ impl CaptureLayer {
     }
 
     fn push(&self, record: Record) {
-        self.records.lock().expect("capture sink").push(record);
+        self.records.lock().push(record);
     }
 
     #[must_use]
     pub fn records(&self) -> Vec<Record> {
-        self.records.lock().expect("capture sink").clone()
+        self.records.lock().clone()
     }
 
     #[must_use]
@@ -142,7 +143,7 @@ impl CaptureLayer {
 
     #[must_use]
     pub fn take_events(&self) -> String {
-        let drained = std::mem::take(&mut *self.records.lock().expect("capture sink"));
+        let drained = std::mem::take(&mut *self.records.lock());
         render(
             drained
                 .iter()
@@ -156,7 +157,7 @@ impl CaptureLayer {
     }
 
     pub fn clear(&self) {
-        self.records.lock().expect("capture sink").clear();
+        self.records.lock().clear();
     }
 }
 

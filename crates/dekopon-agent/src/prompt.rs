@@ -1610,12 +1610,14 @@ fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::{
         collections::{BTreeMap, VecDeque},
         ops::ControlFlow,
-        sync::Arc,
-        sync::Mutex,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
     };
 
     use dekopon_model::TurnEvent;
@@ -1665,7 +1667,6 @@ mod tests {
         fn first_request(&self) -> Vec<ModelMessage> {
             self.observed_messages
                 .lock()
-                .expect("message observations lock")
                 .first()
                 .cloned()
                 .expect("the model was asked at least once")
@@ -1686,7 +1687,6 @@ mod tests {
         fn tool_messages(&self) -> Vec<String> {
             self.observed_messages
                 .lock()
-                .expect("message observations lock")
                 .iter()
                 .flatten()
                 .filter(|message| message.role() == "tool")
@@ -1703,17 +1703,10 @@ mod tests {
             _options: &CompletionOptions,
             _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
-            self.observed_tools
-                .lock()
-                .expect("tool observations lock")
-                .push(tools.to_vec());
-            self.observed_messages
-                .lock()
-                .expect("message observations lock")
-                .push(messages.to_vec());
+            self.observed_tools.lock().push(tools.to_vec());
+            self.observed_messages.lock().push(messages.to_vec());
             self.turns
                 .lock()
-                .expect("turn lock")
                 .pop_front()
                 .ok_or(InferenceError::Protocol(
                     dekopon_model::error::ProtocolFailure::NoChoices,
@@ -1748,12 +1741,9 @@ mod tests {
 
     impl ScriptRuntime for RecordingRuntime {
         fn run_script(&self, script: &str) -> ScriptOutcome {
-            let mut calls = self.calls.lock().expect("calls lock");
+            let mut calls = self.calls.lock();
             let remaining = self.max_calls.saturating_sub(*calls);
-            self.scripts
-                .lock()
-                .expect("script lock")
-                .push(script.to_owned());
+            self.scripts.lock().push(script.to_owned());
             if let Some(steers) = &self.steers {
                 steers.push("msg2");
             }
@@ -1769,7 +1759,7 @@ mod tests {
         }
 
         fn capability_calls_used(&self) -> u32 {
-            *self.calls.lock().expect("calls lock")
+            *self.calls.lock()
         }
     }
 
@@ -1837,11 +1827,7 @@ mod tests {
 
         assert!(matches!(error, PromptError::Cancelled));
         assert!(
-            model
-                .observed_messages
-                .lock()
-                .expect("message observations lock")
-                .is_empty(),
+            model.observed_messages.lock().is_empty(),
             "no model request starts after cancellation"
         );
         assert_eq!(
@@ -1858,7 +1844,7 @@ mod tests {
 
     impl ProgressSink for RecordingSink {
         fn emit(&self, event: ProgressEvent) {
-            self.events.lock().expect("progress lock").push(event);
+            self.events.lock().push(event);
         }
     }
 
@@ -1870,12 +1856,7 @@ mod tests {
 
     impl RecordingSink {
         fn labels(&self) -> Vec<String> {
-            self.events
-                .lock()
-                .expect("progress lock")
-                .iter()
-                .map(progress_label)
-                .collect()
+            self.events.lock().iter().map(progress_label).collect()
         }
 
         #[expect(
@@ -1885,7 +1866,6 @@ mod tests {
         fn forwarded_chars(&self) -> Vec<usize> {
             self.events
                 .lock()
-                .expect("progress lock")
                 .iter()
                 .filter_map(|event| match event {
                     ProgressEvent::TextDelta {
@@ -1951,7 +1931,6 @@ mod tests {
             }
             self.turns
                 .lock()
-                .expect("turn lock")
                 .pop_front()
                 .ok_or(InferenceError::Protocol(
                     dekopon_model::error::ProtocolFailure::NoChoices,
@@ -1983,19 +1962,15 @@ mod tests {
             _options: &CompletionOptions,
             on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
-            let events = std::mem::take(&mut *self.events.lock().expect("event lock"));
+            let events = std::mem::take(&mut *self.events.lock());
             for event in events {
                 if on_event(event).is_break() {
                     return Err(InferenceError::Cancelled);
                 }
             }
-            self.turn
-                .lock()
-                .expect("turn lock")
-                .take()
-                .ok_or(InferenceError::Protocol(
-                    dekopon_model::error::ProtocolFailure::NoChoices,
-                ))
+            self.turn.lock().take().ok_or(InferenceError::Protocol(
+                dekopon_model::error::ProtocolFailure::NoChoices,
+            ))
         }
     }
 
@@ -2033,13 +2008,13 @@ mod tests {
 
     impl QueuedSteers {
         fn push(&self, text: &str) {
-            self.0.lock().expect("steers").push_back(text.to_owned());
+            self.0.lock().push_back(text.to_owned());
         }
     }
 
     impl SteerSource for QueuedSteers {
         fn drain(&self) -> Vec<String> {
-            self.0.lock().expect("steers").drain(..).collect()
+            self.0.lock().drain(..).collect()
         }
     }
 
@@ -2064,7 +2039,7 @@ mod tests {
         }
 
         fn request(&self, index: usize) -> Vec<(String, String)> {
-            self.scripted.observed_messages.lock().expect("messages")[index]
+            self.scripted.observed_messages.lock()[index]
                 .iter()
                 .map(|message| {
                     (
@@ -2084,12 +2059,7 @@ mod tests {
             options: &CompletionOptions,
             on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
-            let first = self
-                .scripted
-                .observed_messages
-                .lock()
-                .expect("messages")
-                .is_empty();
+            let first = self.scripted.observed_messages.lock().is_empty();
             let turn = self.scripted.complete(messages, tools, options, on_event);
             if first {
                 self.steers.push("msg2");
@@ -2191,7 +2161,7 @@ mod tests {
         )
         .expect("the cancelled proposal is discarded");
         assert_eq!(outcome.script_calls, 0);
-        assert!(runtime.scripts.lock().expect("scripts").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
         assert_eq!(
             model.request(1),
             [
@@ -2216,7 +2186,7 @@ mod tests {
         .expect("script work is not interrupted");
         assert_eq!(outcome.script_calls, 1);
         assert_eq!(outcome.capability_invocations, 1);
-        let messages = model.observed_messages.lock().expect("messages");
+        let messages = model.observed_messages.lock();
         let second = &messages[1];
         assert_eq!(
             second.iter().map(ModelMessage::role).collect::<Vec<_>>(),
@@ -2258,17 +2228,10 @@ mod tests {
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
         assert_eq!(model.steers.drain(), ["msg2"]);
-        assert!(
-            !sink
-                .events
-                .lock()
-                .expect("events")
-                .iter()
-                .any(|event| matches!(
-                    event,
-                    ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
-                ))
-        );
+        assert!(!sink.events.lock().iter().any(|event| matches!(
+            event,
+            ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
+        )));
     }
 
     #[test]
@@ -2302,14 +2265,7 @@ mod tests {
                 options: &CompletionOptions,
                 on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
             ) -> Result<AssistantTurn, InferenceError> {
-                if self
-                    .0
-                    .scripted
-                    .observed_messages
-                    .lock()
-                    .expect("messages")
-                    .is_empty()
-                {
+                if self.0.scripted.observed_messages.lock().is_empty() {
                     let events = dekopon_model::events_from_transcript(
                         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
                     )
@@ -2341,7 +2297,7 @@ mod tests {
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         let mut text = dekopon_model::ModelText::default();
         assert!(!sink.forwarded_chars().is_empty());
-        for event in sink.events.lock().expect("progress").iter() {
+        for event in sink.events.lock().iter() {
             match event {
                 ProgressEvent::TextDelta { text: delta, .. } => text.push(delta),
                 ProgressEvent::Steered { .. } => text = dekopon_model::ModelText::default(),
@@ -2637,7 +2593,7 @@ mod tests {
 
     impl ModelUsageObserver for UsageRecorder {
         fn observe(&self, usage: Option<ModelUsage>) {
-            self.0.lock().expect("usage observations lock").push(usage);
+            self.0.lock().push(usage);
         }
     }
 
@@ -2711,10 +2667,7 @@ mod tests {
         )
         .expect("session succeeds");
 
-        assert_eq!(
-            *observer.0.lock().expect("usage observations lock"),
-            vec![Some(expected), None]
-        );
+        assert_eq!(*observer.0.lock(), vec![Some(expected), None]);
     }
 
     #[test]
@@ -3115,11 +3068,9 @@ mod tests {
         ) -> Result<AssistantTurn, InferenceError> {
             self.observed
                 .lock()
-                .expect("options lock")
                 .push(options.prompt_cache_key().map(str::to_owned));
             self.turns
                 .lock()
-                .expect("turn lock")
                 .pop_front()
                 .ok_or(InferenceError::Protocol(
                     dekopon_model::error::ProtocolFailure::NoChoices,
@@ -3157,7 +3108,7 @@ mod tests {
 
         assert_eq!(outcome.model_turns, 3);
         assert_eq!(
-            *model.observed.lock().expect("options lock"),
+            *model.observed.lock(),
             vec![
                 Some("lane-7".to_owned()),
                 Some("lane-7".to_owned()),
@@ -3185,7 +3136,7 @@ mod tests {
         )
         .expect("prompt session succeeds");
 
-        assert_eq!(*observer.observed.lock().expect("options lock"), vec![None]);
+        assert_eq!(*observer.observed.lock(), vec![None]);
     }
 
     #[test]
@@ -3307,7 +3258,7 @@ mod tests {
 
         run_prompt(&model, &runtime, "go", None, limits(1, 1)).expect("prompt succeeds");
 
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         let script = tools[0]
             .iter()
             .find(|tool| tool.name == SCRIPT_TOOL_NAME)
@@ -3331,7 +3282,7 @@ mod tests {
                 inputs = inputs.with_progress_notes();
             }
             run_prompt_session(&model, &runtime, inputs, &mut History::default()).unwrap();
-            let tools = model.observed_tools.lock().unwrap();
+            let tools = model.observed_tools.lock();
             let script = tools[0]
                 .iter()
                 .find(|tool| tool.name == SCRIPT_TOOL_NAME)
@@ -3669,9 +3620,9 @@ mod tests {
         assert_eq!(outcome.answer, "Here is the configuration table.");
         assert_eq!(outcome.script_calls, 0);
         assert_eq!(outcome.capability_invocations, 0);
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
 
-        let observed = model.observed_tools.lock().expect("tool observations lock");
+        let observed = model.observed_tools.lock();
         assert_eq!(observed[0].len(), 3);
         assert_eq!(observed[0][0].name, SCRIPT_TOOL_NAME);
         assert_eq!(observed[0][1].name, IMPROVEMENT_TOOL_NAME);
@@ -3717,7 +3668,7 @@ mod tests {
 
         assert_eq!(outcome.script_calls, 0);
         assert_eq!(outcome.capability_invocations, 0);
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
 
         let messages = model.tool_messages();
         assert_eq!(messages.len(), 2);
@@ -3748,10 +3699,7 @@ mod tests {
         )
         .expect("repeated inspection succeeds");
 
-        let messages = model
-            .observed_messages
-            .lock()
-            .expect("message observations");
+        let messages = model.observed_messages.lock();
         let copies = messages
             .last()
             .expect("the model was asked at least once")
@@ -3878,7 +3826,7 @@ mod tests {
             error,
             PromptError::AgentConfigArgumentsNotEmpty { .. }
         ));
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
     }
 
     #[test]
@@ -3898,12 +3846,12 @@ mod tests {
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         assert!(outcome.answer.is_empty());
         assert_eq!(outcome.model_turns, 1);
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
         assert_eq!(history.len(), 1);
         assert_eq!(history.turns()[0].user(), "OK, thanks");
         assert_eq!(history.turns()[0].answer(), None);
 
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert_eq!(
             tools[0].last().map(|tool| tool.name.as_str()),
             Some(DECLINE_REPLY_TOOL_NAME)
@@ -3933,7 +3881,7 @@ mod tests {
         .expect("an ordinary prompt answers");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Send);
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(
             tools[0]
                 .iter()
@@ -3976,9 +3924,9 @@ mod tests {
         .expect("the no-reply decision is terminal");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
         assert_eq!(outcome.capability_invocations, 0);
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(
             tools[0]
                 .iter()
@@ -4074,7 +4022,7 @@ mod tests {
         assert_eq!(outcome.model_turns, 2);
         assert_eq!(outcome.script_calls, 1);
         assert_eq!(outcome.capability_invocations, 1);
-        let scripts = runtime.scripts.lock().expect("script lock");
+        let scripts = runtime.scripts.lock();
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0], "probe upper --text hi | jq -r .text");
     }
@@ -4086,7 +4034,7 @@ mod tests {
 
         run_prompt(&model, &runtime, "do nothing", None, limits(2, 32)).expect("prompt succeeds");
 
-        let observed = model.observed_tools.lock().expect("tool observations lock");
+        let observed = model.observed_tools.lock();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].len(), 2);
         assert_eq!(observed[0][0].name, SCRIPT_TOOL_NAME);
@@ -4119,7 +4067,7 @@ mod tests {
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 10))
             .expect("prompt session succeeds");
 
-        let scripts = runtime.scripts.lock().expect("script lock");
+        let scripts = runtime.scripts.lock();
         assert_eq!(*scripts, ["one", "two", "three"]);
         assert_eq!(outcome.capability_invocations, 10);
     }
@@ -4136,7 +4084,7 @@ mod tests {
         let outcome = run_prompt(&model, &runtime, "spend it", None, limits(8, 3))
             .expect("prompt session succeeds");
 
-        let scripts = runtime.scripts.lock().expect("script lock");
+        let scripts = runtime.scripts.lock();
         assert_eq!(*scripts, ["one", "two"]);
         assert_eq!(outcome.capability_invocations, 3);
     }
@@ -4161,7 +4109,7 @@ mod tests {
             .expect_err("unknown tools must fail closed");
 
         assert!(matches!(error, PromptError::UnknownTool(_)));
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
     }
 
     #[test]
@@ -4188,7 +4136,7 @@ mod tests {
                 matches!(error, PromptError::MissingScript { .. }),
                 "{arguments}: {error}"
             );
-            assert!(runtime.scripts.lock().expect("script lock").is_empty());
+            assert!(runtime.scripts.lock().is_empty());
         }
     }
 
@@ -4216,10 +4164,7 @@ mod tests {
             outcome.script_calls,
             u32::try_from(MAX_TOOL_CALLS_PER_TURN).expect("tool-call bound fits u32")
         );
-        assert_eq!(
-            runtime.scripts.lock().expect("script lock").len(),
-            MAX_TOOL_CALLS_PER_TURN
-        );
+        assert_eq!(runtime.scripts.lock().len(), MAX_TOOL_CALLS_PER_TURN);
     }
 
     #[test]
@@ -4247,7 +4192,7 @@ mod tests {
                 maximum: 10
             }
         ));
-        assert!(runtime.scripts.lock().expect("script lock").is_empty());
+        assert!(runtime.scripts.lock().is_empty());
     }
 
     #[test]
@@ -4279,10 +4224,7 @@ mod tests {
             let script = script.to_owned();
             let output = self.handle.block_on(async move {
                 tokio::task::yield_now().await;
-                dispatched
-                    .lock()
-                    .expect("dispatch lock")
-                    .push(script.clone());
+                dispatched.lock().push(script.clone());
                 format!("async runtime saw: {script}")
             });
             self.calls.fetch_add(1, AtomicOrdering::Relaxed);
@@ -4322,7 +4264,7 @@ mod tests {
         assert_eq!(outcome.script_calls, 1);
         assert_eq!(outcome.capability_invocations, 1);
         assert_eq!(
-            *dispatched.lock().expect("dispatch lock"),
+            *dispatched.lock(),
             vec!["httpprobe fetch --uri https://example.test".to_owned()]
         );
     }
@@ -4336,13 +4278,7 @@ mod tests {
             .expect_err("a zero-step session is a usage error");
 
         assert!(matches!(error, PromptError::ZeroSteps));
-        assert!(
-            model
-                .observed_tools
-                .lock()
-                .expect("tool observations lock")
-                .is_empty()
-        );
+        assert!(model.observed_tools.lock().is_empty());
     }
 
     #[test]
@@ -4425,7 +4361,6 @@ mod tests {
         model
             .observed_messages
             .lock()
-            .expect("message observations lock")
             .last()
             .expect("the model was asked at least once")
             .iter()
@@ -4501,7 +4436,7 @@ mod tests {
             roles[1].1
         );
         assert_eq!(roles[2], ("user", "review PR 7".to_owned()));
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(
             tools[0].iter().any(|tool| tool.name == SKILL_TOOL_NAME),
             "the read tool is offered when a skill is mounted"
@@ -4534,7 +4469,7 @@ mod tests {
             results[2]
         );
         assert!(
-            runtime.scripts.lock().expect("script lock").is_empty(),
+            runtime.scripts.lock().is_empty(),
             "reading a skill runs no script and spends no capability budget"
         );
     }
@@ -4603,7 +4538,7 @@ mod tests {
         assert!(matches!(error, PromptError::UnknownTool(name) if name == SKILL_TOOL_NAME));
         let roles = model.first_roles();
         assert_eq!(roles.len(), 2, "no listing was added: {roles:?}");
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME));
     }
 
@@ -4687,7 +4622,7 @@ mod tests {
             results[2]
         );
         assert!(results[3].contains("already recorded"), "{}", results[3]);
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(
             tools[0]
                 .iter()
@@ -4744,7 +4679,7 @@ mod tests {
             .expect("the tool needs no per-route opt-in");
 
         assert_eq!(outcome.suggestions.len(), 1);
-        let tools = model.observed_tools.lock().expect("tool observations lock");
+        let tools = model.observed_tools.lock();
         assert!(
             tools[0]
                 .iter()

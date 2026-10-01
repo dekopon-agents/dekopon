@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -101,14 +102,13 @@ impl Injector {
     fn charge(&self) -> Option<FailureKind> {
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
         self.called.notify_one();
-        if let Some((first, kind)) = *self.from.lock().expect("injection plan")
+        if let Some((first, kind)) = *self.from.lock()
             && index >= first
         {
             return Some(kind);
         }
         self.plan
             .lock()
-            .expect("injection plan")
             .iter()
             .find_map(|(at, kind)| (*at == index).then_some(*kind))
     }
@@ -119,17 +119,13 @@ macro_rules! injected {
         impl $object {
             #[must_use]
             pub fn failing_call(self, index: usize, kind: FailureKind) -> Self {
-                self.injector
-                    .plan
-                    .lock()
-                    .expect("injection plan")
-                    .push((index, kind));
+                self.injector.plan.lock().push((index, kind));
                 self
             }
 
             #[must_use]
             pub fn failing_from(self, index: usize, kind: FailureKind) -> Self {
-                *self.injector.from.lock().expect("injection plan") = Some((index, kind));
+                *self.injector.from.lock() = Some((index, kind));
                 self
             }
 
@@ -170,10 +166,7 @@ impl RecordingTyping {
     }
 
     pub fn record(&self, target: String) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Typing { target });
+        self.log.lock().push(DriverCall::Typing { target });
     }
 }
 
@@ -187,10 +180,7 @@ injected!(RecordingStatus);
 
 impl RecordingStatus {
     pub fn record(&self, target: String, status: &'static str) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Status { target, status });
+        self.log.lock().push(DriverCall::Status { target, status });
     }
 }
 
@@ -216,10 +206,7 @@ impl RecordingProgress {
     }
 
     pub fn record(&self, call: ProgressCall) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Progress(call));
+        self.log.lock().push(DriverCall::Progress(call));
     }
 }
 
@@ -245,10 +232,7 @@ impl RecordingStream {
     }
 
     pub fn record(&self, call: StreamCall) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Stream(call));
+        self.log.lock().push(DriverCall::Stream(call));
     }
 }
 
@@ -264,7 +248,6 @@ impl RecordingReaction {
     pub fn record(&self, target: String, present: bool) {
         self.log
             .lock()
-            .expect("driver log")
             .push(DriverCall::Reaction { target, present });
     }
 }
@@ -276,10 +259,7 @@ pub struct RecordingSteerAck {
 
 impl RecordingSteerAck {
     pub fn record(&self, target: String) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Seen { target });
+        self.log.lock().push(DriverCall::Seen { target });
     }
 }
 
@@ -293,10 +273,7 @@ injected!(RecordingCancelButton);
 
 impl RecordingCancelButton {
     pub fn record(&self, subject: String) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::CancelAck { subject });
+        self.log.lock().push(DriverCall::CancelAck { subject });
     }
 }
 
@@ -432,7 +409,7 @@ impl RecordingDriver {
 
     #[must_use]
     pub fn failing_replies_from(self, index: usize, kind: FailureKind) -> Self {
-        *self.replies.from.lock().expect("injection plan") = Some((index, kind));
+        *self.replies.from.lock() = Some((index, kind));
         self
     }
 
@@ -442,10 +419,7 @@ impl RecordingDriver {
     }
 
     pub fn record_reply(&self, text: String, images: Vec<usize>) {
-        self.log
-            .lock()
-            .expect("driver log")
-            .push(DriverCall::Reply { text, images });
+        self.log.lock().push(DriverCall::Reply { text, images });
     }
 
     /// Named apart from the trait accessor with the same job, since inherent methods win
@@ -487,7 +461,7 @@ impl RecordingDriver {
 
     #[must_use]
     pub fn calls(&self) -> Vec<DriverCall> {
-        self.log.lock().expect("driver log").clone()
+        self.log.lock().clone()
     }
 
     #[must_use]

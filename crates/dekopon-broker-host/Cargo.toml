@@ -14,6 +14,7 @@ categories = ["wasm", "web-programming::http-client"]
 include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+parking_lot.workspace = true
 dekopon-capability.workspace = true
 dekopon-core = { workspace = true, features = ["native"] }
 dekopon-broker-protocol.workspace = true

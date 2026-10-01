@@ -14,6 +14,7 @@ categories = ["filesystem", "wasm"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+parking_lot.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 getrandom.workspace = true

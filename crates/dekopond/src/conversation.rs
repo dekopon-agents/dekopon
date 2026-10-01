@@ -1,10 +1,11 @@
 //! Conversation text is never forwarded to the broker, so it stays out of the privileged process;
 //! only the gateway's own journal writes it to disk, and only when an operator configures one.
 
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -131,7 +132,7 @@ impl ConversationLease<'_> {
         declared_cache_key: &str,
         now: Instant,
     ) -> bool {
-        let mut state = self.store.state.lock().expect("conversation store");
+        let mut state = self.store.state.lock();
         let current = state
             .slots
             .get(&self.key)
@@ -169,7 +170,7 @@ impl Drop for ConversationLease<'_> {
         if !self.active {
             return;
         }
-        let mut state = self.store.state.lock().expect("conversation store");
+        let mut state = self.store.state.lock();
         let remove = state.slots.get_mut(&self.key).is_some_and(|slot| {
             if slot.generation != self.generation || slot.granted != self.granted {
                 return false;
@@ -235,7 +236,7 @@ impl ConversationStore {
         window: MemoryWindow,
         now: Instant,
     ) -> bool {
-        let state = self.state.lock().expect("conversation store");
+        let state = self.state.lock();
         state.slots.get(key).is_some_and(|slot| {
             slot.granted == granted
                 && slot
@@ -253,7 +254,7 @@ impl ConversationStore {
         recalled: Option<History>,
         now: Instant,
     ) -> ConversationSeed<'_> {
-        let mut state = self.state.lock().expect("conversation store");
+        let mut state = self.state.lock();
         let stale = state.slots.get(key).and_then(|slot| {
             if slot
                 .live
@@ -362,7 +363,7 @@ impl ConversationStore {
     }
 
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {
-        let mut state = self.state.lock().expect("conversation store");
+        let mut state = self.state.lock();
         let removed = state.slots.remove(key);
         let had_history = removed.as_ref().is_some_and(|slot| slot.live.is_some());
         if let Some(slot) = removed {
@@ -381,7 +382,6 @@ impl ConversationStore {
     pub fn tracked(&self) -> usize {
         self.state
             .lock()
-            .expect("conversation store")
             .slots
             .values()
             .filter(|slot| slot.live.is_some())
@@ -430,7 +430,7 @@ fn allocate_generation(state: &mut StoreState) -> u64 {
 /// pending keys, or identifiers a derived implementation would print.
 impl fmt::Debug for ConversationStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.lock().expect("conversation store");
+        let state = self.state.lock();
         let conversations = state
             .slots
             .values()

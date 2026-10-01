@@ -880,8 +880,8 @@ mod tests {
     struct FakeLeg {
         capability: &'static str,
         marker: &'static str,
-        invoked: std::sync::Mutex<Vec<String>>,
-        secret_uses: std::sync::Mutex<Vec<Option<dekopon_core::SecretUseProposal>>>,
+        invoked: parking_lot::Mutex<Vec<String>>,
+        secret_uses: parking_lot::Mutex<Vec<Option<dekopon_core::SecretUseProposal>>>,
     }
 
     impl FakeLeg {
@@ -889,8 +889,8 @@ mod tests {
             Self {
                 capability,
                 marker,
-                invoked: std::sync::Mutex::new(Vec::new()),
-                secret_uses: std::sync::Mutex::new(Vec::new()),
+                invoked: parking_lot::Mutex::new(Vec::new()),
+                secret_uses: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -913,14 +913,8 @@ mod tests {
             if capability != self.capability {
                 return CapabilityCallResult::NotFound;
             }
-            self.invoked
-                .lock()
-                .expect("invocation lock")
-                .push(capability.to_owned());
-            self.secret_uses
-                .lock()
-                .expect("invocation lock")
-                .push(secret_use);
+            self.invoked.lock().push(capability.to_owned());
+            self.secret_uses.lock().push(secret_use);
             CapabilityCallResult::Succeeded(json!({ "leg": self.marker }))
         }
     }
@@ -1009,12 +1003,7 @@ mod tests {
             dekopon_shell::secret_use_unsupported()
         );
         assert!(
-            invoker
-                .direct
-                .secret_uses
-                .lock()
-                .expect("invocation lock")
-                .is_empty(),
+            invoker.direct.secret_uses.lock().is_empty(),
             "the direct leg was handed a proposal it cannot authorize"
         );
     }
@@ -1079,11 +1068,12 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
+        use parking_lot::Mutex;
         use std::{
             collections::{BTreeMap, BTreeSet},
             os::unix::fs::PermissionsExt as _,
             path::Path,
-            sync::{Arc, Mutex, atomic::AtomicU32},
+            sync::{Arc, atomic::AtomicU32},
             time::Duration,
         };
 
@@ -1939,7 +1929,7 @@ mod tests {
 
         impl ProgressSink for RecordingSink {
             fn emit(&self, event: ProgressEvent) {
-                self.events.lock().expect("progress lock").push(event);
+                self.events.lock().push(event);
             }
         }
 
@@ -1951,12 +1941,7 @@ mod tests {
 
         impl RecordingSink {
             fn labels(&self) -> Vec<String> {
-                self.events
-                    .lock()
-                    .expect("progress lock")
-                    .iter()
-                    .map(label)
-                    .collect()
+                self.events.lock().iter().map(label).collect()
             }
         }
 

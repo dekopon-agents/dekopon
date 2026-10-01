@@ -414,10 +414,11 @@ pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::{
         collections::BTreeMap,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicBool, AtomicU32, Ordering},
         },
         time::{Duration, Instant},
@@ -468,10 +469,7 @@ mod tests {
         ) -> Option<CommandRun> {
             if matches!(word, "retained" | "render") {
                 let stdout = if word == "retained" {
-                    self.retained
-                        .lock()
-                        .unwrap()
-                        .push(self.tree.as_ref()?.value_bytes());
+                    self.retained.lock().push(self.tree.as_ref()?.value_bytes());
                     String::new()
                 } else {
                     "abcdefgh".to_owned()
@@ -500,10 +498,7 @@ mod tests {
         fn invoke(&self, proposal: super::CommandProposal) -> CapabilityCallResult {
             let input = proposal.input;
             let secret_use = proposal.secret_use;
-            self.secret_uses
-                .lock()
-                .expect("recorded secret uses")
-                .push(secret_use);
+            self.secret_uses.lock().push(secret_use);
             CapabilityCallResult::Succeeded(input)
         }
 
@@ -620,7 +615,7 @@ mod tests {
         let interpreter = Interpreter::new(limits);
         let failed = interpreter.run_with_tree(&format!("gh-extra {word} {word}"), &invoker, &tree);
         assert_eq!(failed.exit_code, ExitCode::SYNTAX, "{}", failed.output);
-        assert!(invoker.secret_uses.lock().unwrap().is_empty());
+        assert!(invoker.secret_uses.lock().is_empty());
         assert_eq!(tree.value_bytes(), 0);
         let script = format!("gh-extra {word}; gh-extra {word}");
         let next = interpreter.run_with_tree(&script, &invoker, &tree);
@@ -645,7 +640,7 @@ mod tests {
             &tree,
         );
         assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
-        assert_eq!(*invoker.retained.lock().unwrap(), vec![49, 73]);
+        assert_eq!(*invoker.retained.lock(), vec![49, 73]);
         assert_eq!(tree.value_bytes(), 0);
     }
 
@@ -757,7 +752,7 @@ mod tests {
             };
             let outcome = Interpreter::new(limits).run_with_tree(script, &invoker, &tree);
             assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
-            assert_eq!(*invoker.retained.lock().unwrap(), expected, "{script}");
+            assert_eq!(*invoker.retained.lock(), expected, "{script}");
             assert_eq!(tree.value_bytes(), 0);
         }
     }
@@ -793,7 +788,7 @@ mod tests {
         );
 
         assert_eq!(
-            *inner.secret_uses.lock().expect("recorded secret uses"),
+            *inner.secret_uses.lock(),
             vec![None, Some(proposal())],
             "the pointer altered a proposal on its way to the invoker behind it"
         );
@@ -877,7 +872,6 @@ mod tests {
             let secret_use = proposal.secret_use;
             self.invocations
                 .lock()
-                .expect("recorded invocations")
                 .push((capability.to_owned(), input, secret_use));
             CapabilityCallResult::Succeeded(json!({"status": 200}))
         }
@@ -893,7 +887,7 @@ mod tests {
             assert_eq!(outcome.output, r#"{"status":200}"#);
             assert_eq!(outcome.capability_calls, 1);
             assert_eq!(
-                *invoker.invocations.lock().expect("recorded invocations"),
+                *invoker.invocations.lock(),
                 vec![(
                     "http-probe.fetch".to_owned(),
                     json!({"argv": ["fetch", "--url", "https://x"], "stdin": null}),

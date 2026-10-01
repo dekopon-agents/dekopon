@@ -237,8 +237,9 @@ mod tests {
 
     use super::*;
     use dekopon_test_support::{CaptureLayer, Record};
+    use parking_lot::Mutex;
     use std::{
-        sync::{Arc, Mutex, mpsc},
+        sync::{Arc, mpsc},
         time::Duration,
     };
     use tracing_subscriber::prelude::*;
@@ -262,7 +263,7 @@ mod tests {
             _: tracing_subscriber::layer::Context<'_, S>,
         ) {
             if attrs.metadata().name() == "asset.spool" {
-                self.0.lock().unwrap().push(std::thread::current().id());
+                self.0.lock().push(std::thread::current().id());
             }
         }
     }
@@ -277,7 +278,7 @@ mod tests {
             .set_default();
         let origin = tracing::info_span!("gateway.session");
         let images = origin.in_scope(images);
-        threads.0.lock().unwrap().clear();
+        threads.0.lock().clear();
         let delivery = tracing::info_span!("transport.delivery");
         let result = delivery.in_scope(|| hydrate_images(images)).await.unwrap();
         for (index, image) in result.iter().enumerate() {
@@ -292,7 +293,7 @@ mod tests {
                 }
             );
         }
-        let spool_threads = threads.0.lock().unwrap();
+        let spool_threads = threads.0.lock();
         assert_eq!(
             spool_threads.len(),
             4,
@@ -365,12 +366,12 @@ mod tests {
             .with(threads.clone())
             .set_default();
         let mut queue = ImageQueue::new(images());
-        threads.0.lock().unwrap().clear();
+        threads.0.lock().clear();
 
         drop(queue.next().await.unwrap().unwrap());
         drop(queue);
 
-        let spool_threads = threads.0.lock().unwrap();
+        let spool_threads = threads.0.lock();
         assert_eq!(
             spool_threads.len(),
             3,
@@ -439,7 +440,7 @@ mod tests {
             .with(threads.clone())
             .set_default();
         let images = images();
-        threads.0.lock().unwrap().clear();
+        threads.0.lock().clear();
         let error = hydrate_images_with(0, images, |_image| {
             Err(BlobError::Io(std::io::ErrorKind::PermissionDenied))
         })
@@ -451,7 +452,7 @@ mod tests {
             TransportError::Attachment(BlobError::Io(std::io::ErrorKind::PermissionDenied))
         ));
         assert!(error.to_string().contains("PermissionDenied"));
-        let spool_threads = threads.0.lock().unwrap();
+        let spool_threads = threads.0.lock();
         assert_eq!(
             spool_threads.len(),
             2,

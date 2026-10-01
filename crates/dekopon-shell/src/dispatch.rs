@@ -44,12 +44,10 @@ pub(crate) fn resolve(
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::{
         collections::BTreeSet,
-        sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
@@ -89,7 +87,7 @@ mod tests {
             if secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
-            self.invoked.lock().unwrap().push(capability);
+            self.invoked.lock().push(capability);
             CapabilityCallResult::Succeeded(input)
         }
     }
@@ -170,7 +168,7 @@ mod tests {
             assert_eq!(outcome.capability_calls, 0, "{script}");
         }
         assert!(
-            session.invoked.lock().unwrap().is_empty(),
+            session.invoked.lock().is_empty(),
             "a capability identifier typed as a command reached invoke"
         );
     }

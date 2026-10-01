@@ -1,13 +1,13 @@
 //! Only a missing index counts as a cache miss; every other failure stops startup, and the operator
 //! must never modify or truncate a mapped artifact in place.
 
+use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Instant,
 };
 
@@ -63,9 +63,7 @@ impl Cache {
         source_sha256: &str,
     ) -> wasmtime::Result<Component> {
         let started = Instant::now();
-        let mut loaded = self.loaded.lock().map_err(|error| {
-            wasmtime::Error::msg(format!("compiled component loader lock poisoned: {error}"))
-        })?;
+        let mut loaded = self.loaded.lock();
         tracing::Span::current().record("cache_wait_us", micros(started));
         let index = self
             .root
