@@ -1,5 +1,12 @@
 mod bounded;
+mod handles;
+pub use crate::http::{
+    BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, Part, Request, Response,
+    StreamedRequest, StreamedResponse, method,
+};
+pub use crate::storage::{durable_files, jsonl};
 pub use bounded::{Bounded, TooLong, Truncated};
+pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Settings, Storage};
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -64,9 +71,75 @@ pub trait Capability: Sized + 'static {
 }
 
 /// The imports a capability is granted; `()` grants none.
-pub trait Needs: sealed::Needs {}
+///
+/// ```compile_fail
+/// use dekopon_provider_sdk::provider::Http;
+/// let unauthorized = Http { private: () };
+/// ```
+pub trait Needs: sealed::Needs {
+    /// The import interfaces required by this need.
+    const IMPORTS: ImportSet;
+}
 
-impl Needs for () {}
+impl Needs for () {
+    const IMPORTS: ImportSet = ImportSet::EMPTY;
+}
+
+/// A set of guest import interfaces declared by a capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImportSet(u8);
+
+impl ImportSet {
+    /// No guest imports.
+    pub const EMPTY: Self = Self(0);
+    /// Buffered and asset-backed HTTP requests.
+    pub const HTTP: Self = Self(1);
+    /// Broker wall clock.
+    pub const CLOCK: Self = Self(2);
+    /// Per-provider settings.
+    pub const SETTINGS: Self = Self(4);
+    /// JSONL storage.
+    pub const JSONL: Self = Self(8);
+    /// Durable file storage.
+    pub const DURABLE_FILES: Self = Self(16);
+    /// Conversation assets.
+    pub const ASSETS: Self = Self(32);
+
+    /// Combines two declarations without granting either one.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether all imports in `other` were declared.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+macro_rules! need_tuple {
+    ($($need:ident),+) => {
+        impl<$($need: Needs),+> sealed::Needs for ($($need,)+) {
+            fn grant() -> Result<Self, SdkFailure> {
+                Ok(($(<$need as sealed::Needs>::grant()?,)+))
+            }
+        }
+        impl<$($need: Needs),+> Needs for ($($need,)+) {
+            const IMPORTS: ImportSet = ImportSet::EMPTY$(.union($need::IMPORTS))+;
+        }
+    };
+}
+macro_rules! need_tuples {
+    ($head:ident $(, $tail:ident)*) => {
+        need_tuple!($head $(, $tail)*);
+        need_tuples!($($tail),*);
+    };
+    () => {};
+}
+need_tuples!(
+    N19, N18, N17, N16, N15, N14, N13, N12, N11, N10, N9, N8, N7, N6, N5, N4, N3, N2, N1
+);
 
 /// A capability failure reported to the model: a stable code and its display text.
 pub trait Failure: fmt::Display {
@@ -215,11 +288,13 @@ mod sealed {
     use super::{Capability, ComponentResponse, ManifestError, Provider, ProviderCapability};
 
     pub trait Needs: Sized {
-        fn grant() -> Self;
+        fn grant() -> Result<Self, super::SdkFailure>;
     }
 
     impl Needs for () {
-        fn grant() -> Self {}
+        fn grant() -> Result<Self, super::SdkFailure> {
+            Ok(())
+        }
     }
 
     pub trait Capabilities<P: Provider> {
@@ -341,7 +416,12 @@ fn run<C: Capability>(input: &str) -> ComponentResponse {
             error: failure(&SdkFailure::InvalidInput),
         };
     };
-    match C::run(input, sealed::Needs::grant()) {
+    let Ok(needs) = <C::Needs as sealed::Needs>::grant() else {
+        return ComponentResponse::Failed {
+            error: failure(&SdkFailure::InvalidSettings),
+        };
+    };
+    match C::run(input, needs) {
         Ok(output) => match serde_json::to_value(output) {
             Ok(output) => ComponentResponse::Succeeded { output },
             Err(_) => ComponentResponse::Failed {

@@ -27,9 +27,12 @@ pub use schemars;
 pub mod asset;
 #[cfg(feature = "clap")]
 pub mod cli;
+mod clock;
 #[cfg(feature = "host")]
 pub mod host;
+mod http;
 pub mod provider;
+mod storage;
 
 pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 
