@@ -2,8 +2,8 @@ use dekopon_provider_sdk::clap::{self, Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
     Bounded, Capability, Code, Failure, Proposal, Provider, Usage,
 };
-use dekopon_provider_sdk::schemars::JsonSchema;
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 struct CliProbe;
