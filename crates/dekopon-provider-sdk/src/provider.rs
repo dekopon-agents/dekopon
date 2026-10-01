@@ -428,15 +428,6 @@ fn run<C: Capability>(input: &str) -> ComponentResponse {
             error: failure(&SdkFailure::InvalidInput),
         };
     };
-    #[cfg(not(target_arch = "wasm32"))]
-    if C::Needs::IMPORTS.contains(ImportSet::ASSETS)
-        || C::Needs::IMPORTS.contains(ImportSet::JSONL)
-        || C::Needs::IMPORTS.contains(ImportSet::DURABLE_FILES)
-    {
-        return ComponentResponse::Failed {
-            error: failure(&SdkFailure::ComponentHarnessRequired),
-        };
-    }
     let needs = match <C::Needs as sealed::Needs>::grant() {
         Ok(needs) => needs,
         Err(error) => {

@@ -302,6 +302,14 @@ refused_native_import!(
     dekopon_provider_sdk::provider::Assets
 );
 refused_native_import!(
+    HttpAssetsFixture,
+    HttpAssetsCall,
+    (
+        dekopon_provider_sdk::provider::Http,
+        dekopon_provider_sdk::provider::Assets
+    )
+);
+refused_native_import!(
     TupleFixture,
     TupleCall,
     (
@@ -309,6 +317,109 @@ refused_native_import!(
         dekopon_provider_sdk::provider::Assets
     )
 );
+
+struct HttpFixture;
+struct HttpCall;
+struct HttpClockFixture;
+struct HttpClockCall;
+
+macro_rules! http_provider {
+    ($provider:ident, $capability:ident, $needs:ty, $body:expr) => {
+        impl Provider for $provider {
+            const ID: &'static str = "native-http";
+            const COMMAND_WORDS: &'static [&'static str] = &["native-http"];
+            const DESCRIPTION: &'static str = "Native HTTP fixture";
+            type Args = ClockArgs;
+            type Capabilities = ($capability,);
+            fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+                Ok(Proposal::to::<$capability>(ClockInput {}))
+            }
+        }
+        impl Capability for $capability {
+            type Provider = $provider;
+            const NAME: &'static str = "send";
+            const DESCRIPTION: &'static str = "Sends a request";
+            const EFFECT: EffectKind = EffectKind::ReadOnly;
+            const RISK: RiskLevel = RiskLevel::Low;
+            type Input = ClockInput;
+            type Needs = $needs;
+            type Output = u64;
+            type Error = Infallible;
+            fn run(_: ClockInput, needs: Self::Needs) -> Result<u64, Infallible> {
+                Ok(($body)(needs))
+            }
+        }
+    };
+}
+
+fn fake_http_send(http: dekopon_provider_sdk::provider::Http) -> u64 {
+    let request = dekopon_provider_sdk::provider::Request::new("GET", "https://example.test/")
+        .expect("valid request");
+    u64::from(http.send(request).expect("fake port responds").status)
+}
+http_provider!(
+    HttpFixture,
+    HttpCall,
+    dekopon_provider_sdk::provider::Http,
+    fake_http_send
+);
+http_provider!(
+    HttpClockFixture,
+    HttpClockCall,
+    (
+        dekopon_provider_sdk::provider::Http,
+        dekopon_provider_sdk::provider::Clock
+    ),
+    |(http, clock): (
+        dekopon_provider_sdk::provider::Http,
+        dekopon_provider_sdk::provider::Clock
+    )| { fake_http_send(http) + clock.now_unix_millis() }
+);
+
+#[test]
+fn native_http_and_http_clock_tuple_reach_the_fake_port() {
+    use dekopon_provider_sdk::provider::{Port, with_port};
+    struct Fake;
+    impl Port for Fake {
+        fn now_unix_millis(&mut self) -> u64 {
+            123
+        }
+        fn settings(&mut self) -> Option<String> {
+            None
+        }
+        fn send(
+            &mut self,
+            request: dekopon_provider_sdk::provider::Request,
+        ) -> Result<
+            dekopon_provider_sdk::provider::Response,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            assert_eq!(request.uri, "https://example.test/");
+            Ok(dekopon_provider_sdk::provider::Response {
+                status: 202,
+                headers: vec![],
+                body: vec![],
+            })
+        }
+        fn stream(
+            &mut self,
+            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
+        ) -> Result<
+            dekopon_provider_sdk::provider::StreamedResponse,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            unreachable!()
+        }
+    }
+    assert_eq!(
+        with_port(Fake, || call::<HttpFixture>("native-http.send", "{}")),
+        ComponentResponse::Succeeded { output: json!(202) }
+    );
+    assert_eq!(
+        with_port(Fake, || call::<HttpClockFixture>("native-http.send", "{}")),
+        ComponentResponse::Succeeded { output: json!(325) }
+    );
+}
 
 #[test]
 fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple() {
@@ -326,7 +437,36 @@ fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple(
     requires_harness::<JsonlFixture>();
     requires_harness::<DurableFixture>();
     requires_harness::<AssetsFixture>();
-    requires_harness::<TupleFixture>();
+    requires_harness::<HttpAssetsFixture>();
+    use dekopon_provider_sdk::provider::{Port, with_port};
+    struct SettingsFake;
+    impl Port for SettingsFake {
+        fn now_unix_millis(&mut self) -> u64 {
+            unreachable!()
+        }
+        fn settings(&mut self) -> Option<String> {
+            Some("\"valid\"".to_owned())
+        }
+        fn send(
+            &mut self,
+            _: dekopon_provider_sdk::provider::Request,
+        ) -> Result<
+            dekopon_provider_sdk::provider::Response,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            unreachable!()
+        }
+        fn stream(
+            &mut self,
+            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
+        ) -> Result<
+            dekopon_provider_sdk::provider::StreamedResponse,
+            dekopon_provider_sdk::provider::HttpError,
+        > {
+            unreachable!()
+        }
+    }
+    with_port(SettingsFake, requires_harness::<TupleFixture>);
 }
 
 fn run(words: &[&str], stdin: Option<&str>) -> CommandRunOutcome {
