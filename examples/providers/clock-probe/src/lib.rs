@@ -1,9 +1,12 @@
 use dekopon_provider_sdk::clap::Parser;
-use dekopon_provider_sdk::provider::{Capability, Clock, Code, Failure, Proposal, Provider, Usage};
+use dekopon_provider_sdk::provider::{
+    Capability, Clock, Code, Failure, Proposal, Provider, Stdout, Usage,
+};
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
 
 struct ClockProbe;
 struct Now;
@@ -40,7 +43,7 @@ impl Provider for ClockProbe {
         "Clock provider fixture: the date word and the host wall clock";
     type Args = Date;
     type Capabilities = (Now,);
-    fn propose(_: Date, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: Date, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Now>(Empty {}))
     }
 }
@@ -53,10 +56,10 @@ impl Capability for Now {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Empty;
     type Needs = Clock;
-    type Output = Value;
     type Error = ClockError;
-    fn run(_: Empty, clock: Clock) -> Result<Value, ClockError> {
-        reading(clock.now_unix_millis())
+    fn run(_: Empty, clock: Clock, out: &mut Stdout) -> Result<(), ClockError> {
+        writeln!(out, "{}", reading(clock.now_unix_millis())?)
+            .map_err(|_| ClockError(clock.now_unix_millis()))
     }
 }
 
@@ -104,24 +107,30 @@ dekopon_provider_sdk::export!(ClockProbe);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dekopon_provider_sdk::CommandRunOutcome;
     use dekopon_provider_sdk::provider;
-    use dekopon_provider_sdk::{CommandRunOutcome, ComponentResponse};
 
     #[test]
     fn date_proposes_clock_now_and_refuses_other_arguments() {
         assert!(
-            matches!(provider::command::<ClockProbe>(&[], Some("piped")), CommandRunOutcome::Proposed { capability, input, .. } if capability.as_str() == "clock-probe.now" && input == json!({}))
+            matches!(provider::command::<ClockProbe>(&[], true), CommandRunOutcome::Proposed { capability, input, .. } if capability.as_str() == "clock-probe.now" && input == json!({}))
         );
         assert!(
-            matches!(provider::command::<ClockProbe>(&["--help".into()], None), CommandRunOutcome::Rendered { status: 0, stdout, .. } if !stdout.contains('\u{1b}'))
+            matches!(provider::command::<ClockProbe>(&["--help".into()], false), CommandRunOutcome::Rendered { status: 0, stdout, .. } if !stdout.contains('\u{1b}'))
         );
         assert!(matches!(
-            provider::command::<ClockProbe>(&["-u".into()], None),
+            provider::command::<ClockProbe>(&["-u".into()], false),
             CommandRunOutcome::Rendered { status: 2, .. }
         ));
-        assert!(
-            matches!(provider::call::<ClockProbe>("clock-probe.now", r#"{"zone":"UTC"}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
+        let exit = provider::invoke_native::<ClockProbe>(
+            "clock-probe.now",
+            r#"{"zone":"UTC"}"#,
+            provider::NativeStdio {
+                stdin: None,
+                stdout: Box::new(std::io::sink()),
+            },
         );
+        assert_eq!(exit.status, 2);
     }
 
     #[test]

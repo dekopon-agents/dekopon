@@ -223,13 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn checked_cli_bytes_have_no_imports_but_a_declared_clock_would_mismatch() {
+    fn checked_cli_bytes_import_stdio_but_not_an_undeclared_clock() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/providers/cli-probe-provider.wasm");
         let bytes = std::fs::read(path).unwrap();
         let decoded = decoded_imports(&bytes).unwrap();
         assert!(
-            decoded.is_empty(),
+            decoded == declared_imports(ImportSet::EMPTY),
             "decoded imports: {decoded:?}; bytes: {}",
             bytes.len()
         );

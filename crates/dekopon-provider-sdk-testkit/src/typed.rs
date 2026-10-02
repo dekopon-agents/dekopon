@@ -79,6 +79,7 @@ pub struct Run<P: Provider> {
     limits: BrokerHostLimits,
     clock: Option<SystemTime>,
     http: Option<Result<ScriptServer, HarnessError>>,
+    stdin: Option<Vec<u8>>,
     _provider: PhantomData<P>,
 }
 
@@ -94,6 +95,7 @@ impl<P: Provider> Harness<P> {
             limits: BrokerHostLimits::default(),
             clock: None,
             http: None,
+            stdin: None,
             _provider: PhantomData,
         }
     }
@@ -146,6 +148,13 @@ impl<P: Provider> Run<P> {
         self
     }
 
+    /// Supplies piped bytes; an empty slice is distinct from no pipe.
+    #[must_use]
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
+    }
+
     /// The exact scripted origin to pass to the provider input.
     #[must_use]
     pub fn origin(&self) -> Option<&str> {
@@ -155,24 +164,11 @@ impl<P: Provider> Run<P> {
             .map(|server| server.origin.as_str())
     }
 
-    /// Calls a checked component with an exact grant derived from its scripted origin.
+    /// Calls a checked component and captures its exit status, stdout and stderr.
     ///
     /// # Errors
-    /// Fails on missing artifacts, host refusals, TLS fixture errors or provider failures.
-    pub fn call(self, capability: &str, input: Value) -> Result<Value, HarnessError> {
-        let (_, stdout) = self.call_full(capability, input)?;
-        serde_json::from_slice(&stdout).map_err(|_error| HarnessError::Fixture("stdout JSON"))
-    }
-
-    /// Returns host import recordings and the captured stdout of an authorized component call.
-    ///
-    /// # Errors
-    /// As [`Run::call`].
-    pub fn call_full(
-        self,
-        capability: &str,
-        input: Value,
-    ) -> Result<(dekopon_broker_host::BrokerInvocationOutput, Vec<u8>), HarnessError> {
+    /// Fails on missing artifacts, host refusals, TLS fixture errors or capture failures.
+    pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
         let component = self.component.canonicalize()?;
         let registry = cached_registry::<P>(component, self.limits.clone())?;
         let mut imports = TestImports {
@@ -226,27 +222,86 @@ impl<P: Provider> Run<P> {
                 secret_use: None,
             },
         )?;
-        let (host_end, mut stdout) = std::os::unix::net::UnixStream::pair()?;
+        let (host_end, stdout) = std::os::unix::net::UnixStream::pair()?;
+        let stdin = self
+            .stdin
+            .map(|bytes| {
+                let (host, mut feeder) = std::os::unix::net::UnixStream::pair()?;
+                Ok::<_, std::io::Error>((host, move || {
+                    use std::io::Write;
+                    let _ = feeder.write_all(&bytes);
+                }))
+            })
+            .transpose()?;
+        let (stdin_end, feeder) = match stdin {
+            Some((end, feeder)) => (Some(end.into()), Some(feeder)),
+            None => (None, None),
+        };
         let assets = dekopon_broker_host::asset::AssetInputs {
             streams: Some(dekopon_broker_host::Streams {
-                stdin: None,
+                stdin: stdin_end,
                 stdout: host_end.into(),
             }),
             ..Default::default()
         };
-        let (result, captured) = runtime().block_on(async {
+        let (result, captured, fed) = runtime().block_on(async {
             let invoke =
                 registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
             let capture = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
                 let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes)
+                stdout.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                Ok::<_, std::io::Error>(bytes)
             });
-            tokio::join!(invoke, capture)
+            let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
+            let (result, captured) = tokio::join!(invoke, capture);
+            let fed = match feed {
+                Some(task) => Some(task.await),
+                None => None,
+            };
+            (result, captured, fed)
         });
         drop(server);
+        if fed.is_some_and(|result| result.is_err()) {
+            return Err(HarnessError::Fixture("stdin feeder"));
+        }
         let stdout = captured.map_err(|_error| HarnessError::Fixture("stdout capture"))??;
-        Ok((result.map_err(Box::new)?, stdout))
+        if stdout.len() > 16 * 1024 * 1024 {
+            return Err(HarnessError::Fixture("stdout exceeds capture limit"));
+        }
+        let (status, stderr, http_calls) = match result {
+            Ok(output) => (0, output.stderr, output.http_calls),
+            Err(failure) => match *failure.error {
+                dekopon_broker_host::BrokerHostError::ProviderFailure {
+                    status, stderr, ..
+                } => (status, stderr, failure.http_calls),
+                error => {
+                    return Err(HarnessError::Invocation(Box::new(
+                        dekopon_broker_host::BrokerInvocationFailure {
+                            error: Box::new(error),
+                            http_calls: failure.http_calls,
+                            storage: failure.storage,
+                        },
+                    )));
+                }
+            },
+        };
+        Ok(ComponentOutput {
+            status,
+            stdout,
+            stderr,
+            http_calls,
+        })
     }
+}
+
+/// Captured terminal result and HTTP evidence from one real component invocation.
+#[derive(Debug)]
+pub struct ComponentOutput {
+    pub status: u8,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub http_calls: Vec<dekopon_http_host::HttpCallEvidence>,
 }
 
 struct ScriptServer {
@@ -363,6 +418,7 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
 pub struct Native<P: Provider> {
     clock: Option<SystemTime>,
     http: Option<HttpScript>,
+    stdin: Option<Vec<u8>>,
     requests: Arc<Mutex<Vec<Request>>>,
     _provider: PhantomData<P>,
 }
@@ -372,6 +428,7 @@ impl<P: Provider> Default for Native<P> {
         Self {
             clock: None,
             http: None,
+            stdin: None,
             requests: Arc::new(Mutex::new(Vec::new())),
             _provider: PhantomData,
         }
@@ -393,6 +450,12 @@ impl<P: Provider> Native<P> {
         self.http = Some(script);
         self
     }
+    /// Supplies piped bytes to the native provider invocation.
+    #[must_use]
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
+    }
     #[must_use]
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().clone()
@@ -407,7 +470,9 @@ impl<P: Provider> Native<P> {
         };
         let stdout = Captured::default();
         let stdio = NativeStdio {
-            stdin: None,
+            stdin: self.stdin.as_ref().map(|bytes| {
+                Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read>
+            }),
             stdout: Box::new(stdout.clone()),
         };
         let NativeExit { status, stderr } = provider::with_port(port, || {

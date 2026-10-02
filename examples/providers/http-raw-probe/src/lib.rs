@@ -11,7 +11,7 @@ impl bindings::Guest for RawHttp {
                 "effect":"read-only","risk":"Low","inputSchema":{"type":"object","additionalProperties":false}}]
         }).to_string()
     }
-    fn invoke(_: String, input: String) -> String {
+    fn invoke(_: String, input: String) -> Result<(), u8> {
         use bindings::dekopon::asset::asset as raw;
         let input: serde_json::Value = serde_json::from_str(&input).unwrap();
         let bytes = input["bytes"].as_u64().unwrap() as usize;
@@ -37,9 +37,11 @@ impl bindings::Guest for RawHttp {
                 _ => {}
             }
         }
-        serde_json::json!({"outcome":"succeeded","output":{"caught":result.is_err()}}).to_string()
+        let out = bindings::dekopon::stdio::streams::stdout();
+        out.write(format!("{{\"caught\":{}}}\n", result.is_err()).as_bytes())
+            .map_err(|_| 141)
     }
-    fn run_command(_: Vec<String>, _: Option<String>) -> String {
+    fn run_command(_: Vec<String>, _: bool) -> String {
         serde_json::json!({"outcome":"proposed","capability":"http-probe.fetch","input":{}})
             .to_string()
     }

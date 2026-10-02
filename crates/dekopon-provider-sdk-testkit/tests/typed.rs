@@ -53,6 +53,12 @@ fn stdout_value(output: &dekopon_provider_sdk_testkit::NativeOutput) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn component_stdout(output: dekopon_provider_sdk_testkit::ComponentOutput) -> Value {
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    assert!(output.stdout.ends_with(b"\n"));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 struct Cli;
 struct Upper;
 struct Count;
@@ -199,6 +205,28 @@ fn conformance_refuses_a_declared_word_the_component_does_not_advertise() {
 }
 
 #[test]
+fn real_component_captures_piped_bytes_and_status() {
+    let input = json!({"text":"","piped":true});
+    let result = Harness::<Cli>::get(cli_component())
+        .stdin(b"piped bytes\n".to_vec())
+        .call("cli-probe.upper", input.clone())
+        .unwrap();
+    assert_eq!(result.status, 0);
+    assert_eq!(result.stdout, b"{\"text\":\"PIPED BYTES\\n\"}\n");
+    assert_eq!(result.stderr, "");
+    let empty = Harness::<Cli>::get(cli_component())
+        .stdin(Vec::new())
+        .call("cli-probe.upper", input)
+        .unwrap();
+    assert_eq!(empty.status, 2);
+    assert!(empty.stdout.is_empty());
+    assert_eq!(
+        empty.stderr,
+        "probe: piped input is empty, too large or unavailable\n"
+    );
+}
+
+#[test]
 fn cached_real_component_and_native_dispatch_agree() {
     let input = json!({"text":"hello"});
     let native = Native::<Cli>::new();
@@ -210,17 +238,21 @@ fn cached_real_component_and_native_dispatch_agree() {
     conformance::<Cli>(&component).unwrap();
     for _ in 0..2 {
         assert_eq!(
-            Harness::<Cli>::get(&component)
-                .call("cli-probe.upper", input.clone())
-                .unwrap(),
+            component_stdout(
+                Harness::<Cli>::get(&component)
+                    .call("cli-probe.upper", input.clone())
+                    .unwrap()
+            ),
             json!({"text":"HELLO"})
         );
     }
     assert_eq!(Harness::<Cli>::compiled_identities(), 1);
     assert_eq!(
-        Harness::<OtherCli>::get(&component)
-            .call("cli-probe.upper", input)
-            .unwrap(),
+        component_stdout(
+            Harness::<OtherCli>::get(&component)
+                .call("cli-probe.upper", input)
+                .unwrap()
+        ),
         json!({"text":"HELLO"})
     );
     assert_eq!(Harness::<OtherCli>::compiled_identities(), 1);
@@ -239,9 +271,11 @@ fn cached_real_component_and_native_dispatch_agree() {
     let renamed = temporary.path().join("not-cli-probe.wasm");
     std::fs::copy(component, &renamed).unwrap();
     assert_eq!(
-        Harness::<Cli>::get(&renamed)
-            .call("cli-probe.upper", json!({"text":"hello"}))
-            .unwrap(),
+        component_stdout(
+            Harness::<Cli>::get(&renamed)
+                .call("cli-probe.upper", json!({"text":"hello"}))
+                .unwrap()
+        ),
         json!({"text":"HELLO"})
     );
     assert_eq!(Harness::<Cli>::compiled_identities(), 2);
@@ -354,7 +388,7 @@ fn typed_clock_component_matches_imports_and_uses_injected_clock() {
         .call("clock-probe.now", json!({}))
         .unwrap();
     assert_eq!(
-        output,
+        component_stdout(output),
         json!({"unixMillis":951_782_400_123_u64,"rfc3339":"2000-02-29T00:00:00Z"})
     );
 }
@@ -439,8 +473,9 @@ fn scripted_response_headers_match_native_and_typed_component() {
     let native = Native::<RawHttp>::new().http(native_script);
     let output = stdout_value(&native.call("http-probe.fetch", &input.to_string()));
     assert_eq!(output["headerCount"], 2);
-    let (real, stdout) = run.call_full("http-probe.fetch", input).unwrap();
-    let real_output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let real = run.call("http-probe.fetch", input).unwrap();
+    let real_output: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(real.status, 0, "{}", real.stderr);
     assert_eq!(real_output["headerCount"], output["headerCount"]);
     assert_eq!(real.http_calls.len(), 1);
     assert_eq!(real.http_calls[0].authority, authority);
