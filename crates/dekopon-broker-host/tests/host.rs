@@ -54,7 +54,7 @@ async fn owner_configured_openobserve_component_links_and_has_no_sql_command() {
         .run_command(
             "openobserve",
             &["sql".to_owned(), "--help".to_owned()],
-            None,
+            false,
         )
         .await
         .expect("unknown SQL action is rendered as an error");
@@ -63,7 +63,7 @@ async fn owner_configured_openobserve_component_links_and_has_no_sql_command() {
         .run_command(
             "broker",
             &["usage".to_owned(), "--since".to_owned(), "1h".to_owned()],
-            None,
+            false,
         )
         .await
         .expect("bounded command proposals work without reading settings");
@@ -200,6 +200,7 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
+    let (output_assets, output_stdout) = fixture::piped_stdout();
     let output = registry
         .invoke(
             authorized(
@@ -216,18 +217,19 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
                 http_constraints(authority.clone(), "PATCH"),
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("authorized HTTP invocation succeeds");
+    let output_stdout = output_stdout.json();
 
     assert_eq!(output.provider.as_str(), "http-probe");
-    assert_eq!(output.output["status"], 200);
-    assert_eq!(output.output["bodyBytes"], 11);
-    assert_eq!(output.output["headerCount"], 4);
-    assert_eq!(output.output["body"], "eyJvayI6dHJ1ZX0=");
-    assert_eq!(output.output["bodyText"], r#"{"ok":true}"#);
-    assert_eq!(output.output["bodyTruncated"], false);
+    assert_eq!(output_stdout["status"], 200);
+    assert_eq!(output_stdout["bodyBytes"], 11);
+    assert_eq!(output_stdout["headerCount"], 4);
+    assert_eq!(output_stdout["body"], "eyJvayI6dHJ1ZX0=");
+    assert_eq!(output_stdout["bodyText"], r#"{"ok":true}"#);
+    assert_eq!(output_stdout["bodyTruncated"], false);
     assert_eq!(output.http_calls.len(), 1);
     assert_eq!(output.http_calls[0].method, "PATCH");
     assert_eq!(output.http_calls[0].authority, authority);
@@ -262,6 +264,7 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     );
     let get_server = LoopbackServer::once(get_response.as_bytes());
     let get_authority = get_server.authority().to_owned();
+    let (get_assets, get_stdout) = fixture::piped_stdout();
     let get = registry
         .invoke(
             authorized(
@@ -275,11 +278,12 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
                 http_constraints(get_authority.clone(), "GET"),
             ),
             None,
-            Default::default(),
+            get_assets,
         )
         .await
         .expect("authorized JSONPlaceholder read succeeds");
-    assert_eq!(get.output["post"]["id"], 7);
+    let get_stdout = get_stdout.json();
+    assert_eq!(get_stdout["post"]["id"], 7);
     assert_eq!(get.http_calls.len(), 1);
     assert_eq!(get.http_calls[0].method, "GET");
     assert!(
@@ -297,6 +301,7 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
     );
     let create_server = LoopbackServer::once(create_response.as_bytes());
     let create_authority = create_server.authority().to_owned();
+    let (create_assets, create_stdout) = fixture::piped_stdout();
     let create = registry
         .invoke(
             authorized(
@@ -312,11 +317,12 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
                 http_constraints(create_authority.clone(), "POST"),
             ),
             None,
-            Default::default(),
+            create_assets,
         )
         .await
         .expect("authorized JSONPlaceholder write succeeds");
-    assert_eq!(create.output["post"]["id"], 101);
+    let create_stdout = create_stdout.json();
+    assert_eq!(create_stdout["post"]["id"], 101);
     assert_eq!(create.http_calls.len(), 1);
     assert_eq!(create.http_calls[0].method, "POST");
     let request = create_server.request();
@@ -545,6 +551,7 @@ async fn returns_redirects_without_following_them() {
     let capability = "http-probe.fetch"
         .parse()
         .expect("valid capability fixture");
+    let (output_assets, output_stdout) = fixture::piped_stdout();
     let output = registry
         .invoke(
             authorized(
@@ -553,12 +560,13 @@ async fn returns_redirects_without_following_them() {
                 http_constraints(authority, "GET"),
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("redirect response itself is returned");
+    let output_stdout = output_stdout.json();
 
-    assert_eq!(output.output["status"], 302);
+    assert_eq!(output_stdout["status"], 302);
     assert_eq!(output.http_calls.len(), 1);
     server.join();
 }
@@ -572,6 +580,7 @@ async fn broker_host_also_runs_import_free_components() {
     .await
     .expect("import-free provider loads in the broker linker");
     let capability = "cli-probe.upper".parse().expect("valid capability fixture");
+    let (output_assets, output_stdout) = fixture::piped_stdout();
     let output = registry
         .invoke(
             authorized(
@@ -580,12 +589,13 @@ async fn broker_host_also_runs_import_free_components() {
                 ExecutionConstraints::default(),
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("import-free provider runs without an HTTP grant");
+    let output_stdout = output_stdout.json();
 
-    assert_eq!(output.output, json!({"text": "HELLO"}));
+    assert_eq!(output_stdout, json!({"text": "HELLO"}));
     assert!(output.http_calls.is_empty());
 }
 
@@ -650,7 +660,8 @@ async fn injected_guest_clock_does_not_change_host_timeouts() {
     )
     .await
     .expect("clock provider loads");
-    let output = registry
+    let (output_assets, output_stdout) = fixture::piped_stdout();
+    let _output = registry
         .invoke(
             authorized_for(
                 "clock-probe",
@@ -662,11 +673,12 @@ async fn injected_guest_clock_does_not_change_host_timeouts() {
                 },
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("injected clock is available during invoke");
-    assert_eq!(output.output["unixMillis"], 951_782_400_123_u64);
+    let output_stdout = output_stdout.json();
+    assert_eq!(output_stdout["unixMillis"], 951_782_400_123_u64);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -750,6 +762,7 @@ async fn pinned_https_uses_exact_grant_and_verifies_tls_authority() {
             ..
         }
     ));
+    let (output_assets, output_stdout) = fixture::piped_stdout();
     let output = registry
         .invoke(
             authorized(
@@ -758,11 +771,12 @@ async fn pinned_https_uses_exact_grant_and_verifies_tls_authority() {
                 http_constraints(authority.clone(), "GET"),
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("TLS fixture is reached with exact host grant");
-    assert_eq!(output.output["status"], 200);
+    let output_stdout = output_stdout.json();
+    assert_eq!(output_stdout["status"], 200);
     assert_eq!(output.http_calls[0].authority, authority);
     server.await.expect("server finishes");
 }
@@ -828,7 +842,7 @@ async fn a_loopback_pin_does_not_disable_tls_hostname_verification() {
         .await
         .expect_err("pinned address and CA do not bypass hostname verification");
     assert!(
-        matches!(failure.error.as_ref(), BrokerHostError::ProviderFailure { code, .. } if code == "http-failed"),
+        matches!(failure.error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("http-failed: ")),
         "{failure:?}"
     );
     assert_eq!(failure.http_calls[0].status, None);
@@ -846,7 +860,7 @@ async fn run_command_reading_the_clock_traps() {
     assert_eq!(registry.command_words(), vec!["date".to_owned()]);
 
     let outcome = registry
-        .run_command("date", &[], None)
+        .run_command("date", &[], false)
         .await
         .expect("the bare word proposes");
     assert_eq!(
@@ -859,7 +873,7 @@ async fn run_command_reading_the_clock_traps() {
     );
 
     let error = registry
-        .run_command("date", &["--clock-in-run-command".to_owned()], None)
+        .run_command("date", &["--clock-in-run-command".to_owned()], false)
         .await
         .expect_err("a clock read outside invoke traps");
     assert!(
@@ -872,7 +886,7 @@ async fn run_command_reading_the_clock_traps() {
     );
 
     let outcome = registry
-        .run_command("date", &[], None)
+        .run_command("date", &[], false)
         .await
         .expect("a later run is unaffected");
     assert!(
@@ -1069,7 +1083,7 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     .await
     .expect("hand-rolled command-line provider loads");
     let outcome = registry
-        .run_command("recall", &["--help".to_owned()], None)
+        .run_command("recall", &["--help".to_owned()], false)
         .await
         .expect("help renders");
     let CommandRunOutcome::Rendered {
@@ -1085,7 +1099,7 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     assert!(stderr.is_empty(), "{stderr:?}");
 
     let outcome = registry
-        .run_command("recall", &["yesterday".to_owned()], Some("piped"))
+        .run_command("recall", &["yesterday".to_owned()], true)
         .await
         .expect("the word proposes");
     assert_eq!(
@@ -1098,7 +1112,7 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     );
 
     let outcome = registry
-        .run_command("recall", &["--verbose".to_owned()], None)
+        .run_command("recall", &["--verbose".to_owned()], false)
         .await
         .expect("a decline is an outcome, not a host error");
     assert!(
@@ -1121,7 +1135,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     .expect("command-line provider loads");
     assert_eq!(registry.command_words(), vec!["probe".to_owned()]);
     let outcome = registry
-        .run_command("probe", &["--help".to_owned()], None)
+        .run_command("probe", &["--help".to_owned()], false)
         .await
         .expect("help renders");
     let CommandRunOutcome::Rendered {
@@ -1143,11 +1157,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
         .parse::<CapabilityId>()
         .expect("capability");
     let outcome = registry
-        .run_command(
-            "probe",
-            &["count".to_owned(), "-".to_owned()],
-            Some("héllo"),
-        )
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], true)
         .await
         .expect("a piped value proposes");
     assert_eq!(
@@ -1158,7 +1168,8 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
             input: json!({"text": "héllo"}),
         }
     );
-    let output = registry
+    let (output_assets, output_stdout) = fixture::piped_stdout();
+    let _output = registry
         .invoke(
             authorized_for(
                 "cli-probe",
@@ -1174,14 +1185,15 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
                 },
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("the proposed capability runs");
-    assert_eq!(output.output, json!({"characters": 5}));
+    let output_stdout = output_stdout.json();
+    assert_eq!(output_stdout, json!({"characters": 5}));
 
     let outcome = registry
-        .run_command("probe", &["bogus".to_owned()], None)
+        .run_command("probe", &["bogus".to_owned()], false)
         .await
         .expect("a usage error is rendered, not a host error");
     let CommandRunOutcome::Rendered {
@@ -1201,7 +1213,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
 
     let outcome = registry
-        .run_command("probe", &["count".to_owned(), "-".to_owned()], None)
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], false)
         .await
         .expect("a decline is an outcome, not a host error");
     assert!(
@@ -1318,7 +1330,7 @@ async fn concurrent_small_guest_stores_do_not_reserve_their_maximum() {
         .error;
     assert!(
         matches!(error.as_ref(), BrokerHostError::Timeout { .. })
-            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { code, .. } if code == "http-failed"),
+            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("http-failed: ")),
         "the second store ran; a budget refusal would be MemoryBudgetExhausted: {error:?}"
     );
 
@@ -1478,6 +1490,7 @@ async fn a_two_request_capability_leaves_two_evidence_entries() {
     ]);
     let authority = server.authority().to_owned();
 
+    let (output_assets, output_stdout) = fixture::piped_stdout();
     let output = registry
         .invoke(
             authorized(
@@ -1488,13 +1501,14 @@ async fn a_two_request_capability_leaves_two_evidence_entries() {
                 conditional_write_constraints(authority.clone(), &["GET", "POST"], 2),
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("authorized two-call conditional write succeeds");
+    let output_stdout = output_stdout.json();
 
     assert_eq!(output.provider.as_str(), "http-probe");
-    assert_eq!(output.output["observedEtag"], "\"v1\"");
+    assert_eq!(output_stdout["observedEtag"], "\"v1\"");
 
     assert_eq!(output.http_calls.len(), 2);
     assert_eq!(output.http_calls[0].method, "GET");
@@ -1693,12 +1707,12 @@ async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
         .await
         .expect("probe loads");
 
-    let output = broker
+    let (output, stdout) = broker
         .invoke_full("storage-probe.run", json!({}))
         .await
         .expect("probe succeeds");
 
-    assert_eq!(output.output["clocksCalled"], true);
+    assert_eq!(stdout["clocksCalled"], true);
     assert!(output.storage.is_some());
 }
 
@@ -1874,26 +1888,27 @@ fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
             .concat(),
         )
     };
-    let command_params = "(param \"argv\" (list string)) (param \"stdin\" (option string))";
-    let core_params = "i32 i32 i32 i32 i32";
+    let command_params = "(param \"argv\" (list string)) (param \"stdin-piped\" bool)";
+    let core_params = "i32 i32 i32";
     let wat = format!(
         r#"(component
             (core module $m
                 (memory (export "memory") 1)
                 (data (i32.const 0) "{manifest_descriptor}")
                 (data (i32.const 8) "{response_descriptor}")
+                (data (i32.const 16) "\00\00")
                 (data (i32.const 64) "{manifest}")
                 (data (i32.const 2048) "{response}")
                 (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096)
                 (func (export "describe") (result i32) i32.const 0)
-                (func (export "invoke") (param i32 i32 i32 i32) (result i32) i32.const 8)
+                (func (export "invoke") (param i32 i32 i32 i32) (result i32) i32.const 16)
                 (func (export "command") (param {core_params}) (result i32) i32.const 8)
                 (func (export "cleanup") (param i32) {cleanup})
             )
             (core instance $i (instantiate $m))
             (func (export "describe") (result string)
                 (canon lift (core func $i "describe") (memory (core memory $i "memory"))))
-            (func (export "invoke") (param "capability" string) (param "input" string) (result string)
+            (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
                 (canon lift (core func $i "invoke") (memory (core memory $i "memory"))
                     (realloc (core func $i "realloc")) (post-return (core func $i "cleanup"))))
             (func (export "run-command") {command_params} (result string)
@@ -1918,7 +1933,7 @@ async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
         .await
         .expect("valid manifest loads without cleanup trap");
     let error = registry
-        .run_command("cleanup", &[], None)
+        .run_command("cleanup", &[], false)
         .await
         .expect_err("cleanup trap must not become an output parsing failure");
     let BrokerHostError::RunCommand { source, .. } = error else {
@@ -1970,7 +1985,7 @@ async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
             .await
             .expect("valid manifest loads");
     let error = registry
-        .run_command("cleanup", &[], None)
+        .run_command("cleanup", &[], false)
         .await
         .expect_err("looping cleanup times out");
     assert!(
@@ -1978,7 +1993,7 @@ async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
         "{error:?}"
     );
     assert!(matches!(
-        registry.run_command("cleanup", &[], None).await,
+        registry.run_command("cleanup", &[], false).await,
         Err(BrokerHostError::Timeout { .. })
     ));
 }
@@ -2011,6 +2026,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
         let refs = (1..=count)
             .map(|id| format!("chat-asset:{id}"))
             .collect::<Vec<_>>();
+        let (piped, stdout) = fixture::piped_stdout();
         let inputs = AssetInputs {
             rows: (1..=count)
                 .map(|id| AssetRow {
@@ -2026,6 +2042,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
                 .map(|_| File::open(input.path()).unwrap().into())
                 .collect(),
             sends_remaining: 0,
+            streams: piped.streams,
         };
         let mut constraints = http_constraints(server.authority().to_owned(), "POST");
         constraints.asset = Some(AssetConstraints {
@@ -2044,7 +2061,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
             )
             .await
             .unwrap();
-        assert_eq!(output.output, json!({"status": 200}));
+        assert_eq!(stdout.json(), json!({"status": 200}));
         assert_eq!(output.assets.attached.len(), 1);
         assert_eq!(output.assets.attached[0].descriptor, 0);
         assert_eq!(output.assets.attached[0].bytes, response.len() as u64);

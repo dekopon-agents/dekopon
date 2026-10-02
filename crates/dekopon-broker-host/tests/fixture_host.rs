@@ -43,14 +43,14 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
         .await
         .expect("storage-probe loads");
 
-    let output = broker
+    let (output, stdout) = broker
         .invoke_full("storage-probe.run", json!({}))
         .await
         .expect("the durable-files conformance sequence completes");
 
-    assert_eq!(output.output["clocksCalled"], true);
-    assert_eq!(output.output["entropyBytes"], 32);
-    assert_eq!(output.output["identityNonzero"], true);
+    assert_eq!(stdout["clocksCalled"], true);
+    assert_eq!(stdout["entropyBytes"], 32);
+    assert_eq!(stdout["identityNonzero"], true);
     let evidence = output
         .storage
         .expect("a storage-backed invocation carries evidence");
@@ -142,7 +142,7 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
         .expect("cli-probe loads");
 
     let outcome = broker
-        .run_command("probe", &["--help".to_owned()], None)
+        .run_command("probe", &["--help".to_owned()], false)
         .await
         .expect("help renders");
     let CommandRunOutcome::Rendered {
@@ -162,11 +162,7 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
     assert!(stderr.is_empty(), "{stderr:?}");
 
     let outcome = broker
-        .run_command(
-            "probe",
-            &["reverse".to_owned(), "-".to_owned()],
-            Some("abc"),
-        )
+        .run_command("probe", &["reverse".to_owned(), "-".to_owned()], true)
         .await
         .expect("a piped value proposes");
     assert_eq!(
@@ -184,7 +180,7 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
     assert_eq!(output, json!({"text": "cba"}));
 
     let error = broker
-        .run_command("recall", &[], None)
+        .run_command("recall", &[], false)
         .await
         .expect_err("a word the component did not declare is refused");
     assert!(
@@ -228,8 +224,10 @@ async fn a_provider_declared_failure_is_distinguishable_from_a_host_refusal() {
         .expect_err("last: 0 is refused by the provider");
 
     assert_eq!(
-        error.provider_failure().map(|(code, _)| code),
-        Some("invalid-input"),
+        error
+            .provider_failure()
+            .map(|(status, stderr)| (status, stderr.starts_with("invalid-input: "))),
+        Some((1, true)),
         "{error}"
     );
 

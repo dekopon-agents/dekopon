@@ -200,6 +200,7 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::Deserialize { .. } => "deserialize",
         ProtocolError::DescriptorsTruncated => "descriptors-truncated",
         ProtocolError::TooManyDescriptors => "too-many-descriptors",
+        ProtocolError::MissingStreamDescriptors => "missing-stream-descriptors",
         ProtocolError::UnexpectedDescriptors => "unexpected-descriptors",
         ProtocolError::DescriptorIndex => "descriptor-index",
         ProtocolError::DescriptorFlags { .. } => "descriptor-flags",

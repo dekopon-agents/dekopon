@@ -423,8 +423,9 @@ fn scripted_response_headers_match_native_and_typed_component() {
         panic!("native fake must return the scripted headers");
     };
     assert_eq!(output["headerCount"], 2);
-    let real = run.call_full("http-probe.fetch", input).unwrap();
-    assert_eq!(real.output["headerCount"], output["headerCount"]);
+    let (real, stdout) = run.call_full("http-probe.fetch", input).unwrap();
+    let real_output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(real_output["headerCount"], output["headerCount"]);
     assert_eq!(real.http_calls.len(), 1);
     assert_eq!(real.http_calls[0].authority, authority);
 }

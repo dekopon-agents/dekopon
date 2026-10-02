@@ -1421,7 +1421,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
             None,
             "httpprobe",
             &basic_fetch_argv(&uri),
-            None,
+            false,
         )
         .await
         .expect("the word proposes");
@@ -2544,7 +2544,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
             None,
             "gh",
             &["gh".to_owned(), "pr".to_owned()],
-            None,
+            false,
         )
         .await
         .expect_err("no loaded provider declares this word");
@@ -2586,7 +2586,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     let caller = session("caller", "provider-test");
 
     match broker
-        .run_command(&caller, None, None, "probe", &["--help".to_owned()], None)
+        .run_command(&caller, None, None, "probe", &["--help".to_owned()], false)
         .await
         .expect("the help page renders")
     {
@@ -2609,7 +2609,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
             None,
             "probe",
             &["upper".to_owned(), "-".to_owned()],
-            Some("hello"),
+            true,
         )
         .await
         .expect("the piped value proposes");
@@ -2623,7 +2623,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     );
 
     match broker
-        .run_command(&caller, None, None, "probe", &["bogus".to_owned()], None)
+        .run_command(&caller, None, None, "probe", &["bogus".to_owned()], false)
         .await
         .expect("a usage error renders")
     {

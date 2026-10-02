@@ -504,7 +504,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
             Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
-            None,
+            false,
             trace_parent(),
         )
         .await
@@ -523,7 +523,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
             Some(session()),
             "probe".to_owned(),
             vec!["--help".to_owned()],
-            None,
+            false,
             trace_parent(),
         )
         .await
@@ -538,7 +538,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
             Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
-            None,
+            false,
             trace_parent(),
         )
         .await
@@ -557,7 +557,7 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
             Some(session()),
             "nosuchword".to_owned(),
             Vec::new(),
-            None,
+            false,
             trace_parent(),
         )
         .await;

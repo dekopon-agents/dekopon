@@ -3,6 +3,7 @@ name: WIT package
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
@@ -42,7 +43,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
+  PROVIDER_WIT_PACKAGE: dekopon:provider@0.4.0
+  STDIO_WIT_PACKAGE: dekopon:stdio@0.1.0
   HTTP_WIT_PACKAGE: dekopon:http@1.1.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
@@ -198,7 +200,13 @@ jobs:
           do
             cmp wit/storage/storage.wit "$mirror"
           done
-          # The SDK-local asset-client world is not part of immutable provider@0.3.0.
+          for mirror in \
+            crates/dekopon-provider-sdk/wit/deps/stdio.wit \
+            crates/dekopon-broker-host/wit/deps/stdio.wit
+          do
+            cmp wit/stdio/stdio.wit "$mirror"
+          done
+          # The SDK-local client worlds are not part of provider@0.4.0; wkg.toml resolves stdio locally.
           mkdir -p "$RUNNER_TEMP/provider-publication"
           cp crates/dekopon-provider-sdk/wit/provider.wit "$RUNNER_TEMP/provider-publication/provider.wit"
           wkg build \
@@ -232,47 +240,44 @@ jobs:
           )
           git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock
 
-      - name: Verify provider exports and import-free boundary
+      - name: Verify provider exports and the stdio import
         shell: bash
         run: |
           set -euo pipefail
           package=target/wit-package/dekopon-provider.wasm
           wasm-tools validate "$package"
           wasm-tools component wit --json "$package" > target/wit-package/dekopon-provider.json
-          jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" '
-            (.packages | length == 1) and
-            (.packages[0].name == $package) and
-            (.packages[0].worlds == {"provider": 0, "provider-commands": 1, "provider-cli": 2}) and
-            (.worlds | length == 3) and
-            (.worlds[0].name == "provider") and
-            ((.worlds[0].imports | keys) == []) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
-            (.worlds[0].exports.describe.function.params == []) and
-            (.worlds[0].exports.describe.function.result == "string") and
-            (.worlds[0].exports.invoke.function.params == [
+          jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" --arg stdio "$STDIO_WIT_PACKAGE" '
+          . as $doc |
+          def kind($t): if ($t | type) == "number" then $doc.types[$t].kind else $t end;
+          (.packages == [
+            {"name": $stdio, "interfaces": {"streams": 0}, "worlds": {}},
+            {"name": $package, "interfaces": {}, "worlds": {"provider": 0, "provider-cli": 1}}
+          ]) and
+          (.interfaces | length == 1) and
+          (.interfaces[0].name == "streams") and
+          ((.interfaces[0].functions | keys) == [
+            "[method]reader.read", "[method]writer.write", "stdin", "stdout", "write-stderr"
+          ]) and
+          (.worlds | length == 2) and
+          all(.worlds[];
+            (.imports == {"interface-0": {"interface": {"id": 0}}}) and
+            (.exports.describe.function.params == []) and
+            (.exports.describe.function.result == "string") and
+            (.exports.invoke.function.params == [
               {"name": "capability", "type": "string"},
               {"name": "input-json", "type": "string"}
             ]) and
-            (.worlds[0].exports.invoke.function.result == "string") and
-            (.worlds[1].name == "provider-commands") and
-            ((.worlds[1].imports | keys) == []) and
-            ((.worlds[1].exports | keys) == ["describe", "invoke", "resolve-command"]) and
-            (.worlds[1].exports."resolve-command".function.params == [
-              {"name": "argv", "type": 0}
-            ]) and
-            (.types[0].kind == {"list": "string"}) and
-            (.worlds[1].exports."resolve-command".function.result == "string") and
-            (.worlds[2].name == "provider-cli") and
-            ((.worlds[2].imports | keys) == []) and
-            ((.worlds[2].exports | keys) == ["describe", "invoke", "run-command"]) and
-            (.worlds[2].exports."run-command".function.params == [
-              {"name": "argv", "type": 1},
-              {"name": "stdin", "type": 2}
-            ]) and
-            (.types[1].kind == {"list": "string"}) and
-            (.types[2].kind == {"option": "string"}) and
-            (.types | length == 3) and
-            (.worlds[2].exports."run-command".function.result == "string")
+            (kind(.exports.invoke.function.result) == {"result": {"ok": null, "err": "u8"}})) and
+          (.worlds[0].name == "provider") and
+          ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
+          (.worlds[1].name == "provider-cli") and
+          ((.worlds[1].exports | keys) == ["describe", "invoke", "run-command"]) and
+          (.worlds[1].exports."run-command".function.params | length == 2) and
+          (.worlds[1].exports."run-command".function.params[0].name == "argv") and
+          (kind(.worlds[1].exports."run-command".function.params[0].type) == {"list": "string"}) and
+          (.worlds[1].exports."run-command".function.params[1] == {"name": "stdin-piped", "type": "bool"}) and
+          (.worlds[1].exports."run-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
       - name: Verify buffered and streamed HTTP interfaces
@@ -621,7 +626,7 @@ jobs:
           cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
 
       - name: Upload the verified packages
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dekopon-wit-packages
@@ -635,7 +640,7 @@ jobs:
 
   publish:
     name: publish to GHCR
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: validate
     runs-on: ubuntu-24.04
     permissions:

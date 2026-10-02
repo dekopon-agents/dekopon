@@ -654,7 +654,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     assert!(help.contains_key("recall"));
     assert!(memory.is_none(), "no route means no memory surface");
     broker
-        .run_command(&gateway, Some(&grant), Some(&claim), "recall", &[], None)
+        .run_command(&gateway, Some(&grant), Some(&claim), "recall", &[], false)
         .await
         .expect("chat resolution reserves nothing either");
     let chat_id = "unrouted-chat".parse::<InvocationId>().expect("invocation");
@@ -867,7 +867,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
                     Some(&attestation),
                     "recall",
                     &["--help".to_owned()],
-                    None,
+                    false,
                 )
                 .await
                 .expect_err("a reserved word never reaches its guest");
@@ -900,7 +900,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
                     Some(&claim),
                     "storageprobe",
                     &[],
-                    None
+                    false
                 )
                 .await
                 .is_err()
@@ -1060,7 +1060,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     );
     assert!(
         broker
-            .run_command(&gateway(), None, None, "memory", &[], None)
+            .run_command(&gateway(), None, None, "memory", &[], false)
             .await
             .is_err(),
         "legacy command resolution never enters the memory provider"

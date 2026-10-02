@@ -262,7 +262,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
             Some(session()),
             "probe".to_owned(),
             vec!["--help".to_owned()],
-            None,
+            false,
             TRACE_PARENT.parse().expect("valid traceparent fixture"),
         )
         .await
@@ -286,7 +286,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
             Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
-            Some("hello".to_owned()),
+            true,
             TRACE_PARENT.parse().expect("valid traceparent fixture"),
         )
         .await
@@ -804,6 +804,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
         request("invoke-bound-identifier"),
         vec![],
         0,
+        None,
     );
     write_frame(&mut stream, &envelope, limits.frame)
         .await
@@ -1194,6 +1195,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
                 }],
                 descriptors: vec![file.into()],
                 sends_remaining: 1,
+                streams: None,
             },
         )
         .await
@@ -1233,7 +1235,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let attestation = session().bound_to(invocation.id.clone());
     stream
         .write_frame(
-            &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0),
+            &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0, None),
             &[],
             limits.frame,
         )

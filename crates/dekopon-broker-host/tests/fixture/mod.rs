@@ -29,6 +29,38 @@ pub use dekopon_core::{
 };
 pub use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageHostError, StorageLimits};
 
+pub struct Stdout(std::thread::JoinHandle<Vec<u8>>);
+
+impl Stdout {
+    #[must_use]
+    pub fn bytes(self) -> Vec<u8> {
+        self.0.join().unwrap()
+    }
+
+    #[must_use]
+    pub fn json(self) -> Value {
+        serde_json::from_slice(&self.bytes()).unwrap()
+    }
+}
+
+#[must_use]
+pub fn piped_stdout() -> (dekopon_broker_host::asset::AssetInputs, Stdout) {
+    let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
+        bytes
+    });
+    let assets = dekopon_broker_host::asset::AssetInputs {
+        streams: Some(dekopon_broker_host::Streams {
+            stdin: None,
+            stdout: host.into(),
+        }),
+        ..Default::default()
+    };
+    (assets, Stdout(capture))
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FixtureHostError {
@@ -55,22 +87,17 @@ pub enum FixtureHostError {
 }
 
 impl FixtureHostError {
-    /// Returns the provider-declared `(code, message)` when the guest returned a structured
-    /// failure, rather than the host refusing the call before or after the guest ran.
-    ///
-    /// Asserting on the code is the difference between "the provider refused this for the reason
-    /// it documents" and "something, somewhere, went wrong".
     #[must_use]
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    pub fn provider_failure(&self) -> Option<(&str, &str)> {
+    pub fn provider_failure(&self) -> Option<(u8, &str)> {
         let Self::Invocation(failure) = self else {
             return None;
         };
         match failure.error.as_ref() {
-            BrokerHostError::ProviderFailure { code, message, .. } => Some((code, message)),
+            BrokerHostError::ProviderFailure { status, stderr, .. } => Some((*status, stderr)),
             _ => None,
         }
     }
@@ -300,14 +327,14 @@ impl FixtureHost {
     }
 
     pub async fn invoke(&self, capability: &str, input: Value) -> Result<Value, FixtureHostError> {
-        Ok(self.invoke_full(capability, input).await?.output)
+        Ok(self.invoke_full(capability, input).await?.1)
     }
 
     pub async fn invoke_full(
         &self,
         capability: &str,
         input: Value,
-    ) -> Result<BrokerInvocationOutput, FixtureHostError> {
+    ) -> Result<(BrokerInvocationOutput, Value), FixtureHostError> {
         let capability: CapabilityId = capability.parse()?;
         // Each invocation needs a fresh id since grants are minted and consumed per call; the scope
         // material around it stays fixed, which is what keeps successive calls in one namespace.
@@ -359,10 +386,13 @@ impl FixtureHost {
             self.constraints(),
         )?;
 
-        self.registry
-            .invoke_with_storage(authorized, None, grant, Default::default())
+        let (assets, stdout) = piped_stdout();
+        let output = self
+            .registry
+            .invoke_with_storage(authorized, None, grant, assets)
             .await
-            .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))
+            .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))?;
+        Ok((output, stdout.json()))
     }
 
     /// A command proposal has no authority; pass it through invoke to execute it.
@@ -370,9 +400,9 @@ impl FixtureHost {
         &self,
         word: &str,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Result<CommandRunOutcome, FixtureHostError> {
-        Ok(self.registry.run_command(word, argv, stdin).await?)
+        Ok(self.registry.run_command(word, argv, stdin_piped).await?)
     }
 
     /// StorageEvidence counts bytes moved, not final file sizes; walk the opaque SHA-256 paths.

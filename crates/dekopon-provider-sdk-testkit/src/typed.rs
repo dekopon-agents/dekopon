@@ -163,23 +163,15 @@ impl<P: Provider> Run<P> {
     /// # Errors
     /// Fails on missing artifacts, host refusals, TLS fixture errors or provider failures.
     pub fn call(self, capability: &str, input: Value) -> Result<Value, HarnessError> {
-        let (_, stdout) = self.call_with_stdout(capability, input)?;
+        let (_, stdout) = self.call_full(capability, input)?;
         serde_json::from_slice(&stdout).map_err(|_error| HarnessError::Fixture("stdout JSON"))
     }
 
-    /// Returns output and host import recordings for an authorized component call.
+    /// Returns host import recordings and the captured stdout of an authorized component call.
     ///
     /// # Errors
     /// As [`Run::call`].
     pub fn call_full(
-        self,
-        capability: &str,
-        input: Value,
-    ) -> Result<dekopon_broker_host::BrokerInvocationOutput, HarnessError> {
-        Ok(self.call_with_stdout(capability, input)?.0)
-    }
-
-    fn call_with_stdout(
         self,
         capability: &str,
         input: Value,

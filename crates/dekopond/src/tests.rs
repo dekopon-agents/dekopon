@@ -3474,7 +3474,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     assert!(
         matches!(
             &run,
-            BrokerRequest::RunCommand { word, argv, stdin: None, .. }
+            BrokerRequest::RunCommand { word, argv, stdin_piped: false, .. }
                 if word == "probe" && argv == &["--help".to_owned()]
         ),
         "{run:?}"

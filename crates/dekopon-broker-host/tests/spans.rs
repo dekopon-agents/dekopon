@@ -4,6 +4,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod fixture;
+
 use std::{
     path::PathBuf,
     sync::OnceLock,
@@ -206,7 +208,7 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
         2
     );
     capture.clear();
-    warm.run_command("recall", &["recall".to_owned()], None)
+    warm.run_command("recall", &["recall".to_owned()], false)
         .await
         .expect("mapped command");
     assert!(recordings(&capture, "provider.compile").is_empty());
@@ -314,7 +316,7 @@ async fn a_load_describes_once_and_a_run_adds_exactly_one_more() {
     );
 
     let outcome = registry
-        .run_command("recall", &["recall".to_owned()], Some("piped"))
+        .run_command("recall", &["recall".to_owned()], true)
         .await
         .expect("the probe rewrites its word");
     assert!(
@@ -349,12 +351,12 @@ async fn a_load_describes_once_and_a_run_adds_exactly_one_more() {
         "{rendered}"
     );
     assert!(
-        recorded_value(&capture, "provider.run_command", "command.stdin", "piped"),
-        "{rendered}"
-    );
-    assert_eq!(
-        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
-        vec![5],
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.stdin.piped",
+            "true"
+        ),
         "{rendered}"
     );
     let output = recorded(&capture, "provider.run_command", "command.output.bytes");
@@ -389,9 +391,13 @@ async fn command_input_beyond_the_bound_is_refused_before_a_store_exists() {
     .expect("command-word provider loads");
 
     let error = registry
-        .run_command("recall", &["recall".to_owned()], Some("more than eight"))
+        .run_command(
+            "recall",
+            &["recall".to_owned(), "more than eight".to_owned()],
+            false,
+        )
         .await
-        .expect_err("argv plus stdin exceed the bound");
+        .expect_err("argv exceeds the bound");
     assert!(
         matches!(
             error,
@@ -418,27 +424,22 @@ async fn command_input_beyond_the_bound_is_refused_before_a_store_exists() {
             &capture,
             "provider.run_command",
             "command.arguments",
-            r#"["recall"]"#
+            r#"["recall","more than eight"]"#
         ),
         "{refused:?}"
     );
     assert_eq!(
         recorded(&capture, "provider.run_command", "command.arguments.bytes"),
-        vec![10],
+        vec![28],
         "{refused:?}"
     );
     assert!(
         recorded_value(
             &capture,
             "provider.run_command",
-            "command.stdin",
-            "more than eight"
+            "command.stdin.piped",
+            "false"
         ),
-        "{refused:?}"
-    );
-    assert_eq!(
-        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
-        vec![15],
         "{refused:?}"
     );
     assert!(
@@ -461,18 +462,14 @@ async fn every_operation_instantiates_the_component_exactly_once() {
     .expect("command-line provider loads");
 
     registry
-        .run_command("probe", &["--help".to_owned()], None)
+        .run_command("probe", &["--help".to_owned()], false)
         .await
         .expect("help renders");
     let capability = "cli-probe.count"
         .parse::<CapabilityId>()
         .expect("capability");
     let outcome = registry
-        .run_command(
-            "probe",
-            &["count".to_owned(), "-".to_owned()],
-            Some("héllo"),
-        )
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], true)
         .await
         .expect("a piped value proposes");
     assert_eq!(
@@ -483,15 +480,17 @@ async fn every_operation_instantiates_the_component_exactly_once() {
             input: json!({"text": "héllo"}),
         }
     );
-    let output = registry
+    let (output_assets, output_stdout) = fixture::piped_stdout();
+    let _output = registry
         .invoke(
             authorized("cli-probe", capability, json!({"text": "héllo"})),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("the proposed capability runs");
-    assert_eq!(output.output, json!({"characters": 5}));
+    let output_stdout = output_stdout.json();
+    assert_eq!(output_stdout, json!({"characters": 5}));
 
     assert_one_store_each(&capture, "provider.describe", 1);
     assert_one_store_each(&capture, "provider.run_command", 2);
@@ -512,13 +511,13 @@ async fn every_operation_instantiates_the_component_exactly_once() {
         ),
         "{rendered}"
     );
-    assert_eq!(
-        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
-        vec![6],
-        "{rendered}"
-    );
     assert!(
-        recorded_value(&capture, "provider.run_command", "command.stdin", "héllo"),
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.stdin.piped",
+            "true"
+        ),
         "{rendered}"
     );
     assert_eq!(
@@ -544,11 +543,10 @@ async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_len
     )
     .await
     .expect("command-line provider loads");
-    let piped = "x".repeat(5_000);
     let outcome = registry
-        .run_command("probe", &["count".to_owned(), "-".to_owned()], Some(&piped))
+        .run_command("probe", &["count".to_owned(), "x".repeat(5_000)], false)
         .await
-        .expect("a piped value inside the fixture's bound proposes");
+        .expect("an argument inside the fixture's bound proposes");
     assert!(
         matches!(outcome, CommandRunOutcome::Proposed { .. }),
         "{outcome:?}"
@@ -557,17 +555,14 @@ async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_len
     let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
     let rendered = capture.spans_text();
     assert!(
-        recorded_value(
-            &capture,
-            "provider.run_command",
-            "command.stdin",
-            &format!("{}…[truncated]", "x".repeat(cap))
-        ),
-        "the piped value is its first {cap} bytes plus the marker:\n{rendered}"
+        recordings(&capture, "provider.run_command")
+            .iter()
+            .any(|fields| fields.contains(" command.arguments=") && fields.contains("…[truncated]")),
+        "the arguments are their first {cap} bytes plus the marker:\n{rendered}"
     );
     assert_eq!(
-        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
-        vec![5_000],
+        recorded(&capture, "provider.run_command", "command.arguments.bytes"),
+        vec![5_012],
         "{rendered}"
     );
     let output = recorded(&capture, "provider.run_command", "command.output.bytes");
@@ -599,7 +594,8 @@ async fn invocation_input_past_the_cap_is_truncated_beside_its_full_length() {
     .expect("command-line provider loads");
     let input = json!({ "text": "x".repeat(16_000) });
     let input_bytes = input.to_string().len();
-    let output = registry
+    let (output_assets, output_stdout) = fixture::piped_stdout();
+    let _output = registry
         .invoke(
             authorized(
                 "cli-probe",
@@ -607,11 +603,12 @@ async fn invocation_input_past_the_cap_is_truncated_beside_its_full_length() {
                 input,
             ),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("an input inside the fixture's bound runs");
-    assert_eq!(output.output, json!({"characters": 16_000}));
+    let output_stdout = output_stdout.json();
+    assert_eq!(output_stdout, json!({"characters": 16_000}));
 
     let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
     let rendered = capture.spans_text();
@@ -659,24 +656,26 @@ async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
         .expect("capability");
 
     let before = unix_millis_now();
-    let output = registry
+    let (output_assets, output_stdout) = fixture::piped_stdout();
+    let _output = registry
         .invoke(
             authorized("clock-probe", capability, json!({})),
             None,
-            Default::default(),
+            output_assets,
         )
         .await
         .expect("the clock reads inside invoke");
+    let output_stdout = output_stdout.json();
     let after = unix_millis_now();
 
-    let unix_millis = output.output["unixMillis"]
+    let unix_millis = output_stdout["unixMillis"]
         .as_u64()
         .expect("unixMillis is a u64");
     assert!(
         before <= unix_millis && unix_millis <= after,
         "the reading must fall inside the invocation: {before} <= {unix_millis} <= {after}"
     );
-    let rfc3339 = output.output["rfc3339"]
+    let rfc3339 = output_stdout["rfc3339"]
         .as_str()
         .expect("rfc3339 is a string");
     assert_eq!(rfc3339.len(), "1970-01-01T00:00:00Z".len(), "{rfc3339}");
@@ -714,11 +713,8 @@ fn memory_component(body: &str, failed: bool) -> tempfile::NamedTempFile {
         }]
     }))
     .unwrap();
-    let response = if failed {
-        r#"{"outcome":"failed","error":{"code":"synthetic","message":"private-output-sentinel"}}"#
-    } else {
-        r#"{"outcome":"succeeded","output":{"text":"private-output-sentinel"}}"#
-    };
+    let response = r#"{"outcome":"succeeded","output":{}}"#;
+    let status = if failed { r"\01\01" } else { r"\00\00" };
     let bytes = |data: &[u8]| {
         data.iter()
             .map(|byte| format!("\\{byte:02x}"))
@@ -739,19 +735,20 @@ fn memory_component(body: &str, failed: bool) -> tempfile::NamedTempFile {
             (memory (export "memory") 1)
             (data (i32.const 0) "{manifest_descriptor}")
             (data (i32.const 8) "{response_descriptor}")
+            (data (i32.const 16) "{status}")
             (data (i32.const 64) "{manifest}")
             (data (i32.const 2048) "{response}")
             (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096)
             (func (export "describe") (result i32) i32.const 0)
-            (func (export "invoke") (param i32 i32 i32 i32) (result i32) {body} i32.const 8)
-            (func (export "command") (param i32 i32 i32 i32 i32) (result i32) i32.const 8))
+            (func (export "invoke") (param i32 i32 i32 i32) (result i32) {body} i32.const 16)
+            (func (export "command") (param i32 i32 i32) (result i32) i32.const 8))
         (core instance $i (instantiate $m))
         (func (export "describe") (result string)
             (canon lift (core func $i "describe") (memory (core memory $i "memory"))))
-        (func (export "invoke") (param "capability" string) (param "input" string) (result string)
+        (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
             (canon lift (core func $i "invoke") (memory (core memory $i "memory"))
                 (realloc (core func $i "realloc"))))
-        (func (export "run-command") (param "argv" (list string)) (param "stdin" (option string)) (result string)
+        (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
             (canon lift (core func $i "command") (memory (core memory $i "memory"))
                 (realloc (core func $i "realloc")))))"#,
         manifest_descriptor = descriptor(64, manifest.len()),
