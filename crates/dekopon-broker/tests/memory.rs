@@ -1,39 +1,52 @@
 #![cfg(unix)]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
-    BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatTransportKind,
-    ConstraintCatalog, ConstraintSet, Conversation, ConversationKind, CredentialStore,
-    DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog,
-    PolicyEngine, PolicyWorld, RouteConflict,
+    Attestation, AttestorGrant, Broker, BrokerBuildError, BrokerLimits, CapabilityRoute,
+    ChatMemoryConfig, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
+    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
+    PolicyWorld, RouteConflict,
 };
 
-const MEMORY_RECORD: &str = "memory.chat.record";
-const MEMORY_RECENT: &str = "memory.chat.recent";
 use dekopon_broker_host::{
-    BoundCredential, BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry,
 };
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
     EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface, StorageScope,
 };
 use dekopon_core::{
-    Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, Redacted, RiskLevel, TransportId,
+    Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TransportId,
 };
-use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
-use dekopon_test_support::{CaptureLayer, Record, provider_fixture};
+use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageLimits};
+use dekopon_test_support::provider_fixture;
 use serde_json::json;
-use tracing_subscriber::layer::SubscriberExt as _;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+
+fn stdout_assets() -> (
+    dekopon_broker_host::asset::AssetInputs,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        bytes
+    });
+    (
+        dekopon_broker_host::asset::AssetInputs {
+            streams: Some(dekopon_broker_host::Streams {
+                stdin: None,
+                stdout: host.into(),
+            }),
+            ..Default::default()
+        },
+        captured,
+    )
+}
 
 fn memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
@@ -134,199 +147,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     ConstraintCatalog::new(entries).expect("constraints")
 }
 
-async fn build_broker(root: &Path, audit: Arc<InMemoryAuditLog>) -> Broker<InMemoryAuditLog> {
-    build_broker_with(
-        root,
-        audit,
-        memory_config(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-    )
-    .await
-}
-
-async fn build_broker_with(
-    root: &Path,
-    audit: Arc<InMemoryAuditLog>,
-    memory: ChatMemoryConfig,
-    storage_limits: StorageLimits,
-    host_limits: BrokerHostLimits,
-    reverse_provider_order: bool,
-) -> Broker<InMemoryAuditLog> {
-    build_broker_with_principal(
-        root,
-        audit,
-        memory,
-        storage_limits,
-        host_limits,
-        reverse_provider_order,
-        "maintainer",
-        None,
-        false,
-    )
-    .await
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the integration fixture keeps each independently rotated authority input explicit"
-)]
-async fn build_broker_with_principal(
-    root: &Path,
-    audit: Arc<InMemoryAuditLog>,
-    memory: ChatMemoryConfig,
-    storage_limits: StorageLimits,
-    host_limits: BrokerHostLimits,
-    reverse_provider_order: bool,
-    mapped_principal: &str,
-    authority_credential: Option<(&str, &str)>,
-    permit_generic_storage: bool,
-) -> Broker<InMemoryAuditLog> {
-    build_broker_with_options(
-        root,
-        audit,
-        memory,
-        storage_limits,
-        host_limits,
-        reverse_provider_order,
-        mapped_principal,
-        authority_credential,
-        permit_generic_storage,
-        &BrokerHostOptions::default(),
-    )
-    .await
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the integration fixture keeps authority inputs separate from operational cache options"
-)]
-async fn build_broker_with_options(
-    root: &Path,
-    audit: Arc<InMemoryAuditLog>,
-    memory: ChatMemoryConfig,
-    storage_limits: StorageLimits,
-    host_limits: BrokerHostLimits,
-    reverse_provider_order: bool,
-    mapped_principal: &str,
-    authority_credential: Option<(&str, &str)>,
-    permit_generic_storage: bool,
-    options: &BrokerHostOptions,
-) -> Broker<InMemoryAuditLog> {
-    let storage = StorageHost::open(root, storage_limits).expect("storage host");
-    let mut providers = vec![
-        provider_fixture("memory-chat-provider.wasm"),
-        provider_fixture("cli-probe-provider.wasm"),
-        provider_fixture("storage-probe-provider.wasm"),
-    ];
-    if authority_credential.is_some() {
-        providers.push(provider_fixture("http-probe-provider.wasm"));
-    }
-    if reverse_provider_order {
-        providers.reverse();
-    }
-    let registry =
-        BrokerProviderRegistry::load_with_options(providers, host_limits, Some(storage), options)
-            .await
-            .expect("memory provider loads");
-    let world = PolicyWorld::new(
-        [
-            "gateway".parse::<PrincipalId>().expect("gateway"),
-            mapped_principal.parse().expect("mapped principal"),
-        ],
-        registry
-            .capabilities()
-            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
-    )
-    .expect("world");
-    let mut policy_source = r#"
-        @id("prompt")
-        permit(principal == Dekopon::Principal::"$PRINCIPAL",
-               action == Dekopon::Action::"agent.prompt",
-               resource == Dekopon::Agent::"reviewer")
-        when { context.via == "gateway"
-            && context has transportKind && context.transportKind == "slack"
-            && context has transport && context.transport == "scientist-slack"
-            && context has conversation && context.conversation.id == "c0123abc"
-            && ["channel", "thread"].contains(context.conversation.kind) };
-
-        @id("memory")
-        permit(principal == Dekopon::Principal::"$PRINCIPAL",
-               action in [Dekopon::Action::"memory.chat.record",
-                          Dekopon::Action::"memory.chat.recent",
-                          Dekopon::Action::"memory.chat.search"],
-               resource == Dekopon::Provider::"memory-chat")
-        when { context.via == "gateway"
-            && context.agent == "reviewer"
-            && context has transportKind && context.transportKind == "slack"
-            && context has transport && context.transport == "scientist-slack"
-            && context has conversation && context.conversation.id == "c0123abc"
-            && ["channel", "thread"].contains(context.conversation.kind) };
-        "#
-    .replace("$PRINCIPAL", mapped_principal);
-    if permit_generic_storage {
-        policy_source.push_str(
-            r#"
-        @id("generic-storage-prompt")
-        permit(principal == Dekopon::Principal::"$PRINCIPAL",
-               action == Dekopon::Action::"agent.prompt",
-               resource == Dekopon::Agent::"reviewer");
-
-        @id("generic-storage")
-        permit(principal == Dekopon::Principal::"$PRINCIPAL",
-               action == Dekopon::Action::"storage-probe.run",
-               resource == Dekopon::Provider::"storage-probe");
-        "#,
-        );
-        policy_source = policy_source.replace("$PRINCIPAL", mapped_principal);
-    }
-    if authority_credential.is_some() {
-        policy_source.push_str(
-            r#"
-        @id("effective-http")
-        permit(principal == Dekopon::Principal::"$PRINCIPAL",
-               action == Dekopon::Action::"http-probe.fetch",
-               resource == Dekopon::Provider::"http-probe")
-        when { context.via == "gateway"
-            && context.agent == "reviewer" };
-        "#,
-        );
-        policy_source = policy_source.replace("$PRINCIPAL", mapped_principal);
-    }
-    let policy = PolicyEngine::new(&policy_source, &world).expect("policy");
-    let credentials = authority_credential.map_or_else(CredentialStore::empty, |(name, value)| {
-        CredentialStore::new([(
-            name.to_owned(),
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new(value.to_owned()),
-                vec!["127.0.0.1:1".to_owned()],
-            )
-            .expect("credential"),
-        )])
-        .expect("credential store")
-    });
-    Broker::new(
-        registry,
-        "broker".parse().expect("broker"),
-        "memory-policy".to_owned(),
-        policy,
-        constraints_with_http_credential(authority_credential.map(|(name, _)| name)),
-        credentials,
-        IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
-            mapped_principal.parse().expect("principal"),
-        )])
-        .expect("identities"),
-        audit,
-        BrokerLimits::default(),
-    )
-    .expect("broker")
-    .with_chat_memory(memory)
-    .expect("memory composition")
-}
-
 fn gateway() -> dekopon_broker::AuthenticatedContext {
     dekopon_broker::AuthenticatedContext::new(
         "gateway".parse().expect("principal"),
@@ -375,190 +195,17 @@ fn attestor_grant() -> AttestorGrant {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let root = directory.join("provider-storage");
-    let audit = Arc::new(InMemoryAuditLog::new(1).expect("one-record audit"));
-    let broker = build_broker_with(
-        &root,
-        Arc::clone(&audit),
-        memory_config(),
-        StorageLimits::default(),
+async fn the_fetched_memory_chat_0_3_0_fixture_is_refused_before_any_storage_effect() {
+    let error = BrokerProviderRegistry::load(
+        [provider_fixture("memory-chat-provider.wasm")],
         BrokerHostLimits::default(),
-        false,
     )
-    .await;
-
-    let denied = query_memory_result(&broker, "fill-audit", MEMORY_RECENT, json!({"last": 0}))
-        .await
-        .0;
-    assert_eq!(
-        denied.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(audit.records().len(), 1);
-    let before = snapshot_tree_bytes(&root);
-
-    let id = "audit-full-record"
-        .parse::<InvocationId>()
-        .expect("invocation");
-    let attestor = attestor_grant();
-    let session = claim();
-    let error = broker
-        .record_delivered_turn(
-            &gateway(),
-            Some(&attestor),
-            &session.bound_to(id.clone()),
-            DeliveredTurnRequest::new(
-                id,
-                TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                DeliveryIdentity::Slack {
-                    channel: "c0123abc".to_owned(),
-                    timestamp: "1712345678.000101".to_owned(),
-                },
-                "must remain unmaterialized".to_owned(),
-                DeliveredAnswer::accepted_by_transport("audit failed".to_owned()),
-            ),
-        )
-        .await
-        .expect_err("full authorization audit refuses before storage materialization");
-    assert!(matches!(error, BrokerError::DecisionAudit { .. }));
-    assert_eq!(
-        snapshot_tree_bytes(&root),
-        before,
-        "audit failure created a namespace, lifecycle marker, generation, or current pointer"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn generic_storage_surfaces_require_an_effective_chat_scope() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let root = directory.join("provider-storage");
-    let broker = build_broker_with_principal(
-        &root,
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        memory_config(),
-        StorageLimits::default(),
-        BrokerHostLimits::default(),
-        false,
-        "maintainer",
-        None,
-        true,
-    )
-    .await;
-    let storage_id = "storage-probe.run";
-    let storage_word = "storageprobe";
-    let direct = AuthenticatedContext::new(
-        "maintainer".parse().expect("principal"),
-        Actor::Service {
-            principal: "maintainer".parse().expect("principal"),
-        },
-    )
-    .expect("direct context");
+    .await
+    .expect_err("a returned-string invoke cannot load as a process");
     assert!(
-        broker
-            .capabilities(&direct)
-            .iter()
-            .all(|entry| entry.capability.id.as_str() != storage_id)
+        matches!(error, BrokerHostError::Instantiate { .. }),
+        "{error:?}"
     );
-    assert!(
-        !broker
-            .command_words(&direct)
-            .iter()
-            .any(|word| word == storage_word)
-    );
-    assert_eq!(
-        broker.capability_view(&direct),
-        (
-            broker.capabilities(&direct),
-            broker.command_words(&direct),
-            broker.command_word_help(&direct)
-        )
-    );
-
-    let session = claim();
-    let legacy_grant = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
-    };
-    let (legacy_capabilities, legacy_words, _legacy_help, _memory) = broker
-        .capability_surface(
-            &gateway(),
-            Some(&legacy_grant),
-            Some(&Attestation::for_subject(
-                session.subject.clone(),
-                session.agent.clone(),
-            )),
-        )
-        .expect("legacy subject-only chat remains authorized");
-    assert!(
-        legacy_capabilities
-            .iter()
-            .all(|entry| entry.capability.id.as_str() != storage_id)
-    );
-    assert!(!legacy_words.iter().any(|word| word == storage_word));
-
-    let (scoped_capabilities, scoped_words, scoped_help, _) = broker
-        .capability_surface(&gateway(), Some(&attestor_grant()), Some(&session))
-        .expect("scoped chat is authorized");
-    assert!(
-        scoped_capabilities
-            .iter()
-            .any(|entry| entry.capability.id.as_str() == storage_id)
-    );
-    assert!(scoped_words.iter().any(|word| word == storage_word));
-    assert!(
-        scoped_help.keys().all(|word| scoped_words.contains(word)),
-        "help never advertises a word that is not also listed"
-    );
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
-    let temporary = tempfile::tempdir().expect("tempdir");
-    let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let broker = build_broker(
-        &directory.join("provider-storage"),
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-    )
-    .await;
-    let mut probe = claim();
-    if let Some(scope) = probe.scope.as_mut() {
-        scope.trigger = dekopon_broker::Trigger::Probe;
-    }
-
-    let (capabilities, words, _help, _) = broker
-        .capability_surface(&gateway(), Some(&attestor_grant()), Some(&probe))
-        .expect("a probe is an authorized chat session");
-    assert!(
-        capabilities
-            .iter()
-            .all(|entry| entry.capability.id.as_str() != "storage-probe.run")
-    );
-    assert!(!words.iter().any(|word| word == "storageprobe"));
-
-    let id = "probe-write".parse::<InvocationId>().expect("invocation");
-    let result = broker
-        .invoke(
-            &gateway(),
-            Some(&attestor_grant()),
-            Some(&probe.bound_to(id.clone())),
-            InvocationRequest {
-                id,
-                capability: "storage-probe.run".parse().expect("capability"),
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                input: json!({"mode": "quota-denial"}),
-                secret_use: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("the refusal is accounted");
-    assert_eq!(
-        result.result.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(result.result.error.as_deref(), Some("probe-write"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -657,6 +304,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         .await
         .expect("chat resolution reserves nothing either");
     let chat_id = "unrouted-chat".parse::<InvocationId>().expect("invocation");
+    let (streams, stdout) = stdout_assets();
     let chat_result = broker
         .invoke(
             &gateway,
@@ -669,10 +317,11 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 input: json!({}),
                 secret_use: None,
             },
-            Default::default(),
+            streams,
         )
         .await
         .expect("chat invocation is audited");
+    assert_eq!(stdout.join().unwrap(), b"{\"escaped\":true}\n");
     assert_eq!(
         chat_result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded,
@@ -680,6 +329,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
 
     for capability in ["ordinary.escape", "memory.chat.export"] {
+        let (streams, stdout) = stdout_assets();
         let id = format!("unrouted-attested-{capability}")
             .parse::<InvocationId>()
             .expect("invocation");
@@ -698,10 +348,11 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                     input: json!({}),
                     secret_use: None,
                 },
-                Default::default(),
+                streams,
             )
             .await
             .expect("attested invocation is audited");
+        assert_eq!(stdout.join().unwrap(), b"{\"escaped\":true}\n");
         assert_eq!(
             result.result.outcome,
             dekopon_capability::InvocationOutcome::Succeeded,

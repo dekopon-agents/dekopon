@@ -254,17 +254,6 @@ impl SecretResolver for MissingSecretResolver {
     }
 }
 
-fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
-    engine(
-        policies,
-        ["caller"],
-        [
-            ("jsonplaceholder.posts.get", "jsonplaceholder"),
-            ("jsonplaceholder.posts.create", "jsonplaceholder"),
-        ],
-    )
-}
-
 fn provider_policy(name: &str, agent_name: &str, provider: &str, capability: &str) -> String {
     format!(
         r#"@id("{name}-{capability}-via-{agent_name}")
@@ -559,11 +548,11 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     assert!(matches!(error, BrokerBuildError::HostConstraint { .. }));
 
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("JSONPlaceholder provider fixture loads");
+    .expect("checked HTTP provider loads");
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let error = Broker::new(
         registry,
@@ -575,13 +564,13 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             "",
             ["caller"],
             [
-                ("jsonplaceholder.posts.get", "jsonplaceholder"),
-                ("jsonplaceholder.posts.create", "jsonplaceholder"),
+                ("http-probe.fetch", "http-probe"),
+                ("http-probe.conditional-write", "http-probe"),
             ],
         ),
         catalog([(
-            "jsonplaceholder.posts.create",
-            set("jsonplaceholder", ExecutionConstraints::default()),
+            "http-probe.conditional-write",
+            set("http-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
         callers(["caller"]),
@@ -662,7 +651,8 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(result.result.evidence.len(), 3);
+    assert_eq!(result.result.evidence.len(), 2);
+    assert!(result.result.evidence.iter().any(|item| item.kind == "http-calls"));
     let wire = server.request();
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
     server.join();
@@ -688,56 +678,39 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails() {
     use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
 
-    for (body, expected) in [
-        (
-            r#"{"userId":3,"id":101,"title":"private title","body":"private body"}"#,
-            Succeeded,
-        ),
-        ("not-json", Failed),
+    for (response, expected) in [
+        (b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(), Succeeded),
+        (b"not-http".as_slice(), Failed),
     ] {
         let registry = BrokerProviderRegistry::load(
-            [provider_fixture("jsonplaceholder-provider.wasm")],
+            [provider_fixture("http-probe-provider.wasm")],
             BrokerHostLimits::default(),
         )
         .await
-        .expect("JSONPlaceholder provider fixture loads");
-        let response = format!(
-            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let server = LoopbackServer::once(response.as_bytes());
+        .expect("checked HTTP provider loads");
+        let server = LoopbackServer::once(response);
         let authority = server.authority().to_owned();
         let mut constraints = loopback_constraints(&authority);
         constraints
             .http
             .as_mut()
             .expect("HTTP constraints")
-            .allowed_methods = vec!["POST".to_owned()];
+            .allowed_methods = vec!["DELETE".to_owned()];
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-jsonplaceholder".to_owned(),
-            jsonplaceholder_engine(&provider_policy(
-                "caller",
-                "provider-test",
-                "jsonplaceholder",
-                "jsonplaceholder.posts.create",
-            )),
+            "policy-http-probe".to_owned(),
+            engine(
+                &provider_policy("caller", "provider-test", "http-probe", "http-probe.purge"),
+                ["caller"],
+                [("http-probe.fetch", "http-probe"), ("http-probe.purge", "http-probe")],
+            ),
             catalog([
-                (
-                    "jsonplaceholder.posts.get",
-                    set("jsonplaceholder", loopback_constraints(&authority)),
-                ),
-                (
-                    "jsonplaceholder.posts.create",
-                    set_with_metadata(
-                        "jsonplaceholder",
-                        EffectKind::ExternalWrite,
-                        RiskLevel::Medium,
-                        constraints,
-                    ),
-                ),
+                ("http-probe.fetch", set("http-probe", loopback_constraints(&authority))),
+                ("http-probe.purge", set_with_metadata(
+                    "http-probe", EffectKind::ExternalWrite, RiskLevel::High, constraints,
+                )),
             ]),
             CredentialStore::empty(),
             callers(["caller"]),
@@ -749,17 +722,15 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             let available = broker.capabilities(&session("caller", "provider-test"));
             assert_eq!(available.len(), 1);
             assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
-            assert_eq!(available[0].capability.risk, RiskLevel::Medium);
+            assert_eq!(available[0].capability.risk, RiskLevel::High);
             let read = invoke_as(
                 &broker,
                 "caller",
                 "provider-test",
                 request(
-                    "invoke-json-read-with-write-rule",
-                    "jsonplaceholder.posts.get",
-                    json!({
-                        "postId": 7, "endpoint": format!("http://{authority}")
-                    }),
+                    "invoke-http-read-with-write-rule",
+                    "http-probe.fetch",
+                    json!({"uri": format!("http://{authority}/private-path")}),
                 ),
             )
             .await
@@ -775,12 +746,9 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             "caller",
             "provider-test",
             request(
-                "invoke-json-write",
-                "jsonplaceholder.posts.create",
-                json!({
-                    "userId": 3, "title": "private title", "body": "private body",
-                    "endpoint": format!("http://{authority}")
-                }),
+                "invoke-http-write",
+                "http-probe.purge",
+                json!({"uri": format!("http://{authority}/private-path?token=query-secret")}),
             ),
         )
         .await
@@ -788,18 +756,10 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
         assert_eq!(result.result.outcome, expected);
         let wire = server.request();
         assert!(
-            wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
+            wire.starts_with(b"DELETE /private-path?token=query-secret HTTP/1.1\r\n"),
             "the external write must have left the host before the outcome"
         );
-        let body_offset = wire
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("POST headers terminate")
-            + 4;
-        assert_eq!(
-            serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
-            json!({"userId": 3, "title": "private title", "body": "private body"})
-        );
+        assert!(wire.ends_with(b"\r\n\r\n"), "DELETE has no body");
         server.join();
         let records = audit.records();
         if expected == Succeeded {
@@ -808,10 +768,7 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
             assert_eq!(
                 result.result.detail,
-                Some(ProviderFailureDetail::new(
-                    "invalid-response",
-                    "endpoint returned an invalid post"
-                )),
+                Some(ProviderFailureDetail::new("provider-exit", "transport: HTTP transport failed\n")),
                 "a typed provider failure carries the provider's own code and message on the wire"
             );
             assert!(
@@ -839,24 +796,23 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                 error_detail
                     .as_ref()
                     .map(|detail| (detail.code.as_str(), detail.message.as_str())),
-                Some(("invalid-response", "endpoint returned an invalid post"))
+                Some(("provider-exit", "transport: HTTP transport failed\n"))
             );
             assert_eq!(
                 http_calls.len(),
                 1,
                 "the completed call must survive into the failed execution record"
             );
-            assert_eq!(http_calls[0].method, "POST");
+            assert_eq!(http_calls[0].method, "DELETE");
             assert_eq!(http_calls[0].authority, authority);
-            assert_eq!(http_calls[0].status, Some(201));
+            assert_eq!(http_calls[0].status, None);
         }
         let serialized = serde_json::to_string(&records).expect("audit serializes");
         assert!(serialized.contains(&authority));
         assert!(serialized.contains("external-write"));
-        assert!(serialized.contains("POST"));
-        assert!(!serialized.contains("private title"));
-        assert!(!serialized.contains("private body"));
-        assert!(!serialized.contains("/posts"));
+        assert!(serialized.contains("DELETE"));
+        assert!(!serialized.contains("private-path"));
+        assert!(!serialized.contains("query-secret"));
     }
 }
 

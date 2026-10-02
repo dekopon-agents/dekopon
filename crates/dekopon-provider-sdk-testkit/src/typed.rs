@@ -168,6 +168,10 @@ impl<P: Provider> Run<P> {
     ///
     /// # Errors
     /// Fails on missing artifacts, host refusals, TLS fixture errors or capture failures.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "only a guest exit is a captured result; every present and future host error remains a refusal"
+    )]
     pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
         let component = self.component.canonicalize()?;
         let registry = cached_registry::<P>(component, self.limits.clone())?;
@@ -229,7 +233,7 @@ impl<P: Provider> Run<P> {
                 let (host, mut feeder) = std::os::unix::net::UnixStream::pair()?;
                 Ok::<_, std::io::Error>((host, move || {
                     use std::io::Write;
-                    let _ = feeder.write_all(&bytes);
+                    drop(feeder.write_all(&bytes));
                 }))
             })
             .transpose()?;
