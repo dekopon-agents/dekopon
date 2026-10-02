@@ -159,6 +159,13 @@ Proposals carry untrusted intent; authorization, provider credentials, privilege
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
 
+## Prior art
+
+- [Varlock](https://github.com/dmno-dev/varlock) separates agent-readable environment schemas from secret values. Its [credential proxy](https://varlock.dev/guides/proxy/), currently in preview, gives agents placeholders and injects real credentials into matching HTTPS requests at the network boundary, a close parallel to Dekopon's broker-owned credential injection.
+- [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) isolates agent workloads in containers or VMs. Its [architecture](https://docs.nvidia.com/openshell/latest/about/architecture) places a trusted supervisor outside the workload to enforce network policy and supply credentials only to approved endpoints, sharing Dekopon's separation of untrusted execution from policy and credentials.
+
+Dekopon's approach is a Rust agent runtime with WebAssembly providers: a separate broker authorizes each capability call through Cedar and owns provider effects and credentials.
+
 ## Roadmap
 
 Sequencing, the next milestones, and deferred scope live in [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
