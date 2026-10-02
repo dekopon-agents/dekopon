@@ -101,10 +101,7 @@ impl Capability for Upper {
     type Needs = ();
     type Error = Gone;
     fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            Ok(json!({"text": input.text.to_uppercase()}))
-        })();
-        emit(out, value)
+        emit(out, Ok(json!({"text": input.text.to_uppercase()})))
     }
 }
 
@@ -118,9 +115,7 @@ impl Capability for Count {
     type Needs = ();
     type Error = Gone;
     fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            Ok(json!({"characters":input.text.chars().count()}))
-        })();
+        let value = Ok(json!({"characters":input.text.chars().count()}));
         emit(out, value)
     }
 }
@@ -134,9 +129,7 @@ impl Capability for Reverse {
     type Needs = ();
     type Error = Gone;
     fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            Ok(json!({"text":input.text.chars().rev().collect::<String>()}))
-        })();
+        let value = Ok(json!({"text":input.text.chars().rev().collect::<String>()}));
         emit(out, value)
     }
 }
@@ -187,9 +180,7 @@ macro_rules! missing_capability {
             type Needs = ();
             type Error = Gone;
             fn run(_: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
-                let value =
-                    (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
-                emit(out, value)
+                emit(out, Ok(json!({})))
             }
         }
     };
@@ -280,10 +271,7 @@ impl Capability for OtherUpper {
     type Needs = ();
     type Error = Gone;
     fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            Ok(json!({"text": input.text.to_uppercase()}))
-        })();
-        emit(out, value)
+        emit(out, Ok(json!({"text": input.text.to_uppercase()})))
     }
 }
 
@@ -314,7 +302,7 @@ impl Capability for StorageRun {
     type Needs = Storage<DurableFiles>;
     type Error = Gone;
     fn run(_: StorageInput, _: Storage<DurableFiles>, out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
+        let value = Ok(json!({}));
         emit(out, value)
     }
 }
@@ -350,9 +338,7 @@ impl Capability for ClockNow {
     type Needs = Clock;
     type Error = Gone;
     fn run(_: EmptyInput, clock: Clock, out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            Ok(json!({"unixMillis":clock.now_unix_millis()}))
-        })();
+        let value = Ok(json!({"unixMillis":clock.now_unix_millis()}));
         emit(out, value)
     }
 }
@@ -397,10 +383,8 @@ impl Capability for Fetch {
     type Needs = Http;
     type Error = Gone;
     fn run(input: UrlInput, http: Http, out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            let response = http.send(Request::new("GET", input.uri).unwrap()).unwrap();
-            Ok(json!({"headerCount": response.headers.len()}))
-        })();
+        let response = http.send(Request::new("GET", input.uri).unwrap()).unwrap();
+        let value = Ok(json!({"headerCount": response.headers.len()}));
         emit(out, value)
     }
 }
@@ -419,9 +403,7 @@ macro_rules! http_route {
             type Needs = Http;
             type Error = Gone;
             fn run(_: UrlInput, _: Http, out: &mut Stdout) -> Result<(), Self::Error> {
-                let value =
-                    (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
-                emit(out, value)
+                emit(out, Ok(json!({})))
             }
         }
     };
@@ -529,13 +511,11 @@ impl Capability for Read {
         (clock, http): (Clock, Http),
         out: &mut Stdout,
     ) -> Result<(), Self::Error> {
-        let value = (move || -> Result<Value, std::convert::Infallible> {
-            let request = Request::new("GET", input.uri).unwrap();
-            let response = http.send(request).unwrap();
-            Ok(
-                json!({"clock":clock.now_unix_millis(),"status":response.status,"body":String::from_utf8(response.body).unwrap()}),
-            )
-        })();
+        let request = Request::new("GET", input.uri).unwrap();
+        let response = http.send(request).unwrap();
+        let value = Ok(
+            json!({"clock":clock.now_unix_millis(),"status":response.status,"body":String::from_utf8(response.body).unwrap()}),
+        );
         emit(out, value)
     }
 }

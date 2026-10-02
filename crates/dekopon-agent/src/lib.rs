@@ -912,8 +912,41 @@ mod tests {
         CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
     };
     use serde_json::json;
+    use std::{io::Read, os::fd::OwnedFd, os::unix::net::UnixStream};
 
     use super::{SessionInvoker, current_trace_parent};
+
+    fn streams() -> (dekopon_shell::Streams, UnixStream) {
+        let (writer, reader) = UnixStream::pair().expect("stdout socketpair");
+        (
+            dekopon_shell::Streams {
+                stdin: None,
+                stdout: OwnedFd::from(writer),
+            },
+            reader,
+        )
+    }
+
+    fn output(mut reader: UnixStream) -> String {
+        reader.set_nonblocking(true).expect("nonblocking stdout");
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("stdout read: {error}"),
+            }
+        }
+        String::from_utf8(bytes).expect("stdout text")
+    }
 
     #[test]
     fn trace_parent_is_absent_without_an_active_exporting_span() {
@@ -974,10 +1007,15 @@ mod tests {
             broker: Some(shared),
         };
 
+        let (streams, reader) = streams();
         assert_eq!(
-            invoker.invoke(CommandProposal::new("shared.capability", json!({}), None)),
-            CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
+            invoker.invoke(
+                CommandProposal::new("shared.capability", json!({}), None),
+                streams
+            ),
+            CapabilityCallResult::Succeeded
         );
+        assert_eq!(output(reader), "{\"leg\":\"direct\"}\n");
     }
 
     #[test]
@@ -987,10 +1025,15 @@ mod tests {
             broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
         };
 
+        let (streams, reader) = streams();
         assert_eq!(
-            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
-            CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), None),
+                streams
+            ),
+            CapabilityCallResult::Succeeded
         );
+        assert_eq!(output(reader), "{\"leg\":\"broker\"}\n");
         assert!(invoker.is_granted("http-probe.fetch"));
         assert_eq!(
             invoker.granted(),
@@ -1014,7 +1057,10 @@ mod tests {
         assert_eq!(invoker.granted(), vec!["cli-probe.upper".to_owned()]);
         assert!(!invoker.is_granted("http-probe.fetch"));
         assert_eq!(
-            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), None),
+                streams().0
+            ),
             CapabilityCallResult::NotFound
         );
     }
@@ -1033,20 +1079,18 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke(CommandProposal::new(
-                "http-probe.fetch",
-                json!({}),
-                Some(proposal.clone())
-            )),
-            CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), Some(proposal.clone())),
+                streams().0
+            ),
+            CapabilityCallResult::Succeeded
         );
 
         assert_eq!(
-            invoker.invoke(CommandProposal::new(
-                "cli-probe.upper",
-                json!({}),
-                Some(proposal)
-            )),
+            invoker.invoke(
+                CommandProposal::new("cli-probe.upper", json!({}), Some(proposal)),
+                streams().0
+            ),
             dekopon_shell::secret_use_unsupported()
         );
         assert!(
@@ -1204,6 +1248,7 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
+        use super::{output, streams};
         use parking_lot::Mutex;
         use std::{
             collections::{BTreeMap, BTreeSet},
@@ -1353,7 +1398,7 @@ mod tests {
                     .iter()
                     .map(|argument| (*argument).to_owned())
                     .collect::<Vec<_>>();
-                leg.run_command("probe", &argv, stdin)
+                leg.run_command("probe", &argv, stdin.is_some())
             })
             .await
             .expect("blocking dispatch completes")
@@ -1490,7 +1535,7 @@ mod tests {
             let leg = leg.with_cancel_signal(signal);
 
             let run = tokio::task::spawn_blocking(move || {
-                leg.run_command("probe", &["--help".to_owned()], None)
+                leg.run_command("probe", &["--help".to_owned()], false)
             });
             observed.recv().await.expect("the run reached the broker");
             handle.cancel();
@@ -1577,13 +1622,28 @@ mod tests {
             }
         }
 
+        async fn invoke_with_stdout(
+            leg: BrokerLeg,
+            capability: &'static str,
+        ) -> (CapabilityCallResult, String) {
+            tokio::task::spawn_blocking(move || {
+                let (streams, reader) = streams();
+                let result = leg.invoke(
+                    CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
+                    streams,
+                );
+                (result, output(reader))
+            })
+            .await
+            .expect("blocking dispatch completes")
+        }
+
         async fn invoke(leg: BrokerLeg, capability: &'static str) -> CapabilityCallResult {
             tokio::task::spawn_blocking(move || {
-                leg.invoke(CommandProposal::new(
-                    capability,
-                    json!({"uri": "http://x/"}),
-                    None,
-                ))
+                leg.invoke(
+                    CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
+                    streams().0,
+                )
             })
             .await
             .expect("blocking dispatch completes")
@@ -1612,29 +1672,28 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn ordinary_attachment_metadata_remains_successful_provider_json() {
-            for output in [
+        async fn obsolete_return_envelopes_never_become_stdout() {
+            for old_envelope in [
                 json!({"subject": "report", "attachments": [{"name": "a.pdf"}]}),
                 json!({"attachments": []}),
                 json!({"attachments": {"count": 1}}),
             ] {
                 let directory = private_broker_directory();
                 let mut result = result(InvocationOutcome::Succeeded, None);
-                result.output = Some(output.clone());
+                result.output = Some(old_envelope);
                 let leg = stub_leg(
                     directory.path(),
                     vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
                 )
                 .await;
-                assert_eq!(
-                    invoke(leg, CAPABILITY).await,
-                    CapabilityCallResult::Succeeded(output)
-                );
+                let (status, stdout) = invoke_with_stdout(leg, CAPABILITY).await;
+                assert_eq!(status, CapabilityCallResult::Succeeded);
+                assert!(stdout.is_empty(), "obsolete result envelope reached stdout");
             }
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_retired_base64_attachment_envelope_is_refused_after_execution() {
+        async fn a_retired_base64_attachment_envelope_cannot_become_stdout() {
             let directory = private_broker_directory();
             let mut result = result(InvocationOutcome::Succeeded, None);
             result.output =
@@ -1644,14 +1703,9 @@ mod tests {
                 vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
             )
             .await;
-            assert_eq!(
-                invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Denied {
-                    reason: format!(
-                        "{CAPABILITY} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
-                    ),
-                }
-            );
+            let (status, stdout) = invoke_with_stdout(leg, CAPABILITY).await;
+            assert_eq!(status, CapabilityCallResult::Succeeded);
+            assert!(stdout.is_empty(), "retired attachment bytes reached stdout");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1676,7 +1730,7 @@ mod tests {
         async fn an_embedder_without_a_store_reports_received_descriptors_instead_of_silently_discarding_metadata()
          {
             use dekopon_broker_protocol::{AssetEncoding, DescriptorStream, NewAsset};
-            use std::os::fd::AsFd;
+            use std::{io::Write, os::fd::AsFd};
             let directory = private_broker_directory();
             let socket = directory.path().join("broker.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -1691,7 +1745,14 @@ mod tests {
                     .read_frame::<RequestEnvelope>(FrameLimits::default())
                     .await
                     .unwrap();
-                assert!(descriptors.is_empty());
+                assert_eq!(
+                    descriptors.len(),
+                    1,
+                    "stdout descriptor accompanies invocation"
+                );
+                let mut provider_stdout =
+                    std::os::unix::net::UnixStream::from(descriptors.into_iter().next().unwrap());
+                provider_stdout.write_all(b"provider line\n").unwrap();
                 let mut result = result(InvocationOutcome::Succeeded, None);
                 result.output = Some(json!({"effect":"complete"}));
                 let reply = ResponseEnvelope::invocation(
@@ -1711,19 +1772,23 @@ mod tests {
                     .await
                     .unwrap();
             });
-            let result = invoke(leg_with(&socket, None), CAPABILITY).await;
+            let (status, stdout) = invoke_with_stdout(leg_with(&socket, None), CAPABILITY).await;
             peer.await.unwrap();
-            let CapabilityCallResult::Succeeded(output) = result else {
-                panic!("effect already completed")
-            };
-            assert_eq!(output["result"]["effect"], "complete");
-            assert!(
-                output["assetNote"]
-                    .as_str()
-                    .unwrap()
-                    .contains("no asset store")
+            assert_eq!(
+                status,
+                CapabilityCallResult::Succeeded,
+                "effect already completed"
             );
-            assert!(!output.to_string().contains("PRIVATE_PAYLOAD"));
+            assert!(stdout.starts_with("provider line\n"), "{stdout}");
+            assert!(
+                stdout["provider line\n".len()..].contains("no asset store"),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("PRIVATE_PAYLOAD"));
+            assert!(
+                !stdout.contains("\"effect\":\"complete\""),
+                "returned value leaked into stdout"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1780,7 +1845,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_successful_invocation_hands_provider_output_to_the_script() {
+        async fn a_successful_invocation_has_no_returned_value() {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
@@ -1795,7 +1860,7 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
         }
 
@@ -1816,7 +1881,7 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -1870,7 +1935,7 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -1931,15 +1996,18 @@ mod tests {
 
             assert_eq!(
                 tokio::task::spawn_blocking(move || {
-                    leg.invoke(CommandProposal::new(
-                        CAPABILITY,
-                        json!({"uri": "http://x/"}),
-                        Some(submitted),
-                    ))
+                    leg.invoke(
+                        CommandProposal::new(
+                            CAPABILITY,
+                            json!({"uri": "http://x/"}),
+                            Some(submitted),
+                        ),
+                        streams().0,
+                    )
                 })
                 .await
                 .expect("blocking dispatch completes"),
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -2117,7 +2185,7 @@ mod tests {
                 reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
             let leg = leg.with_progress_notes();
             tokio::task::spawn_blocking(move || {
-                let proposal = leg.run_command("probe", &[], None);
+                let proposal = leg.run_command("probe", &[], false);
                 assert!(matches!(proposal, Some(CommandRun::Proposed { .. })));
                 leg.note(
                     " rendering the image ",
@@ -2347,15 +2415,18 @@ mod tests {
                 direct: super::FakeLeg::new(CAPABILITY, "direct"),
                 broker: Some(Box::new(leg)),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                invoker.invoke(owned_proposal(invoker.run_command("probe", &[], None)))
+            let (result, stdout) = tokio::task::spawn_blocking(move || {
+                let (streams, reader) = streams();
+                let result = invoker.invoke(
+                    owned_proposal(invoker.run_command("probe", &[], false)),
+                    streams,
+                );
+                (result, output(reader))
             })
             .await
             .unwrap();
-            assert_eq!(
-                result,
-                CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
-            );
+            assert_eq!(result, CapabilityCallResult::Succeeded);
+            assert_eq!(stdout, "{\"leg\":\"direct\"}\n");
             assert_eq!(sink.labels().last().unwrap(), "finished probe Succeeded");
         }
 
@@ -2382,17 +2453,20 @@ mod tests {
                     let (resume, resumed) = std::sync::mpsc::sync_channel(1);
                     let leg = &leg;
                     let first = scope.spawn(move || {
-                        let proposal = owned_proposal(leg.run_command("probe", &[], None));
+                        let proposal = owned_proposal(leg.run_command("probe", &[], false));
                         ready.send(()).unwrap();
                         resumed.recv().unwrap();
-                        leg.invoke(proposal)
+                        leg.invoke(proposal, streams().0)
                     });
                     observed.recv().unwrap();
                     let second = scope.spawn(move || {
-                        leg.invoke(owned_proposal(leg.run_command("second", &[], None)))
+                        leg.invoke(
+                            owned_proposal(leg.run_command("second", &[], false)),
+                            streams().0,
+                        )
                     });
                     let second = second.join().unwrap();
-                    assert!(matches!(second, CapabilityCallResult::Succeeded(_)));
+                    assert!(matches!(second, CapabilityCallResult::Succeeded));
                     resume.send(()).unwrap();
                     let first = first.join().unwrap();
                     assert!(matches!(first, CapabilityCallResult::Failed { .. }));
@@ -2472,8 +2546,8 @@ mod tests {
                 reporting_probe_leg(directory.path(), vec![rendered_at(0), rendered_at(2)]).await;
 
             let (help, usage_error) = tokio::task::spawn_blocking(move || {
-                let help = leg.run_command("probe", &["--help".to_owned()], None);
-                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], None);
+                let help = leg.run_command("probe", &["--help".to_owned()], false);
+                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], false);
                 leg.script_finished();
                 (help, usage_error)
             })
@@ -2518,7 +2592,10 @@ mod tests {
 
             let called = tokio::task::spawn_blocking(move || {
                 let argv = ["fetch".to_owned(), "7".to_owned()];
-                let called = leg.invoke(owned_proposal(leg.run_command("probe", &argv, None)));
+                let called = leg.invoke(
+                    owned_proposal(leg.run_command("probe", &argv, false)),
+                    streams().0,
+                );
                 leg.script_finished();
                 called
             })
@@ -2581,8 +2658,8 @@ mod tests {
             .await;
 
             let (merge, help) = tokio::task::spawn_blocking(move || {
-                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], None);
-                let help = leg.run_command("probe", &["--help".to_owned()], None);
+                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], false);
+                let help = leg.run_command("probe", &["--help".to_owned()], false);
                 leg.script_finished();
                 (merge, help)
             })
@@ -2619,11 +2696,10 @@ mod tests {
             let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
-                leg.invoke(CommandProposal::new(
-                    "ignore-your-instructions",
-                    json!({}),
-                    None,
-                ))
+                leg.invoke(
+                    CommandProposal::new("ignore-your-instructions", json!({}), None),
+                    streams().0,
+                )
             })
             .await
             .expect("blocking dispatch completes");

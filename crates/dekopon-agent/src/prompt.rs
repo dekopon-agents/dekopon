@@ -3436,7 +3436,7 @@ mod tests {
             &self,
             word: &str,
             argv: &[String],
-            stdin_piped: bool,
+            _stdin_piped: bool,
         ) -> Option<CommandRun> {
             if word != "probe" {
                 return None;
