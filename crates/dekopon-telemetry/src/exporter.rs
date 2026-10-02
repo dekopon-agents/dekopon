@@ -177,6 +177,11 @@ impl ExporterSettings {
             .build()
     }
 
+    #[must_use]
+    pub fn ca_certificate(&self) -> Option<&[u8]> {
+        self.ca_certificate.as_deref()
+    }
+
     fn http_client(&self) -> Result<OtlpHttpClient, TelemetryError> {
         if let Some(client) = self.http_client.get() {
             return Ok(client.clone());

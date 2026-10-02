@@ -157,6 +157,22 @@ impl Default for LookbackMax {
 }
 
 impl RestoreConfig {
+    pub(crate) const fn delay(&self) -> Duration {
+        match self {
+            Self::Openobserve { delay_ms, .. } | Self::Quickwit { delay_ms, .. } => {
+                Duration::from_millis(delay_ms.0)
+            }
+        }
+    }
+
+    pub(crate) const fn lookback_max(&self) -> Duration {
+        match self {
+            Self::Openobserve { lookback_max, .. } | Self::Quickwit { lookback_max, .. } => {
+                lookback_max.0.0
+            }
+        }
+    }
+
     pub(crate) const fn timeout(&self) -> Duration {
         match self {
             Self::Openobserve { timeout_ms, .. } | Self::Quickwit { timeout_ms, .. } => {
@@ -347,7 +363,11 @@ pub(crate) fn build(
             )
         })
         .collect();
-    Metering::new(budgets, now)
+    let metering = Metering::new(budgets, now);
+    if resolved.restore.is_some() {
+        metering.begin_restore();
+    }
+    metering
 }
 
 impl ModelConfig {

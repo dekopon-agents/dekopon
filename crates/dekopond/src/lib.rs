@@ -20,6 +20,7 @@ mod config;
 mod conversation;
 mod jobs;
 mod journal;
+mod meter_restore;
 mod metering;
 mod progress;
 mod routes;
@@ -157,6 +158,10 @@ where
         )),
         None => None,
     };
+    let metering = Arc::new(metering::build(
+        &config.metering,
+        dekopon_model_token_governor::Metering::system_clock(),
+    ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels::default()))),
@@ -174,11 +179,18 @@ where
         thread_ownership,
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
-        metering: Arc::new(metering::build(
-            &config.metering,
-            dekopon_model_token_governor::Metering::system_clock(),
-        )),
+        metering: Arc::clone(&metering),
     });
+    let mut restores = JoinSet::new();
+    meter_restore::spawn(
+        &metering,
+        config.metering.restore.clone(),
+        config
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
+        &mut restores,
+    );
 
     tracing::info!(
         event = "gateway_started",
@@ -204,6 +216,7 @@ where
     )
     .await;
     readers.abort_all();
+    restores.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {
             Ok(Err(problem)) => tracing::warn!(
