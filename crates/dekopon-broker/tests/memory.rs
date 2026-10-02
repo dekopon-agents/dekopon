@@ -10,9 +10,7 @@ use dekopon_broker::{
     PolicyWorld, RouteConflict,
 };
 
-use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry,
-};
+use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
     EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface, StorageScope,

@@ -652,7 +652,13 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(result.result.evidence.len(), 2);
-    assert!(result.result.evidence.iter().any(|item| item.kind == "http-calls"));
+    assert!(
+        result
+            .result
+            .evidence
+            .iter()
+            .any(|item| item.kind == "http-calls")
+    );
     let wire = server.request();
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
     server.join();
@@ -679,7 +685,10 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
     use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
 
     for (response, expected) in [
-        (b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(), Succeeded),
+        (
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            Succeeded,
+        ),
         (b"not-http".as_slice(), Failed),
     ] {
         let registry = BrokerProviderRegistry::load(
@@ -704,13 +713,25 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             engine(
                 &provider_policy("caller", "provider-test", "http-probe", "http-probe.purge"),
                 ["caller"],
-                [("http-probe.fetch", "http-probe"), ("http-probe.purge", "http-probe")],
+                [
+                    ("http-probe.fetch", "http-probe"),
+                    ("http-probe.purge", "http-probe"),
+                ],
             ),
             catalog([
-                ("http-probe.fetch", set("http-probe", loopback_constraints(&authority))),
-                ("http-probe.purge", set_with_metadata(
-                    "http-probe", EffectKind::ExternalWrite, RiskLevel::High, constraints,
-                )),
+                (
+                    "http-probe.fetch",
+                    set("http-probe", loopback_constraints(&authority)),
+                ),
+                (
+                    "http-probe.purge",
+                    set_with_metadata(
+                        "http-probe",
+                        EffectKind::ExternalWrite,
+                        RiskLevel::High,
+                        constraints,
+                    ),
+                ),
             ]),
             CredentialStore::empty(),
             callers(["caller"]),
@@ -768,7 +789,10 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
             assert_eq!(
                 result.result.detail,
-                Some(ProviderFailureDetail::new("provider-exit", "protocol: HTTP transport failed\n")),
+                Some(ProviderFailureDetail::new(
+                    "provider-exit",
+                    "protocol: HTTP transport failed\n"
+                )),
                 "a typed provider failure carries the provider's own code and message on the wire"
             );
             assert!(
