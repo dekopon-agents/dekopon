@@ -304,7 +304,7 @@ impl ConflictScan {
 /// worth instantiating the component to discover.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandExport {
-    /// Exports `run-command: func(argv: list<string>, stdin: option<string>) -> string`.
+    /// Exports `run-command: func(argv: list<string>, stdin-piped: bool) -> string`.
     Present,
     /// Exports nothing under the name: the component was built against the base
     /// `dekopon:provider` world.
@@ -345,9 +345,8 @@ fn runs_commands(function: &ComponentFunc) -> bool {
     let mut params = function.params();
     let argv_is_strings = params.len() == 2
         && matches!(params.next(), Some((_, Type::List(list))) if list.ty() == Type::String);
-    let stdin_is_optional_string =
-        matches!(params.next(), Some((_, Type::Option(option))) if option.ty() == Type::String);
-    argv_is_strings && stdin_is_optional_string && returns_one_string(function)
+    let stdin_piped_is_bool = matches!(params.next(), Some((_, Type::Bool)));
+    argv_is_strings && stdin_piped_is_bool && returns_one_string(function)
 }
 
 fn returns_one_string(function: &ComponentFunc) -> bool {
@@ -432,13 +431,10 @@ pub fn check_command_export(
     }
 }
 
-/// Bytes a host counts against its input bound for one command run: every argv word plus the
-/// piped value.
 #[must_use]
-pub fn command_input_bytes(argv: &[String], stdin: Option<&str>) -> usize {
-    argv.iter().fold(stdin.map_or(0, str::len), |total, word| {
-        total.saturating_add(word.len())
-    })
+pub fn command_input_bytes(argv: &[String]) -> usize {
+    argv.iter()
+        .fold(0, |total: usize, word| total.saturating_add(word.len()))
 }
 
 /// Failure to build the shared Wasmtime engine.
@@ -647,12 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn command_input_counts_every_argv_word_and_the_piped_value() {
+    fn command_input_counts_every_argv_word() {
         let argv = vec!["say".to_owned(), "-".to_owned()];
 
-        assert_eq!(command_input_bytes(&argv, None), 4);
-        assert_eq!(command_input_bytes(&argv, Some("hello")), 9);
-        assert_eq!(command_input_bytes(&[], Some("hello")), 5);
+        assert_eq!(command_input_bytes(&argv), 4);
+        assert_eq!(command_input_bytes(&[]), 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::{
-    CapabilityCallResult, CapabilityInvoker, ExitCode,
+    CapabilityInvoker, ExitCode,
     limits::{Budget, LimitExceeded},
 };
 
@@ -106,50 +106,6 @@ pub(crate) struct BuiltinContext<'a> {
     /// a real filesystem path.
     pub buffers: &'a BTreeMap<String, Vec<u8>>,
     pub started_jobs: &'a [crate::JobId],
-}
-
-impl BuiltinContext<'_> {
-    /// Capability calls are wall-clock expensive but step-cheap (the default budget allows 32 in 96
-    /// steps), so the deadline is re-read on both sides; step-counting alone let a script overrun
-    /// its deadline by minutes.
-    pub(crate) fn invoke_proposal(
-        &mut self,
-        proposal: crate::CommandProposal,
-    ) -> Result<CommandResult, CommandFailure> {
-        self.budget.charge_capability_call()?;
-        self.budget.check_deadline()?;
-        let capability = proposal.capability.clone();
-        let result = self.invoker.invoke(proposal);
-        self.budget.check_deadline()?;
-        let status = ExitCode::from_capability_result(&result);
-        Ok(match result {
-            CapabilityCallResult::Succeeded(output) => CommandResult {
-                value: output,
-                status,
-                suppress_newline: false,
-                retained: Vec::new(),
-            },
-            CapabilityCallResult::Denied { reason } => {
-                return Err(CommandFailure::Status {
-                    message: format!("{capability}: denied: {reason}"),
-                    status,
-                });
-            }
-            CapabilityCallResult::Failed { error, detail } => {
-                let message = match detail {
-                    Some(detail) => format!("{capability}: failed: {error}: {detail}"),
-                    None => format!("{capability}: failed: {error}"),
-                };
-                return Err(CommandFailure::Status { message, status });
-            }
-            CapabilityCallResult::NotFound => {
-                return Err(CommandFailure::Status {
-                    message: format!("{capability}: capability not found"),
-                    status,
-                });
-            }
-        })
-    }
 }
 
 pub(crate) trait Builtin {
@@ -282,7 +238,11 @@ pub(crate) mod test_support {
             Vec::new()
         }
 
-        fn invoke(&self, _: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -434,7 +394,11 @@ mod tests {
             vec!["http-probe.fetch".to_owned()]
         }
 
-        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }

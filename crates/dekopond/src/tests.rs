@@ -26,8 +26,8 @@ use dekopon_agent::{
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
     CommandRunOutcome, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
-    read_frame, write_frame,
+    DescriptorStream, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
+    ResponseEnvelope,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
@@ -2449,11 +2449,8 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
     .expect("record result fixture decodes")
 }
 
-fn record_output(output: Value) -> InvocationResult {
-    InvocationResult {
-        output: Some(output),
-        ..record_result(InvocationOutcome::Succeeded, None)
-    }
+fn record_success() -> InvocationResult {
+    record_result(InvocationOutcome::Succeeded, None)
 }
 
 fn probe_listing() -> ResponseEnvelope {
@@ -2513,7 +2510,7 @@ async fn stub_broker_assets(
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let mut stream = dekopon_broker_protocol::DescriptorStream::new(stream);
+            let mut stream = DescriptorStream::new(stream);
             let Ok((request, _inputs)) = stream
                 .read_frame::<RequestEnvelope>(FrameLimits::default())
                 .await
@@ -3054,12 +3051,7 @@ fn asset_response(bytes: &[u8], label: &str) -> (ResponseEnvelope, Vec<std::os::
         sha256: "0".repeat(64),
     };
     (
-        ResponseEnvelope::invocation(
-            record_output(json!({"generationId":"gen-7"})),
-            vec![metadata],
-            Vec::new(),
-            Vec::new(),
-        ),
+        ResponseEnvelope::invocation(record_success(), vec![metadata], Vec::new(), Vec::new()),
         vec![blob.descriptor().unwrap()],
     )
 }
@@ -3068,7 +3060,7 @@ fn plain_response(response: ResponseEnvelope) -> (ResponseEnvelope, Vec<std::os:
 }
 fn queued_response(id: u64) -> (ResponseEnvelope, Vec<std::os::fd::OwnedFd>) {
     plain_response(ResponseEnvelope::invocation(
-        record_output(json!({})),
+        record_success(),
         Vec::new(),
         Vec::new(),
         vec![id],
@@ -3116,8 +3108,9 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
         "attachment bytes reached the model: {tool}"
     );
     assert!(
-        tool.contains("gen-7"),
-        "the ordinary result fields survive: {tool}"
+        tool.lines().any(|line| line
+            == "[gateway: chat-asset:1 (image/png, 20 stored bytes) attached, not sent]"),
+        "the asset note is its own stdout line: {tool}"
     );
 }
 
@@ -3182,51 +3175,6 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
             "request {request} carried a {longest}-character base64 run"
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_retired_base64_result_envelope_is_refused_without_decoding() {
-    let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![
-            probe_listing(),
-            upper_proposal("kitty"),
-            ResponseEnvelope::invocation(
-                record_output(json!({"attachments": [{
-                    "mediaType": "image/png",
-                    "base64": STANDARD.encode(b"kitty pixels"),
-                }]})),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        ],
-    )
-    .await;
-    let models = ModelScript::new([
-        script_call("probe upper --text kitty"),
-        answer("I cannot attach that."),
-    ]);
-    let driver = Arc::new(RecordingDriver::default());
-    let runner = runner(broker, Arc::clone(&models), 4);
-
-    run_session(
-        runner,
-        route(model_config()),
-        message("draw me a kitty cat"),
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
-    )
-    .await;
-
-    assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
-    let tool = tool_message(&models, 1);
-    assert!(tool.contains("cli-probe.upper"), "{tool}");
-    assert!(tool.contains("dekopon:asset"), "{tool}");
-    assert!(
-        !tool.contains(&STANDARD.encode(b"kitty pixels")),
-        "attachment bytes reached the model: {tool}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3474,7 +3422,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     assert!(
         matches!(
             &run,
-            BrokerRequest::RunCommand { word, argv, stdin: None, .. }
+            BrokerRequest::RunCommand { word, argv, stdin_piped: false, .. }
                 if word == "probe" && argv == &["--help".to_owned()]
         ),
         "{run:?}"
@@ -11787,40 +11735,48 @@ async fn parked_broker(
     let released = Arc::clone(&release);
     tokio::spawn(async move {
         for response in answer_first {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            if read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+            let mut stream = DescriptorStream::new(stream);
+            if stream
+                .read_frame::<RequestEnvelope>(FrameLimits::default())
                 .await
                 .is_err()
             {
                 return;
             }
-            if write_frame(&mut stream, &response, FrameLimits::default())
+            if stream
+                .write_frame(&response, &[], FrameLimits::default())
                 .await
                 .is_err()
             {
                 return;
             }
         }
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let Ok((stream, _)) = listener.accept().await else {
             return;
         };
-        if read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+        let mut stream = DescriptorStream::new(stream);
+        let Ok((_request, streams)) = stream
+            .read_frame::<RequestEnvelope>(FrameLimits::default())
             .await
-            .is_err()
-        {
+        else {
             return;
-        }
+        };
         entered.notify_one();
         released.notified().await;
+        // A real broker closes the provider's streams before it answers.
+        drop(streams);
         #[allow(
             clippy::let_underscore_must_use,
             reason = "the parked call is released only after the test has already cancelled the \
                       session, so the client may well be gone; what the test asserts on is the \
                       cancellation, not this write"
         )]
-        let _ = write_frame(&mut stream, &parked_answer, FrameLimits::default()).await;
+        let _ = stream
+            .write_frame(&parked_answer, &[], FrameLimits::default())
+            .await;
     });
     (
         ResolvedBroker {

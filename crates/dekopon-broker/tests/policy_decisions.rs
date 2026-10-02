@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::sync::Arc;
 
@@ -165,16 +165,29 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
     );
 
     let ordinary = request(98, "cli-probe.reverse");
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
     let ordinary_result = broker
         .invoke(
             &gateway,
             Some(&grant),
             Some(&chat.bound_to(ordinary.id.clone())),
             ordinary,
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("ordinary subject-only chat executes through the upgraded chat operation");
+    assert!(!captured.join().unwrap().is_empty());
     assert_eq!(ordinary_result.result.outcome, InvocationOutcome::Succeeded);
 
     assert!(

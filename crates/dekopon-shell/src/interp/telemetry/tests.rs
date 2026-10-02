@@ -41,7 +41,7 @@ impl CapabilityInvoker for Fixture {
         vec!["probe".into()]
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], _stdin_piped: bool) -> Option<CommandRun> {
         if word != "probe" {
             return None;
         }
@@ -55,7 +55,7 @@ impl CapabilityInvoker for Fixture {
             },
             ["upper", "-"] => CommandRun::Proposed {
                 capability: "cli-probe.upper".into(),
-                input: json!({"text": stdin}),
+                input: json!({"text": null}),
                 secret_use: None,
                 report: None,
             },
@@ -68,13 +68,25 @@ impl CapabilityInvoker for Fixture {
         })
     }
 
-    fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        proposal: crate::CommandProposal,
+        mut streams: crate::Streams,
+    ) -> CapabilityCallResult {
         let capability = proposal.capability;
         let input = proposal.input;
         match capability.as_str() {
-            "cli-probe.upper" => CapabilityCallResult::Succeeded(json!({
-                "text": input["text"].as_str().unwrap_or_default().to_uppercase()
-            })),
+            "cli-probe.upper" => {
+                let mut text = input["text"].as_str().unwrap_or_default().to_owned();
+                if let Some(stdin) = streams.stdin.take() {
+                    std::io::Read::read_to_string(
+                        &mut std::os::unix::net::UnixStream::from(stdin),
+                        &mut text,
+                    )
+                    .expect("piped stdin");
+                }
+                streams.reply(&json!({ "text": text.to_uppercase() }))
+            }
             "provider.broken" => CapabilityCallResult::Failed {
                 error: "provider trapped".into(),
                 detail: None,
@@ -349,10 +361,10 @@ fn a_fatal_producer_still_emits_its_diagnostics_before_the_consumers() {
 }
 
 #[test]
-fn a_provider_records_its_drained_stdin_but_a_stream_copy_does_not() {
+fn a_provider_and_a_stream_copy_count_their_stdin_without_recording_it() {
     let telemetry = capture("echo payload | probe upper -");
     let provider = telemetry.command_spans("probe")[0];
-    assert_recorded(provider, "shell.command.stdin", "payload\n", 8);
+    assert_eq!(provider.field("shell.command.stdin"), None);
     assert_eq!(provider.field("shell.command.input.bytes"), Some("8"));
     let streamed = capture("echo payload | cat");
     let cat = streamed.command_spans("cat")[0];
@@ -474,7 +486,7 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
 }
 
 #[test]
-fn a_command_span_records_its_arguments_stdin_and_output() {
+fn a_command_span_records_its_arguments_but_not_a_provider_s_streams() {
     let telemetry = capture("probe upper --text hello\necho piped | probe upper -");
     let probes = telemetry.command_spans("probe");
     let [flag, piped] = probes.as_slice() else {
@@ -483,16 +495,16 @@ fn a_command_span_records_its_arguments_stdin_and_output() {
 
     let arguments = r#"["upper","--text","hello"]"#;
     assert_recorded(flag, "shell.command.arguments", arguments, arguments.len());
-    let output = r#"{"text":"HELLO"}"#;
-    assert_recorded(flag, "shell.command.output", output, output.len());
     assert_eq!(flag.field("shell.command.stdin"), None);
     assert_eq!(flag.field("shell.command.stdin.bytes"), None);
 
     let arguments = r#"["upper","-"]"#;
     assert_recorded(piped, "shell.command.arguments", arguments, arguments.len());
-    assert_recorded(piped, "shell.command.stdin", "piped\n", "piped\n".len());
-    let output = r#"{"text":"PIPED\n"}"#;
-    assert_recorded(piped, "shell.command.output", output, output.len());
+    assert_eq!(piped.field("shell.command.stdin"), None);
+    assert_eq!(
+        telemetry.outcome.output,
+        "{\"text\":\"HELLO\"}\n{\"text\":\"PIPED\\n\"}"
+    );
 }
 
 #[test]
@@ -510,18 +522,9 @@ fn an_oversized_attribute_keeps_a_4096_byte_head_a_marker_and_its_full_length() 
     };
 
     let arguments = format!(r#"["upper","--text","{payload}"]"#);
-    let output = format!(r#"{{"text":"{}"}}"#, payload.to_uppercase());
-    let stdin = format!("{payload}\n");
-    let piped_output = format!(r#"{{"text":"{}\n"}}"#, payload.to_uppercase());
-    for (span, field, full) in [
-        (flag, "shell.command.arguments", &arguments),
-        (flag, "shell.command.output", &output),
-        (piped, "shell.command.stdin", &stdin),
-        (piped, "shell.command.output", &piped_output),
-    ] {
-        let head = format!("{}{MARKER}", &full[..CAP]);
-        assert_recorded(span, field, &head, full.len());
-    }
+    let head = format!("{}{MARKER}", &arguments[..CAP]);
+    assert_recorded(flag, "shell.command.arguments", &head, arguments.len());
+    assert_eq!(piped.field("shell.command.stdin"), None);
 
     let exact = "x".repeat(CAP - r#"["upper","--text",""]"#.len());
     let telemetry = capture(&format!("probe upper --text {exact}"));

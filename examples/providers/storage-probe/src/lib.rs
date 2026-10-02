@@ -1,12 +1,13 @@
 use dekopon_provider_sdk::clap::Parser;
 use dekopon_provider_sdk::provider::{
-    Capability, Code, DurableFiles, Failure, Proposal, Provider, Storage, Usage,
+    Capability, Code, DurableFiles, Failure, Proposal, Provider, Stdout, Storage, Usage,
     durable_files::{Durability, OpenOptions, StorageError},
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
 
 struct StorageProbe;
 struct Run;
@@ -79,7 +80,7 @@ impl Provider for StorageProbe {
     const DESCRIPTION: &'static str = "Exercises every durable-files contract family";
     type Args = Args;
     type Capabilities = (Run,);
-    fn propose(_: Args, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: Args, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Run>(Input { mode: None }))
     }
 }
@@ -91,17 +92,21 @@ impl Capability for Run {
     const RISK: RiskLevel = RiskLevel::Medium;
     type Input = Input;
     type Needs = Storage<DurableFiles>;
-    type Output = Value;
     type Error = ProbeError;
-    fn run(input: Input, storage: Storage<DurableFiles>) -> Result<Value, ProbeError> {
-        match input.mode.unwrap_or(Mode::Success) {
+    fn run(
+        input: Input,
+        storage: Storage<DurableFiles>,
+        out: &mut Stdout,
+    ) -> Result<(), ProbeError> {
+        let value = match input.mode.unwrap_or(Mode::Success) {
             Mode::Success => run(&storage),
             Mode::ReadOnlyDenial => catch_read_only_denial(&storage),
             Mode::WrongInterfaceDenial => catch_wrong_interface_denial(&storage),
             Mode::QuotaDenial => catch_quota_denial(&storage),
             Mode::BudgetDenial => catch_budget_denial(&storage),
             Mode::DropAfterDenial => drop_after_denial(&storage),
-        }
+        }?;
+        writeln!(out, "{value}").map_err(|_| ProbeError::StorageError)
     }
 }
 
@@ -309,7 +314,7 @@ mod tests {
         assert_eq!(manifest.capabilities[0].id.as_str(), "storage-probe.run");
         assert_eq!(manifest.command_words, ["storageprobe"]);
         assert!(
-            matches!(provider::command::<StorageProbe>(&[], None), CommandRunOutcome::Proposed { input, .. } if input == json!({}))
+            matches!(provider::command::<StorageProbe>(&[], false), CommandRunOutcome::Proposed { input, .. } if input == json!({}))
         );
         assert_eq!(
             manifest.capabilities[0].input_schema["additionalProperties"],

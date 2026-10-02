@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
+mod fixture;
+
 use dekopon_broker_host::asset::AssetInputs;
 use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{AssetEncoding, AssetRow};
@@ -69,7 +71,6 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority],
             allowed_methods: vec![method.to_owned()],
@@ -120,6 +121,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
         ..Default::default()
     };
     for bytes in [65536, 65537, 8 * 1024 * 1024] {
+        let (streams, stdout) = fixture::piped_stdout();
         let result = raw_registry
             .invoke(
                 authorized(
@@ -128,11 +130,12 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
                     constraints.clone(),
                 ),
                 None,
-                AssetInputs::default(),
+                streams,
             )
             .await;
         if bytes == 65536 {
             assert_eq!(result.unwrap().assets.attached[0].bytes, bytes as u64);
+            assert_eq!(stdout.json(), json!({"caught":false}));
         } else {
             assert!(matches!(
                 *result.unwrap_err().error,
@@ -141,6 +144,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
                     ..
                 }
             ));
+            assert_eq!(stdout.json(), json!({"caught":true}));
         }
         assert!(capture.events().iter().any(|(fields, _)| {
             fields.contains(&format!("asset.write.guest_bytes={bytes}"))
@@ -173,6 +177,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
     ] {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), &bytes).unwrap();
+        let (piped, stdout) = fixture::piped_stdout();
         let inputs = AssetInputs {
             rows: vec![AssetRow {
                 id,
@@ -184,8 +189,10 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             }],
             descriptors: vec![std::fs::File::open(file.path()).unwrap().into()],
             sends_remaining: 0,
+            streams: piped.streams,
+            cancel: None,
         };
-        let result = registry
+        let _result = registry
             .invoke(
                 authorized(
                     "http-probe.fetch".parse().unwrap(),
@@ -197,7 +204,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             )
             .await
             .unwrap();
-        assert_eq!(result.output, json!({"read":payload.len()}));
+        assert_eq!(stdout.json(), json!({"read":payload.len()}));
         let records = capture.records();
         let hashes = records.iter().filter(|record| matches!(record, dekopon_test_support::Record::Event { fields, scope, .. } if fields.contains(&format!("asset.id={id}")) && fields.contains(&hash) && fields.contains(r#"asset.content_type="text/plain""#) && scope.contains(&"provider.invoke"))).count();
         assert_eq!(hashes, 1);

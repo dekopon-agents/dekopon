@@ -68,6 +68,7 @@ pub struct ShellRuntime<I> {
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
+        self.invoker.script_started(self.limits.timeout);
         let tree = TreeContext::new(self.limits, self.calls.clone());
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
@@ -97,6 +98,13 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
+    fn script_started(&self, timeout: Duration) {
+        self.direct.script_started(timeout);
+        if let Some(broker) = &self.broker {
+            broker.script_started(timeout);
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.direct.cancelled()
             || self
@@ -139,26 +147,30 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         })
     }
 
-    fn invoke(&self, mut proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        mut proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         let capability = &proposal.capability;
         // A secret-use proposal must reach only the broker leg; the direct leg has no authorizer to
         // check it.
         if proposal.secret_use.is_some() {
             return match &self.broker {
-                Some(broker) if broker.is_granted(capability) => broker.invoke(proposal),
+                Some(broker) if broker.is_granted(capability) => broker.invoke(proposal, streams),
                 _ => dekopon_shell::secret_use_unsupported(),
             };
         }
         if self.direct.is_granted(capability) {
             let report = proposal.report.take();
-            let result = self.direct.invoke(proposal);
+            let result = self.direct.invoke(proposal, streams);
             if let Some(report) = report {
                 report.complete(report_outcome(call_outcome(&result)));
             }
             return result;
         }
         match &self.broker {
-            Some(broker) => broker.invoke(proposal),
+            Some(broker) => broker.invoke(proposal, streams),
             None => CapabilityCallResult::NotFound,
         }
     }
@@ -181,10 +193,10 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         pages
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.direct
-            .run_command(word, argv, stdin)
-            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
+            .run_command(word, argv, stdin_piped)
+            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin_piped))
     }
 
     fn note(&self, text: &str, eta: Option<Duration>) {
@@ -284,6 +296,33 @@ pub enum BrokerLegError {
     DuplicateCapabilities { capabilities: String },
 }
 
+#[cfg(unix)]
+struct ScriptCancellation {
+    signal: CancelSignal,
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for ScriptCancellation {
+    fn drop(&mut self) {
+        if let Some(timer) = &self.timer {
+            timer.abort();
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_cancel(mut signal: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *signal.borrow_and_update() {
+            return;
+        }
+        if signal.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// A client of brokerd's authorization path, never a participant: it only submits proposals and
 /// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
@@ -298,6 +337,7 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
     cancel: CancelSignal,
+    script_cancel: parking_lot::Mutex<Option<ScriptCancellation>>,
     attachments: Option<Arc<ReplyAttachments>>,
     asset_inputs: Option<ChatAssetInputs>,
     progress: Option<Arc<dyn ProgressSink>>,
@@ -345,6 +385,7 @@ impl BrokerLeg {
             attestation,
             chat_memory,
             cancel: CancelSignal::never(),
+            script_cancel: parking_lot::Mutex::new(None),
             attachments: None,
             asset_inputs: None,
             progress: None,
@@ -433,6 +474,7 @@ impl BrokerLeg {
                             rows: Vec::new(),
                             descriptors: Vec::new(),
                             sends_remaining: remaining,
+                            streams: None,
                         },
                         Vec::new(),
                     ))
@@ -463,9 +505,13 @@ fn report_outcome(outcome: ToolOutcome) -> dekopon_shell::CommandReportOutcome {
 
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
-        CapabilityCallResult::Succeeded(_) => ToolOutcome::Succeeded,
+        CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
+            ToolOutcome::Succeeded
+        }
         CapabilityCallResult::Denied { .. } => ToolOutcome::Denied,
-        CapabilityCallResult::Failed { .. } | CapabilityCallResult::NotFound => ToolOutcome::Failed,
+        CapabilityCallResult::Exited { .. }
+        | CapabilityCallResult::Failed { .. }
+        | CapabilityCallResult::NotFound => ToolOutcome::Failed,
     }
 }
 
@@ -516,7 +562,38 @@ fn snapshot(
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
     fn cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
+        self.effective_cancel().is_cancelled()
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: BrokerLeg script; bound: one timer per script, aborted and joined on script_finished"
+    )]
+    fn script_started(&self, timeout: Duration) {
+        let (handle, signal) = CancelSignal::pair();
+        let parent = self.cancel.watch();
+        let timer = self.runtime.spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => {},
+                () = wait_for_cancel(parent) => {},
+            }
+            handle.cancel();
+        });
+        *self.script_cancel.lock() = Some(ScriptCancellation {
+            signal,
+            timer: Some(timer),
+        });
+    }
+
+    fn script_finished(&self) {
+        let script = self.script_cancel.lock().take();
+        if let Some(mut script) = script
+            && let Some(timer) = script.timer.take()
+        {
+            timer.abort();
+            let _joined = self.runtime.block_on(timer);
+        }
+        self.notes.store(0, Ordering::Relaxed);
     }
 
     fn granted(&self) -> Vec<String> {
@@ -543,7 +620,7 @@ impl CapabilityInvoker for BrokerLeg {
         self.command_words.contains(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         if !self.command_words.contains(word) {
             return None;
         }
@@ -559,13 +636,13 @@ impl CapabilityInvoker for BrokerLeg {
         // aborted call is still in flight.
         let client = self.client.clone();
         let attestation = self.attestation.clone();
-        let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
+        let (owned_word, argv) = (word.to_owned(), argv.to_vec());
         let trace_parent = self.identifiers.trace_parent();
         let operation = process_fn(
-            ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
+            ProcessMetadata::cancellable("broker-command", self.effective_cancel()),
             move || async move {
                 client
-                    .run_command(attestation, owned_word, argv, stdin, trace_parent)
+                    .run_command(attestation, owned_word, argv, stdin_piped, trace_parent)
                     .await
                     .map(command_run_from_outcome)
             },
@@ -621,7 +698,11 @@ impl CapabilityInvoker for BrokerLeg {
         Some(run)
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         let dekopon_shell::CommandProposal {
             capability,
             input,
@@ -629,7 +710,7 @@ impl CapabilityInvoker for BrokerLeg {
             report,
         } = proposal;
         let capability = capability.as_str();
-        let cancelled = self.cancel.is_cancelled();
+        let cancelled = self.cancelled();
         let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
@@ -659,7 +740,7 @@ impl CapabilityInvoker for BrokerLeg {
                 ToolOutcome::Cancelled,
             )
         } else {
-            let result = self.submit(capability, input, secret_use);
+            let result = self.submit(capability, input, secret_use, streams);
             let outcome = call_outcome(&result);
             (result, outcome)
         };
@@ -698,10 +779,6 @@ impl CapabilityInvoker for BrokerLeg {
         self.emit(ProgressEvent::Note { text, eta });
     }
 
-    fn script_finished(&self) {
-        self.notes.store(0, Ordering::Relaxed);
-    }
-
     fn job_control(&self) -> Option<&dyn JobControl> {
         self.jobs.as_deref()
     }
@@ -709,11 +786,19 @@ impl CapabilityInvoker for BrokerLeg {
 
 #[cfg(unix)]
 impl BrokerLeg {
+    fn effective_cancel(&self) -> CancelSignal {
+        self.script_cancel
+            .lock()
+            .as_ref()
+            .map_or_else(|| self.cancel.clone(), |script| script.signal.clone())
+    }
+
     fn submit(
         &self,
         capability: &str,
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
+        streams: dekopon_shell::Streams,
     ) -> CapabilityCallResult {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
@@ -724,7 +809,7 @@ impl BrokerLeg {
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        let (assets, asset_pins) = match self.prepare_assets(&input) {
+        let (mut assets, asset_pins) = match self.prepare_assets(&input) {
             Ok(input) => input,
             // This refusal is permanent, the interpreter's non-retryable Denied rather than a
             // retryable Failed, and produces no broker audit record since no proposal was ever
@@ -738,6 +823,10 @@ impl BrokerLeg {
                 };
             }
         };
+        assets.streams = Some(dekopon_broker_protocol::Streams {
+            stdin: streams.stdin,
+            stdout: streams.stdout,
+        });
         let request = InvocationRequest {
             id: self.identifiers.next_invocation(),
             capability: parsed,
@@ -750,72 +839,83 @@ impl BrokerLeg {
         // ordinary runtime worker would deadlock the executor.
         let invocation = request.id.to_string();
         let submitted = self.runtime.block_on(async {
-            self.client
-                .invoke(self.attestation.clone(), request, assets)
-                .await
+            tokio::select! {
+                result = self.client.invoke(self.attestation.clone(), request, assets) => Some(result),
+                () = wait_for_cancel(self.effective_cancel().watch()) => None,
+            }
         });
         drop(asset_pins);
         match submitted {
-            Ok(outcome) => {
+            None => CapabilityCallResult::Denied {
+                reason: "script-cancelled".to_owned(),
+            },
+            Some(Ok(outcome)) => {
                 let result = outcome.result;
                 match result.outcome {
                     InvocationOutcome::Succeeded => {
-                        let mut output = result.output.unwrap_or(Value::Null);
-                        if output
-                            .get("attachments")
-                            .and_then(Value::as_array)
-                            .is_some_and(|attachments| {
-                                attachments
-                                    .iter()
-                                    .any(|attachment| attachment.get("base64").is_some())
-                            })
-                        {
-                            return CapabilityCallResult::Denied {
-                                reason: format!(
-                                    "{capability} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
-                                ),
-                            };
-                        }
-                        if let Some(slot) = &self.attachments {
-                            let note = slot.receive(
+                        let note = if let Some(slot) = &self.attachments {
+                            slot.receive(
                                 outcome.attached,
                                 outcome.descriptors,
                                 outcome.removed,
                                 outcome.sent,
                                 capability,
                                 &invocation,
-                            );
-                            if !note.is_empty() {
-                                output = serde_json::json!({"result": output, "assetNote": note});
-                            }
+                            )
                         } else if !outcome.attached.is_empty()
                             || !outcome.removed.is_empty()
                             || !outcome.sent.is_empty()
                         {
-                            output = serde_json::json!({"result": output, "assetNote": "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]"});
+                            "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]".to_owned()
+                        } else {
+                            String::new()
+                        };
+                        let mut stderr = result
+                            .detail
+                            .map(|detail| detail.message)
+                            .unwrap_or_default();
+                        if !note.is_empty() {
+                            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                                stderr.push('\n');
+                            }
+                            stderr.push_str(&note);
+                            stderr.push('\n');
                         }
-                        CapabilityCallResult::Succeeded(output)
+                        if stderr.is_empty() {
+                            CapabilityCallResult::Succeeded
+                        } else {
+                            CapabilityCallResult::SucceededWithStderr(stderr)
+                        }
                     }
                     InvocationOutcome::Denied => CapabilityCallResult::Denied {
                         reason: result
                             .error
                             .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
                     },
-                    InvocationOutcome::Failed => CapabilityCallResult::Failed {
-                        error: result.error.unwrap_or_else(|| {
-                            "the broker reported a failed invocation".to_owned()
-                        }),
-                        detail: result.detail,
+                    InvocationOutcome::Failed => match result.exit_status {
+                        Some(status) => CapabilityCallResult::Exited {
+                            status,
+                            stderr: result
+                                .detail
+                                .map(|detail| detail.message)
+                                .unwrap_or_default(),
+                        },
+                        None => CapabilityCallResult::Failed {
+                            error: result.error.unwrap_or_else(|| {
+                                "the broker reported a failed invocation".to_owned()
+                            }),
+                            detail: result.detail,
+                        },
                     },
                 }
             }
-            Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
+            Some(Err(ClientError::Remote { code, message })) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
             // A client-side timeout cannot tell whether the call ran, so it is treated as the one
             // non-retryable Denied status with an explicit refusal to resubmit, rather than a
             // Failed a model would retry.
-            Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
+            Some(Err(error)) if error.may_have_executed() => CapabilityCallResult::Denied {
                 reason: format!(
                     "the broker did not record an outcome for this invocation and it may already \
                      have taken effect; do not resubmit it ({error})"
@@ -823,7 +923,7 @@ impl BrokerLeg {
             },
             // Every ClientError renders without the socket path, since this is the one path that
             // could otherwise leak DEKOPON_BROKER_SOCKET back into a script.
-            Err(error) => CapabilityCallResult::Failed {
+            Some(Err(error)) => CapabilityCallResult::Failed {
                 error: error.to_string(),
                 detail: None,
             },
@@ -887,8 +987,31 @@ mod tests {
         CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
     };
     use serde_json::json;
+    use std::{io::Read, os::fd::OwnedFd, os::unix::net::UnixStream};
 
     use super::{SessionInvoker, current_trace_parent};
+
+    fn streams() -> (dekopon_shell::Streams, UnixStream) {
+        let (writer, reader) = UnixStream::pair().expect("stdout socketpair");
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("stdout read timeout");
+        (
+            dekopon_shell::Streams {
+                stdin: None,
+                stdout: OwnedFd::from(writer),
+            },
+            reader,
+        )
+    }
+
+    fn output(mut reader: UnixStream) -> String {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .expect("every stdout writer closes by the time the call returns");
+        String::from_utf8(bytes).expect("stdout text")
+    }
 
     #[test]
     fn trace_parent_is_absent_without_an_active_exporting_span() {
@@ -925,7 +1048,11 @@ mod tests {
             })
         }
 
-        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: dekopon_shell::CommandProposal,
+            streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let secret_use = proposal.secret_use;
             if capability != self.capability {
@@ -933,7 +1060,7 @@ mod tests {
             }
             self.invoked.lock().push(capability.to_owned());
             self.secret_uses.lock().push(secret_use);
-            CapabilityCallResult::Succeeded(json!({ "leg": self.marker }))
+            streams.reply(&json!({ "leg": self.marker }))
         }
     }
 
@@ -945,10 +1072,15 @@ mod tests {
             broker: Some(shared),
         };
 
+        let (streams, reader) = streams();
         assert_eq!(
-            invoker.invoke(CommandProposal::new("shared.capability", json!({}), None)),
-            CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
+            invoker.invoke(
+                CommandProposal::new("shared.capability", json!({}), None),
+                streams
+            ),
+            CapabilityCallResult::Succeeded
         );
+        assert_eq!(output(reader), "{\"leg\":\"direct\"}\n");
     }
 
     #[test]
@@ -958,10 +1090,15 @@ mod tests {
             broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
         };
 
+        let (streams, reader) = streams();
         assert_eq!(
-            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
-            CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), None),
+                streams
+            ),
+            CapabilityCallResult::Succeeded
         );
+        assert_eq!(output(reader), "{\"leg\":\"broker\"}\n");
         assert!(invoker.is_granted("http-probe.fetch"));
         assert_eq!(
             invoker.granted(),
@@ -985,7 +1122,10 @@ mod tests {
         assert_eq!(invoker.granted(), vec!["cli-probe.upper".to_owned()]);
         assert!(!invoker.is_granted("http-probe.fetch"));
         assert_eq!(
-            invoker.invoke(CommandProposal::new("http-probe.fetch", json!({}), None)),
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), None),
+                streams().0
+            ),
             CapabilityCallResult::NotFound
         );
     }
@@ -1004,20 +1144,18 @@ mod tests {
         };
 
         assert_eq!(
-            invoker.invoke(CommandProposal::new(
-                "http-probe.fetch",
-                json!({}),
-                Some(proposal.clone())
-            )),
-            CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
+            invoker.invoke(
+                CommandProposal::new("http-probe.fetch", json!({}), Some(proposal.clone())),
+                streams().0
+            ),
+            CapabilityCallResult::Succeeded
         );
 
         assert_eq!(
-            invoker.invoke(CommandProposal::new(
-                "cli-probe.upper",
-                json!({}),
-                Some(proposal)
-            )),
+            invoker.invoke(
+                CommandProposal::new("cli-probe.upper", json!({}), Some(proposal)),
+                streams().0
+            ),
             dekopon_shell::secret_use_unsupported()
         );
         assert!(
@@ -1073,7 +1211,11 @@ mod tests {
             Some(self)
         }
 
-        fn invoke(&self, _: CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -1129,7 +1271,11 @@ mod tests {
             word == self.word
         }
 
-        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: dekopon_shell::CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -1167,6 +1313,7 @@ mod tests {
 
     #[cfg(unix)]
     mod broker_leg {
+        use super::{output, streams};
         use parking_lot::Mutex;
         use std::{
             collections::{BTreeMap, BTreeSet},
@@ -1177,9 +1324,9 @@ mod tests {
         };
 
         use dekopon_broker_protocol::{
-            BrokerClient, BrokerRequest, CommandRunOutcome, ERROR_UNAUTHENTICATED, FrameLimits,
-            InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
-            write_frame,
+            BrokerClient, BrokerRequest, CommandRunOutcome, DescriptorStream,
+            ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome, InvocationResult,
+            RequestEnvelope, ResponseEnvelope,
         };
         use dekopon_capability::DecisionReference;
         use dekopon_core::{
@@ -1224,8 +1371,7 @@ mod tests {
                     policy_revision: "policy-stub".to_owned(),
                 },
                 outcome,
-                output: matches!(outcome, InvocationOutcome::Succeeded)
-                    .then(|| json!({"status": 200})),
+                exit_status: None,
                 error: error.map(str::to_owned),
                 detail: None,
                 evidence: Vec::new(),
@@ -1249,18 +1395,20 @@ mod tests {
             let (observed, receiver) = mpsc::unbounded_channel();
             tokio::spawn(async move {
                 for response in responses {
-                    let (mut stream, _) = listener.accept().await.expect("stub broker accepts");
-                    let request =
-                        read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
-                            .await
-                            .expect("stub broker reads one request");
+                    let (stream, _) = listener.accept().await.expect("stub broker accepts");
+                    let mut stream = DescriptorStream::new(stream);
+                    let (request, _) = stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .expect("stub broker reads one request");
                     #[allow(
                         clippy::let_underscore_must_use,
                         reason = "`stub_leg` drops the observation receiver immediately, so a \
                                   closed channel is the ordinary case for every unobserved test"
                     )]
                     let _ = observed.send(request);
-                    write_frame(&mut stream, &response, FrameLimits::default())
+                    stream
+                        .write_frame(&response, &[], FrameLimits::default())
                         .await
                         .expect("stub broker writes one response");
                 }
@@ -1287,8 +1435,10 @@ mod tests {
             let (observed, receiver) = mpsc::unbounded_channel();
             let (release, released) = oneshot::channel::<()>();
             tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.expect("stub broker accepts");
-                let request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+                let (stream, _) = listener.accept().await.expect("stub broker accepts");
+                let mut stream = DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
                     .await
                     .expect("stub broker reads one request");
                 #[allow(
@@ -1316,7 +1466,7 @@ mod tests {
                     .iter()
                     .map(|argument| (*argument).to_owned())
                     .collect::<Vec<_>>();
-                leg.run_command("probe", &argv, stdin)
+                leg.run_command("probe", &argv, stdin.is_some())
             })
             .await
             .expect("blocking dispatch completes")
@@ -1357,14 +1507,14 @@ mod tests {
                     attestation: None,
                     word: "probe".to_owned(),
                     argv: vec!["--help".to_owned()],
-                    stdin: None,
+                    stdin_piped: false,
                     trace_parent,
                 }
             );
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn the_piped_value_travels_in_the_run_frame() {
+        async fn only_whether_stdin_is_piped_travels_in_the_run_frame() {
             let directory = private_broker_directory();
             let proposed = CommandRunOutcome::Proposed {
                 capability: "cli-probe.upper".parse().expect("valid capability fixture"),
@@ -1398,10 +1548,10 @@ mod tests {
                 matches!(
                     &request.request,
                     BrokerRequest::RunCommand {
-                        stdin: Some(piped),
+                        stdin_piped: true,
                         trace_parent: sent,
                         ..
-                    } if piped == "hello" && *sent == trace_parent
+                    } if *sent == trace_parent
                 ),
                 "{request:?}"
             );
@@ -1453,7 +1603,7 @@ mod tests {
             let leg = leg.with_cancel_signal(signal);
 
             let run = tokio::task::spawn_blocking(move || {
-                leg.run_command("probe", &["--help".to_owned()], None)
+                leg.run_command("probe", &["--help".to_owned()], false)
             });
             observed.recv().await.expect("the run reached the broker");
             handle.cancel();
@@ -1461,6 +1611,29 @@ mod tests {
             assert!(
                 matches!(run.await.expect("blocking dispatch completes"), Some(CommandRun::Denied { reason }) if reason == "session-cancelled")
             );
+            drop(release);
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_script_deadline_aborts_an_in_flight_broker_leg() {
+            let directory = private_broker_directory();
+            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
+            leg.command_words.insert("probe".to_owned());
+            leg.script_started(Duration::from_secs(5));
+            let run = tokio::task::spawn_blocking(move || {
+                let result = leg.run_command("probe", &["--help".to_owned()], false);
+                leg.script_finished();
+                result
+            });
+            observed
+                .recv()
+                .await
+                .expect("the command reached the broker");
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(matches!(
+                run.await.expect("blocking dispatch completes"),
+                Some(CommandRun::Denied { reason }) if reason == "session-cancelled"
+            ));
             drop(release);
         }
 
@@ -1530,6 +1703,7 @@ mod tests {
                 attestation,
                 chat_memory: None,
                 cancel: CancelSignal::never(),
+                script_cancel: parking_lot::Mutex::new(None),
                 attachments: None,
                 asset_inputs: None,
                 progress: None,
@@ -1540,13 +1714,28 @@ mod tests {
             }
         }
 
+        async fn invoke_with_stdout(
+            leg: BrokerLeg,
+            capability: &'static str,
+        ) -> (CapabilityCallResult, String) {
+            tokio::task::spawn_blocking(move || {
+                let (streams, reader) = streams();
+                let result = leg.invoke(
+                    CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
+                    streams,
+                );
+                (result, output(reader))
+            })
+            .await
+            .expect("blocking dispatch completes")
+        }
+
         async fn invoke(leg: BrokerLeg, capability: &'static str) -> CapabilityCallResult {
             tokio::task::spawn_blocking(move || {
-                leg.invoke(CommandProposal::new(
-                    capability,
-                    json!({"uri": "http://x/"}),
-                    None,
-                ))
+                leg.invoke(
+                    CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
+                    streams().0,
+                )
             })
             .await
             .expect("blocking dispatch completes")
@@ -1575,49 +1764,6 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn ordinary_attachment_metadata_remains_successful_provider_json() {
-            for output in [
-                json!({"subject": "report", "attachments": [{"name": "a.pdf"}]}),
-                json!({"attachments": []}),
-                json!({"attachments": {"count": 1}}),
-            ] {
-                let directory = private_broker_directory();
-                let mut result = result(InvocationOutcome::Succeeded, None);
-                result.output = Some(output.clone());
-                let leg = stub_leg(
-                    directory.path(),
-                    vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
-                )
-                .await;
-                assert_eq!(
-                    invoke(leg, CAPABILITY).await,
-                    CapabilityCallResult::Succeeded(output)
-                );
-            }
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_retired_base64_attachment_envelope_is_refused_after_execution() {
-            let directory = private_broker_directory();
-            let mut result = result(InvocationOutcome::Succeeded, None);
-            result.output =
-                Some(json!({"attachments": [{"mediaType": "image/png", "base64": "cG5n"}]}));
-            let leg = stub_leg(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
-            )
-            .await;
-            assert_eq!(
-                invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Denied {
-                    reason: format!(
-                        "{CAPABILITY} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
-                    ),
-                }
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
         async fn an_unmapped_peer_is_a_denial_rather_than_an_infrastructure_failure() {
             let directory = private_broker_directory();
             let leg = stub_leg(
@@ -1638,8 +1784,8 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn an_embedder_without_a_store_reports_received_descriptors_instead_of_silently_discarding_metadata()
          {
-            use dekopon_broker_protocol::{AssetEncoding, DescriptorStream, NewAsset};
-            use std::os::fd::AsFd;
+            use dekopon_broker_protocol::{AssetEncoding, NewAsset};
+            use std::{io::Write, os::fd::AsFd};
             let directory = private_broker_directory();
             let socket = directory.path().join("broker.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -1654,11 +1800,16 @@ mod tests {
                     .read_frame::<RequestEnvelope>(FrameLimits::default())
                     .await
                     .unwrap();
-                assert!(descriptors.is_empty());
-                let mut result = result(InvocationOutcome::Succeeded, None);
-                result.output = Some(json!({"effect":"complete"}));
+                assert_eq!(
+                    descriptors.len(),
+                    1,
+                    "stdout descriptor accompanies invocation"
+                );
+                let mut provider_stdout =
+                    std::os::unix::net::UnixStream::from(descriptors.into_iter().next().unwrap());
+                provider_stdout.write_all(b"provider line\n").unwrap();
                 let reply = ResponseEnvelope::invocation(
-                    result,
+                    result(InvocationOutcome::Succeeded, None),
                     vec![NewAsset {
                         descriptor: 0,
                         content_type: "text/plain".to_owned(),
@@ -1674,19 +1825,19 @@ mod tests {
                     .await
                     .unwrap();
             });
-            let result = invoke(leg_with(&socket, None), CAPABILITY).await;
+            let (status, stdout) = invoke_with_stdout(leg_with(&socket, None), CAPABILITY).await;
             peer.await.unwrap();
-            let CapabilityCallResult::Succeeded(output) = result else {
-                panic!("effect already completed")
-            };
-            assert_eq!(output["result"]["effect"], "complete");
-            assert!(
-                output["assetNote"]
-                    .as_str()
-                    .unwrap()
-                    .contains("no asset store")
+            assert_eq!(
+                status,
+                CapabilityCallResult::SucceededWithStderr("[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]\n".to_owned()),
+                "effect already completed"
             );
-            assert!(!output.to_string().contains("PRIVATE_PAYLOAD"));
+            assert_eq!(stdout, "provider line\n");
+            assert!(!stdout.contains("PRIVATE_PAYLOAD"));
+            assert!(
+                !stdout.contains("\"effect\":\"complete\""),
+                "returned value leaked into stdout"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1708,6 +1859,35 @@ mod tests {
                 CapabilityCallResult::Failed {
                     error: "provider trapped".to_owned(),
                     detail: None
+                }
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_guest_exit_uses_the_typed_status_and_stderr_not_a_parsed_detail_code() {
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(
+                    InvocationResult {
+                        exit_status: std::num::NonZeroU8::new(7),
+                        detail: Some(ProviderFailureDetail::new(
+                            "provider-exit",
+                            "guest failed\n",
+                        )),
+                        ..result(InvocationOutcome::Failed, Some("provider-failure"))
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            )
+            .await;
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Exited {
+                    status: std::num::NonZeroU8::new(7).unwrap(),
+                    stderr: "guest failed\n".to_owned(),
                 }
             );
         }
@@ -1743,7 +1923,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_successful_invocation_hands_provider_output_to_the_script() {
+        async fn a_successful_invocation_has_no_returned_value() {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
@@ -1758,7 +1938,32 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn successful_guest_stderr_reaches_the_gateway_note() {
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(
+                    InvocationResult {
+                        detail: Some(ProviderFailureDetail::new(
+                            "provider-stderr",
+                            "guest note\n",
+                        )),
+                        ..result(InvocationOutcome::Succeeded, None)
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            )
+            .await;
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::SucceededWithStderr("guest note\n".to_owned())
             );
         }
 
@@ -1779,7 +1984,7 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -1833,7 +2038,7 @@ mod tests {
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -1894,15 +2099,18 @@ mod tests {
 
             assert_eq!(
                 tokio::task::spawn_blocking(move || {
-                    leg.invoke(CommandProposal::new(
-                        CAPABILITY,
-                        json!({"uri": "http://x/"}),
-                        Some(submitted),
-                    ))
+                    leg.invoke(
+                        CommandProposal::new(
+                            CAPABILITY,
+                            json!({"uri": "http://x/"}),
+                            Some(submitted),
+                        ),
+                        streams().0,
+                    )
                 })
                 .await
                 .expect("blocking dispatch completes"),
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
+                CapabilityCallResult::Succeeded
             );
 
             let request = observed.recv().await.expect("stub broker saw one request");
@@ -2080,7 +2288,7 @@ mod tests {
                 reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
             let leg = leg.with_progress_notes();
             tokio::task::spawn_blocking(move || {
-                let proposal = leg.run_command("probe", &[], None);
+                let proposal = leg.run_command("probe", &[], false);
                 assert!(matches!(proposal, Some(CommandRun::Proposed { .. })));
                 leg.note(
                     " rendering the image ",
@@ -2131,11 +2339,15 @@ mod tests {
                 .map(|index| format!("progress note-{index}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
-            assert_eq!(
-                runtime.run_script("progress fresh").exit_code,
-                ExitCode::SUCCESS
-            );
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
+                assert_eq!(
+                    runtime.run_script("progress fresh").exit_code,
+                    ExitCode::SUCCESS
+                );
+            })
+            .await
+            .expect("script thread completes");
             let mut expected = (1..=8)
                 .map(|index| format!("note \"note-{index}\" None"))
                 .collect::<Vec<_>>();
@@ -2310,15 +2522,18 @@ mod tests {
                 direct: super::FakeLeg::new(CAPABILITY, "direct"),
                 broker: Some(Box::new(leg)),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                invoker.invoke(owned_proposal(invoker.run_command("probe", &[], None)))
+            let (result, stdout) = tokio::task::spawn_blocking(move || {
+                let (streams, reader) = streams();
+                let result = invoker.invoke(
+                    owned_proposal(invoker.run_command("probe", &[], false)),
+                    streams,
+                );
+                (result, output(reader))
             })
             .await
             .unwrap();
-            assert_eq!(
-                result,
-                CapabilityCallResult::Succeeded(json!({"leg": "direct"}))
-            );
+            assert_eq!(result, CapabilityCallResult::Succeeded);
+            assert_eq!(stdout, "{\"leg\":\"direct\"}\n");
             assert_eq!(sink.labels().last().unwrap(), "finished probe Succeeded");
         }
 
@@ -2345,17 +2560,20 @@ mod tests {
                     let (resume, resumed) = std::sync::mpsc::sync_channel(1);
                     let leg = &leg;
                     let first = scope.spawn(move || {
-                        let proposal = owned_proposal(leg.run_command("probe", &[], None));
+                        let proposal = owned_proposal(leg.run_command("probe", &[], false));
                         ready.send(()).unwrap();
                         resumed.recv().unwrap();
-                        leg.invoke(proposal)
+                        leg.invoke(proposal, streams().0)
                     });
                     observed.recv().unwrap();
                     let second = scope.spawn(move || {
-                        leg.invoke(owned_proposal(leg.run_command("second", &[], None)))
+                        leg.invoke(
+                            owned_proposal(leg.run_command("second", &[], false)),
+                            streams().0,
+                        )
                     });
                     let second = second.join().unwrap();
-                    assert!(matches!(second, CapabilityCallResult::Succeeded(_)));
+                    assert!(matches!(second, CapabilityCallResult::Succeeded));
                     resume.send(()).unwrap();
                     let first = first.join().unwrap();
                     assert!(matches!(first, CapabilityCallResult::Failed { .. }));
@@ -2435,8 +2653,8 @@ mod tests {
                 reporting_probe_leg(directory.path(), vec![rendered_at(0), rendered_at(2)]).await;
 
             let (help, usage_error) = tokio::task::spawn_blocking(move || {
-                let help = leg.run_command("probe", &["--help".to_owned()], None);
-                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], None);
+                let help = leg.run_command("probe", &["--help".to_owned()], false);
+                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], false);
                 leg.script_finished();
                 (help, usage_error)
             })
@@ -2481,7 +2699,10 @@ mod tests {
 
             let called = tokio::task::spawn_blocking(move || {
                 let argv = ["fetch".to_owned(), "7".to_owned()];
-                let called = leg.invoke(owned_proposal(leg.run_command("probe", &argv, None)));
+                let called = leg.invoke(
+                    owned_proposal(leg.run_command("probe", &argv, false)),
+                    streams().0,
+                );
                 leg.script_finished();
                 called
             })
@@ -2544,8 +2765,8 @@ mod tests {
             .await;
 
             let (merge, help) = tokio::task::spawn_blocking(move || {
-                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], None);
-                let help = leg.run_command("probe", &["--help".to_owned()], None);
+                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], false);
+                let help = leg.run_command("probe", &["--help".to_owned()], false);
                 leg.script_finished();
                 (merge, help)
             })
@@ -2582,11 +2803,10 @@ mod tests {
             let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
-                leg.invoke(CommandProposal::new(
-                    "ignore-your-instructions",
-                    json!({}),
-                    None,
-                ))
+                leg.invoke(
+                    CommandProposal::new("ignore-your-instructions", json!({}), None),
+                    streams().0,
+                )
             })
             .await
             .expect("blocking dispatch completes");

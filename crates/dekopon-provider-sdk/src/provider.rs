@@ -2,6 +2,7 @@ mod bounded;
 mod handles;
 #[cfg(not(target_arch = "wasm32"))]
 mod port;
+mod stdio;
 pub use crate::http::{
     BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, Part, Request, Response,
     StreamedRequest, StreamedResponse, method,
@@ -11,11 +12,15 @@ pub use bounded::{Bounded, TooLong, Truncated};
 pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Settings, Storage};
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{Port, with_port};
+#[cfg(not(target_arch = "wasm32"))]
+pub use stdio::{NativeExit, NativeStdio, invoke_native};
+pub use stdio::{Stdin, Stdout, stdin};
 
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroU8;
 
 use clap::{CommandFactory, FromArgMatches};
 use dekopon_core::IdentifierError;
@@ -26,9 +31,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    CapabilityId, CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind,
-    ProviderApiVersion, ProviderCapability, ProviderId, ProviderManifest, RiskLevel,
-    SecretUseProposal,
+    CapabilityId, CommandRunOutcome, ComponentFailure, EffectKind, ProviderApiVersion,
+    ProviderCapability, ProviderId, ProviderManifest, RiskLevel, SecretUseProposal,
 };
 
 /// A provider: its identity, command words, argv grammar and the capabilities it exports.
@@ -45,8 +49,9 @@ pub trait Provider: Sized + 'static {
     type Capabilities: Capabilities<Self>;
 
     /// Maps parsed arguments to one capability proposal or a usage error; it runs before
-    /// authorization, so it is pure and reaches no import.
-    fn propose(args: Self::Args, stdin: Option<&str>) -> Result<Proposal<Self>, Usage>;
+    /// authorization, so it is pure and reaches no import. `stdin_piped` says whether input is
+    /// piped in; the input itself is read by the capability through [`stdin`].
+    fn propose(args: Self::Args, stdin_piped: bool) -> Result<Proposal<Self>, Usage>;
 }
 
 /// One capability of a provider.
@@ -65,13 +70,12 @@ pub trait Capability: Sized + 'static {
     type Input: DeserializeOwned + Serialize + JsonSchema;
     /// The imports the capability is granted for one authorized call.
     type Needs: Needs;
-    /// The value serialized into a successful response.
-    type Output: Serialize;
     /// The capability's own failures.
     type Error: Failure;
 
-    /// Runs one authorized call; a failure is reported with its [`Code`] and display text.
-    fn run(input: Self::Input, needs: Self::Needs) -> Result<Self::Output, Self::Error>;
+    /// Runs one authorized call, writing its output to `out`; a failure exits with its
+    /// [`Code`]'s status and its display text on stderr.
+    fn run(input: Self::Input, needs: Self::Needs, out: &mut Stdout) -> Result<(), Self::Error>;
 }
 
 /// The imports a capability is granted; `()` grants none.
@@ -157,27 +161,36 @@ impl Failure for Infallible {
     }
 }
 
-/// A failure code: lowercase ASCII letters and digits in hyphen-separated words.
+/// A failure code: lowercase ASCII letters and digits in hyphen-separated words, and the exit
+/// status a capability failing with it reports, 1 unless the code names its own.
 ///
 /// ```compile_fail
 /// const BAD: dekopon_provider_sdk::provider::Code =
 ///     dekopon_provider_sdk::provider::Code::new("Not Kebab");
 /// ```
+///
+/// ```compile_fail
+/// const ZERO: dekopon_provider_sdk::provider::Code =
+///     dekopon_provider_sdk::provider::Code::new("zero").exiting(0);
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Code(&'static str);
+pub struct Code {
+    name: &'static str,
+    status: NonZeroU8,
+}
 
 impl Code {
     /// The capability id names no capability the provider lists.
     pub const UNKNOWN_CAPABILITY: Self = Self::new("unknown-capability");
-    /// The input does not match the capability's input type.
-    pub const INVALID_INPUT: Self = Self::new("invalid-input");
+    /// The input does not match the capability's input type; a usage error.
+    pub const INVALID_INPUT: Self = Self::new("invalid-input").exiting(2);
     /// The operator's settings do not match the capability's settings type.
     pub const INVALID_SETTINGS: Self = Self::new("invalid-settings");
     /// This import requires execution through the real component host.
     pub const COMPONENT_HARNESS_REQUIRED: Self = Self::new("component-harness-required");
-    /// A provider declined parsed arguments.
-    pub const USAGE: Self = Self::new("usage");
-    /// The output or proposal input could not be serialized.
+    /// A usage error, exit status 2: declined arguments, or piped input that is required but empty.
+    pub const USAGE: Self = Self::new("usage").exiting(2);
+    /// The proposal input could not be serialized.
     pub const SERIALIZATION_FAILED: Self = Self::new("serialization-failed");
 
     /// Panics unless `code` is hyphen-separated lowercase words, so an invalid code in a `const`
@@ -200,13 +213,32 @@ impl Code {
             );
             index += 1;
         }
-        Self(code)
+        Self {
+            name: code,
+            status: NonZeroU8::MIN,
+        }
+    }
+
+    /// The same code exiting with `status`; panics on 0, so a zero status in a `const` is a
+    /// compile error.
+    #[must_use]
+    pub const fn exiting(self, status: u8) -> Self {
+        let Some(status) = NonZeroU8::new(status) else {
+            panic!("a failure exits with a nonzero status");
+        };
+        Self { status, ..self }
     }
 
     /// The code as it appears on the wire.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        self.0
+        self.name
+    }
+
+    /// The exit status of an invocation failing with this code.
+    #[must_use]
+    pub const fn status(self) -> NonZeroU8 {
+        self.status
     }
 }
 
@@ -221,7 +253,7 @@ pub enum SdkFailure {
     InvalidSettings,
     /// Native execution cannot supply storage or asset imports.
     ComponentHarnessRequired,
-    /// The output or proposal input could not be serialized.
+    /// The proposal input could not be serialized.
     SerializationFailed,
 }
 
@@ -234,7 +266,7 @@ impl fmt::Display for SdkFailure {
             Self::ComponentHarnessRequired => {
                 "this capability needs the component harness (Harness<P>)"
             }
-            Self::SerializationFailed => "the provider could not serialize its result",
+            Self::SerializationFailed => "the provider could not serialize its proposal",
         })
     }
 }
@@ -300,7 +332,7 @@ pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {
 }
 
 mod sealed {
-    use super::{Capability, ComponentResponse, ManifestError, Provider, ProviderCapability};
+    use super::{Capability, ManifestError, Provider, ProviderCapability, Stdout, stdio::Exit};
 
     pub trait Needs: Sized {
         fn grant() -> Result<Self, super::SdkFailure>;
@@ -315,7 +347,7 @@ mod sealed {
     pub trait Capabilities<P: Provider> {
         fn describe(provider: &str) -> Result<Vec<ProviderCapability>, ManifestError>;
         fn lists(name: &str) -> bool;
-        fn call(name: &str, input: &str) -> Option<ComponentResponse>;
+        fn run(name: &str, input: &str, out: &mut Stdout) -> Option<Result<(), Exit>>;
     }
 
     macro_rules! tuple {
@@ -331,9 +363,9 @@ mod sealed {
                     $(name == $capability::NAME)||+
                 }
 
-                fn call(name: &str, input: &str) -> Option<ComponentResponse> {
+                fn run(name: &str, input: &str, out: &mut Stdout) -> Option<Result<(), Exit>> {
                     $(if name == $capability::NAME {
-                        return Some(super::run::<$capability>(input));
+                        return Some(super::run::<$capability>(input, out));
                     })+
                     None
                 }
@@ -426,31 +458,11 @@ fn failure(failure: &impl Failure) -> ComponentFailure {
     }
 }
 
-fn run<C: Capability>(input: &str) -> ComponentResponse {
-    let Ok(input) = serde_json::from_str::<C::Input>(input) else {
-        return ComponentResponse::Failed {
-            error: failure(&SdkFailure::InvalidInput),
-        };
-    };
-    let needs = match <C::Needs as sealed::Needs>::grant() {
-        Ok(needs) => needs,
-        Err(error) => {
-            return ComponentResponse::Failed {
-                error: failure(&error),
-            };
-        }
-    };
-    match C::run(input, needs) {
-        Ok(output) => match serde_json::to_value(output) {
-            Ok(output) => ComponentResponse::Succeeded { output },
-            Err(_) => ComponentResponse::Failed {
-                error: failure(&SdkFailure::SerializationFailed),
-            },
-        },
-        Err(error) => ComponentResponse::Failed {
-            error: failure(&error),
-        },
-    }
+fn run<C: Capability>(input: &str, out: &mut Stdout) -> Result<(), stdio::Exit> {
+    let input = serde_json::from_str::<C::Input>(input)
+        .map_err(|_invalid| stdio::Exit::from(&SdkFailure::InvalidInput))?;
+    let needs = <C::Needs as sealed::Needs>::grant().map_err(|error| stdio::Exit::from(&error))?;
+    C::run(input, needs, out).map_err(|error| stdio::Exit::from(&error))
 }
 
 /// Why an input schema cannot be published.
@@ -513,22 +525,29 @@ pub fn manifest<P: Provider>() -> Result<ProviderManifest, ManifestError> {
     })
 }
 
-/// Runs one authorized call of the capability `capability` names with the JSON `input`.
-#[must_use]
-pub fn call<P: Provider>(capability: &str, input: &str) -> ComponentResponse {
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn invoke<P: Provider>(capability: &str, input: &str) -> Result<(), NonZeroU8> {
+    let mut out = Stdout::open();
+    let outcome = dispatch::<P>(capability, input, &mut out);
+    stdio::exit(outcome, &out)
+}
+
+fn dispatch<P: Provider>(
+    capability: &str,
+    input: &str,
+    out: &mut Stdout,
+) -> Result<(), stdio::Exit> {
     capability
         .strip_prefix(P::ID)
         .and_then(|rest| rest.strip_prefix('.'))
-        .and_then(|name| <P::Capabilities as sealed::Capabilities<P>>::call(name, input))
-        .unwrap_or_else(|| ComponentResponse::Failed {
-            error: failure(&SdkFailure::UnknownCapability),
-        })
+        .and_then(|name| <P::Capabilities as sealed::Capabilities<P>>::run(name, input, out))
+        .unwrap_or_else(|| Err(stdio::Exit::from(&SdkFailure::UnknownCapability)))
 }
 
 /// Parses `argv`, the words after the command word, and renders help or a usage error or
 /// returns the provider's proposal.
 #[must_use]
-pub fn command<P: Provider>(argv: &[String], stdin: Option<&str>) -> CommandRunOutcome {
+pub fn command<P: Provider>(argv: &[String], stdin_piped: bool) -> CommandRunOutcome {
     let mut grammar = P::Args::command().no_binary_name(true);
     if grammar.get_bin_name().is_none() {
         let name = grammar.get_name().to_owned();
@@ -539,7 +558,7 @@ pub fn command<P: Provider>(argv: &[String], stdin: Option<&str>) -> CommandRunO
         .and_then(|matches| P::Args::from_arg_matches(&matches))
         .map_err(|error| error.format(&mut grammar));
     match args {
-        Ok(args) => match P::propose(args, stdin) {
+        Ok(args) => match P::propose(args, stdin_piped) {
             Ok(proposal) => proposed(proposal),
             Err(Usage(message)) => CommandRunOutcome::Failed {
                 error: ComponentFailure {
