@@ -918,6 +918,9 @@ mod tests {
 
     fn streams() -> (dekopon_shell::Streams, UnixStream) {
         let (writer, reader) = UnixStream::pair().expect("stdout socketpair");
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("stdout read timeout");
         (
             dekopon_shell::Streams {
                 stdin: None,
@@ -928,23 +931,10 @@ mod tests {
     }
 
     fn output(mut reader: UnixStream) -> String {
-        reader.set_nonblocking(true).expect("nonblocking stdout");
         let mut bytes = Vec::new();
-        let mut chunk = [0; 4096];
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(error) => panic!("stdout read: {error}"),
-            }
-        }
+        reader
+            .read_to_end(&mut bytes)
+            .expect("every stdout writer closes by the time the call returns");
         String::from_utf8(bytes).expect("stdout text")
     }
 
@@ -1259,9 +1249,9 @@ mod tests {
         };
 
         use dekopon_broker_protocol::{
-            BrokerClient, BrokerRequest, CommandRunOutcome, ERROR_UNAUTHENTICATED, FrameLimits,
-            InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
-            write_frame,
+            BrokerClient, BrokerRequest, CommandRunOutcome, DescriptorStream,
+            ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome, InvocationResult,
+            RequestEnvelope, ResponseEnvelope,
         };
         use dekopon_capability::DecisionReference;
         use dekopon_core::{
@@ -1331,18 +1321,20 @@ mod tests {
             let (observed, receiver) = mpsc::unbounded_channel();
             tokio::spawn(async move {
                 for response in responses {
-                    let (mut stream, _) = listener.accept().await.expect("stub broker accepts");
-                    let request =
-                        read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
-                            .await
-                            .expect("stub broker reads one request");
+                    let (stream, _) = listener.accept().await.expect("stub broker accepts");
+                    let mut stream = DescriptorStream::new(stream);
+                    let (request, _) = stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .expect("stub broker reads one request");
                     #[allow(
                         clippy::let_underscore_must_use,
                         reason = "`stub_leg` drops the observation receiver immediately, so a \
                                   closed channel is the ordinary case for every unobserved test"
                     )]
                     let _ = observed.send(request);
-                    write_frame(&mut stream, &response, FrameLimits::default())
+                    stream
+                        .write_frame(&response, &[], FrameLimits::default())
                         .await
                         .expect("stub broker writes one response");
                 }
@@ -1369,8 +1361,10 @@ mod tests {
             let (observed, receiver) = mpsc::unbounded_channel();
             let (release, released) = oneshot::channel::<()>();
             tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.expect("stub broker accepts");
-                let request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+                let (stream, _) = listener.accept().await.expect("stub broker accepts");
+                let mut stream = DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
                     .await
                     .expect("stub broker reads one request");
                 #[allow(
@@ -1729,7 +1723,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn an_embedder_without_a_store_reports_received_descriptors_instead_of_silently_discarding_metadata()
          {
-            use dekopon_broker_protocol::{AssetEncoding, DescriptorStream, NewAsset};
+            use dekopon_broker_protocol::{AssetEncoding, NewAsset};
             use std::{io::Write, os::fd::AsFd};
             let directory = private_broker_directory();
             let socket = directory.path().join("broker.sock");
