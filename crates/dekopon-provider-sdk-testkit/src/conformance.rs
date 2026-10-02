@@ -186,7 +186,7 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
         ] {
             let native_outcome = provider::command::<P>(argv, None);
             let real_outcome =
-                super::typed::runtime().block_on(registry.run_command(word, argv, None))?;
+                super::typed::runtime().block_on(registry.run_command(word, argv, false))?;
             if !rendered(&native_outcome, help) || !rendered(&real_outcome, help) {
                 return Err(ConformanceError::HelpUsage {
                     word: word.to_owned(),

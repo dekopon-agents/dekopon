@@ -433,6 +433,7 @@ impl BrokerLeg {
                             rows: Vec::new(),
                             descriptors: Vec::new(),
                             sends_remaining: remaining,
+                            streams: None,
                         },
                         Vec::new(),
                     ))
@@ -565,7 +566,7 @@ impl CapabilityInvoker for BrokerLeg {
             ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
             move || async move {
                 client
-                    .run_command(attestation, owned_word, argv, stdin, trace_parent)
+                    .run_command(attestation, owned_word, argv, stdin.is_some(), trace_parent)
                     .await
                     .map(command_run_from_outcome)
             },
@@ -1357,14 +1358,14 @@ mod tests {
                     attestation: None,
                     word: "probe".to_owned(),
                     argv: vec!["--help".to_owned()],
-                    stdin: None,
+                    stdin_piped: false,
                     trace_parent,
                 }
             );
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn the_piped_value_travels_in_the_run_frame() {
+        async fn only_whether_stdin_is_piped_travels_in_the_run_frame() {
             let directory = private_broker_directory();
             let proposed = CommandRunOutcome::Proposed {
                 capability: "cli-probe.upper".parse().expect("valid capability fixture"),
@@ -1398,10 +1399,10 @@ mod tests {
                 matches!(
                     &request.request,
                     BrokerRequest::RunCommand {
-                        stdin: Some(piped),
+                        stdin_piped: true,
                         trace_parent: sent,
                         ..
-                    } if piped == "hello" && *sent == trace_parent
+                    } if *sent == trace_parent
                 ),
                 "{request:?}"
             );

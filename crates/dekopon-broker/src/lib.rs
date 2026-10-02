@@ -2029,7 +2029,7 @@ where
         attestation: Option<&Attestation>,
         word: &str,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Result<CommandRunOutcome, BrokerHostError> {
         let attested = match attestation {
             Some(claim) => {
@@ -2054,7 +2054,7 @@ where
                 word: word.to_owned(),
             });
         }
-        let outcome = self.registry.run_command(word, argv, stdin).await?;
+        let outcome = self.registry.run_command(word, argv, stdin_piped).await?;
         if matches!(
             &outcome,
             CommandRunOutcome::Proposed { capability, .. } if {
@@ -3328,7 +3328,13 @@ where
             Ok(output) => {
                 *outputs = output.assets;
                 let output_digest = output.storage.as_ref().map_or_else(
-                    || outcome_evidence_digest(&invocation_id, "provider-response", &output.output),
+                    || {
+                        outcome_evidence_digest(
+                            &invocation_id,
+                            "provider-response",
+                            &serde_json::json!({ "stderr": output.stderr }),
+                        )
+                    },
                     |storage| {
                         Ok(storage
                             .output_commitment
@@ -3389,7 +3395,7 @@ where
                         invocation: invocation_id.clone(),
                         decision: decision.clone(),
                         outcome: InvocationOutcome::Succeeded,
-                        output: Some(output.output),
+                        output: None,
                         error: None,
                         detail: None,
                         evidence,
@@ -4065,9 +4071,9 @@ fn execution_event(
 )]
 fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDetail> {
     match error {
-        BrokerHostError::ProviderFailure { code, message, .. } => {
-            Some(ProviderFailureDetail::new(code, message))
-        }
+        BrokerHostError::ProviderFailure { status, stderr, .. } => Some(
+            ProviderFailureDetail::new(&format!("exit-status-{status}"), stderr),
+        ),
         _ => None,
     }
 }
@@ -4144,7 +4150,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'static str {
+fn public_host_error(error: &BrokerHostError, _route: CapabilityRoute) -> &'static str {
     match error {
         BrokerHostError::AuthorizationExceedsHostLimit { .. }
         | BrokerHostError::InvalidHttpAuthorization
@@ -4179,9 +4185,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         | BrokerHostError::SerializeInput { .. }
         | BrokerHostError::InputTooLarge { .. }
         | BrokerHostError::CommandInputTooLarge { .. } => "invalid-input",
-        BrokerHostError::OutputTooLarge { .. } | BrokerHostError::InvalidOutput { .. } => {
-            "invalid-provider-output"
-        }
+        BrokerHostError::OutputTooLarge { .. } => "invalid-provider-output",
         BrokerHostError::RunCommand { .. }
         | BrokerHostError::RunCommandUsedHostImport { .. }
         | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
@@ -4209,17 +4213,8 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
             _ => "storage-io",
         },
         BrokerHostError::Invoke { .. } => "provider-trap",
-        BrokerHostError::ProviderFailure { code, .. }
-            if route.is_chat_memory()
-                && matches!(code.as_str(), "memory-corrupt" | "result-too-large") =>
-        {
-            match code.as_str() {
-                "memory-corrupt" => "memory-corrupt",
-                "result-too-large" => "result-too-large",
-                _ => "provider-failure",
-            }
-        }
         BrokerHostError::ProviderFailure { .. } => "provider-failure",
+        BrokerHostError::StdioAdmission { .. } => "invalid-input",
         BrokerHostError::NoProviders
         | BrokerHostError::InvalidLimit { .. }
         | BrokerHostError::Engine { .. }

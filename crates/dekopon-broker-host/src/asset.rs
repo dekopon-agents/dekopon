@@ -1,6 +1,6 @@
 use crate::{StoreState, bindings::dekopon::asset::asset as wit};
 use dekopon_broker_protocol::{
-    AssetEncoding, AssetRow, MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
+    AssetEncoding, AssetRow, MAX_ASSET_DESCRIPTORS, MAX_ASSET_ROWS, NewAsset,
 };
 use dekopon_capability::AssetConstraints;
 use dekopon_core::{
@@ -47,6 +47,8 @@ pub struct AssetInputs {
     pub rows: Vec<AssetRow>,
     pub descriptors: Vec<OwnedFd>,
     pub sends_remaining: u8,
+    /// Stream ends ride the asset descriptor path but are admitted by [`crate::stdio`].
+    pub streams: Option<dekopon_broker_protocol::Streams>,
 }
 
 #[derive(Debug, Default)]
@@ -209,7 +211,7 @@ impl AssetState {
                 return Err(AssetAdmissionError::TooManyRows);
             }
             if references.len() != inputs.descriptors.len()
-                || references.len() > MAX_DESCRIPTORS_PER_FRAME
+                || references.len() > MAX_ASSET_DESCRIPTORS
             {
                 return Err(AssetAdmissionError::DescriptorCount);
             }
@@ -296,7 +298,7 @@ pub(crate) fn references(input: &serde_json::Value) -> Vec<u64> {
         match input {
             serde_json::Value::String(text) => {
                 if let Some(id) = reference(text)
-                    && found.len() <= MAX_DESCRIPTORS_PER_FRAME
+                    && found.len() <= MAX_ASSET_DESCRIPTORS
                     && !found.contains(&id)
                 {
                     found.push(id);
@@ -758,7 +760,7 @@ impl wit::Host for StoreState {
                 .assets
                 .refuse(error(wit::ErrorCode::Denied, "asset.attach is not granted")));
         }
-        if self.assets.outputs.attached.len() >= MAX_DESCRIPTORS_PER_FRAME {
+        if self.assets.outputs.attached.len() >= MAX_ASSET_DESCRIPTORS {
             return Ok(self.assets.refuse(error(
                 wit::ErrorCode::TooManyAssets,
                 "at most five assets may be attached",
@@ -960,6 +962,7 @@ mod tests {
             }],
             descriptors: vec![file.into()],
             sends_remaining: 1,
+            streams: None,
         }
     }
 
@@ -1465,14 +1468,14 @@ mod tests {
             vec![],
         )
         .await;
-        for index in 0..=MAX_DESCRIPTORS_PER_FRAME {
+        for index in 0..=MAX_ASSET_DESCRIPTORS {
             let writer = state
                 .allocate("text/plain".to_owned(), wit::Encoding::Identity)
                 .await
                 .unwrap()
                 .unwrap();
             let attached = state.attach(writer).await.unwrap();
-            if index == MAX_DESCRIPTORS_PER_FRAME {
+            if index == MAX_ASSET_DESCRIPTORS {
                 assert_eq!(attached.unwrap_err().code, wit::ErrorCode::TooManyAssets);
             } else {
                 let handle = attached.unwrap();
@@ -1486,7 +1489,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(state.assets.outputs.files.len(), MAX_DESCRIPTORS_PER_FRAME);
+        assert_eq!(state.assets.outputs.files.len(), MAX_ASSET_DESCRIPTORS);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
@@ -1726,14 +1729,14 @@ mod tests {
                 "chat-asset:5"
             ]))
             .len(),
-            MAX_DESCRIPTORS_PER_FRAME
+            MAX_ASSET_DESCRIPTORS
         );
         let many = serde_json::Value::Array(
             (1..1000)
                 .map(|id| serde_json::json!(format!("chat-asset:{id}")))
                 .collect(),
         );
-        assert_eq!(references(&many).len(), MAX_DESCRIPTORS_PER_FRAME + 1);
+        assert_eq!(references(&many).len(), MAX_ASSET_DESCRIPTORS + 1);
     }
     #[tokio::test]
     async fn a_capacity_one_channel_sink_suspends_and_resumes_the_real_guest_without_changing_wit()

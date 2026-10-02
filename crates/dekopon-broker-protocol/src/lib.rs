@@ -759,7 +759,7 @@ impl RequestEnvelope {
         attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
-        stdin: Option<String>,
+        stdin_piped: bool,
         trace_parent: TraceParent,
     ) -> Self {
         Self {
@@ -769,7 +769,7 @@ impl RequestEnvelope {
                 trace_parent,
                 word,
                 argv,
-                stdin,
+                stdin_piped,
             },
         }
     }
@@ -780,6 +780,7 @@ impl RequestEnvelope {
         invocation: InvocationRequest,
         assets: Vec<AssetRow>,
         sends_remaining: u8,
+        streams: Option<StreamDescriptors>,
     ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
@@ -788,6 +789,7 @@ impl RequestEnvelope {
                 invocation,
                 assets,
                 sends_remaining,
+                streams,
             },
         }
     }
@@ -818,8 +820,8 @@ pub enum BrokerRequest {
         trace_parent: TraceParent,
         word: String,
         argv: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        stdin: Option<String>,
+        #[serde(default, rename = "stdinPiped")]
+        stdin_piped: bool,
     },
     Invoke {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -829,6 +831,8 @@ pub enum BrokerRequest {
         assets: Vec<AssetRow>,
         #[serde(default, rename = "sendsRemaining")]
         sends_remaining: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streams: Option<StreamDescriptors>,
     },
     RecordDeliveredTurn {
         attestation: Attestation,
@@ -846,7 +850,65 @@ impl BrokerRequest {
 }
 
 pub const MAX_ASSET_ROWS: usize = 32;
-pub const MAX_DESCRIPTORS_PER_FRAME: usize = 5;
+pub const MAX_ASSET_DESCRIPTORS: usize = 5;
+pub const MAX_STREAM_DESCRIPTORS: usize = 2;
+pub const MAX_DESCRIPTORS_PER_FRAME: usize = 8;
+
+/// Which stream ends follow an Invoke frame's asset descriptors: stdin when piped, then stdout.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StreamDescriptors {
+    pub stdin: bool,
+}
+
+impl StreamDescriptors {
+    #[must_use]
+    pub const fn count(self) -> usize {
+        if self.stdin { 2 } else { 1 }
+    }
+}
+
+/// An invocation's stream ends: stdin when something is piped in, and stdout.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Streams {
+    pub stdin: Option<OwnedFd>,
+    pub stdout: OwnedFd,
+}
+
+#[cfg(unix)]
+impl Streams {
+    #[must_use]
+    pub const fn descriptors(&self) -> StreamDescriptors {
+        StreamDescriptors {
+            stdin: self.stdin.is_some(),
+        }
+    }
+
+    /// Splits stream ends off the tail of a received Invoke frame's descriptors, leaving the
+    /// asset descriptors in place.
+    pub fn split_from(
+        descriptors: &mut Vec<OwnedFd>,
+        shape: StreamDescriptors,
+    ) -> Result<Self, ProtocolError> {
+        let stdout = descriptors
+            .pop()
+            .ok_or(ProtocolError::MissingStreamDescriptors)?;
+        let stdin = if shape.stdin {
+            Some(
+                descriptors
+                    .pop()
+                    .ok_or(ProtocolError::MissingStreamDescriptors)?,
+            )
+        } else {
+            None
+        };
+        if descriptors.len() > MAX_ASSET_DESCRIPTORS {
+            return Err(ProtocolError::TooManyDescriptors);
+        }
+        Ok(Self { stdin, stdout })
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -882,6 +944,7 @@ pub struct InvokeAssets {
     pub rows: Vec<AssetRow>,
     pub sends_remaining: u8,
     pub descriptors: Vec<OwnedFd>,
+    pub streams: Option<Streams>,
 }
 
 #[cfg(unix)]
@@ -1267,6 +1330,8 @@ pub enum ProtocolError {
     TooManyDescriptors,
     #[error("broker frame has unexpected descriptors")]
     UnexpectedDescriptors,
+    #[error("broker frame is missing its stream descriptors")]
+    MissingStreamDescriptors,
     #[error("broker frame has invalid descriptor indexes")]
     DescriptorIndex,
     #[error("broker frame has too many asset rows")]
@@ -1362,7 +1427,7 @@ impl BrokerClient {
         attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
-        stdin: Option<String>,
+        stdin_piped: bool,
         trace_parent: TraceParent,
     ) -> Result<CommandRunOutcome, ClientError> {
         match self
@@ -1370,7 +1435,7 @@ impl BrokerClient {
                 attestation,
                 word,
                 argv,
-                stdin,
+                stdin_piped,
                 trace_parent,
             ))
             .await?
@@ -1390,10 +1455,34 @@ impl BrokerClient {
         assets: InvokeAssets,
     ) -> Result<AssetInvocationOutcome, ClientError> {
         let attestation = attestation.map(|claim| claim.bound_to(request.id.clone()));
-        let descriptors: Vec<_> = assets.descriptors.iter().map(|fd| fd.as_fd()).collect();
+        if assets.descriptors.len() > MAX_ASSET_DESCRIPTORS {
+            return Err(ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::TooManyDescriptors,
+            });
+        }
+        let shape = assets.streams.as_ref().map(Streams::descriptors);
+        let descriptors: Vec<_> = assets
+            .descriptors
+            .iter()
+            .chain(
+                assets
+                    .streams
+                    .as_ref()
+                    .and_then(|streams| streams.stdin.as_ref()),
+            )
+            .chain(assets.streams.as_ref().map(|streams| &streams.stdout))
+            .map(|fd| fd.as_fd())
+            .collect();
         let (response, descriptors) = self
             .exchange_assets(
-                RequestEnvelope::invoke(attestation, request, assets.rows, assets.sends_remaining),
+                RequestEnvelope::invoke(
+                    attestation,
+                    request,
+                    assets.rows,
+                    assets.sends_remaining,
+                    shape,
+                ),
                 &descriptors,
             )
             .await?;

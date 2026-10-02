@@ -163,7 +163,8 @@ impl<P: Provider> Run<P> {
     /// # Errors
     /// Fails on missing artifacts, host refusals, TLS fixture errors or provider failures.
     pub fn call(self, capability: &str, input: Value) -> Result<Value, HarnessError> {
-        Ok(self.call_full(capability, input)?.output)
+        let (_, stdout) = self.call_with_stdout(capability, input)?;
+        serde_json::from_slice(&stdout).map_err(|_error| HarnessError::Fixture("stdout JSON"))
     }
 
     /// Returns output and host import recordings for an authorized component call.
@@ -175,6 +176,14 @@ impl<P: Provider> Run<P> {
         capability: &str,
         input: Value,
     ) -> Result<dekopon_broker_host::BrokerInvocationOutput, HarnessError> {
+        Ok(self.call_with_stdout(capability, input)?.0)
+    }
+
+    fn call_with_stdout(
+        self,
+        capability: &str,
+        input: Value,
+    ) -> Result<(dekopon_broker_host::BrokerInvocationOutput, Vec<u8>), HarnessError> {
         let component = self.component.canonicalize()?;
         let registry = cached_registry::<P>(component, self.limits.clone())?;
         let mut imports = TestImports {
@@ -229,15 +238,26 @@ impl<P: Provider> Run<P> {
                 secret_use: None,
             },
         )?;
-        let result = runtime().block_on(registry.invoke_with_test_imports(
-            authorized,
-            None,
-            None,
-            Default::default(),
-            Some(&imports),
-        ));
+        let (host_end, mut stdout) = std::os::unix::net::UnixStream::pair()?;
+        let assets = dekopon_broker_host::asset::AssetInputs {
+            streams: Some(dekopon_broker_host::Streams {
+                stdin: None,
+                stdout: host_end.into(),
+            }),
+            ..Default::default()
+        };
+        let (result, captured) = runtime().block_on(async {
+            let invoke =
+                registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
+            let capture = tokio::task::spawn_blocking(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes)
+            });
+            tokio::join!(invoke, capture)
+        });
         drop(server);
-        Ok(result.map_err(Box::new)?)
+        let stdout = captured.map_err(|_error| HarnessError::Fixture("stdout capture"))??;
+        Ok((result.map_err(Box::new)?, stdout))
     }
 }
 

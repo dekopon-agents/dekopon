@@ -867,8 +867,8 @@ fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_o
             capability: "gpt-image.edit"
                 .parse::<CapabilityId>()
                 .expect("valid capability"),
-            code: "upstream-rejected".to_owned(),
-            message,
+            status: 1,
+            stderr: message,
         };
         assert_eq!(
             public_host_error(&failure, CapabilityRoute::Generic),

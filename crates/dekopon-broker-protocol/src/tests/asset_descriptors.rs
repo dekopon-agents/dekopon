@@ -59,7 +59,7 @@ async fn invoke_round_trips_five_close_on_exec_descriptors() {
         })
         .collect();
     let descriptors: Vec<_> = files.iter().map(|file| file.as_fd()).collect();
-    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4);
+    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4, None);
     writer
         .write_frame(&request, &descriptors, FrameLimits::default())
         .await
@@ -179,7 +179,7 @@ async fn descriptor_cap_applies_across_all_reads_of_one_frame() {
 
 #[test]
 fn asset_metadata_is_strict_and_sends_remaining_is_camel_case() {
-    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4);
+    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4, None);
     let value = serde_json::to_value(request).expect("request JSON");
     assert_eq!(value["request"]["sendsRemaining"], 4);
     let mut row = serde_json::json!({
@@ -230,10 +230,16 @@ fn typed_rows_and_response_indexes_are_exact() {
         super::invocation(),
         vec![row.clone(); MAX_ASSET_ROWS],
         4,
+        None,
     );
     request.request.validate().expect("row cap inclusive");
-    let request =
-        RequestEnvelope::invoke(None, super::invocation(), vec![row; MAX_ASSET_ROWS + 1], 4);
+    let request = RequestEnvelope::invoke(
+        None,
+        super::invocation(),
+        vec![row; MAX_ASSET_ROWS + 1],
+        4,
+        None,
+    );
     assert!(matches!(
         request.request.validate(),
         Err(ProtocolError::TooManyAssetRows)
