@@ -1289,6 +1289,9 @@ pub(crate) fn resolve(
         &mut metering_problems,
     );
     problems.extend(metering_problems.into_iter().map(ConfigProblem::Metering));
+    if let Some(crate::metering::RestoreConfig::Openobserve { auth_env, .. }) = &metering.restore {
+        check_env_name(auth_env, &mut problems);
+    }
 
     let mut routes = Vec::with_capacity(config.routes.len());
     for (index, route) in config.routes.into_iter().enumerate() {
