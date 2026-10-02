@@ -36,7 +36,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 /// Category targets run at the standard level.
 #[cfg(unix)]
-const OTEL_LOG_FILTER: &str = "job=debug";
+const OTEL_LOG_FILTER: &str = "job=debug,meter=info";
 
 #[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";

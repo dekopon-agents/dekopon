@@ -50,6 +50,7 @@ use crate::{
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     jobs::JobContext,
     journal::{self, Journal},
+    metering::ChatProviderGovernor,
     progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
     transport::{
@@ -763,6 +764,7 @@ pub(crate) struct SessionRunner {
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
     pub jobs: Arc<crate::jobs::Jobs>,
+    pub metering: Arc<dekopon_model_token_governor::Metering>,
 }
 
 struct RecalledWindow {
@@ -1441,6 +1443,8 @@ async fn session(
         .is_some_and(|continuation| continuation.inherited);
     let skills = Arc::clone(&route.skills);
     let agent = route.agent.to_string();
+    let agent_id = route.agent.clone();
+    let metering = Arc::clone(&runner.metering);
     let progress_notes = route.progress_notes;
     let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
@@ -1498,7 +1502,7 @@ async fn session(
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = blocking_span.enter();
             let model = match models.client(&model_config, model_runtime, model_cancel) {
-                Ok(model) => model,
+                Ok(model) => ChatProviderGovernor::wrap(model, &metering, &agent_id, &model_config),
                 Err(error) => return (Err(error), None, Vec::new()),
             };
             let runtime = ShellRuntime {
@@ -1619,6 +1623,14 @@ async fn session(
                 OutboundReply::with_images(text.clone(), images)
             };
             (Terminal::Answered(reply), "answered", Some(text))
+        }
+        Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
+            tracing::info!(event = "gateway_session_refused", category = "over-budget");
+            (
+                Terminal::Failed(bound_outbound(&refusal.to_string())),
+                "refused",
+                None,
+            )
         }
         Err(SessionError::Prompt(PromptError::UnreportedCapabilityWork)) => {
             tracing::error!(
@@ -1997,6 +2009,8 @@ impl SessionError {
             Self::BrokerClient(_) => "broker-client",
             Self::BrokerLeg(_) => "broker-leg",
             Self::TransportId(_) => "transport-id",
+            Self::Model(InferenceError::OverBudget(_))
+            | Self::Prompt(PromptError::Model(InferenceError::OverBudget(_))) => "over-budget",
             Self::Model(_) => "model",
             Self::ModelCredential(_) => "model-credential",
             Self::Prompt(error) => error.telemetry_kind(),

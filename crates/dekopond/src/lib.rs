@@ -20,6 +20,7 @@ mod config;
 mod conversation;
 mod jobs;
 mod journal;
+mod metering;
 mod progress;
 mod routes;
 mod session;
@@ -173,6 +174,10 @@ where
         thread_ownership,
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
+        metering: Arc::new(metering::build(
+            &config.metering,
+            dekopon_model_token_governor::Metering::system_clock(),
+        )),
     });
 
     tracing::info!(

@@ -2775,6 +2775,36 @@ fn runner_with(
     runner_tracking(broker, models, max_concurrent, 1024)
 }
 
+fn unmetered() -> Arc<dekopon_model_token_governor::Metering> {
+    Arc::new(dekopon_model_token_governor::Metering::new(
+        Vec::new(),
+        dekopon_model_token_governor::Metering::system_clock(),
+    ))
+}
+
+fn metered_runner(
+    broker: ResolvedBroker,
+    models: Arc<dyn ModelFactory>,
+    agent: &str,
+    limit: u64,
+) -> Arc<SessionRunner> {
+    let runner = runner_with(broker, models, 4);
+    let mut runner = Arc::into_inner(runner).expect("a fresh runner has one owner");
+    runner.metering = Arc::new(dekopon_model_token_governor::Metering::new(
+        vec![dekopon_model_token_governor::Budget::new(
+            agent.parse().expect("valid agent fixture"),
+            None,
+            &[dekopon_model_token_governor::MeterSpec::Rolling {
+                limit: dekopon_model_token_governor::Tokens(limit),
+                period: Duration::from_secs(5 * 3_600),
+            }],
+            dekopon_model_token_governor::UnixMillis::now(),
+        )],
+        dekopon_model_token_governor::Metering::system_clock(),
+    ));
+    Arc::new(runner)
+}
+
 fn runner_tracking(
     broker: ResolvedBroker,
     models: Arc<dyn ModelFactory>,
@@ -2797,6 +2827,7 @@ fn runner_tracking(
         thread_ownership: HashMap::new(),
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        metering: unmetered(),
     })
 }
 
@@ -13842,6 +13873,7 @@ fn journaled_runner(
         thread_ownership: HashMap::new(),
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        metering: unmetered(),
     })
 }
 
@@ -14217,4 +14249,84 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
                 RouteProblem::UnknownAgent { agent } if agent == "nobody"
             ))
     )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_over_its_budget_replies_with_the_refusal_sentence() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("never asked")]);
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        metered_runner(
+            broker,
+            Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+            "reviewer",
+            10,
+        ),
+        route(model_config()),
+        message("hello"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let replies = driver.replies();
+    assert_eq!(replies.len(), 1);
+    assert!(
+        replies[0].starts_with("This message needs about")
+            && replies[0].ends_with(
+                "more than my whole 10-token budget (5-hour rolling window). It can't run as is."
+            ),
+        "{replies:?}"
+    );
+    assert_ne!(replies[0], FAILURE_REPLY);
+    assert_eq!(
+        models.requests(),
+        0,
+        "a refused call never reaches the model"
+    );
+    let text = capture.text();
+    assert!(!text.contains("gateway_session_failed"), "{text}");
+    assert!(text.contains("gateway_session_refused"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_without_a_budget_is_never_refused() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("hi there")]);
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        metered_runner(
+            broker,
+            Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+            "someone-else",
+            1,
+        ),
+        route(model_config()),
+        message("hello"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(driver.replies(), ["hi there"]);
 }
