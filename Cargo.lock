@@ -1077,6 +1077,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-model-token-governor"
+version = "0.30.0"
+dependencies = [
+ "dekopon-core",
+ "parking_lot",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dekopon-policy"
 version = "0.30.0"
 dependencies = [
