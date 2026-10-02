@@ -1,6 +1,6 @@
 # HTTP import probe
 
-A test fixture for the broker host's `dekopon:http/client@1.1.0` and `dekopon:asset/asset@0.1.0` imports, not a provider to deploy. It composes the `dekopon:provider@0.3.0` `provider-cli` world with those imports, exercising unchanged buffered `send`, additive asset-backed `stream`, and authorized attach/send effects. The separate, unchanged JSONPlaceholder fixture retains HTTP `@1.0.0` compatibility coverage.
+A test fixture for the broker host's `dekopon:http/client@1.2.0`, `dekopon:stdio/streams@0.1.0`, and `dekopon:asset/asset@0.1.0` imports, not a provider to deploy. It composes the `dekopon:provider@0.4.0` `provider-cli` world with those imports, exercising buffered `send`, asset-backed `stream`, response `open`/`splice`, and authorized attach/send effects. The separate, unchanged JSONPlaceholder fixture retains HTTP `@1.0.0` compatibility coverage.
 
 Its word is `httpprobe`, built on typed SDK clap arguments: one subcommand per capability and one flag per input field, the flag being the field's kebab-case spelling. The dispatch assembles exactly the input object `invoke` reads, and an optional field is present only when its flag was given.
 
@@ -26,4 +26,4 @@ wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 ```
 
-The decoded component must export exactly `describe`, `invoke`, and `run-command`, import exactly `dekopon:http/client@1.1.0` and `dekopon:asset/asset@0.1.0`, and import no WASI interfaces.
+The decoded component must export exactly `describe`, `invoke`, and `run-command`, import exactly `dekopon:http/client@1.2.0`, `dekopon:asset/asset@0.1.0`, and `dekopon:stdio/streams@0.1.0`, and import no WASI interfaces.

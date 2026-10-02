@@ -45,7 +45,7 @@ concurrency:
 env:
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.4.0
   STDIO_WIT_PACKAGE: dekopon:stdio@0.1.0
-  HTTP_WIT_PACKAGE: dekopon:http@1.1.0
+  HTTP_WIT_PACKAGE: dekopon:http@1.2.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
 
@@ -148,7 +148,7 @@ jobs:
             expected='dekopon:stdio/streams@0.1.0'
             case "$provider" in
               clock-probe|clock-raw-probe) expected+=$'\ndekopon:clock/wall@1.0.0' ;;
-              http-probe|http-raw-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.1.0' ;;
+              http-probe|http-raw-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.2.0' ;;
               storage-probe) expected+=$'\ndekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
@@ -315,61 +315,80 @@ jobs:
           jq --exit-status --arg package "$HTTP_WIT_PACKAGE" '
             (.packages == [
               {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 0}, "worlds": {}},
-              {"name": $package, "interfaces": {"client": 1}, "worlds": {}}
+              {"name": "dekopon:stdio@0.1.0", "interfaces": {"streams": 1}, "worlds": {}},
+              {"name": $package, "interfaces": {"client": 2}, "worlds": {}}
             ]) and
-            (.interfaces | length == 2) and
+            (.interfaces | length == 3) and
             (.interfaces[0].name == "asset") and
-            (.interfaces[1].name == "client") and
-            ((.interfaces[1].functions | keys) == ["send", "stream"]) and
-            (.interfaces[1].functions.send.params == [{"name": "request", "type": 12}]) and
-            (.interfaces[1].functions.send.result == 23) and
-            (.types[9].kind == {"list": "u8"}) and
-            (.types[10].kind.record.fields == [
-              {"name": "name", "type": "string"}, {"name": "value", "type": 9}
+            (.interfaces[1].name == "streams") and
+            (.interfaces[2].name == "client") and
+            ((.interfaces[2].functions | keys) == ["open", "send", "splice", "stream"]) and
+            (.interfaces[2].functions.send.params == [{"name": "request", "type": 17}]) and
+            (.interfaces[2].functions.send.result == 31) and
+            (.types[14].kind == {"list": "u8"}) and
+            (.types[15].kind.record.fields | map({name, type}) == [
+              {"name": "name", "type": "string"}, {"name": "value", "type": 14}
             ]) and
-            (.types[11].kind == {"list": 10}) and
-            (.types[12].kind.record.fields | map({name, type}) == [
+            (.types[16].kind == {"list": 15}) and
+            (.types[17].kind.record.fields | map({name, type}) == [
               {"name": "method", "type": "string"}, {"name": "uri", "type": "string"},
-              {"name": "headers", "type": 11}, {"name": "body", "type": 9}
+              {"name": "headers", "type": 16}, {"name": "body", "type": 14}
             ]) and
-            (.types[13].kind.record.fields | map({name, type}) == [
+            (.types[18].kind.record.fields | map({name, type}) == [
               {"name": "status", "type": "u16"},
-              {"name": "headers", "type": 11}, {"name": "body", "type": 9}
+              {"name": "headers", "type": 16}, {"name": "body", "type": 14}
             ]) and
-            (.types[14].kind.enum.cases | map(.name) == [
+            (.types[19].kind.enum.cases | map(.name) == [
               "invalid-method", "invalid-uri", "invalid-header", "request-too-large",
               "denied", "host-call-limit", "dns", "connect", "tls", "timeout",
               "protocol", "response-too-large", "internal"
             ]) and
-            (.types[15].kind.record.fields == [
-              {"name": "code", "type": 14}, {"name": "message", "type": "string"}
-            ]) and
-            (.types[23].kind == {"result": {"ok": 13, "err": 15}}) and
-            (.types[7].kind == {"type": 5}) and
-            (.types[5].kind == "resource") and
-            (.types[8].kind == {"type": 0}) and
-            (.types[0].kind.enum.cases | map(.name) == ["identity", "base64"]) and
-            (.types[16].kind == {"handle": {"borrow": 7}}) and
-            (.types[17].kind.record.fields | map({name, type}) == [
-              {"name": "handle", "type": 16}, {"name": "encoding", "type": 8}
-            ]) and
-            (.types[18].kind.variant.cases == [
-              {"name": "literal", "type": 9}, {"name": "asset", "type": 17}
-            ]) and
-            (.types[19].kind == {"list": 18}) and
             (.types[20].kind.record.fields == [
+              {"name": "code", "type": 19}, {"name": "message", "type": "string"}
+            ]) and
+            (.types[31].kind == {"result": {"ok": 18, "err": 20}}) and
+            (.types[10].kind == {"type": 5}) and
+            (.types[5].kind == "resource") and
+            (.types[11].kind == {"type": 0}) and
+            (.types[0].kind.enum.cases | map(.name) == ["identity", "base64"]) and
+            (.types[21].kind == {"handle": {"borrow": 10}}) and
+            (.types[22].kind.record.fields | map({name, type}) == [
+              {"name": "handle", "type": 21}, {"name": "encoding", "type": 11}
+            ]) and
+            (.types[23].kind.variant.cases | map({name, type}) == [
+              {"name": "literal", "type": 14}, {"name": "asset", "type": 22}
+            ]) and
+            (.types[24].kind == {"list": 23}) and
+            (.types[25].kind.record.fields | map({name, type}) == [
               {"name": "method", "type": "string"}, {"name": "uri", "type": "string"},
-              {"name": "headers", "type": 11}, {"name": "body", "type": 19}
+              {"name": "headers", "type": 16}, {"name": "body", "type": 24}
             ]) and
-            (.types[21].kind == {"handle": {"own": 7}}) and
-            (.types[22].kind.record.fields == [
+            (.types[26].kind == {"handle": {"own": 10}}) and
+            (.types[27].kind.record.fields | map({name, type}) == [
               {"name": "status", "type": "u16"},
-              {"name": "headers", "type": 11}, {"name": "body", "type": 21}
+              {"name": "headers", "type": 16}, {"name": "body", "type": 26}
             ]) and
-            (.interfaces[1].functions.stream.params == [{"name": "request", "type": 20}]) and
-            (.interfaces[1].functions.stream.result == 24) and
-            (.types[24].kind == {"result": {"ok": 22, "err": 15}}) and
-            (.types | length == 25) and
+            (.interfaces[2].functions.stream.params == [{"name": "request", "type": 25}]) and
+            (.interfaces[2].functions.stream.result == 32) and
+            (.types[32].kind == {"result": {"ok": 27, "err": 20}}) and
+            (.interfaces[2].functions.open.params == [{"name": "request", "type": 17}]) and
+            (.interfaces[2].functions.open.result == 33) and
+            (.types[28].kind == {"handle": {"own": 12}}) and
+            (.types[29].kind.record.fields | map({name, type}) == [
+              {"name": "status", "type": "u16"},
+              {"name": "headers", "type": 16}, {"name": "body", "type": 28}
+            ]) and
+            (.types[33].kind == {"result": {"ok": 29, "err": 20}}) and
+            (.interfaces[2].functions.splice.params == [
+              {"name": "source", "type": 28}, {"name": "sink", "type": 34}
+            ]) and
+            (.interfaces[2].functions.splice.result == 35) and
+            (.types[34].kind == {"handle": {"borrow": 13}}) and
+            (.types[30].kind.variant.cases | map({name, type}) == [
+              {"name": "closed", "type": null}, {"name": "failed", "type": 20}
+            ]) and
+            (.types[35].kind == {"result": {"ok": "u64", "err": 30}}) and
+            (.types | length == 36) and
             (.worlds == [])
           ' target/wit-package/dekopon-http.json
 
@@ -566,7 +585,7 @@ jobs:
                 (.packages == [
                   {"name": "dekopon:stdio@0.1.0", "interfaces": {"streams": 0}, "worlds": {}},
                   {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 1}, "worlds": {}},
-                  {"name": "dekopon:http@1.1.0", "interfaces": {"client": 2}, "worlds": {}},
+                  {"name": "dekopon:http@1.2.0", "interfaces": {"client": 2}, "worlds": {}},
                   {"name": "root:component", "interfaces": {}, "worlds": {"root": 0}}
                 ]) and
                 (.worlds | length == 1) and
@@ -581,7 +600,7 @@ jobs:
                 ((.interfaces[1].functions | keys) == [
                   "[method]handle.read", "[method]writer.write", "allocate", "attach", "open", "send"
                 ]) and
-                ((.interfaces[2].functions | keys) == ["send", "stream"]) and
+                ((.interfaces[2].functions | keys) == ["open", "send", "splice", "stream"]) and
                 (.worlds[0].exports."run-command".function.params[1].type == "bool") and
                 (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
               ' "$description"
