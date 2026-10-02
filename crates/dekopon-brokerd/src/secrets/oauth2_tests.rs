@@ -391,6 +391,10 @@ fn oauth_policy() -> PolicyEngine {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one concurrent credential rotation scenario"
+)]
 async fn two_drns_over_one_record_share_one_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
@@ -507,15 +511,29 @@ async fn two_drns_over_one_record_share_one_refresh() {
                 "agent".parse::<AgentId>().unwrap(),
             )
             .bound_to(id);
-            broker
+            let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            let captured = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+                bytes
+            });
+            let result = broker
                 .invoke(
                     &context,
                     Some(&AttestorGrant { namespaces: None }),
                     Some(&attestation),
                     request,
-                    Default::default(),
+                    dekopon_broker_host::asset::AssetInputs {
+                        streams: Some(dekopon_broker_host::Streams {
+                            stdin: None,
+                            stdout: host.into(),
+                        }),
+                        ..Default::default()
+                    },
                 )
-                .await
+                .await;
+            assert!(!captured.join().unwrap().is_empty());
+            result
         })
     };
     let a = invoke("invoke-oauth-one", drn("one"));

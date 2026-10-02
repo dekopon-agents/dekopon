@@ -120,6 +120,36 @@ fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str
     PolicyEngine::new(policies, &world).expect("fixture policy validates")
 }
 
+fn stdio(
+    stdin: Option<&[u8]>,
+) -> (
+    dekopon_broker_protocol::InvokeAssets,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    use std::io::Write;
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
+    let stdin = stdin.map(|bytes| {
+        let (host, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+        feeder.write_all(bytes).unwrap();
+        host.into()
+    });
+    (
+        dekopon_broker_protocol::InvokeAssets {
+            streams: Some(dekopon_broker_protocol::Streams {
+                stdin,
+                stdout: host.into(),
+            }),
+            ..Default::default()
+        },
+        reader,
+    )
+}
+
 fn request(id: &str) -> InvocationRequest {
     InvocationRequest {
         id: id
@@ -303,8 +333,9 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         other => panic!("expected a proposal, got {other:?}"),
     };
     assert_eq!(capability.as_str(), "cli-probe.upper");
-    assert_eq!(input, json!({"text": "hello"}));
+    assert_eq!(input, json!({"text": "", "piped": true}));
 
+    let (streams, stdout) = stdio(Some(b"hello"));
     let result = client
         .invoke(
             Some(session()),
@@ -317,10 +348,11 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
                 secret_use: None,
                 input,
             },
-            Default::default(),
+            streams,
         )
         .await
         .expect("invoke the proposal");
+    assert_eq!(stdout.join().unwrap(), b"{\"text\":\"HELLO\"}\n");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     assert_eq!(
         audit.records().len(),
@@ -422,6 +454,10 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one private credential resolution and authorization scenario"
+)]
 async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
     let uid = current_uid();
     let directory = private_directory();
@@ -550,10 +586,15 @@ when { context.capability == "http-probe.fetch"
             "method": "GET"
         }),
     };
+    let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(Some(session()), invocation.clone(), Default::default())
+        .invoke(Some(session()), invocation.clone(), streams)
         .await
         .expect("secret invocation succeeds");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stdout.join().unwrap()).unwrap()["status"],
+        200
+    );
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     let wire = String::from_utf8(wire_receive.await.expect("HTTP wire")).expect("wire text");
     assert!(
@@ -694,14 +735,15 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(
-            Some(session()),
-            request("invoke-attested-socket"),
-            Default::default(),
-        )
+        .invoke(Some(session()), request("invoke-attested-socket"), streams)
         .await
         .expect("attested invocation completes");
+    assert_eq!(
+        stdout.join().unwrap(),
+        b"{\"text\":\"HELLO THROUGH BROKER\"}\n"
+    );
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let records = audit.records();
@@ -1257,11 +1299,13 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let mut invocation = request("attach-asset");
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "attach"});
+    let (streams, attached_stdout) = stdio(None);
     let attached = client
-        .invoke(Some(session()), invocation, InvokeAssets::default())
+        .invoke(Some(session()), invocation, streams)
         .await
         .unwrap();
     assert_eq!(attached.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(attached_stdout.join().unwrap(), b"{\"ok\":true}\n");
     assert_eq!(attached.attached.len(), 1);
     assert_eq!(attached.descriptors.len(), 1);
     let file = std::fs::File::from(attached.descriptors.into_iter().next().unwrap());
@@ -1273,6 +1317,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let mut invocation = request("send-asset");
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "send", "reference": "chat-asset:1"});
+    let (streams, sent_stdout) = stdio(None);
     let sent = client
         .invoke(
             Some(session()),
@@ -1288,12 +1333,13 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
                 }],
                 descriptors: vec![file.into()],
                 sends_remaining: 1,
-                streams: None,
+                streams: streams.streams,
             },
         )
         .await
         .unwrap();
     assert_eq!(sent.result.outcome, InvocationOutcome::Succeeded);
+    assert!(!sent_stdout.join().unwrap().is_empty());
     assert_eq!(sent.sent, vec![1]);
     assert!(sent.descriptors.is_empty());
     assert_eq!(audit.records().len(), 4);

@@ -90,7 +90,7 @@ macro_rules! capability {
             fn run(input: TextInput, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
                 let mut text = input.text.as_str().to_owned();
                 if input.piped {
-                    let mut reader = stdin().ok_or(Never)?;
+                    let reader = stdin().ok_or(Never)?;
                     reader
                         .take((MAX_TEXT_BYTES + 1) as u64)
                         .read_to_string(&mut text)
@@ -181,6 +181,7 @@ fn propose_text<C: Capability<Provider = CliProbe, Input = TextInput>>(
 dekopon_provider_sdk::export!(CliProbe);
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use dekopon_provider_sdk::CommandRunOutcome;

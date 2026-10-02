@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -85,15 +85,29 @@ async fn invoke_as(
 ) -> Result<AssetInvocationResult, BrokerError> {
     let attestation = Attestation::for_subject(caller_subject(name), agent(agent_name))
         .bound_to(request.id.clone());
-    broker
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("test stdout pipe");
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).expect("stdout capture");
+        bytes
+    });
+    let result = broker
         .invoke(
             &service_context(GATEWAY),
             Some(&AttestorGrant { namespaces: None }),
             Some(&attestation),
             request,
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
-        .await
+        .await;
+    let _stdout = capture.join().expect("stdout capture thread");
+    result
 }
 
 fn service_context(name: &str) -> AuthenticatedContext {
@@ -1840,6 +1854,12 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     let grant = attestor_grant(["slack.t0123abc"]);
     let subject = subject(SLACK_SUBJECT);
 
+    let (attested_stdout, mut attested_reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let attested_capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut attested_reader, &mut bytes).unwrap();
+        bytes
+    });
     let attested = broker
         .invoke(
             &gateway,
@@ -1850,10 +1870,20 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
                 "cli-probe.upper",
                 json!({"text": "on behalf of"}),
             ),
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: attested_stdout.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("attested invocation is accounted");
+    assert_eq!(
+        attested_capture.join().unwrap(),
+        b"{\"text\":\"ON BEHALF OF\"}\n"
+    );
     assert_eq!(
         attested.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -2047,6 +2077,12 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_success_audits_via_and_subject() {
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let broker = attested_broker(
         directory([(SLACK_SUBJECT, "cpetersen")]),
@@ -2067,10 +2103,20 @@ async fn attested_success_audits_via_and_subject() {
                 "cli-probe.upper",
                 json!({"text": "top-secret-payload"}),
             ),
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("attested invocation is accounted");
+    assert_eq!(
+        capture.join().unwrap(),
+        b"{\"text\":\"TOP-SECRET-PAYLOAD\"}\n"
+    );
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -2602,7 +2648,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
         CommandRunOutcome::Proposed {
             secret_use: None,
             capability: "cli-probe.upper".parse().expect("valid capability fixture"),
-            input: json!({"text": "hello"}),
+            input: json!({"text": "", "piped": true}),
         }
     );
 

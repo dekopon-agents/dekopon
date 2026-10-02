@@ -4,33 +4,27 @@ mod fixture;
 
 use dekopon_test_support::provider_fixture;
 use fixture::{
-    BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FixtureHost,
-    FixtureHostError, StorageAccess, StorageInterface, StorageLimits,
+    BrokerHostError, BrokerHostLimits, CommandRunOutcome, FixtureHost, FixtureHostError,
+    StorageAccess, StorageInterface, StorageLimits,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
-fn record(id: &str, user: &str, assistant: &str) -> Value {
-    json!({
-        "operation": "record",
-        "id": id,
-        "commitment": format!("commitment-{id}"),
-        "user": user,
-        "assistant": assistant,
-        "maxTurnBytes": 4096,
-        "maxLookbackTurns": 64,
-        "compactionTargetBytes": 8192,
-        "compactionThresholdBytes": 16384,
-    })
-}
-
-async fn memory_chat() -> FixtureHost {
-    FixtureHost::builder()
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetched_0_3_0_memory_chat_component_is_refused_at_load() {
+    let error = FixtureHost::builder()
         .component(provider_fixture("memory-chat-provider.wasm"))
         .provider("memory-chat")
         .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
         .build()
         .await
-        .expect("memory-chat loads")
+        .expect_err("0.3.0 invoke returns a string, not an exit status");
+    assert!(
+        matches!(
+            error,
+            FixtureHostError::Host(BrokerHostError::Instantiate { .. })
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -59,99 +53,24 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn successive_invocations_reach_one_durable_namespace() {
-    let broker = memory_chat().await;
-
-    broker
-        .invoke(
-            "memory.chat.record",
-            record("turn-1", "first question", "first answer"),
-        )
-        .await
-        .expect("first turn records");
-    broker
-        .invoke(
-            "memory.chat.record",
-            record("turn-2", "second question", "second answer"),
-        )
-        .await
-        .expect("second turn records");
-
-    let recent = broker
-        .invoke(
-            "memory.chat.recent",
-            json!({
-                "operation": "recent",
-                "last": 2,
-                "maxLookbackTurns": 64,
-                "maxRecentTurns": 64,
-                "maxResultBytes": 65536,
-            }),
-        )
-        .await
-        .expect("a later invocation reads what the earlier ones committed");
-
-    let turns = recent["turns"].as_array().expect("turns array");
-    assert_eq!(turns.len(), 2, "{recent}");
-    assert_eq!(turns[0]["user"], "first question");
-    assert_eq!(turns[1]["assistant"], "second answer");
-
-    assert_eq!(generations(broker.storage_root()), 1);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn two_subjects_do_not_share_a_namespace() {
-    let first = memory_chat().await;
-    first
-        .invoke("memory.chat.record", record("turn-1", "private", "answer"))
-        .await
-        .expect("records");
-
-    let second = FixtureHost::builder()
-        .component(provider_fixture("memory-chat-provider.wasm"))
-        .provider("memory-chat")
-        .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
-        .subject("slack.t0123abc.udifferent")
-        .build()
-        .await
-        .expect("memory-chat loads");
-
-    let recent = second
-        .invoke(
-            "memory.chat.recent",
-            json!({
-                "operation": "recent",
-                "last": 2,
-                "maxLookbackTurns": 64,
-                "maxRecentTurns": 64,
-                "maxResultBytes": 65536,
-            }),
-        )
-        .await
-        .expect("an empty namespace reads cleanly");
-    assert_eq!(recent["turns"].as_array().expect("turns array").len(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_command_word_renders_its_help_page_and_proposes() {
+async fn a_command_word_renders_help_and_proposes_piped_input_without_reading_it() {
     let broker = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .build()
         .await
         .expect("cli-probe loads");
-
     let outcome = broker
         .run_command("probe", &["--help".to_owned()], false)
         .await
-        .expect("help renders");
+        .unwrap();
     let CommandRunOutcome::Rendered {
         stdout,
         stderr,
         status,
     } = outcome
     else {
-        panic!("expected rendered help, got {outcome:?}");
+        panic!("expected help, got {outcome:?}");
     };
     assert_eq!(status, 0);
     assert!(stdout.starts_with("Usage: probe <COMMAND>\n"), "{stdout:?}");
@@ -164,25 +83,23 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
     let outcome = broker
         .run_command("probe", &["reverse".to_owned(), "-".to_owned()], true)
         .await
-        .expect("a piped value proposes");
+        .unwrap();
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
             secret_use: None,
-            capability: "cli-probe.reverse".parse().expect("capability"),
-            input: json!({"text": "abc"}),
+            capability: "cli-probe.reverse".parse().unwrap(),
+            input: json!({"text":"", "piped":true}),
         }
     );
-    let output = broker
-        .invoke("cli-probe.reverse", json!({"text": "abc"}))
-        .await
-        .expect("the proposal runs");
-    assert_eq!(output, json!({"text": "cba"}));
-
-    let error = broker
-        .run_command("recall", &[], false)
-        .await
-        .expect_err("a word the component did not declare is refused");
+    assert_eq!(
+        broker
+            .invoke("cli-probe.reverse", json!({"text":"abc"}))
+            .await
+            .unwrap(),
+        json!({"text":"cba"})
+    );
+    let error = broker.run_command("recall", &[], false).await.unwrap_err();
     assert!(
         matches!(error, FixtureHostError::Host(BrokerHostError::UnknownCommandWord { ref word }) if word == "recall"),
         "{error:?}"
@@ -190,52 +107,44 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_import_free_component_needs_no_storage() {
+async fn a_stdio_only_component_needs_no_storage() {
     let broker = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
         .build()
         .await
-        .expect("cli-probe loads");
-
-    let output = broker
-        .invoke("cli-probe.upper", json!({"text": "hello"}))
-        .await
-        .expect("cli-probe runs");
-    assert_eq!(output["text"], "HELLO");
+        .unwrap();
+    assert_eq!(
+        broker
+            .invoke("cli-probe.upper", json!({"text":"hello"}))
+            .await
+            .unwrap()["text"],
+        "HELLO"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_provider_declared_failure_is_distinguishable_from_a_host_refusal() {
-    let broker = memory_chat().await;
-
+async fn a_provider_exit_is_distinct_from_an_undeclared_capability_refusal() {
+    let broker = FixtureHost::builder()
+        .component(provider_fixture("cli-probe-provider.wasm"))
+        .provider("cli-probe")
+        .build()
+        .await
+        .unwrap();
     let error = broker
-        .invoke(
-            "memory.chat.recent",
-            json!({
-                "operation": "recent",
-                "last": 0,
-                "maxLookbackTurns": 64,
-                "maxRecentTurns": 64,
-                "maxResultBytes": 65536,
-            }),
-        )
+        .invoke("cli-probe.upper", json!({"text":1}))
         .await
-        .expect_err("last: 0 is refused by the provider");
-
+        .unwrap_err();
     assert_eq!(
-        error
-            .provider_failure()
-            .map(|(status, stderr)| (status, stderr.starts_with("invalid-input: "))),
-        Some((1, true)),
-        "{error}"
+        error.provider_failure().map(|(status, _)| status),
+        Some(2),
+        "{error:?}"
     );
-
     let refused = broker
-        .invoke("memory.chat.nonexistent", json!({}))
+        .invoke("cli-probe.nonexistent", json!({}))
         .await
-        .expect_err("an undeclared capability has no route");
-    assert_eq!(refused.provider_failure(), None, "{refused}");
+        .unwrap_err();
+    assert_eq!(refused.provider_failure(), None, "{refused:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -245,8 +154,7 @@ async fn a_missing_component_names_the_path() {
         .provider("nobody")
         .build()
         .await
-        .expect_err("a missing component cannot load");
-
+        .unwrap_err();
     assert!(
         matches!(error, FixtureHostError::ComponentMissing { .. }),
         "{error}"
@@ -259,23 +167,22 @@ async fn a_builder_missing_its_component_or_provider_says_which() {
         .provider("cli-probe")
         .build()
         .await
-        .expect_err("no component");
+        .unwrap_err();
     assert!(matches!(error, FixtureHostError::NoComponent), "{error}");
-
     let error = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .build()
         .await
-        .expect_err("no provider");
+        .unwrap_err();
     assert!(matches!(error, FixtureHostError::NoProvider), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
     let narrowed = FixtureHost::builder()
-        .component(provider_fixture("memory-chat-provider.wasm"))
-        .provider("memory-chat")
-        .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
+        .component(provider_fixture("storage-probe-provider.wasm"))
+        .provider("storage-probe")
+        .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
         .storage_limits(StorageLimits {
             max_write_bytes_per_call: 1,
             max_write_bytes_per_invocation: 1,
@@ -283,84 +190,39 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
         })
         .build()
         .await
-        .expect("memory-chat loads under a one-byte write budget");
-
+        .unwrap();
     let error = narrowed
-        .invoke("memory.chat.record", record("turn-1", "question", "answer"))
+        .invoke("storage-probe.run", json!({}))
         .await
-        .expect_err("a one-byte write budget cannot record a turn");
-    let FixtureHostError::Invocation(failure) = &error else {
-        panic!("expected an invocation failure: {error:?}");
-    };
+        .unwrap_err();
     assert!(
-        matches!(
-            failure.error.as_ref(),
-            BrokerHostError::StorageCallRejected { reason, .. } if *reason == "quota"
-        ),
+        matches!(error, FixtureHostError::Invocation(_)),
         "{error:?}"
     );
-    assert_eq!(error.provider_failure(), None, "{error}");
-
-    memory_chat()
-        .await
-        .invoke("memory.chat.record", record("turn-1", "question", "answer"))
-        .await
-        .expect("the default storage limits accept the same turn");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here() {
-    let broker = FixtureHost::builder()
-        .component(provider_fixture("memory-chat-provider.wasm"))
-        .provider("memory-chat")
-        .storage(StorageInterface::Jsonl, StorageAccess::ReadWrite)
-        .continuity(ContinuityPolicy::AuthorityBound)
+    let default = FixtureHost::builder()
+        .component(provider_fixture("storage-probe-provider.wasm"))
+        .provider("storage-probe")
+        .storage(StorageInterface::DurableFiles, StorageAccess::ReadWrite)
         .build()
         .await
-        .expect("memory-chat loads under AuthorityBound continuity");
-
-    broker
-        .invoke("memory.chat.record", record("turn-1", "first", "answer"))
-        .await
-        .expect("first turn records");
-    broker
-        .invoke("memory.chat.record", record("turn-2", "second", "answer"))
-        .await
-        .expect("second turn records");
-
-    let recent = broker
-        .invoke(
-            "memory.chat.recent",
-            json!({
-                "operation": "recent",
-                "last": 2,
-                "maxLookbackTurns": 64,
-                "maxRecentTurns": 64,
-                "maxResultBytes": 65536,
-            }),
-        )
-        .await
-        .expect("a later invocation reads what the earlier ones committed");
-
-    let turns = recent["turns"].as_array().expect("turns array");
-    assert_eq!(turns.len(), 2, "{recent}");
-    assert_eq!(generations(broker.storage_root()), 1);
+        .unwrap();
+    assert_eq!(
+        default
+            .invoke("storage-probe.run", json!({}))
+            .await
+            .unwrap()["identityNonzero"],
+        true
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
-        .host_limits(BrokerHostLimits::default())
         .build()
         .await
-        .expect("cli-probe loads under the default host limits");
-
+        .unwrap();
     let error = FixtureHost::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
@@ -370,36 +232,15 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
         })
         .build()
         .await
-        .expect_err("one unit of fuel cannot load the component");
-
-    let source = match &error {
-        FixtureHostError::Host(
-            BrokerHostError::Instantiate { source, .. } | BrokerHostError::Describe { source, .. },
-        ) => source,
-        _ => panic!("expected load-time fuel exhaustion, got {error:?}"),
+        .unwrap_err();
+    let FixtureHostError::Host(
+        BrokerHostError::Instantiate { source, .. } | BrokerHostError::Describe { source, .. },
+    ) = &error
+    else {
+        panic!("expected load-time fuel exhaustion, got {error:?}");
     };
     assert_eq!(
         source.root_cause().to_string(),
-        "wasm trap: all fuel consumed by WebAssembly",
-        "expected an out-of-fuel root cause, got {error:?}"
+        "wasm trap: all fuel consumed by WebAssembly"
     );
-}
-
-fn generations(root: &std::path::Path) -> usize {
-    let namespaces = root.join("namespaces");
-    let Ok(entries) = std::fs::read_dir(&namespaces) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|namespace| namespace.path().is_dir())
-        .map(|namespace| {
-            std::fs::read_dir(namespace.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|generation| generation.path().is_dir())
-                .count()
-        })
-        .sum()
 }

@@ -21,13 +21,15 @@ struct Processes {
 
 impl CapabilityInvoker for Processes {
     fn granted(&self) -> Vec<String> {
-        ["flood", "relay", "probe"]
+        ["flood", "relay", "probe", "note"]
             .map(|word| format!("proc.{word}"))
             .to_vec()
     }
 
     fn command_words(&self) -> Vec<String> {
-        ["flood", "relay", "probe"].map(str::to_owned).to_vec()
+        ["flood", "relay", "probe", "note"]
+            .map(str::to_owned)
+            .to_vec()
     }
 
     fn run_command(&self, word: &str, _: &[String], stdin_piped: bool) -> Option<CommandRun> {
@@ -48,6 +50,10 @@ impl CapabilityInvoker for Processes {
         let mut stdout = UnixStream::from(streams.stdout);
         let wrote = match proposal.capability.as_str() {
             "proc.flood" => (0_u64..).try_for_each(|line| writeln!(stdout, "line {line}")),
+            "proc.note" => {
+                writeln!(stdout, "provider bytes").expect("stdout reader is open");
+                return CapabilityCallResult::SucceededWithStderr("asset note\n".to_owned());
+            }
             "proc.relay" => {
                 let Some(stdin) = streams.stdin else {
                     return CapabilityCallResult::Exited {
@@ -70,6 +76,13 @@ impl CapabilityInvoker for Processes {
             },
         }
     }
+}
+
+#[test]
+fn an_asset_note_is_stage_stderr_not_piped_stdout() {
+    let processes = Processes::default();
+    let outcome = Interpreter::new(Limits::default()).run("note | cat", &processes);
+    assert_eq!(outcome.output, "provider bytes\nasset note", "{outcome:?}");
 }
 
 #[test]

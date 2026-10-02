@@ -112,18 +112,26 @@ The broker host and imported guests also mirror the provider package:
 - `crates/dekopon-broker-host/wit/deps/provider.wit`
 - `examples/providers/cli-probe/wit/deps/provider.wit`
 - `examples/providers/clock-probe/wit/deps/provider.wit`
+- `examples/providers/clock-raw-probe/wit/deps/provider.wit`
 - `examples/providers/http-probe/wit/deps/provider.wit`
+- `examples/providers/http-raw-probe/wit/deps/provider.wit`
 - `examples/providers/memory-reservation-probe/wit/deps/provider.wit`
 - `examples/providers/storage-probe/wit/deps/provider.wit`
 
-Update all copies together and keep their equality checks passing. The SDK's canonical `provider.wit` alone is staged as the publication source for the `dekopon:provider@0.3.0` WIT package; its local `asset-client.wit` binding world and dependencies are excluded. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-cli` world adding `run-command` and a `provider-commands` world adding `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.3.0`. Published package versions are immutable, so the `provider-commands` world stays in that text even though no host calls `resolve-command` any more and the SDK generates no such export; nothing in this repository builds against it. The `0.1.0` and `0.2.0` packages also remain published, but no component built against either loads with a capability: neither world offers `run-command`, a manifest declaring `commandWords` behind a component without it is refused at load, and the broker refuses to start while any provider declares capabilities and no command word, naming every such provider. The host reads whether a component's type offers `run-command` at load and looks it up by name at instantiation rather than requiring it of the bound world. Packaging this existing contract adds distribution, not guest authority: the broker authorizes every effect.
+Update all copies together and keep their equality checks passing. The SDK's canonical
+`provider.wit` is the publication source for `dekopon:provider@0.4.0`, with the
+`dekopon:stdio@0.1.0` dependency. The `provider` world imports standard streams and exports
+`describe` and `invoke(capability, input-json) -> result<_, u8>`; `provider-cli` adds pure
+`run-command(argv, stdin-piped: bool) -> string`. The host refuses the older 0.3.0 string-returning
+`invoke` at load. Published packages are immutable; the workflow publishes only on `v*` tags.
+The broker still authorizes every effect and refuses capabilities not reachable by a command word.
 
 WIT package versions and Rust crate versions are independent. Providers depend on
 the WIT interface versions they import; a broker host crate may register adapters
 for multiple supported WIT versions. Compatible native HTTP-library upgrades do not
 require provider rebuilds.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), and [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), independently define the HTTP, storage, and clock packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.3.0` worlds and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, and `dekopon:clock@1.0.0` packages independently. The broker host's own `dekopon:broker-provider@0.3.0` world is not published, so widening it with an import leaves its version unchanged. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), and [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), independently define the HTTP, storage, and clock packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, and `dekopon:clock@1.0.0` packages independently. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
 `dekopon-broker-host` links only project-owned HTTP (current `@1.1.0` plus buffered `@1.0.0` compatibility),
 asset `@0.1.0`, storage, and wall clock interfaces, consumes `AuthorizedInvocation` and an exact optional storage

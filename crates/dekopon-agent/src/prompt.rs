@@ -1448,9 +1448,9 @@ shows those capability IDs.
 3. Variables can hold JSON values, but `|` carries bytes, not values. `echo` writes a newline; \
 `printf` and `echo -n` do not. `read`, `cat`, and other stdin-reading builtins consume their \
 input once; a silent or failed stage supplies end of input, not JSON null. A provider command \
-receives only its own pipe or here-document, as UTF-8 text; it returns a drained answer, not a \
-live stream. Invalid UTF-8 sent to a provider, captured into a variable, or expanded into an \
-argument fails that stage. `$(cmd)` strips trailing newlines; a whole assignment like \
+receives only its own pipe or here-document as a live byte stream. Provider stdout feeds the \
+next stage while it runs; a closed consumer ends the provider stage with status 141. Invalid \
+UTF-8 captured into a variable or expanded into an argument fails that stage. `$(cmd)` strips trailing newlines; a whole assignment like \
 `pr=$(cmd)` parses object/array JSON, while scalar text stays text. Unquoted substitution \
 splits on newlines, not spaces. `x=$(cmd 2>&1)` captures diagnostics; `> buf` and `>> buf` \
 store exact bytes, including binary bytes for `cat` or `base64` to copy.
@@ -1460,7 +1460,7 @@ change the parent; only the last stage keeps assignments. A non-final `exit`, `r
 `break` ends that stage, not the parent. Inside a compound, stdin-reading builtins share its \
 one-shot stream; provider commands do not inherit it. Under `set -o pipefail` the rightmost \
 failure determines status; `${PIPESTATUS[@]}` lists each stage. A closed consumer stops its \
-producer without turning that producer into status 141.
+provider producer with status 141; `${PIPESTATUS[@]}` reports that exit status.
 5. The session is bounded. Steps, retained bytes (including substitutions, sort, tail, \
 slurped jq input, and stage stacks), output, wall-clock time, and capability calls have \
 ceilings; tripping one ends the script with a message naming it. Streaming bytes do not \

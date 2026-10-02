@@ -2828,7 +2828,8 @@ impl<'a> Evaluator<'a> {
         let status = ExitCode::from_capability_result(&result);
         match result {
             CapabilityCallResult::Succeeded => {}
-            CapabilityCallResult::Exited { stderr, .. } => {
+            CapabilityCallResult::SucceededWithStderr(stderr)
+            | CapabilityCallResult::Exited { stderr, .. } => {
                 for line in stderr.lines() {
                     self.write_line(line);
                 }

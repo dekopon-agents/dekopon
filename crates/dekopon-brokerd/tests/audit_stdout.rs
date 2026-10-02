@@ -45,6 +45,10 @@ fn write_owner_only(path: &Path, contents: &[u8]) {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one daemon invocation and its decision and execution audit records"
+)]
 async fn a_broker_without_telemetry_records_every_decision_on_stdout() {
     let directory = tempfile::tempdir().expect("create fixture directory");
     let private = directory.path();
@@ -123,6 +127,12 @@ permit(principal == Dekopon::Principal::"cpetersen",
     }
 
     let client = BrokerClient::new(&socket, uid, FrameLimits::default()).expect("client");
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        bytes
+    });
     let result = client
         .invoke(
             Some(Attestation::for_subject(
@@ -141,10 +151,20 @@ permit(principal == Dekopon::Principal::"cpetersen",
                 secret_use: None,
                 input: json!({"text": "hello through broker"}),
             },
-            Default::default(),
+            dekopon_broker_protocol::InvokeAssets {
+                streams: Some(dekopon_broker_protocol::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("the authorized invocation completes");
+    assert_eq!(
+        captured.join().unwrap(),
+        b"{\"text\":\"HELLO THROUGH BROKER\"}\n"
+    );
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let until = Instant::now() + Duration::from_secs(30);

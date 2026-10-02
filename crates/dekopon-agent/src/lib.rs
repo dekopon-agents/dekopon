@@ -505,7 +505,9 @@ fn report_outcome(outcome: ToolOutcome) -> dekopon_shell::CommandReportOutcome {
 
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
-        CapabilityCallResult::Succeeded => ToolOutcome::Succeeded,
+        CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
+            ToolOutcome::Succeeded
+        }
         CapabilityCallResult::Denied { .. } => ToolOutcome::Denied,
         CapabilityCallResult::Exited { .. }
         | CapabilityCallResult::Failed { .. }
@@ -821,7 +823,6 @@ impl BrokerLeg {
                 };
             }
         };
-        let note_sink = streams.stdout.try_clone().ok();
         assets.streams = Some(dekopon_broker_protocol::Streams {
             stdin: streams.stdin,
             stdout: streams.stdout,
@@ -869,15 +870,11 @@ impl BrokerLeg {
                         } else {
                             String::new()
                         };
-                        if !note.is_empty()
-                            && let Some(sink) = note_sink
-                        {
-                            let _closed = std::io::Write::write_all(
-                                &mut std::os::unix::net::UnixStream::from(sink),
-                                format!("{note}\n").as_bytes(),
-                            );
+                        if note.is_empty() {
+                            CapabilityCallResult::Succeeded
+                        } else {
+                            CapabilityCallResult::SucceededWithStderr(format!("{note}\n"))
                         }
-                        CapabilityCallResult::Succeeded
                     }
                     InvocationOutcome::Denied => CapabilityCallResult::Denied {
                         reason: result
@@ -1821,14 +1818,10 @@ mod tests {
             peer.await.unwrap();
             assert_eq!(
                 status,
-                CapabilityCallResult::Succeeded,
+                CapabilityCallResult::SucceededWithStderr("[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]\n".to_owned()),
                 "effect already completed"
             );
-            assert!(stdout.starts_with("provider line\n"), "{stdout}");
-            assert!(
-                stdout["provider line\n".len()..].contains("no asset store"),
-                "{stdout}"
-            );
+            assert_eq!(stdout, "provider line\n");
             assert!(!stdout.contains("PRIVATE_PAYLOAD"));
             assert!(
                 !stdout.contains("\"effect\":\"complete\""),

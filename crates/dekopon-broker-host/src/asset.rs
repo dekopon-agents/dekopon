@@ -1765,6 +1765,17 @@ mod tests {
                 SettingsState::invoke(None),
             )
             .unwrap();
+        let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let captured = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
+            bytes
+        });
+        store.data_mut().stdio = crate::stdio::StdioState::invoke(Some(crate::Streams {
+            stdin: None,
+            stdout: host.into(),
+        }))
+        .unwrap();
         store.data_mut().assets = AssetState::invoke(
             AssetInputs::default(),
             vec![],
@@ -1778,23 +1789,27 @@ mod tests {
         store.data_mut().assets.channel_sink = Some(sender);
         let capability = "http-probe.fetch".parse().unwrap();
         let constraints = dekopon_capability::ExecutionConstraints::default();
-        let call = provider.execute_in_store(
-            &mut store,
-            &capability,
-            r#"{"assetMode":"channel"}"#,
-            &constraints,
-            Duration::from_secs(5),
-            None,
-        );
-        tokio::pin!(call);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut call)
-                .await
-                .is_err()
-        );
-        assert_eq!(receiver.recv().await.unwrap(), b"asset ");
-        assert_eq!(call.await.unwrap(), serde_json::json!({"ok": true}));
-        assert_eq!(receiver.recv().await.unwrap(), b"probe");
+        {
+            let call = provider.execute_in_store(
+                &mut store,
+                &capability,
+                r#"{"assetMode":"channel"}"#,
+                &constraints,
+                Duration::from_secs(5),
+                None,
+            );
+            tokio::pin!(call);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut call)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(receiver.recv().await.unwrap(), b"asset ");
+            assert_eq!(call.await.unwrap(), 0);
+            assert_eq!(receiver.recv().await.unwrap(), b"probe");
+        }
+        drop(store);
+        assert_eq!(captured.join().unwrap(), b"{\"ok\":true}\n");
     }
     #[tokio::test]
     async fn input_rows_accept_thirty_two_and_refuse_thirty_three() {

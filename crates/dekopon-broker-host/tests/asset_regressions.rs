@@ -121,6 +121,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
         ..Default::default()
     };
     for bytes in [65536, 65537, 8 * 1024 * 1024] {
+        let (streams, stdout) = fixture::piped_stdout();
         let result = raw_registry
             .invoke(
                 authorized(
@@ -129,11 +130,12 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
                     constraints.clone(),
                 ),
                 None,
-                AssetInputs::default(),
+                streams,
             )
             .await;
         if bytes == 65536 {
             assert_eq!(result.unwrap().assets.attached[0].bytes, bytes as u64);
+            assert_eq!(stdout.json(), json!({"caught":false}));
         } else {
             assert!(matches!(
                 *result.unwrap_err().error,
@@ -142,6 +144,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
                     ..
                 }
             ));
+            assert_eq!(stdout.json(), json!({"caught":true}));
         }
         assert!(capture.events().iter().any(|(fields, _)| {
             fields.contains(&format!("asset.write.guest_bytes={bytes}"))

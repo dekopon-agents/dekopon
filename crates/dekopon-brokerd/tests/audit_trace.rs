@@ -411,6 +411,12 @@ async fn serve() -> Served<impl std::fmt::Debug> {
 async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
     let probe = install();
     let served = serve().await;
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        bytes
+    });
 
     let invoked = served
         .client
@@ -425,10 +431,20 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
                 secret_use: None,
                 input: serde_json::json!({"text": "hello through broker"}),
             },
-            Default::default(),
+            dekopon_broker_protocol::InvokeAssets {
+                streams: Some(dekopon_broker_protocol::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("the authorized invocation completes");
+    assert_eq!(
+        captured.join().unwrap(),
+        b"{\"text\":\"HELLO THROUGH BROKER\"}\n"
+    );
     assert_eq!(invoked.result.outcome, InvocationOutcome::Succeeded);
 
     let refused = served

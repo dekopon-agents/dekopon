@@ -476,7 +476,7 @@ async fn every_operation_instantiates_the_component_exactly_once() {
         CommandRunOutcome::Proposed {
             secret_use: None,
             capability: capability.clone(),
-            input: json!({"text": "héllo"}),
+            input: json!({"text": "", "piped": true}),
         }
     );
     let (output_assets, output_stdout) = fixture::piped_stdout();
@@ -543,7 +543,11 @@ async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_len
     .await
     .expect("command-line provider loads");
     let outcome = registry
-        .run_command("probe", &["count".to_owned(), "x".repeat(5_000)], false)
+        .run_command(
+            "probe",
+            &["count".to_owned(), "--text".to_owned(), "x".repeat(5_000)],
+            false,
+        )
         .await
         .expect("an argument inside the fixture's bound proposes");
     assert!(
@@ -561,7 +565,7 @@ async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_len
     );
     assert_eq!(
         recorded(&capture, "provider.run_command", "command.arguments.bytes"),
-        vec![5_012],
+        vec![5_021],
         "{rendered}"
     );
     let output = recorded(&capture, "provider.run_command", "command.output.bytes");

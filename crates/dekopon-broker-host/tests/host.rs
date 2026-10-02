@@ -247,98 +247,17 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
-    let registry = BrokerProviderRegistry::load(
+async fn fetched_jsonplaceholder_0_3_0_is_refused_at_load() {
+    let error = BrokerProviderRegistry::load(
         [provider_fixture("jsonplaceholder-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("JSONPlaceholder provider loads without description-time HTTP");
-
-    let get_body = br#"{"userId":2,"id":7,"title":"mock title","body":"mock body"}"#;
-    let get_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        get_body.len(),
-        String::from_utf8_lossy(get_body)
-    );
-    let get_server = LoopbackServer::once(get_response.as_bytes());
-    let get_authority = get_server.authority().to_owned();
-    let (get_assets, get_stdout) = fixture::piped_stdout();
-    let get = registry
-        .invoke(
-            authorized(
-                "jsonplaceholder.posts.get"
-                    .parse()
-                    .expect("valid get capability"),
-                json!({
-                    "postId": 7,
-                    "endpoint": format!("http://{get_authority}")
-                }),
-                http_constraints(get_authority.clone(), "GET"),
-            ),
-            None,
-            get_assets,
-        )
-        .await
-        .expect("authorized JSONPlaceholder read succeeds");
-    let get_stdout = get_stdout.json();
-    assert_eq!(get_stdout["post"]["id"], 7);
-    assert_eq!(get.http_calls.len(), 1);
-    assert_eq!(get.http_calls[0].method, "GET");
+    .expect_err("string-returning invoke does not load on the stream world");
     assert!(
-        get_server
-            .request()
-            .starts_with(b"GET /posts/7 HTTP/1.1\r\n")
+        matches!(error, BrokerHostError::Instantiate { .. }),
+        "{error:?}"
     );
-    get_server.join();
-
-    let create_body = br#"{"userId":3,"id":101,"title":"created title","body":"created body"}"#;
-    let create_response = format!(
-        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        create_body.len(),
-        String::from_utf8_lossy(create_body)
-    );
-    let create_server = LoopbackServer::once(create_response.as_bytes());
-    let create_authority = create_server.authority().to_owned();
-    let (create_assets, create_stdout) = fixture::piped_stdout();
-    let create = registry
-        .invoke(
-            authorized(
-                "jsonplaceholder.posts.create"
-                    .parse()
-                    .expect("valid create capability"),
-                json!({
-                    "userId": 3,
-                    "title": "created title",
-                    "body": "created body",
-                    "endpoint": format!("http://{create_authority}")
-                }),
-                http_constraints(create_authority.clone(), "POST"),
-            ),
-            None,
-            create_assets,
-        )
-        .await
-        .expect("authorized JSONPlaceholder write succeeds");
-    let create_stdout = create_stdout.json();
-    assert_eq!(create_stdout["post"]["id"], 101);
-    assert_eq!(create.http_calls.len(), 1);
-    assert_eq!(create.http_calls[0].method, "POST");
-    let request = create_server.request();
-    assert!(request.starts_with(b"POST /posts HTTP/1.1\r\n"));
-    let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-    assert!(!request_text.contains("authorization:"));
-    assert!(!request_text.contains("cookie:"));
-    let body_offset = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("POST headers terminate")
-        + 4;
-    assert_eq!(
-        serde_json::from_slice::<Value>(&request[body_offset..]).expect("POST body is JSON"),
-        json!({"userId": 3, "title": "created title", "body": "created body"})
-    );
-    create_server.join();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -841,7 +760,7 @@ async fn a_loopback_pin_does_not_disable_tls_hostname_verification() {
         .await
         .expect_err("pinned address and CA do not bypass hostname verification");
     assert!(
-        matches!(failure.error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("http-failed: ")),
+        matches!(failure.error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("tls: ")),
         "{failure:?}"
     );
     assert_eq!(failure.http_calls[0].status, None);
@@ -1164,7 +1083,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
         CommandRunOutcome::Proposed {
             secret_use: None,
             capability: capability.clone(),
-            input: json!({"text": "héllo"}),
+            input: json!({"text": "", "piped": true}),
         }
     );
     let (output_assets, output_stdout) = fixture::piped_stdout();
@@ -1328,7 +1247,7 @@ async fn concurrent_small_guest_stores_do_not_reserve_their_maximum() {
         .error;
     assert!(
         matches!(error.as_ref(), BrokerHostError::Timeout { .. })
-            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("http-failed: ")),
+            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("timeout: ")),
         "the second store ran; a budget refusal would be MemoryBudgetExhausted: {error:?}"
     );
 
@@ -2097,6 +2016,7 @@ async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_
     .unwrap();
     registry.set_assets(directory.clone());
     for mode in ["attach", "fail", "trap", "timeout", "catch-denied"] {
+        let (piped, stdout) = fixture::piped_stdout();
         let constraints = ExecutionConstraints {
             timeout_ms: if mode == "timeout" { 10 } else { 5000 },
             asset: Some(AssetConstraints {
@@ -2113,7 +2033,7 @@ async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_
                     constraints,
                 ),
                 None,
-                Default::default(),
+                piped,
             )
             .await;
         match mode {
@@ -2138,6 +2058,10 @@ async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_
                 }
             )),
             _ => unreachable!(),
+        }
+        let bytes = stdout.bytes();
+        if mode == "attach" {
+            assert_eq!(bytes, b"{\"ok\":true}\n");
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         directory

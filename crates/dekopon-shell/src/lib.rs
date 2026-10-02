@@ -207,6 +207,7 @@ impl Streams {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CapabilityCallResult {
     Succeeded,
+    SucceededWithStderr(String),
     /// The provider ran and exited nonzero, its own failure rather than the host's.
     Exited {
         status: std::num::NonZeroU8,
@@ -392,7 +393,9 @@ impl ExitCode {
     #[must_use]
     pub const fn from_capability_result(result: &CapabilityCallResult) -> Self {
         match result {
-            CapabilityCallResult::Succeeded => Self::SUCCESS,
+            CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
+                Self::SUCCESS
+            }
             CapabilityCallResult::Exited { status, .. } => Self(status.get()),
             CapabilityCallResult::Failed { .. } => Self::FAILURE,
             CapabilityCallResult::Denied { .. } => Self::DENIED,
