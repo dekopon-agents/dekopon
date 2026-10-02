@@ -89,6 +89,12 @@ metering:
     xaviers-conditional-writer:
       meters:
       - {kind: rolling, limit: 200000, period: 5h}
+  # restore:
+  #   kind: quickwit
+  #   endpoint: http://127.0.0.1:7280
+  #   index: otel-logs-v0_9
+  #   delay: 30s
+  #   timeout: 10s
 
 # Optional, same shape as broker.yaml's. Exported spans and log records carry chat text and the
 # canonical subject: the telemetry store is inside the operator's trust boundary and there is no

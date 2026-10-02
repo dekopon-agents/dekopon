@@ -1253,8 +1253,8 @@ metering:
     org: default
     stream: dekopon               # quickwit: `index: otel-logs-v0_9`, and no org or authEnv
     authEnv: DEKOPON_METER_SEARCH_AUTH
-    delayMs: 30000                # default 30000
-    timeoutMs: 10000              # default 10000
+    delay: 30s                    # default 30s
+    timeout: 10s                  # default 10s
     lookbackMax: 7d               # default 7d
 ```
 
@@ -1267,13 +1267,14 @@ metering:
 
 A budget allows a call only if every meter does; the refusal names the meter with the longest wait,
 and a call larger than a meter's whole limit is refused outright ("It can't run as is."). Durations
-are `humantime` strings (`30m`, `5h`, `1d`) of at least one minute. `initial` is `full` or a token
-count no greater than `capacity`. Unknown keys are denied, and every unknown agent, unknown model,
-zero limit, oversized `initial`, and too-short period is reported in one startup failure.
+are `humantime` strings (`30m`, `5h`, `1d`) of at least one minute and at most 366 days. `initial`
+is `full` or a token count no greater than `capacity`. Unknown keys are denied, and every unknown
+agent, unknown model, empty `meters` or `models` list, zero limit, oversized `initial`, and too-short
+or too-long period is reported in one startup failure.
 
 A call costs its input plus output tokens, raw and unweighted. Before a call the gateway reserves an
 estimate — the request's JSON bytes divided by four plus 1,000 per image, raised to the session's
-last reported input plus the new messages' bytes divided by four, plus an output reserve of the
+last reported input plus the new messages' bytes divided by four and 1,000 per new image, plus an output reserve of the
 model's `generation.maxOutputTokens`, else 4,096 for a `reasoning`-class model, else 1,024 — so two
 concurrent sessions cannot both pass and both overspend. When the call ends the reservation is
 swapped for the provider's reported usage; a provider that reports nothing is charged the input
@@ -1286,7 +1287,8 @@ Without `metering`, or for an agent with no budget, spend is unbounded and still
 model call writes one [`meter` record](observability.md#the-meter-charge-record), so a budget added
 later restores real history. A refusal mid-turn ends the turn with the sentence; capability calls
 that already ran stay run. It is logged as `gateway_session_refused` with category `over-budget`,
-never as `gateway_session_failed`, and the message's outcome is `refused`.
+never as `gateway_session_failed` or a `failed` `gateway.progress` record, and the message's outcome
+is `refused`.
 
 Budgets live in gateway memory. They need neither `telemetry` nor `restore`: without them every boot
 starts every window empty. `restore` without `telemetry` is a startup error, because it reads
@@ -1294,8 +1296,8 @@ records this gateway never exports.
 
 ### Restoring token windows at boot is best effort
 
-With `restore`, the gateway serves at once and, after `delayMs`, sends one search, bounded by
-`timeoutMs`, for the `meter` records in `[boot − lookback, boot)`, summed per agent, model, and time
+With `restore` and at least one budget, the gateway serves at once and, after `delay`, sends one
+search, bounded by `timeout`, for the `meter` records in `[boot − lookback, boot)`, summed per agent, model, and time
 bucket. The lookback is the longest history any meter can still see (a fixed window's start, a
 rolling period, twice a session length, or a credit bucket's time to fill), capped at `lookbackMax`;
 the bucket is the larger of one minute and the lookback divided by 500. Fresh meters are built from
