@@ -10,6 +10,7 @@ members = [
     "crates/dekopon-core",
     "crates/dekopon-model",
     "crates/dekopon-model-token-governor",
+    "crates/dekopon-model-proxy",
     "crates/dekopon-http-host",
     "crates/dekopon-policy",
     "crates/dekopon-provider-sdk",
@@ -71,8 +72,10 @@ opentelemetry-otlp = { version = "0.33.0", default-features = false, features = 
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 # The engine `jaq-std`'s `regex` feature already links into `dekopon-shell`. `grep -E`/`sed -E` use
 # that one directly rather than adding a second regex engine to the graph.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 regex-bites = "0.1.6"
 reqwest ={ version = "0.12.28", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "stream"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustix = { version = "1.1.4", features = ["fs", "net", "process"] }
 schemars = "1.2.2"
 semver = { version = "1.0.28", features = ["serde"] }
@@ -84,12 +87,14 @@ tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = { version = "0.3.55", features = ["formatting", "macros"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 url = "2.5.8"
+x509-parser = { version = "0.18.1", default-features = false }
 # Component toolchain pin. Do not touch this unless you are moving all of these in lockstep:
 #   rust-toolchain.toml            one Rust for the workspace, the fixtures and every CI job
 #   Cargo.toml rust-version        the same number, kept for crates.io metadata
@@ -113,6 +118,7 @@ dekopon-core = { version = "0.30.0", path = "crates/dekopon-core", default-featu
 dekopon-http-host = { version = "0.30.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.30.0", path = "crates/dekopon-model" }
 dekopon-model-token-governor = { version = "0.30.0", path = "crates/dekopon-model-token-governor" }
+dekopon-model-proxy = { version = "0.30.0", path = "crates/dekopon-model-proxy" }
 dekopon-policy = { version = "0.30.0", path = "crates/dekopon-policy" }
 dekopon-provider-sdk = { version = "0.30.0", path = "crates/dekopon-provider-sdk" }
 dekopon-provider-sdk-testkit = { version = "0.30.0", path = "crates/dekopon-provider-sdk-testkit" }

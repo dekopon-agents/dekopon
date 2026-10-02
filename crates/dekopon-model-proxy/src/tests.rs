@@ -1,0 +1,581 @@
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::Duration,
+};
+
+use dekopon_core::Redacted;
+use dekopon_model_token_governor::{Budget, MeterSpec, Metering, Tokens, UnixMillis};
+use dekopon_test_support::{CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
+use parking_lot::Mutex;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpListener,
+};
+
+use crate::{Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SUBJECT_HEADER, Upstream};
+
+const SUBJECT: &str = "dekopon:gylmar-vm";
+
+enum Step {
+    Write(Vec<u8>),
+    Wait(Duration),
+}
+
+/// A loopback upstream that records each request and answers with scripted writes and pauses.
+struct FakeUpstream {
+    url: String,
+    requests: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl FakeUpstream {
+    async fn start(steps: Vec<Step>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut stream).await;
+            recorded.lock().push(request);
+            for step in steps {
+                match step {
+                    Step::Write(bytes) => {
+                        if stream.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                        let _flushed = stream.flush().await;
+                    }
+                    Step::Wait(duration) => tokio::time::sleep(duration).await,
+                }
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn request(&self) -> String {
+        String::from_utf8(self.requests.lock()[0].clone()).unwrap()
+    }
+
+    fn body(&self) -> String {
+        let request = self.request();
+        request.split_once("\r\n\r\n").unwrap().1.to_owned()
+    }
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let length = dekopon_test_support::content_length(&request[..end]);
+            if request.len() >= end + 4 + length || read == 0 {
+                return request;
+            }
+        }
+        if read == 0 {
+            return request;
+        }
+    }
+}
+
+fn sse_head() -> Step {
+    Step::Write(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+            .to_vec(),
+    )
+}
+
+fn chunk(bytes: &[u8]) -> Step {
+    let mut out = format!("{:x}\r\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+    Step::Write(out)
+}
+
+fn end() -> Step {
+    Step::Write(b"0\r\n\r\n".to_vec())
+}
+
+fn json(status: &str, body: &str) -> Step {
+    Step::Write(
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+}
+
+fn metering(limit: u64) -> Arc<Metering> {
+    Arc::new(Metering::new(
+        vec![Budget::new(
+            "gylmar".parse().unwrap(),
+            None,
+            &[MeterSpec::Rolling {
+                limit: Tokens(limit),
+                period: Duration::from_secs(5 * 3_600),
+            }],
+            UnixMillis::now(),
+        )],
+        Metering::system_clock(),
+    ))
+}
+
+fn used(metering: &Metering) -> u64 {
+    metering.statuses(&"gylmar".parse().unwrap()).unwrap()[0]
+        .1
+        .used
+        .0
+}
+
+fn models(
+    endpoint: &str,
+    codex: Option<Arc<dekopon_model::chatgpt::CredentialFile>>,
+) -> Vec<ProxyModel> {
+    let mut models = vec![
+        ProxyModel {
+            name: "claude-opus".to_owned(),
+            wire_model: "claude-opus-4-1".to_owned(),
+            backend: "anthropic",
+            reserve: Tokens(10),
+            upstream: Upstream::Anthropic {
+                endpoint: endpoint.to_owned(),
+                api_key: Redacted::new("sk-ant-proxy".to_owned()),
+            },
+        },
+        ProxyModel {
+            name: "glm-flash".to_owned(),
+            wire_model: "z-ai/glm-4.5-air".to_owned(),
+            backend: "openrouter",
+            reserve: Tokens(10),
+            upstream: Upstream::OpenRouter {
+                endpoint: endpoint.to_owned(),
+                api_key: Redacted::new("sk-or-proxy".to_owned()),
+            },
+        },
+    ];
+    if let Some(credential) = codex {
+        models.push(ProxyModel {
+            name: "astra".to_owned(),
+            wire_model: "gpt-5-codex".to_owned(),
+            backend: "codex",
+            reserve: Tokens(10),
+            upstream: Upstream::Codex {
+                endpoint: endpoint.to_owned(),
+                credential,
+            },
+        });
+    }
+    models
+}
+
+struct Running {
+    url: String,
+    metering: Arc<Metering>,
+    client: reqwest::Client,
+}
+
+async fn proxy_with(
+    endpoint: &str,
+    limit: u64,
+    codex: Option<Arc<dekopon_model::chatgpt::CredentialFile>>,
+    ping: Duration,
+) -> Running {
+    let metering = metering(limit);
+    let guests = HashMap::from([(
+        SUBJECT.to_owned(),
+        Grant {
+            agent: "gylmar".parse().unwrap(),
+            models: BTreeSet::from([
+                "claude-opus".to_owned(),
+                "glm-flash".to_owned(),
+                "astra".to_owned(),
+            ]),
+        },
+    )]);
+    let proxy = ModelProxy::new(models(endpoint, codex), guests, Arc::clone(&metering))
+        .unwrap()
+        .with_timing(ping, Duration::from_secs(30));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = Arc::new(proxy).router();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    Running {
+        url,
+        metering,
+        client: reqwest::Client::new(),
+    }
+}
+
+async fn proxy(endpoint: &str, limit: u64) -> Running {
+    proxy_with(endpoint, limit, None, Duration::from_secs(20)).await
+}
+
+impl Running {
+    fn post(&self, path: &str, body: impl Into<reqwest::Body>) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{}{path}", self.url))
+            .header(SUBJECT_HEADER, SUBJECT)
+            .header("content-type", "application/json")
+            .body(body)
+    }
+}
+
+#[derive(Clone, Default)]
+struct MeterRecords(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        if event.metadata().target() == "meter" {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().push(fields.0);
+        }
+    }
+}
+
+fn capture() -> (MeterRecords, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let records = MeterRecords::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(records.clone()));
+    (records, guard)
+}
+
+#[tokio::test]
+async fn a_forwarded_request_changes_only_the_model_and_the_credential() {
+    let upstream = FakeUpstream::start(vec![json(
+        "200 OK",
+        r#"{"id":"x","usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+    )])
+    .await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let body = "{\"model\": \"glm-flash\",\n \"messages\":[{\"role\":\"user\",\"content\":\"hi \\u00e9\"}], \"stream\":false}";
+    let response = running
+        .post("/v1/chat/completions", body)
+        .header("authorization", "Bearer guest-token")
+        .header("x-api-key", "guest-key")
+        .header("x-request-id", "req-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.unwrap(),
+        r#"{"id":"x","usage":{"prompt_tokens":5,"completion_tokens":2}}"#
+    );
+    assert_eq!(
+        upstream.body(),
+        "{\"model\": \"z-ai/glm-4.5-air\",\n \"messages\":[{\"role\":\"user\",\"content\":\"hi \\u00e9\"}], \"stream\":false}"
+    );
+    let request = upstream.request().to_ascii_lowercase();
+    assert!(
+        request.starts_with("post /v1/chat/completions "),
+        "{request}"
+    );
+    assert!(
+        request.contains("authorization: bearer sk-or-proxy"),
+        "{request}"
+    );
+    assert!(request.contains("x-request-id: req-7"), "{request}");
+    assert!(
+        !request.contains("guest-token") && !request.contains("guest-key"),
+        "{request}"
+    );
+    assert!(!request.contains(SUBJECT), "{request}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(used(&running.metering), 7);
+}
+
+#[tokio::test]
+async fn a_codex_request_is_forced_unstored_and_must_stream() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("auth.json");
+    std::fs::write(&path, r#"{"version":1,"access":"synthetic-access","refresh":"synthetic","expiresAt":18446744073709551615,"accountId":"acct-1"}"#).unwrap();
+    let credential = Arc::new(
+        dekopon_model::chatgpt::CredentialFile::open(&path, Duration::from_secs(2)).unwrap(),
+    );
+    let mut steps = vec![Step::Write(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n".to_vec(),
+    )];
+    steps.push(Step::Write(CODEX_RESPONSES_TWO_DELTAS.as_bytes().to_vec()));
+    let upstream = FakeUpstream::start(steps).await;
+    let running = proxy_with(
+        &upstream.url,
+        100_000,
+        Some(credential),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let refused = running
+        .post("/v1/responses", r#"{"model":"astra","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+
+    let streamed = running
+        .post(
+            "/v1/responses",
+            r#"{"model":"astra","store":true,"stream":true,"input":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), 200);
+    assert_eq!(streamed.text().await.unwrap(), CODEX_RESPONSES_TWO_DELTAS);
+    assert_eq!(
+        upstream.body(),
+        r#"{"model":"gpt-5-codex","store":false,"stream":true,"input":[]}"#
+    );
+    let request = upstream.request().to_ascii_lowercase();
+    assert!(
+        request.contains("authorization: bearer synthetic-access"),
+        "{request}"
+    );
+    assert!(request.contains("chatgpt-account-id: acct-1"), "{request}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(used(&running.metering), 150);
+}
+
+fn refusal_shape<'a>(dialect_path: &str, body: &'a serde_json::Value) -> Option<&'a str> {
+    match dialect_path {
+        "/v1/messages" => {
+            assert_eq!(body["type"], "error");
+            body["error"]["type"].as_str()
+        }
+        _ => body["error"]["code"].as_str(),
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
+    let running = proxy("http://127.0.0.1:9", 2_000).await;
+    let spent = running
+        .metering
+        .admit(
+            dekopon_model_token_governor::Call {
+                agent: "gylmar".parse().unwrap(),
+                model: "glm-flash".to_owned(),
+                backend: "openrouter",
+                via: dekopon_model_token_governor::Via::Agent,
+            },
+            dekopon_model_token_governor::Estimate {
+                input: Tokens(1_990),
+                output_reserve: Tokens(0),
+            },
+        )
+        .unwrap();
+    spent.settle(dekopon_model_token_governor::Outcome::Failed);
+    for (path, model, expected) in [
+        ("/v1/messages", "claude-opus", "rate_limit_error"),
+        ("/v1/chat/completions", "glm-flash", "rate_limit_exceeded"),
+    ] {
+        let response = running
+            .post(
+                path,
+                format!(r#"{{"model":"{model}","stream":true,"messages":[]}}"#),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429, "{path}");
+        let retry: u64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(retry > 60, "{path}: {retry}");
+        let body: serde_json::Value = json_body(response).await;
+        assert_eq!(refusal_shape(path, &body), Some(expected), "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("The agent gylmar is at 99% of its token budget"),
+            "{message}"
+        );
+    }
+    let huge = format!(
+        r#"{{"model":"claude-opus","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(20_000)
+    );
+    let response = running.post("/v1/messages", huge).send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.headers().get("retry-after").is_none());
+    let body: serde_json::Value = json_body(response).await;
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("prompt is too long"), "{message}");
+    assert!(message.contains("can't run as is"), "{message}");
+}
+
+#[tokio::test]
+async fn an_unknown_subject_is_forbidden_and_an_ungranted_model_is_not_found() {
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    let response = running
+        .client
+        .post(format!("{}/v1/messages", running.url))
+        .header(SUBJECT_HEADER, "dekopon:stranger-vm")
+        .body(r#"{"model":"claude-opus"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let body: serde_json::Value = json_body(response).await;
+    assert_eq!(body["error"]["type"], "permission_error");
+    for (path, model) in [
+        ("/v1/messages", "terra"),
+        ("/v1/messages", "glm-flash"),
+        ("/v1/chat/completions", "claude-opus"),
+    ] {
+        let response = running
+            .post(path, format!(r#"{{"model":"{model}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path} {model}");
+    }
+}
+
+#[tokio::test]
+async fn a_body_over_the_cap_is_refused_with_413() {
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            vec![b' '; MAX_BODY_BYTES + 1024 * 1024],
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+    let body: serde_json::Value = json_body(response).await;
+    assert_eq!(body["error"]["code"], "request_too_large");
+}
+
+#[tokio::test]
+async fn count_tokens_is_forwarded_and_never_charged() {
+    let (records, _guard) = capture();
+    let upstream = FakeUpstream::start(vec![json("200 OK", r#"{"input_tokens":2095}"#)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post(
+            "/v1/messages/count_tokens",
+            r#"{"model":"claude-opus","messages":[]}"#,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), r#"{"input_tokens":2095}"#);
+    let request = upstream.request().to_ascii_lowercase();
+    assert!(
+        request.starts_with("post /v1/messages/count_tokens "),
+        "{request}"
+    );
+    assert!(request.contains("x-api-key: sk-ant-proxy"), "{request}");
+    assert!(
+        request.contains("anthropic-version: 2023-06-01"),
+        "{request}"
+    );
+    assert_eq!(used(&running.metering), 0);
+    assert!(records.0.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_silent_upstream_stream_carries_pings() {
+    let upstream = FakeUpstream::start(vec![
+        sse_head(),
+        chunk(
+            OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+                .split_inclusive("\n\n")
+                .next()
+                .unwrap()
+                .as_bytes(),
+        ),
+        Step::Wait(Duration::from_millis(400)),
+        chunk(
+            OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+                .split_once("\n\n")
+                .unwrap()
+                .1
+                .as_bytes(),
+        ),
+        end(),
+    ])
+    .await;
+    let running = proxy_with(&upstream.url, 100_000, None, Duration::from_millis(100)).await;
+    let text = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","stream":true,"messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.matches(": ping\n\n").count() >= 2, "{text}");
+    assert_eq!(
+        text.replace(": ping\n\n", ""),
+        OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+    );
+}
+
+#[tokio::test]
+async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
+    let (records, _guard) = capture();
+    let first = OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+        .split_inclusive("\n\n")
+        .take(3)
+        .collect::<String>();
+    let upstream = FakeUpstream::start(vec![
+        sse_head(),
+        chunk(first.as_bytes()),
+        Step::Wait(Duration::from_secs(10)),
+    ])
+    .await;
+    let running = proxy_with(&upstream.url, 100_000, None, Duration::from_millis(50)).await;
+    let body = r#"{"model":"glm-flash","stream":true,"messages":[]}"#;
+    let mut response = running
+        .post("/v1/chat/completions", body)
+        .send()
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("hello.") {
+        seen.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+    }
+    drop(response);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while records.0.lock().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let records = records.0.lock().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
+    assert!(records[0].contains("meter.via=\"proxy\""), "{records:?}");
+    let input = Tokens::from_bytes(body.replace("glm-flash", "z-ai/glm-4.5-air").len()).0;
+    assert_eq!(
+        used(&running.metering),
+        input + Tokens::from_bytes("Echoed hello.".len()).0
+    );
+}
+
+async fn json_body(response: reqwest::Response) -> serde_json::Value {
+    serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+}

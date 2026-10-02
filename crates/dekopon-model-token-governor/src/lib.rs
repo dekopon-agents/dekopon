@@ -16,7 +16,7 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
-pub use budget::{Budget, Refusal, Reservation, Retry};
+pub use budget::{Budget, GuestRefusal, Refusal, Reservation, Retry};
 pub use meter::{Meter, MeterKind, MeterSpec, MeterStatus, Tokens, UnixMillis, Verdict};
 pub use metering::{
     Admission, Call, Clock, DEFAULT_OUTPUT_RESERVE, Estimate, HistoryRow, IMAGE_TOKENS, InputHint,

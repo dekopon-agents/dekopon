@@ -1079,6 +1079,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-model-proxy"
+version = "0.30.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "dekopon-core",
+ "dekopon-model",
+ "dekopon-model-token-governor",
+ "dekopon-test-support",
+ "futures-util",
+ "http",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "x509-parser",
+]
+
+[[package]]
 name = "dekopon-model-token-governor"
 version = "0.30.0"
 dependencies = [
