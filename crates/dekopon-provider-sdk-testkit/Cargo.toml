@@ -26,7 +26,7 @@ parking_lot.workspace = true
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
-wasmparser = { version = "=0.254.0", default-features = false, features = ["component-model"] }
+wasmparser = { version = "=0.254.2", default-features = false, features = ["component-model"] }
 
 [dev-dependencies]
 tempfile.workspace = true
