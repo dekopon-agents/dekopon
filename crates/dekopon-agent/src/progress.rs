@@ -153,7 +153,6 @@ pub enum ToolOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClass {
     StepBudget,
-    OverBudget,
     Model,
     Internal,
 }
@@ -162,9 +161,9 @@ impl FailureClass {
     #[must_use]
     pub fn of(error: &PromptError) -> Option<Self> {
         match error {
-            PromptError::Cancelled | PromptError::Model(InferenceError::Cancelled) => None,
+            PromptError::Cancelled
+            | PromptError::Model(InferenceError::Cancelled | InferenceError::OverBudget(_)) => None,
             PromptError::MaxSteps { .. } => Some(Self::StepBudget),
-            PromptError::Model(InferenceError::OverBudget(_)) => Some(Self::OverBudget),
             PromptError::ZeroSteps => Some(Self::Internal),
             PromptError::Model(_)
             | PromptError::UnknownTool(_)
@@ -313,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_refusal_is_not_a_model_failure() {
+    fn a_budget_refusal_is_not_a_failure() {
         let refusal = dekopon_model_token_governor::Refusal {
             agent: "gylmar".parse().unwrap(),
             meter: dekopon_model_token_governor::MeterKind::Credit,
@@ -324,7 +323,7 @@ mod tests {
         };
         assert_eq!(
             FailureClass::of(&PromptError::Model(InferenceError::OverBudget(refusal))),
-            Some(FailureClass::OverBudget)
+            None
         );
     }
 }

@@ -15,7 +15,7 @@ use dekopon_model::{
     model::{AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool},
 };
 use dekopon_model_token_governor::{
-    Budget, Call, Estimate, InputHint, MeterSpec, Metering, Outcome, Tokens, Via,
+    Budget, Call, Estimate, InputHint, MeterSpec, Metering, Outcome, Sizes, Tokens, Via,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::{config::ModelConfig, session::SharedModel};
 
 const MIN_PERIOD: Duration = Duration::from_secs(60);
+const MAX_PERIOD: Duration = Duration::from_secs(366 * 86_400);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -108,9 +109,9 @@ pub enum RestoreConfig {
         stream: String,
         auth_env: String,
         #[serde(default)]
-        delay_ms: RestoreDelay,
+        delay: RestoreDelay,
         #[serde(default)]
-        timeout_ms: RestoreTimeout,
+        timeout: RestoreTimeout,
         #[serde(default)]
         lookback_max: LookbackMax,
     },
@@ -118,9 +119,9 @@ pub enum RestoreConfig {
         endpoint: String,
         index: String,
         #[serde(default)]
-        delay_ms: RestoreDelay,
+        delay: RestoreDelay,
         #[serde(default)]
-        timeout_ms: RestoreTimeout,
+        timeout: RestoreTimeout,
         #[serde(default)]
         lookback_max: LookbackMax,
     },
@@ -128,21 +129,21 @@ pub enum RestoreConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(transparent)]
-pub struct RestoreDelay(pub u64);
+pub struct RestoreDelay(pub HumanDuration);
 
 impl Default for RestoreDelay {
     fn default() -> Self {
-        Self(30_000)
+        Self(HumanDuration(Duration::from_secs(30)))
     }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(transparent)]
-pub struct RestoreTimeout(pub u64);
+pub struct RestoreTimeout(pub HumanDuration);
 
 impl Default for RestoreTimeout {
     fn default() -> Self {
-        Self(10_000)
+        Self(HumanDuration(Duration::from_secs(10)))
     }
 }
 
@@ -159,9 +160,7 @@ impl Default for LookbackMax {
 impl RestoreConfig {
     pub(crate) const fn delay(&self) -> Duration {
         match self {
-            Self::Openobserve { delay_ms, .. } | Self::Quickwit { delay_ms, .. } => {
-                Duration::from_millis(delay_ms.0)
-            }
+            Self::Openobserve { delay, .. } | Self::Quickwit { delay, .. } => delay.0.0,
         }
     }
 
@@ -175,9 +174,7 @@ impl RestoreConfig {
 
     pub(crate) const fn timeout(&self) -> Duration {
         match self {
-            Self::Openobserve { timeout_ms, .. } | Self::Quickwit { timeout_ms, .. } => {
-                Duration::from_millis(timeout_ms.0)
-            }
+            Self::Openobserve { timeout, .. } | Self::Quickwit { timeout, .. } => timeout.0.0,
         }
     }
 }
@@ -188,6 +185,10 @@ pub enum MeteringProblem {
     UnknownAgent { agent: String },
     #[error("metering budget for {agent:?} names unknown model {model:?}")]
     UnknownModel { agent: String, model: String },
+    #[error("metering budget for {agent:?} lists no meters")]
+    EmptyMeters { agent: String },
+    #[error("metering budget for {agent:?} lists no models; omit models to cover every model")]
+    EmptyModels { agent: String },
     #[error("metering budget for {agent:?}: meter {meter} must have a limit above zero")]
     ZeroLimit { agent: String, meter: usize },
     #[error(
@@ -196,9 +197,11 @@ pub enum MeteringProblem {
     InitialAboveCapacity { agent: String, meter: usize },
     #[error("metering budget for {agent:?}: meter {meter} has a period shorter than one minute")]
     PeriodTooShort { agent: String, meter: usize },
+    #[error("metering budget for {agent:?}: meter {meter} has a period longer than 366 days")]
+    PeriodTooLong { agent: String, meter: usize },
     #[error("metering.restore reads records this gateway never exports; add a telemetry block")]
     RestoreWithoutTelemetry,
-    #[error("metering.restore timeoutMs must be greater than zero")]
+    #[error("metering.restore timeout must be greater than zero")]
     ZeroRestoreTimeout,
 }
 
@@ -233,6 +236,16 @@ pub(crate) fn resolve(
             .filter(|_| agents.contains(&agent));
         if id.is_none() {
             problems.push(MeteringProblem::UnknownAgent {
+                agent: agent.clone(),
+            });
+        }
+        if budget.meters.is_empty() {
+            problems.push(MeteringProblem::EmptyMeters {
+                agent: agent.clone(),
+            });
+        }
+        if budget.models.as_ref().is_some_and(Vec::is_empty) {
+            problems.push(MeteringProblem::EmptyModels {
                 agent: agent.clone(),
             });
         }
@@ -343,6 +356,12 @@ fn spec(
             meter,
         });
     }
+    if period > MAX_PERIOD {
+        problems.push(MeteringProblem::PeriodTooLong {
+            agent: agent.to_owned(),
+            meter,
+        });
+    }
     spec
 }
 
@@ -444,9 +463,17 @@ impl ChatModel for ChatProviderGovernor {
         let seen = self.seen.swap(messages.len(), Ordering::Relaxed);
         let fresh = messages.get(seen..).unwrap_or(messages);
         let estimate = Estimate::from_sizes(
-            json_bytes(messages).saturating_add(json_bytes(tools)),
-            images(messages),
-            Some((&self.hint, json_bytes(fresh))),
+            Sizes {
+                bytes: json_bytes(messages).saturating_add(json_bytes(tools)),
+                images: images(messages),
+            },
+            Some((
+                &self.hint,
+                Sizes {
+                    bytes: json_bytes(fresh),
+                    images: images(fresh),
+                },
+            )),
             self.reserve,
         );
         let admission = self
@@ -625,8 +652,11 @@ mod tests {
         let metering = metering(LIMIT);
         ask(&governed(streaming(None), &metering)).unwrap();
         let input = Estimate::from_sizes(
-            json_bytes(&[ModelMessage::user("x".repeat(400))]) + json_bytes::<[ModelTool]>(&[]),
-            0,
+            Sizes {
+                bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
+                    + json_bytes::<[ModelTool]>(&[]),
+                images: 0,
+            },
             None,
             Tokens(0),
         )
@@ -724,6 +754,17 @@ mod tests {
             }
         );
         assert_eq!(resolved.budgets[0].meters.len(), 5);
+        let restore = parse(
+            "restore: {kind: quickwit, endpoint: 'http://quickwit:7280', index: otel-logs-v0_9, delay: 45s, timeout: 3s}",
+        )
+        .unwrap()
+        .restore
+        .unwrap();
+        assert_eq!(restore.delay(), Duration::from_secs(45));
+        assert_eq!(restore.timeout(), Duration::from_secs(3));
+        assert!(
+            parse("restore: {kind: quickwit, endpoint: 'http://quickwit:7280', index: otel-logs-v0_9, delayMs: 30000}").is_err()
+        );
         assert!(
             parse(
                 "budgets: {reviewer: {meters: [{kind: rolling, limit: 1, period: 5h, extra: 1}]}}"
@@ -739,13 +780,13 @@ mod tests {
     #[test]
     fn every_metering_problem_is_reported_at_once() {
         let config = parse(
-            "budgets:\n  ghost:\n    meters: [{kind: rolling, limit: 10, period: 5h}]\n  reviewer:\n    models: [nope]\n    meters:\n    - {kind: fixed, limit: 0, period: 1d}\n    - {kind: rolling, limit: 10, period: 30s}\n    - {kind: credit, capacity: 10, refill: 1, per: 1h, initial: 11}\nrestore: {kind: quickwit, endpoint: 'http://quickwit:7280', index: otel-logs-v0_9}\n",
+            "budgets:\n  ghost:\n    meters: [{kind: rolling, limit: 10, period: 5h}]\n  idle:\n    models: []\n    meters: []\n  reviewer:\n    models: [nope]\n    meters:\n    - {kind: fixed, limit: 0, period: 1d}\n    - {kind: rolling, limit: 10, period: 30s}\n    - {kind: credit, capacity: 10, refill: 1, per: 1h, initial: 11}\n    - {kind: session, limit: 10, length: 400d}\nrestore: {kind: quickwit, endpoint: 'http://quickwit:7280', index: otel-logs-v0_9, timeout: 0s}\n",
         )
         .unwrap();
         let mut problems = Vec::new();
         resolve(
             Some(config),
-            &BTreeSet::from(["reviewer".to_owned()]),
+            &BTreeSet::from(["idle".to_owned(), "reviewer".to_owned()]),
             &BTreeSet::from(["local".to_owned()]),
             false,
             &mut problems,
@@ -755,6 +796,12 @@ mod tests {
             [
                 MeteringProblem::UnknownAgent {
                     agent: "ghost".to_owned()
+                },
+                MeteringProblem::EmptyMeters {
+                    agent: "idle".to_owned()
+                },
+                MeteringProblem::EmptyModels {
+                    agent: "idle".to_owned()
                 },
                 MeteringProblem::UnknownModel {
                     agent: "reviewer".to_owned(),
@@ -772,7 +819,12 @@ mod tests {
                     agent: "reviewer".to_owned(),
                     meter: 2
                 },
+                MeteringProblem::PeriodTooLong {
+                    agent: "reviewer".to_owned(),
+                    meter: 3
+                },
                 MeteringProblem::RestoreWithoutTelemetry,
+                MeteringProblem::ZeroRestoreTimeout,
             ]
         );
     }

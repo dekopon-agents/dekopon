@@ -20,6 +20,6 @@ pub use budget::{Budget, GuestRefusal, Refusal, Reservation, Retry};
 pub use meter::{Meter, MeterKind, MeterSpec, MeterStatus, Tokens, UnixMillis, Verdict};
 pub use metering::{
     Admission, Call, Clock, DEFAULT_OUTPUT_RESERVE, Estimate, HistoryRow, IMAGE_TOKENS, InputHint,
-    Metering, Outcome, REASONING_OUTPUT_RESERVE, Via,
+    Metering, Outcome, REASONING_OUTPUT_RESERVE, Sizes, Via,
 };
 pub use usage::ModelUsage;

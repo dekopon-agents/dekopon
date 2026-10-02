@@ -87,7 +87,7 @@ pub(crate) fn spawn(
     ca_certificate: Option<Vec<u8>>,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
-    if let Some(restore) = restore {
+    if let Some(restore) = restore.filter(|_| metering.has_budgets()) {
         tasks.spawn(restore_once(
             Arc::clone(metering),
             restore,
@@ -480,7 +480,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::metering::{LookbackMax, RestoreDelay, RestoreTimeout};
+    use crate::metering::{HumanDuration, LookbackMax, RestoreDelay, RestoreTimeout};
 
     const HOUR: i64 = 3_600_000;
 
@@ -619,12 +619,12 @@ mod tests {
         admission.settle(dekopon_model_token_governor::Outcome::Failed);
     }
 
-    fn quickwit(endpoint: String, timeout_ms: u64) -> RestoreConfig {
+    fn quickwit(endpoint: String, timeout: Duration) -> RestoreConfig {
         RestoreConfig::Quickwit {
             endpoint,
             index: "otel-logs-v0_9".to_owned(),
-            delay_ms: RestoreDelay(0),
-            timeout_ms: RestoreTimeout(timeout_ms),
+            delay: RestoreDelay(HumanDuration(Duration::ZERO)),
+            timeout: RestoreTimeout(HumanDuration(timeout)),
             lookback_max: LookbackMax::default(),
         }
     }
@@ -662,7 +662,7 @@ mod tests {
         charge(&metering, 7);
         restore_once(
             Arc::clone(&metering),
-            quickwit(endpoint, 5_000),
+            quickwit(endpoint, Duration::from_secs(5)),
             None,
             UnixMillis(now),
         )
@@ -678,7 +678,7 @@ mod tests {
         charge(&metering, 7);
         restore_once(
             Arc::clone(&metering),
-            quickwit(endpoint, 50),
+            quickwit(endpoint, Duration::from_millis(50)),
             None,
             UnixMillis::now(),
         )
@@ -695,7 +695,7 @@ mod tests {
         charge(&metering, 7);
         restore_once(
             Arc::clone(&metering),
-            quickwit("http://127.0.0.1:9".to_owned(), 50),
+            quickwit("http://127.0.0.1:9".to_owned(), Duration::from_millis(50)),
             None,
             UnixMillis(0),
         )
@@ -708,6 +708,22 @@ mod tests {
         let metering = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
         let mut tasks = tokio::task::JoinSet::new();
         spawn(&metering, None, None, &mut tasks);
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_without_budgets_starts_no_restore_task() {
+        let metering = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
+        let mut tasks = tokio::task::JoinSet::new();
+        spawn(
+            &metering,
+            Some(quickwit(
+                "http://127.0.0.1:9".to_owned(),
+                Duration::from_millis(50),
+            )),
+            None,
+            &mut tasks,
+        );
         assert!(tasks.is_empty());
     }
 }

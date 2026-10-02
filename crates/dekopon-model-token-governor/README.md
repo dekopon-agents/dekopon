@@ -27,7 +27,7 @@ image, raised to the session's last settled input plus the new bytes, and an out
 ```rust
 use std::{sync::Arc, time::Duration};
 use dekopon_model_token_governor::{
-    Budget, Call, Estimate, MeterSpec, Metering, Outcome, Tokens, UnixMillis, Via,
+    Budget, Call, Estimate, MeterSpec, Metering, Outcome, Sizes, Tokens, UnixMillis, Via,
 };
 
 let agent = "gylmar".parse().unwrap();
@@ -40,7 +40,7 @@ let budget = Budget::new(
 let metering = Arc::new(Metering::new(vec![budget], Metering::system_clock()));
 let call = Call { agent: "gylmar".parse().unwrap(), model: "astra".into(), backend: "codex", via: Via::Agent };
 let admission = metering
-    .admit(call, Estimate::from_sizes(4_000, 0, None, Tokens(1_024)))
+    .admit(call, Estimate::from_sizes(Sizes { bytes: 4_000, images: 0 }, None, Tokens(1_024)))
     .expect("an empty budget admits");
 admission.observe_text(120);
 admission.settle(Outcome::Succeeded);

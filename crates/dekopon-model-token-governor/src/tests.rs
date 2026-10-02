@@ -14,7 +14,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt as _};
 
 use crate::{
     Budget, Call, Estimate, HistoryRow, InputHint, Meter, MeterKind, MeterSpec, Metering,
-    ModelUsage, Outcome, Refusal, Retry, Tokens, UnixMillis, Verdict, Via,
+    ModelUsage, Outcome, Refusal, Retry, Sizes, Tokens, UnixMillis, Verdict, Via,
 };
 
 const MINUTE: i64 = 60_000;
@@ -217,6 +217,14 @@ fn a_second_caller_sees_the_first_callers_reservation() {
     assert!(budget.reserve(at(0), Tokens(31)).is_err());
     budget.settle(first, at(0), Tokens(20));
     assert!(budget.reserve(at(0), Tokens(80)).is_ok());
+}
+
+#[test]
+fn a_refusal_counts_reservations_in_flight_as_spent() {
+    let mut budget = budget(&specs()[1..2]);
+    let _first = budget.reserve(at(0), Tokens(70)).unwrap();
+    let refusal = budget.reserve(at(0), Tokens(40)).unwrap_err();
+    assert_eq!(refusal.remaining, 30);
 }
 
 #[test]
@@ -663,8 +671,10 @@ fn restore_applies_only_matching_rows_and_replays_the_live_tail() {
 #[test]
 fn the_estimate_takes_the_larger_of_the_bytes_and_the_hint() {
     let hint = InputHint::default();
+    let whole = |images| Sizes { bytes: 400, images };
+    let fresh = |images| Sizes { bytes: 40, images };
     assert_eq!(
-        Estimate::from_sizes(400, 1, Some((&hint, 40)), Tokens(5)).input,
+        Estimate::from_sizes(whole(1), Some((&hint, fresh(1))), Tokens(5)).input,
         Tokens(1_100)
     );
     hint.observe(&ModelUsage {
@@ -672,8 +682,12 @@ fn the_estimate_takes_the_larger_of_the_bytes_and_the_hint() {
         ..ModelUsage::default()
     });
     assert_eq!(
-        Estimate::from_sizes(400, 0, Some((&hint, 40)), Tokens(5)).input,
+        Estimate::from_sizes(whole(0), Some((&hint, fresh(0))), Tokens(5)).input,
         Tokens(5_010)
+    );
+    assert_eq!(
+        Estimate::from_sizes(whole(1), Some((&hint, fresh(1))), Tokens(5)).input,
+        Tokens(6_010)
     );
     assert_eq!(Estimate::output_reserve(None, true), Tokens(4_096));
     assert_eq!(Estimate::output_reserve(Some(7), true), Tokens(7));
