@@ -1316,6 +1316,76 @@ one capacity. Restore also assumes that two gateways never run at once, which th
 deployment strategy guarantees: a rolling update would let the old process spend while the new one
 restores. No serving path waits on restore, and nothing reconciles it later.
 
+## Guest model proxy
+
+An optional `proxy` block serves model APIs to Firecracker guests, so `claude`, `pi` or `codex`
+inside a VM run with no credentials of their own and spend their agent's
+[token budget](#token-budgets). It is its own listener, separate from every transport, and is
+reachable only through the jail's egress gateway; it has no IngressRoute or public route.
+
+```yaml
+proxy:
+  bind: 0.0.0.0:9090
+  tls:                                   # required: there is no plaintext mode
+    certFile: /etc/dekopon-proxy-tls/tls.crt
+    keyFile: /etc/dekopon-proxy-tls/tls.key
+    clientCaFile: /etc/dekopon-proxy-tls/ca.crt
+  jailIdentity: spiffe://homelab/ns/vm-runner/sa/vm-runner-jail   # the client cert's exact URI SAN
+  guests:
+    dekopon:gylmar-vm: {agent: gylmar, models: [astra, glm-flash, claude-opus]}
+```
+
+| Path | Dialect | Upstream |
+|---|---|---|
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic Messages | a `kind: anthropic` model |
+| `POST /v1/responses` | OpenAI Responses | a `chatgptSubscription` model (Codex) |
+| `POST /v1/chat/completions` | OpenAI chat completions | an `openrouter` model |
+
+- **Identity.** The client certificate must chain to `clientCaFile` and carry `jailIdentity` as a
+  URI SAN, or the TLS handshake fails. The jail names the VM in `x-dekopon-vm-subject`; an
+  unlisted subject gets a 403. See [the security model](security-model.md#the-guest-model-proxy-trusts-the-jail-to-name-its-vm).
+- **Models.** A guest names a configured model (`astra`, `claude-opus`), never an upstream id.
+  A model outside the guest's list, or one the path's dialect cannot reach, gets a 404. The proxy
+  rewrites `model` to the configured upstream id and injects the upstream credential. It drops
+  the guest's `authorization` and `x-api-key`, and passes `anthropic-version`, `anthropic-beta`
+  and `x-request-id` unchanged. Every other body byte is forwarded as the guest sent it.
+- **Codex.** The proxy forces `store: false` and refuses `stream: false` with a 400, because the
+  ChatGPT backend requires both. On a 401 it retries once after a forced refresh of the same
+  credential file the gateway's own client uses.
+- **`kind: anthropic`** (`name`, `model`, `apiKeyEnv`) is proxy-only for now. A route that selects
+  one is a startup error.
+- **Metering.** Every call except `count_tokens` is admitted against the agent's budget before
+  it is sent. The estimate is the body's bytes divided by four, plus 1,000 per image, plus the
+  model's output reserve. A refusal is the dialect's own throttling error: a 429 with
+  `rate_limit_error` (Anthropic) or `rate_limit_exceeded` (OpenAI), a `retry-after` header, and
+  the budget sentence in the third person. A request that can never fit is a plain 400
+  `invalid_request_error`, never worded as "prompt is too long", which Claude Code would read as
+  a reason to compact and retry. Usage is read from each streamed event as it passes. A client
+  that disconnects is charged what had streamed, and the `meter` record says `meter.via = "proxy"`.
+- **Streaming.** Responses stream back unbuffered. While the upstream is silent, the proxy
+  writes an SSE comment `: ping` every 20 seconds, under the jail's 90-second idle timer; both SDKs
+  ignore comment lines. An upstream silent for 300 seconds ends the stream. There is no total
+  timeout: the client's disconnect and the budget bound a call.
+- **Bounds.** A request body over 32 MiB gets a 413 in the dialect's error shape. At most 256
+  connections are served at once.
+- **Rotation.** The listener rereads its certificate, key and client CA when their mtime changes,
+  checked on each connection, so cert-manager's renewals need no restart.
+- **Startup.** No `proxy` block means no listener. Every unknown agent, unknown model, model the
+  proxy cannot serve (`openaiCompatible`), and unreadable TLS file is reported in one startup
+  failure.
+
+Claude Code needs its model names pointed at configured ones. The exec environment sets
+`ANTHROPIC_BASE_URL=https://models.vm.internal`, `ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` to names in the guest's grant, plus
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. OpenAI clients use `https://models.vm.internal/v1` as
+their base URL. The token any client sends is ignored.
+
+**Cost warning.** A Claude Code turn re-sends tens of thousands of cached input tokens on every
+request, and the budget counts cached input at the full rate, because a call costs its raw input
+plus output. A budget sized for chat is gone in minutes; size a proxied agent's budget for agentic
+coding.
+
 ## Telemetry
 
 Spans follow [`observability.md`](observability.md):
@@ -1334,7 +1404,7 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_refused` (a token budget ended the turn), `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_steer_refused` (`mailbox-full`), `gateway_steer_ack_failed` (debug); `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_cancelled`,
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_refused` (a token budget ended the turn), `gateway_proxy_listening` (the guest model proxy's port), `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_steer_refused` (`mailbox-full`), `gateway_steer_ack_failed` (debug); `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_cancelled`,
 `gateway_wake_tick_failed`, `gateway_wake_tick_skipped`, `gateway_wake_probe_unavailable`, and
 `gateway_wake_task_failed`, `gateway_wake_store_failed` (a failed write refuses that one change; a
 failed write while firing or leasing stops wake firing until restart), `gateway_memory_record_skipped`

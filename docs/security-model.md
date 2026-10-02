@@ -405,6 +405,25 @@ not interpret repository/object identity in bodies or upstream API semantics. Th
 at the provider remains the final boundary. The [current local process boundary](#current-local-process-boundary)
 separates gateway and broker UIDs; per-agent credential selection does not establish a separate OS identity for each organization.
 
+## The guest model proxy trusts the jail to name its VM
+
+`dekopond`'s optional guest model proxy lets `claude`, `pi` or `codex` inside a Firecracker guest
+call a configured model with no model credential of its own. The guest never holds an identity:
+the jail's egress gateway (`vm-runnerd jail`) connects to the proxy over mTLS and asserts which VM
+it serves in `x-dekopon-vm-subject`, stripping any copy the guest sent. The proxy accepts only a
+client certificate that chains to the configured CA and carries the configured URI SAN
+(`jailIdentity`); anything else fails the TLS handshake.
+
+It trusts the asserted subject only because an authenticated jail asserted it. Every jail pod
+shares one ServiceAccount and one client certificate, so the certificate proves "a jail pod", not
+which VM: a guest that escaped into the jail process could assert any configured subject and spend
+that subject's agent's budget on the models that subject is granted. That rates low, because an
+escape already owns the jail, and it is the same trust the jail already has with the controller.
+The subject grants only model calls, never broker authority: a proxied call reaches no provider,
+capability or broker, and the guest still holds no credential. Model credentials stay in
+`dekopond` and are injected per request. The guest's own `authorization` and `x-api-key` are
+dropped, and the upstream credential never appears in a response, record or log.
+
 ## Threat-model limitations
 
 [`design.md`](design.md#non-goals) lists what this project has decided not to defend: a malicious process in the broker's trust domain, a compromised host or root, crash durability and audit tamper-detection, transformed reflection at an authorized endpoint, duplicate-effect defense, end-user privacy from the operator, and production-sandbox claims for Wasmtime. This section adds the limits that are specific to what is built.

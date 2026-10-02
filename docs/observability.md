@@ -48,7 +48,7 @@ model spend is the `meter` record below.
 
 ### The `meter` charge record
 
-Every model call — the agent's own and, once the guest proxy lands, a proxied one — writes exactly
+Every model call — the agent's own and one a guest makes through the [model proxy](dekopond.md#guest-model-proxy) — writes exactly
 one OTLP log record on the `meter` target, message `model call charged`, whether or not its agent
 has a [token budget](dekopond.md#token-budgets). It is a log record rather than a span event
 because the log queue carries only `job` and `meter`, while the span queue carries every debug span
