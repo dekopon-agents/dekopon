@@ -767,11 +767,8 @@ fn reserved_read_constraint() -> ConstraintSet {
 async fn chat_memory_without_routes_names_every_missing_role() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
-    let storage = StorageHost::open(
-        directory.join("provider-storage"),
-        StorageLimits::default(),
-    )
-    .expect("storage host");
+    let storage = StorageHost::open(directory.join("provider-storage"), StorageLimits::default())
+        .expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("storage-probe-provider.wasm")],
         BrokerHostLimits::default(),
