@@ -86,7 +86,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority.to_owned()],
             allowed_methods: vec!["GET".to_owned()],
@@ -256,6 +255,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
 
     let (execution, parent) = only(&records, &["broker.execution"]);
     assert_eq!(parent, Some("broker.execute"), "{execution}");
+    assert!(!execution.contains("output.digest="), "{execution}");
     for expected in [
         "invocation.id=invoke-audited",
         "outcome=Succeeded",
@@ -263,7 +263,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         "risk=Low",
         "credential=\"fetch-token\"",
         "\\\"credentialInjected\\\":true",
-        "output.digest=",
     ] {
         assert!(
             execution.contains(expected),

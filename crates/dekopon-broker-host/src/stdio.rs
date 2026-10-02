@@ -23,6 +23,30 @@ pub const ZERO_FAILURE_STATUS_NOTE: &str =
 // Handles live in the host table, outside the guest's memory limit, so a guest may not mint them
 // without bound.
 const MAX_LIVE_HANDLES: u8 = 16;
+const TRACE_PREFIX_BYTES: usize = 4096;
+
+#[derive(Debug, Default)]
+pub(crate) struct StreamTrace {
+    pub(crate) bytes: u64,
+    prefix: Vec<u8>,
+}
+
+impl StreamTrace {
+    fn record(&mut self, bytes: &[u8]) {
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        let remaining = TRACE_PREFIX_BYTES.saturating_sub(self.prefix.len());
+        self.prefix
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    }
+
+    pub(crate) fn prefix(&self) -> String {
+        let mut text = String::from_utf8_lossy(&self.prefix).into_owned();
+        if text.len() > TRACE_PREFIX_BYTES {
+            text.truncate(text.floor_char_boundary(TRACE_PREFIX_BYTES));
+        }
+        text
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StdioTrap {
@@ -49,6 +73,9 @@ pub(crate) struct StdioState {
     stdout: Option<UnixStream>,
     stderr: String,
     stderr_truncated: bool,
+    pub(crate) stdin_trace: StreamTrace,
+    pub(crate) stdout_trace: StreamTrace,
+    pub(crate) stderr_trace: StreamTrace,
     handles: u8,
     pub(crate) clock: WorkClock,
 }
@@ -74,6 +101,7 @@ impl StdioState {
     }
 
     pub(crate) fn append_stderr(&mut self, text: &str) {
+        self.stderr_trace.record(text.as_bytes());
         if self.stderr_truncated {
             return;
         }
@@ -111,8 +139,11 @@ impl StdioState {
         }
         if !self.stderr.is_empty() && !self.stderr.ends_with('\n') {
             self.stderr.push('\n');
+            self.stderr_trace.record(b"\n");
         }
         self.stderr.push_str(ZERO_FAILURE_STATUS_NOTE);
+        self.stderr_trace
+            .record(ZERO_FAILURE_STATUS_NOTE.as_bytes());
     }
 
     fn release(&mut self) {
@@ -237,6 +268,7 @@ impl wit::HostReader for StoreState {
         match read {
             Ok(count) => {
                 buffer.truncate(count);
+                self.stdio.stdin_trace.record(&buffer);
                 if count == 0 {
                     self.stdio.stdin = None;
                 }
@@ -273,6 +305,7 @@ impl wit::HostWriter for StoreState {
             self.stdio.stdout = None;
             return Ok(Err(wit::WriteError::Closed));
         }
+        self.stdio.stdout_trace.record(&bytes);
         Ok(Ok(()))
     }
 
@@ -308,8 +341,26 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioState, WorkClock, ZERO_FAILURE_STATUS_NOTE,
+        MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioState, StreamTrace, WorkClock,
+        ZERO_FAILURE_STATUS_NOTE,
     };
+
+    #[test]
+    fn stream_telemetry_counts_all_bytes_and_keeps_only_the_first_four_kib() {
+        let mut stream = StreamTrace::default();
+        stream.record(b"first");
+        stream.record(&vec![b'x'; 8192]);
+        assert_eq!(stream.bytes, 8197);
+        assert_eq!(stream.prefix().len(), 4096);
+        assert!(stream.prefix().starts_with("first"));
+        stream.record(b"last");
+        assert_eq!(stream.bytes, 8201);
+        assert!(!stream.prefix().contains("last"));
+        let mut split_utf8 = StreamTrace::default();
+        split_utf8.record(&vec![b'x'; 4095]);
+        split_utf8.record(&[0xc3]);
+        assert!(split_utf8.prefix().len() <= 4096);
+    }
 
     #[test]
     fn the_zero_status_note_fits_after_a_truncated_stderr() {

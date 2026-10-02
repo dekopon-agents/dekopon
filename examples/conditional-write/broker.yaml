@@ -79,7 +79,6 @@ capabilities:
       http-probe.fetch:
         constraints:
           timeoutMs: 10000
-          maxOutputBytes: 262144
           http:
             allowedMethods: [GET]
             maxRequests: 1
@@ -87,7 +86,6 @@ capabilities:
       http-probe.conditional-write:
         constraints:
           timeoutMs: 15000
-          maxOutputBytes: 8192
           http:
             # Two calls and two methods because the write pre-reads: one GET for the resource, one
             # POST carrying the etag it just observed. That pre-read is what makes the capability

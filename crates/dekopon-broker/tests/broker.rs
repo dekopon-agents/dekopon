@@ -271,7 +271,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority.to_owned()],
             propagate_trace: false,
@@ -412,11 +411,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
     );
     assert_eq!(result.result.decision.decision_id, "allow-invoke-once");
     assert_eq!(result.result.decision.policy_revision, "policy-test");
-    assert_eq!(
-        result.result.output,
-        Some(json!({"text": "TOP-SECRET-PAYLOAD"}))
-    );
-    assert_eq!(result.result.evidence.len(), 2);
+    assert_eq!(result.result.evidence.len(), 1);
 
     let records = audit.records();
     assert_eq!(records.len(), 2);
@@ -487,7 +482,6 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     );
     assert_eq!(result.result.decision.decision_id, "deny-invoke-denied");
     assert_eq!(result.result.error.as_deref(), Some("policy-denied"));
-    assert!(result.result.output.is_none());
     let records = audit.records();
     assert_eq!(records.len(), 1);
     assert!(matches!(
@@ -605,7 +599,6 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     let constraints = ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             propagate_trace: false,
             allowed_hosts: vec![authority.clone()],
@@ -796,10 +789,6 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
         server.join();
         let records = audit.records();
         if expected == Succeeded {
-            assert_eq!(
-                result.result.output.as_ref().expect("write returns output")["post"]["id"],
-                101
-            );
             assert_eq!(records.len(), 3);
         } else {
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
@@ -1667,7 +1656,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let http = |hosts: Vec<String>| ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: hosts,
             propagate_trace: false,
@@ -1869,10 +1857,6 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     assert_eq!(
         attested.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
-    );
-    assert_eq!(
-        attested.result.output,
-        Some(json!({"text": "ON BEHALF OF"}))
     );
 
     let crossed = broker

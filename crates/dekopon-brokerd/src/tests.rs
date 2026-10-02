@@ -26,7 +26,7 @@ when { context.via == "gateway"
 fn probe_capabilities() -> serde_json::Value {
     json!({
         "cli-probe": {
-            "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+            "constraints": {"timeoutMs": 30_000},
             "capabilities": {"cli-probe.upper": {}}
         }
     })

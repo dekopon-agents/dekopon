@@ -83,13 +83,11 @@ const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
 pub const MAX_SECRET_BINDINGS: usize = 1024;
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
-const PROVIDER_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.provider-response+json";
 const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+json";
 const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evidence+json";
 
 const UNROUTED_RECORD_CAPABILITY: &str = "memory.chat.record";
 const MEMORY_MIN_TURN_LINE_BYTES: u64 = 241;
-const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
 const MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES: u64 = 4 * 1024;
 const MEMORY_QUERY_JSON_EXPANSION: u64 = 6;
 const MEMORY_WORKING_SET_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
@@ -228,14 +226,8 @@ impl ChatMemoryConfig {
         host: &dekopon_broker_host::BrokerHostLimits,
     ) -> Result<(), BrokerBuildError> {
         let max_input = u64::try_from(host.max_input_bytes).unwrap_or(u64::MAX);
-        let max_output = u64::try_from(host.max_output_bytes).unwrap_or(u64::MAX);
         let max_memory = u64::try_from(host.max_memory_bytes).unwrap_or(u64::MAX);
-        let provider_output = self
-            .max_result_bytes
-            .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
-            .ok_or(BrokerBuildError::InvalidChatMemory)?;
         if self.maximum_provider_input_bytes()? > max_input
-            || provider_output > max_output
             || self.maximum_provider_working_set_bytes()? > max_memory
             || self.minimum_provider_fuel()? > host.fuel
         {
@@ -1294,7 +1286,6 @@ fn validate_set_credential(
 fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError> {
     let constraints = &set.constraints;
     if constraints.timeout_ms == 0
-        || constraints.max_output_bytes == 0
         || constraints.secret_use.is_some()
         || (constraints.http.is_some() && constraints.storage.is_some())
     {
@@ -1569,9 +1560,6 @@ pub enum AuditEvent {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_detail: Option<ProviderFailureDetail>,
-        /// Digest of successful provider output; output itself is never audited.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_digest: Option<String>,
         /// Sanitized HTTP metadata; never paths, queries, headers, or bodies.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         http_calls: Vec<HttpCallEvidence>,
@@ -1837,15 +1825,6 @@ where
                 || set.risk != risk
                 || set.credential.is_some()
                 || set.constraints.http.is_some()
-                || set.constraints.max_output_bytes
-                    < if route == CapabilityRoute::ChatMemoryRecord {
-                        MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES
-                    } else {
-                        config
-                            .max_result_bytes
-                            .checked_add(MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES)
-                            .ok_or(BrokerBuildError::InvalidChatMemory)?
-                    }
             {
                 return Err(BrokerBuildError::InvalidChatMemory);
             }
@@ -2936,7 +2915,7 @@ where
             invocation: request.id.clone(),
             decision,
             outcome: InvocationOutcome::Denied,
-            output: None,
+            exit_status: None,
             error: Some(wire.to_owned()),
             detail: None,
             evidence: vec![Evidence {
@@ -2983,7 +2962,6 @@ where
             0,
             Some(reason.to_owned()),
             None,
-            None,
             Vec::new(),
             None,
             None,
@@ -3001,7 +2979,7 @@ where
             invocation: invocation.clone(),
             decision,
             outcome: InvocationOutcome::Failed,
-            output: None,
+            exit_status: None,
             error: Some(reason.to_owned()),
             detail: None,
             evidence: vec![policy_evidence],
@@ -3327,28 +3305,7 @@ where
         let (result, audit_event) = match execution {
             Ok(output) => {
                 *outputs = output.assets;
-                let output_digest = output.storage.as_ref().map_or_else(
-                    || {
-                        outcome_evidence_digest(
-                            &invocation_id,
-                            "provider-response",
-                            &serde_json::json!({ "stderr": output.stderr }),
-                        )
-                    },
-                    |storage| {
-                        Ok(storage
-                            .output_commitment
-                            .clone()
-                            .unwrap_or_else(|| storage.evidence_commitment.clone()))
-                    },
-                )?;
                 let mut evidence = vec![policy_evidence];
-                evidence.push(Evidence {
-                    kind: "provider-response".to_owned(),
-                    digest: output_digest.clone(),
-                    media_type: PROVIDER_EVIDENCE_MEDIA_TYPE.to_owned(),
-                    uri: None,
-                });
                 if let Some(storage) = &output.storage {
                     evidence.push(Evidence {
                         kind: "storage".to_owned(),
@@ -3385,7 +3342,6 @@ where
                     duration_ms,
                     None,
                     None,
-                    Some(output_digest),
                     output.http_calls,
                     storage_scope_commitment.clone(),
                     output.storage,
@@ -3395,7 +3351,7 @@ where
                         invocation: invocation_id.clone(),
                         decision: decision.clone(),
                         outcome: InvocationOutcome::Succeeded,
-                        output: None,
+                        exit_status: None,
                         error: None,
                         detail: None,
                         evidence,
@@ -3404,7 +3360,7 @@ where
                 )
             }
             Err(failure) => {
-                let error = public_host_error(&failure.error, set.route).to_owned();
+                let error = public_host_error(&failure.error).to_owned();
                 let detail = provider_failure_detail(&failure.error);
                 let mut evidence = vec![policy_evidence];
                 if let Some(storage) = &failure.storage {
@@ -3443,7 +3399,6 @@ where
                     duration_ms,
                     Some(error.clone()),
                     detail.clone(),
-                    None,
                     failure.http_calls,
                     storage_scope_commitment.clone(),
                     failure.storage,
@@ -3453,7 +3408,7 @@ where
                         invocation: invocation_id.clone(),
                         decision,
                         outcome: InvocationOutcome::Failed,
-                        output: None,
+                        exit_status: provider_exit_status(&failure.error),
                         error: Some(error),
                         detail,
                         evidence,
@@ -3596,10 +3551,6 @@ fn encode_execution_constraints(
     constraints: &ExecutionConstraints,
 ) {
     encoded.number("execution.timeoutMs", u128::from(constraints.timeout_ms));
-    encoded.number(
-        "execution.maxOutputBytes",
-        u128::from(constraints.max_output_bytes),
-    );
     if let Some(http) = &constraints.http {
         encoded.byte("execution.http.present", 1);
         let hosts = http.allowed_hosts.iter().collect::<BTreeSet<_>>();
@@ -3924,7 +3875,6 @@ fn emit_audit_event(event: &AuditEvent) {
             duration_ms,
             error,
             error_detail,
-            output_digest,
             http_calls,
             storage_scope_commitment,
             storage,
@@ -3956,7 +3906,6 @@ fn emit_audit_event(event: &AuditEvent) {
                 error = error.as_deref(),
                 error.code = error_detail.as_ref().map(|detail| detail.code.as_str()),
                 error.message = error_detail.as_ref().map(|detail| detail.message.as_str()),
-                output.digest = output_digest.as_deref(),
                 http.calls = rendered(http_calls),
                 storage.scope_commitment = storage_scope_commitment
                     .as_ref()
@@ -4022,7 +3971,6 @@ fn execution_event(
     duration_ms: u64,
     error: Option<String>,
     error_detail: Option<ProviderFailureDetail>,
-    output_digest: Option<String>,
     http_calls: Vec<HttpCallEvidence>,
     storage_scope_commitment: Option<StorageScopeCommitment>,
     storage: Option<StorageEvidence>,
@@ -4058,7 +4006,6 @@ fn execution_event(
         duration_ms,
         error,
         error_detail,
-        output_digest,
         http_calls,
         storage_scope_commitment,
         storage,
@@ -4071,10 +4018,18 @@ fn execution_event(
 )]
 fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDetail> {
     match error {
-        BrokerHostError::ProviderFailure { status, stderr, .. } => Some(
-            ProviderFailureDetail::new(&format!("exit-status-{status}"), stderr),
-        ),
+        BrokerHostError::ProviderFailure { stderr, .. } => {
+            Some(ProviderFailureDetail::new("provider-exit", stderr))
+        }
         _ => None,
+    }
+}
+
+fn provider_exit_status(error: &BrokerHostError) -> Option<std::num::NonZeroU8> {
+    if let BrokerHostError::ProviderFailure { status, .. } = error {
+        std::num::NonZeroU8::new(*status)
+    } else {
+        None
     }
 }
 
@@ -4150,7 +4105,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn public_host_error(error: &BrokerHostError, _route: CapabilityRoute) -> &'static str {
+fn public_host_error(error: &BrokerHostError) -> &'static str {
     match error {
         BrokerHostError::AuthorizationExceedsHostLimit { .. }
         | BrokerHostError::InvalidHttpAuthorization
@@ -4190,6 +4145,7 @@ fn public_host_error(error: &BrokerHostError, _route: CapabilityRoute) -> &'stat
         | BrokerHostError::RunCommandUsedHostImport { .. }
         | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
+        BrokerHostError::PeerDisconnected => "peer-disconnected",
         BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
         BrokerHostError::StorageCallRejected {
             reason: "quota", ..

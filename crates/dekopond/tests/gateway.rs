@@ -121,12 +121,12 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         },
         "capabilities": {
             "cli-probe": {
-                "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+                "constraints": {"timeoutMs": 30_000},
                 "capabilities": {"cli-probe.upper": {}}
             },
             "memory-chat": {
                 "constraints": {
-                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
+                    "timeoutMs": 30_000,
                     "storage": {"interface":"jsonl","access":"read-only","scope":"private-conversation"}
                 },
                 "capabilities": {

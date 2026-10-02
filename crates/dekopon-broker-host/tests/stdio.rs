@@ -180,7 +180,6 @@ fn authorized(timeout_ms: u64) -> AuthorizedInvocation {
             "policy-test".to_owned(),
             ExecutionConstraints {
                 timeout_ms,
-                max_output_bytes: 1024,
                 ..ExecutionConstraints::default()
             },
         )
@@ -227,6 +226,35 @@ async fn a_0_3_0_component_is_refused_at_load_on_the_invoke_type() {
         panic!("expected a typed instantiation refusal, got {error:?}");
     };
     assert!(format!("{source:?}").contains("invoke"), "{source:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnected_peer_cancels_a_parked_read_and_closes_stdout() {
+    let (stdin, _writer) = UnixStream::pair().unwrap();
+    let (stdout, reader) = UnixStream::pair().unwrap();
+    let capture = drain(reader);
+    let (cancel, signal) = tokio::sync::watch::channel(false);
+    let mut assets = streams(Some(stdin), stdout);
+    assets.cancel = Some(signal);
+    let component = component(
+        "i32.const 32 call $stdin i32.const 36 i32.load i32.const 4096 i32.const 48 call $read call $ok",
+    );
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .unwrap();
+    let invocation = registry.invoke(authorized(100), None, assets);
+    tokio::pin!(invocation);
+    tokio::select! {
+        _ = &mut invocation => panic!("parked guest must wait for its peer"),
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    cancel.send_replace(true);
+    let failure = tokio::time::timeout(Duration::from_secs(2), invocation)
+        .await
+        .expect("peer cancellation is prompt")
+        .expect_err("cancelled guest is not a success");
+    assert!(matches!(*failure.error, BrokerHostError::PeerDisconnected));
+    assert!(capture.join().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -344,6 +372,40 @@ async fn stderr_keeps_64_kib_and_ends_in_the_marker() {
         "the prefix fills the bound"
     );
     assert!(output.stderr.starts_with(&"x".repeat(1024)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_span_records_byte_counts_and_bounded_prefixes() {
+    use dekopon_test_support::CaptureLayer;
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+    let capture = CaptureLayer::workspace();
+    tracing_subscriber::registry().with(capture.clone()).init();
+    let (stdin, mut feeder) = UnixStream::pair().unwrap();
+    feeder.write_all(b"hello").unwrap();
+    drop(feeder);
+    let (stdout, reader) = UnixStream::pair().unwrap();
+    let captured_stdout = drain(reader);
+    let body = r"
+        i32.const 32 call $stdin
+        i32.const 36 i32.load i32.const 64 i32.const 48 call $read
+        call $stdout i32.const 3072 i32.const 5 i32.const 56 call $write
+        i32.const 3072 i32.const 5 call $stderr
+        call $ok";
+    run(body, 5_000, streams(Some(stdin), stdout))
+        .await
+        .expect("stdio succeeds");
+    assert_eq!(captured_stdout.join().unwrap(), b"boom\n");
+    let spans = capture.spans_text();
+    for (name, count, prefix) in [
+        ("stdin", 5, "hello"),
+        ("stdout", 5, "boom"),
+        ("stderr", 5, "boom"),
+    ] {
+        assert!(spans.contains(&format!("{name}.bytes={count}")), "{spans}");
+        assert!(spans.contains(&format!("{name}.prefix=")), "{spans}");
+        assert!(spans.contains(prefix), "{spans}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

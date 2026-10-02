@@ -93,7 +93,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             constraints: dekopon_capability::ExecutionConstraints {
                 asset: None,
                 timeout_ms: 10_000,
-                max_output_bytes: 131_072,
                 http: None,
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::DurableFiles,
@@ -117,7 +116,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 constraints: dekopon_capability::ExecutionConstraints {
                     asset: None,
                     timeout_ms: 10_000,
-                    max_output_bytes: 131_072,
                     http: Some(HttpConstraints {
                         allowed_hosts: vec!["127.0.0.1:1".to_owned()],
                         allowed_methods: vec!["GET".to_owned()],
@@ -392,8 +390,9 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
     )
     .await;
 
-    let denied =
-        query_memory_result(&broker, "fill-audit", MEMORY_RECENT, json!({"last": 0})).await;
+    let denied = query_memory_result(&broker, "fill-audit", MEMORY_RECENT, json!({"last": 0}))
+        .await
+        .0;
     assert_eq!(
         denied.outcome,
         dekopon_capability::InvocationOutcome::Denied
@@ -975,7 +974,6 @@ fn memory_constraint(
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
-            max_output_bytes: 131_072,
             http: None,
             storage: Some(StorageConstraints {
                 interface: StorageInterface::Jsonl,
@@ -1587,13 +1585,13 @@ async fn query_memory(
     capability: &str,
     input: serde_json::Value,
 ) -> serde_json::Value {
-    let result = query_memory_result(broker, invocation, capability, input).await;
+    let (result, output) = query_memory_result(broker, invocation, capability, input).await;
     assert_eq!(
         result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded,
         "{result:?}"
     );
-    result.output.expect("query output")
+    output
 }
 
 async fn query_memory_result(
@@ -1601,7 +1599,7 @@ async fn query_memory_result(
     invocation: &str,
     capability: &str,
     input: serde_json::Value,
-) -> dekopon_capability::InvocationResult {
+) -> (dekopon_capability::InvocationResult, serde_json::Value) {
     query_memory_result_in(
         broker,
         &claim(),
@@ -1620,9 +1618,15 @@ async fn query_memory_result_in(
     invocation: &str,
     capability: &str,
     input: serde_json::Value,
-) -> dekopon_capability::InvocationResult {
+) -> (dekopon_capability::InvocationResult, serde_json::Value) {
     let id = invocation.parse::<InvocationId>().expect("invocation");
-    broker
+    let (stdout, mut reader) = std::os::unix::net::UnixStream::pair().expect("stdout socket");
+    let capture = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).expect("stdout read");
+        bytes
+    });
+    let result = broker
         .invoke(
             &gateway(),
             Some(grant),
@@ -1634,11 +1638,20 @@ async fn query_memory_result_in(
                 input,
                 secret_use: None,
             },
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_protocol::Streams {
+                    stdin: None,
+                    stdout: stdout.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("query accounted")
-        .result
+        .result;
+    let bytes = capture.await.expect("stdout capture");
+    let output = serde_json::from_slice(&bytes).expect("query stdout JSON");
+    (result, output)
 }
 
 async fn query_memory_in(
@@ -1649,12 +1662,13 @@ async fn query_memory_in(
     capability: &str,
     input: serde_json::Value,
 ) -> serde_json::Value {
-    let result = query_memory_result_in(broker, claim, grant, invocation, capability, input).await;
+    let (result, output) =
+        query_memory_result_in(broker, claim, grant, invocation, capability, input).await;
     assert_eq!(
         result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    result.output.expect("query output")
+    output
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2343,7 +2357,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
-            max_output_bytes: 131_072,
             http: None,
             storage,
             secret_use: None,

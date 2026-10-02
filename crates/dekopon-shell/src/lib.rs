@@ -295,6 +295,8 @@ pub trait CapabilityInvoker: Send + Sync {
         let _ = (text, eta);
     }
 
+    fn script_started(&self, _timeout: Duration) {}
+
     fn script_finished(&self) {}
 
     fn job_control(&self) -> Option<&dyn JobControl> {
@@ -346,6 +348,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn note(&self, text: &str, eta: Option<Duration>) {
         self.as_ref().note(text, eta);
+    }
+
+    fn script_started(&self, timeout: Duration) {
+        self.as_ref().script_started(timeout);
     }
 
     fn script_finished(&self) {

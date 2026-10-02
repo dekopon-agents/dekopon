@@ -221,7 +221,6 @@ impl<P: Provider> Run<P> {
                     .as_millis()
                     .try_into()
                     .unwrap_or(u64::MAX),
-                max_output_bytes: self.limits.max_output_bytes as u64,
                 http,
                 storage: None,
                 secret_use: None,

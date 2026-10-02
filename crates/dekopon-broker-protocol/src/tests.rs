@@ -236,6 +236,17 @@ async fn in_bound_prefix_that_over_promises_fails_instead_of_decoding_a_short_fr
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_completed_request_can_wait_for_peer_disconnection() {
+    let (peer, server) = tokio::net::UnixStream::pair().expect("socketpair");
+    let watcher = super::DescriptorStream::new(server);
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(1), watcher.peer_disconnected())
+        .await
+        .expect("a disconnected peer wakes the broker");
+}
+
 #[tokio::test]
 async fn prefix_only_peer_times_out_rather_than_completing_a_frame() {
     let limits = FrameLimits {
@@ -2158,7 +2169,7 @@ fn failed_with_detail() -> InvocationResult {
             policy_revision: "policy-1".to_owned(),
         },
         outcome: InvocationOutcome::Failed,
-        output: None,
+        exit_status: None,
         error: Some("provider-failure".to_owned()),
         detail: Some(ProviderFailureDetail::new(
             "upstream-rejected",
@@ -2201,6 +2212,21 @@ async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
 }
 
 #[test]
+fn a_guest_exit_round_trips_as_a_nonzero_status_not_a_detail_code() {
+    let mut result = failed_with_detail();
+    result.exit_status = Some(std::num::NonZeroU8::new(7).expect("guest failure"));
+    let document = serde_json::to_value(&result).expect("result serializes");
+    assert_eq!(document["exitStatus"], 7);
+    assert_eq!(
+        serde_json::from_value::<InvocationResult>(document).unwrap(),
+        result
+    );
+    let mut invalid = serde_json::to_value(&result).unwrap();
+    invalid["exitStatus"] = json!(0);
+    assert!(serde_json::from_value::<InvocationResult>(invalid).is_err());
+}
+
+#[test]
 fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
     let result = InvocationResult {
         error: Some("provider-timeout".to_owned()),
@@ -2221,6 +2247,13 @@ fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
         serde_json::from_str::<ResponseEnvelope>(&document).expect("it decodes"),
         ResponseEnvelope::invocation(result, vec![], vec![], vec![])
     );
+}
+
+#[test]
+fn a_returned_output_is_not_a_valid_invocation_result() {
+    let mut document = serde_json::to_value(failed_with_detail()).expect("result serializes");
+    document["output"] = json!({"text": "retired"});
+    assert!(serde_json::from_value::<InvocationResult>(document).is_err());
 }
 
 #[test]

@@ -137,7 +137,6 @@ pub struct FixtureHostBuilder {
     continuity: ContinuityPolicy,
     scope: Scope,
     timeout_ms: Option<u64>,
-    max_output_bytes: Option<u64>,
 }
 
 impl Default for FixtureHostBuilder {
@@ -157,7 +156,6 @@ impl Default for FixtureHostBuilder {
             // Left unset so build derives them from the host limits in force; a hardcoded default
             // here would duplicate a number this crate does not own and could drift out of sync.
             timeout_ms: None,
-            max_output_bytes: None,
         }
     }
 }
@@ -232,15 +230,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Narrows the maximum serialized output one invocation may return.
-    ///
-    /// Defaults to the host's own `max_output_bytes`, and is bounded by it for the same reason.
-    #[must_use]
-    pub const fn max_output_bytes(mut self, max_output_bytes: u64) -> Self {
-        self.max_output_bytes = Some(max_output_bytes);
-        self
-    }
-
     pub async fn build(self) -> Result<FixtureHost, FixtureHostError> {
         let component = self.component.ok_or(FixtureHostError::NoComponent)?;
         if !component.exists() {
@@ -287,9 +276,6 @@ impl FixtureHostBuilder {
                     .try_into()
                     .unwrap_or(u64::MAX)
             }),
-            max_output_bytes: self
-                .max_output_bytes
-                .unwrap_or(host_limits.max_output_bytes as u64),
             invocations: AtomicU64::new(0),
         })
     }
@@ -316,7 +302,6 @@ pub struct FixtureHost {
     conversation: String,
     continuity: ContinuityPolicy,
     timeout_ms: u64,
-    max_output_bytes: u64,
     invocations: AtomicU64,
 }
 
@@ -420,7 +405,6 @@ impl FixtureHost {
         ExecutionConstraints {
             asset: None,
             timeout_ms: self.timeout_ms,
-            max_output_bytes: self.max_output_bytes,
             http: None,
             storage: self
                 .storage_grant

@@ -71,7 +71,6 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority],
             allowed_methods: vec![method.to_owned()],
@@ -188,6 +187,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             descriptors: vec![std::fs::File::open(file.path()).unwrap().into()],
             sends_remaining: 0,
             streams: piped.streams,
+            cancel: None,
         };
         let _result = registry
             .invoke(

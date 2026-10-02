@@ -436,7 +436,8 @@ where
             }
             let span = invocation_span(&invocation, attestation.as_ref());
             adopt_trace_parent(&span, invocation.trace_parent);
-            match broker
+            let (cancel, signal) = tokio::sync::watch::channel(false);
+            let operation = broker
                 .invoke(
                     context,
                     peer.attestor.as_ref(),
@@ -447,11 +448,19 @@ where
                         descriptors,
                         sends_remaining,
                         streams,
+                        cancel: Some(signal),
                     },
                 )
-                .instrument(span)
-                .await
-            {
+                .instrument(span);
+            tokio::pin!(operation);
+            let outcome = tokio::select! {
+                result = &mut operation => result,
+                () = stream.peer_disconnected() => {
+                    cancel.send_replace(true);
+                    operation.await
+                }
+            };
+            match outcome {
                 Ok(outcome) => {
                     outputs = outcome.assets;
                     ResponseEnvelope::invocation(

@@ -446,7 +446,6 @@ async fn two_drns_over_one_record_share_one_refresh() {
             constraints: ExecutionConstraints {
                 asset: None,
                 timeout_ms: 5_000,
-                max_output_bytes: 1024 * 1024,
                 http: Some(HttpConstraints {
                     allowed_hosts: vec![authority.clone()],
                     propagate_trace: false,

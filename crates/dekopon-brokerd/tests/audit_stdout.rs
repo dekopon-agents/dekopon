@@ -85,7 +85,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
             "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
             "capabilities": {
                 "cli-probe": {
-                    "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
+                    "constraints": {"timeoutMs": 30000},
                     "capabilities": {"cli-probe.upper": {}},
                 }
             },
@@ -183,7 +183,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
         .expect("the outcome reached stdout");
     assert_eq!(execution["outcome"], "Succeeded");
     assert_eq!(execution["provider"], "cli-probe");
-    assert!(execution["output.digest"].is_string(), "{execution}");
+    assert!(execution.get("output.digest").is_none(), "{execution}");
 
     assert!(decision.get("trace_id").is_none(), "{decision}");
     assert!(decision.get("span_id").is_none(), "{decision}");

@@ -49,6 +49,7 @@ pub struct AssetInputs {
     pub sends_remaining: u8,
     /// Stream ends ride the asset descriptor path but are admitted by [`crate::stdio`].
     pub streams: Option<dekopon_broker_protocol::Streams>,
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -963,6 +964,7 @@ mod tests {
             descriptors: vec![file.into()],
             sends_remaining: 1,
             streams: None,
+            cancel: None,
         }
     }
 
@@ -1782,6 +1784,7 @@ mod tests {
             r#"{"assetMode":"channel"}"#,
             &constraints,
             Duration::from_secs(5),
+            None,
         );
         tokio::pin!(call);
         assert!(

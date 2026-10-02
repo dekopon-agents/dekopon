@@ -38,6 +38,9 @@ use tokio::{
     sync::oneshot,
 };
 
+#[path = "fixture/parked_component.rs"]
+mod parked_component;
+
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 fn context(principal: &str) -> AuthenticatedContext {
@@ -82,7 +85,7 @@ fn probe_constraint_set() -> ConstraintSet {
 fn probe_capabilities() -> serde_json::Value {
     json!({
         "cli-probe": {
-            "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+            "constraints": {"timeoutMs": 30_000},
             "capabilities": {"cli-probe.upper": {}}
         }
     })
@@ -319,7 +322,6 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         .await
         .expect("invoke the proposal");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(result.result.output, Some(json!({"text": "HELLO"})));
     assert_eq!(
         audit.records().len(),
         2,
@@ -504,7 +506,6 @@ when { context.capability == "http-probe.fetch"
             "http-probe": {
                 "constraints": {
                     "timeoutMs": 5_000,
-                    "maxOutputBytes": 64 * 1024,
                     "http": {
                         "allowedHosts": [&authority],
                         "allowedMethods": ["GET"],
@@ -702,10 +703,6 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
         .await
         .expect("attested invocation completes");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        result.result.output,
-        Some(json!({"text": "HELLO THROUGH BROKER"}))
-    );
 
     let records = audit.records();
     assert_eq!(records.len(), 2);
@@ -718,6 +715,102 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     task.await
         .expect("server task exits")
         .expect("server shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
+    let component = parked_component::component();
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .expect("typed parked provider loads");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit bound"));
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test".parse().unwrap(),
+            "policy-test".to_owned(),
+            probe_engine(POLICY, ["caller", "cpetersen"]),
+            probe_catalog(),
+            CredentialStore::empty(),
+            identities(),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("broker starts"),
+    );
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let identities = BTreeMap::from([(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    )]);
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server starts");
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.serve(listener, shutdown_on(stop)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let (stdin, _feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (stdout, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pending = tokio::spawn(async move {
+        client
+            .invoke(
+                Some(session()),
+                request("invoke-parked-peer-hangup"),
+                dekopon_broker_protocol::InvokeAssets {
+                    streams: Some(dekopon_broker_protocol::Streams {
+                        stdin: Some(stdin.into()),
+                        stdout: stdout.into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while audit.records().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("decision audited before hangup");
+    pending.abort();
+    assert!(
+        pending
+            .await
+            .expect_err("client was aborted")
+            .is_cancelled()
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while audit.records().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal execution audit survives peer hangup");
+    let encoded = serde_json::to_value(audit.records()).unwrap();
+    assert_eq!(encoded[1]["error"], "peer-disconnected");
+    let read = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut byte = [0_u8; 1];
+        reader.read(&mut byte)
+    })
+    .await
+    .unwrap()
+    .expect("stdout closes after cleanup");
+    assert_eq!(read, 0, "host must release stdout on peer hangup");
+    shutdown.send(()).expect("stop broker");
+    server_task
+        .await
+        .expect("server task")
+        .expect("clean shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread")]

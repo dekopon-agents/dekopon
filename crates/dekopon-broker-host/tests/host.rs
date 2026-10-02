@@ -146,7 +146,6 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority],
             allowed_methods: vec![method.to_owned()],
@@ -1178,7 +1177,6 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
                 ExecutionConstraints {
                     asset: None,
                     timeout_ms: 5_000,
-                    max_output_bytes: 4_096,
                     http: None,
                     storage: None,
                     secret_use: None,
@@ -1461,7 +1459,6 @@ fn conditional_write_constraints(
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority],
             allowed_methods: methods.iter().map(|method| (*method).to_owned()).collect(),
@@ -1787,7 +1784,6 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
         let constraints = ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
-            max_output_bytes: 64 * 1024,
             http: None,
             storage: Some(StorageConstraints {
                 interface,
@@ -1950,7 +1946,6 @@ async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
                 json!({}),
                 ExecutionConstraints {
                     timeout_ms: 5_000,
-                    max_output_bytes: 1024,
                     ..ExecutionConstraints::default()
                 },
             ),
@@ -2043,6 +2038,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
                 .collect(),
             sends_remaining: 0,
             streams: piped.streams,
+            cancel: None,
         };
         let mut constraints = http_constraints(server.authority().to_owned(), "POST");
         constraints.asset = Some(AssetConstraints {

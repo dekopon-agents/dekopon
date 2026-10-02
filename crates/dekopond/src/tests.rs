@@ -2449,11 +2449,8 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
     .expect("record result fixture decodes")
 }
 
-fn record_output(output: Value) -> InvocationResult {
-    InvocationResult {
-        output: Some(output),
-        ..record_result(InvocationOutcome::Succeeded, None)
-    }
+fn record_success() -> InvocationResult {
+    record_result(InvocationOutcome::Succeeded, None)
 }
 
 fn probe_listing() -> ResponseEnvelope {
@@ -3054,12 +3051,7 @@ fn asset_response(bytes: &[u8], label: &str) -> (ResponseEnvelope, Vec<std::os::
         sha256: "0".repeat(64),
     };
     (
-        ResponseEnvelope::invocation(
-            record_output(json!({"generationId":"gen-7"})),
-            vec![metadata],
-            Vec::new(),
-            Vec::new(),
-        ),
+        ResponseEnvelope::invocation(record_success(), vec![metadata], Vec::new(), Vec::new()),
         vec![blob.descriptor().unwrap()],
     )
 }
@@ -3068,7 +3060,7 @@ fn plain_response(response: ResponseEnvelope) -> (ResponseEnvelope, Vec<std::os:
 }
 fn queued_response(id: u64) -> (ResponseEnvelope, Vec<std::os::fd::OwnedFd>) {
     plain_response(ResponseEnvelope::invocation(
-        record_output(json!({})),
+        record_success(),
         Vec::new(),
         Vec::new(),
         vec![id],

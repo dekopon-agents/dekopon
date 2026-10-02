@@ -113,7 +113,6 @@ fn authorized(provider: &str, capability: CapabilityId, input: Value) -> Authori
             ExecutionConstraints {
                 asset: None,
                 timeout_ms: 5_000,
-                max_output_bytes: 4_096,
                 http: None,
                 storage: None,
                 secret_use: None,

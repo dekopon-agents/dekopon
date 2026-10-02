@@ -68,6 +68,7 @@ pub struct ShellRuntime<I> {
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
+        self.invoker.script_started(self.limits.timeout);
         let tree = TreeContext::new(self.limits, self.calls.clone());
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
@@ -97,6 +98,13 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
+    fn script_started(&self, timeout: Duration) {
+        self.direct.script_started(timeout);
+        if let Some(broker) = &self.broker {
+            broker.script_started(timeout);
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.direct.cancelled()
             || self
@@ -291,6 +299,33 @@ pub enum BrokerLegError {
 /// A client of brokerd's authorization path, never a participant: it only submits proposals and
 /// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
+struct ScriptCancellation {
+    signal: CancelSignal,
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for ScriptCancellation {
+    fn drop(&mut self) {
+        if let Some(timer) = &self.timer {
+            timer.abort();
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_cancel(mut signal: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *signal.borrow_and_update() {
+            return;
+        }
+        if signal.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(unix)]
 pub struct BrokerLeg {
     client: BrokerClient,
     runtime: tokio::runtime::Handle,
@@ -302,6 +337,7 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
     cancel: CancelSignal,
+    script_cancel: parking_lot::Mutex<Option<ScriptCancellation>>,
     attachments: Option<Arc<ReplyAttachments>>,
     asset_inputs: Option<ChatAssetInputs>,
     progress: Option<Arc<dyn ProgressSink>>,
@@ -349,6 +385,7 @@ impl BrokerLeg {
             attestation,
             chat_memory,
             cancel: CancelSignal::never(),
+            script_cancel: parking_lot::Mutex::new(None),
             attachments: None,
             asset_inputs: None,
             progress: None,
@@ -466,14 +503,6 @@ fn report_outcome(outcome: ToolOutcome) -> dekopon_shell::CommandReportOutcome {
     }
 }
 
-/// The broker reports a guest's own nonzero exit as the detail code `exit-status-N` with its
-/// stderr as the message; every other failure is the host's.
-fn provider_exit(
-    detail: Option<&dekopon_core::ProviderFailureDetail>,
-) -> Option<std::num::NonZeroU8> {
-    detail?.code.strip_prefix("exit-status-")?.parse().ok()
-}
-
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
         CapabilityCallResult::Succeeded => ToolOutcome::Succeeded,
@@ -531,7 +560,38 @@ fn snapshot(
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
     fn cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
+        self.effective_cancel().is_cancelled()
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: BrokerLeg script; bound: one timer per script, aborted and joined on script_finished"
+    )]
+    fn script_started(&self, timeout: Duration) {
+        let (handle, signal) = CancelSignal::pair();
+        let parent = self.cancel.watch();
+        let timer = self.runtime.spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => {},
+                () = wait_for_cancel(parent) => {},
+            }
+            handle.cancel();
+        });
+        *self.script_cancel.lock() = Some(ScriptCancellation {
+            signal,
+            timer: Some(timer),
+        });
+    }
+
+    fn script_finished(&self) {
+        let script = self.script_cancel.lock().take();
+        if let Some(mut script) = script
+            && let Some(timer) = script.timer.take()
+        {
+            timer.abort();
+            let _joined = self.runtime.block_on(timer);
+        }
+        self.notes.store(0, Ordering::Relaxed);
     }
 
     fn granted(&self) -> Vec<String> {
@@ -577,7 +637,7 @@ impl CapabilityInvoker for BrokerLeg {
         let (owned_word, argv) = (word.to_owned(), argv.to_vec());
         let trace_parent = self.identifiers.trace_parent();
         let operation = process_fn(
-            ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
+            ProcessMetadata::cancellable("broker-command", self.effective_cancel()),
             move || async move {
                 client
                     .run_command(attestation, owned_word, argv, stdin_piped, trace_parent)
@@ -648,7 +708,7 @@ impl CapabilityInvoker for BrokerLeg {
             report,
         } = proposal;
         let capability = capability.as_str();
-        let cancelled = self.cancel.is_cancelled();
+        let cancelled = self.cancelled();
         let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
@@ -717,10 +777,6 @@ impl CapabilityInvoker for BrokerLeg {
         self.emit(ProgressEvent::Note { text, eta });
     }
 
-    fn script_finished(&self) {
-        self.notes.store(0, Ordering::Relaxed);
-    }
-
     fn job_control(&self) -> Option<&dyn JobControl> {
         self.jobs.as_deref()
     }
@@ -728,6 +784,13 @@ impl CapabilityInvoker for BrokerLeg {
 
 #[cfg(unix)]
 impl BrokerLeg {
+    fn effective_cancel(&self) -> CancelSignal {
+        self.script_cancel
+            .lock()
+            .as_ref()
+            .map_or_else(|| self.cancel.clone(), |script| script.signal.clone())
+    }
+
     fn submit(
         &self,
         capability: &str,
@@ -775,13 +838,17 @@ impl BrokerLeg {
         // ordinary runtime worker would deadlock the executor.
         let invocation = request.id.to_string();
         let submitted = self.runtime.block_on(async {
-            self.client
-                .invoke(self.attestation.clone(), request, assets)
-                .await
+            tokio::select! {
+                result = self.client.invoke(self.attestation.clone(), request, assets) => Some(result),
+                () = wait_for_cancel(self.effective_cancel().watch()) => None,
+            }
         });
         drop(asset_pins);
         match submitted {
-            Ok(outcome) => {
+            None => CapabilityCallResult::Denied {
+                reason: "script-cancelled".to_owned(),
+            },
+            Some(Ok(outcome)) => {
                 let result = outcome.result;
                 match result.outcome {
                     InvocationOutcome::Succeeded => {
@@ -817,7 +884,7 @@ impl BrokerLeg {
                             .error
                             .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
                     },
-                    InvocationOutcome::Failed => match provider_exit(result.detail.as_ref()) {
+                    InvocationOutcome::Failed => match result.exit_status {
                         Some(status) => CapabilityCallResult::Exited {
                             status,
                             stderr: result
@@ -834,13 +901,13 @@ impl BrokerLeg {
                     },
                 }
             }
-            Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
+            Some(Err(ClientError::Remote { code, message })) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
             // A client-side timeout cannot tell whether the call ran, so it is treated as the one
             // non-retryable Denied status with an explicit refusal to resubmit, rather than a
             // Failed a model would retry.
-            Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
+            Some(Err(error)) if error.may_have_executed() => CapabilityCallResult::Denied {
                 reason: format!(
                     "the broker did not record an outcome for this invocation and it may already \
                      have taken effect; do not resubmit it ({error})"
@@ -848,7 +915,7 @@ impl BrokerLeg {
             },
             // Every ClientError renders without the socket path, since this is the one path that
             // could otherwise leak DEKOPON_BROKER_SOCKET back into a script.
-            Err(error) => CapabilityCallResult::Failed {
+            Some(Err(error)) => CapabilityCallResult::Failed {
                 error: error.to_string(),
                 detail: None,
             },
@@ -1296,8 +1363,7 @@ mod tests {
                     policy_revision: "policy-stub".to_owned(),
                 },
                 outcome,
-                output: matches!(outcome, InvocationOutcome::Succeeded)
-                    .then(|| json!({"status": 200})),
+                exit_status: None,
                 error: error.map(str::to_owned),
                 detail: None,
                 evidence: Vec::new(),
@@ -1540,6 +1606,29 @@ mod tests {
             drop(release);
         }
 
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_script_deadline_aborts_an_in_flight_broker_leg() {
+            let directory = private_broker_directory();
+            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
+            leg.command_words.insert("probe".to_owned());
+            leg.script_started(Duration::from_secs(5));
+            let run = tokio::task::spawn_blocking(move || {
+                let result = leg.run_command("probe", &["--help".to_owned()], false);
+                leg.script_finished();
+                result
+            });
+            observed
+                .recv()
+                .await
+                .expect("the command reached the broker");
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(matches!(
+                run.await.expect("blocking dispatch completes"),
+                Some(CommandRun::Denied { reason }) if reason == "session-cancelled"
+            ));
+            drop(release);
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn a_transport_failure_names_its_cause_and_never_the_socket() {
             let directory = private_broker_directory();
@@ -1606,6 +1695,7 @@ mod tests {
                 attestation,
                 chat_memory: None,
                 cancel: CancelSignal::never(),
+                script_cancel: parking_lot::Mutex::new(None),
                 attachments: None,
                 asset_inputs: None,
                 progress: None,
@@ -1666,43 +1756,6 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn obsolete_return_envelopes_never_become_stdout() {
-            for old_envelope in [
-                json!({"subject": "report", "attachments": [{"name": "a.pdf"}]}),
-                json!({"attachments": []}),
-                json!({"attachments": {"count": 1}}),
-            ] {
-                let directory = private_broker_directory();
-                let mut result = result(InvocationOutcome::Succeeded, None);
-                result.output = Some(old_envelope);
-                let leg = stub_leg(
-                    directory.path(),
-                    vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
-                )
-                .await;
-                let (status, stdout) = invoke_with_stdout(leg, CAPABILITY).await;
-                assert_eq!(status, CapabilityCallResult::Succeeded);
-                assert!(stdout.is_empty(), "obsolete result envelope reached stdout");
-            }
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_retired_base64_attachment_envelope_cannot_become_stdout() {
-            let directory = private_broker_directory();
-            let mut result = result(InvocationOutcome::Succeeded, None);
-            result.output =
-                Some(json!({"attachments": [{"mediaType": "image/png", "base64": "cG5n"}]}));
-            let leg = stub_leg(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
-            )
-            .await;
-            let (status, stdout) = invoke_with_stdout(leg, CAPABILITY).await;
-            assert_eq!(status, CapabilityCallResult::Succeeded);
-            assert!(stdout.is_empty(), "retired attachment bytes reached stdout");
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
         async fn an_unmapped_peer_is_a_denial_rather_than_an_infrastructure_failure() {
             let directory = private_broker_directory();
             let leg = stub_leg(
@@ -1747,10 +1800,8 @@ mod tests {
                 let mut provider_stdout =
                     std::os::unix::net::UnixStream::from(descriptors.into_iter().next().unwrap());
                 provider_stdout.write_all(b"provider line\n").unwrap();
-                let mut result = result(InvocationOutcome::Succeeded, None);
-                result.output = Some(json!({"effect":"complete"}));
                 let reply = ResponseEnvelope::invocation(
-                    result,
+                    result(InvocationOutcome::Succeeded, None),
                     vec![NewAsset {
                         descriptor: 0,
                         content_type: "text/plain".to_owned(),
@@ -1804,6 +1855,35 @@ mod tests {
                 CapabilityCallResult::Failed {
                     error: "provider trapped".to_owned(),
                     detail: None
+                }
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_guest_exit_uses_the_typed_status_and_stderr_not_a_parsed_detail_code() {
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(
+                    InvocationResult {
+                        exit_status: std::num::NonZeroU8::new(7),
+                        detail: Some(ProviderFailureDetail::new(
+                            "provider-exit",
+                            "guest failed\n",
+                        )),
+                        ..result(InvocationOutcome::Failed, Some("provider-failure"))
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            )
+            .await;
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Exited {
+                    status: std::num::NonZeroU8::new(7).unwrap(),
+                    stderr: "guest failed\n".to_owned(),
                 }
             );
         }
@@ -2230,11 +2310,15 @@ mod tests {
                 .map(|index| format!("progress note-{index}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
-            assert_eq!(
-                runtime.run_script("progress fresh").exit_code,
-                ExitCode::SUCCESS
-            );
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
+                assert_eq!(
+                    runtime.run_script("progress fresh").exit_code,
+                    ExitCode::SUCCESS
+                );
+            })
+            .await
+            .expect("script thread completes");
             let mut expected = (1..=8)
                 .map(|index| format!("note \"note-{index}\" None"))
                 .collect::<Vec<_>>();

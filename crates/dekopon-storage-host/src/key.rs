@@ -13,7 +13,6 @@ pub(crate) const DOMAIN_AUDIT_SCOPE: &str = "audit-scope-commitment-v1";
 pub(crate) const DOMAIN_RECORD_ID: &str = "record-id-v1";
 pub(crate) const DOMAIN_CONTENT: &str = "content-dedup-commitment-v1";
 pub(crate) const DOMAIN_DECISION_EVIDENCE: &str = "storage-decision-evidence-v1";
-pub(crate) const DOMAIN_OUTPUT_EVIDENCE: &str = "storage-output-evidence-v1";
 pub(crate) const DOMAIN_OPERATION_EVIDENCE: &str = "storage-operation-evidence-v1";
 
 pub(crate) fn digest(domain: &str, fields: &[&[u8]]) -> [u8; 32] {
@@ -81,7 +80,7 @@ mod tests {
     use super::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE,
         DOMAIN_GENERATION, DOMAIN_LOGICAL_PATH, DOMAIN_NAMESPACE_PATH, DOMAIN_OPERATION_EVIDENCE,
-        DOMAIN_OUTPUT_EVIDENCE, DOMAIN_RECORD_ID, token,
+        DOMAIN_RECORD_ID, token,
     };
 
     #[test]
@@ -96,7 +95,6 @@ mod tests {
             DOMAIN_RECORD_ID,
             DOMAIN_CONTENT,
             DOMAIN_DECISION_EVIDENCE,
-            DOMAIN_OUTPUT_EVIDENCE,
             DOMAIN_OPERATION_EVIDENCE,
         ]
         .map(|domain| token(domain, &fields));
