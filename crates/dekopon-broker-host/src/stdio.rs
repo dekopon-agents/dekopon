@@ -25,8 +25,12 @@ pub const ZERO_FAILURE_STATUS_NOTE: &str =
 const MAX_LIVE_HANDLES: u8 = 16;
 
 #[derive(Debug, thiserror::Error)]
-#[error("the provider held more than {MAX_LIVE_HANDLES} stdio handles at once")]
-pub struct StdioHandleLimit;
+pub enum StdioTrap {
+    #[error("the provider held more than {MAX_LIVE_HANDLES} stdio handles at once")]
+    TooManyHandles,
+    #[error("the provider asked to read zero bytes, which would read as end of input")]
+    ZeroRead,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StdioAdmissionError {
@@ -91,10 +95,24 @@ impl StdioState {
 
     fn mint(&mut self) -> wasmtime::Result<()> {
         if self.handles >= MAX_LIVE_HANDLES {
-            return Err(StdioHandleLimit.into());
+            return Err(StdioTrap::TooManyHandles.into());
         }
         self.handles += 1;
         Ok(())
+    }
+
+    // The note is its own line and survives a full stderr, so the prefix gives way to it.
+    pub(crate) fn note_zero_status(&mut self) {
+        let room = MAX_STDERR_BYTES - ZERO_FAILURE_STATUS_NOTE.len() - 1;
+        if self.stderr.len() > room {
+            let keep = room - STDERR_TRUNCATION_MARKER.len();
+            self.stderr.truncate(self.stderr.floor_char_boundary(keep));
+            self.stderr.push_str(STDERR_TRUNCATION_MARKER);
+        }
+        if !self.stderr.is_empty() && !self.stderr.ends_with('\n') {
+            self.stderr.push('\n');
+        }
+        self.stderr.push_str(ZERO_FAILURE_STATUS_NOTE);
     }
 
     fn release(&mut self) {
@@ -205,13 +223,13 @@ impl wit::HostReader for StoreState {
         max: u32,
     ) -> wasmtime::Result<Vec<u8>> {
         self.table.get(&resource)?;
+        if max == 0 {
+            return Err(StdioTrap::ZeroRead.into());
+        }
         let length = usize::try_from(max.min(MAX_READ_BYTES))?;
         let Some(stream) = self.stdio.stdin.as_mut() else {
             return Ok(Vec::new());
         };
-        if length == 0 {
-            return Ok(Vec::new());
-        }
         let mut buffer = vec![0; length];
         let parked = self.stdio.clock.park();
         let read = stream.read(&mut buffer).await;
@@ -289,7 +307,22 @@ impl wit::Host for StoreState {
 mod tests {
     use std::time::Duration;
 
-    use super::{MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioState, WorkClock};
+    use super::{
+        MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioState, WorkClock, ZERO_FAILURE_STATUS_NOTE,
+    };
+
+    #[test]
+    fn the_zero_status_note_fits_after_a_truncated_stderr() {
+        let mut state = StdioState::none();
+        state.append_stderr(&"x".repeat(2 * MAX_STDERR_BYTES));
+        state.note_zero_status();
+        let stderr = state.take_stderr();
+        assert!(stderr.len() <= MAX_STDERR_BYTES);
+        assert!(stderr.ends_with(&format!(
+            "{STDERR_TRUNCATION_MARKER}\n{ZERO_FAILURE_STATUS_NOTE}"
+        )));
+        assert_eq!(stderr.matches(STDERR_TRUNCATION_MARKER).count(), 1);
+    }
 
     #[test]
     fn stderr_keeps_a_bounded_prefix_and_marks_the_cut_once() {

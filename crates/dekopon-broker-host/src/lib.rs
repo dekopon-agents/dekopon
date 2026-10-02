@@ -60,8 +60,8 @@ pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
 use settings::SettingsState;
 pub use stdio::{
-    MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError,
-    StdioHandleLimit, ZERO_FAILURE_STATUS_NOTE,
+    MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError, StdioTrap,
+    ZERO_FAILURE_STATUS_NOTE,
 };
 
 pub(crate) mod bindings {
@@ -1263,10 +1263,7 @@ impl BrokerWasmProvider {
         match operation_result? {
             Ok(()) => Ok(0),
             Err(0) => {
-                store
-                    .data_mut()
-                    .stdio
-                    .append_stderr(stdio::ZERO_FAILURE_STATUS_NOTE);
+                store.data_mut().stdio.note_zero_status();
                 Ok(1)
             }
             Err(status) => Ok(status),

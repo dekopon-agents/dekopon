@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use dekopon_broker_host::asset::AssetInputs;
 use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerInvocationFailure, BrokerInvocationOutput,
-    BrokerProviderRegistry, MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER,
-    StdioHandleLimit, Streams, ZERO_FAILURE_STATUS_NOTE,
+    BrokerProviderRegistry, MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioTrap,
+    Streams, ZERO_FAILURE_STATUS_NOTE,
 };
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints, broker::AuthorizationGate};
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
@@ -474,7 +474,65 @@ async fn live_stdio_handles_are_bounded_and_dropped_ones_are_returned() {
         panic!("expected a trap, got {:?}", failure.error);
     };
     assert!(
-        source.downcast_ref::<StdioHandleLimit>().is_some(),
+        matches!(
+            source.downcast_ref::<StdioTrap>(),
+            Some(StdioTrap::TooManyHandles)
+        ),
+        "{source:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_err_0_note_is_its_own_line_even_after_a_full_stderr() {
+    let unterminated = "i32.const 3072 i32.const 4 call $stderr i32.const 0 call $err";
+    let flood = format!(
+        "i32.const {BUFFER} i32.const 120 i32.const {STDERR_CHUNK} memory.fill
+        i32.const {BUFFER} i32.const {STDERR_CHUNK} call $stderr
+        i32.const {BUFFER} i32.const {STDERR_CHUNK} call $stderr
+        i32.const 0 call $err"
+    );
+    for body in [unterminated.to_owned(), flood] {
+        let (host, _peer) = UnixStream::pair().unwrap();
+        let failure = run(&body, 5_000, streams(None, host))
+            .await
+            .expect_err("err(0) is a guest exit");
+        let BrokerHostError::ProviderFailure { status, stderr, .. } = *failure.error else {
+            panic!("expected a provider exit, got {:?}", failure.error);
+        };
+        assert_eq!(status, 1);
+        assert!(stderr.len() <= MAX_STDERR_BYTES, "{}", stderr.len());
+        let prefix = stderr
+            .strip_suffix(ZERO_FAILURE_STATUS_NOTE)
+            .expect("the note ends stderr");
+        assert!(
+            prefix.ends_with('\n'),
+            "{:?}",
+            &prefix[prefix.len().saturating_sub(20)..]
+        );
+        assert!(prefix.starts_with("boom") || prefix.starts_with('x'));
+        assert!(prefix.matches(STDERR_TRUNCATION_MARKER).count() <= 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_byte_read_traps_rather_than_reading_as_end_of_input() {
+    let (stdin_host, _stdin_peer) = UnixStream::pair().unwrap();
+    let (stdout_host, _stdout_peer) = UnixStream::pair().unwrap();
+    let body = r"
+        i32.const 32 call $stdin
+        i32.const 36 i32.load i32.const 0 i32.const 48 call $read
+        call $ok";
+    let failure = run(body, 5_000, streams(Some(stdin_host), stdout_host))
+        .await
+        .expect_err("read(0) is a guest bug");
+    let BrokerHostError::Invoke { source, .. } = &*failure.error else {
+        panic!("expected a trap, got {:?}", failure.error);
+    };
+    assert!(
+        matches!(
+            source.downcast_ref::<StdioTrap>(),
+            Some(StdioTrap::ZeroRead)
+        ),
         "{source:?}"
     );
 }
