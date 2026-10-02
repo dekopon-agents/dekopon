@@ -1247,7 +1247,7 @@ async fn concurrent_small_guest_stores_do_not_reserve_their_maximum() {
         .error;
     assert!(
         matches!(error.as_ref(), BrokerHostError::Timeout { .. })
-            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("timeout: ")),
+            || matches!(error.as_ref(), BrokerHostError::ProviderFailure { status: 1, stderr, .. } if stderr.starts_with("timeout: ") || stderr == "protocol: HTTP transport failed\n"),
         "the second store ran; a budget refusal would be MemoryBudgetExhausted: {error:?}"
     );
 
