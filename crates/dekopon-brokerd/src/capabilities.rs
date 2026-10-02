@@ -34,7 +34,6 @@ pub struct CapabilityConfig {
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintsPatch {
     pub timeout_ms: Option<u64>,
-    pub max_output_bytes: Option<u64>,
     pub http: Option<HttpPatch>,
     pub storage: Option<StorageConstraints>,
     pub asset: Option<AssetConstraints>,
@@ -57,7 +56,6 @@ impl ConstraintsPatch {
     fn over(&self, base: &Self) -> Self {
         Self {
             timeout_ms: self.timeout_ms.or(base.timeout_ms),
-            max_output_bytes: self.max_output_bytes.or(base.max_output_bytes),
             http: match (&self.http, &base.http) {
                 (Some(top), Some(bottom)) => Some(top.over(bottom)),
                 (top, bottom) => top.clone().or_else(|| bottom.clone()),
@@ -78,9 +76,6 @@ impl ConstraintsPatch {
         };
         Ok(ExecutionConstraints {
             timeout_ms: self.timeout_ms.ok_or_else(|| missing("timeoutMs"))?,
-            max_output_bytes: self
-                .max_output_bytes
-                .ok_or_else(|| missing("maxOutputBytes"))?,
             http: self
                 .http
                 .map(|http| {
@@ -266,7 +261,6 @@ gh:
   credential: github-pat
   constraints:
     timeoutMs: 10000
-    maxOutputBytes: 4096
     http:
       allowedHosts: [api.github.com]
       allowedMethods: [GET]
@@ -349,12 +343,12 @@ gh:
         let (_, problems) = resolve(
             r"
 gh:
-  constraints: { maxOutputBytes: 4096 }
+  constraints: {}
   capabilities:
     gh.repo.read: {}
     gh.repo.delete: {}
 absent:
-  constraints: { timeoutMs: 1, maxOutputBytes: 1 }
+  constraints: { timeoutMs: 1 }
 ",
         );
         assert!(problems.contains(&CapabilityProblem::MissingField {

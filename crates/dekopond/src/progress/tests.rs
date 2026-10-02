@@ -567,7 +567,7 @@ async fn producer_events(
         if let Some(word) = command {
             let word = word.to_owned();
             tokio::task::spawn_blocking(move || {
-                assert!(leg.run_command(&word, &[], None).is_some());
+                assert!(leg.run_command(&word, &[], false).is_some());
             })
             .await
             .unwrap();

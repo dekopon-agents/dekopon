@@ -255,15 +255,6 @@ pub(crate) fn record_arguments(span: &tracing::Span, arguments: &[String]) {
     );
 }
 
-pub(crate) fn record_stdin(span: &tracing::Span, piped: &Value) {
-    record_bounded(
-        span,
-        "shell.command.stdin",
-        "shell.command.stdin.bytes",
-        &display(piped),
-    );
-}
-
 pub(crate) fn record_output(span: &tracing::Span, output: &Value) {
     record_bounded(
         span,

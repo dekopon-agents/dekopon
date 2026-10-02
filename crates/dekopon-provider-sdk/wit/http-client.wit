@@ -1,4 +1,4 @@
-package dekopon:provider@0.3.0;
+package dekopon:provider@0.4.0;
 
 /// Guest binding world for Dekopon's broker-mediated HTTP client.
 world http-client {

@@ -15,8 +15,8 @@ use super::{
     AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
     AuthorityEncoder, CapabilityRoute, ChatMemoryConfig, ConstraintSet, ContextError,
     InMemoryAuditLog, encode_capability_authority, encode_execution_constraints,
-    encode_host_limits, encode_memory_config, encode_storage_limits, provider_failure_detail,
-    public_host_error,
+    encode_host_limits, encode_memory_config, encode_storage_limits, provider_exit_status,
+    provider_failure_detail, public_host_error,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -66,7 +66,7 @@ fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
         "provider": "memory-chat",
         "effect": "read-only",
         "risk": "Low",
-        "constraints": {"timeoutMs": 1000, "maxOutputBytes": 1024},
+        "constraints": {"timeoutMs": 1000},
     });
     let generic: ConstraintSet =
         serde_json::from_value(authored.clone()).expect("route may be omitted");
@@ -231,13 +231,6 @@ fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
                 memory.maximum_provider_input_bytes().expect("input") - 1,
             )
             .expect("input fits usize"),
-            ..BrokerHostLimits::default()
-        },
-        BrokerHostLimits {
-            max_output_bytes: usize::try_from(
-                memory.max_result_bytes + super::MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES - 1,
-            )
-            .expect("output fits usize"),
             ..BrokerHostLimits::default()
         },
         BrokerHostLimits {
@@ -440,7 +433,6 @@ fn capability_authority_commits_exactly_these_fields() {
             "credential.present",
             "credential",
             "execution.timeoutMs",
-            "execution.maxOutputBytes",
             "execution.http.present",
             "execution.storage.present",
             "execution.asset.present",
@@ -454,7 +446,6 @@ fn capability_authority_commits_exactly_these_fields() {
 fn a_flag_false_http_constraint_set_encodes_as_before_the_field_existed() {
     let constraints = ExecutionConstraints {
         timeout_ms: 30_000,
-        max_output_bytes: 1_048_576,
         http: Some(HttpConstraints {
             allowed_hosts: vec!["a.example:443".to_owned()],
             allowed_methods: vec!["GET".to_owned()],
@@ -468,7 +459,6 @@ fn a_flag_false_http_constraint_set_encodes_as_before_the_field_existed() {
     };
     let mut legacy = AuthorityEncoder::new();
     legacy.number("execution.timeoutMs", 30_000);
-    legacy.number("execution.maxOutputBytes", 1_048_576);
     legacy.byte("execution.http.present", 1);
     legacy.number("execution.http.allowedHostCount", 1);
     legacy.text("execution.http.allowedHost", "a.example:443");
@@ -496,7 +486,6 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
     let baseline = ExecutionConstraints {
         asset: None,
         timeout_ms: 30_000,
-        max_output_bytes: 1_048_576,
         http: Some(HttpConstraints {
             allowed_hosts: vec!["b.example:443".to_owned(), "a.example:443".to_owned()],
             allowed_methods: vec!["POST".to_owned(), "GET".to_owned()],
@@ -524,7 +513,6 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         }};
     }
     changes!(|v: &mut ExecutionConstraints| v.timeout_ms += 1);
-    changes!(|v: &mut ExecutionConstraints| v.max_output_bytes += 1);
     changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_requests += 1);
     changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_request_bytes += 1);
     changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").max_response_bytes += 1);
@@ -789,7 +777,7 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
         "effect": "external-write",
         "risk": "Medium",
         "credential": "github-pat",
-        "constraints": { "timeoutMs": 1000, "maxOutputBytes": 1024 }
+        "constraints": { "timeoutMs": 1000 }
     }"#;
     let named =
         serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
@@ -849,7 +837,7 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
 }
 
 #[test]
-fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_own_code() {
+fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() {
     let message = "the image route refused the request with HTTP 400 (moderation_blocked: the \
                    request was rejected)";
     for (message, expected) in [
@@ -867,17 +855,18 @@ fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_o
             capability: "gpt-image.edit"
                 .parse::<CapabilityId>()
                 .expect("valid capability"),
-            code: "upstream-rejected".to_owned(),
-            message,
+            status: 1,
+            stderr: message,
         };
+        assert_eq!(public_host_error(&failure), "provider-failure");
         assert_eq!(
-            public_host_error(&failure, CapabilityRoute::Generic),
-            "provider-failure"
+            provider_exit_status(&failure).map(std::num::NonZeroU8::get),
+            Some(1)
         );
         assert_eq!(
             provider_failure_detail(&failure),
             Some(ProviderFailureDetail {
-                code: "upstream-rejected".to_owned(),
+                code: "provider-exit".to_owned(),
                 message: expected,
             })
         );
@@ -894,6 +883,7 @@ fn a_host_failure_no_provider_reported_carries_no_detail() {
         BrokerHostError::StorageDisabled,
     ] {
         assert_eq!(provider_failure_detail(&failure), None);
+        assert_eq!(provider_exit_status(&failure), None);
     }
 }
 

@@ -5,7 +5,7 @@ use dekopon_broker_protocol::{
     Attestation, BrokerRequest, CommandRunOutcome, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
     ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER,
     ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, TraceParent,
+    ResponseEnvelope, Streams, TraceParent,
 };
 use dekopon_core::{
     ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
@@ -200,6 +200,7 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::Deserialize { .. } => "deserialize",
         ProtocolError::DescriptorsTruncated => "descriptors-truncated",
         ProtocolError::TooManyDescriptors => "too-many-descriptors",
+        ProtocolError::MissingStreamDescriptors => "missing-stream-descriptors",
         ProtocolError::UnexpectedDescriptors => "unexpected-descriptors",
         ProtocolError::DescriptorIndex => "descriptor-index",
         ProtocolError::DescriptorFlags { .. } => "descriptor-flags",
@@ -321,20 +322,25 @@ where
             .map_err(ConnectionError::Write)?;
         return Ok(());
     };
-    let received =
-        stream
-            .read_frame::<RequestEnvelope>(limits)
-            .await
-            .and_then(|(request, descriptors)| {
-                request.request.validate()?;
-                if !descriptors.is_empty()
-                    && !matches!(request.request, BrokerRequest::Invoke { .. })
-                {
-                    return Err(ProtocolError::UnexpectedDescriptors);
-                }
-                Ok((request, descriptors))
-            });
-    let (request, descriptors) = match received {
+    let received = stream.read_frame::<RequestEnvelope>(limits).await.and_then(
+        |(request, mut descriptors)| {
+            request.request.validate()?;
+            if !descriptors.is_empty() && !matches!(request.request, BrokerRequest::Invoke { .. }) {
+                return Err(ProtocolError::UnexpectedDescriptors);
+            }
+            let streams = if let BrokerRequest::Invoke {
+                streams: Some(shape),
+                ..
+            } = &request.request
+            {
+                Some(Streams::split_from(&mut descriptors, *shape)?)
+            } else {
+                None
+            };
+            Ok((request, descriptors, streams))
+        },
+    );
+    let (request, descriptors, streams) = match received {
         Ok(request) => request,
         Err(error) => {
             // Timeout, oversized frame, and bad JSON share one wire code; only the bounded message
@@ -384,7 +390,7 @@ where
             trace_parent,
             word,
             argv,
-            stdin,
+            stdin_piped,
         } => {
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
@@ -402,7 +408,7 @@ where
                     attestation.as_ref(),
                     &word,
                     &argv,
-                    stdin.as_deref(),
+                    stdin_piped,
                 )
                 .instrument(span.clone())
                 .await
@@ -423,13 +429,15 @@ where
             invocation,
             assets,
             sends_remaining,
+            streams: _,
         } => {
             if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
             let span = invocation_span(&invocation, attestation.as_ref());
             adopt_trace_parent(&span, invocation.trace_parent);
-            match broker
+            let (cancel, signal) = tokio::sync::watch::channel(false);
+            let operation = broker
                 .invoke(
                     context,
                     peer.attestor.as_ref(),
@@ -439,11 +447,20 @@ where
                         rows: assets,
                         descriptors,
                         sends_remaining,
+                        streams,
+                        cancel: Some(signal),
                     },
                 )
-                .instrument(span)
-                .await
-            {
+                .instrument(span);
+            tokio::pin!(operation);
+            let outcome = tokio::select! {
+                result = &mut operation => result,
+                () = stream.peer_disconnected() => {
+                    cancel.send_replace(true);
+                    operation.await
+                }
+            };
+            match outcome {
                 Ok(outcome) => {
                     outputs = outcome.assets;
                     ResponseEnvelope::invocation(

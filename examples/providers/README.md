@@ -4,7 +4,8 @@ Dekopon core keeps only host-conformance fixtures in this directory. Providers w
 behavior, dependency graph, issues, and release cadence live in standalone repositories. Core does
 not track their source or generated Wasm.
 
-Fetch the components local workspace tests need:
+Fetch pinned external 0.3.0 components for load-refusal tests and image staging (they cannot
+execute under the 0.4.0 host until their standalone repositories migrate):
 
 ```console
 ci/fetch-external-provider-components.sh examples/providers
@@ -33,18 +34,22 @@ The remaining checked components are repository-owned fixtures. Each declares a 
 because a model reaches a provider only through one and a broker refuses to start with a provider
 whose capabilities no word reaches:
 
-- [`cli-probe/`](cli-probe/) is the import-free typed SDK guest built on clap:  its `probe` word renders clap's help and usage errors, reads a piped value, and proposes
-  its three read-only capabilities.
+- [`cli-probe/`](cli-probe/) is a typed SDK guest built on clap: its `probe` word renders
+  clap's help and usage errors, proposes piped input without reading it, and its three
+  read-only capabilities consume piped bytes at invoke time.
 - [`clock-probe/`](clock-probe/) uses typed SDK clock needs for its `date` word and invocation;
   its separate raw fixture retains the clock-read-during-command refusal. It is never packaged.
 - [`http-probe/`](http-probe/) exercises typed SDK HTTP and asset handles; its `httpprobe` word proposes
   `fetch`, `conditional-write`, and `purge` from flags. Its `conditional-write` capability keeps
   two-call host budgets, per-call evidence, and etag-guarded writes covered without public
   network access.
-- [`memory-reservation-probe/`](memory-reservation-probe/) is a single import-free raw-bindings
+- [`memory-reservation-probe/`](memory-reservation-probe/) is a single stdio-only raw-bindings
   adversarial fixture for memory-route escape; it is never packaged.
 - [`storage-probe/`](storage-probe/) is the typed SDK durable-files conformance fixture;
   its `storageprobe` word proposes the run. It is never packaged in a scanned image directory.
+
+All seven checked components import `dekopon:stdio/streams@0.1.0`, write stdout bytes, and
+return a terminal result status from `invoke`; none exports a second returned-value path.
 
 Regenerate only repository-owned fixtures with their `build.sh`, each of which calls the shared
 [`build-component.sh`](build-component.sh). That script reads the compiler from
