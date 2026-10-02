@@ -159,37 +159,47 @@ pub struct RequestPeek {
 
 impl RequestPeek {
     pub fn of(body: &[u8]) -> Result<Self, PeekError> {
-        let value = serde_json::from_slice::<serde_json::Value>(body)
-            .map_err(|_invalid| PeekError::NotJson)?;
-        let object = value.as_object().ok_or(PeekError::NotObject)?;
-        let model = object
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(PeekError::NoModel)?
-            .to_owned();
+        let images = serde_json::from_slice::<Scan>(body)
+            .map_err(|_invalid| PeekError::NotJson)?
+            .images;
+        let fields = top_level_fields(body).ok_or(PeekError::NotObject)?;
+        let model = values(body, &fields, "model")
+            .next_back()
+            .and_then(|raw| serde_json::from_slice::<String>(raw).ok())
+            .ok_or(PeekError::NoModel)?;
+        let stream = {
+            let mut streams =
+                values(body, &fields, "stream").map(|raw| serde_json::from_slice::<bool>(raw).ok());
+            let first = streams.next().flatten();
+            first.filter(|first| streams.all(|other| other == Some(*first)))
+        };
         Ok(Self {
             model,
-            stream: object.get("stream").and_then(serde_json::Value::as_bool),
-            images: images(&value),
-            fields: top_level_fields(body).ok_or(PeekError::NotObject)?,
+            stream,
+            images,
+            fields,
         })
     }
 
-    /// Replaces each named top-level value with the given raw JSON, inserting a field the request
-    /// lacks at the front of the object.
+    /// Replaces every copy of each named top-level value with the given raw JSON, inserting a
+    /// field the request lacks at the front of the object.
     #[must_use]
     pub fn rewrite(&self, body: &[u8], replacements: &[(&str, &str)]) -> Vec<u8> {
         let mut edits = Vec::new();
         let mut inserted = String::new();
         for (key, raw) in replacements {
-            match self.fields.iter().find(|(field, _)| field == key) {
-                Some((_, range)) => edits.push((range.clone(), *raw)),
-                None => {
-                    inserted.push_str(&serde_json::Value::from(*key).to_string());
-                    inserted.push(':');
-                    inserted.push_str(raw);
-                    inserted.push(',');
-                }
+            let before = edits.len();
+            edits.extend(
+                self.fields
+                    .iter()
+                    .filter(|(field, _)| field == key)
+                    .map(|(_, range)| (range.clone(), *raw)),
+            );
+            if edits.len() == before {
+                inserted.push_str(&serde_json::Value::from(*key).to_string());
+                inserted.push(':');
+                inserted.push_str(raw);
+                inserted.push(',');
             }
         }
         edits.sort_by_key(|(range, _)| range.start);
@@ -215,20 +225,97 @@ impl RequestPeek {
     }
 }
 
-fn images(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Object(object) => {
-            let own = usize::from(matches!(
-                object.get("type").and_then(serde_json::Value::as_str),
-                Some("image" | "image_url" | "input_image")
-            ));
-            own + object.values().map(images).sum::<usize>()
+fn values<'a>(
+    body: &'a [u8],
+    fields: &'a [(String, std::ops::Range<usize>)],
+    name: &'a str,
+) -> impl DoubleEndedIterator<Item = &'a [u8]> {
+    fields
+        .iter()
+        .filter(move |(key, _)| key == name)
+        .filter_map(|(_, range)| body.get(range.clone()))
+}
+
+/// Validates the body and counts its image blocks in one pass; a `serde_json::Value` tree of the
+/// same body costs many times its size.
+#[derive(Default)]
+struct Scan {
+    images: usize,
+    image_type: bool,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum Key {
+    Type,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Scan {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ScanVisitor)
+    }
+}
+
+struct ScanVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ScanVisitor {
+    type Value = Scan;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Scan, E> {
+        Ok(Scan::default())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Scan, E> {
+        Ok(Scan::default())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Scan, E> {
+        Ok(Scan::default())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Scan, E> {
+        Ok(Scan::default())
+    }
+
+    fn visit_unit<E>(self) -> Result<Scan, E> {
+        Ok(Scan::default())
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Scan, E> {
+        Ok(Scan {
+            images: 0,
+            image_type: matches!(text, "image" | "image_url" | "input_image"),
+        })
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut items: A) -> Result<Scan, A::Error> {
+        let mut images = 0_usize;
+        while let Some(item) = items.next_element::<Scan>()? {
+            images = images.saturating_add(item.images);
         }
-        serde_json::Value::Array(items) => items.iter().map(images).sum(),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => 0,
+        Ok(Scan {
+            images,
+            image_type: false,
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut entries: A) -> Result<Scan, A::Error> {
+        let mut images = 0_usize;
+        while let Some(key) = entries.next_key::<Key>()? {
+            let value = entries.next_value::<Scan>()?;
+            let own = usize::from(key == Key::Type && value.image_type);
+            images = images.saturating_add(value.images).saturating_add(own);
+        }
+        Ok(Scan {
+            images,
+            image_type: false,
+        })
     }
 }
 
@@ -402,6 +489,27 @@ mod tests {
             String::from_utf8(expected.to_vec()).unwrap()
         );
         assert_eq!(peek.rewrite(body, &[("stream", "true")]), body);
+    }
+
+    #[test]
+    fn a_rewrite_replaces_every_copy_of_a_duplicated_key() {
+        let body = br#"{"model":"astra","store":false,"stream":true,"store":true}"#;
+        let peek = RequestPeek::of(body).unwrap();
+        let rewritten = peek.rewrite(body, &[("model", "\"gpt-5\""), ("store", "false")]);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap(),
+            json!({"model": "gpt-5", "store": false, "stream": true})
+        );
+        assert_eq!(
+            String::from_utf8(rewritten).unwrap(),
+            r#"{"model":"gpt-5","store":false,"stream":true,"store":false}"#
+        );
+    }
+
+    #[test]
+    fn a_stream_flag_whose_copies_disagree_is_unknown() {
+        let peek = RequestPeek::of(br#"{"model":"astra","stream":false,"stream":true}"#).unwrap();
+        assert_eq!(peek.stream, None);
     }
 
     #[test]
