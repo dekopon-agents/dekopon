@@ -22,7 +22,7 @@ use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 /// Connections served at once; one more waits in the kernel backlog until one closes.
-const MAX_CONNECTIONS: usize = 256;
+const MAX_CONNECTIONS: usize = 32;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

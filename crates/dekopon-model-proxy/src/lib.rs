@@ -32,13 +32,13 @@ use axum::{
 use bytes::Bytes;
 use dekopon_core::{AgentId, Redacted};
 use dekopon_model::{chatgpt::CredentialFile, wire::RequestPeek};
-use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Tokens, Via};
+use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 
 pub use dialect::Dialect;
 use dialect::Problem;
 use tee::{Shape, Timing};
 
-pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
 /// Under the jail's 90 s idle timer, so a reasoning model's silence never drops the stream.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -199,7 +199,7 @@ async fn handle(
             tracing::debug!(target: "model", error = %error, "proxy request body refused");
             return dialect.error(
                 Problem::TooLarge,
-                "request body exceeds the proxy's 32 MiB limit",
+                "request body exceeds the proxy's 8 MiB limit",
             );
         }
     };
@@ -242,7 +242,14 @@ async fn handle(
             backend: model.backend,
             via: Via::Proxy,
         };
-        let estimate = Estimate::from_sizes(rewritten.len(), peek.images, None, model.reserve);
+        let estimate = Estimate::from_sizes(
+            Sizes {
+                bytes: rewritten.len(),
+                images: peek.images,
+            },
+            None,
+            model.reserve,
+        );
         match proxy.metering.admit(call, estimate) {
             Ok(admission) => Some(admission),
             Err(refusal) => return dialect.refusal(&refusal),

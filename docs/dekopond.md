@@ -1366,10 +1366,12 @@ proxy:
   that disconnects is charged what had streamed, and the `meter` record says `meter.via = "proxy"`.
 - **Streaming.** Responses stream back unbuffered. While the upstream is silent, the proxy
   writes an SSE comment `: ping` every 20 seconds, under the jail's 90-second idle timer; both SDKs
-  ignore comment lines. An upstream silent for 300 seconds ends the stream. There is no total
-  timeout: the client's disconnect and the budget bound a call.
-- **Bounds.** A request body over 32 MiB gets a 413 in the dialect's error shape. At most 256
-  connections are served at once.
+  ignore comment lines. An upstream silent for 300 seconds ends the stream. The proxy sets no
+  total timeout; the jail's `maxConnectionSeconds` (1800 seconds by default) bounds a proxied
+  call. A stream cut there is charged as cancelled, and the client's retry is charged again.
+- **Bounds.** A request body over 8 MiB gets a 413 in the dialect's error shape. At most 32
+  connections are served at once. The proxy validates a body without parsing it into a tree and
+  keeps one copy of it per request once rewritten, so request bodies stay under 256 MiB together.
 - **Rotation.** The listener rereads its certificate, key and client CA when their mtime changes,
   checked on each connection, so cert-manager's renewals need no restart.
 - **Startup.** No `proxy` block means no listener. Every unknown agent, unknown model, model the

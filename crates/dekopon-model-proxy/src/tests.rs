@@ -464,6 +464,20 @@ async fn a_body_over_the_cap_is_refused_with_413() {
     assert_eq!(body["error"]["code"], "request_too_large");
 }
 
+#[test]
+fn a_cap_sized_body_of_deeply_nested_arrays_is_peeked() {
+    let nested = format!("{}{}", "[".repeat(120), "]".repeat(120));
+    let mut body = String::from(r#"{"model":"astra","messages":["#);
+    while body.len() + nested.len() + 64 < MAX_BODY_BYTES {
+        body.push_str(&nested);
+        body.push(',');
+    }
+    body.push_str(r#"{"type":"image"}]}"#);
+    let peek = dekopon_model::wire::RequestPeek::of(body.as_bytes()).unwrap();
+    assert_eq!(peek.model, "astra");
+    assert_eq!(peek.images, 1);
+}
+
 #[tokio::test]
 async fn count_tokens_is_forwarded_and_never_charged() {
     let (records, _guard) = capture();
