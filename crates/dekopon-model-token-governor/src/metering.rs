@@ -56,21 +56,28 @@ pub struct Estimate {
     pub output_reserve: Tokens,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Sizes {
+    pub bytes: usize,
+    pub images: usize,
+}
+
+impl Sizes {
+    const fn tokens(self) -> u64 {
+        Tokens::from_bytes(self.bytes)
+            .0
+            .saturating_add((self.images as u64).saturating_mul(IMAGE_TOKENS))
+    }
+}
+
 impl Estimate {
     #[must_use]
-    pub fn from_sizes(
-        request_bytes: usize,
-        images: usize,
-        hint: Option<(&InputHint, usize)>,
-        reserve: Tokens,
-    ) -> Self {
-        let images = (images as u64).saturating_mul(IMAGE_TOKENS);
-        let whole = Tokens::from_bytes(request_bytes).0.saturating_add(images);
-        let hinted = hint.map_or(0, |(hint, new_bytes)| {
-            hint.last().saturating_add(Tokens::from_bytes(new_bytes).0)
+    pub fn from_sizes(whole: Sizes, fresh: Option<(&InputHint, Sizes)>, reserve: Tokens) -> Self {
+        let hinted = fresh.map_or(0, |(hint, fresh)| {
+            hint.last().saturating_add(fresh.tokens())
         });
         Self {
-            input: Tokens(whole.max(hinted)),
+            input: Tokens(whole.tokens().max(hinted)),
             output_reserve: reserve,
         }
     }
@@ -241,16 +248,10 @@ impl Metering {
             .map(|budget| budget.lock().statuses(now))
     }
 
-    fn settle(&self, call: &Call, reservation: Option<Reservation>, actual: Tokens) {
-        let Some(budget) = self.budgets.get(&call.agent) else {
-            return;
-        };
-        let now = self.now();
-        let mut budget = budget.lock();
-        match reservation {
-            Some(reservation) => budget.settle(reservation, now, actual),
-            None if budget.covers(&call.model) => budget.charge(now, actual),
-            None => {}
+    fn settle(&self, call: &Call, reservation: Reservation, actual: Tokens) {
+        if let Some(budget) = self.budgets.get(&call.agent) {
+            let now = self.now();
+            budget.lock().settle(reservation, now, actual);
         }
     }
 }
@@ -287,11 +288,13 @@ impl Admission {
             let observed = self.observed.lock();
             Charge::of(outcome, self.estimate, &observed)
         };
-        self.metering.settle(
-            &self.call,
-            self.reservation.take(),
-            Tokens(charge.input.saturating_add(charge.output)),
-        );
+        if let Some(reservation) = self.reservation.take() {
+            self.metering.settle(
+                &self.call,
+                reservation,
+                Tokens(charge.input.saturating_add(charge.output)),
+            );
+        }
         record(&self.call, self.estimate, &charge);
     }
 }

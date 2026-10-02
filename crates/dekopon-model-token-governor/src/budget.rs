@@ -99,7 +99,9 @@ impl Budget {
                 agent: self.agent.clone(),
                 meter: meter.spec().kind(),
                 limit: status.limit,
-                remaining: status.remaining,
+                remaining: status
+                    .remaining
+                    .saturating_sub(i64::try_from(self.reserved.0).unwrap_or(i64::MAX)),
                 requested: want,
                 retry,
             }
