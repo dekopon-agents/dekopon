@@ -4,16 +4,17 @@
 use std::sync::Arc;
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, Broker, BrokerBuildError, BrokerLimits, CapabilityRoute,
-    ChatMemoryConfig, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
-    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
-    PolicyWorld, RouteConflict,
+    Attestation, AttestorGrant, AuditEvent, Broker, BrokerBuildError, BrokerLimits,
+    CapabilityRoute, ChatMemoryConfig, ChatTransportKind, ConstraintCatalog, ConstraintSet,
+    Conversation, ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    PolicyEngine, PolicyWorld, RouteConflict,
 };
 
 use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
-    EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface, StorageScope,
+    EffectKind, HttpConstraints, InvocationOutcome, StorageAccess, StorageConstraints,
+    StorageInterface, StorageScope,
 };
 use dekopon_core::{
     Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TransportId,
@@ -203,6 +204,122 @@ async fn the_fetched_memory_chat_0_3_0_fixture_is_refused_before_any_storage_eff
     assert!(
         matches!(error, BrokerHostError::Instantiate { .. }),
         "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [provider_fixture("storage-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("checked storage provider loads");
+    let world = PolicyWorld::new(
+        [
+            "gateway".parse::<PrincipalId>().expect("gateway"),
+            "maintainer".parse().expect("maintainer"),
+        ],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    let policy = PolicyEngine::new(
+        r#"@id("probe-prompt")
+            permit(principal == Dekopon::Principal::"maintainer",
+                   action == Dekopon::Action::"agent.prompt",
+                   resource == Dekopon::Agent::"reviewer")
+            when { context.via == "gateway" };
+            @id("probe-storage-write")
+            permit(principal == Dekopon::Principal::"maintainer",
+                   action == Dekopon::Action::"storage-probe.run",
+                   resource == Dekopon::Provider::"storage-probe")
+            when { context.via == "gateway" && context.agent == "reviewer" };"#,
+        &world,
+    )
+    .expect("policy permits the write in an ordinary message");
+    let constraints = ConstraintCatalog::new([(
+        "storage-probe.run".parse().expect("capability"),
+        ConstraintSet {
+            route: CapabilityRoute::Generic,
+            provider: "storage-probe".parse().expect("provider"),
+            effect: EffectKind::LocalWrite,
+            risk: RiskLevel::Medium,
+            credential: None,
+            constraints: dekopon_capability::ExecutionConstraints {
+                storage: Some(StorageConstraints {
+                    interface: StorageInterface::DurableFiles,
+                    access: StorageAccess::ReadWrite,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
+                }),
+                ..Default::default()
+            },
+        },
+    )])
+    .expect("catalog");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "probe-write-policy".to_owned(),
+        policy,
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        )])
+        .expect("identities"),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker");
+    let mut probe = claim();
+    probe.scope.as_mut().expect("chat scope").trigger = dekopon_broker::Trigger::Probe;
+
+    let (capabilities, words, _help, _) = broker
+        .capability_surface(&gateway(), Some(&attestor_grant()), Some(&probe))
+        .expect("a probe is an authorized chat session");
+    assert!(
+        capabilities
+            .iter()
+            .all(|entry| entry.capability.id.as_str() != "storage-probe.run")
+    );
+    assert!(!words.iter().any(|word| word == "storageprobe"));
+
+    let id = "probe-write".parse::<InvocationId>().expect("invocation");
+    let result = broker
+        .invoke(
+            &gateway(),
+            Some(&attestor_grant()),
+            Some(&probe.bound_to(id.clone())),
+            InvocationRequest {
+                id: id.clone(),
+                capability: "storage-probe.run".parse().expect("capability"),
+                trace_parent: TRACE_PARENT.parse().expect("traceparent"),
+                input: json!({"mode": "quota-denial"}),
+                secret_use: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("the refusal is accounted");
+    assert_eq!(result.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(result.result.error.as_deref(), Some("probe-write"));
+    assert!(
+        audit.records().iter().any(|event| matches!(
+            event,
+            AuditEvent::Decision { invocation, allowed: false, reason: Some(reason), .. }
+                if invocation == &id && reason == "probe-write"
+        )),
+        "the exact probe-write refusal must be audited"
     );
 }
 
@@ -643,6 +760,92 @@ fn reserved_read_constraint() -> ConstraintSet {
         risk: RiskLevel::Low,
         credential: None,
         constraints: dekopon_capability::ExecutionConstraints::default(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_memory_without_routes_names_every_missing_role() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let storage = StorageHost::open(
+        directory.join("provider-storage"),
+        StorageLimits::default(),
+    )
+    .expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [provider_fixture("storage-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("checked 0.4.0 fixture loads");
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().expect("caller")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    let constraints = ConstraintCatalog::new([(
+        "storage-probe.run".parse().expect("capability"),
+        ConstraintSet {
+            route: CapabilityRoute::Generic,
+            provider: "storage-probe".parse().expect("provider"),
+            effect: EffectKind::LocalWrite,
+            risk: RiskLevel::Medium,
+            credential: None,
+            constraints: dekopon_capability::ExecutionConstraints {
+                storage: Some(StorageConstraints {
+                    interface: StorageInterface::DurableFiles,
+                    access: StorageAccess::ReadWrite,
+                    scope: StorageScope::PrivateConversation,
+                    retention: Default::default(),
+                }),
+                ..Default::default()
+            },
+        },
+    )])
+    .expect("catalog");
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "unrouted-memory-policy".to_owned(),
+        PolicyEngine::new("", &world).expect("empty policy"),
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("a deployment with no complete chat memory route still starts");
+    let Err(error) = broker.with_chat_memory(memory_config()) else {
+        panic!("chatMemory must not compose with an unrouted catalog");
+    };
+    let rendered = error.to_string();
+    let BrokerBuildError::UnroutedChatMemory { roles } = error else {
+        panic!("an unrouted catalog must be its own build error: {rendered}");
+    };
+    assert_eq!(
+        roles,
+        vec![
+            CapabilityRoute::ChatMemoryRecord,
+            CapabilityRoute::ChatMemoryRecent,
+            CapabilityRoute::ChatMemorySearch,
+        ],
+        "every missing role is reported at once, not the first: {rendered}"
+    );
+    for fragment in [
+        "route:",
+        "chatMemoryRecord",
+        "chatMemoryRecent",
+        "chatMemorySearch",
+        "exactly one constraint set",
+        "docs/upgrading.md",
+    ] {
+        assert!(
+            rendered.contains(fragment),
+            "the refusal must name {fragment}: {rendered}"
+        );
     }
 }
 
