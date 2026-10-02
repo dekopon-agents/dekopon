@@ -106,6 +106,7 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     ]
     .into_iter()
     .filter_map(|(bit, name)| set.contains(bit).then_some(name.to_owned()))
+    .chain(std::iter::once("dekopon:stdio/streams@0.1.0".to_owned()))
     .collect()
 }
 
