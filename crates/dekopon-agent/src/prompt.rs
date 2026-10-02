@@ -662,6 +662,21 @@ where
                 }
                 return Err(PromptError::Cancelled);
             }
+            Err(InferenceError::OverBudget(refusal)) => {
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "accounting.model.turn",
+                        model.turn = model_turns,
+                        agent = agent,
+                        duration_ms = milliseconds(model_started.elapsed()),
+                        outcome = "refused",
+                        refusal = %refusal,
+                    },
+                    "model turn refused by the token budget"
+                );
+                return Err(InferenceError::OverBudget(refusal).into());
+            }
             Err(error) => {
                 tracing::error!(
                     target: "dekopon_agent::audit",
