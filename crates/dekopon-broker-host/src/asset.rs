@@ -1145,8 +1145,7 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
-        let handle = state
-            .open("chat-asset:1".to_owned())
+        let handle = wit::Host::open(&mut state, "chat-asset:1".to_owned())
             .await
             .unwrap()
             .unwrap();
