@@ -19,7 +19,7 @@ use dekopon_core::{
     SecretUseProposal,
 };
 use dekopon_test_support::{LoopbackServer, provider_fixture};
-use serde_json::{Value, json};
+use serde_json::json;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
@@ -768,7 +768,7 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
             assert_eq!(
                 result.result.detail,
-                Some(ProviderFailureDetail::new("provider-exit", "transport: HTTP transport failed\n")),
+                Some(ProviderFailureDetail::new("provider-exit", "protocol: HTTP transport failed\n")),
                 "a typed provider failure carries the provider's own code and message on the wire"
             );
             assert!(
@@ -796,7 +796,7 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                 error_detail
                     .as_ref()
                     .map(|detail| (detail.code.as_str(), detail.message.as_str())),
-                Some(("provider-exit", "transport: HTTP transport failed\n"))
+                Some(("provider-exit", "protocol: HTTP transport failed\n"))
             );
             assert_eq!(
                 http_calls.len(),
