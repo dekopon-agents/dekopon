@@ -110,7 +110,8 @@ pub(crate) fn model_bearer_token_with(
 ) -> Result<Option<String>, ModelCredentialError> {
     let variable = match model {
         ModelConfig::OpenaiCompatible { api_key_env, .. } => api_key_env.as_deref(),
-        ModelConfig::Openrouter { api_key_env, .. } => Some(api_key_env.as_str()),
+        ModelConfig::Openrouter { api_key_env, .. }
+        | ModelConfig::Anthropic { api_key_env, .. } => Some(api_key_env.as_str()),
         ModelConfig::ChatgptSubscription { .. } => None,
     };
     match variable {
@@ -132,7 +133,7 @@ pub(crate) fn model_credential(
 }
 
 impl ConfiguredModels {
-    fn chatgpt_credential(
+    pub(crate) fn chatgpt_credential(
         &self,
         auth_file: Option<&std::path::Path>,
         timeout: std::time::Duration,
@@ -226,6 +227,9 @@ impl ConfiguredModels {
                     CodexClient::with_credential(model, credential, timeout)?.with_name(name),
                 )))
             }
+            ModelConfig::Anthropic { name, .. } => Err(SessionError::ProxyOnlyModel {
+                model: name.clone(),
+            }),
         }
     }
 }
@@ -246,11 +250,11 @@ impl ModelFactory for ConfiguredModels {
                 Arc::clone(clients.entry(model.name().to_owned()).or_insert(built))
             }
         };
-        let timeout_ms = match model {
-            ModelConfig::ChatgptSubscription { timeout_ms, .. }
-            | ModelConfig::OpenaiCompatible { timeout_ms, .. }
-            | ModelConfig::Openrouter { timeout_ms, .. } => *timeout_ms,
-        };
+        let timeout_ms = model
+            .timeout_ms()
+            .ok_or_else(|| SessionError::ProxyOnlyModel {
+                model: model.name().to_owned(),
+            })?;
         Ok(Arc::new(BlockingModel::new(
             client,
             runtime,
@@ -2001,6 +2005,8 @@ pub enum SessionError {
     ModelCredential(#[from] ModelCredentialError),
     #[error(transparent)]
     Prompt(#[from] PromptError),
+    #[error("model {model:?} is served only through the guest model proxy")]
+    ProxyOnlyModel { model: String },
 }
 
 impl SessionError {
@@ -2013,6 +2019,7 @@ impl SessionError {
             | Self::Prompt(PromptError::Model(InferenceError::OverBudget(_))) => "over-budget",
             Self::Model(_) => "model",
             Self::ModelCredential(_) => "model-credential",
+            Self::ProxyOnlyModel { .. } => "proxy-only-model",
             Self::Prompt(error) => error.telemetry_kind(),
         }
     }

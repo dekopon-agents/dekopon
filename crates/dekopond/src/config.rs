@@ -274,6 +274,8 @@ pub struct DekopondConfig {
     pub telemetry: Option<TelemetryConfig>,
     #[serde(default)]
     pub metering: Option<crate::metering::MeteringConfig>,
+    #[serde(default)]
+    pub proxy: Option<crate::proxy::ProxyConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -462,6 +464,11 @@ pub enum ModelConfig {
         #[serde(default)]
         modalities: Vec<Modality>,
     },
+    Anthropic {
+        name: String,
+        model: String,
+        api_key_env: String,
+    },
 }
 
 const fn default_model_stream() -> bool {
@@ -480,7 +487,8 @@ impl ModelConfig {
         match self {
             Self::OpenaiCompatible { name, .. }
             | Self::ChatgptSubscription { name, .. }
-            | Self::Openrouter { name, .. } => name,
+            | Self::Openrouter { name, .. }
+            | Self::Anthropic { name, .. } => name,
         }
     }
 
@@ -490,6 +498,7 @@ impl ModelConfig {
             Self::OpenaiCompatible { modalities, .. }
             | Self::ChatgptSubscription { modalities, .. }
             | Self::Openrouter { modalities, .. } => modalities.contains(&Modality::Image),
+            Self::Anthropic { .. } => false,
         }
     }
 
@@ -499,14 +508,16 @@ impl ModelConfig {
             Self::OpenaiCompatible { classes, .. }
             | Self::ChatgptSubscription { classes, .. }
             | Self::Openrouter { classes, .. } => classes,
+            Self::Anthropic { .. } => &[],
         }
     }
 
-    fn timeout_ms(&self) -> u64 {
+    pub(crate) const fn timeout_ms(&self) -> Option<u64> {
         match self {
             Self::OpenaiCompatible { timeout_ms, .. }
             | Self::ChatgptSubscription { timeout_ms, .. }
-            | Self::Openrouter { timeout_ms, .. } => *timeout_ms,
+            | Self::Openrouter { timeout_ms, .. } => Some(*timeout_ms),
+            Self::Anthropic { .. } => None,
         }
     }
 }
@@ -876,6 +887,7 @@ pub struct ResolvedConfig {
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
     pub metering: crate::metering::ResolvedMetering,
+    pub proxy: Option<crate::proxy::ResolvedProxy>,
 }
 
 /// `Check` keeps going past a directory's fragment refusals so they are reported beside whatever
@@ -1235,7 +1247,7 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::DuplicateModel { name });
             continue;
         }
-        if model.timeout_ms() == 0 {
+        if model.timeout_ms() == Some(0) {
             problems.push(ConfigProblem::InvalidModelTimeout { name: name.clone() });
         }
         if let ModelConfig::Openrouter {
@@ -1270,12 +1282,22 @@ pub(crate) fn resolve(
         | ModelConfig::Openrouter {
             api_key_env: variable,
             ..
+        }
+        | ModelConfig::Anthropic {
+            api_key_env: variable,
+            ..
         } = model
         {
             check_env_name(variable, &mut problems);
         }
     }
 
+    let proxy_only = config
+        .models
+        .iter()
+        .filter(|model| matches!(model, ModelConfig::Anthropic { .. }))
+        .map(|model| model.name().to_owned())
+        .collect::<BTreeSet<_>>();
     let mut metering_problems = Vec::new();
     let metering = crate::metering::resolve(
         config.metering,
@@ -1289,6 +1311,19 @@ pub(crate) fn resolve(
         &mut metering_problems,
     );
     problems.extend(metering_problems.into_iter().map(ConfigProblem::Metering));
+    let mut proxy_problems = Vec::new();
+    let proxy = crate::proxy::resolve(
+        config.proxy,
+        &config
+            .routes
+            .iter()
+            .map(|route| route.agent.to_string())
+            .collect(),
+        &config.models,
+        resolve_path,
+        &mut proxy_problems,
+    );
+    problems.extend(proxy_problems.into_iter().map(ConfigProblem::Proxy));
     if let Some(crate::metering::RestoreConfig::Openobserve { auth_env, .. }) = &metering.restore {
         check_env_name(auth_env, &mut problems);
     }
@@ -1364,6 +1399,13 @@ pub(crate) fn resolve(
             && !model_names.contains(model)
         {
             problems.push(ConfigProblem::UnknownRouteModel {
+                model: model.clone(),
+            });
+        }
+        if let Some(model) = &route.model
+            && proxy_only.contains(model)
+        {
+            problems.push(ConfigProblem::ProxyOnlyRouteModel {
                 model: model.clone(),
             });
         }
@@ -1637,6 +1679,7 @@ pub(crate) fn resolve(
                 shutdown_grace,
                 telemetry,
                 metering,
+                proxy,
             })
         }
         _ => Err(ConfigError::Invalid {
@@ -2019,6 +2062,8 @@ pub enum ConfigError {
 pub enum ConfigProblem {
     #[error(transparent)]
     Metering(crate::metering::MeteringProblem),
+    #[error(transparent)]
+    Proxy(crate::proxy::ProxyProblem),
     #[error("model {name:?} requires a nonempty model identifier")]
     EmptyModelId { name: String },
     #[error("model {name:?}: {problem}")]
@@ -2115,6 +2160,10 @@ pub enum ConfigProblem {
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
     UnknownRouteModel { model: String },
+    #[error(
+        "route names model {model:?}, whose kind anthropic is served only through the guest model proxy"
+    )]
+    ProxyOnlyRouteModel { model: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
@@ -2805,7 +2854,9 @@ routes:
             .iter()
             .filter_map(|model| match model {
                 ModelConfig::OpenaiCompatible { stream, .. } => Some(*stream),
-                ModelConfig::ChatgptSubscription { .. } | ModelConfig::Openrouter { .. } => None,
+                ModelConfig::ChatgptSubscription { .. }
+                | ModelConfig::Openrouter { .. }
+                | ModelConfig::Anthropic { .. } => None,
             })
             .collect();
         assert_eq!(
