@@ -220,8 +220,8 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
-        vec!["upper".to_owned(), "-".to_owned()],
-        Some("x".repeat(128 * 1024)),
+        vec!["upper".to_owned(), "x".repeat(128 * 1024)],
+        false,
         TRACE_PARENT.parse().expect("valid traceparent fixture"),
     ))
     .expect("the oversized run frame serializes");

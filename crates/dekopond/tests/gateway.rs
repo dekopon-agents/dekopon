@@ -79,17 +79,6 @@ permit(principal == Dekopon::Principal::"{principal}",
 when {{ context.via == "{GATEWAY_PRINCIPAL}"
      && context.agent == "{AGENT}" }};
 
-@id("chat-agent-memory-{suffix}")
-permit(principal == Dekopon::Principal::"{principal}",
-       action in [Dekopon::Action::"memory.chat.record",
-                  Dekopon::Action::"memory.chat.recent",
-                  Dekopon::Action::"memory.chat.search"],
-       resource == Dekopon::Provider::"memory-chat")
-when {{ context.via == "{GATEWAY_PRINCIPAL}"
-     && context.agent == "{AGENT}"
-     && context has transportKind && context.transportKind == "local"
-     && context has transport && context.transport == "dev"
-     && context has conversation && context.conversation.id == "dev" }};
 "#
         )
     })
@@ -97,18 +86,11 @@ when {{ context.via == "{GATEWAY_PRINCIPAL}"
 }
 
 fn broker_config(directory: &Path, uid: u32) -> Value {
-    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
-        .expect("storage limits serialize");
-    let fields = storage.as_object_mut().expect("storage limits object");
-    fields.insert(
-        "rootPath".to_owned(),
-        json!(directory.join("provider-storage")),
-    );
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
         "policiesPath": directory.join("policies.cedar"),
-        "providers": [provider("cli-probe"), provider("memory-chat")],
+        "providers": [provider("cli-probe")],
         "identities": [{
             "uid": uid,
             "principal": GATEWAY_PRINCIPAL,
@@ -121,38 +103,9 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         },
         "capabilities": {
             "cli-probe": {
-                "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+                "constraints": {"timeoutMs": 30_000},
                 "capabilities": {"cli-probe.upper": {}}
-            },
-            "memory-chat": {
-                "constraints": {
-                    "timeoutMs": 30_000, "maxOutputBytes": 131_072,
-                    "storage": {"interface":"jsonl","access":"read-only","scope":"private-conversation"}
-                },
-                "capabilities": {
-                    "memory.chat.record": {
-                        "route": "chatMemoryRecord",
-                        "constraints": {
-                            "storage": {"interface":"jsonl","access":"read-write","scope":"private-conversation"}
-                        }
-                    },
-                    "memory.chat.recent": {"route": "chatMemoryRecent"},
-                    "memory.chat.search": {"route": "chatMemorySearch"}
-                }
             }
-        },
-        "storage": storage,
-        "chatMemory": {
-            "continuityPolicy": "authority-bound",
-            "enabledAgents": [AGENT],
-            "maxLookbackTurns": 200,
-            "maxRecentTurns": 20,
-            "maxSearchResults": 20,
-            "maxQueryBytes": 256,
-            "maxResultBytes": 65_536,
-            "maxTurnBytes": 32_768,
-            "compactionTargetBytes": 8_388_608,
-            "compactionThresholdBytes": 12_582_912
         }
     })
 }
@@ -534,25 +487,6 @@ impl Audit {
         }
         false
     }
-
-    async fn wait_for_memory_record(&self) {
-        for _ in 0..3_000 {
-            if self
-                .find(
-                    "broker.execution",
-                    &[
-                        ("capability.id", "memory.chat.record"),
-                        ("outcome", "Succeeded"),
-                    ],
-                )
-                .is_some()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the post-acceptance memory record did not complete within thirty seconds");
-    }
 }
 
 fn has(record: &str, field: &str, value: &str) -> bool {
@@ -690,10 +624,6 @@ async fn boot_shared(responses: Vec<Value>) -> Fixture {
         true,
     )
     .await
-}
-
-async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture {
-    boot_in_with_scope(directory, responses, None, "plain", true).await
 }
 
 /// Timing this race is unreliable, since an instant answer can finish before a second caller's line
@@ -943,7 +873,6 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
         .await
         .expect("the first request completes");
     assert_eq!(first, "Two things broke.");
-    audit.wait_for_memory_record().await;
     let second = tokio::task::spawn_blocking(move || {
         ask_when_idle(&socket, MAPPED_SUBJECT, "and the second one?")
     })
@@ -962,9 +891,6 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                 "system",
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "Durable chat memory is available on demand. Use `memory recent --last N` or ",
-                    "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it.\n\n",
                     "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
                     "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
                     "References use chat-asset:<N>, never data URLs.]"
@@ -1000,7 +926,6 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
         .await
         .expect("the first participant's request completes");
     assert_eq!(first, "Two things broke.");
-    audit.wait_for_memory_record().await;
 
     let second = tokio::task::spawn_blocking(move || {
         ask_when_idle(&socket, OTHER_MAPPED_SUBJECT, "and the second one?")
@@ -1021,9 +946,6 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                 "system".to_owned(),
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "Durable chat memory is available on demand. Use `memory recent --last N` or ",
-                    "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it.\n\n",
                     "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
                     "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
                     "References use chat-asset:<N>, never data URLs.]"
@@ -1057,53 +979,6 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
         "the second participant still receives an independent broker decision: {:#?}",
         audit.records()
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn durable_recent_retrieves_the_accepted_turn_after_broker_and_gateway_restart() {
-    let audit = Audit::exclusive().await;
-    let fixture = boot(vec![final_answer("The retained answer.")]).await;
-    let socket = fixture.socket();
-    let first = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "remember this"))
-        .await
-        .expect("first request completes");
-    assert_eq!(first, "The retained answer.");
-    audit.wait_for_memory_record().await;
-    let directory = fixture.shutdown().await;
-
-    let fixture = boot_in(
-        directory,
-        vec![
-            bash_tool_call(
-                "memory-1",
-                "memory recent --last 1 | jq -r '.turns[0].assistant'",
-            ),
-            final_answer("I retrieved the retained answer."),
-        ],
-    )
-    .await;
-    let socket = fixture.socket();
-    let second = tokio::task::spawn_blocking(move || {
-        ask(
-            &socket,
-            MAPPED_SUBJECT,
-            "retrieve the prior accepted answer",
-        )
-    })
-    .await
-    .expect("post-restart request completes");
-    assert_eq!(second, "I retrieved the retained answer.");
-    assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
-    let tool_output = fixture
-        .prompt(1)
-        .into_iter()
-        .find_map(|(role, content)| (role == "tool").then_some(content))
-        .expect("second model turn carries memory command output");
-    assert!(
-        tool_output.contains("The retained answer."),
-        "{tool_output}"
-    );
-    let _directory = fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

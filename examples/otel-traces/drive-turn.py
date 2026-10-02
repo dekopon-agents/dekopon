@@ -143,7 +143,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
                 "attestor": {"namespaces": ["tel"]}}],
             "principals": {"smoke-user": {"subjects": ["tel.16034700182"]}},
             "capabilities": {"cli-probe": {
-                "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
+                "constraints": {"timeoutMs": 30000},
                 "capabilities": {"cli-probe.upper": {}}}},
             "telemetry": telemetry})
         broker = start("dekopon-brokerd", broker_config)

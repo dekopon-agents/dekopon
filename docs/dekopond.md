@@ -442,7 +442,7 @@ beside the invocation. Broker subject, Cedar and HTTP authorization are unchange
 
 A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
-`assetNote` naming the reference, declared content type and stored-byte count. The declared label
+stderr note naming the reference, declared content type and stored-byte count. The declared label
 is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
 Pathless outputs are retained without copying and reclaimed by closing their last descriptor.
 All descriptor reads are positional. A trap, denial or timeout admits no asset effects.

@@ -170,7 +170,7 @@ async fn round_trips_one_strict_bounded_frame() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let expected = RequestEnvelope::invoke(None, invocation(), vec![], 0);
+    let expected = RequestEnvelope::invoke(None, invocation(), vec![], 0, None);
     let (mut writer, mut reader) = duplex(8 * 1024);
     let write = tokio::spawn({
         let expected = expected.clone();
@@ -234,6 +234,17 @@ async fn in_bound_prefix_that_over_promises_fails_instead_of_decoding_a_short_fr
         matches!(&error, ProtocolError::Io { source } if source.kind() == std::io::ErrorKind::UnexpectedEof),
         "expected an unexpected-EOF failure, got {error}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_completed_request_can_wait_for_peer_disconnection() {
+    let (peer, server) = tokio::net::UnixStream::pair().expect("socketpair");
+    let watcher = super::DescriptorStream::new(server);
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(1), watcher.peer_disconnected())
+        .await
+        .expect("a disconnected peer wakes the broker");
 }
 
 #[tokio::test]
@@ -300,7 +311,7 @@ async fn one_frame_reaches_the_socket_in_one_write() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let request = RequestEnvelope::invoke(None, invocation(), vec![], 0);
+    let request = RequestEnvelope::invoke(None, invocation(), vec![], 0, None);
     let mut writer = CountingWriter::default();
     write_frame(&mut writer, &request, limits)
         .await
@@ -429,7 +440,7 @@ async fn a_payload_that_ends_early_is_not_decoded() {
 
 #[test]
 fn wire_invocation_contains_no_identity_or_authority_fields() {
-    let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation(), vec![], 0))
+    let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation(), vec![], 0, None))
         .expect("request serializes");
     let encoded = serde_json::to_string(&value).expect("request JSON renders");
     for prohibited in [
@@ -1559,7 +1570,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 None,
                 "memory".to_owned(),
                 Vec::new(),
-                None,
+                false,
                 sample_trace_parent(),
             ),
         ),
@@ -1569,13 +1580,13 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 Some(chat.clone()),
                 "memory".to_owned(),
                 vec!["search".to_owned(), "-".to_owned()],
-                Some("piped".to_owned()),
+                true,
                 sample_trace_parent(),
             ),
         ),
         (
             "invoke",
-            RequestEnvelope::invoke(None, invocation(), vec![], 0),
+            RequestEnvelope::invoke(None, invocation(), vec![], 0, None),
         ),
         (
             "invoke",
@@ -1584,6 +1595,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 invocation(),
                 vec![],
                 0,
+                None,
             ),
         ),
         (
@@ -1593,6 +1605,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 invocation(),
                 vec![],
                 0,
+                None,
             ),
         ),
         (
@@ -1714,17 +1727,17 @@ fn recording_is_reachable_only_through_its_own_operation() {
 }
 
 #[test]
-fn a_run_command_frame_omits_an_absent_piped_value() {
+fn a_run_command_frame_carries_whether_stdin_is_piped_never_its_bytes() {
     let bare = RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
         vec!["--help".to_owned()],
-        None,
+        false,
         sample_trace_parent(),
     );
     let encoded = serde_json::to_value(&bare).expect("envelope serializes");
     assert_eq!(encoded["request"]["operation"], json!("runCommand"));
-    assert!(encoded["request"].get("stdin").is_none(), "{encoded}");
+    assert_eq!(encoded["request"]["stdinPiped"], json!(false), "{encoded}");
     assert_eq!(
         serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
         bare
@@ -1734,11 +1747,12 @@ fn a_run_command_frame_omits_an_absent_piped_value() {
         None,
         "probe".to_owned(),
         vec!["upper".to_owned(), "-".to_owned()],
-        Some("hello".to_owned()),
+        true,
         sample_trace_parent(),
     );
     let encoded = serde_json::to_value(&piped).expect("envelope serializes");
-    assert_eq!(encoded["request"]["stdin"], json!("hello"), "{encoded}");
+    assert_eq!(encoded["request"]["stdinPiped"], json!(true), "{encoded}");
+    assert!(encoded["request"].get("stdin").is_none(), "{encoded}");
     assert_eq!(
         serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
         piped
@@ -1751,7 +1765,7 @@ fn a_run_command_frame_requires_one_well_formed_trace_parent() {
         None,
         "probe".to_owned(),
         vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
-        None,
+        false,
         sample_trace_parent(),
     ))
     .expect("envelope serializes");
@@ -1929,7 +1943,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
                 trace_parent: sample_trace_parent(),
                 word: "probe".to_owned(),
                 argv: vec!["--help".to_owned()],
-                stdin: None,
+                stdin_piped: false,
             }
         );
         write_frame(&mut stream, &ResponseEnvelope::command_run(answer), limits)
@@ -1943,7 +1957,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
             None,
             "probe".to_owned(),
             vec!["--help".to_owned()],
-            None,
+            false,
             sample_trace_parent(),
         )
         .await
@@ -1954,7 +1968,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
+async fn an_oversized_command_frame_is_refused_before_it_leaves_the_client() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     use tokio::net::UnixListener;
@@ -1976,12 +1990,12 @@ async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
         .run_command(
             None,
             "probe".to_owned(),
-            vec!["upper".to_owned(), "-".to_owned()],
-            Some("x".repeat(256)),
+            vec!["upper".to_owned(), "x".repeat(256)],
+            false,
             sample_trace_parent(),
         )
         .await
-        .expect_err("an oversized piped value must fail");
+        .expect_err("an oversized command frame must fail");
     drop(listener);
     assert!(
         matches!(
@@ -2155,7 +2169,7 @@ fn failed_with_detail() -> InvocationResult {
             policy_revision: "policy-1".to_owned(),
         },
         outcome: InvocationOutcome::Failed,
-        output: None,
+        exit_status: None,
         error: Some("provider-failure".to_owned()),
         detail: Some(ProviderFailureDetail::new(
             "upstream-rejected",
@@ -2198,6 +2212,21 @@ async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
 }
 
 #[test]
+fn a_guest_exit_round_trips_as_a_nonzero_status_not_a_detail_code() {
+    let mut result = failed_with_detail();
+    result.exit_status = Some(std::num::NonZeroU8::new(7).expect("guest failure"));
+    let document = serde_json::to_value(&result).expect("result serializes");
+    assert_eq!(document["exitStatus"], 7);
+    assert_eq!(
+        serde_json::from_value::<InvocationResult>(document).unwrap(),
+        result
+    );
+    let mut invalid = serde_json::to_value(&result).unwrap();
+    invalid["exitStatus"] = json!(0);
+    assert!(serde_json::from_value::<InvocationResult>(invalid).is_err());
+}
+
+#[test]
 fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
     let result = InvocationResult {
         error: Some("provider-timeout".to_owned()),
@@ -2218,6 +2247,13 @@ fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
         serde_json::from_str::<ResponseEnvelope>(&document).expect("it decodes"),
         ResponseEnvelope::invocation(result, vec![], vec![], vec![])
     );
+}
+
+#[test]
+fn a_returned_output_is_not_a_valid_invocation_result() {
+    let mut document = serde_json::to_value(failed_with_detail()).expect("result serializes");
+    document["output"] = json!({"text": "retired"});
+    assert!(serde_json::from_value::<InvocationResult>(document).is_err());
 }
 
 #[test]

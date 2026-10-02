@@ -174,13 +174,12 @@ returns a normal result carrying its outcome and decision linkage.
 
 Only on a chat-memory-routed capability may a provider-reported failure retain one of
 `memory-corrupt` or `result-too-large` as its classification.
-Every other provider-reported failure classifies as `provider-failure`, and carries the provider's
-own answer beside it: a failed `InvocationResult` sets `detail` to the component's `{ code, message }`
-whenever the classification came from a typed `ComponentResponse::Failed`, and omits it for every
-host, transport, or storage failure no provider reported. `error` stays the field a caller branches
-on; `detail` is provider-authored text, bounded at 128 and 1024 bytes on both construction and
-decode, that says which refusal this was. This routed provider-code allowlist is separate from the
-native pre-execution storage setup failures above.
+Every other provider-reported failure classifies as `provider-failure`. A guest's nonzero exit
+carries its bounded stderr in `detail` with code `provider-exit`; a successful guest with non-empty
+stderr carries `provider-stderr`. Host, transport, and storage failures have no provider-authored
+stderr. `error` stays the field a caller branches on; `detail` is bounded at 128 and 1024 bytes on
+both construction and decode. This routed provider-code allowlist is separate from native
+pre-execution storage setup failures above.
 
 `capacity-exhausted` separates an exhausted bounded embedding in-memory audit log from a momentary
 outage. It does not evict during its lifetime, so clients must not retry automatically. The server

@@ -120,8 +120,6 @@ pub struct StorageEvidence {
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub evidence_commitment: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_commitment: Option<String>,
 }
 
 pub struct StorageGrantRequest {

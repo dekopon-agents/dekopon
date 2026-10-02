@@ -1,4 +1,4 @@
-package dekopon:provider@0.3.0;
+package dekopon:provider@0.4.0;
 
 /// Guest binding world for the broker host's wall clock.
 world clock-client {

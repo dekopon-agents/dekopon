@@ -55,7 +55,7 @@ impl CapabilityInvoker for Fixture {
         word == PROBE
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         if word != PROBE {
             return None;
         }
@@ -67,11 +67,9 @@ impl CapabilityInvoker for Fixture {
                 status: 0,
             },
             ["upper", "--text", text] => proposal("cli-probe.upper", json!({ "text": text })),
-            ["upper", "-"] => match stdin {
-                Some(text) => proposal("cli-probe.upper", json!({ "text": text })),
-                None => CommandRun::Failed {
-                    message: "probe: no input was piped for -".to_owned(),
-                },
+            ["upper", "-"] if stdin_piped => proposal("cli-probe.upper", json!({ "text": null })),
+            ["upper", "-"] => CommandRun::Failed {
+                message: "probe: no input was piped for -".to_owned(),
             },
             ["object", flags @ ..] => match object_from_flags(flags) {
                 Some(object) => proposal("fixture.object", object),
@@ -111,10 +109,37 @@ impl CapabilityInvoker for Fixture {
         })
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        mut streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         let capability = proposal.capability;
-        let input = proposal.input;
+        let mut input = proposal.input;
         let secret_use = proposal.secret_use;
+        if input.get("text") == Some(&Value::Null)
+            && let Some(stdin) = streams.stdin.take()
+        {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::os::unix::net::UnixStream::from(stdin),
+                &mut bytes,
+            )
+            .expect("piped stdin");
+            let Ok(text) = String::from_utf8(bytes) else {
+                return CapabilityCallResult::Exited {
+                    status: std::num::NonZeroU8::MIN,
+                    stderr: "probe: standard input is not valid UTF-8\n".to_owned(),
+                };
+            };
+            if text.is_empty() {
+                return CapabilityCallResult::Exited {
+                    status: std::num::NonZeroU8::new(2).expect("nonzero"),
+                    stderr: "probe: no input was piped for -\n".to_owned(),
+                };
+            }
+            input = json!({ "text": text });
+        }
         let capability = capability.as_str();
         if secret_use.is_some() {
             return dekopon_shell::secret_use_unsupported();
@@ -124,17 +149,15 @@ impl CapabilityInvoker for Fixture {
             .push((capability.to_owned(), input.clone()));
         match capability {
             "cli-probe.upper" => match input.get("text").and_then(Value::as_str) {
-                Some(text) => {
-                    CapabilityCallResult::Succeeded(json!({ "text": text.to_uppercase() }))
-                }
+                Some(text) => streams.reply(&json!({ "text": text.to_uppercase() })),
                 None => CapabilityCallResult::Failed {
                     error: "input must be {\"text\": <string>}".to_owned(),
                     detail: None,
                 },
             },
-            "fixture.object" => CapabilityCallResult::Succeeded(input),
-            "fixture.list" => CapabilityCallResult::Succeeded(json!(["a", "b"])),
-            "fixture.null" => CapabilityCallResult::Succeeded(Value::Null),
+            "fixture.object" => streams.reply(&input),
+            "fixture.list" => streams.reply(&json!(["a", "b"])),
+            "fixture.null" => streams.reply(&Value::Null),
             "policy.denied" => CapabilityCallResult::Denied {
                 reason: "exact policy refused this proposal".to_owned(),
             },
@@ -149,7 +172,7 @@ impl CapabilityInvoker for Fixture {
                     "the image route refused the request with HTTP 400 (moderation_blocked)",
                 )),
             },
-            "http-probe.fetch" => CapabilityCallResult::Succeeded(json!({
+            "http-probe.fetch" => streams.reply(&json!({
                 "status": 200,
                 "bodyText": "alpha\nbeta\nalpha",
             })),
@@ -1186,7 +1209,7 @@ fn a_binary_named_buffer_refuses_text_capture_and_provider_stdin() {
     let capture = run("printf '/w==' | base64 -d > buf; v=$(cat buf)");
     assert_ne!(capture.exit_code, ExitCode::SUCCESS, "{capture:?}");
     assert!(capture.output.contains("not valid UTF-8"), "{capture:?}");
-    let provider = run("printf '/w==' | base64 -d > buf; cat buf | probe upper");
+    let provider = run("printf '/w==' | base64 -d > buf; cat buf | probe upper -");
     assert_ne!(provider.exit_code, ExitCode::SUCCESS, "{provider:?}");
     assert!(provider.output.contains("not valid UTF-8"), "{provider:?}");
 }
@@ -2291,15 +2314,19 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             &self,
             word: &str,
             _argv: &[String],
-            _stdin: Option<&str>,
+            _stdin_piped: bool,
         ) -> Option<CommandRun> {
             (word == "slow").then(|| proposal("slow.call", json!({})))
         }
 
-        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: dekopon_shell::CommandProposal,
+            streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             let input = proposal.input;
             std::thread::sleep(Duration::from_millis(20));
-            CapabilityCallResult::Succeeded(input)
+            streams.reply(&input)
         }
     }
 
@@ -2791,9 +2818,9 @@ fn a_builtin_writes_its_lines_and_xargs_reads_text_not_json() {
 }
 
 #[test]
-fn a_provider_that_returns_null_still_writes_its_newline() {
-    assert_eq!(output("probe null | wc -c"), "1");
-    assert_eq!(output("probe null | wc -l"), "1");
+fn a_provider_that_writes_nothing_leaves_its_stage_empty() {
+    assert_eq!(output("probe null | wc -c"), "0");
+    assert_eq!(output("probe null | wc -l"), "0");
 }
 
 #[test]
@@ -2856,7 +2883,7 @@ impl CapabilityInvoker for OrderedFixture {
         self.fixture.has_command_word(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
             self.released
                 .lock()
@@ -2873,11 +2900,15 @@ impl CapabilityInvoker for OrderedFixture {
         if argv == ["upper", "--text", "release"] {
             self.release.send(()).expect("producer still waiting");
         }
-        self.fixture.run_command(word, argv, stdin)
+        self.fixture.run_command(word, argv, stdin_piped)
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
-        self.fixture.invoke(proposal)
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
+        self.fixture.invoke(proposal, streams)
     }
 }
 
@@ -2920,7 +2951,7 @@ fn xargs_emits_one_item_before_requesting_the_next() {
 
 struct StdinFixture {
     fixture: Fixture,
-    received: Mutex<Vec<Option<String>>>,
+    received: Mutex<Vec<bool>>,
 }
 
 impl CapabilityInvoker for StdinFixture {
@@ -2932,13 +2963,17 @@ impl CapabilityInvoker for StdinFixture {
         self.fixture.has_command_word(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        self.received.lock().push(stdin.map(str::to_owned));
-        self.fixture.run_command(word, argv, stdin)
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
+        self.received.lock().push(stdin_piped);
+        self.fixture.run_command(word, argv, stdin_piped)
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
-        self.fixture.invoke(proposal)
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
+        self.fixture.invoke(proposal, streams)
     }
 }
 
@@ -2993,7 +3028,7 @@ fn a_compound_read_does_not_pass_its_stream_to_a_provider() {
         &fixture,
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
-    assert_eq!(*fixture.received.lock(), vec![None, None]);
+    assert_eq!(*fixture.received.lock(), vec![false, false]);
 }
 
 #[test]
@@ -3129,8 +3164,12 @@ impl CapabilityInvoker for WithJobs {
         Some(&self.jobs)
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
-        self.fixture.invoke(proposal)
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
+        self.fixture.invoke(proposal, streams)
     }
 }
 
@@ -3247,7 +3286,11 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
         fn job_control(&self) -> Option<&dyn JobControl> {
             Some(&self.0)
         }
-        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: dekopon_shell::CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }

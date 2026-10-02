@@ -1,5 +1,5 @@
 use dekopon_broker_protocol::{
-    AssetEncoding, AssetRow, InvokeAssets, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
+    AssetEncoding, AssetRow, InvokeAssets, MAX_ASSET_DESCRIPTORS, NewAsset,
 };
 use dekopon_core::{
     base64::{DecoderReader, STANDARD},
@@ -358,6 +358,7 @@ impl ChatAssetInputs {
                 rows,
                 descriptors,
                 sends_remaining,
+                streams: None,
             },
             pins,
         ))
@@ -388,7 +389,7 @@ pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
                 if let Some(id) = chat_asset_marker(text)
                     && !ids.contains(&id)
                 {
-                    if ids.len() == MAX_DESCRIPTORS_PER_FRAME {
+                    if ids.len() == MAX_ASSET_DESCRIPTORS {
                         return Err(ChatAssetRefusal::PerInvocationLimit);
                     }
                     ids.push(id);

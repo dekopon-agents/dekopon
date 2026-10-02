@@ -26,12 +26,14 @@ impl bindings::Guest for RawClock {
         .to_string()
     }
 
-    fn invoke(_: String, _: String) -> String {
+    fn invoke(_: String, _: String) -> Result<(), u8> {
         let now = bindings::dekopon::clock::wall::now_unix_millis();
-        serde_json::json!({"outcome":"succeeded","output":{"unixMillis":now}}).to_string()
+        let out = bindings::dekopon::stdio::streams::stdout();
+        out.write(format!("{{\"unixMillis\":{now}}}\n").as_bytes())
+            .map_err(|_| 141)
     }
 
-    fn run_command(argv: Vec<String>, _: Option<String>) -> String {
+    fn run_command(argv: Vec<String>, _: bool) -> String {
         if argv.iter().any(|arg| arg == "--clock-in-run-command") {
             let _ = bindings::dekopon::clock::wall::now_unix_millis();
         }
