@@ -870,10 +870,21 @@ impl BrokerLeg {
                         } else {
                             String::new()
                         };
-                        if note.is_empty() {
+                        let mut stderr = result
+                            .detail
+                            .map(|detail| detail.message)
+                            .unwrap_or_default();
+                        if !note.is_empty() {
+                            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                                stderr.push('\n');
+                            }
+                            stderr.push_str(&note);
+                            stderr.push('\n');
+                        }
+                        if stderr.is_empty() {
                             CapabilityCallResult::Succeeded
                         } else {
-                            CapabilityCallResult::SucceededWithStderr(format!("{note}\n"))
+                            CapabilityCallResult::SucceededWithStderr(stderr)
                         }
                     }
                     InvocationOutcome::Denied => CapabilityCallResult::Denied {
@@ -1928,6 +1939,31 @@ mod tests {
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
                 CapabilityCallResult::Succeeded
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn successful_guest_stderr_reaches_the_gateway_note() {
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(
+                    InvocationResult {
+                        detail: Some(ProviderFailureDetail::new(
+                            "provider-stderr",
+                            "guest note\n",
+                        )),
+                        ..result(InvocationOutcome::Succeeded, None)
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            )
+            .await;
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::SucceededWithStderr("guest note\n".to_owned())
             );
         }
 

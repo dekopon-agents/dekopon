@@ -1071,6 +1071,7 @@ pub enum BrokerResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
     pub max_frame_bytes: usize,
+    /// Bounds IPC frame I/O, including waiting for an invocation parked on stdio; peer closure is not the only bound.
     pub io_timeout: Duration,
 }
 

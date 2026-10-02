@@ -82,7 +82,6 @@ capabilities:
   cli-probe:
     constraints:                    # inherited by every capability listed below
       timeoutMs: 30000
-      maxOutputBytes: 1048576
     capabilities:
       cli-probe.upper: {}           # only listed capabilities run
 ```
@@ -184,7 +183,6 @@ capabilities:
       internal-service.read:
         constraints:
           timeoutMs: 5000
-          maxOutputBytes: 4096
           http:
             allowedHosts: [api.example.com]
             allowedMethods: [GET]
@@ -292,7 +290,6 @@ capabilities:
         credential: github-pat
         constraints:
           timeoutMs: 15000
-          maxOutputBytes: 8192
           http:
             allowedHosts:
               - api.github.com
@@ -419,7 +416,6 @@ capabilities:
         credential: github-pat
         constraints:
           timeoutMs: 15000
-          maxOutputBytes: 8192
           http:
             allowedHosts:
               - api.github.com
@@ -472,7 +468,6 @@ capabilities:
         credential: github-pat
         constraints:
           timeoutMs: 15000
-          maxOutputBytes: 8192
           http:
             allowedHosts:
               - api.github.com
@@ -907,7 +902,6 @@ capabilities:
         route: chatMemoryRecord
         constraints:
           timeoutMs: 30000
-          maxOutputBytes: 131072
           storage:
             interface: jsonl
             access: read-write
@@ -916,7 +910,6 @@ capabilities:
         route: chatMemoryRecent
         constraints:
           timeoutMs: 30000
-          maxOutputBytes: 131072
           storage:
             interface: jsonl
             access: read-only
@@ -925,7 +918,6 @@ capabilities:
         route: chatMemorySearch
         constraints:
           timeoutMs: 30000
-          maxOutputBytes: 131072
           storage:
             interface: jsonl
             access: read-only
@@ -940,9 +932,7 @@ non-chat vocabulary, and makes the record route reachable only through the deliv
 Renaming the shipped provider therefore drops no reservation, and the reserved names are the ones
 this deployment chose.
 
-Each recent and search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
-`chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
-headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
+Enabling `chatMemory` also requires the routed provider to declare exactly those three
 capabilities and no fourth. Memory and storage composition rounds the 256 KiB JSONL read request
 when checking the invocation and host-call budgets, requires the one logical file, and reserves the
 direct peak: the post-append turn file and conservative namespace entry metadata including

@@ -112,10 +112,76 @@ fn pump_stdin(
     budget: &crate::limits::Budget,
     invoker: &dyn CapabilityInvoker,
 ) {
+    if socket.set_write_timeout(Some(pipe::POLL)).is_err() {
+        return;
+    }
     while let Ok(ReadOutcome::Bytes(chunk)) = reader.read(budget, invoker) {
-        if socket.write_all(&chunk).is_err() {
-            return;
+        let mut remaining = chunk.as_slice();
+        while !remaining.is_empty() {
+            if invoker.cancelled() || budget.check_deadline().is_err() {
+                return;
+            }
+            match socket.write(remaining) {
+                Ok(0) => return,
+                Ok(written) => remaining = &remaining[written..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use super::*;
+    use crate::limits::Limits;
+    use std::{sync::mpsc, time::Duration};
+
+    struct Idle;
+
+    impl CapabilityInvoker for Idle {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn invoke(
+            &self,
+            _proposal: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> crate::CapabilityCallResult {
+            unreachable!("pump test never invokes")
+        }
+    }
+
+    #[test]
+    fn a_stalled_stdin_peer_releases_the_feeder_after_the_deadline() {
+        let budget = crate::limits::Budget::start(Limits {
+            timeout: Duration::from_millis(100),
+            ..Limits::default()
+        });
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let (done, finished) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                pump_stdin(
+                    PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
+                    socket,
+                    &budget,
+                    &Idle,
+                );
+                done.send(()).unwrap();
+            });
+            let result = finished.recv_timeout(Duration::from_secs(3));
+            drop(peer);
+            assert!(
+                result.is_ok(),
+                "stalled peer kept the feeder past its deadline"
+            );
+        });
     }
 }
 

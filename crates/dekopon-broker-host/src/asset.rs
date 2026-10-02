@@ -47,7 +47,7 @@ pub struct AssetInputs {
     pub rows: Vec<AssetRow>,
     pub descriptors: Vec<OwnedFd>,
     pub sends_remaining: u8,
-    /// Stream ends ride the asset descriptor path but are admitted by [`crate::stdio`].
+    /// Stream ends ride the asset descriptor path but are admitted by the stdio host.
     pub streams: Option<dekopon_broker_protocol::Streams>,
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }

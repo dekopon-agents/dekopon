@@ -49,7 +49,7 @@ pub(crate) const CHUNK_BYTES: usize = 4 * 1024;
 
 const CAPACITY_CHUNKS: usize = 16;
 
-const POLL: Duration = Duration::from_secs(1);
+pub(crate) const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ReadOutcome {

@@ -3353,7 +3353,8 @@ where
                         outcome: InvocationOutcome::Succeeded,
                         exit_status: None,
                         error: None,
-                        detail: None,
+                        detail: (!output.stderr.is_empty())
+                            .then(|| ProviderFailureDetail::new("provider-stderr", &output.stderr)),
                         evidence,
                     },
                     event,
