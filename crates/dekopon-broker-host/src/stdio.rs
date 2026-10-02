@@ -20,6 +20,13 @@ pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 pub const STDERR_TRUNCATION_MARKER: &str = "\u{2026}[truncated]";
 pub const ZERO_FAILURE_STATUS_NOTE: &str =
     "provider reported failure with exit status 0; reported as status 1\n";
+// Handles live in the host table, outside the guest's memory limit, so a guest may not mint them
+// without bound.
+const MAX_LIVE_HANDLES: u8 = 16;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the provider held more than {MAX_LIVE_HANDLES} stdio handles at once")]
+pub struct StdioHandleLimit;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StdioAdmissionError {
@@ -38,6 +45,7 @@ pub(crate) struct StdioState {
     stdout: Option<UnixStream>,
     stderr: String,
     stderr_truncated: bool,
+    handles: u8,
     pub(crate) clock: WorkClock,
 }
 
@@ -79,6 +87,18 @@ impl StdioState {
         }
         self.stderr.push_str(STDERR_TRUNCATION_MARKER);
         self.stderr_truncated = true;
+    }
+
+    fn mint(&mut self) -> wasmtime::Result<()> {
+        if self.handles >= MAX_LIVE_HANDLES {
+            return Err(StdioHandleLimit.into());
+        }
+        self.handles += 1;
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        self.handles = self.handles.saturating_sub(1);
     }
 
     // The peer sees end of output only once both ends are dropped here.
@@ -213,6 +233,7 @@ impl wit::HostReader for StoreState {
 
     async fn drop(&mut self, resource: Resource<ReaderResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
+        self.stdio.release();
         Ok(())
     }
 }
@@ -239,6 +260,7 @@ impl wit::HostWriter for StoreState {
 
     async fn drop(&mut self, resource: Resource<WriterResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
+        self.stdio.release();
         Ok(())
     }
 }
@@ -248,10 +270,12 @@ impl wit::Host for StoreState {
         if self.stdio.stdin.is_none() {
             return Ok(None);
         }
+        self.stdio.mint()?;
         Ok(Some(self.table.push(ReaderResource)?))
     }
 
     async fn stdout(&mut self) -> wasmtime::Result<Resource<WriterResource>> {
+        self.stdio.mint()?;
         Ok(self.table.push(WriterResource)?)
     }
 

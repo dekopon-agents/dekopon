@@ -849,7 +849,7 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
 }
 
 #[test]
-fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_own_code() {
+fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() {
     let message = "the image route refused the request with HTTP 400 (moderation_blocked: the \
                    request was rejected)";
     for (message, expected) in [
@@ -877,7 +877,7 @@ fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_o
         assert_eq!(
             provider_failure_detail(&failure),
             Some(ProviderFailureDetail {
-                code: "upstream-rejected".to_owned(),
+                code: "exit-status-1".to_owned(),
                 message: expected,
             })
         );

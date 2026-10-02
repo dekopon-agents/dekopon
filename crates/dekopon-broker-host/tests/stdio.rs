@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use dekopon_broker_host::asset::AssetInputs;
 use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerInvocationFailure, BrokerInvocationOutput,
-    BrokerProviderRegistry, MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, Streams,
-    ZERO_FAILURE_STATUS_NOTE,
+    BrokerProviderRegistry, MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER,
+    StdioHandleLimit, Streams, ZERO_FAILURE_STATUS_NOTE,
 };
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints, broker::AuthorizationGate};
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
@@ -76,6 +76,8 @@ fn component(body: &str) -> tempfile::NamedTempFile {
     (core func $stdin (canon lower (func $streams "stdin") (memory $mem)))
     (core func $stdout (canon lower (func $streams "stdout")))
     (core func $stderr (canon lower (func $streams "write-stderr") (memory $mem)))
+    (alias export $streams "writer" (type $writer))
+    (core func $drop-writer (canon resource.drop $writer))
     (core module $m
         (import "libc" "memory" (memory 8))
         (import "host" "read" (func $read (param i32 i32 i32)))
@@ -83,6 +85,7 @@ fn component(body: &str) -> tempfile::NamedTempFile {
         (import "host" "stdin" (func $stdin (param i32)))
         (import "host" "stdout" (func $stdout (result i32)))
         (import "host" "stderr" (func $stderr (param i32 i32)))
+        (import "host" "drop-writer" (func $drop-writer (param i32)))
         (data (i32.const 0) "{manifest_descriptor}")
         (data (i32.const 64) "{manifest}")
         (data (i32.const 3072) "boom\0a")
@@ -103,7 +106,8 @@ fn component(body: &str) -> tempfile::NamedTempFile {
             (export "write" (func $write))
             (export "stdin" (func $stdin))
             (export "stdout" (func $stdout))
-            (export "stderr" (func $stderr))))))
+            (export "stderr" (func $stderr))
+            (export "drop-writer" (func $drop-writer))))))
     (func (export "describe") (result string)
         (canon lift (core func $i "describe") (memory $mem)))
     (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
@@ -435,4 +439,42 @@ async fn stream_ends_that_are_not_stream_sockets_are_refused_at_admission() {
             failure.error
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_stdio_handles_are_bounded_and_dropped_ones_are_returned() {
+    let mint_and_drop = r"
+        block $done
+            loop $more
+                call $stdout call $drop-writer
+                local.get $n i32.const 1 i32.add local.tee $n
+                i32.const 1000 i32.lt_u br_if $more
+            end
+        end
+        call $ok";
+    let (host, _peer) = UnixStream::pair().unwrap();
+    run(mint_and_drop, 5_000, streams(None, host))
+        .await
+        .expect("dropped handles do not count");
+
+    let hoard = r"
+        block $done
+            loop $more
+                call $stdout drop
+                local.get $n i32.const 1 i32.add local.tee $n
+                i32.const 1000 i32.lt_u br_if $more
+            end
+        end
+        call $ok";
+    let (host, _peer) = UnixStream::pair().unwrap();
+    let failure = run(hoard, 5_000, streams(None, host))
+        .await
+        .expect_err("a guest cannot hoard host handles");
+    let BrokerHostError::Invoke { source, .. } = &*failure.error else {
+        panic!("expected a trap, got {:?}", failure.error);
+    };
+    assert!(
+        source.downcast_ref::<StdioHandleLimit>().is_some(),
+        "{source:?}"
+    );
 }

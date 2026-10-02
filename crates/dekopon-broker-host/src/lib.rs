@@ -61,7 +61,7 @@ use metadata::identify_bytes;
 use settings::SettingsState;
 pub use stdio::{
     MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError,
-    ZERO_FAILURE_STATUS_NOTE,
+    StdioHandleLimit, ZERO_FAILURE_STATUS_NOTE,
 };
 
 pub(crate) mod bindings {

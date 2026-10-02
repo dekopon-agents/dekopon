@@ -229,7 +229,7 @@ async fn too_many_outgoing_descriptors_are_refused_before_writing() {
 async fn descriptor_cap_applies_across_all_reads_of_one_frame() {
     let (writer, reader) = UnixStream::pair().expect("socket pair");
     let mut reader = DescriptorStream::new(reader);
-    let files = files(3);
+    let files = files(MAX_DESCRIPTORS_PER_FRAME / 2 + 1);
     raw_frame(&writer, &[0, 0, 0, 2], &files).await;
     raw_frame(&writer, b"{}", &files).await;
     assert!(matches!(
