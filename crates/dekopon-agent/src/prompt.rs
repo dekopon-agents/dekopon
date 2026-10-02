@@ -474,6 +474,9 @@ fn report_end(
     let Some(sink) = progress else {
         return;
     };
+    if let PromptError::Model(InferenceError::OverBudget(_)) = error {
+        return;
+    }
     sink.emit(match FailureClass::of(error) {
         Some(class) => ProgressEvent::Failed { class },
         None => ProgressEvent::Cancelled {
