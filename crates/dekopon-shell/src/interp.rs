@@ -5,6 +5,8 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    io::Write,
+    os::{fd::OwnedFd, unix::net::UnixStream},
     sync::Arc,
     thread::{self, Scope, ScopedJoinHandle},
 };
@@ -12,8 +14,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CallBudget, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed, ScriptOutcome,
-    TreeContext,
+    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed,
+    ScriptOutcome, TreeContext,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
         CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
@@ -87,11 +89,6 @@ enum StreamCommand {
     Jq,
 }
 
-struct BuiltinInput {
-    value: Value,
-    _charges: Vec<crate::RetainedBytes>,
-}
-
 /// Each non-final stage thread reserves this much stack, charged against retained bytes until its
 /// join, so the default budget admits sixteen concurrent producers.
 const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
@@ -105,6 +102,21 @@ struct StagePosition {
 struct StageSetup {
     position: StagePosition,
     meter: Arc<telemetry::StageMeter>,
+}
+
+/// Ends when upstream ends or the provider stops reading; either way the dropped socket is the
+/// provider's end of input and the dropped reader is upstream's closed pipe.
+fn pump_stdin(
+    mut reader: PipeReader,
+    mut socket: UnixStream,
+    budget: &crate::limits::Budget,
+    invoker: &dyn CapabilityInvoker,
+) {
+    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read(budget, invoker) {
+        if socket.write_all(&chunk).is_err() {
+            return;
+        }
+    }
 }
 
 fn stage_compound_span(command: &Command) -> Option<tracing::Span> {
@@ -1650,29 +1662,6 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    fn provider_input(
-        &mut self,
-        input: StageInput,
-    ) -> Result<Option<BuiltinInput>, CommandFailure> {
-        let bytes = match input {
-            StageInput::Piped(mut reader) => reader.drain(&self.budget, self.invoker)?,
-            StageInput::Inherited => return Ok(None),
-        };
-        if bytes.bytes.is_empty() {
-            return Ok(None);
-        }
-        let (bytes, charges) = bytes.into_parts();
-        let text = String::from_utf8(bytes).map_err(|_not_utf8| {
-            CommandFailure::failed("standard input is not valid UTF-8 text")
-        })?;
-        let value = Value::String(text);
-        telemetry::record_stdin(&tracing::Span::current(), &value);
-        Ok(Some(BuiltinInput {
-            value,
-            _charges: charges,
-        }))
-    }
-
     fn execute_command(
         &mut self,
         command: &Command,
@@ -2710,21 +2699,14 @@ impl<'a> Evaluator<'a> {
                 self.run_xargs(arguments, input, stdout_sink)
             }
             Resolution::ProviderCommand => {
-                let stdin = match input {
-                    StageInput::Piped(_) => match self.provider_input(input) {
-                        Ok(stdin) => stdin,
-                        Err(failure) => {
-                            let status = self.absorb(failure)?;
-                            return Ok(Executed::Result(CommandResult::status(status)));
-                        }
-                    },
+                let piped = match input {
+                    StageInput::Piped(reader) => Some(reader),
                     StageInput::Inherited => None,
                 };
                 self.budget.check_deadline()?;
-                let stdin_text = stdin.as_ref().map(|input| display(&input.value));
                 let run = self
                     .invoker
-                    .run_command(command, arguments, stdin_text.as_deref());
+                    .run_command(command, arguments, piped.is_some());
                 self.budget.check_deadline()?;
                 let proposal = match run {
                     Some(CommandRun::Proposed {
@@ -2773,17 +2755,8 @@ impl<'a> Evaluator<'a> {
                     ));
                     return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
                 }
-                let outcome = {
-                    let mut context = BuiltinContext {
-                        invoker: self.invoker,
-                        budget: &mut self.budget,
-                        buffers: &self.buffers,
-                        started_jobs: &self.jobs.started,
-                    };
-                    context.invoke_proposal(proposal)
-                };
-                match outcome {
-                    Ok(result) => Ok(Executed::Result(self.provider_value(result))),
+                match self.run_provider(proposal, piped, capture_output, stdout_sink) {
+                    Ok(result) => Ok(Executed::Result(result)),
                     Err(failure) => {
                         let status = self.absorb(failure)?;
                         Ok(Executed::Result(CommandResult::status(status)))
@@ -2797,11 +2770,91 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn provider_value(&self, mut result: CommandResult) -> CommandResult {
-        if result.value.is_null() && self.stdout.is_some() && self.captures.is_empty() {
-            result.value = Value::String(String::new());
+    /// The call is charged and the deadline re-read on both sides, since capability calls are
+    /// wall-clock expensive but step-cheap. The provider's stdout is copied to this stage's sink
+    /// while the call runs, and dropping that copy closes the provider's stdout.
+    fn run_provider(
+        &mut self,
+        proposal: crate::CommandProposal,
+        piped: Option<PipeReader>,
+        capture_output: bool,
+        sink: &Sink,
+    ) -> Result<CommandResult, CommandFailure> {
+        self.budget.charge_capability_call()?;
+        self.budget.check_deadline()?;
+        let capability = proposal.capability.clone();
+        let unopened = |_error: std::io::Error| {
+            CommandFailure::failed(format!(
+                "{capability}: failed: its standard streams could not be opened"
+            ))
+        };
+        let (stdout, provider_stdout) = UnixStream::pair().map_err(unopened)?;
+        let output = PipeReader::from_socket(stdout).map_err(unopened)?;
+        let (feed, provider_stdin) = match piped {
+            Some(reader) => {
+                let (socket, provider_stdin) = UnixStream::pair().map_err(unopened)?;
+                (Some((reader, socket)), Some(OwnedFd::from(provider_stdin)))
+            }
+            None => (None, None),
+        };
+        let streams = crate::Streams {
+            stdin: provider_stdin,
+            stdout: OwnedFd::from(provider_stdout),
+        };
+        let invoker = self.invoker;
+        let feeder_budget = self.budget.fork();
+        let span = tracing::Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let (result, copied) = thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    span.in_scope(|| invoker.invoke(proposal, streams))
+                })
+            });
+            let feeder = feed.map(|(reader, socket)| {
+                scope.spawn(move || pump_stdin(reader, socket, &feeder_budget, invoker))
+            });
+            let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
+            let result = call
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if let Some(Err(panic)) = feeder.map(ScopedJoinHandle::join) {
+                std::panic::resume_unwind(panic);
+            }
+            (result, copied)
+        });
+        self.budget.check_deadline()?;
+        let mut copied = copied?;
+        let status = ExitCode::from_capability_result(&result);
+        match result {
+            CapabilityCallResult::Succeeded => {}
+            CapabilityCallResult::Exited { stderr, .. } => {
+                for line in stderr.lines() {
+                    self.write_line(line);
+                }
+            }
+            CapabilityCallResult::Denied { reason } => {
+                return Err(CommandFailure::Status {
+                    message: format!("{capability}: denied: {reason}"),
+                    status,
+                });
+            }
+            CapabilityCallResult::Failed { error, detail } => {
+                let message = match detail {
+                    Some(detail) => format!("{capability}: failed: {error}: {detail}"),
+                    None => format!("{capability}: failed: {error}"),
+                };
+                return Err(CommandFailure::Status { message, status });
+            }
+            CapabilityCallResult::NotFound => {
+                return Err(CommandFailure::Status {
+                    message: format!("{capability}: capability not found"),
+                    status,
+                });
+            }
         }
-        result
+        copied.status = status;
+        Ok(copied)
     }
 
     fn run_control_word(

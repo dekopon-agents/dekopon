@@ -139,26 +139,30 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         })
     }
 
-    fn invoke(&self, mut proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        mut proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         let capability = &proposal.capability;
         // A secret-use proposal must reach only the broker leg; the direct leg has no authorizer to
         // check it.
         if proposal.secret_use.is_some() {
             return match &self.broker {
-                Some(broker) if broker.is_granted(capability) => broker.invoke(proposal),
+                Some(broker) if broker.is_granted(capability) => broker.invoke(proposal, streams),
                 _ => dekopon_shell::secret_use_unsupported(),
             };
         }
         if self.direct.is_granted(capability) {
             let report = proposal.report.take();
-            let result = self.direct.invoke(proposal);
+            let result = self.direct.invoke(proposal, streams);
             if let Some(report) = report {
                 report.complete(report_outcome(call_outcome(&result)));
             }
             return result;
         }
         match &self.broker {
-            Some(broker) => broker.invoke(proposal),
+            Some(broker) => broker.invoke(proposal, streams),
             None => CapabilityCallResult::NotFound,
         }
     }
@@ -181,10 +185,10 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         pages
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.direct
-            .run_command(word, argv, stdin)
-            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
+            .run_command(word, argv, stdin_piped)
+            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin_piped))
     }
 
     fn note(&self, text: &str, eta: Option<Duration>) {
@@ -462,11 +466,21 @@ fn report_outcome(outcome: ToolOutcome) -> dekopon_shell::CommandReportOutcome {
     }
 }
 
+/// The broker reports a guest's own nonzero exit as the detail code `exit-status-N` with its
+/// stderr as the message; every other failure is the host's.
+fn provider_exit(
+    detail: Option<&dekopon_core::ProviderFailureDetail>,
+) -> Option<std::num::NonZeroU8> {
+    detail?.code.strip_prefix("exit-status-")?.parse().ok()
+}
+
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
-        CapabilityCallResult::Succeeded(_) => ToolOutcome::Succeeded,
+        CapabilityCallResult::Succeeded => ToolOutcome::Succeeded,
         CapabilityCallResult::Denied { .. } => ToolOutcome::Denied,
-        CapabilityCallResult::Failed { .. } | CapabilityCallResult::NotFound => ToolOutcome::Failed,
+        CapabilityCallResult::Exited { .. }
+        | CapabilityCallResult::Failed { .. }
+        | CapabilityCallResult::NotFound => ToolOutcome::Failed,
     }
 }
 
@@ -544,7 +558,7 @@ impl CapabilityInvoker for BrokerLeg {
         self.command_words.contains(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         if !self.command_words.contains(word) {
             return None;
         }
@@ -560,13 +574,13 @@ impl CapabilityInvoker for BrokerLeg {
         // aborted call is still in flight.
         let client = self.client.clone();
         let attestation = self.attestation.clone();
-        let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
+        let (owned_word, argv) = (word.to_owned(), argv.to_vec());
         let trace_parent = self.identifiers.trace_parent();
         let operation = process_fn(
             ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
             move || async move {
                 client
-                    .run_command(attestation, owned_word, argv, stdin.is_some(), trace_parent)
+                    .run_command(attestation, owned_word, argv, stdin_piped, trace_parent)
                     .await
                     .map(command_run_from_outcome)
             },
@@ -622,7 +636,11 @@ impl CapabilityInvoker for BrokerLeg {
         Some(run)
     }
 
-    fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         let dekopon_shell::CommandProposal {
             capability,
             input,
@@ -660,7 +678,7 @@ impl CapabilityInvoker for BrokerLeg {
                 ToolOutcome::Cancelled,
             )
         } else {
-            let result = self.submit(capability, input, secret_use);
+            let result = self.submit(capability, input, secret_use, streams);
             let outcome = call_outcome(&result);
             (result, outcome)
         };
@@ -715,6 +733,7 @@ impl BrokerLeg {
         capability: &str,
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
+        streams: dekopon_shell::Streams,
     ) -> CapabilityCallResult {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
@@ -725,7 +744,7 @@ impl BrokerLeg {
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        let (assets, asset_pins) = match self.prepare_assets(&input) {
+        let (mut assets, asset_pins) = match self.prepare_assets(&input) {
             Ok(input) => input,
             // This refusal is permanent, the interpreter's non-retryable Denied rather than a
             // retryable Failed, and produces no broker audit record since no proposal was ever
@@ -739,6 +758,11 @@ impl BrokerLeg {
                 };
             }
         };
+        let note_sink = streams.stdout.try_clone().ok();
+        assets.streams = Some(dekopon_broker_protocol::Streams {
+            stdin: streams.stdin,
+            stdout: streams.stdout,
+        });
         let request = InvocationRequest {
             id: self.identifiers.next_invocation(),
             capability: parsed,
@@ -761,52 +785,52 @@ impl BrokerLeg {
                 let result = outcome.result;
                 match result.outcome {
                     InvocationOutcome::Succeeded => {
-                        let mut output = result.output.unwrap_or(Value::Null);
-                        if output
-                            .get("attachments")
-                            .and_then(Value::as_array)
-                            .is_some_and(|attachments| {
-                                attachments
-                                    .iter()
-                                    .any(|attachment| attachment.get("base64").is_some())
-                            })
-                        {
-                            return CapabilityCallResult::Denied {
-                                reason: format!(
-                                    "{capability} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
-                                ),
-                            };
-                        }
-                        if let Some(slot) = &self.attachments {
-                            let note = slot.receive(
+                        let note = if let Some(slot) = &self.attachments {
+                            slot.receive(
                                 outcome.attached,
                                 outcome.descriptors,
                                 outcome.removed,
                                 outcome.sent,
                                 capability,
                                 &invocation,
-                            );
-                            if !note.is_empty() {
-                                output = serde_json::json!({"result": output, "assetNote": note});
-                            }
+                            )
                         } else if !outcome.attached.is_empty()
                             || !outcome.removed.is_empty()
                             || !outcome.sent.is_empty()
                         {
-                            output = serde_json::json!({"result": output, "assetNote": "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]"});
+                            "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]".to_owned()
+                        } else {
+                            String::new()
+                        };
+                        if !note.is_empty()
+                            && let Some(sink) = note_sink
+                        {
+                            let _closed = std::io::Write::write_all(
+                                &mut std::os::unix::net::UnixStream::from(sink),
+                                format!("{note}\n").as_bytes(),
+                            );
                         }
-                        CapabilityCallResult::Succeeded(output)
+                        CapabilityCallResult::Succeeded
                     }
                     InvocationOutcome::Denied => CapabilityCallResult::Denied {
                         reason: result
                             .error
                             .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
                     },
-                    InvocationOutcome::Failed => CapabilityCallResult::Failed {
-                        error: result.error.unwrap_or_else(|| {
-                            "the broker reported a failed invocation".to_owned()
-                        }),
-                        detail: result.detail,
+                    InvocationOutcome::Failed => match provider_exit(result.detail.as_ref()) {
+                        Some(status) => CapabilityCallResult::Exited {
+                            status,
+                            stderr: result
+                                .detail
+                                .map(|detail| detail.message)
+                                .unwrap_or_default(),
+                        },
+                        None => CapabilityCallResult::Failed {
+                            error: result.error.unwrap_or_else(|| {
+                                "the broker reported a failed invocation".to_owned()
+                            }),
+                            detail: result.detail,
+                        },
                     },
                 }
             }
@@ -926,7 +950,11 @@ mod tests {
             })
         }
 
-        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: dekopon_shell::CommandProposal,
+            streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let secret_use = proposal.secret_use;
             if capability != self.capability {
@@ -934,7 +962,7 @@ mod tests {
             }
             self.invoked.lock().push(capability.to_owned());
             self.secret_uses.lock().push(secret_use);
-            CapabilityCallResult::Succeeded(json!({ "leg": self.marker }))
+            streams.reply(&json!({ "leg": self.marker }))
         }
     }
 
@@ -1074,7 +1102,11 @@ mod tests {
             Some(self)
         }
 
-        fn invoke(&self, _: CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -1130,7 +1162,11 @@ mod tests {
             word == self.word
         }
 
-        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: dekopon_shell::CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }

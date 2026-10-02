@@ -927,7 +927,11 @@ impl CapabilityInvoker for ProbeInvoker {
         Some(&self.0)
     }
 
-    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _: dekopon_shell::CommandProposal,
+        _streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }

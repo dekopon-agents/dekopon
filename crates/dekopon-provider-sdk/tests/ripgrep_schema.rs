@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use clap::Parser;
-use dekopon_provider_sdk::provider::{Capability, Proposal, Provider, Usage, manifest};
+use dekopon_provider_sdk::provider::{Capability, Proposal, Provider, Stdout, Usage, manifest};
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -24,12 +24,14 @@ impl Provider for Ripgrep {
     type Args = Args;
     type Capabilities = (Search,);
 
-    fn propose(args: Args, stdin: Option<&str>) -> Result<Proposal<Self>, Usage> {
-        let text = stdin.ok_or_else(|| Usage::new("rg: pipe the text to search"))?;
+    fn propose(args: Args, stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
+        if !stdin_piped {
+            return Err(Usage::new("rg: pipe the text to search"));
+        }
         Ok(Proposal::to::<Search>(SearchInput {
             documents: vec![Document {
                 path: "stdin".to_owned(),
-                text: text.to_owned(),
+                text: String::new(),
             }],
             pattern: args.pattern,
             mode: SearchMode::default(),
@@ -137,11 +139,10 @@ impl Capability for Search {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = SearchInput;
     type Needs = ();
-    type Output = usize;
     type Error = Infallible;
 
-    fn run(input: SearchInput, (): ()) -> Result<usize, Infallible> {
-        Ok(input.documents.len())
+    fn run(_: SearchInput, (): (), _: &mut Stdout) -> Result<(), Infallible> {
+        Ok(())
     }
 }
 

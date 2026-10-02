@@ -5,7 +5,11 @@ impl CapabilityInvoker for Invoker {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _: dekopon_shell::CommandProposal,
+        _streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }

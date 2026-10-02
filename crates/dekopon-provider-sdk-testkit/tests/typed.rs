@@ -9,12 +9,14 @@ fn cli_component() -> PathBuf {
         .join("../../examples/providers/cli-probe-provider.wasm")
 }
 
+use std::{fmt, io::Write};
+
 use dekopon_provider_sdk::{
-    ComponentResponse, EffectKind, RiskLevel,
+    EffectKind, RiskLevel,
     clap::{Parser, Subcommand},
     provider::{
-        Capability, Clock, DurableFiles, Header, Http, Proposal, Provider, Request, Response,
-        Storage, Usage,
+        Capability, Clock, Code, DurableFiles, Failure, Header, Http, Proposal, Provider, Request,
+        Response, Stdout, Storage, Usage,
     },
 };
 use dekopon_provider_sdk_testkit::{
@@ -26,6 +28,30 @@ use serde_json::{Value, json};
 
 #[derive(Parser)]
 struct NoArgs {}
+
+struct Gone;
+
+impl fmt::Display for Gone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("stdout is closed")
+    }
+}
+
+impl Failure for Gone {
+    fn code(&self) -> Code {
+        Code::new("gone")
+    }
+}
+
+fn emit(out: &mut Stdout, value: Result<Value, std::convert::Infallible>) -> Result<(), Gone> {
+    let Ok(value) = value;
+    writeln!(out, "{value}").map_err(|_closed| Gone)
+}
+
+fn stdout_value(output: &dekopon_provider_sdk_testkit::NativeOutput) -> Value {
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
 
 struct Cli;
 struct Upper;
@@ -54,7 +80,7 @@ impl Provider for Cli {
     const DESCRIPTION: &'static str = "typed test of checked cli-probe";
     type Args = CliArgs;
     type Capabilities = (Upper, Count, Reverse);
-    fn propose(args: CliArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(args: CliArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         let text = Text {
             text: "abc".to_owned(),
         };
@@ -73,10 +99,12 @@ impl Capability for Upper {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Text;
     type Needs = ();
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
-        Ok(json!({"text": input.text.to_uppercase()}))
+    type Error = Gone;
+    fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            Ok(json!({"text": input.text.to_uppercase()}))
+        })();
+        emit(out, value)
     }
 }
 
@@ -88,10 +116,12 @@ impl Capability for Count {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Text;
     type Needs = ();
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
-        Ok(json!({"characters":input.text.chars().count()}))
+    type Error = Gone;
+    fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            Ok(json!({"characters":input.text.chars().count()}))
+        })();
+        emit(out, value)
     }
 }
 impl Capability for Reverse {
@@ -102,10 +132,12 @@ impl Capability for Reverse {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Text;
     type Needs = ();
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
-        Ok(json!({"text":input.text.chars().rev().collect::<String>()}))
+    type Error = Gone;
+    fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            Ok(json!({"text":input.text.chars().rev().collect::<String>()}))
+        })();
+        emit(out, value)
     }
 }
 
@@ -137,7 +169,7 @@ impl Provider for MissingWord {
     const DESCRIPTION: &'static str = "word mismatch fixture";
     type Args = CliArgs;
     type Capabilities = (MissingUpper, MissingCount, MissingReverse);
-    fn propose(_: CliArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: CliArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<MissingUpper>(Text {
             text: "abc".to_owned(),
         }))
@@ -153,10 +185,11 @@ macro_rules! missing_capability {
             const RISK: RiskLevel = RiskLevel::Low;
             type Input = Text;
             type Needs = ();
-            type Output = Value;
-            type Error = std::convert::Infallible;
-            fn run(_: Text, (): ()) -> Result<Value, Self::Error> {
-                Ok(json!({}))
+            type Error = Gone;
+            fn run(_: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+                let value =
+                    (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
+                emit(out, value)
             }
         }
     };
@@ -179,10 +212,8 @@ fn cached_real_component_and_native_dispatch_agree() {
     let input = json!({"text":"hello"});
     let native = Native::<Cli>::new();
     assert_eq!(
-        native.call("cli-probe.upper", &input.to_string()),
-        ComponentResponse::Succeeded {
-            output: json!({"text":"HELLO"})
-        }
+        stdout_value(&native.call("cli-probe.upper", &input.to_string())),
+        json!({"text":"HELLO"})
     );
     let component = cli_component();
     conformance::<Cli>(&component).unwrap();
@@ -233,7 +264,7 @@ impl Provider for OtherCli {
     const DESCRIPTION: &'static str = "a distinct test provider type for the same artifact";
     type Args = NoArgs;
     type Capabilities = (OtherUpper,);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<OtherUpper>(Text {
             text: "abc".to_owned(),
         }))
@@ -247,10 +278,12 @@ impl Capability for OtherUpper {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Text;
     type Needs = ();
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: Text, (): ()) -> Result<Value, Self::Error> {
-        Ok(json!({"text": input.text.to_uppercase()}))
+    type Error = Gone;
+    fn run(input: Text, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            Ok(json!({"text": input.text.to_uppercase()}))
+        })();
+        emit(out, value)
     }
 }
 
@@ -267,7 +300,7 @@ impl Provider for TypedStorage {
     const DESCRIPTION: &'static str = "Durable files conformance fixture";
     type Args = NoArgs;
     type Capabilities = (StorageRun,);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<StorageRun>(StorageInput { mode: None }))
     }
 }
@@ -279,10 +312,10 @@ impl Capability for StorageRun {
     const RISK: RiskLevel = RiskLevel::Medium;
     type Input = StorageInput;
     type Needs = Storage<DurableFiles>;
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(_: StorageInput, _: Storage<DurableFiles>) -> Result<Value, Self::Error> {
-        Ok(json!({}))
+    type Error = Gone;
+    fn run(_: StorageInput, _: Storage<DurableFiles>, out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
+        emit(out, value)
     }
 }
 #[test]
@@ -303,7 +336,7 @@ impl Provider for TypedClock {
     const DESCRIPTION: &'static str = "Clock provider fixture";
     type Args = NoArgs;
     type Capabilities = (ClockNow,);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<ClockNow>(EmptyInput {}))
     }
 }
@@ -315,10 +348,12 @@ impl Capability for ClockNow {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = EmptyInput;
     type Needs = Clock;
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(_: EmptyInput, clock: Clock) -> Result<Value, Self::Error> {
-        Ok(json!({"unixMillis":clock.now_unix_millis()}))
+    type Error = Gone;
+    fn run(_: EmptyInput, clock: Clock, out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            Ok(json!({"unixMillis":clock.now_unix_millis()}))
+        })();
+        emit(out, value)
     }
 }
 
@@ -346,7 +381,7 @@ impl Provider for RawHttp {
     const DESCRIPTION: &'static str = "native counterpart for the typed HTTP fixture";
     type Args = NoArgs;
     type Capabilities = (Fetch, ConditionalWrite, Purge);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Fetch>(UrlInput {
             uri: "https://fixture.example.test/path".to_owned(),
         }))
@@ -360,11 +395,13 @@ impl Capability for Fetch {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = UrlInput;
     type Needs = Http;
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: UrlInput, http: Http) -> Result<Value, Self::Error> {
-        let response = http.send(Request::new("GET", input.uri).unwrap()).unwrap();
-        Ok(json!({"headerCount": response.headers.len()}))
+    type Error = Gone;
+    fn run(input: UrlInput, http: Http, out: &mut Stdout) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            let response = http.send(Request::new("GET", input.uri).unwrap()).unwrap();
+            Ok(json!({"headerCount": response.headers.len()}))
+        })();
+        emit(out, value)
     }
 }
 
@@ -380,10 +417,11 @@ macro_rules! http_route {
             const RISK: RiskLevel = RiskLevel::High;
             type Input = UrlInput;
             type Needs = Http;
-            type Output = Value;
-            type Error = std::convert::Infallible;
-            fn run(_: UrlInput, _: Http) -> Result<Value, Self::Error> {
-                Ok(json!({}))
+            type Error = Gone;
+            fn run(_: UrlInput, _: Http, out: &mut Stdout) -> Result<(), Self::Error> {
+                let value =
+                    (move || -> Result<Value, std::convert::Infallible> { Ok(json!({})) })();
+                emit(out, value)
             }
         }
     };
@@ -417,11 +455,7 @@ fn scripted_response_headers_match_native_and_typed_component() {
     let input = json!({"uri": format!("{origin}/resource")});
     let native_script = HttpScript::new(&authority, "GET", response);
     let native = Native::<RawHttp>::new().http(native_script);
-    let ComponentResponse::Succeeded { output } =
-        native.call("http-probe.fetch", &input.to_string())
-    else {
-        panic!("native fake must return the scripted headers");
-    };
+    let output = stdout_value(&native.call("http-probe.fetch", &input.to_string()));
     assert_eq!(output["headerCount"], 2);
     let (real, stdout) = run.call_full("http-probe.fetch", input).unwrap();
     let real_output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
@@ -475,7 +509,7 @@ impl Provider for Fake {
     const DESCRIPTION: &'static str = "native fake imports";
     type Args = NoArgs;
     type Capabilities = (Read,);
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Read>(UrlInput {
             uri: "https://fixture.example.test/path".to_owned(),
         }))
@@ -489,14 +523,20 @@ impl Capability for Read {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = UrlInput;
     type Needs = (Clock, Http);
-    type Output = Value;
-    type Error = std::convert::Infallible;
-    fn run(input: UrlInput, (clock, http): (Clock, Http)) -> Result<Value, Self::Error> {
-        let request = Request::new("GET", input.uri).unwrap();
-        let response = http.send(request).unwrap();
-        Ok(
-            json!({"clock":clock.now_unix_millis(),"status":response.status,"body":String::from_utf8(response.body).unwrap()}),
-        )
+    type Error = Gone;
+    fn run(
+        input: UrlInput,
+        (clock, http): (Clock, Http),
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let value = (move || -> Result<Value, std::convert::Infallible> {
+            let request = Request::new("GET", input.uri).unwrap();
+            let response = http.send(request).unwrap();
+            Ok(
+                json!({"clock":clock.now_unix_millis(),"status":response.status,"body":String::from_utf8(response.body).unwrap()}),
+            )
+        })();
+        emit(out, value)
     }
 }
 
@@ -513,13 +553,11 @@ fn native_fake_records_http_and_fixes_guest_clock() {
         },
     ));
     assert_eq!(
-        native.call(
+        stdout_value(&native.call(
             "fake-imports.read",
             r#"{"uri":"https://fixture.example.test/path"}"#
-        ),
-        ComponentResponse::Succeeded {
-            output: json!({"clock":951_782_400_123_u64,"status":201,"body":"ok"})
-        }
+        )),
+        json!({"clock":951_782_400_123_u64,"status":201,"body":"ok"})
     );
     assert_eq!(native.requests().len(), 1);
     assert_eq!(

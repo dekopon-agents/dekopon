@@ -3327,7 +3327,11 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: dekopon_shell::CommandProposal,
+            _streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             panic!(
                 "a refused construct must never reach {}",
                 proposal.capability
@@ -3432,7 +3436,7 @@ mod tests {
             &self,
             word: &str,
             argv: &[String],
-            _stdin: Option<&str>,
+            stdin_piped: bool,
         ) -> Option<CommandRun> {
             if word != "probe" {
                 return None;
@@ -3464,11 +3468,15 @@ mod tests {
             None
         }
 
-        fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: dekopon_shell::CommandProposal,
+            streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
             match capability.as_str() {
-                "posts.get" => CapabilityCallResult::Succeeded(input),
+                "posts.get" => streams.reply(&input),
                 "locked.door" => CapabilityCallResult::Denied {
                     reason: "policy says no".to_owned(),
                 },

@@ -184,7 +184,7 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
             (&["--help".to_owned()][..], true),
             (&["--definitely-invalid-option".to_owned()][..], false),
         ] {
-            let native_outcome = provider::command::<P>(argv, None);
+            let native_outcome = provider::command::<P>(argv, false);
             let real_outcome =
                 super::typed::runtime().block_on(registry.run_command(word, argv, false))?;
             if !rendered(&native_outcome, help) || !rendered(&real_outcome, help) {

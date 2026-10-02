@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    io::Read,
+    os::unix::net::UnixStream,
     sync::{
         Arc,
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
@@ -89,6 +91,7 @@ impl PipeWriter {
 #[derive(Debug)]
 enum Source {
     Channel(Receiver<Vec<u8>>),
+    Socket(UnixStream),
     Fixed,
 }
 
@@ -110,6 +113,18 @@ impl PipeReader {
     pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
         self.meter = Some(meter);
         self
+    }
+
+    /// Reads a provider's stdout; dropping the reader closes the socket, so the provider's next
+    /// write finds its reader gone.
+    pub(crate) fn from_socket(socket: UnixStream) -> std::io::Result<Self> {
+        socket.set_read_timeout(Some(POLL))?;
+        Ok(Self {
+            source: Source::Socket(socket),
+            pending: VecDeque::new(),
+            ended: false,
+            meter: None,
+        })
     }
 
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
@@ -138,23 +153,57 @@ impl PipeReader {
             if self.ended {
                 return Ok(ReadOutcome::End);
             }
-            let Source::Channel(receiver) = &self.source else {
+            if let Source::Fixed = self.source {
                 self.ended = true;
                 continue;
-            };
+            }
             if invoker.cancelled() {
                 return Err(LimitExceeded::Cancelled);
             }
             budget.check_deadline()?;
-            let wait = budget.remaining().min(POLL);
-            match receiver.recv_timeout(wait) {
-                Ok(bytes) if bytes.is_empty() => {}
-                Ok(bytes) => {
-                    telemetry::stage_read(bytes.len(), self.meter.as_ref());
-                    return Ok(ReadOutcome::Bytes(bytes));
+            let counted = match &mut self.source {
+                Source::Fixed => continue,
+                Source::Channel(receiver) => {
+                    match receiver.recv_timeout(budget.remaining().min(POLL)) {
+                        Ok(bytes) => bytes,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            self.ended = true;
+                            continue;
+                        }
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => self.ended = true,
+                Source::Socket(socket) => {
+                    let mut bytes = vec![0; CHUNK_BYTES];
+                    match socket.read(&mut bytes) {
+                        Ok(0) => {
+                            self.ended = true;
+                            continue;
+                        }
+                        Ok(count) => {
+                            bytes.truncate(count);
+                            return Ok(ReadOutcome::Bytes(bytes));
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => {
+                            self.ended = true;
+                            continue;
+                        }
+                    }
+                }
+            };
+            if !counted.is_empty() {
+                telemetry::stage_read(counted.len(), self.meter.as_ref());
+                return Ok(ReadOutcome::Bytes(counted));
             }
         }
     }
@@ -181,19 +230,6 @@ impl PipeReader {
                 }
             }
         }
-    }
-
-    pub(crate) fn drain(
-        &mut self,
-        budget: &Budget,
-        invoker: &dyn CapabilityInvoker,
-    ) -> Result<ChargedBytes, LimitExceeded> {
-        let mut bytes = ChargedBytes::new();
-        while let ReadOutcome::Bytes(chunk) = self.read(budget, invoker)? {
-            let len = chunk.len();
-            bytes.extend(chunk, len, budget)?;
-        }
-        Ok(bytes)
     }
 
     fn read_more(
@@ -239,7 +275,11 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(&self, _proposal: crate::CommandProposal) -> crate::CapabilityCallResult {
+        fn invoke(
+            &self,
+            _proposal: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> crate::CapabilityCallResult {
             unreachable!("pipe tests never invoke")
         }
     }
@@ -278,14 +318,6 @@ mod tests {
         drop(writer);
         assert!(matches!(
             reader.read_line(&budget, &Idle),
-            Err(LimitExceeded::ValueBytes { maximum: 12 })
-        ));
-        assert_eq!(budget.value_bytes(), 0);
-        let (mut writer, mut reader) = pipe();
-        assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
-        drop(writer);
-        assert!(matches!(
-            reader.drain(&budget, &Idle),
             Err(LimitExceeded::ValueBytes { maximum: 12 })
         ));
         assert_eq!(budget.value_bytes(), 0);

@@ -22,8 +22,7 @@ use std::{
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
 pub use dekopon_provider_sdk::{
-    CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
-    ProviderManifest,
+    CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
 pub use host::ProviderConflicts;

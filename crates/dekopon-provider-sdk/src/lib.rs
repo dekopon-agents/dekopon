@@ -26,8 +26,8 @@ pub mod provider;
 mod storage;
 
 pub use provider::{
-    Capability, Code, Failure, Needs, Proposal, Provider, SdkFailure, Usage, call, command,
-    manifest,
+    Capability, Code, Failure, Needs, Proposal, Provider, SdkFailure, Stdin, Stdout, Usage,
+    command, manifest, stdin,
 };
 
 #[doc(hidden)]
@@ -80,40 +80,29 @@ pub fn __typed_describe<P: provider::Provider>() -> String {
 }
 
 #[doc(hidden)]
+#[cfg(target_arch = "wasm32")]
 pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> Result<(), u8> {
-    match provider::call::<P>(capability, input) {
-        ComponentResponse::Succeeded { output } => {
-            write_stdout(format!("{output}\n").as_bytes());
-            Ok(())
-        }
-        ComponentResponse::Failed { error } => {
-            write_stderr(&format!("{}: {}\n", error.code, error.message));
-            Err(1)
-        }
+    provider::invoke::<P>(capability, input).map_err(std::num::NonZeroU8::get)
+}
+
+#[doc(hidden)]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> Result<(), u8> {
+    let stdio = provider::NativeStdio {
+        stdin: None,
+        stdout: Box::new(std::io::stdout()),
+    };
+    match provider::invoke_native::<P>(capability, input, stdio) {
+        provider::NativeExit { status: 0, .. } => Ok(()),
+        provider::NativeExit { status, .. } => Err(status),
     }
 }
 
 #[doc(hidden)]
 pub fn __typed_run_command<P: provider::Provider>(argv: &[String], stdin_piped: bool) -> String {
-    serde_json::to_string(&provider::command::<P>(argv, stdin_piped.then_some("")))
+    serde_json::to_string(&provider::command::<P>(argv, stdin_piped))
         .unwrap_or_else(|_| RUN_SERIALIZATION_FALLBACK.to_owned())
 }
-
-#[cfg(target_arch = "wasm32")]
-fn write_stdout(bytes: &[u8]) {
-    let _closed = export_bindings::dekopon::stdio::streams::stdout().write(bytes);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn write_stderr(text: &str) {
-    export_bindings::dekopon::stdio::streams::write_stderr(text);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-const fn write_stdout(_bytes: &[u8]) {}
-
-#[cfg(not(target_arch = "wasm32"))]
-const fn write_stderr(_text: &str) {}
 
 pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 
@@ -161,23 +150,7 @@ pub struct ProviderCapability {
     pub input_schema: Value,
 }
 
-/// JSON response returned across the WIT boundary.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ComponentResponse {
-    /// Provider execution completed and returned JSON output.
-    Succeeded {
-        /// Capability-specific result.
-        output: Value,
-    },
-    /// Provider rejected or failed the operation without trapping.
-    Failed {
-        /// Stable failure detail.
-        error: ComponentFailure,
-    },
-}
-
-/// Serializable provider failure carried by [`ComponentResponse::Failed`].
+/// A provider's refusal of an argv, carried by [`CommandRunOutcome::Failed`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ComponentFailure {

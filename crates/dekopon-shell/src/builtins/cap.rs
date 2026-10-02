@@ -93,7 +93,11 @@ mod tests {
             })
         }
 
-        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }

@@ -14,12 +14,9 @@ use dekopon_capability::{
 };
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
 use dekopon_http_host::LoopbackHttpsPin;
-use dekopon_provider_sdk::{
-    ComponentResponse,
-    provider::{
-        self, Header, HttpError, HttpErrorCode, Port, Provider, Request, Response, StreamedRequest,
-        StreamedResponse,
-    },
+use dekopon_provider_sdk::provider::{
+    self, Header, HttpError, HttpErrorCode, NativeExit, NativeStdio, Port, Provider, Request,
+    Response, StreamedRequest, StreamedResponse,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -401,14 +398,49 @@ impl<P: Provider> Native<P> {
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().clone()
     }
+    /// Runs one call with nothing piped in, capturing its stdout, stderr and exit status.
     #[must_use]
-    pub fn call(&self, capability: &str, input: &str) -> ComponentResponse {
+    pub fn call(&self, capability: &str, input: &str) -> NativeOutput {
         let port = FakePort {
             clock: self.clock,
             http: self.http.clone(),
             requests: Arc::clone(&self.requests),
         };
-        provider::with_port(port, || provider::call::<P>(capability, input))
+        let stdout = Captured::default();
+        let stdio = NativeStdio {
+            stdin: None,
+            stdout: Box::new(stdout.clone()),
+        };
+        let NativeExit { status, stderr } = provider::with_port(port, || {
+            provider::invoke_native::<P>(capability, input, stdio)
+        });
+        NativeOutput {
+            status,
+            stdout: std::mem::take(&mut *stdout.0.lock()),
+            stderr,
+        }
+    }
+}
+
+/// What a native call wrote and how it exited.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeOutput {
+    pub status: u8,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

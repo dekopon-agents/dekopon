@@ -58,8 +58,12 @@
 //! # Example
 //!
 //! ```
-//! use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits};
-//! use serde_json::{Value, json};
+//! use std::io::Write;
+//!
+//! use dekopon_shell::{
+//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, Streams,
+//! };
+//! use serde_json::json;
 //!
 //! /// One provider word, `probe`, whose `upper --text <s>` proposes `cli-probe.upper`.
 //! struct Fixture;
@@ -77,7 +81,7 @@
 //!         &self,
 //!         word: &str,
 //!         argv: &[String],
-//!         _stdin: Option<&str>,
+//!         _stdin_piped: bool,
 //!     ) -> Option<CommandRun> {
 //!         if word != "probe" {
 //!             return None;
@@ -97,21 +101,32 @@
 //!         })
 //!     }
 //!
-//!     fn invoke(&self, proposal: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+//!     fn invoke(
+//!         &self,
+//!         proposal: dekopon_shell::CommandProposal,
+//!         streams: Streams,
+//!     ) -> CapabilityCallResult {
 //!         let dekopon_shell::CommandProposal { capability, input, secret_use, .. } = proposal;
 //!         if secret_use.is_some() {
 //!             return dekopon_shell::secret_use_unsupported();
 //!         }
 //!         assert_eq!(capability, "cli-probe.upper");
 //!         let text = input["text"].as_str().unwrap_or_default().to_uppercase();
-//!         CapabilityCallResult::Succeeded(json!({ "text": text }))
+//!         let mut stdout = std::os::unix::net::UnixStream::from(streams.stdout);
+//!         match writeln!(stdout, "{text}") {
+//!             Ok(()) => CapabilityCallResult::Succeeded,
+//!             Err(_) => CapabilityCallResult::Exited {
+//!                 status: std::num::NonZeroU8::new(141).unwrap(),
+//!                 stderr: String::new(),
+//!             },
+//!         }
 //!     }
 //! }
 //!
 //! let outcome = Interpreter::new(Limits::default())
 //!     .run("probe upper --text hi | cat", &Fixture);
 //! assert_eq!(outcome.exit_code.get(), 0);
-//! assert_eq!(outcome.output, r#"{"text":"HI"}"#);
+//! assert_eq!(outcome.output, "HI");
 //! ```
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -162,9 +177,41 @@ pub struct CapabilityDescription {
     pub description: String,
 }
 
+/// The stream ends one provider invocation runs on: stdin only when something is piped in.
+#[derive(Debug)]
+pub struct Streams {
+    pub stdin: Option<std::os::fd::OwnedFd>,
+    pub stdout: std::os::fd::OwnedFd,
+}
+
+impl Streams {
+    /// Writes `value` to stdout as the shell displays it, one line, for an invoker that answers
+    /// in-process; a closed reader exits 141 as a provider would.
+    #[must_use]
+    pub fn reply(self, value: &Value) -> CapabilityCallResult {
+        use std::io::Write;
+        if value.is_null() {
+            return CapabilityCallResult::Succeeded;
+        }
+        let mut stdout = std::os::unix::net::UnixStream::from(self.stdout);
+        match writeln!(stdout, "{}", value::display(value)) {
+            Ok(()) => CapabilityCallResult::Succeeded,
+            Err(_closed) => CapabilityCallResult::Exited {
+                status: std::num::NonZeroU8::new(141).unwrap_or(std::num::NonZeroU8::MIN),
+                stderr: String::new(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CapabilityCallResult {
-    Succeeded(Value),
+    Succeeded,
+    /// The provider ran and exited nonzero, its own failure rather than the host's.
+    Exited {
+        status: std::num::NonZeroU8,
+        stderr: String,
+    },
     Denied {
         reason: String,
     },
@@ -234,8 +281,8 @@ pub trait CapabilityInvoker: Send + Sync {
 
     /// Running a command word grants nothing: any proposal it makes is invoked through the same
     /// budget, denial, and telemetry path as every other capability call.
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        let _ = (word, argv, stdin);
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
+        let _ = (word, argv, stdin_piped);
         None
     }
 
@@ -254,7 +301,7 @@ pub trait CapabilityInvoker: Send + Sync {
         None
     }
 
-    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult;
+    fn invoke(&self, proposal: CommandProposal, streams: Streams) -> CapabilityCallResult;
 }
 
 #[must_use]
@@ -289,8 +336,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().has_command_word(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        self.as_ref().run_command(word, argv, stdin)
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
+        self.as_ref().run_command(word, argv, stdin_piped)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -309,8 +356,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().job_control()
     }
 
-    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult {
-        self.as_ref().invoke(proposal)
+    fn invoke(&self, proposal: CommandProposal, streams: Streams) -> CapabilityCallResult {
+        self.as_ref().invoke(proposal, streams)
     }
 }
 
@@ -339,7 +386,8 @@ impl ExitCode {
     #[must_use]
     pub const fn from_capability_result(result: &CapabilityCallResult) -> Self {
         match result {
-            CapabilityCallResult::Succeeded(_) => Self::SUCCESS,
+            CapabilityCallResult::Succeeded => Self::SUCCESS,
+            CapabilityCallResult::Exited { status, .. } => Self(status.get()),
             CapabilityCallResult::Failed { .. } => Self::FAILURE,
             CapabilityCallResult::Denied { .. } => Self::DENIED,
             CapabilityCallResult::NotFound => Self::NOT_FOUND,
@@ -486,7 +534,7 @@ mod tests {
             &self,
             word: &str,
             argv: &[String],
-            stdin: Option<&str>,
+            stdin_piped: bool,
         ) -> Option<CommandRun> {
             if matches!(word, "retained" | "render") {
                 let stdout = if word == "retained" {
@@ -503,7 +551,7 @@ mod tests {
             }
             Some(CommandRun::Proposed {
                 capability: word.to_owned(),
-                input: json!({ "argv": argv, "stdin": stdin }),
+                input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
                 secret_use: None,
                 report: None,
             })
@@ -516,11 +564,15 @@ mod tests {
             })
         }
 
-        fn invoke(&self, proposal: super::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: super::CommandProposal,
+            streams: super::Streams,
+        ) -> CapabilityCallResult {
             let input = proposal.input;
             let secret_use = proposal.secret_use;
             self.secret_uses.lock().push(secret_use);
-            CapabilityCallResult::Succeeded(input)
+            streams.reply(&input)
         }
 
         fn script_finished(&self) {
@@ -537,7 +589,11 @@ mod tests {
         fn granted(&self) -> Vec<String> {
             Vec::new()
         }
-        fn invoke(&self, _: super::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: super::CommandProposal,
+            _streams: super::Streams,
+        ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
     }
@@ -628,7 +684,7 @@ mod tests {
     fn substitution_arguments_keep_their_charges_until_the_command_finishes() {
         let invoker = RecordingInvoker::default();
         let limits = Limits {
-            max_value_bytes: 80,
+            max_value_bytes: 96,
             ..Limits::default()
         };
         let tree = TreeContext::new(limits, CallBudget::new(4));
@@ -638,7 +694,8 @@ mod tests {
         assert_eq!(failed.exit_code, ExitCode::SYNTAX, "{}", failed.output);
         assert!(invoker.secret_uses.lock().is_empty());
         assert_eq!(tree.value_bytes(), 0);
-        let script = format!("gh-extra {word}; gh-extra {word}");
+        let script = format!("gh-extra {word} > /dev/null; gh-extra {word} > /dev/null");
+        assert_eq!(tree.value_bytes(), 0);
         let next = interpreter.run_with_tree(&script, &invoker, &tree);
         assert_eq!(next.exit_code, ExitCode::SUCCESS, "{}", next.output);
         assert_eq!(tree.value_bytes(), 0);
@@ -778,6 +835,15 @@ mod tests {
         }
     }
 
+    fn streams() -> (super::Streams, std::os::unix::net::UnixStream) {
+        let (stdout, reader) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let streams = super::Streams {
+            stdin: None,
+            stdout: stdout.into(),
+        };
+        (streams, reader)
+    }
+
     fn proposal() -> SecretUseProposal {
         SecretUseProposal::HttpBearer {
             secret: "drn:com.xrl:secret:prod:api/token"
@@ -792,20 +858,18 @@ mod tests {
         let shared: Arc<dyn CapabilityInvoker> = Arc::clone(&inner) as Arc<dyn CapabilityInvoker>;
 
         assert_eq!(
-            shared.invoke(super::CommandProposal::new(
-                "http-probe.fetch",
-                json!({"url": "https://x"}),
-                None
-            )),
-            CapabilityCallResult::Succeeded(json!({"url": "https://x"}))
+            shared.invoke(
+                super::CommandProposal::new("http-probe.fetch", json!({"url": "https://x"}), None),
+                streams().0
+            ),
+            CapabilityCallResult::Succeeded
         );
         assert_eq!(
-            shared.invoke(super::CommandProposal::new(
-                "http-probe.fetch",
-                json!({}),
-                Some(proposal())
-            )),
-            CapabilityCallResult::Succeeded(json!({}))
+            shared.invoke(
+                super::CommandProposal::new("http-probe.fetch", json!({}), Some(proposal())),
+                streams().0
+            ),
+            CapabilityCallResult::Succeeded
         );
 
         assert_eq!(
@@ -836,12 +900,12 @@ mod tests {
             input,
             secret_use,
             report,
-        }) = shared.run_command("gh", &["pr".to_owned()], Some("piped"))
+        }) = shared.run_command("gh", &["pr".to_owned()], true)
         else {
             panic!("expected proposal")
         };
         assert_eq!(capability, "gh");
-        assert_eq!(input, json!({"argv": ["pr"], "stdin": "piped"}));
+        assert_eq!(input, json!({"argv": ["pr"], "stdin": ""}));
         assert!(secret_use.is_none());
         assert!(report.is_none());
         assert_eq!(
@@ -877,24 +941,28 @@ mod tests {
             &self,
             word: &str,
             argv: &[String],
-            stdin: Option<&str>,
+            stdin_piped: bool,
         ) -> Option<CommandRun> {
             (word == "httpprobe").then(|| CommandRun::Proposed {
                 capability: "http-probe.fetch".to_owned(),
-                input: json!({ "argv": argv, "stdin": stdin }),
+                input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
                 secret_use: self.secret_use.clone(),
                 report: None,
             })
         }
 
-        fn invoke(&self, proposal: super::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: super::CommandProposal,
+            streams: super::Streams,
+        ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
             let secret_use = proposal.secret_use;
             self.invocations
                 .lock()
                 .push((capability.to_owned(), input, secret_use));
-            CapabilityCallResult::Succeeded(json!({"status": 200}))
+            streams.reply(&json!({"status": 200}))
         }
     }
 
@@ -932,9 +1000,7 @@ mod tests {
     #[test]
     fn capability_results_map_onto_distinct_codes() {
         assert_eq!(
-            ExitCode::from_capability_result(&CapabilityCallResult::Succeeded(
-                serde_json::Value::Null
-            )),
+            ExitCode::from_capability_result(&CapabilityCallResult::Succeeded),
             ExitCode::SUCCESS
         );
         assert_eq!(
