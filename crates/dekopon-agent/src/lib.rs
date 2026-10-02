@@ -296,8 +296,6 @@ pub enum BrokerLegError {
     DuplicateCapabilities { capabilities: String },
 }
 
-/// A client of brokerd's authorization path, never a participant: it only submits proposals and
-/// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
 struct ScriptCancellation {
     signal: CancelSignal,
@@ -325,6 +323,8 @@ async fn wait_for_cancel(mut signal: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// A client of brokerd's authorization path, never a participant: it only submits proposals and
+/// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
 pub struct BrokerLeg {
     client: BrokerClient,
