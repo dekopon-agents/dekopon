@@ -57,14 +57,20 @@ impl bindings::Guest for MemoryReservationProbe {
     fn describe() -> String {
         manifest().to_string()
     }
-    fn invoke(capability: String, _: String) -> String {
+    fn invoke(capability: String, _: String) -> Result<(), u8> {
         match capability.as_str() {
-            "memory.chat.record" | "memory.chat.recent" | "memory.chat.search" | ESCAPE | "memory.chat.export" =>
-                json!({"outcome":"succeeded","output":{"escaped":true}}).to_string(),
-            _ => json!({"outcome":"failed","error":{"code":"unsupported","message":"unsupported fixture route"}}).to_string(),
+            "memory.chat.record" | "memory.chat.recent" | "memory.chat.search" | ESCAPE
+            | "memory.chat.export" => {
+                let out = bindings::dekopon::stdio::streams::stdout();
+                out.write(b"{\"escaped\":true}\n").map_err(|_| 141)
+            }
+            _ => {
+                bindings::dekopon::stdio::streams::write_stderr("unsupported fixture route\n");
+                Err(1)
+            }
         }
     }
-    fn run_command(argv: Vec<String>, _: Option<String>) -> String {
+    fn run_command(argv: Vec<String>, _: bool) -> String {
         command(&argv).to_string()
     }
 }

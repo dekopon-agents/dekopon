@@ -2,12 +2,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_provider_sdk::clap::{Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
     Assets, Capability, Code, Failure, Header, Http, HttpBuildError, HttpError, Part, Proposal,
-    Provider, Request, StreamedRequest, Usage,
+    Provider, Request, Stdout, StreamedRequest, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel, SecretDrn, SecretUseProposal};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::io::Write;
 
 const MAX_RETURNED_BODY_BYTES: usize = 64 * 1024;
 struct HttpProbe;
@@ -129,6 +130,7 @@ enum ProbeError {
     Asset(dekopon_provider_sdk::asset::AssetError),
     PreconditionFailed { expected: String, observed: String },
     AssetTestFailure,
+    Output,
 }
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -146,6 +148,7 @@ impl std::fmt::Display for ProbeError {
                 )
             }
             Self::AssetTestFailure => f.write_str("failure after attach"),
+            Self::Output => f.write_str("provider stdout closed"),
         }
     }
 }
@@ -159,6 +162,7 @@ impl Failure for ProbeError {
             Self::Asset(error) => error.code.as_str(),
             Self::PreconditionFailed { .. } => "precondition-failed",
             Self::AssetTestFailure => "asset-test-failure",
+            Self::Output => "output-error",
         })
     }
 }
@@ -181,7 +185,7 @@ impl Provider for HttpProbe {
     const DESCRIPTION: &'static str = "Exercises the versioned broker HTTP import";
     type Args = Command;
     type Capabilities = (Fetch, ConditionalWrite, Purge);
-    fn propose(args: Command, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(args: Command, _: bool) -> Result<Proposal<Self>, Usage> {
         match args.action {
             Action::Fetch(fetch) => {
                 let input = FetchInput {
@@ -251,33 +255,39 @@ impl Capability for Fetch {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = FetchInput;
     type Needs = (Http, Assets);
-    type Output = Value;
     type Error = ProbeError;
-    fn run(input: FetchInput, (http, assets): (Http, Assets)) -> Result<Value, ProbeError> {
-        if let Some(mode) = input.asset_mode.as_deref() {
-            return asset_probe(mode, &input, &http, &assets);
-        }
-        let uri = input.uri.ok_or(ProbeError::UriRequired)?;
-        let mut request =
-            Request::new(input.method.as_deref().unwrap_or("GET"), uri).map_err(invalid_request)?;
-        for header in input.headers.unwrap_or_default() {
-            request = request
-                .with_header(Header::text(header.name, header.value).map_err(invalid_request)?);
-        }
-        if let Some(body) = input.body {
-            request = request.with_body(body.into_bytes());
-        }
-        match http.send(request) {
-            Ok(response) => Ok(describe_response(
-                response.status,
-                &response.body,
-                response.headers.len(),
-            )),
-            Err(error) if input.catch_error.unwrap_or(false) => {
-                Ok(json!({"caughtError":format!("{:?}", error.code)}))
+    fn run(
+        input: FetchInput,
+        (http, assets): (Http, Assets),
+        out: &mut Stdout,
+    ) -> Result<(), ProbeError> {
+        let value = (|| -> Result<Value, ProbeError> {
+            if let Some(mode) = input.asset_mode.as_deref() {
+                return asset_probe(mode, &input, &http, &assets);
             }
-            Err(error) => Err(http_failed(error)),
-        }
+            let uri = input.uri.ok_or(ProbeError::UriRequired)?;
+            let mut request = Request::new(input.method.as_deref().unwrap_or("GET"), uri)
+                .map_err(invalid_request)?;
+            for header in input.headers.unwrap_or_default() {
+                request = request
+                    .with_header(Header::text(header.name, header.value).map_err(invalid_request)?);
+            }
+            if let Some(body) = input.body {
+                request = request.with_body(body.into_bytes());
+            }
+            match http.send(request) {
+                Ok(response) => Ok(describe_response(
+                    response.status,
+                    &response.body,
+                    response.headers.len(),
+                )),
+                Err(error) if input.catch_error.unwrap_or(false) => {
+                    Ok(json!({"caughtError":format!("{:?}", error.code)}))
+                }
+                Err(error) => Err(http_failed(error)),
+            }
+        })()?;
+        writeln!(out, "{value}").map_err(|_| ProbeError::Output)
     }
 }
 impl Capability for ConditionalWrite {
@@ -289,31 +299,34 @@ impl Capability for ConditionalWrite {
     const RISK: RiskLevel = RiskLevel::High;
     type Input = WriteInput;
     type Needs = Http;
-    type Output = Value;
     type Error = ProbeError;
-    fn run(input: WriteInput, http: Http) -> Result<Value, ProbeError> {
-        let read = http
-            .send(Request::new("GET", &input.uri).map_err(invalid_request)?)
-            .map_err(http_failed)?;
-        let observed = read
-            .headers
-            .iter()
-            .find(|header| header.name.eq_ignore_ascii_case("etag"))
-            .map(|header| String::from_utf8_lossy(&header.value).into_owned())
-            .unwrap_or_default();
-        if let Some(expected) = input.expected_etag
-            && expected != observed
-        {
-            return Err(ProbeError::PreconditionFailed { expected, observed });
-        }
-        let request = Request::new("POST", &input.uri)
-            .map_err(invalid_request)?
-            .with_header(
-                Header::new("if-match", observed.clone().into_bytes()).map_err(invalid_request)?,
-            )
-            .with_body(b"{}".to_vec());
-        let write = http.send(request).map_err(http_failed)?;
-        Ok(json!({"observedEtag":observed,"readStatus":read.status,"writeStatus":write.status}))
+    fn run(input: WriteInput, http: Http, out: &mut Stdout) -> Result<(), ProbeError> {
+        let value = (|| -> Result<Value, ProbeError> {
+            let read = http
+                .send(Request::new("GET", &input.uri).map_err(invalid_request)?)
+                .map_err(http_failed)?;
+            let observed = read
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("etag"))
+                .map(|header| String::from_utf8_lossy(&header.value).into_owned())
+                .unwrap_or_default();
+            if let Some(expected) = input.expected_etag
+                && expected != observed
+            {
+                return Err(ProbeError::PreconditionFailed { expected, observed });
+            }
+            let request = Request::new("POST", &input.uri)
+                .map_err(invalid_request)?
+                .with_header(
+                    Header::new("if-match", observed.clone().into_bytes())
+                        .map_err(invalid_request)?,
+                )
+                .with_body(b"{}".to_vec());
+            let write = http.send(request).map_err(http_failed)?;
+            Ok(json!({"observedEtag":observed,"readStatus":read.status,"writeStatus":write.status}))
+        })()?;
+        writeln!(out, "{value}").map_err(|_| ProbeError::Output)
     }
 }
 impl Capability for Purge {
@@ -324,30 +337,36 @@ impl Capability for Purge {
     const RISK: RiskLevel = RiskLevel::High;
     type Input = PurgeInput;
     type Needs = (Http, Assets);
-    type Output = Value;
     type Error = ProbeError;
-    fn run(input: PurgeInput, (http, assets): (Http, Assets)) -> Result<Value, ProbeError> {
-        if let Some(mode) = input.asset_mode.as_deref() {
-            let asset_input = FetchInput {
-                uri: input.uri,
-                method: None,
-                headers: None,
-                body: None,
-                catch_error: None,
-                asset_mode: None,
-                bytes: input.bytes,
-                after_write_error: None,
-                reference: input.reference,
-                references: None,
-                catch_stream_error: None,
-            };
-            return asset_probe(mode, &asset_input, &http, &assets);
-        }
-        let uri = input.uri.ok_or(ProbeError::UriRequired)?;
-        let response = http
-            .send(Request::new("DELETE", uri).map_err(invalid_request)?)
-            .map_err(http_failed)?;
-        Ok(json!({"status":response.status}))
+    fn run(
+        input: PurgeInput,
+        (http, assets): (Http, Assets),
+        out: &mut Stdout,
+    ) -> Result<(), ProbeError> {
+        let value = (|| -> Result<Value, ProbeError> {
+            if let Some(mode) = input.asset_mode.as_deref() {
+                let asset_input = FetchInput {
+                    uri: input.uri,
+                    method: None,
+                    headers: None,
+                    body: None,
+                    catch_error: None,
+                    asset_mode: None,
+                    bytes: input.bytes,
+                    after_write_error: None,
+                    reference: input.reference,
+                    references: None,
+                    catch_stream_error: None,
+                };
+                return asset_probe(mode, &asset_input, &http, &assets);
+            }
+            let uri = input.uri.ok_or(ProbeError::UriRequired)?;
+            let response = http
+                .send(Request::new("DELETE", uri).map_err(invalid_request)?)
+                .map_err(http_failed)?;
+            Ok(json!({"status":response.status}))
+        })()?;
+        writeln!(out, "{value}").map_err(|_| ProbeError::Output)
     }
 }
 
@@ -487,8 +506,8 @@ dekopon_provider_sdk::export!(HttpProbe);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dekopon_provider_sdk::CommandRunOutcome;
     use dekopon_provider_sdk::provider;
-    use dekopon_provider_sdk::{CommandRunOutcome, ComponentResponse};
     #[test]
     fn typed_manifest_and_command_cover_all_routes() {
         let manifest = provider::manifest::<HttpProbe>().unwrap();
@@ -508,20 +527,29 @@ mod tests {
             assert!(matches!(
                 provider::command::<HttpProbe>(
                     &[sub.into(), "--uri".into(), "https://example.test/".into()],
-                    None
+                    false
                 ),
                 CommandRunOutcome::Proposed { .. }
             ));
         }
-        assert!(
-            matches!(provider::call::<HttpProbe>("http-probe.fetch", r#"{"unknown":true}"#), ComponentResponse::Failed { error } if error.code == "invalid-input")
+        assert_eq!(
+            provider::invoke_native::<HttpProbe>(
+                "http-probe.fetch",
+                r#"{"unknown":true}"#,
+                provider::NativeStdio {
+                    stdin: None,
+                    stdout: Box::new(std::io::sink())
+                }
+            )
+            .status,
+            2
         );
         assert_eq!(
             manifest.capabilities[2].input_schema["additionalProperties"],
             false
         );
         assert!(matches!(provider::command::<HttpProbe>(
-            &["purge".into(), "--uri".into(), "https://example.test/".into()], None,
+            &["purge".into(), "--uri".into(), "https://example.test/".into()], false,
         ), CommandRunOutcome::Proposed { capability, input, .. }
             if capability.as_str() == "http-probe.purge" && input == json!({"uri":"https://example.test/"})));
     }
@@ -540,7 +568,7 @@ mod tests {
             const DESCRIPTION: &'static str = "streamed host failure witness";
             type Args = Command;
             type Capabilities = (Stream,);
-            fn propose(_: Command, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+            fn propose(_: Command, _: bool) -> Result<Proposal<Self>, Usage> {
                 Err(Usage::new("no proposal"))
             }
         }
@@ -552,14 +580,14 @@ mod tests {
             const RISK: RiskLevel = RiskLevel::Low;
             type Input = PurgeInput;
             type Needs = Http;
-            type Output = Value;
             type Error = ProbeError;
-            fn run(input: PurgeInput, http: Http) -> Result<Value, ProbeError> {
+            fn run(input: PurgeInput, http: Http, out: &mut Stdout) -> Result<(), ProbeError> {
                 let request =
                     StreamedRequest::new("POST", input.uri.ok_or(ProbeError::UriRequired)?)
                         .map_err(invalid_request)?;
                 let response = http.stream(request).map_err(stream_failed)?;
-                Ok(json!({"status": response.status}))
+                writeln!(out, "{}", json!({"status": response.status}))
+                    .map_err(|_| ProbeError::Output)
             }
         }
         impl Port for StreamHost {
@@ -583,16 +611,17 @@ mod tests {
             }
         }
         let outcome = provider::with_port(StreamHost, || {
-            provider::call::<StreamProbe>(
+            provider::invoke_native::<StreamProbe>(
                 "stream-host-test.stream",
                 r#"{"uri":"https://example.test/path"}"#,
+                provider::NativeStdio {
+                    stdin: None,
+                    stdout: Box::new(std::io::sink()),
+                },
             )
         });
-        assert!(
-            matches!(&outcome, ComponentResponse::Failed { error }
-            if error.code == "request-too-large" && error.message == "host rejected streamed request"),
-            "{outcome:?}"
-        );
+        assert_eq!(outcome.status, 1);
+        assert_eq!(outcome.stderr, "host rejected streamed request\n");
     }
 
     #[test]
@@ -648,7 +677,7 @@ mod tests {
                 capability,
                 input,
                 secret_use,
-            } = provider::command::<HttpProbe>(&argv, None)
+            } = provider::command::<HttpProbe>(&argv, false)
             else {
                 panic!("valid secret flag must propose");
             };
@@ -669,7 +698,7 @@ mod tests {
                 .iter()
                 .map(|word| (*word).to_owned())
                 .collect::<Vec<_>>();
-            assert!(matches!(provider::command::<HttpProbe>(&argv, None),
+            assert!(matches!(provider::command::<HttpProbe>(&argv, false),
                 CommandRunOutcome::Failed { error } if error.code == "usage"));
         }
         for words in [
@@ -682,7 +711,7 @@ mod tests {
                 .map(|word| (*word).to_owned())
                 .collect::<Vec<_>>();
             assert!(matches!(
-                provider::command::<HttpProbe>(&argv, None),
+                provider::command::<HttpProbe>(&argv, false),
                 CommandRunOutcome::Rendered { status: 2, .. }
             ));
         }

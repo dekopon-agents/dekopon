@@ -14,7 +14,11 @@ impl CapabilityInvoker for Invoker {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _: dekopon_shell::CommandProposal,
+        _streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }
@@ -182,7 +186,7 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
             &self,
             word: &str,
             _: &[String],
-            _: Option<&str>,
+            _: bool,
         ) -> Option<dekopon_shell::CommandRun> {
             (word == "hold").then(|| dekopon_shell::CommandRun::Proposed {
                 capability: "test.hold".to_owned(),
@@ -191,12 +195,16 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
                 report: None,
             })
         }
-        fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: dekopon_shell::CommandProposal,
+            streams: dekopon_shell::Streams,
+        ) -> CapabilityCallResult {
             self.release
                 .lock()
                 .recv_timeout(Duration::from_secs(5))
                 .expect("release producer after first result");
-            CapabilityCallResult::Succeeded(Value::Null)
+            streams.reply(&Value::Null)
         }
         fn note(&self, text: &str, _: Option<Duration>) {
             self.observed
@@ -398,7 +406,11 @@ impl CapabilityInvoker for Cancelled {
     fn granted(&self) -> Vec<String> {
         Vec::new()
     }
-    fn invoke(&self, _: dekopon_shell::CommandProposal) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        _: dekopon_shell::CommandProposal,
+        _streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
 }

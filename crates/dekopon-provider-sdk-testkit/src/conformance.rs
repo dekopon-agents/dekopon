@@ -106,6 +106,7 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     ]
     .into_iter()
     .filter_map(|(bit, name)| set.contains(bit).then_some(name.to_owned()))
+    .chain(std::iter::once("dekopon:stdio/streams@0.1.0".to_owned()))
     .collect()
 }
 
@@ -184,9 +185,9 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
             (&["--help".to_owned()][..], true),
             (&["--definitely-invalid-option".to_owned()][..], false),
         ] {
-            let native_outcome = provider::command::<P>(argv, None);
+            let native_outcome = provider::command::<P>(argv, false);
             let real_outcome =
-                super::typed::runtime().block_on(registry.run_command(word, argv, None))?;
+                super::typed::runtime().block_on(registry.run_command(word, argv, false))?;
             if !rendered(&native_outcome, help) || !rendered(&real_outcome, help) {
                 return Err(ConformanceError::HelpUsage {
                     word: word.to_owned(),
@@ -222,13 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn checked_cli_bytes_have_no_imports_but_a_declared_clock_would_mismatch() {
+    fn checked_cli_bytes_import_stdio_but_not_an_undeclared_clock() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/providers/cli-probe-provider.wasm");
         let bytes = std::fs::read(path).unwrap();
         let decoded = decoded_imports(&bytes).unwrap();
         assert!(
-            decoded.is_empty(),
+            decoded == declared_imports(ImportSet::EMPTY),
             "decoded imports: {decoded:?}; bytes: {}",
             bytes.len()
         );

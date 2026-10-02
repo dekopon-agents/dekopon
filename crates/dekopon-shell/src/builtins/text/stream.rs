@@ -224,7 +224,7 @@ mod tests {
         fn granted(&self) -> Vec<String> {
             Vec::new()
         }
-        fn invoke(&self, _: CommandProposal) -> CapabilityCallResult {
+        fn invoke(&self, _: CommandProposal, _streams: crate::Streams) -> CapabilityCallResult {
             unreachable!()
         }
         fn cancelled(&self) -> bool {
@@ -286,7 +286,7 @@ mod tests {
             fn granted(&self) -> Vec<String> {
                 Vec::new()
             }
-            fn invoke(&self, _: CommandProposal) -> CapabilityCallResult {
+            fn invoke(&self, _: CommandProposal, _streams: crate::Streams) -> CapabilityCallResult {
                 unreachable!()
             }
             fn cancelled(&self) -> bool {

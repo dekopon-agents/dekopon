@@ -40,6 +40,7 @@ dekopon-capability.workspace = true
 rustix.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "compare_models"

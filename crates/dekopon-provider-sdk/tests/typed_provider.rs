@@ -1,15 +1,17 @@
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::fmt;
+use std::io::{self, Write};
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use clap::{Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Capability, Code, Failure, ManifestError, Proposal, Provider, SchemaFault, SdkFailure, Usage,
-    call, command, manifest,
+    Capability, Code, Failure, ManifestError, NativeExit, NativeStdio, Proposal, Provider,
+    SchemaFault, SdkFailure, Stdout, Usage, command, invoke_native, manifest, stdin,
 };
 use dekopon_provider_sdk::{
-    CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind, RiskLevel,
-    SecretUseProposal,
+    CommandRunOutcome, ComponentFailure, EffectKind, RiskLevel, SecretUseProposal,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -54,13 +56,13 @@ impl Provider for Fixture {
     type Args = Args;
     type Capabilities = (Upper, Count);
 
-    fn propose(args: Args, stdin: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(args: Args, stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         match args.verb {
             Verb::Upper { text } => {
-                let text = text
-                    .or_else(|| stdin.map(str::to_owned))
-                    .ok_or_else(|| Usage::new("fixture upper: pass --text or pipe input"))?;
-                Ok(Proposal::to::<Upper>(TextInput { text }))
+                if text.is_none() && !stdin_piped {
+                    return Err(Usage::new("fixture upper: pass --text or pipe input"));
+                }
+                Ok(Proposal::to::<Upper>(UpperInput { text }))
             }
             Verb::Count { text, bearer } => {
                 let proposal = Proposal::to::<Count>(CountInput { text, limit: 8 });
@@ -74,18 +76,17 @@ impl Provider for Fixture {
                     }
                 }
             }
-            Verb::Stray => Ok(Proposal::to::<Stray>(TextInput {
-                text: String::new(),
-            })),
+            Verb::Stray => Ok(Proposal::to::<Stray>(UpperInput { text: None })),
         }
     }
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct TextInput {
-    /// The text to transform
-    text: String,
+struct UpperInput {
+    /// The text to transform; absent to transform piped lines
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -98,30 +99,59 @@ struct CountInput {
     limit: u32,
 }
 
-#[derive(Serialize)]
-struct TextOutput {
-    text: String,
-}
-
 enum CountFailure {
     TooLong,
+    EmptyLine,
+    NothingPiped,
+    Gone,
 }
 
 impl fmt::Display for CountFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLong => formatter.write_str("the text is longer than the limit"),
-        }
+        formatter.write_str(match self {
+            Self::TooLong => "the text is longer than the limit",
+            Self::EmptyLine => "fixture upper: a piped line is empty",
+            Self::NothingPiped => "fixture upper: nothing was piped in",
+            Self::Gone => "fixture upper: stdout is closed",
+        })
     }
 }
 
-const TOO_LONG: Code = Code::new("too-long");
+impl From<io::Error> for CountFailure {
+    fn from(_: io::Error) -> Self {
+        Self::Gone
+    }
+}
+
+const TOO_LONG: Code = Code::new("too-long").exiting(3);
 
 impl Failure for CountFailure {
     fn code(&self) -> Code {
         match self {
             Self::TooLong => TOO_LONG,
+            Self::EmptyLine | Self::NothingPiped => Code::USAGE,
+            Self::Gone => Code::new("gone"),
         }
+    }
+}
+
+struct Gone;
+
+impl fmt::Display for Gone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("stdout is closed")
+    }
+}
+
+impl Failure for Gone {
+    fn code(&self) -> Code {
+        Code::new("gone")
+    }
+}
+
+impl From<io::Error> for Gone {
+    fn from(_: io::Error) -> Self {
+        Self
     }
 }
 
@@ -133,15 +163,28 @@ impl Capability for Upper {
     const DESCRIPTION: &'static str = "Upper-cases text";
     const EFFECT: EffectKind = EffectKind::ReadOnly;
     const RISK: RiskLevel = RiskLevel::Low;
-    type Input = TextInput;
+    type Input = UpperInput;
     type Needs = ();
-    type Output = TextOutput;
     type Error = CountFailure;
 
-    fn run(input: TextInput, (): ()) -> Result<TextOutput, CountFailure> {
-        Ok(TextOutput {
-            text: input.text.to_uppercase(),
-        })
+    fn run(input: UpperInput, (): (), out: &mut Stdout) -> Result<(), CountFailure> {
+        if let Some(text) = input.text {
+            writeln!(out, "{}", text.to_uppercase())?;
+            return Ok(());
+        }
+        let mut lines = 0;
+        for line in stdin().ok_or(CountFailure::NothingPiped)?.lines() {
+            let line = line?;
+            if line.is_empty() {
+                return Err(CountFailure::EmptyLine);
+            }
+            writeln!(out, "{}", line.to_uppercase())?;
+            lines += 1;
+        }
+        if lines == 0 {
+            return Err(CountFailure::NothingPiped);
+        }
+        Ok(())
     }
 }
 
@@ -155,14 +198,15 @@ impl Capability for Count {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = CountInput;
     type Needs = ();
-    type Output = u32;
     type Error = CountFailure;
 
-    fn run(input: CountInput, (): ()) -> Result<u32, CountFailure> {
-        u32::try_from(input.text.chars().count())
+    fn run(input: CountInput, (): (), out: &mut Stdout) -> Result<(), CountFailure> {
+        let count = u32::try_from(input.text.chars().count())
             .ok()
             .filter(|count| *count <= input.limit)
-            .ok_or(CountFailure::TooLong)
+            .ok_or(CountFailure::TooLong)?;
+        writeln!(out, "{count}")?;
+        Ok(())
     }
 }
 
@@ -174,13 +218,12 @@ impl Capability for Stray {
     const DESCRIPTION: &'static str = "Is not listed by its provider";
     const EFFECT: EffectKind = EffectKind::ReadOnly;
     const RISK: RiskLevel = RiskLevel::Low;
-    type Input = TextInput;
+    type Input = UpperInput;
     type Needs = ();
-    type Output = TextOutput;
     type Error = CountFailure;
 
-    fn run(input: TextInput, (): ()) -> Result<TextOutput, CountFailure> {
-        Ok(TextOutput { text: input.text })
+    fn run(_: UpperInput, (): (), _: &mut Stdout) -> Result<(), CountFailure> {
+        Ok(())
     }
 }
 
@@ -195,7 +238,7 @@ impl Provider for ClockFixture {
     const DESCRIPTION: &'static str = "Clock fixture";
     type Args = ClockArgs;
     type Capabilities = (ClockRead,);
-    fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<ClockRead>(ClockInput {}))
     }
 }
@@ -213,10 +256,10 @@ impl Capability for ClockRead {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = ClockInput;
     type Needs = dekopon_provider_sdk::provider::Clock;
-    type Output = u64;
-    type Error = Infallible;
-    fn run(_: ClockInput, clock: Self::Needs) -> Result<u64, Infallible> {
-        Ok(clock.now_unix_millis())
+    type Error = Gone;
+    fn run(_: ClockInput, clock: Self::Needs, out: &mut Stdout) -> Result<(), Gone> {
+        writeln!(out, "{}", clock.now_unix_millis())?;
+        Ok(())
     }
 }
 
@@ -251,8 +294,8 @@ fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
         }
     }
     assert_eq!(
-        with_port(Fake, || call::<ClockFixture>("clock-fixture.read", "{}")),
-        ComponentResponse::Succeeded { output: json!(123) }
+        with_port(Fake, || call::<ClockFixture>("clock-fixture.read", "{}")).stdout,
+        "123\n"
     );
 }
 
@@ -266,7 +309,7 @@ macro_rules! refused_native_import {
             const DESCRIPTION: &'static str = "Native import fixture";
             type Args = ClockArgs;
             type Capabilities = ($capability,);
-            fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+            fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
                 Ok(Proposal::to::<$capability>(ClockInput {}))
             }
         }
@@ -278,9 +321,8 @@ macro_rules! refused_native_import {
             const RISK: RiskLevel = RiskLevel::Low;
             type Input = ClockInput;
             type Needs = $needs;
-            type Output = ();
             type Error = Infallible;
-            fn run(_: ClockInput, _: Self::Needs) -> Result<(), Infallible> {
+            fn run(_: ClockInput, _: Self::Needs, _: &mut Stdout) -> Result<(), Infallible> {
                 panic!("the unsupported native import must be rejected before run")
             }
         }
@@ -331,7 +373,7 @@ macro_rules! http_provider {
             const DESCRIPTION: &'static str = "Native HTTP fixture";
             type Args = ClockArgs;
             type Capabilities = ($capability,);
-            fn propose(_: ClockArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+            fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
                 Ok(Proposal::to::<$capability>(ClockInput {}))
             }
         }
@@ -343,10 +385,10 @@ macro_rules! http_provider {
             const RISK: RiskLevel = RiskLevel::Low;
             type Input = ClockInput;
             type Needs = $needs;
-            type Output = u64;
-            type Error = Infallible;
-            fn run(_: ClockInput, needs: Self::Needs) -> Result<u64, Infallible> {
-                Ok(($body)(needs))
+            type Error = Gone;
+            fn run(_: ClockInput, needs: Self::Needs, out: &mut Stdout) -> Result<(), Gone> {
+                writeln!(out, "{}", ($body)(needs))?;
+                Ok(())
             }
         }
     };
@@ -412,26 +454,23 @@ fn native_http_and_http_clock_tuple_reach_the_fake_port() {
         }
     }
     assert_eq!(
-        with_port(Fake, || call::<HttpFixture>("native-http.send", "{}")),
-        ComponentResponse::Succeeded { output: json!(202) }
+        with_port(Fake, || call::<HttpFixture>("native-http.send", "{}")).stdout,
+        "202\n"
     );
     assert_eq!(
-        with_port(Fake, || call::<HttpClockFixture>("native-http.send", "{}")),
-        ComponentResponse::Succeeded { output: json!(325) }
+        with_port(Fake, || call::<HttpClockFixture>("native-http.send", "{}")).stdout,
+        "325\n"
     );
 }
 
 #[test]
 fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple() {
     fn requires_harness<P: Provider>() {
-        let error = failed(call::<P>("native-import.read", "{}"));
+        let exit = call::<P>("native-import.read", "{}");
+        assert_eq!(exit.status, 1);
         assert_eq!(
-            error.code,
-            SdkFailure::ComponentHarnessRequired.code().as_str()
-        );
-        assert_eq!(
-            error.message,
-            "this capability needs the component harness (Harness<P>)"
+            exit.stderr,
+            "this capability needs the component harness (Harness<P>)\n"
         );
     }
     requires_harness::<JsonlFixture>();
@@ -469,16 +508,64 @@ fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple(
     with_port(SettingsFake, requires_harness::<TupleFixture>);
 }
 
-fn run(words: &[&str], stdin: Option<&str>) -> CommandRunOutcome {
+fn run(words: &[&str], stdin_piped: bool) -> CommandRunOutcome {
     let argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
-    command::<Fixture>(&argv, stdin)
+    command::<Fixture>(&argv, stdin_piped)
 }
 
-fn failed(response: ComponentResponse) -> ComponentFailure {
-    match response {
-        ComponentResponse::Failed { error } => error,
-        ComponentResponse::Succeeded { output } => panic!("expected a failure, got {output}"),
+#[derive(Clone, Default)]
+struct Captured(Rc<RefCell<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct Closed;
+
+impl Write for Closed {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Exit {
+    status: u8,
+    stdout: String,
+    stderr: String,
+}
+
+fn call_with<P: Provider>(capability: &str, input: &str, piped: Option<&'static str>) -> Exit {
+    let captured = Captured::default();
+    let NativeExit { status, stderr } = invoke_native::<P>(
+        capability,
+        input,
+        NativeStdio {
+            stdin: piped.map(|text| Box::new(text.as_bytes()) as Box<dyn io::Read>),
+            stdout: Box::new(captured.clone()),
+        },
+    );
+    let stdout = String::from_utf8(captured.0.take()).expect("UTF-8 stdout");
+    Exit {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+fn call<P: Provider>(capability: &str, input: &str) -> Exit {
+    call_with::<P>(capability, input, None)
 }
 
 fn walk(schema: &Value, visit: &mut impl FnMut(&serde_json::Map<String, Value>)) {
@@ -531,32 +618,95 @@ fn every_input_schema_is_closed_and_inline() {
 }
 
 #[test]
-fn a_call_dispatches_to_the_named_capability_and_serializes_its_output() {
+fn a_call_dispatches_to_the_named_capability_and_writes_its_stdout() {
+    let exit = call::<Fixture>("fixture.upper", r#"{"text":"hello"}"#);
     assert_eq!(
-        call::<Fixture>("fixture.upper", r#"{"text":"hello"}"#),
-        ComponentResponse::Succeeded {
-            output: json!({"text": "HELLO"})
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (0, "HELLO\n", "")
+    );
+    let exit = call::<Fixture>("fixture.count", r#"{"text":"hello","limit":5}"#);
+    assert_eq!((exit.status, exit.stdout.as_str()), (0, "5\n"));
+}
+
+#[test]
+fn piped_lines_stream_to_stdout_and_a_usage_failure_exits_2_with_its_message_on_stderr() {
+    let exit = call_with::<Fixture>("fixture.upper", "{}", Some("a\nb\n"));
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (0, "A\nB\n", "")
+    );
+
+    let exit = call_with::<Fixture>("fixture.upper", "{}", Some("a\n\nb\n"));
+    assert_eq!(exit.status, 2);
+    assert_eq!(exit.stdout, "A\n");
+    assert_eq!(exit.stderr, "fixture upper: a piped line is empty\n");
+}
+
+#[test]
+fn zero_byte_piped_input_differs_from_nothing_piped_and_both_are_usage_errors() {
+    let empty = call_with::<Fixture>("fixture.upper", "{}", Some(""));
+    let absent = call::<Fixture>("fixture.upper", "{}");
+    assert_eq!(
+        (empty.status, empty.stderr.as_str()),
+        (2, "fixture upper: nothing was piped in\n")
+    );
+    assert_eq!(
+        (absent.status, absent.stderr.as_str()),
+        (2, "fixture upper: nothing was piped in\n")
+    );
+    assert!(
+        invoke_native::<Fixture>(
+            "fixture.stray",
+            "{}",
+            NativeStdio {
+                stdin: None,
+                stdout: Box::new(io::sink()),
+            },
+        )
+        .status
+            != 0
+    );
+}
+
+#[test]
+fn a_write_to_a_closed_stdout_exits_141_whatever_the_capability_returns() {
+    let exit = invoke_native::<Fixture>(
+        "fixture.upper",
+        "{}",
+        NativeStdio {
+            stdin: Some(Box::new(&b"a\nb\n"[..])),
+            stdout: Box::new(Closed),
+        },
+    );
+    assert_eq!(
+        exit,
+        NativeExit {
+            status: 141,
+            stderr: String::new()
         }
     );
-    assert_eq!(
-        call::<Fixture>("fixture.count", r#"{"text":"hello","limit":5}"#),
-        ComponentResponse::Succeeded { output: json!(5) }
-    );
 }
 
 #[test]
-fn a_capability_failure_carries_its_typed_code_and_display_message() {
-    let error = failed(call::<Fixture>("fixture.count", r#"{"text":"hello"}"#));
-    assert_eq!(error.code, TOO_LONG.as_str());
-    assert_eq!(error.message, CountFailure::TooLong.to_string());
+fn a_capability_failure_exits_with_its_code_s_status_and_display_message() {
+    let exit = call::<Fixture>("fixture.count", r#"{"text":"hello"}"#);
+    assert_eq!(exit.status, TOO_LONG.status().get());
+    assert_eq!(exit.status, 3);
+    assert_eq!(exit.stdout, "");
+    assert_eq!(exit.stderr, format!("{}\n", CountFailure::TooLong));
+    assert_eq!(Code::new("default").status().get(), 1);
+    assert_eq!(Code::USAGE.status().get(), 2);
 }
 
 #[test]
-fn an_unknown_capability_fails_with_the_sdk_code_and_static_message() {
+fn an_unknown_capability_fails_with_the_sdk_status_and_static_message() {
     for capability in ["fixture.stray", "other.upper", "fixture", "Not Valid"] {
-        let error = failed(call::<Fixture>(capability, r#"{"text":"x"}"#));
-        assert_eq!(error.code, SdkFailure::UnknownCapability.code().as_str());
-        assert_eq!(error.message, SdkFailure::UnknownCapability.to_string());
+        let exit = call::<Fixture>(capability, r#"{"text":"x"}"#);
+        assert_eq!(
+            exit.status,
+            SdkFailure::UnknownCapability.code().status().get()
+        );
+        assert_eq!(exit.stderr, format!("{}\n", SdkFailure::UnknownCapability));
     }
 }
 
@@ -568,9 +718,9 @@ fn invalid_input_never_echoes_parser_text() {
         r#"{"limit":1}"#,
         "{",
     ] {
-        let error = failed(call::<Fixture>("fixture.count", input));
-        assert_eq!(error.code, SdkFailure::InvalidInput.code().as_str());
-        assert_eq!(error.message, SdkFailure::InvalidInput.to_string());
+        let exit = call::<Fixture>("fixture.count", input);
+        assert_eq!(exit.status, 2);
+        assert_eq!(exit.stderr, format!("{}\n", SdkFailure::InvalidInput));
     }
 }
 
@@ -600,7 +750,7 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
         stdout,
         stderr,
         status,
-    } = run(&["--help"], None)
+    } = run(&["--help"], false)
     else {
         panic!("help renders");
     };
@@ -615,7 +765,7 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
         &["bogus"],
         &["count"],
     ] {
-        let CommandRunOutcome::Rendered { stdout, stderr, .. } = run(words, None) else {
+        let CommandRunOutcome::Rendered { stdout, stderr, .. } = run(words, false) else {
             panic!("{words:?} renders");
         };
         assert!(!stdout.contains('\u{1b}'), "{words:?}: {stdout:?}");
@@ -626,7 +776,7 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
         stdout,
         stderr,
         status,
-    } = run(&["count"], None)
+    } = run(&["count"], false)
     else {
         panic!("a missing argument renders a usage error");
     };
@@ -638,7 +788,7 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
 #[test]
 fn a_command_proposes_the_capability_with_its_typed_input() {
     assert_eq!(
-        run(&["upper", "--text", "hi"], None),
+        run(&["upper", "--text", "hi"], false),
         CommandRunOutcome::Proposed {
             capability: "fixture.upper".parse().expect("valid id"),
             input: json!({"text": "hi"}),
@@ -646,10 +796,10 @@ fn a_command_proposes_the_capability_with_its_typed_input() {
         }
     );
     assert_eq!(
-        run(&["upper"], Some("piped")),
+        run(&["upper"], true),
         CommandRunOutcome::Proposed {
             capability: "fixture.upper".parse().expect("valid id"),
-            input: json!({"text": "piped"}),
+            input: json!({"text": null}),
             secret_use: None,
         }
     );
@@ -658,7 +808,7 @@ fn a_command_proposes_the_capability_with_its_typed_input() {
 #[test]
 fn a_proposal_carries_its_secret_use() {
     assert_eq!(
-        run(&["count", "abc", "--bearer", DRN], None),
+        run(&["count", "abc", "--bearer", DRN], false),
         CommandRunOutcome::Proposed {
             capability: "fixture.count".parse().expect("valid id"),
             input: json!({"text": "abc", "limit": 8}),
@@ -672,7 +822,7 @@ fn a_proposal_carries_its_secret_use() {
 #[test]
 fn a_provider_usage_error_is_a_failed_run_with_the_usage_code() {
     assert_eq!(
-        run(&["upper"], None),
+        run(&["upper"], false),
         CommandRunOutcome::Failed {
             error: ComponentFailure {
                 code: Code::USAGE.as_str().to_owned(),
@@ -684,7 +834,7 @@ fn a_provider_usage_error_is_a_failed_run_with_the_usage_code() {
 
 #[test]
 fn a_proposal_for_an_unlisted_capability_is_refused() {
-    let CommandRunOutcome::Failed { error } = run(&["stray"], None) else {
+    let CommandRunOutcome::Failed { error } = run(&["stray"], false) else {
         panic!("an unlisted capability cannot be proposed");
     };
     assert_eq!(error.code, SdkFailure::UnknownCapability.code().as_str());
@@ -703,7 +853,7 @@ impl<I: Faulted> Provider for Faulty<I> {
     type Args = NoArgs;
     type Capabilities = (Take<I>,);
 
-    fn propose(_: NoArgs, _: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Err(Usage::new("faulty takes no proposal"))
     }
 }
@@ -735,10 +885,9 @@ impl<I: Faulted> Capability for Take<I> {
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = I;
     type Needs = ();
-    type Output = ();
     type Error = Infallible;
 
-    fn run(_: I, (): ()) -> Result<(), Infallible> {
+    fn run(_: I, (): (), _: &mut Stdout) -> Result<(), Infallible> {
         Ok(())
     }
 }

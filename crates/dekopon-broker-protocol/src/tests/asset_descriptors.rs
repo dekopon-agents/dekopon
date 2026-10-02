@@ -8,9 +8,9 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg}
 use tokio::{io::Interest, net::UnixStream};
 
 use crate::{
-    AssetEncoding, AssetRow, DescriptorStream, FrameLimits, MAX_ASSET_ROWS,
-    MAX_DESCRIPTORS_PER_FRAME, NewAsset, ProtocolError, RequestEnvelope, ResponseEnvelope,
-    validate_response_descriptors,
+    AssetEncoding, AssetRow, BrokerRequest, DescriptorStream, FrameLimits, MAX_ASSET_DESCRIPTORS,
+    MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME, NewAsset, ProtocolError, RequestEnvelope,
+    ResponseEnvelope, StreamDescriptors, Streams, validate_response_descriptors,
 };
 
 fn files(count: usize) -> Vec<std::fs::File> {
@@ -59,7 +59,7 @@ async fn invoke_round_trips_five_close_on_exec_descriptors() {
         })
         .collect();
     let descriptors: Vec<_> = files.iter().map(|file| file.as_fd()).collect();
-    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4);
+    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4, None);
     writer
         .write_frame(&request, &descriptors, FrameLimits::default())
         .await
@@ -82,6 +82,69 @@ async fn invoke_round_trips_five_close_on_exec_descriptors() {
         assert_eq!(&bytes, index.to_string().as_bytes());
         assert!(std::os::unix::fs::FileExt::write_at(&file, b"x", 0).is_err());
     }
+}
+
+fn inode(descriptor: &impl std::os::fd::AsFd) -> u64 {
+    rustix::fs::fstat(descriptor).expect("fstat fixture").st_ino as u64
+}
+
+#[tokio::test]
+async fn five_assets_and_both_stream_ends_share_one_frame_and_split_apart() {
+    let (writer, reader) = UnixStream::pair().expect("socket pair");
+    let mut writer = DescriptorStream::new(writer);
+    let mut reader = DescriptorStream::new(reader);
+    let assets = files(MAX_ASSET_DESCRIPTORS);
+    let (stdin, _stdin_peer) = std::os::unix::net::UnixStream::pair().expect("stdin pair");
+    let (stdout, _stdout_peer) = std::os::unix::net::UnixStream::pair().expect("stdout pair");
+    let streams = StreamDescriptors { stdin: true };
+    let descriptors: Vec<_> = assets
+        .iter()
+        .map(|file| file.as_fd())
+        .chain([stdin.as_fd(), stdout.as_fd()])
+        .collect();
+    assert_eq!(descriptors.len(), MAX_ASSET_DESCRIPTORS + streams.count());
+    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 0, Some(streams));
+    writer
+        .write_frame(&request, &descriptors, FrameLimits::default())
+        .await
+        .expect("write frame");
+    let (actual, mut received): (RequestEnvelope, Vec<OwnedFd>) = reader
+        .read_frame(FrameLimits::default())
+        .await
+        .expect("read frame");
+    assert_eq!(actual, request);
+    let BrokerRequest::Invoke {
+        streams: Some(shape),
+        ..
+    } = actual.request
+    else {
+        panic!("the stream shape travels with the invoke");
+    };
+    let split = Streams::split_from(&mut received, shape).expect("stream ends split off");
+    assert_eq!(received.len(), MAX_ASSET_DESCRIPTORS);
+    assert_eq!(inode(&split.stdin.expect("stdin end")), inode(&stdin));
+    assert_eq!(inode(&split.stdout), inode(&stdout));
+    assert_eq!(inode(&received[0]), inode(&assets[0]));
+}
+
+#[test]
+fn stream_split_refuses_a_sixth_asset_and_a_missing_end() {
+    let owned = |count| -> Vec<OwnedFd> { files(count).into_iter().map(OwnedFd::from).collect() };
+    let mut six = owned(MAX_ASSET_DESCRIPTORS + 1 + 2);
+    assert!(matches!(
+        Streams::split_from(&mut six, StreamDescriptors { stdin: true }),
+        Err(ProtocolError::TooManyDescriptors)
+    ));
+    let mut one = owned(1);
+    assert!(matches!(
+        Streams::split_from(&mut one, StreamDescriptors { stdin: true }),
+        Err(ProtocolError::MissingStreamDescriptors)
+    ));
+    let mut none = owned(0);
+    assert!(matches!(
+        Streams::split_from(&mut none, StreamDescriptors { stdin: false }),
+        Err(ProtocolError::MissingStreamDescriptors)
+    ));
 }
 
 #[test]
@@ -166,7 +229,7 @@ async fn too_many_outgoing_descriptors_are_refused_before_writing() {
 async fn descriptor_cap_applies_across_all_reads_of_one_frame() {
     let (writer, reader) = UnixStream::pair().expect("socket pair");
     let mut reader = DescriptorStream::new(reader);
-    let files = files(3);
+    let files = files(MAX_DESCRIPTORS_PER_FRAME / 2 + 1);
     raw_frame(&writer, &[0, 0, 0, 2], &files).await;
     raw_frame(&writer, b"{}", &files).await;
     assert!(matches!(
@@ -179,7 +242,7 @@ async fn descriptor_cap_applies_across_all_reads_of_one_frame() {
 
 #[test]
 fn asset_metadata_is_strict_and_sends_remaining_is_camel_case() {
-    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4);
+    let request = RequestEnvelope::invoke(None, super::invocation(), vec![], 4, None);
     let value = serde_json::to_value(request).expect("request JSON");
     assert_eq!(value["request"]["sendsRemaining"], 4);
     let mut row = serde_json::json!({
@@ -230,10 +293,16 @@ fn typed_rows_and_response_indexes_are_exact() {
         super::invocation(),
         vec![row.clone(); MAX_ASSET_ROWS],
         4,
+        None,
     );
     request.request.validate().expect("row cap inclusive");
-    let request =
-        RequestEnvelope::invoke(None, super::invocation(), vec![row; MAX_ASSET_ROWS + 1], 4);
+    let request = RequestEnvelope::invoke(
+        None,
+        super::invocation(),
+        vec![row; MAX_ASSET_ROWS + 1],
+        4,
+        None,
+    );
     assert!(matches!(
         request.request.validate(),
         Err(ProtocolError::TooManyAssetRows)

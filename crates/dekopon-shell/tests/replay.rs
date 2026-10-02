@@ -25,9 +25,9 @@ impl CapabilityInvoker for Replay {
         matches!(word, "gh" | "python" | "ssh" | "turso" | "date")
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.calls.lock().push(json!({
-            "word": word, "argv": argv, "stdin": stdin,
+            "word": word, "argv": argv, "stdin": stdin_piped.then_some(""),
         }));
         let output = match (word, argv.first().map(String::as_str)) {
             ("gh", Some("pr")) => json!({"headSha": "0123456789012345678901234567890123456789"}),
@@ -46,8 +46,23 @@ impl CapabilityInvoker for Replay {
         })
     }
 
-    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult {
-        CapabilityCallResult::Succeeded(proposal.input["result"].clone())
+    fn invoke(
+        &self,
+        proposal: CommandProposal,
+        mut streams: dekopon_shell::Streams,
+    ) -> CapabilityCallResult {
+        if let Some(stdin) = streams.stdin.take() {
+            let mut text = String::new();
+            std::io::Read::read_to_string(
+                &mut std::os::unix::net::UnixStream::from(stdin),
+                &mut text,
+            )
+            .expect("piped stdin");
+            if let Some(call) = self.calls.lock().last_mut() {
+                call["stdin"] = json!(text);
+            }
+        }
+        streams.reply(&proposal.input["result"].clone())
     }
 }
 

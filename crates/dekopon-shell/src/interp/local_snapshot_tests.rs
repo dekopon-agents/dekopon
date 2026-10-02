@@ -20,7 +20,7 @@ impl CapabilityInvoker for NoCalls {
         Vec::new()
     }
 
-    fn invoke(&self, _proposal: CommandProposal) -> CapabilityCallResult {
+    fn invoke(&self, _proposal: CommandProposal, _streams: crate::Streams) -> CapabilityCallResult {
         crate::secret_use_unsupported()
     }
 }

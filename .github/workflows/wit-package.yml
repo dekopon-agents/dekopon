@@ -3,6 +3,7 @@ name: WIT package
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
@@ -42,7 +43,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
+  PROVIDER_WIT_PACKAGE: dekopon:provider@0.4.0
+  STDIO_WIT_PACKAGE: dekopon:stdio@0.1.0
   HTTP_WIT_PACKAGE: dekopon:http@1.1.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
@@ -109,6 +111,16 @@ jobs:
             cp "$artifact" "$RUNNER_TEMP/checked-components/$provider.wasm"
             "examples/providers/$provider/build.sh"
             cmp "$RUNNER_TEMP/checked-components/$provider.wasm" "$artifact"
+            wasm-tools validate "$artifact"
+            wasm-tools component wit --json "$artifact" > "target/wit-package/provider-inspection/$provider.json"
+            jq --exit-status '
+              ([.packages[].name] | index("dekopon:stdio@0.1.0") != null) and
+              ([.interfaces[].name] | index("streams") != null) and
+              (.worlds | length == 1) and
+              ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+              (.worlds[0].exports."run-command".function.params[1] == {"name":"stdin-piped","type":"bool"}) and
+              (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
+            ' "target/wit-package/provider-inspection/$provider.json"
 
             manifest="examples/providers/$provider/Cargo.toml"
             cargo tree --locked --manifest-path "$manifest" \
@@ -133,22 +145,25 @@ jobs:
             wasm-tools print "$core" | grep '(import ' \
               > "target/wit-package/provider-inspection/$provider.core-imports.txt" || true
 
-            expected=''
+            expected='dekopon:stdio/streams@0.1.0'
             case "$provider" in
-              clock-probe|clock-raw-probe) expected='dekopon:clock/wall@1.0.0' ;;
-              http-probe|http-raw-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
-              storage-probe) expected='dekopon:storage/durable-files@0.1.1' ;;
+              clock-probe|clock-raw-probe) expected+=$'\ndekopon:clock/wall@1.0.0' ;;
+              http-probe|http-raw-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.1.0' ;;
+              storage-probe) expected+=$'\ndekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
-            if [ -z "$expected" ]; then
-              test ! -s "$imports"
-            else
-              test -s "$imports"
-              if grep -Fv "$expected" "$imports"; then
-                echo "unexpected core import in $provider" >&2
+            test -s "$imports"
+            while IFS= read -r line; do
+              name=${line#*\"}
+              name=${name%%\"*}
+              if ! grep -Fxq "$name" <<< "$expected"; then
+                echo "unexpected core import in $provider: $name" >&2
                 exit 1
               fi
-            fi
+            done < "$imports"
+            while IFS= read -r name; do
+              grep -Fq "\"$name\"" "$imports"
+            done <<< "$expected"
           done
 
       - name: Fetch exact attested standalone provider fixtures
@@ -166,7 +181,9 @@ jobs:
             crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/cli-probe/wit/deps/provider.wit \
             examples/providers/clock-probe/wit/deps/provider.wit \
+            examples/providers/clock-raw-probe/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
+            examples/providers/http-raw-probe/wit/deps/provider.wit \
             examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
           do
@@ -176,19 +193,22 @@ jobs:
             wit/http/deps/asset.wit \
             crates/dekopon-provider-sdk/wit/deps/asset.wit \
             crates/dekopon-broker-host/wit/deps/asset.wit \
-            examples/providers/http-probe/wit/deps/asset.wit
+            examples/providers/http-probe/wit/deps/asset.wit \
+            examples/providers/http-raw-probe/wit/deps/asset.wit
           do
             cmp wit/asset/asset.wit "$mirror"
           done
           for mirror in \
             crates/dekopon-broker-host/wit/deps/http.wit \
-            examples/providers/http-probe/wit/deps/http.wit
+            examples/providers/http-probe/wit/deps/http.wit \
+            examples/providers/http-raw-probe/wit/deps/http.wit
           do
             cmp wit/http/http.wit "$mirror"
           done
           for mirror in \
             crates/dekopon-broker-host/wit/deps/clock.wit \
-            examples/providers/clock-probe/wit/deps/clock.wit
+            examples/providers/clock-probe/wit/deps/clock.wit \
+            examples/providers/clock-raw-probe/wit/deps/clock.wit
           do
             cmp wit/clock/clock.wit "$mirror"
           done
@@ -198,7 +218,20 @@ jobs:
           do
             cmp wit/storage/storage.wit "$mirror"
           done
-          # The SDK-local asset-client world is not part of immutable provider@0.3.0.
+          for mirror in \
+            crates/dekopon-provider-sdk/wit/deps/stdio.wit \
+            crates/dekopon-broker-host/wit/deps/stdio.wit \
+            examples/providers/cli-probe/wit/deps/stdio.wit \
+            examples/providers/clock-probe/wit/deps/stdio.wit \
+            examples/providers/clock-raw-probe/wit/deps/stdio.wit \
+            examples/providers/http-probe/wit/deps/stdio.wit \
+            examples/providers/http-raw-probe/wit/deps/stdio.wit \
+            examples/providers/memory-reservation-probe/wit/deps/stdio.wit \
+            examples/providers/storage-probe/wit/deps/stdio.wit
+          do
+            cmp wit/stdio/stdio.wit "$mirror"
+          done
+          # The SDK-local client worlds are not part of provider@0.4.0; wkg.toml resolves stdio locally.
           mkdir -p "$RUNNER_TEMP/provider-publication"
           cp crates/dekopon-provider-sdk/wit/provider.wit "$RUNNER_TEMP/provider-publication/provider.wit"
           wkg build \
@@ -232,47 +265,44 @@ jobs:
           )
           git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock
 
-      - name: Verify provider exports and import-free boundary
+      - name: Verify provider exports and the stdio import
         shell: bash
         run: |
           set -euo pipefail
           package=target/wit-package/dekopon-provider.wasm
           wasm-tools validate "$package"
           wasm-tools component wit --json "$package" > target/wit-package/dekopon-provider.json
-          jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" '
-            (.packages | length == 1) and
-            (.packages[0].name == $package) and
-            (.packages[0].worlds == {"provider": 0, "provider-commands": 1, "provider-cli": 2}) and
-            (.worlds | length == 3) and
-            (.worlds[0].name == "provider") and
-            ((.worlds[0].imports | keys) == []) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
-            (.worlds[0].exports.describe.function.params == []) and
-            (.worlds[0].exports.describe.function.result == "string") and
-            (.worlds[0].exports.invoke.function.params == [
+          jq --exit-status --arg package "$PROVIDER_WIT_PACKAGE" --arg stdio "$STDIO_WIT_PACKAGE" '
+          . as $doc |
+          def kind($t): if ($t | type) == "number" then $doc.types[$t].kind else $t end;
+          (.packages == [
+            {"name": $stdio, "interfaces": {"streams": 0}, "worlds": {}},
+            {"name": $package, "interfaces": {}, "worlds": {"provider": 0, "provider-cli": 1}}
+          ]) and
+          (.interfaces | length == 1) and
+          (.interfaces[0].name == "streams") and
+          ((.interfaces[0].functions | keys) == [
+            "[method]reader.read", "[method]writer.write", "stdin", "stdout", "write-stderr"
+          ]) and
+          (.worlds | length == 2) and
+          all(.worlds[];
+            (.imports == {"interface-0": {"interface": {"id": 0}}}) and
+            (.exports.describe.function.params == []) and
+            (.exports.describe.function.result == "string") and
+            (.exports.invoke.function.params == [
               {"name": "capability", "type": "string"},
               {"name": "input-json", "type": "string"}
             ]) and
-            (.worlds[0].exports.invoke.function.result == "string") and
-            (.worlds[1].name == "provider-commands") and
-            ((.worlds[1].imports | keys) == []) and
-            ((.worlds[1].exports | keys) == ["describe", "invoke", "resolve-command"]) and
-            (.worlds[1].exports."resolve-command".function.params == [
-              {"name": "argv", "type": 0}
-            ]) and
-            (.types[0].kind == {"list": "string"}) and
-            (.worlds[1].exports."resolve-command".function.result == "string") and
-            (.worlds[2].name == "provider-cli") and
-            ((.worlds[2].imports | keys) == []) and
-            ((.worlds[2].exports | keys) == ["describe", "invoke", "run-command"]) and
-            (.worlds[2].exports."run-command".function.params == [
-              {"name": "argv", "type": 1},
-              {"name": "stdin", "type": 2}
-            ]) and
-            (.types[1].kind == {"list": "string"}) and
-            (.types[2].kind == {"option": "string"}) and
-            (.types | length == 3) and
-            (.worlds[2].exports."run-command".function.result == "string")
+            (kind(.exports.invoke.function.result) == {"result": {"ok": null, "err": "u8"}})) and
+          (.worlds[0].name == "provider") and
+          ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
+          (.worlds[1].name == "provider-cli") and
+          ((.worlds[1].exports | keys) == ["describe", "invoke", "run-command"]) and
+          (.worlds[1].exports."run-command".function.params | length == 2) and
+          (.worlds[1].exports."run-command".function.params[0].name == "argv") and
+          (kind(.worlds[1].exports."run-command".function.params[0].type) == {"list": "string"}) and
+          (.worlds[1].exports."run-command".function.params[1] == {"name": "stdin-piped", "type": "bool"}) and
+          (.worlds[1].exports."run-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
       - name: Verify buffered and streamed HTTP interfaces
@@ -437,40 +467,46 @@ jobs:
             })
           ' target/wit-package/dekopon-clock.json
 
-      - name: Verify the command-line provider fixture is import-free
+      - name: Verify the command-line provider fixture imports only stdio
         shell: bash
         run: |
           set -euo pipefail
           component=examples/providers/cli-probe-provider.wasm
           description=target/wit-package/cli-probe.json
-          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+          grep -Fq 'include dekopon:provider/provider-cli@0.4.0;' \
             examples/providers/cli-probe/wit/provider.wit
           wasm-tools validate "$component"
           wasm-tools component wit --json "$component" > "$description"
           jq --exit-status '
-            (.packages | map(.name) == ["root:component"]) and
             (.worlds | length == 1) and
-            (.worlds[0].imports == {}) and
+            (.packages | map(.name) == ["dekopon:stdio@0.1.0", "root:component"]) and
+            (.worlds[0].imports == {"interface-0":{"interface":{"id":0}}}) and
+            ([.interfaces[].name] == ["streams"]) and
             ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
-            (.worlds[0].exports."run-command".function.params | map(.name) == ["argv", "stdin"]) and
-            (.worlds[0].exports."run-command".function.result == "string")
+            (.worlds[0].exports."run-command".function.params | map(.name) == ["argv", "stdin-piped"]) and
+            (.worlds[0].exports."run-command".function.params[1].type == "bool") and
+            (.worlds[0].exports."run-command".function.result == "string") and
+            (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
           ' "$description"
 
-      - name: Verify the malicious memory reservation fixture is import-free
+      - name: Verify the malicious memory reservation fixture imports only stdio
         shell: bash
         run: |
           set -euo pipefail
           component=examples/providers/memory-reservation-probe-provider.wasm
           description=target/wit-package/memory-reservation-probe.json
-          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+          grep -Fq 'include dekopon:provider/provider-cli@0.4.0;' \
             examples/providers/memory-reservation-probe/wit/provider.wit
           wasm-tools validate "$component"
           wasm-tools component wit --json "$component" > "$description"
           jq --exit-status '
-            (.packages | map(.name) == ["root:component"]) and
+            (.packages | map(.name) == ["dekopon:stdio@0.1.0", "root:component"]) and
             (.worlds | length == 1) and
-            (.worlds[0].imports == {}) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"])
+            (.worlds[0].imports == {"interface-0":{"interface":{"id":0}}}) and
+            ([.interfaces[].name] == ["streams"]) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+            (.worlds[0].exports."run-command".function.params[1].type == "bool") and
+            (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
           ' "$description"
 
       - name: Verify storage-importing provider fixtures
@@ -487,16 +523,27 @@ jobs:
             if [ "$name" = storage-probe ]; then
               expected=durable-files
               package="$STORAGE_WIT_PACKAGE"
+              jq --exit-status --arg interface "$expected" --arg package "$package" '
+                (.packages | map(.name) == ["dekopon:stdio@0.1.0", $package, "root:component"]) and
+                (.worlds | length == 1) and
+                (.worlds[0].name == "root") and
+                (.worlds[0].imports == {"interface-0":{"interface":{"id":0}}, "interface-1":{"interface":{"id":1}}}) and
+                ([.interfaces[].name] == ["streams", $interface]) and
+                ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+                (.worlds[0].exports."run-command".function.params[1].type == "bool") and
+                (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
+              ' "$description"
+            else
+              jq --exit-status --arg interface "$expected" --arg package "$package" '
+                (.packages | map(.name) == [$package, "root:component"]) and
+                (.worlds | length == 1) and
+                (.worlds[0].name == "root") and
+                (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
+                ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+                (.interfaces | length == 1) and
+                (.interfaces[0].name == $interface)
+              ' "$description"
             fi
-            jq --exit-status --arg interface "$expected" --arg package "$package" '
-              (.packages | map(.name) == [$package, "root:component"]) and
-              (.worlds | length == 1) and
-              (.worlds[0].name == "root") and
-              (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
-              ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
-              (.interfaces | length == 1) and
-              (.interfaces[0].name == $interface)
-            ' "$description"
             if grep -Eqi 'wasi:|wasm-bindgen|js-sys' "$description"; then
               echo "forbidden ambient import in $component" >&2
               exit 1
@@ -517,24 +564,26 @@ jobs:
             if [ "$name" = http-probe ]; then
               jq --exit-status --argjson exports "$exports" '
                 (.packages == [
-                  {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 0}, "worlds": {}},
-                  {"name": "dekopon:http@1.1.0", "interfaces": {"client": 1}, "worlds": {}},
+                  {"name": "dekopon:stdio@0.1.0", "interfaces": {"streams": 0}, "worlds": {}},
+                  {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 1}, "worlds": {}},
+                  {"name": "dekopon:http@1.1.0", "interfaces": {"client": 2}, "worlds": {}},
                   {"name": "root:component", "interfaces": {}, "worlds": {"root": 0}}
                 ]) and
                 (.worlds | length == 1) and
                 (.worlds[0].name == "root") and
                 (.worlds[0].imports == {
                   "interface-0": {"interface": {"id": 0}},
-                  "interface-1": {"interface": {"id": 1}}
+                  "interface-1": {"interface": {"id": 1}},
+                  "interface-2": {"interface": {"id": 2}}
                 }) and
                 ((.worlds[0].exports | keys) == $exports) and
-                (.interfaces | length == 2) and
-                (.interfaces[0].name == "asset") and
-                ((.interfaces[0].functions | keys) == [
+                ([.interfaces[].name] == ["streams", "asset", "client"]) and
+                ((.interfaces[1].functions | keys) == [
                   "[method]handle.read", "[method]writer.write", "allocate", "attach", "open", "send"
                 ]) and
-                (.interfaces[1].name == "client") and
-                ((.interfaces[1].functions | keys) == ["send", "stream"])
+                ((.interfaces[2].functions | keys) == ["send", "stream"]) and
+                (.worlds[0].exports."run-command".function.params[1].type == "bool") and
+                (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
               ' "$description"
             else
               # The unchanged standalone JSONPlaceholder release remains HTTP@1.0.0 coverage.
@@ -557,19 +606,20 @@ jobs:
           set -euo pipefail
           component=examples/providers/clock-probe-provider.wasm
           description=target/wit-package/clock-probe.json
-          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+          grep -Fq 'include dekopon:provider/provider-cli@0.4.0;' \
             examples/providers/clock-probe/wit/provider.wit
           wasm-tools validate "$component"
           wasm-tools component wit --json "$component" > "$description"
           jq --exit-status '
-            (.packages | map(.name) == ["dekopon:clock@1.0.0", "root:component"]) and
+            (.packages | map(.name) == ["dekopon:stdio@0.1.0", "dekopon:clock@1.0.0", "root:component"]) and
             (.worlds | length == 1) and
             (.worlds[0].name == "root") and
-            (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
+            (.worlds[0].imports == {"interface-0":{"interface":{"id":0}},"interface-1":{"interface":{"id":1}}}) and
             ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
-            (.interfaces | length == 1) and
-            (.interfaces[0].name == "wall") and
-            ((.interfaces[0].functions | keys) == ["now-unix-millis"])
+            ([.interfaces[].name] == ["streams", "wall"]) and
+            ((.interfaces[1].functions | keys) == ["now-unix-millis"]) and
+            (.worlds[0].exports."run-command".function.params[1].type == "bool") and
+            (.types[.worlds[0].exports.invoke.function.result].kind.result == {"ok":null,"err":"u8"})
           ' "$description"
           if grep -Eqi 'wasi:|wasm-bindgen|js-sys' "$description"; then
             echo "forbidden ambient import in $component" >&2
@@ -621,7 +671,7 @@ jobs:
           cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
 
       - name: Upload the verified packages
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dekopon-wit-packages
@@ -635,7 +685,7 @@ jobs:
 
   publish:
     name: publish to GHCR
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: validate
     runs-on: ubuntu-24.04
     permissions:

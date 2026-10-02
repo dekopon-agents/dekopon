@@ -58,7 +58,7 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-use std::fmt;
+use std::{fmt, num::NonZeroU8};
 
 use dekopon_core::{
     Actor, CapabilityId, InvocationId, PrincipalId, ProviderFailureDetail, ProviderId, SecretDrn,
@@ -547,7 +547,6 @@ pub struct AssetConstraints {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
     pub timeout_ms: u64,
-    pub max_output_bytes: u64,
     /// Its absence means no HTTP host calls are permitted at all, not unrestricted access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpConstraints>,
@@ -564,7 +563,6 @@ impl Default for ExecutionConstraints {
     fn default() -> Self {
         Self {
             timeout_ms: 30_000,
-            max_output_bytes: 1_048_576,
             http: None,
             storage: None,
             asset: None,
@@ -665,7 +663,7 @@ pub struct InvocationResult {
     pub decision: DecisionReference,
     pub outcome: InvocationOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<Value>,
+    pub exit_status: Option<NonZeroU8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,8 +680,6 @@ pub enum AuthorizationError {
     EmptyPolicyRevision,
     #[error("authorization timeout must be greater than zero")]
     ZeroTimeout,
-    #[error("authorization output limit must be greater than zero")]
-    ZeroOutputLimit,
     #[error(transparent)]
     InvalidHttp(#[from] HttpConstraintsError),
     #[error("HTTP and storage authority cannot coexist in one capability")]
@@ -740,9 +736,6 @@ pub mod broker {
             }
             if constraints.timeout_ms == 0 {
                 return Err(AuthorizationError::ZeroTimeout);
-            }
-            if constraints.max_output_bytes == 0 {
-                return Err(AuthorizationError::ZeroOutputLimit);
             }
             if constraints.http.is_some() && constraints.storage.is_some() {
                 return Err(AuthorizationError::MixedHttpAndStorage);
@@ -1033,7 +1026,6 @@ mod tests {
                 },
                 "constraints": {
                     "timeoutMs": 30_000,
-                    "maxOutputBytes": 1_048_576,
                     "http": {
                         "allowedHosts": ["api.github.com"],
                         "allowedMethods": ["POST"],

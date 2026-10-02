@@ -80,7 +80,11 @@ mod tests {
             word == "probe"
         }
 
-        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: crate::CommandProposal,
+            streams: crate::Streams,
+        ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
             let secret_use = proposal.secret_use;
@@ -88,7 +92,7 @@ mod tests {
                 return crate::secret_use_unsupported();
             }
             self.invoked.lock().push(capability);
-            CapabilityCallResult::Succeeded(input)
+            streams.reply(&input)
         }
     }
 
@@ -103,7 +107,11 @@ mod tests {
             self.0.iter().map(|word| (*word).to_owned()).collect()
         }
 
-        fn invoke(&self, proposal: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            proposal: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
