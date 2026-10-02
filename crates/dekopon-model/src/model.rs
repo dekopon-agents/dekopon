@@ -5,6 +5,8 @@ use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
+use dekopon_model_token_governor::ModelUsage;
+
 use crate::{error::InferenceError, stream::TurnEvent};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -298,18 +300,6 @@ pub struct ModelToolCall {
 pub struct ModelFunctionCall {
     pub name: String,
     pub arguments: String,
-}
-
-/// Every field is None when the provider reported nothing rather than zero, since defaulting to
-/// zero would misreport an unknown cost as a free one.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ModelUsage {
-    pub input_tokens: Option<u64>,
-    pub cached_input_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub reasoning_output_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Serialize)]

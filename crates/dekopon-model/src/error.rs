@@ -37,6 +37,8 @@ pub enum InferenceError {
     DeadlineExceeded,
     #[error("model turn interrupted by its caller")]
     Cancelled,
+    #[error("{0}")]
+    OverBudget(dekopon_model_token_governor::Refusal),
 }
 
 #[derive(Debug, Error)]

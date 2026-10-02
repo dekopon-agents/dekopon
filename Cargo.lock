@@ -867,6 +867,7 @@ dependencies = [
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
+ "dekopon-model-token-governor",
  "dekopon-process",
  "dekopon-shell",
  "dekopon-telemetry",
@@ -1062,6 +1063,7 @@ version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
+ "dekopon-model-token-governor",
  "futures-util",
  "http",
  "parking_lot",

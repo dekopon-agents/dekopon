@@ -9,10 +9,11 @@ use std::{
 use dekopon_config::Skill;
 use dekopon_model::error::InferenceError;
 use dekopon_model::model::{
-    ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+    ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall,
     assistant_message,
 };
 use dekopon_model::{ModelText, TurnEvent};
+use dekopon_model_token_governor::ModelUsage;
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -1642,8 +1643,9 @@ mod tests {
     use dekopon_model::error::InferenceError;
     use dekopon_model::model::{
         AssistantTurn, ChatModel, CompletionOptions, ModelFunctionCall, ModelMessage, ModelTool,
-        ModelToolCall, ModelUsage,
+        ModelToolCall,
     };
+    use dekopon_model_token_governor::ModelUsage;
     use dekopon_shell::{
         CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
     };

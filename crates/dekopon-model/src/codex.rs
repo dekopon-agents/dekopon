@@ -10,12 +10,13 @@ use crate::{
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ClientIdentity, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
-        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage, compact_json_body,
+        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
         sanitize_diagnostic,
     },
     sse::{SseEvent, decode_transcript},
     stream::{ModelText, TurnEvent},
 };
+use dekopon_model_token_governor::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -361,7 +362,7 @@ struct WireEvent {
 struct WireResponse {
     status: Option<ResponseStatus>,
     model: Option<String>,
-    usage: Option<WireResponsesUsage>,
+    usage: Option<crate::wire::ResponsesUsage>,
     error: Option<WireFailure>,
     #[serde(default)]
     output: Vec<Value>,
@@ -985,49 +986,6 @@ async fn build_request_body<'a>(
         text: ResponsesText { verbosity: "low" },
         prompt_cache_key: options.prompt_cache_key(),
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct WireResponsesUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    input_tokens_details: Option<WireInputTokensDetails>,
-    #[serde(default)]
-    output_tokens_details: Option<WireOutputTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireInputTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireOutputTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-}
-
-impl From<WireResponsesUsage> for ModelUsage {
-    fn from(usage: WireResponsesUsage) -> Self {
-        Self {
-            input_tokens: usage.input_tokens,
-            cache_write_tokens: None,
-            cached_input_tokens: usage
-                .input_tokens_details
-                .and_then(|details| details.cached_tokens),
-            output_tokens: usage.output_tokens,
-            reasoning_output_tokens: usage
-                .output_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            total_tokens: usage.total_tokens,
-        }
-    }
 }
 
 #[cfg(test)]

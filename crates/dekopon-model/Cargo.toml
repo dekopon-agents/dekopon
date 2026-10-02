@@ -17,6 +17,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 parking_lot.workspace = true
 base64.workspace = true
 dekopon-core.workspace = true
+dekopon-model-token-governor.workspace = true
 futures-util.workspace = true
 http.workspace = true
 reqwest.workspace = true

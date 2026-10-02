@@ -6,12 +6,13 @@ use crate::{
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ContentPart, DataUrl, JSON_CONTENT_TYPE, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, ModelUsage, compact_json_body,
+        ModelTool, ModelToolCall, compact_json_body,
     },
     sse::{SseEvent, decode_transcript},
     stream::{ModelText, TurnEvent},
 };
 use dekopon_core::Redacted;
+use dekopon_model_token_governor::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, ops::ControlFlow, time::Duration};
@@ -479,63 +480,7 @@ struct ChatResponse {
     #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
-    usage: Option<WireChatUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WireChatUsage<CacheWrite = serde::de::IgnoredAny> {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    prompt_tokens_details: Option<WirePromptTokensDetails<CacheWrite>>,
-    #[serde(default)]
-    completion_tokens_details: Option<WireCompletionTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WirePromptTokensDetails<CacheWrite> {
-    cached_tokens: Option<u64>,
-    cache_write_tokens: Option<CacheWrite>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireCompletionTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-}
-
-impl<CacheWrite> From<WireChatUsage<CacheWrite>> for ModelUsage {
-    fn from(usage: WireChatUsage<CacheWrite>) -> Self {
-        Self {
-            input_tokens: usage.prompt_tokens,
-            cache_write_tokens: None,
-            cached_input_tokens: usage
-                .prompt_tokens_details
-                .and_then(|details| details.cached_tokens),
-            output_tokens: usage.completion_tokens,
-            reasoning_output_tokens: usage
-                .completion_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            total_tokens: usage.total_tokens,
-        }
-    }
-}
-
-impl WireChatUsage<u64> {
-    pub(crate) fn into_openrouter(self) -> ModelUsage {
-        let cache_write_tokens = self
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| details.cache_write_tokens);
-        ModelUsage {
-            cache_write_tokens,
-            ..self.into()
-        }
-    }
+    usage: Option<crate::wire::ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,7 +605,7 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     #[serde(default)]
-    usage: Option<WireChatUsage>,
+    usage: Option<crate::wire::ChatUsage>,
     #[serde(default)]
     error: Option<ChunkError>,
 }
@@ -1694,54 +1639,6 @@ mod tests {
                 Duration::from_secs(1),
             )
             .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn normalizes_chat_completion_usage() {
-        let response: ChatResponse = serde_json::from_value(json!({
-            "choices": [{"message": {"content": "hi"}}],
-            "usage": {
-                "prompt_tokens": 120,
-                "completion_tokens": 30,
-                "total_tokens": 150,
-                "prompt_tokens_details": {"cached_tokens": 100, "audio_tokens": 0},
-                "completion_tokens_details": {"reasoning_tokens": 7}
-            }
-        }))
-        .expect("usage-bearing response deserializes");
-
-        assert_eq!(
-            ModelUsage::from(response.usage.expect("usage present")),
-            ModelUsage {
-                input_tokens: Some(120),
-                cache_write_tokens: None,
-                cached_input_tokens: Some(100),
-                output_tokens: Some(30),
-                reasoning_output_tokens: Some(7),
-                total_tokens: Some(150),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn keeps_bare_usage_counts_from_minimal_endpoints() {
-        let response: ChatResponse = serde_json::from_value(json!({
-            "choices": [{"message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
-        }))
-        .expect("bare usage deserializes");
-
-        assert_eq!(
-            ModelUsage::from(response.usage.expect("usage present")),
-            ModelUsage {
-                input_tokens: Some(8),
-                cache_write_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: Some(2),
-                reasoning_output_tokens: None,
-                total_tokens: Some(10),
-            }
         );
     }
 
