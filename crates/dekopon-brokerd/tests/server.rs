@@ -38,6 +38,9 @@ use tokio::{
     sync::oneshot,
 };
 
+#[path = "fixture/parked_component.rs"]
+mod parked_component;
+
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 fn context(principal: &str) -> AuthenticatedContext {
@@ -82,7 +85,7 @@ fn probe_constraint_set() -> ConstraintSet {
 fn probe_capabilities() -> serde_json::Value {
     json!({
         "cli-probe": {
-            "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576},
+            "constraints": {"timeoutMs": 30_000},
             "capabilities": {"cli-probe.upper": {}}
         }
     })
@@ -115,6 +118,36 @@ fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str
     )
     .expect("distinct fixtures build a world");
     PolicyEngine::new(policies, &world).expect("fixture policy validates")
+}
+
+fn stdio(
+    stdin: Option<&[u8]>,
+) -> (
+    dekopon_broker_protocol::InvokeAssets,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    use std::io::Write;
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
+    let stdin = stdin.map(|bytes| {
+        let (host, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+        feeder.write_all(bytes).unwrap();
+        host.into()
+    });
+    (
+        dekopon_broker_protocol::InvokeAssets {
+            streams: Some(dekopon_broker_protocol::Streams {
+                stdin,
+                stdout: host.into(),
+            }),
+            ..Default::default()
+        },
+        reader,
+    )
 }
 
 fn request(id: &str) -> InvocationRequest {
@@ -262,7 +295,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
             Some(session()),
             "probe".to_owned(),
             vec!["--help".to_owned()],
-            None,
+            false,
             TRACE_PARENT.parse().expect("valid traceparent fixture"),
         )
         .await
@@ -286,7 +319,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
             Some(session()),
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
-            Some("hello".to_owned()),
+            true,
             TRACE_PARENT.parse().expect("valid traceparent fixture"),
         )
         .await
@@ -300,8 +333,9 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         other => panic!("expected a proposal, got {other:?}"),
     };
     assert_eq!(capability.as_str(), "cli-probe.upper");
-    assert_eq!(input, json!({"text": "hello"}));
+    assert_eq!(input, json!({"text": "", "piped": true}));
 
+    let (streams, stdout) = stdio(Some(b"hello"));
     let result = client
         .invoke(
             Some(session()),
@@ -314,12 +348,12 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
                 secret_use: None,
                 input,
             },
-            Default::default(),
+            streams,
         )
         .await
         .expect("invoke the proposal");
+    assert_eq!(stdout.join().unwrap(), b"{\"text\":\"HELLO\"}\n");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(result.result.output, Some(json!({"text": "HELLO"})));
     assert_eq!(
         audit.records().len(),
         2,
@@ -420,6 +454,10 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one private credential resolution and authorization scenario"
+)]
 async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
     let uid = current_uid();
     let directory = private_directory();
@@ -504,7 +542,6 @@ when { context.capability == "http-probe.fetch"
             "http-probe": {
                 "constraints": {
                     "timeoutMs": 5_000,
-                    "maxOutputBytes": 64 * 1024,
                     "http": {
                         "allowedHosts": [&authority],
                         "allowedMethods": ["GET"],
@@ -549,10 +586,15 @@ when { context.capability == "http-probe.fetch"
             "method": "GET"
         }),
     };
+    let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(Some(session()), invocation.clone(), Default::default())
+        .invoke(Some(session()), invocation.clone(), streams)
         .await
         .expect("secret invocation succeeds");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stdout.join().unwrap()).unwrap()["status"],
+        200
+    );
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     let wire = String::from_utf8(wire_receive.await.expect("HTTP wire")).expect("wire text");
     assert!(
@@ -693,19 +735,16 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(
-            Some(session()),
-            request("invoke-attested-socket"),
-            Default::default(),
-        )
+        .invoke(Some(session()), request("invoke-attested-socket"), streams)
         .await
         .expect("attested invocation completes");
-    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     assert_eq!(
-        result.result.output,
-        Some(json!({"text": "HELLO THROUGH BROKER"}))
+        stdout.join().unwrap(),
+        b"{\"text\":\"HELLO THROUGH BROKER\"}\n"
     );
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let records = audit.records();
     assert_eq!(records.len(), 2);
@@ -718,6 +757,102 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     task.await
         .expect("server task exits")
         .expect("server shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
+    let component = parked_component::component();
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .expect("typed parked provider loads");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit bound"));
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test".parse().unwrap(),
+            "policy-test".to_owned(),
+            probe_engine(POLICY, ["caller", "cpetersen"]),
+            probe_catalog(),
+            CredentialStore::empty(),
+            identities(),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .expect("broker starts"),
+    );
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let identities = BTreeMap::from([(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    )]);
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server starts");
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.serve(listener, shutdown_on(stop)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    let (stdin, _feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (stdout, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pending = tokio::spawn(async move {
+        client
+            .invoke(
+                Some(session()),
+                request("invoke-parked-peer-hangup"),
+                dekopon_broker_protocol::InvokeAssets {
+                    streams: Some(dekopon_broker_protocol::Streams {
+                        stdin: Some(stdin.into()),
+                        stdout: stdout.into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while audit.records().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("decision audited before hangup");
+    pending.abort();
+    assert!(
+        pending
+            .await
+            .expect_err("client was aborted")
+            .is_cancelled()
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while audit.records().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal execution audit survives peer hangup");
+    let encoded = serde_json::to_value(audit.records()).unwrap();
+    assert_eq!(encoded[1]["error"], "peer-disconnected");
+    let read = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut byte = [0_u8; 1];
+        reader.read(&mut byte)
+    })
+    .await
+    .unwrap()
+    .expect("stdout closes after cleanup");
+    assert_eq!(read, 0, "host must release stdout on peer hangup");
+    shutdown.send(()).expect("stop broker");
+    server_task
+        .await
+        .expect("server task")
+        .expect("clean shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -804,6 +939,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
         request("invoke-bound-identifier"),
         vec![],
         0,
+        None,
     );
     write_frame(&mut stream, &envelope, limits.frame)
         .await
@@ -1163,11 +1299,13 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let mut invocation = request("attach-asset");
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "attach"});
+    let (streams, attached_stdout) = stdio(None);
     let attached = client
-        .invoke(Some(session()), invocation, InvokeAssets::default())
+        .invoke(Some(session()), invocation, streams)
         .await
         .unwrap();
     assert_eq!(attached.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(attached_stdout.join().unwrap(), b"{\"ok\":true}\n");
     assert_eq!(attached.attached.len(), 1);
     assert_eq!(attached.descriptors.len(), 1);
     let file = std::fs::File::from(attached.descriptors.into_iter().next().unwrap());
@@ -1179,6 +1317,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let mut invocation = request("send-asset");
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "send", "reference": "chat-asset:1"});
+    let (streams, sent_stdout) = stdio(None);
     let sent = client
         .invoke(
             Some(session()),
@@ -1194,11 +1333,13 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
                 }],
                 descriptors: vec![file.into()],
                 sends_remaining: 1,
+                streams: streams.streams,
             },
         )
         .await
         .unwrap();
     assert_eq!(sent.result.outcome, InvocationOutcome::Succeeded);
+    assert!(!sent_stdout.join().unwrap().is_empty());
     assert_eq!(sent.sent, vec![1]);
     assert!(sent.descriptors.is_empty());
     assert_eq!(audit.records().len(), 4);
@@ -1233,7 +1374,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let attestation = session().bound_to(invocation.id.clone());
     stream
         .write_frame(
-            &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0),
+            &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0, None),
             &[],
             limits.frame,
         )

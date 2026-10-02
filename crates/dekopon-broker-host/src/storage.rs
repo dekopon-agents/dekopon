@@ -107,7 +107,6 @@ impl StorageState {
     pub(crate) async fn finish(
         &mut self,
         commit: bool,
-        output: Option<Vec<u8>>,
     ) -> Result<Option<StorageEvidence>, StorageHostError> {
         let Self::Active {
             active,
@@ -137,21 +136,17 @@ impl StorageState {
                 transaction.abort();
                 return Err(StorageHostError::Timeout);
             }
-            let output_commitment = output
-                .as_deref()
-                .map(|bytes| transaction.output_commitment(bytes));
             if commit && !rejected && Instant::now() >= deadline {
                 transaction.abort();
                 return Err(StorageHostError::Timeout);
             }
-            let mut result = if !commit || rejected {
+            let result = if !commit || rejected {
                 transaction.abort()
             } else if transaction.access() == dekopon_capability::StorageAccess::ReadOnly {
                 transaction.finish_read()?
             } else {
                 transaction.commit_before(deadline)?
             };
-            result.output_commitment = output_commitment;
             Ok::<StorageEvidence, StorageHostError>(result)
         })
         .await
@@ -568,7 +563,7 @@ mod tests {
             .expect("the orphaned job holds the transaction");
         let started = Instant::now();
         assert!(matches!(
-            state.finish(true, None).await,
+            state.finish(true).await,
             Err(StorageHostError::Timeout)
         ));
         assert!(started.elapsed() >= Duration::from_millis(70));

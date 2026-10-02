@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -19,7 +19,7 @@ use dekopon_core::{
     SecretUseProposal,
 };
 use dekopon_test_support::{LoopbackServer, provider_fixture};
-use serde_json::{Value, json};
+use serde_json::json;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
@@ -85,15 +85,29 @@ async fn invoke_as(
 ) -> Result<AssetInvocationResult, BrokerError> {
     let attestation = Attestation::for_subject(caller_subject(name), agent(agent_name))
         .bound_to(request.id.clone());
-    broker
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("test stdout pipe");
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).expect("stdout capture");
+        bytes
+    });
+    let result = broker
         .invoke(
             &service_context(GATEWAY),
             Some(&AttestorGrant { namespaces: None }),
             Some(&attestation),
             request,
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
-        .await
+        .await;
+    let _stdout = capture.join().expect("stdout capture thread");
+    result
 }
 
 fn service_context(name: &str) -> AuthenticatedContext {
@@ -240,17 +254,6 @@ impl SecretResolver for MissingSecretResolver {
     }
 }
 
-fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
-    engine(
-        policies,
-        ["caller"],
-        [
-            ("jsonplaceholder.posts.get", "jsonplaceholder"),
-            ("jsonplaceholder.posts.create", "jsonplaceholder"),
-        ],
-    )
-}
-
 fn provider_policy(name: &str, agent_name: &str, provider: &str, capability: &str) -> String {
     format!(
         r#"@id("{name}-{capability}-via-{agent_name}")
@@ -271,7 +274,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority.to_owned()],
             propagate_trace: false,
@@ -412,11 +414,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
     );
     assert_eq!(result.result.decision.decision_id, "allow-invoke-once");
     assert_eq!(result.result.decision.policy_revision, "policy-test");
-    assert_eq!(
-        result.result.output,
-        Some(json!({"text": "TOP-SECRET-PAYLOAD"}))
-    );
-    assert_eq!(result.result.evidence.len(), 2);
+    assert_eq!(result.result.evidence.len(), 1);
 
     let records = audit.records();
     assert_eq!(records.len(), 2);
@@ -487,7 +485,6 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     );
     assert_eq!(result.result.decision.decision_id, "deny-invoke-denied");
     assert_eq!(result.result.error.as_deref(), Some("policy-denied"));
-    assert!(result.result.output.is_none());
     let records = audit.records();
     assert_eq!(records.len(), 1);
     assert!(matches!(
@@ -551,11 +548,11 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     assert!(matches!(error, BrokerBuildError::HostConstraint { .. }));
 
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("jsonplaceholder-provider.wasm")],
+        [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("JSONPlaceholder provider fixture loads");
+    .expect("checked HTTP provider loads");
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let error = Broker::new(
         registry,
@@ -567,13 +564,13 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             "",
             ["caller"],
             [
-                ("jsonplaceholder.posts.get", "jsonplaceholder"),
-                ("jsonplaceholder.posts.create", "jsonplaceholder"),
+                ("http-probe.fetch", "http-probe"),
+                ("http-probe.conditional-write", "http-probe"),
             ],
         ),
         catalog([(
-            "jsonplaceholder.posts.create",
-            set("jsonplaceholder", ExecutionConstraints::default()),
+            "http-probe.conditional-write",
+            set("http-probe", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
         callers(["caller"]),
@@ -605,7 +602,6 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     let constraints = ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             propagate_trace: false,
             allowed_hosts: vec![authority.clone()],
@@ -655,7 +651,14 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(result.result.evidence.len(), 3);
+    assert_eq!(result.result.evidence.len(), 2);
+    assert!(
+        result
+            .result
+            .evidence
+            .iter()
+            .any(|item| item.kind == "http-calls")
+    );
     let wire = server.request();
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
     server.join();
@@ -681,53 +684,51 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails() {
     use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
 
-    for (body, expected) in [
+    for (response, expected) in [
         (
-            r#"{"userId":3,"id":101,"title":"private title","body":"private body"}"#,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
             Succeeded,
         ),
-        ("not-json", Failed),
+        (b"not-http".as_slice(), Failed),
     ] {
         let registry = BrokerProviderRegistry::load(
-            [provider_fixture("jsonplaceholder-provider.wasm")],
+            [provider_fixture("http-probe-provider.wasm")],
             BrokerHostLimits::default(),
         )
         .await
-        .expect("JSONPlaceholder provider fixture loads");
-        let response = format!(
-            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let server = LoopbackServer::once(response.as_bytes());
+        .expect("checked HTTP provider loads");
+        let server = LoopbackServer::once(response);
         let authority = server.authority().to_owned();
         let mut constraints = loopback_constraints(&authority);
         constraints
             .http
             .as_mut()
             .expect("HTTP constraints")
-            .allowed_methods = vec!["POST".to_owned()];
+            .allowed_methods = vec!["DELETE".to_owned()];
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-jsonplaceholder".to_owned(),
-            jsonplaceholder_engine(&provider_policy(
-                "caller",
-                "provider-test",
-                "jsonplaceholder",
-                "jsonplaceholder.posts.create",
-            )),
+            "policy-http-probe".to_owned(),
+            engine(
+                &provider_policy("caller", "provider-test", "http-probe", "http-probe.purge"),
+                ["caller"],
+                [
+                    ("http-probe.fetch", "http-probe"),
+                    ("http-probe.purge", "http-probe"),
+                ],
+            ),
             catalog([
                 (
-                    "jsonplaceholder.posts.get",
-                    set("jsonplaceholder", loopback_constraints(&authority)),
+                    "http-probe.fetch",
+                    set("http-probe", loopback_constraints(&authority)),
                 ),
                 (
-                    "jsonplaceholder.posts.create",
+                    "http-probe.purge",
                     set_with_metadata(
-                        "jsonplaceholder",
+                        "http-probe",
                         EffectKind::ExternalWrite,
-                        RiskLevel::Medium,
+                        RiskLevel::High,
                         constraints,
                     ),
                 ),
@@ -742,17 +743,15 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             let available = broker.capabilities(&session("caller", "provider-test"));
             assert_eq!(available.len(), 1);
             assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
-            assert_eq!(available[0].capability.risk, RiskLevel::Medium);
+            assert_eq!(available[0].capability.risk, RiskLevel::High);
             let read = invoke_as(
                 &broker,
                 "caller",
                 "provider-test",
                 request(
-                    "invoke-json-read-with-write-rule",
-                    "jsonplaceholder.posts.get",
-                    json!({
-                        "postId": 7, "endpoint": format!("http://{authority}")
-                    }),
+                    "invoke-http-read-with-write-rule",
+                    "http-probe.fetch",
+                    json!({"uri": format!("http://{authority}/private-path")}),
                 ),
             )
             .await
@@ -768,12 +767,9 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             "caller",
             "provider-test",
             request(
-                "invoke-json-write",
-                "jsonplaceholder.posts.create",
-                json!({
-                    "userId": 3, "title": "private title", "body": "private body",
-                    "endpoint": format!("http://{authority}")
-                }),
+                "invoke-http-write",
+                "http-probe.purge",
+                json!({"uri": format!("http://{authority}/private-path?token=query-secret")}),
             ),
         )
         .await
@@ -781,33 +777,21 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
         assert_eq!(result.result.outcome, expected);
         let wire = server.request();
         assert!(
-            wire.starts_with(b"POST /posts HTTP/1.1\r\n"),
+            wire.starts_with(b"DELETE /private-path?token=query-secret HTTP/1.1\r\n"),
             "the external write must have left the host before the outcome"
         );
-        let body_offset = wire
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("POST headers terminate")
-            + 4;
-        assert_eq!(
-            serde_json::from_slice::<Value>(&wire[body_offset..]).expect("POST body is JSON"),
-            json!({"userId": 3, "title": "private title", "body": "private body"})
-        );
+        assert!(wire.ends_with(b"\r\n\r\n"), "DELETE has no body");
         server.join();
         let records = audit.records();
         if expected == Succeeded {
-            assert_eq!(
-                result.result.output.as_ref().expect("write returns output")["post"]["id"],
-                101
-            );
             assert_eq!(records.len(), 3);
         } else {
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
             assert_eq!(
                 result.result.detail,
                 Some(ProviderFailureDetail::new(
-                    "invalid-response",
-                    "endpoint returned an invalid post"
+                    "provider-exit",
+                    "protocol: HTTP transport failed\n"
                 )),
                 "a typed provider failure carries the provider's own code and message on the wire"
             );
@@ -836,24 +820,23 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                 error_detail
                     .as_ref()
                     .map(|detail| (detail.code.as_str(), detail.message.as_str())),
-                Some(("invalid-response", "endpoint returned an invalid post"))
+                Some(("provider-exit", "protocol: HTTP transport failed\n"))
             );
             assert_eq!(
                 http_calls.len(),
                 1,
                 "the completed call must survive into the failed execution record"
             );
-            assert_eq!(http_calls[0].method, "POST");
+            assert_eq!(http_calls[0].method, "DELETE");
             assert_eq!(http_calls[0].authority, authority);
-            assert_eq!(http_calls[0].status, Some(201));
+            assert_eq!(http_calls[0].status, None);
         }
         let serialized = serde_json::to_string(&records).expect("audit serializes");
         assert!(serialized.contains(&authority));
         assert!(serialized.contains("external-write"));
-        assert!(serialized.contains("POST"));
-        assert!(!serialized.contains("private title"));
-        assert!(!serialized.contains("private body"));
-        assert!(!serialized.contains("/posts"));
+        assert!(serialized.contains("DELETE"));
+        assert!(!serialized.contains("private-path"));
+        assert!(!serialized.contains("query-secret"));
     }
 }
 
@@ -1421,7 +1404,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
             None,
             "httpprobe",
             &basic_fetch_argv(&uri),
-            None,
+            false,
         )
         .await
         .expect("the word proposes");
@@ -1667,7 +1650,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let http = |hosts: Vec<String>| ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: hosts,
             propagate_trace: false,
@@ -1852,6 +1834,12 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     let grant = attestor_grant(["slack.t0123abc"]);
     let subject = subject(SLACK_SUBJECT);
 
+    let (attested_stdout, mut attested_reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let attested_capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut attested_reader, &mut bytes).unwrap();
+        bytes
+    });
     let attested = broker
         .invoke(
             &gateway,
@@ -1862,17 +1850,23 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
                 "cli-probe.upper",
                 json!({"text": "on behalf of"}),
             ),
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: attested_stdout.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("attested invocation is accounted");
     assert_eq!(
-        attested.result.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
+        attested_capture.join().unwrap(),
+        b"{\"text\":\"ON BEHALF OF\"}\n"
     );
     assert_eq!(
-        attested.result.output,
-        Some(json!({"text": "ON BEHALF OF"}))
+        attested.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
     );
 
     let crossed = broker
@@ -2063,6 +2057,12 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_success_audits_via_and_subject() {
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let broker = attested_broker(
         directory([(SLACK_SUBJECT, "cpetersen")]),
@@ -2083,10 +2083,20 @@ async fn attested_success_audits_via_and_subject() {
                 "cli-probe.upper",
                 json!({"text": "top-secret-payload"}),
             ),
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("attested invocation is accounted");
+    assert_eq!(
+        capture.join().unwrap(),
+        b"{\"text\":\"TOP-SECRET-PAYLOAD\"}\n"
+    );
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
@@ -2544,7 +2554,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
             None,
             "gh",
             &["gh".to_owned(), "pr".to_owned()],
-            None,
+            false,
         )
         .await
         .expect_err("no loaded provider declares this word");
@@ -2586,7 +2596,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     let caller = session("caller", "provider-test");
 
     match broker
-        .run_command(&caller, None, None, "probe", &["--help".to_owned()], None)
+        .run_command(&caller, None, None, "probe", &["--help".to_owned()], false)
         .await
         .expect("the help page renders")
     {
@@ -2609,7 +2619,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
             None,
             "probe",
             &["upper".to_owned(), "-".to_owned()],
-            Some("hello"),
+            true,
         )
         .await
         .expect("the piped value proposes");
@@ -2618,12 +2628,12 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
         CommandRunOutcome::Proposed {
             secret_use: None,
             capability: "cli-probe.upper".parse().expect("valid capability fixture"),
-            input: json!({"text": "hello"}),
+            input: json!({"text": "", "piped": true}),
         }
     );
 
     match broker
-        .run_command(&caller, None, None, "probe", &["bogus".to_owned()], None)
+        .run_command(&caller, None, None, "probe", &["bogus".to_owned()], false)
         .await
         .expect("a usage error renders")
     {

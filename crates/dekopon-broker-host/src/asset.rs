@@ -1,6 +1,6 @@
 use crate::{StoreState, bindings::dekopon::asset::asset as wit};
 use dekopon_broker_protocol::{
-    AssetEncoding, AssetRow, MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
+    AssetEncoding, AssetRow, MAX_ASSET_DESCRIPTORS, MAX_ASSET_ROWS, NewAsset,
 };
 use dekopon_capability::AssetConstraints;
 use dekopon_core::{
@@ -47,6 +47,9 @@ pub struct AssetInputs {
     pub rows: Vec<AssetRow>,
     pub descriptors: Vec<OwnedFd>,
     pub sends_remaining: u8,
+    /// Stream ends ride the asset descriptor path but are admitted by the stdio host.
+    pub streams: Option<dekopon_broker_protocol::Streams>,
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -209,7 +212,7 @@ impl AssetState {
                 return Err(AssetAdmissionError::TooManyRows);
             }
             if references.len() != inputs.descriptors.len()
-                || references.len() > MAX_DESCRIPTORS_PER_FRAME
+                || references.len() > MAX_ASSET_DESCRIPTORS
             {
                 return Err(AssetAdmissionError::DescriptorCount);
             }
@@ -296,7 +299,7 @@ pub(crate) fn references(input: &serde_json::Value) -> Vec<u64> {
         match input {
             serde_json::Value::String(text) => {
                 if let Some(id) = reference(text)
-                    && found.len() <= MAX_DESCRIPTORS_PER_FRAME
+                    && found.len() <= MAX_ASSET_DESCRIPTORS
                     && !found.contains(&id)
                 {
                     found.push(id);
@@ -758,7 +761,7 @@ impl wit::Host for StoreState {
                 .assets
                 .refuse(error(wit::ErrorCode::Denied, "asset.attach is not granted")));
         }
-        if self.assets.outputs.attached.len() >= MAX_DESCRIPTORS_PER_FRAME {
+        if self.assets.outputs.attached.len() >= MAX_ASSET_DESCRIPTORS {
             return Ok(self.assets.refuse(error(
                 wit::ErrorCode::TooManyAssets,
                 "at most five assets may be attached",
@@ -960,6 +963,8 @@ mod tests {
             }],
             descriptors: vec![file.into()],
             sends_remaining: 1,
+            streams: None,
+            cancel: None,
         }
     }
 
@@ -1465,14 +1470,14 @@ mod tests {
             vec![],
         )
         .await;
-        for index in 0..=MAX_DESCRIPTORS_PER_FRAME {
+        for index in 0..=MAX_ASSET_DESCRIPTORS {
             let writer = state
                 .allocate("text/plain".to_owned(), wit::Encoding::Identity)
                 .await
                 .unwrap()
                 .unwrap();
             let attached = state.attach(writer).await.unwrap();
-            if index == MAX_DESCRIPTORS_PER_FRAME {
+            if index == MAX_ASSET_DESCRIPTORS {
                 assert_eq!(attached.unwrap_err().code, wit::ErrorCode::TooManyAssets);
             } else {
                 let handle = attached.unwrap();
@@ -1486,7 +1491,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(state.assets.outputs.files.len(), MAX_DESCRIPTORS_PER_FRAME);
+        assert_eq!(state.assets.outputs.files.len(), MAX_ASSET_DESCRIPTORS);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
@@ -1726,14 +1731,14 @@ mod tests {
                 "chat-asset:5"
             ]))
             .len(),
-            MAX_DESCRIPTORS_PER_FRAME
+            MAX_ASSET_DESCRIPTORS
         );
         let many = serde_json::Value::Array(
             (1..1000)
                 .map(|id| serde_json::json!(format!("chat-asset:{id}")))
                 .collect(),
         );
-        assert_eq!(references(&many).len(), MAX_DESCRIPTORS_PER_FRAME + 1);
+        assert_eq!(references(&many).len(), MAX_ASSET_DESCRIPTORS + 1);
     }
     #[tokio::test]
     async fn a_capacity_one_channel_sink_suspends_and_resumes_the_real_guest_without_changing_wit()
@@ -1760,6 +1765,17 @@ mod tests {
                 SettingsState::invoke(None),
             )
             .unwrap();
+        let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let captured = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
+            bytes
+        });
+        store.data_mut().stdio = crate::stdio::StdioState::invoke(Some(crate::Streams {
+            stdin: None,
+            stdout: host.into(),
+        }))
+        .unwrap();
         store.data_mut().assets = AssetState::invoke(
             AssetInputs::default(),
             vec![],
@@ -1773,22 +1789,27 @@ mod tests {
         store.data_mut().assets.channel_sink = Some(sender);
         let capability = "http-probe.fetch".parse().unwrap();
         let constraints = dekopon_capability::ExecutionConstraints::default();
-        let call = provider.execute_in_store(
-            &mut store,
-            &capability,
-            r#"{"assetMode":"channel"}"#,
-            &constraints,
-            Duration::from_secs(5),
-        );
-        tokio::pin!(call);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut call)
-                .await
-                .is_err()
-        );
-        assert_eq!(receiver.recv().await.unwrap(), b"asset ");
-        assert_eq!(call.await.unwrap(), serde_json::json!({"ok": true}));
-        assert_eq!(receiver.recv().await.unwrap(), b"probe");
+        {
+            let call = provider.execute_in_store(
+                &mut store,
+                &capability,
+                r#"{"assetMode":"channel"}"#,
+                &constraints,
+                Duration::from_secs(5),
+                None,
+            );
+            tokio::pin!(call);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut call)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(receiver.recv().await.unwrap(), b"asset ");
+            assert_eq!(call.await.unwrap(), 0);
+            assert_eq!(receiver.recv().await.unwrap(), b"probe");
+        }
+        drop(store);
+        assert_eq!(captured.join().unwrap(), b"{\"ok\":true}\n");
     }
     #[tokio::test]
     async fn input_rows_accept_thirty_two_and_refuse_thirty_three() {

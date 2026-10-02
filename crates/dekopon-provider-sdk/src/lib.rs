@@ -26,8 +26,8 @@ pub mod provider;
 mod storage;
 
 pub use provider::{
-    Capability, Code, Failure, Needs, Proposal, Provider, SdkFailure, Usage, call, command,
-    manifest,
+    Capability, Code, Failure, Needs, Proposal, Provider, SdkFailure, Stdin, Stdout, Usage,
+    command, manifest, stdin,
 };
 
 #[doc(hidden)]
@@ -36,6 +36,7 @@ pub mod export_bindings {
         path: "wit",
         world: "provider-cli",
         pub_export_macro: true,
+        generate_all,
     });
 }
 
@@ -49,12 +50,12 @@ macro_rules! export {
                 $crate::__typed_describe::<$provider>()
             }
 
-            fn invoke(capability: ::std::string::String, input_json: ::std::string::String) -> ::std::string::String {
+            fn invoke(capability: ::std::string::String, input_json: ::std::string::String) -> ::std::result::Result<(), u8> {
                 $crate::__typed_invoke::<$provider>(&capability, &input_json)
             }
 
-            fn run_command(argv: ::std::vec::Vec<::std::string::String>, stdin: ::std::option::Option<::std::string::String>) -> ::std::string::String {
-                $crate::__typed_run_command::<$provider>(&argv, stdin.as_deref())
+            fn run_command(argv: ::std::vec::Vec<::std::string::String>, stdin_piped: bool) -> ::std::string::String {
+                $crate::__typed_run_command::<$provider>(&argv, stdin_piped)
             }
         }
 
@@ -79,14 +80,27 @@ pub fn __typed_describe<P: provider::Provider>() -> String {
 }
 
 #[doc(hidden)]
-pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> String {
-    serde_json::to_string(&provider::call::<P>(capability, input))
-        .unwrap_or_else(|_| INVOKE_SERIALIZATION_FALLBACK.to_owned())
+#[cfg(target_arch = "wasm32")]
+pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> Result<(), u8> {
+    provider::invoke::<P>(capability, input).map_err(std::num::NonZeroU8::get)
 }
 
 #[doc(hidden)]
-pub fn __typed_run_command<P: provider::Provider>(argv: &[String], stdin: Option<&str>) -> String {
-    serde_json::to_string(&provider::command::<P>(argv, stdin))
+#[cfg(not(target_arch = "wasm32"))]
+pub fn __typed_invoke<P: provider::Provider>(capability: &str, input: &str) -> Result<(), u8> {
+    let stdio = provider::NativeStdio {
+        stdin: None,
+        stdout: Box::new(std::io::stdout()),
+    };
+    match provider::invoke_native::<P>(capability, input, stdio) {
+        provider::NativeExit { status: 0, .. } => Ok(()),
+        provider::NativeExit { status, .. } => Err(status),
+    }
+}
+
+#[doc(hidden)]
+pub fn __typed_run_command<P: provider::Provider>(argv: &[String], stdin_piped: bool) -> String {
+    serde_json::to_string(&provider::command::<P>(argv, stdin_piped))
         .unwrap_or_else(|_| RUN_SERIALIZATION_FALLBACK.to_owned())
 }
 
@@ -136,23 +150,7 @@ pub struct ProviderCapability {
     pub input_schema: Value,
 }
 
-/// JSON response returned across the WIT boundary.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ComponentResponse {
-    /// Provider execution completed and returned JSON output.
-    Succeeded {
-        /// Capability-specific result.
-        output: Value,
-    },
-    /// Provider rejected or failed the operation without trapping.
-    Failed {
-        /// Stable failure detail.
-        error: ComponentFailure,
-    },
-}
-
-/// Serializable provider failure carried by [`ComponentResponse::Failed`].
+/// A provider's refusal of an argv, carried by [`CommandRunOutcome::Failed`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ComponentFailure {
@@ -193,9 +191,6 @@ pub enum CommandRunOutcome {
     },
 }
 
-/// Hand-written because the failing operation is the JSON encoder itself.
-const INVOKE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"provider response could not be serialized"}}"#;
-
 const RUN_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command run could not be serialized"}}"#;
 
 /// The description carries the serialization error instead of being empty, so the refusal is
@@ -214,9 +209,8 @@ fn describe_fallback(error: &serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandRunOutcome, ComponentFailure, ComponentResponse, INVOKE_SERIALIZATION_FALLBACK,
-        ProviderCapability, ProviderManifest, RUN_SERIALIZATION_FALLBACK, SecretUseProposal,
-        describe_fallback,
+        CommandRunOutcome, ComponentFailure, ProviderCapability, ProviderManifest,
+        RUN_SERIALIZATION_FALLBACK, SecretUseProposal, describe_fallback,
     };
     use serde_json::json;
     const UPPER: &str = "cli-probe.upper";
@@ -338,18 +332,6 @@ mod tests {
         let error = serde_json::from_str::<ProviderManifest>("{").expect_err("malformed manifest");
         serde_json::from_str::<ProviderManifest>(&describe_fallback(&error))
             .expect("describe fallback decodes as a manifest");
-
-        let response = serde_json::from_str::<ComponentResponse>(INVOKE_SERIALIZATION_FALLBACK)
-            .expect("invoke fallback decodes as a component response");
-        assert_eq!(
-            response,
-            ComponentResponse::Failed {
-                error: ComponentFailure {
-                    code: "serialization-failed".to_owned(),
-                    message: "provider response could not be serialized".to_owned(),
-                },
-            }
-        );
 
         let run = serde_json::from_str::<CommandRunOutcome>(RUN_SERIALIZATION_FALLBACK)
             .expect("run fallback decodes as a command run outcome");

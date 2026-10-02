@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::sync::Arc;
 
@@ -55,15 +55,29 @@ async fn invoke_as_caller(
         "provider-test".parse::<AgentId>().expect("valid agent"),
     )
     .bound_to(request.id.clone());
-    broker
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("test stdout pipe");
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).expect("capture stdout");
+        bytes
+    });
+    let result = broker
         .invoke(
             &gateway,
             Some(&AttestorGrant { namespaces: None }),
             Some(&attestation),
             request,
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
-        .await
+        .await;
+    let _stdout = capture.join().expect("stdout capture thread");
+    result
 }
 
 fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRequest {
@@ -86,7 +100,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
-        max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
             allowed_hosts: vec![authority.to_owned()],
             allowed_methods: vec!["GET".to_owned()],
@@ -256,6 +269,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
 
     let (execution, parent) = only(&records, &["broker.execution"]);
     assert_eq!(parent, Some("broker.execute"), "{execution}");
+    assert!(!execution.contains("output.digest="), "{execution}");
     for expected in [
         "invocation.id=invoke-audited",
         "outcome=Succeeded",
@@ -263,7 +277,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         "risk=Low",
         "credential=\"fetch-token\"",
         "\\\"credentialInjected\\\":true",
-        "output.digest=",
     ] {
         assert!(
             execution.contains(expected),

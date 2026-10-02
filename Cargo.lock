@@ -993,6 +993,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "wat",
 ]
 
 [[package]]

@@ -230,7 +230,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 Some(&chat_claim(UNMAPPED_SUBJECT, "some-agent")),
                 "probe",
                 &[],
-                None,
+                false,
             )
             .await
             .is_err()

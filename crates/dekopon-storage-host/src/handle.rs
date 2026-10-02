@@ -1,8 +1,6 @@
 use crate::{
     StorageEvidence, StorageGrant, StorageHostError,
-    key::{
-        DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, commitment, token,
-    },
+    key::{DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, commitment, token},
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     namespace::{Namespace, deadline_after, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
@@ -656,19 +654,6 @@ impl StorageHandle {
         }
     }
 
-    #[must_use]
-    pub fn output_commitment(&self, bytes: &[u8]) -> String {
-        commitment(
-            DOMAIN_OUTPUT_EVIDENCE,
-            &[
-                self.namespace.base_token.as_bytes(),
-                self.namespace.generation_token.as_bytes(),
-                b"provider-output",
-                bytes,
-            ],
-        )
-    }
-
     fn make_evidence(&self) -> StorageEvidence {
         let operations = self.evidence.operations.to_be_bytes();
         let syncs = self.evidence.syncs.to_be_bytes();
@@ -688,7 +673,6 @@ impl StorageHandle {
                     &denials,
                 ],
             ),
-            output_commitment: None,
         }
     }
 }

@@ -29,6 +29,38 @@ pub use dekopon_core::{
 };
 pub use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageHostError, StorageLimits};
 
+pub struct Stdout(std::thread::JoinHandle<Vec<u8>>);
+
+impl Stdout {
+    #[must_use]
+    pub fn bytes(self) -> Vec<u8> {
+        self.0.join().unwrap()
+    }
+
+    #[must_use]
+    pub fn json(self) -> Value {
+        serde_json::from_slice(&self.bytes()).unwrap()
+    }
+}
+
+#[must_use]
+pub fn piped_stdout() -> (dekopon_broker_host::asset::AssetInputs, Stdout) {
+    let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut bytes).unwrap();
+        bytes
+    });
+    let assets = dekopon_broker_host::asset::AssetInputs {
+        streams: Some(dekopon_broker_host::Streams {
+            stdin: None,
+            stdout: host.into(),
+        }),
+        ..Default::default()
+    };
+    (assets, Stdout(capture))
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FixtureHostError {
@@ -55,22 +87,17 @@ pub enum FixtureHostError {
 }
 
 impl FixtureHostError {
-    /// Returns the provider-declared `(code, message)` when the guest returned a structured
-    /// failure, rather than the host refusing the call before or after the guest ran.
-    ///
-    /// Asserting on the code is the difference between "the provider refused this for the reason
-    /// it documents" and "something, somewhere, went wrong".
     #[must_use]
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    pub fn provider_failure(&self) -> Option<(&str, &str)> {
+    pub fn provider_failure(&self) -> Option<(u8, &str)> {
         let Self::Invocation(failure) = self else {
             return None;
         };
         match failure.error.as_ref() {
-            BrokerHostError::ProviderFailure { code, message, .. } => Some((code, message)),
+            BrokerHostError::ProviderFailure { status, stderr, .. } => Some((*status, stderr)),
             _ => None,
         }
     }
@@ -110,7 +137,6 @@ pub struct FixtureHostBuilder {
     continuity: ContinuityPolicy,
     scope: Scope,
     timeout_ms: Option<u64>,
-    max_output_bytes: Option<u64>,
 }
 
 impl Default for FixtureHostBuilder {
@@ -130,7 +156,6 @@ impl Default for FixtureHostBuilder {
             // Left unset so build derives them from the host limits in force; a hardcoded default
             // here would duplicate a number this crate does not own and could drift out of sync.
             timeout_ms: None,
-            max_output_bytes: None,
         }
     }
 }
@@ -205,15 +230,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Narrows the maximum serialized output one invocation may return.
-    ///
-    /// Defaults to the host's own `max_output_bytes`, and is bounded by it for the same reason.
-    #[must_use]
-    pub const fn max_output_bytes(mut self, max_output_bytes: u64) -> Self {
-        self.max_output_bytes = Some(max_output_bytes);
-        self
-    }
-
     pub async fn build(self) -> Result<FixtureHost, FixtureHostError> {
         let component = self.component.ok_or(FixtureHostError::NoComponent)?;
         if !component.exists() {
@@ -260,9 +276,6 @@ impl FixtureHostBuilder {
                     .try_into()
                     .unwrap_or(u64::MAX)
             }),
-            max_output_bytes: self
-                .max_output_bytes
-                .unwrap_or(host_limits.max_output_bytes as u64),
             invocations: AtomicU64::new(0),
         })
     }
@@ -289,7 +302,6 @@ pub struct FixtureHost {
     conversation: String,
     continuity: ContinuityPolicy,
     timeout_ms: u64,
-    max_output_bytes: u64,
     invocations: AtomicU64,
 }
 
@@ -300,14 +312,14 @@ impl FixtureHost {
     }
 
     pub async fn invoke(&self, capability: &str, input: Value) -> Result<Value, FixtureHostError> {
-        Ok(self.invoke_full(capability, input).await?.output)
+        Ok(self.invoke_full(capability, input).await?.1)
     }
 
     pub async fn invoke_full(
         &self,
         capability: &str,
         input: Value,
-    ) -> Result<BrokerInvocationOutput, FixtureHostError> {
+    ) -> Result<(BrokerInvocationOutput, Value), FixtureHostError> {
         let capability: CapabilityId = capability.parse()?;
         // Each invocation needs a fresh id since grants are minted and consumed per call; the scope
         // material around it stays fixed, which is what keeps successive calls in one namespace.
@@ -359,10 +371,13 @@ impl FixtureHost {
             self.constraints(),
         )?;
 
-        self.registry
-            .invoke_with_storage(authorized, None, grant, Default::default())
+        let (assets, stdout) = piped_stdout();
+        let output = self
+            .registry
+            .invoke_with_storage(authorized, None, grant, assets)
             .await
-            .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))
+            .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))?;
+        Ok((output, stdout.json()))
     }
 
     /// A command proposal has no authority; pass it through invoke to execute it.
@@ -370,9 +385,9 @@ impl FixtureHost {
         &self,
         word: &str,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Result<CommandRunOutcome, FixtureHostError> {
-        Ok(self.registry.run_command(word, argv, stdin).await?)
+        Ok(self.registry.run_command(word, argv, stdin_piped).await?)
     }
 
     /// StorageEvidence counts bytes moved, not final file sizes; walk the opaque SHA-256 paths.
@@ -390,7 +405,6 @@ impl FixtureHost {
         ExecutionConstraints {
             asset: None,
             timeout_ms: self.timeout_ms,
-            max_output_bytes: self.max_output_bytes,
             http: None,
             storage: self
                 .storage_grant

@@ -548,7 +548,11 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(&self, _: crate::CommandProposal) -> CapabilityCallResult {
+        fn invoke(
+            &self,
+            _: crate::CommandProposal,
+            _streams: crate::Streams,
+        ) -> CapabilityCallResult {
             panic!("progress must not invoke a capability")
         }
 

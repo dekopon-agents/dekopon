@@ -22,8 +22,7 @@ use std::{
 use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
 pub use dekopon_provider_sdk::{
-    CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
-    ProviderManifest,
+    CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
 pub use host::ProviderConflicts;
@@ -47,8 +46,10 @@ mod http;
 mod memory;
 mod metadata;
 mod settings;
+mod stdio;
 mod storage;
 use clock::ClockState;
+pub use dekopon_broker_protocol::Streams;
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, NonPublicHttpsAuthority,
     PlaintextHostError, PlaintextHosts, destinations_cover,
@@ -57,6 +58,10 @@ use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
 use settings::SettingsState;
+pub use stdio::{
+    MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError, StdioTrap,
+    ZERO_FAILURE_STATUS_NOTE,
+};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -68,6 +73,8 @@ pub(crate) mod bindings {
             "dekopon:storage/durable-files.file": crate::storage::FileResource,
             "dekopon:asset/asset.handle": crate::asset::HandleResource,
             "dekopon:asset/asset.writer": crate::asset::WriterResource,
+            "dekopon:stdio/streams.reader": crate::stdio::ReaderResource,
+            "dekopon:stdio/streams.writer": crate::stdio::WriterResource,
         },
     });
 }
@@ -75,6 +82,7 @@ pub(crate) mod bindings {
 pub const PROVIDER_WIT: &str = include_str!("../wit/deps/provider.wit");
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
+pub const STDIO_WIT: &str = include_str!("../wit/deps/stdio.wit");
 
 pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_HTTP_REQUESTS: u32 = 32;
@@ -314,7 +322,7 @@ pub struct BrokerInvocationOutput {
     pub assets: asset::AssetOutputs,
     pub provider: ProviderId,
     pub capability: CapabilityId,
-    pub output: Value,
+    pub stderr: String,
     pub http_calls: Vec<HttpCallEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageEvidence>,
@@ -398,6 +406,7 @@ impl Runtime {
                 clock,
                 settings,
                 assets: asset::AssetState::disabled(),
+                stdio: stdio::StdioState::none(),
                 table: storage::new_table(),
                 instantiations: 0,
             },
@@ -436,6 +445,7 @@ struct StoreState {
     /// Granted only in an invocation's store; descriptions and command runs are pure.
     clock: ClockState,
     settings: SettingsState,
+    stdio: stdio::StdioState,
     table: wasmtime::component::ResourceTable,
     instantiations: u64,
 }
@@ -849,9 +859,9 @@ impl BrokerWasmProvider {
     pub async fn run_command(
         &self,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Result<String, BrokerHostError> {
-        let length = command_input_bytes(argv, stdin);
+        let length = command_input_bytes(argv);
         if length > self.runtime.limits.max_input_bytes {
             return Err(BrokerHostError::CommandInputTooLarge {
                 provider: self.manifest.id.clone(),
@@ -886,7 +896,6 @@ impl BrokerWasmProvider {
             SettingsState::describe(),
         )?;
         let argv = argv.to_vec();
-        let stdin = stdin.map(str::to_owned);
         let signature = |source: wasmtime::Error| BrokerHostError::CommandExportSignature {
             provider: self.manifest.id.clone(),
             path: self.source.clone(),
@@ -908,13 +917,10 @@ impl BrokerWasmProvider {
                 })?;
             store.data_mut().instantiations += 1;
             let function = instance
-                .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
-                    &mut store,
-                    RUN_COMMAND_EXPORT,
-                )
+                .get_typed_func::<(Vec<String>, bool), (String,)>(&mut store, RUN_COMMAND_EXPORT)
                 .map_err(signature)?;
             let (output,) = function
-                .call_async(&mut store, (argv, stdin))
+                .call_async(&mut store, (argv, stdin_piped))
                 .await
                 .map_err(failed)?;
             Ok::<_, BrokerHostError>(output)
@@ -981,7 +987,7 @@ impl BrokerWasmProvider {
         reason = "reshaped by the unit that next rewrites this"
     )]
     async fn render_provider_help(&self) -> Option<String> {
-        let json = match self.run_command(&["--help".to_owned()], None).await {
+        let json = match self.run_command(&["--help".to_owned()], false).await {
             Ok(json) => json,
             Err(error) => {
                 tracing::warn!(
@@ -1021,7 +1027,8 @@ impl BrokerWasmProvider {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the invocation keeps separate authority grants and native resource ownership"
+        clippy::too_many_lines,
+        reason = "the invocation keeps separate authority grants, cancellation, and cleanup in one owned store"
     )]
     async fn invoke(
         &self,
@@ -1031,7 +1038,7 @@ impl BrokerWasmProvider {
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
         storage_transaction: Option<dekopon_storage_host::StorageHandle>,
-        assets: asset::AssetInputs,
+        mut assets: asset::AssetInputs,
         directory: Option<dekopon_http_host::asset::AssetDirectory>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
@@ -1099,6 +1106,9 @@ impl BrokerWasmProvider {
                     .cloned(),
             ),
         )?;
+        let cancel = assets.cancel.take();
+        store.data_mut().stdio = stdio::StdioState::invoke(assets.streams.take())
+            .map_err(|source| BrokerHostError::StdioAdmission { source })?;
         store.data_mut().assets = asset::AssetState::invoke(
             assets,
             asset::references(input),
@@ -1124,10 +1134,12 @@ impl BrokerWasmProvider {
                 &input_json,
                 constraints,
                 operation_timeout,
+                cancel,
             )
             .await;
         executed = executed
             .map_err(|error| invocation_budget_failure(error, store.data().limits.refusal()));
+        store.data_mut().stdio.close();
         store.data().assets.drain().await;
         // A caught, typed disk failure stays terminal even if later guest work times out or is
         // refused; never infer exhaustion from cancellation itself.
@@ -1137,17 +1149,20 @@ impl BrokerWasmProvider {
         ) {
             executed = Err(BrokerHostError::AssetOverBudget);
         }
+        record_stream_trace(&store.data().stdio);
+        let stderr = store.data_mut().stdio.take_stderr();
+        executed = match executed {
+            Ok(0) => Ok(0),
+            Ok(status) => Err(BrokerHostError::ProviderFailure {
+                provider: self.manifest.id.clone(),
+                capability: capability.clone(),
+                status,
+                stderr: stderr.clone(),
+            }),
+            Err(error) => Err(error),
+        };
         let commit = executed.is_ok();
-        let storage_output = executed
-            .as_ref()
-            .ok()
-            .and_then(|output| serde_json::to_vec(output).ok());
-        if let Err(source) = store
-            .data_mut()
-            .storage
-            .finish(commit, storage_output)
-            .await
-        {
+        if let Err(source) = store.data_mut().storage.finish(commit).await {
             executed = Err(BrokerHostError::Storage { source });
         }
         record_store_outcome(&mut store, self.runtime.limits.fuel);
@@ -1155,6 +1170,7 @@ impl BrokerWasmProvider {
             Ok(_) => "succeeded",
             Err(BrokerHostError::ProviderFailure { .. }) => "provider-error",
             Err(BrokerHostError::Timeout { .. }) => "timeout",
+            Err(BrokerHostError::PeerDisconnected) => "peer-disconnected",
             Err(BrokerHostError::MemoryBudgetExhausted { .. }) => "host-memory-budget",
             Err(BrokerHostError::Invoke { source, .. })
                 if source.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) =>
@@ -1169,10 +1185,10 @@ impl BrokerWasmProvider {
         let storage = data.storage.take_evidence();
         let http_calls = data.http.into_evidence();
         match executed {
-            Ok(output) => Ok(BrokerInvocationOutput {
+            Ok(_) => Ok(BrokerInvocationOutput {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
-                output,
+                stderr,
                 assets: data.assets.finish(),
                 http_calls,
                 storage,
@@ -1185,6 +1201,10 @@ impl BrokerWasmProvider {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the host keeps the authorized budget and peer cancellation separate from guest inputs"
+    )]
     async fn execute_in_store(
         &self,
         store: &mut Store<StoreState>,
@@ -1192,7 +1212,9 @@ impl BrokerWasmProvider {
         input_json: &str,
         constraints: &ExecutionConstraints,
         operation_timeout: Duration,
-    ) -> Result<Value, BrokerHostError> {
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<u8, BrokerHostError> {
+        let clock = store.data().stdio.clock.clone();
         let operation = async {
             let bindings = self
                 .pre
@@ -1217,13 +1239,23 @@ impl BrokerWasmProvider {
             reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\"; the \
                       Timeout variant already names the operation and the budget it exceeded"
         )]
-        let operation_result =
-            timeout(operation_timeout, operation)
-                .await
-                .map_err(|_| BrokerHostError::Timeout {
-                    operation: format!("invoke {capability}"),
-                    timeout_ms: constraints.timeout_ms,
-                })?;
+        let operation_result = tokio::select! {
+            result = clock.run(operation_timeout, operation) => result,
+            () = async {
+                if let Some(signal) = cancel.as_mut() {
+                    loop {
+                        if *signal.borrow_and_update() { break; }
+                        if signal.changed().await.is_err() { std::future::pending::<()>().await; }
+                    }
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => return Err(BrokerHostError::PeerDisconnected),
+        }
+        .ok_or_else(|| BrokerHostError::Timeout {
+            operation: format!("invoke {capability}"),
+            timeout_ms: constraints.timeout_ms,
+        })?;
         // Host policy violations win even if the guest catches the error or a failing destructor
         // turns it into a trap; check policy before trusting the guest's result.
         if let Some(reason) = store.data().http.policy_violation() {
@@ -1247,33 +1279,13 @@ impl BrokerWasmProvider {
                 reason,
             });
         }
-        let output_json = operation_result?;
-        let maximum_output = usize::try_from(constraints.max_output_bytes)
-            .unwrap_or(usize::MAX)
-            .min(self.runtime.limits.max_output_bytes);
-        if output_json.len() > maximum_output {
-            return Err(BrokerHostError::OutputTooLarge {
-                provider: self.manifest.id.to_string(),
-                length: output_json.len(),
-                maximum: maximum_output,
-            });
-        }
-        let response =
-            serde_json::from_str::<ComponentResponse>(&output_json).map_err(|source| {
-                BrokerHostError::InvalidOutput {
-                    provider: self.manifest.id.clone(),
-                    capability: capability.clone(),
-                    source,
-                }
-            })?;
-        match response {
-            ComponentResponse::Succeeded { output } => Ok(output),
-            ComponentResponse::Failed { error } => Err(BrokerHostError::ProviderFailure {
-                provider: self.manifest.id.clone(),
-                capability: capability.clone(),
-                code: error.code,
-                message: error.message,
-            }),
+        match operation_result? {
+            Ok(()) => Ok(0),
+            Err(0) => {
+                store.data_mut().stdio.note_zero_status();
+                Ok(1)
+            }
+            Err(status) => Ok(status),
         }
     }
 }
@@ -1453,7 +1465,7 @@ impl BrokerProviderRegistry {
         &self,
         word: &str,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Result<CommandRunOutcome, BrokerHostError> {
         let provider = self
             .providers
@@ -1475,8 +1487,7 @@ impl BrokerProviderRegistry {
             command.export = command_export_name(&provider.command_export),
             command.arguments = tracing::field::Empty,
             command.arguments.bytes = tracing::field::Empty,
-            command.stdin = tracing::field::Empty,
-            command.stdin.bytes = tracing::field::Empty,
+            command.stdin.piped = stdin_piped,
             command.output = tracing::field::Empty,
             command.output.bytes = tracing::field::Empty,
             stores = tracing::field::Empty,
@@ -1489,12 +1500,8 @@ impl BrokerProviderRegistry {
             &*dekopon_core::bounded_attribute(&arguments),
         );
         span.record("command.arguments.bytes", arguments.len());
-        if let Some(stdin) = stdin {
-            span.record("command.stdin", &*dekopon_core::bounded_attribute(stdin));
-            span.record("command.stdin.bytes", stdin.len());
-        }
         let json = provider
-            .run_command(argv, stdin)
+            .run_command(argv, stdin_piped)
             .instrument(span.clone())
             .await?;
         span.record("command.output", &*dekopon_core::bounded_attribute(&json));
@@ -1685,6 +1692,12 @@ impl BrokerProviderRegistry {
             provider = %provider.manifest.id,
             input = tracing::field::Empty,
             input.bytes = tracing::field::Empty,
+            stdin.bytes = tracing::field::Empty,
+            stdin.prefix = tracing::field::Empty,
+            stdout.bytes = tracing::field::Empty,
+            stdout.prefix = tracing::field::Empty,
+            stderr.bytes = tracing::field::Empty,
+            stderr.prefix = tracing::field::Empty,
             storage = tracing::field::Empty,
             stores = tracing::field::Empty,
             instantiations = tracing::field::Empty,
@@ -1709,6 +1722,18 @@ impl BrokerProviderRegistry {
             )
             .instrument(span)
             .await
+    }
+}
+
+fn record_stream_trace(stream: &stdio::StdioState) {
+    let span = tracing::Span::current();
+    for (name, trace) in [
+        ("stdin", &stream.stdin_trace),
+        ("stdout", &stream.stdout_trace),
+        ("stderr", &stream.stderr_trace),
+    ] {
+        span.record(format!("{name}.bytes").as_str(), trace.bytes);
+        span.record(format!("{name}.prefix").as_str(), trace.prefix().as_str());
     }
 }
 
@@ -1859,13 +1884,6 @@ fn validate_authorized_constraints(
             field: "timeout_ms",
         });
     }
-    if constraints.max_output_bytes == 0
-        || constraints.max_output_bytes > limits.max_output_bytes as u64
-    {
-        return Err(BrokerHostError::AuthorizationExceedsHostLimit {
-            field: "max_output_bytes",
-        });
-    }
     if constraints.http.is_some() && constraints.storage.is_some() {
         return Err(BrokerHostError::MixedHostAuthorization);
     }
@@ -1922,6 +1940,8 @@ fn invalid_manifest(source: &Path, message: impl Into<String>) -> BrokerHostErro
 
 #[derive(Debug, Error)]
 pub enum BrokerHostError {
+    #[error("broker peer disconnected during invocation")]
+    PeerDisconnected,
     #[error("over-budget: broker asset disk capacity exhausted")]
     AssetOverBudget,
     #[error("invalid invocation assets")]
@@ -2167,19 +2187,17 @@ pub enum BrokerHostError {
         #[source]
         source: wasmtime::Error,
     },
-    #[error("broker provider {provider} failed {capability} with {code}: {message}")]
+    #[error("broker provider {provider} exited with status {status} from {capability}")]
     ProviderFailure {
         provider: ProviderId,
         capability: CapabilityId,
-        code: String,
-        message: String,
+        status: u8,
+        stderr: String,
     },
-    #[error("broker provider {provider} returned an invalid response for {capability}")]
-    InvalidOutput {
-        provider: ProviderId,
-        capability: CapabilityId,
+    #[error("broker could not admit an invocation stream")]
+    StdioAdmission {
         #[source]
-        source: serde_json::Error,
+        source: stdio::StdioAdmissionError,
     },
 }
 

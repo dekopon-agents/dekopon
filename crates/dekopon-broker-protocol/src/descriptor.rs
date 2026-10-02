@@ -44,6 +44,20 @@ impl DescriptorStream {
         }
     }
 
+    pub async fn peer_disconnected(&self) {
+        let mut byte = [0_u8; 1];
+        loop {
+            if self.stream.readable().await.is_err() {
+                return;
+            }
+            match self.stream.try_read(&mut byte) {
+                Ok(_) => return,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+    }
+
     pub async fn read_frame<T: DeserializeOwned>(
         &mut self,
         limits: FrameLimits,

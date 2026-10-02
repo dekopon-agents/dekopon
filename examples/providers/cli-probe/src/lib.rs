@@ -1,10 +1,11 @@
 use dekopon_provider_sdk::clap::{self, Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Bounded, Capability, Code, Failure, Proposal, Provider, Usage,
+    Bounded, Capability, Code, Failure, Proposal, Provider, Stdout, Usage, stdin,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 
 struct CliProbe;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -45,6 +46,8 @@ struct TextSource {
 #[serde(deny_unknown_fields)]
 struct TextInput {
     text: Bounded<MAX_TEXT_BYTES>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    piped: bool,
 }
 
 #[derive(Serialize)]
@@ -60,12 +63,12 @@ struct CountOutput {
 struct Never;
 impl std::fmt::Display for Never {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("unreachable")
+        f.write_str("probe: piped input is empty, too large or unavailable")
     }
 }
 impl Failure for Never {
     fn code(&self) -> Code {
-        Code::new("unreachable")
+        Code::USAGE
     }
 }
 
@@ -83,10 +86,26 @@ macro_rules! capability {
             const RISK: RiskLevel = RiskLevel::Low;
             type Input = TextInput;
             type Needs = ();
-            type Output = $output;
             type Error = Never;
-            fn run(input: TextInput, (): ()) -> Result<Self::Output, Self::Error> {
-                Ok(($body)(input.text.as_str()))
+            fn run(input: TextInput, (): (), out: &mut Stdout) -> Result<(), Self::Error> {
+                let mut text = input.text.as_str().to_owned();
+                if input.piped {
+                    let reader = stdin().ok_or(Never)?;
+                    reader
+                        .take((MAX_TEXT_BYTES + 1) as u64)
+                        .read_to_string(&mut text)
+                        .map_err(|_| Never)?;
+                    if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+                        return Err(Never);
+                    }
+                }
+                let value: $output = ($body)(&text);
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&value).expect("serializable probe output")
+                )
+                .map_err(|_| Never)
             }
         }
     };
@@ -127,43 +146,72 @@ impl Provider for CliProbe {
     type Args = Probe;
     type Capabilities = (Upper, Count, Reverse);
 
-    fn propose(args: Probe, stdin: Option<&str>) -> Result<Proposal<Self>, Usage> {
+    fn propose(args: Probe, stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         match args.transform {
-            Transform::Upper(source) => propose_text::<Upper>(source, stdin, "upper"),
-            Transform::Count(source) => propose_text::<Count>(source, stdin, "count"),
-            Transform::Reverse(source) => propose_text::<Reverse>(source, stdin, "reverse"),
+            Transform::Upper(source) => propose_text::<Upper>(source, stdin_piped, "upper"),
+            Transform::Count(source) => propose_text::<Count>(source, stdin_piped, "count"),
+            Transform::Reverse(source) => propose_text::<Reverse>(source, stdin_piped, "reverse"),
         }
     }
 }
 
 fn propose_text<C: Capability<Provider = CliProbe, Input = TextInput>>(
     source: TextSource,
-    stdin: Option<&str>,
+    stdin_piped: bool,
     name: &str,
 ) -> Result<Proposal<CliProbe>, Usage> {
     let text = match (source.text, source.piped) {
         (Some(text), _) => text,
-        (None, Some(_)) => Bounded::new(
-            stdin.ok_or_else(|| Usage::new(format!("probe {name} -: nothing was piped in")))?,
-        )
-        .map_err(|error| Usage::new(error.to_string()))?,
+        (None, Some(_)) if stdin_piped => {
+            return Ok(Proposal::to::<C>(TextInput {
+                text: Bounded::new("").expect("empty text is bounded"),
+                piped: true,
+            }));
+        }
+        (None, Some(_)) => return Err(Usage::new(format!("probe {name} -: nothing was piped in"))),
         (None, None) => {
             return Err(Usage::new(format!(
                 "probe {name} takes `--text <TEXT>` or `-`"
             )));
         }
     };
-    Ok(Proposal::to::<C>(TextInput { text }))
+    Ok(Proposal::to::<C>(TextInput { text, piped: false }))
 }
 
 dekopon_provider_sdk::export!(CliProbe);
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
+    use dekopon_provider_sdk::CommandRunOutcome;
     use dekopon_provider_sdk::provider;
-    use dekopon_provider_sdk::{CommandRunOutcome, ComponentResponse};
     use serde_json::json;
+
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn invoke(id: &str, input: &str) -> (provider::NativeExit, Vec<u8>) {
+        let capture = Capture::default();
+        let result = provider::invoke_native::<CliProbe>(
+            id,
+            input,
+            provider::NativeStdio {
+                stdin: None,
+                stdout: Box::new(capture.clone()),
+            },
+        );
+        let bytes = capture.0.lock().unwrap().clone();
+        (result, bytes)
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
@@ -186,11 +234,13 @@ mod tests {
                     .iter()
                     .any(|cap| cap.id.as_str() == id)
             );
+            let (result, stdout) = invoke(&id, r#"{"text":"hello"}"#);
+            assert_eq!(result.status, 0, "{}", result.stderr);
             assert_eq!(
-                provider::call::<CliProbe>(&id, r#"{"text":"hello"}"#),
-                ComponentResponse::Succeeded { output: expected }
+                serde_json::from_slice::<serde_json::Value>(&stdout).unwrap(),
+                expected
             );
-            let proposal = provider::command::<CliProbe>(&argv(&[name, "--text", "hello"]), None);
+            let proposal = provider::command::<CliProbe>(&argv(&[name, "--text", "hello"]), false);
             assert!(
                 matches!(proposal, CommandRunOutcome::Proposed { capability, .. } if capability.as_str() == id)
             );
@@ -201,34 +251,35 @@ mod tests {
     fn help_usage_stdin_and_bounded_input() {
         for flag in ["--help", "-h", "--version"] {
             assert!(
-                matches!(provider::command::<CliProbe>(&argv(&[flag]), None), CommandRunOutcome::Rendered { stdout, stderr, status: 0 } if !stdout.contains('\u{1b}') && stderr.is_empty())
+                matches!(provider::command::<CliProbe>(&argv(&[flag]), false), CommandRunOutcome::Rendered { stdout, stderr, status: 0 } if !stdout.contains('\u{1b}') && stderr.is_empty())
             );
         }
         assert!(
-            matches!(provider::command::<CliProbe>(&argv(&["bogus"]), None), CommandRunOutcome::Rendered { stdout, stderr, status: 2 } if stdout.is_empty() && stderr.contains("unrecognized subcommand") && !stderr.contains('\u{1b}'))
+            matches!(provider::command::<CliProbe>(&argv(&["bogus"]), false), CommandRunOutcome::Rendered { stdout, stderr, status: 2 } if stdout.is_empty() && stderr.contains("unrecognized subcommand") && !stderr.contains('\u{1b}'))
         );
         assert!(
-            matches!(provider::command::<CliProbe>(&argv(&["upper", "-"]), Some("hello")), CommandRunOutcome::Proposed { input, .. } if input == json!({"text":"hello"}))
+            matches!(provider::command::<CliProbe>(&argv(&["upper", "-"]), true), CommandRunOutcome::Proposed { input, .. } if input == json!({"text":"","piped":true}))
         );
         assert!(
-            matches!(provider::command::<CliProbe>(&argv(&["upper", "-"]), None), CommandRunOutcome::Failed { error } if error.code == "usage" && error.message.contains("nothing was piped"))
+            matches!(provider::command::<CliProbe>(&argv(&["upper", "-"]), false), CommandRunOutcome::Failed { error } if error.code == "usage" && error.message.contains("nothing was piped"))
         );
         let too_long = "x".repeat(MAX_TEXT_BYTES + 1);
         assert!(matches!(
-            provider::command::<CliProbe>(&argv(&["upper", "--text", &too_long]), None),
+            provider::command::<CliProbe>(&argv(&["upper", "--text", &too_long]), false),
             CommandRunOutcome::Rendered { status: 2, .. }
         ));
-        assert!(
-            matches!(provider::call::<CliProbe>("cli-probe.upper", &json!({"text":too_long}).to_string()), ComponentResponse::Failed { error } if error.code == "invalid-input")
+        assert_eq!(
+            invoke("cli-probe.upper", &json!({"text":too_long}).to_string())
+                .0
+                .status,
+            2
         );
         for input in [
             json!({}),
             json!({"text":1}),
             json!({"text":"a","extra":true}),
         ] {
-            assert!(
-                matches!(provider::call::<CliProbe>("cli-probe.upper", &input.to_string()), ComponentResponse::Failed { error } if error.code == "invalid-input")
-            );
+            assert_eq!(invoke("cli-probe.upper", &input.to_string()).0.status, 2);
         }
     }
 }

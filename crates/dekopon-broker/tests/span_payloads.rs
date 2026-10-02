@@ -2,7 +2,7 @@
 //! rather than building the full value and cutting it, avoiding a copy of large attachments per
 //! layer.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::sync::Arc;
 
@@ -121,6 +121,12 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
         "reviewer".parse::<AgentId>().expect("valid agent"),
     )
     .bound_to(id.clone());
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
     let result = broker()
         .await
         .invoke(
@@ -134,10 +140,17 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
                 input,
                 secret_use: None,
             },
-            Default::default(),
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("a permitted capability runs");
+    assert_eq!(capture.join().unwrap(), b"{\"characters\":16000}\n");
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
