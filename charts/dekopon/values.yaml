@@ -232,9 +232,9 @@ broker:
   # the image, or a generated lock plus a content-addressed blob store that
   # `dekopon-brokerd provider sync` resolved from digest-pinned OCI artifacts.
   #
-  # The pod never writes into this directory. The claim's `subdir` is mounted into the BROKER
-  # container at `mountPath`, and the init container creates that subdirectory and hands it to 65532
-  # as `0700`. Both are load-bearing. The broker refuses a lock or a store it does not own, and
+  # The pod's precompile init container writes cwasm here before the broker reads it. The claim's
+  # `subdir` is mounted into the broker at `mountPath`; prepare-files creates that subtree and
+  # hands it to UID 65532 as `0700`. Both are load-bearing. The broker refuses a lock or a store it does not own, and
   # refuses any ancestor that is group- or world-writable without the sticky bit; a fresh
   # `local-path` volume arrives root-owned and `0777`, so a first start without the chown refuses.
   #
@@ -313,9 +313,9 @@ broker:
       cpu: 100m
       memory: 256Mi
     limits:
-      # Headroom for Cranelift. A warm cwasm cache skips the compile; this limit covers the
-      # cold-compile peak (about 416 MiB, nearly all Cranelift). The allocator hands back what it
-      # holds after the compile over time; only fewer concurrent compiles lower the peak itself.
+      # The precompile init container compiles and exits before the broker starts, releasing its
+      # compiler memory. This shared limit covers its cold-compile peak (about 416 MiB) as well
+      # as the broker's warm startup; the broker retains its mapped components until it exits.
       cpu: "2"
       memory: 1Gi
 

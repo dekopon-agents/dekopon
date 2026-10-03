@@ -12,6 +12,18 @@ do not understand rather than guessing.
 
 No broker configuration changes are needed. Providers already built against `dekopon:clock/wall@1.0.0` continue to load without rebuilding: the broker's `wall@1.1.0` definition satisfies their 1.x import. New SDK builds import `wall@1.1.0`; providers that use the new `monotonic@1.1.0` or `random/source@0.1.0` interfaces need a v0.32.0 broker before installation. Rebuild and inspect only providers that opt into the new services; there is no compatibility shim or deployment in this change.
 
+## Managed provider precompile (unreleased)
+
+A managed `providerSet` now requires compiled artifacts before the broker starts: the broker
+verifies and maps the cache, and refuses a missing index instead of compiling. The chart runs
+`provider precompile` after `prepare-files` and before the broker when `broker.providerSet.enabled`
+is true; pin an application image containing the new command. For a non-chart managed set, run
+`dekopon-brokerd provider --lock-file <lock> --store <store> precompile` after each upgrade or
+source change and before broker startup, or set `compileOnLoad: true` to bypass the cache.
+Precompile checks locked local blobs, fills or repairs compiled artifacts, and prunes stale engine
+generations. Stop the broker before manually removing mapped artifacts; a pod delete reruns chart
+initialization. Direct `providers:` configurations still compile from source without a cache.
+
 ## Provider streams, model budgets, and image distribution (0.31.0)
 
 Upgrade broker and gateway together before installing providers compiled against
@@ -472,9 +484,9 @@ change.
 ## Mapped compiled providers (0.17.0)
 
 Remove broker `compileCachePath`; it is now an unknown field. Managed `providerSet` startup uses
-`storePath/cwasm/v1` by default. Its first boot compiles and writes the cache; subsequent compatible
-boots verify selected compiled hashes once and map the files. The provider store must be writable
-on a miss. Legacy `providers:` paths continue source compilation without writing a cache.
+`storePath/cwasm/v1` by default. In 0.17.0 its first boot compiled and wrote the cache; subsequent
+compatible boots verified selected compiled hashes once and mapped the files. The precompile
+change above moves that initial publication before startup. Legacy `providers:` paths continue source compilation without writing a cache.
 
 Set `compileOnLoad: true` to disable all cwasm reads/writes, including when a cache error blocks
 startup. Errors do not trigger repair or fallback. For manual cache removal, first stop every

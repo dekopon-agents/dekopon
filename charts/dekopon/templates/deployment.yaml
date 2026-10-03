@@ -295,11 +295,8 @@ spec:
 {{- end }}
 {{- if include "dekopon.providerSetEnabled" . }}
 
-              # The managed provider set's directory on the claim. This pod writes nothing into
-              # it: `dekopon-brokerd provider sync` (broker.providerSync, or the operator's own
-              # step), which has to have run before this pod rolls, writes the lock and the blob
-              # store here, and the broker reads them at startup. What only the pod can do is
-              # ownership.
+              # Sync must have written the lock and blobs before this pod rolls. This container
+              # establishes ownership before precompile writes cwasm and the broker reads it.
               # The broker refuses a lock or a store that is not owned by its own UID, and refuses
               # any ancestor that is group- or world-writable without the sticky bit; a fresh
               # local-path volume arrives root-owned and 0777, so a first start without this
@@ -377,6 +374,26 @@ spec:
 {{- if .Values.providerStorage.enabled }}
             - name: provider-storage
               mountPath: {{ $storageRoot }}
+{{- end }}
+{{- if include "dekopon.providerSetEnabled" . }}
+        - name: precompile
+          image: {{ include "dekopon.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["dekopon-brokerd"]
+          args:
+            - provider
+            - --lock-file={{ .Values.broker.providerSet.mountPath }}/providers.lock.yaml
+            - --store={{ .Values.broker.providerSet.mountPath }}/store
+            - --output=json
+            - precompile
+          securityContext:
+            {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" ($uid | int) "runAsGroup" ($gid | int))) | nindent 12 }}
+          resources:
+            {{- toYaml .Values.broker.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.broker.providerSet.mountPath }}
+              subPath: {{ .Values.broker.providerSet.subdir }}
 {{- end }}
         {{- if .Values.gateway.enabled }}
         {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" true) | nindent 8 }}

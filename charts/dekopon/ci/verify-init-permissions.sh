@@ -70,6 +70,8 @@ assert security["capabilities"]=={"drop":["ALL"],"add":["CHOWN","FOWNER"]}
 assert security["readOnlyRootFilesystem"] and not security["allowPrivilegeEscalation"]
 gateway=next(c for c in pod["containers"] if c["name"]=="gateway")
 broker=next(c for c in pod["initContainers"] if c["name"]=="broker")
+if not any(m.get("subPath")=="providers" for m in broker["volumeMounts"]):
+    assert "precompile" not in [c["name"] for c in pod["initContainers"]]
 for probe in ("startupProbe", "readinessProbe"):
     assert broker[probe]["exec"]["command"] == ["dekopon-brokerd", "probe", "--socket", "/run/dekopon/broker.sock"]
 assert "livenessProbe" not in broker
@@ -808,7 +810,20 @@ for document in yaml.safe_load_all(sys.stdin):
     gateway_paths = {m["mountPath"] for m in gateway.get("volumeMounts", [])}
     assert SET not in gateway_paths, gateway_paths
     assert STATE not in gateway_paths, ("the gateway must never mount the whole claim", gateway_paths)
-    broker = next(c for c in spec["initContainers"] if c["name"] == "broker")
+    inits = spec["initContainers"]
+    assert [c["name"] for c in inits] == ["prepare-files", "precompile", "broker"]
+    precompile, broker = inits[1:]
+    assert precompile["image"] == broker["image"]
+    assert precompile["imagePullPolicy"] == broker["imagePullPolicy"]
+    assert precompile["command"] == ["dekopon-brokerd"]
+    assert precompile["args"] == [
+        "provider", f"--lock-file={SET}/providers.lock.yaml", f"--store={SET}/store",
+        "--output=json", "precompile",
+    ]
+    assert precompile["securityContext"] == broker["securityContext"]
+    assert precompile["securityContext"]["runAsUser"] == precompile["securityContext"]["runAsGroup"] == 65532
+    assert precompile["resources"] == broker["resources"]
+    assert precompile["volumeMounts"] == [{"name":"state", "mountPath":SET, "subPath":"providers"}]
     broker_paths = {m["mountPath"] for m in broker["volumeMounts"]}
     assert STATE not in broker_paths, ("the broker must never mount the whole claim", broker_paths)
     mount = next(m for m in broker["volumeMounts"] if m["mountPath"] == SET)
