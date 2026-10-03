@@ -592,7 +592,7 @@ at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine com
 fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
 
 `compileOnLoad: true` disables cache reads and writes and compiles from source at every startup.
-Legacy `providers:` paths and offline provider-manager commands other than sync and precompile compile without a cache.
+Legacy `providers:` paths and `provider verify` compile without a cache; `provider list` only inspects the lock and store.
 `compileCachePath` is removed, not aliased; remove it from old configurations. The old compressed
 Wasmtime cache is neither read nor migrated. Component startup runs one at a time off Tokio to bound
 compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
