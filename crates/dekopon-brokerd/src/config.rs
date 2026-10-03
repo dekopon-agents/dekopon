@@ -962,6 +962,7 @@ async fn resolve(
                 .as_ref()
                 .filter(|_| !config.compile_on_load && mode == LoadMode::Boot)
                 .map(|(_, store)| store.join("cwasm")),
+            compiled_cache_mode: dekopon_broker_host::CompiledCacheMode::Reader,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
             plaintext_hosts: plaintext_hosts.clone(),
             extra_ca_bundles: Arc::new(extra_ca_bundles),

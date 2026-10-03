@@ -4179,6 +4179,7 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::Linker { .. }
         | BrokerHostError::ArtifactMetadata { .. }
         | BrokerHostError::CompiledArtifact { .. }
+        | BrokerHostError::CompiledArtifactMissing { .. }
         | BrokerHostError::Compile { .. }
         | BrokerHostError::Instantiate { .. }
         | BrokerHostError::DescribeUsedHostImport { .. }

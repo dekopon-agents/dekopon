@@ -50,8 +50,9 @@ read: each credential a capability can select and each secret a policy names is 
 warning naming what boot will require, and credential destination coverage and the secret map are
 not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
-provider paths loads them directly. The peer-UID socket-parent check and the cwasm cache are
-runtime-only and skipped, and a configuration with no `identities` (the chart renders them into
+provider paths loads them directly. `check` publishes validated managed components into its own
+`--store` cwasm cache through sync; provider paths have no cache. The peer-UID socket-parent check
+is runtime-only and skipped, and a configuration with no `identities` (the chart renders them into
 `peers.yaml`) is a warning rather than a problem.
 
 ## Configuration
@@ -578,9 +579,12 @@ hostLimits:
 ```
 
 Managed providers default to immutable, file-backed compiled components under
-`providerSet.storePath/cwasm/v1`. A missing source/engine index compiles the verified Wasm once,
-atomically publishes a raw `.cwasm` named by its own SHA-256, then maps it with Wasmtime. If that
-object already exists, the miss stream-verifies and reuses it instead, and also records `verify`.
+`providerSet.storePath/cwasm/v1`. `provider sync` validates and publishes compiled components
+under the store lock, reusing verified objects when their index is missing. A second sync of
+unchanged sources uses the compiled cache without recompilation. `check` publishes into its own
+`--store` through sync; `provider verify` does not publish. The broker only reads the cache:
+a missing source/engine index refuses startup with `CompiledArtifactMissing`, naming the source
+and engine key. Set `compileOnLoad: true` for a managed set without a precompile step.
 Warm startup stream-verifies each selected compiled artifact's length and SHA-256 once, checks
 engine compatibility, and maps it without decompression or a whole-file buffer. Calls reuse the retained
 component; they neither hash nor reopen it. Source Wasm is still checked against the provider lock
@@ -588,18 +592,16 @@ at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine com
 fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
 
 `compileOnLoad: true` disables cache reads and writes and compiles from source at every startup.
-Legacy `providers:` paths and offline provider-manager commands also compile without a cache.
+Legacy `providers:` paths and offline provider-manager commands other than sync compile without a cache.
 `compileCachePath` is removed, not aliased; remove it from old configurations. The old compressed
 Wasmtime cache is neither read nor migrated. Component startup runs one at a time off Tokio to bound
 compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
 component. The socket binds only after the entire registry validates.
 
-Errors are fatal: a corrupt index/artifact, missing indexed object, incompatible mapped artifact,
-publication conflict, or I/O failure is reported with its cause. There is no retry, eviction,
-automatic repair, or fallback. Disable the feature explicitly to get running again, or stop all
-brokers using the cache and remove its generated `cwasm` directory before restarting. Never rewrite
-or truncate mapped files. The filesystem and local index are trusted; adversarial same-UID file
-replacement is outside this feature's model. Use one cache publisher at a time. Compiled artifacts
+Cache faults stop broker startup without fallback. Delete the pod to rerun `provider precompile`
+and repair the cache, or set `compileOnLoad: true` to bypass it. Never rewrite or truncate mapped
+files. The filesystem and local index are trusted; adversarial same-UID file replacement is outside
+this feature's model. Publishers hold the store lock. Compiled artifacts
 are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or
 2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Historical objects are
 not automatically pruned. Keep the cache on persistent disk, not memory-backed `/tmp`, for

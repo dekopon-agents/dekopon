@@ -262,9 +262,21 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     let mut runnable = document.clone();
     runnable["identities"] = json!([document["identities"][0].clone()]);
     write_config(&path, &runnable);
+    dekopon_broker_host::BrokerProviderRegistry::load_locked_with_options(
+        resolved.locked_providers.clone().expect("locked sources"),
+        dekopon_broker_host::BrokerHostLimits::default(),
+        None,
+        &dekopon_broker_host::BrokerHostOptions {
+            cwasm_dir: resolved.host_options.cwasm_dir.clone(),
+            compiled_cache_mode: dekopon_broker_host::CompiledCacheMode::Publisher,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("publisher fills managed cache before boot");
     super::run(&path, async {})
         .await
-        .expect("daemon populates the default mapped cache before binding");
+        .expect("daemon reads compiled artifacts before binding");
     super::run(&path, async {})
         .await
         .expect("warm daemon loads mapped artifacts");

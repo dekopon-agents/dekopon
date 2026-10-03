@@ -144,11 +144,19 @@ pub struct TestImports {
     pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CompiledCacheMode {
+    #[default]
+    Reader,
+    Publisher,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
     /// None compiles without a cache; the operator must not modify these mapped files while the
     /// registry is alive, since hashes are checked once at startup.
     pub cwasm_dir: Option<PathBuf>,
+    pub compiled_cache_mode: CompiledCacheMode,
     pub max_total_memory_bytes: Option<usize>,
     pub plaintext_hosts: PlaintextHosts,
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
@@ -165,6 +173,7 @@ impl Default for BrokerHostOptions {
     fn default() -> Self {
         Self {
             cwasm_dir: None,
+            compiled_cache_mode: CompiledCacheMode::Reader,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
             plaintext_hosts: PlaintextHosts::default(),
             extra_ca_bundles: Arc::new(Vec::new()),
@@ -333,6 +342,7 @@ struct Runtime {
     engine: Engine,
     engine_key: String,
     cwasm: Option<cwasm::Cache>,
+    compiled_cache_mode: CompiledCacheMode,
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
     memory_budget: Option<Arc<memory::MemoryBudget>>,
@@ -372,6 +382,7 @@ impl Runtime {
             engine_key: cwasm::compatibility_key(&engine),
             engine,
             cwasm,
+            compiled_cache_mode: options.compiled_cache_mode,
             linker,
             limits,
             memory_budget: options
@@ -751,12 +762,28 @@ fn prepare_component(
     let expected_provider_id = source.expected.map(|expected| expected.provider_id);
     let source = source.path;
     let component = match &runtime.cwasm {
-        Some(cache) => cache
-            .load(&runtime.engine, &bytes, &artifact.sha256)
-            .map_err(|error| BrokerHostError::CompiledArtifact {
-                path: source.clone(),
-                source: error,
-            })?,
+        Some(cache) => match runtime.compiled_cache_mode {
+            CompiledCacheMode::Reader => match cache
+                .load(&runtime.engine, &bytes, &artifact.sha256)
+                .map_err(|error| BrokerHostError::CompiledArtifact {
+                    path: source.clone(),
+                    source: error,
+                })? {
+                cwasm::Lookup::Mapped(component) => component,
+                cwasm::Lookup::Missing => {
+                    return Err(BrokerHostError::CompiledArtifactMissing {
+                        path: source,
+                        engine_key: runtime.engine_key.clone(),
+                    });
+                }
+            },
+            CompiledCacheMode::Publisher => cache
+                .publish_component(&runtime.engine, &bytes, &artifact.sha256)
+                .map_err(|error| BrokerHostError::CompiledArtifact {
+                    path: source.clone(),
+                    source: error,
+                })?,
+        },
         None => cwasm::stage("compile", artifact.bytes, || {
             Component::new(&runtime.engine, &bytes)
         })
@@ -2075,7 +2102,9 @@ pub enum BrokerHostError {
         #[source]
         source: std::io::Error,
     },
-    #[error("compiled artifact load failed for {}; set compileOnLoad: true to bypass the cwasm cache", path.display())]
+    #[error("no compiled artifact for {} under engine {engine_key}; delete the pod; `provider precompile` repairs it, or set compileOnLoad: true", path.display())]
+    CompiledArtifactMissing { path: PathBuf, engine_key: String },
+    #[error("compiled artifact load failed for {}; delete the pod; `provider precompile` repairs it, or set compileOnLoad: true", path.display())]
     CompiledArtifact {
         path: PathBuf,
         #[source]

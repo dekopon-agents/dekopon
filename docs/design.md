@@ -286,12 +286,13 @@ The JSONPlaceholder example proves separately named read-only and external-write
 
 **Status: current.** Managed-provider startup defaults to disk-backed, immutable cwasm, addressed by
 compiled SHA-256 through a source-digest/engine-compatibility index. Source lock checks remain;
-selected compiled hashes are verified once at startup, not on calls. A missing index compiles once.
-Other errors stop startup without repair or fallback; `compileOnLoad: true` bypasses cwasm. The
-operator trusts and maintains the local cache, never rewriting mapped inodes. This is a memory and
-startup-cost optimization, not a new adversarial-filesystem boundary. Components load sequentially
-to bound compiler memory; startup traces separate source verification, compilation, publication,
-verification, and mapping from guest execution. The [broker configuration contract](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget)
+selected compiled hashes are verified once at startup, not on calls. The broker refuses startup
+on a missing index or a faulty artifact; `compileOnLoad: true` bypasses cwasm. `provider sync`
+publishes compiled components during validation, and `provider precompile` fills and repairs the
+cache before broker startup. The operator trusts and maintains the local cache, never rewriting
+mapped inodes. This is a memory and startup-cost optimization, not a new adversarial-filesystem
+boundary. Components load sequentially to bound compiler memory; startup traces separate source
+verification, verification and mapping from guest execution. The [broker configuration contract](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget)
 owns the exact layout, bounds, and operator recovery.
 
 ## The granularity of authority
