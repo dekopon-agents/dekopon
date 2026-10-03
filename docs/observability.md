@@ -777,13 +777,15 @@ invocation; `rendered` when the guest answered by itself; `failed` when it decli
 `maxInputBytes`, the guest trapped, or its answer did not decode — whose cause
 `command.resolve.failed` records.
 
-Every read of the `dekopon:clock/wall@1.0.0` import emits `provider_clock_read` at `INFO` from
+Every read of the `dekopon:clock/wall@1.1.0` import emits `provider_clock_read` at `INFO` from
 `dekopon-broker-host`, parented by `provider.invoke`, carrying `unix_millis`: the exact value the
 host handed the guest. A provider's output can depend on the time it read, so the reading is a
 host-supplied input to the run and belongs in the trace beside the proposal's `input`. It is one
 event per read with nothing else attached, and it is not an `audit.event`: audit is one record per
 broker decision, and a clock read is not a decision. Reads outside an invocation emit nothing; they
 trap, and the operation fails as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
+
+Each `dekopon:clock/monotonic@1.1.0` read emits `provider_monotonic_read` with the elapsed `nanos` during invoke, or `status = "overflow"` on refusal. Each `dekopon:random/source@0.1.0` read emits `provider_random_read` with `length` and `status`: `succeeded`, `refused-phase`, `refused-size`, or `entropy-failed`. Random bytes never enter spans, logs, or error messages; a refused phase read fails the pure describe or command run, and a size or entropy failure refuses the invocation even when a guest catches its trap.
 
 A `policy-denied` outcome the policy engine never evaluated additionally emits
 `audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The
@@ -922,7 +924,7 @@ Both records name opaque tokens and paths under the storage root. They are for t
 nothing in them reaches a guest or a model.
 
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. The
-separate `dekopon:clock/wall@1.0.0` import is not a storage interface; its `provider_clock_read`
+separate `dekopon:clock/wall@1.1.0` import is not a storage interface; its `provider_clock_read`
 reading is emitted on storage-backed and other invocations alike, and it names no more than the
 enclosing span's own timestamps already do. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded

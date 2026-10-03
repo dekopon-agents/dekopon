@@ -8,6 +8,10 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Host time and entropy (0.32.0)
+
+No broker configuration changes are needed. Providers already built against `dekopon:clock/wall@1.0.0` continue to load without rebuilding: the broker's `wall@1.1.0` definition satisfies their 1.x import. New SDK builds import `wall@1.1.0`; providers that use the new `monotonic@1.1.0` or `random/source@0.1.0` interfaces need a v0.32.0 broker before installation. Rebuild and inspect only providers that opt into the new services; there is no compatibility shim or deployment in this change.
+
 ## Provider streams, model budgets, and image distribution (0.31.0)
 
 Upgrade broker and gateway together before installing providers compiled against

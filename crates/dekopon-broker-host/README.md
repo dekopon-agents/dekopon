@@ -2,7 +2,7 @@
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
 `dekopon:http@1.2.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.1`, or
-`dekopon:clock@1.0.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
+`dekopon:clock@1.1.0` or `dekopon:random@0.1.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
 `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a
@@ -79,14 +79,15 @@ The linker exposes only these imports; generic WASI and unknown imports fail bef
 | `dekopon:http/client@1.2.0` (`send`, `stream`, `open`, `splice`), buffered `client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
 | `dekopon:asset/asset@0.1.0` | invocation-scoped inputs and exact attach/send grants | typed `denied`, then the tripwire |
 | `dekopon:storage/jsonl@0.1.1`, `dekopon:storage/durable-files@0.1.1` | an invocation carrying an exact storage grant of that interface | typed `permission-denied`, then the tripwire |
-| `dekopon:clock/wall@1.0.0` | every invocation; no grant | traps, then the tripwire |
+| `dekopon:clock/wall@1.1.0`, `dekopon:clock/monotonic@1.1.0` | every invocation; no grant | traps, then the tripwire |
+| `dekopon:random/source@0.1.0` | every invocation; no grant | traps, then the tripwire |
 
 Provider description is linked so an importing component can instantiate, but any host call during
 `describe` rejects the component. Invocation requires an `AuthorizedInvocation`; its provider must
 match the trusted capability route, and absent exact constraints supply no HTTP or storage
 authority.
 
-## Wall clock
+## Host clocks and entropy
 
 `now-unix-millis` returns the host's `SystemTime` as milliseconds since the Unix epoch, saturating
 at `0` for a clock set before 1970. The import has no error channel, so a store built for a
@@ -98,8 +99,10 @@ event carrying `unix_millis`, parented by `provider.invoke`, so the value the gu
 the trace.
 
 A component importing the clock does not load on a host older than this import: instantiation
-fails with `component imports instance \`dekopon:clock/wall@1.0.0\`, but a matching implementation
-was not found in the linker`.
+fails with `component imports instance \`dekopon:clock/wall@1.1.0\`, but a matching implementation
+was not found in the linker`. Providers importing `wall@1.0.0` still instantiate against the 1.1.0 definition.
+
+`monotonic.now-nanos` measures elapsed time since the invocation store was created and is shared across components in that store. Overflow refuses the invocation. `random.get-random-bytes` uses OS entropy only, refuses more than 4096 bytes before allocation and never returns partial bytes on failure. Its event records requested length and status, never bytes; both services trap outside invoke.
 
 ## Buffered and asset-streamed HTTP enforcement
 
