@@ -102,9 +102,9 @@ jobs:
             tag="$REQUESTED_TAG"
             push=true
           else
-            # A pull request has no release of its own. Building its Dockerfile and exact
-            # provider staging inputs against the newest published release proves the part a
-            # pull request can break, before a release depends on it.
+            # A pull request has no release of its own. Check its staging and image
+            # ownership/byte identity against the latest release; component startup is
+            # meaningful only after the matching release binaries exist (tag mode).
             tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             push=false
           fi
@@ -221,30 +221,28 @@ jobs:
                 if ($2 != "65532/65532") { print "unexpected owner " $2 " on " $NF; bad++ }
               }
               END {
-                if (seen != 5) { print "expected 5 provider entries, found " seen; exit 1 }
+                if (seen != 3) { print "expected directory plus two checked probes, found " seen; exit 1 }
                 if (bad) { exit 1 }
                 print "provider components are 65532-owned and not group- or world-writable"
               }'
-            tar -tvf "$rootfs" | awk '
-              $NF ~ /^opt\/dekopon\/optional-providers\// {
-                seen++
-                if ($1 != "-rw-r--r--" && $1 != "drwxr-xr-x") { print "unexpected mode " $1 " on " $NF; bad++ }
-                if ($2 != "65532/65532") { print "unexpected owner " $2 " on " $NF; bad++ }
-              }
-              END {
-                if (seen != 2) { print "expected optional directory plus memory component, found " seen; exit 1 }
-                if (bad) { exit 1 }
-                print "memory is packaged only in the optional provider directory"
-              }'
+            if tar -tf "$rootfs" | grep -Eq '^opt/dekopon/optional-providers/'; then
+              echo "::error::obsolete optional provider directory in image"
+              exit 1
+            fi
           done
 
           # The runner is amd64, so that image runs here for real.
           docker run --rm dekopon-proof:amd64 dekopond --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopond --version
-          # Exercise real broker loading/startup of the baked cli-probe component. This proves
-          # released image bytes, not a native build of the PR's source HEAD.
-          "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
+          # On a PR, the newest released binary predates the new checked stdio probes and
+          # refuses them. Never call that cross-version refusal a provider regression or
+          # claim startup passed: tag mode runs the real broker against matching bytes.
+          if [ "${{ steps.plan.outputs.push }}" = "true" ]; then
+            "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
+          else
+            echo "::notice::broker component startup deferred to tag mode: PR probes and released binary have different provider epochs"
+          fi
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
           human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
           {
@@ -252,7 +250,7 @@ jobs:
             echo "|---|---|"
             echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
-            echo "| binaries executed (amd64) | 2/2 plus broker component load/startup |"
+            echo "| binaries executed (amd64) | 2/2; broker component load only on matching release tag |"
             echo "| unpacked size | $human |"
           } >> "$GITHUB_STEP_SUMMARY"
 

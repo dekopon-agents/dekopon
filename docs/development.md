@@ -531,9 +531,12 @@ exactly that for all four before it pushes anything, and the staging script refu
 binary that needs a glibc newer than the runtime base provides.
 
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits
-under a deadline for its post-load socket. Releases exposing `probe` exercise that command;
-older ones use version-appropriate configuration and prove component-load/startup only. This validates released image bytes, not a native build of source
-HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
+under a deadline for its post-load socket. The workflow runs this component-load check on release
+tags, when the broker binaries match the checked probes. Pull requests stage against the newest
+published release and check image structure and binary identity but skip the cross-version broker
+load when the new probes use a newer provider epoch; a green PR is **not** evidence of 0.31.0
+broker startup. The tag workflow retains the real load gate. This validates released image bytes,
+not a native build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
 checked in-tree components must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 
