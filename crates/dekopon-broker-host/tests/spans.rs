@@ -13,7 +13,8 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CommandRunOutcome,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    CommandRunOutcome, CompiledCacheMode,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, ProposedInvocation, broker::AuthorizationGate,
@@ -126,6 +127,53 @@ fn probe() -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_cache_miss_refuses_startup_and_names_the_artifact() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    capture.clear();
+    let directory = tempfile::tempdir().expect("cache");
+    let path = probe();
+    let error = BrokerProviderRegistry::load_with_options(
+        [path.clone()],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions {
+            cwasm_dir: Some(directory.path().to_owned()),
+            ..BrokerHostOptions::default()
+        },
+    )
+    .await
+    .expect_err("missing index refuses startup");
+    let BrokerHostError::CompiledArtifactMissing {
+        path: missing,
+        engine_key,
+    } = error
+    else {
+        panic!("expected typed missing artifact: {error:?}");
+    };
+    assert_eq!(missing, path);
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "compile"
+    ));
+    BrokerProviderRegistry::load_with_options(
+        [path],
+        BrokerHostLimits::default(),
+        None,
+        &BrokerHostOptions {
+            cwasm_dir: Some(directory.path().to_owned()),
+            compiled_cache_mode: CompiledCacheMode::Publisher,
+            ..BrokerHostOptions::default()
+        },
+    )
+    .await
+    .expect("publisher fills the same engine generation");
+    assert!(directory.path().join("v1").join(engine_key).is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
     let _sequential = SEQUENTIAL.lock().await;
@@ -136,11 +184,15 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
         cwasm_dir: Some(directory.path().to_owned()),
         ..BrokerHostOptions::default()
     };
+    let publisher = BrokerHostOptions {
+        compiled_cache_mode: CompiledCacheMode::Publisher,
+        ..options.clone()
+    };
     let cold = BrokerProviderRegistry::load_with_options(
         [probe()],
         BrokerHostLimits::default(),
         None,
-        &options,
+        &publisher,
     )
     .await
     .expect("cold load");

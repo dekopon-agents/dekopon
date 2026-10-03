@@ -16,7 +16,7 @@ use std::{
 pub use dekopon_broker_host::HARD_MAX_PROVIDER_COMPONENT_BYTES;
 use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
-    LoadedProviderMetadata, LockedProviderSource,
+    CompiledCacheMode, LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::{
     AncestorPolicy, FileHygieneError, FileTier, ProviderId, check_trusted_ancestors,
@@ -250,7 +250,7 @@ impl ProviderManager {
                 fetched += 1;
             }
         }
-        validate_lock(&lock, &store).await?;
+        validate_lock(&lock, &store, store.cache_options()).await?;
         Ok(ProviderSyncReport {
             providers: lock.providers.len(),
             fetched,
@@ -307,7 +307,7 @@ impl ProviderManager {
         let uid = socket::current_uid();
         let lock = load_lock(&self.paths.lock_file, uid).await?;
         let store = ProviderStore::open(&self.paths.store, uid, false)?;
-        validate_lock(&lock, &store).await?;
+        validate_lock(&lock, &store, BrokerHostOptions::default()).await?;
         Ok(ProviderVerifyReport {
             providers: lock.providers.len(),
         })
@@ -371,9 +371,14 @@ async fn validate_candidates(
         .iter()
         .map(|candidate| store.blob_path(&candidate.component_digest))
         .collect::<Result<Vec<_>, _>>()?;
-    let registry = BrokerProviderRegistry::load(paths, BrokerHostLimits::default())
-        .await
-        .map_err(ProviderManagerError::Host)?;
+    let registry = BrokerProviderRegistry::load_with_options(
+        paths,
+        BrokerHostLimits::default(),
+        None,
+        &store.cache_options(),
+    )
+    .await
+    .map_err(ProviderManagerError::Host)?;
     let metadata = registry
         .loaded_provider_metadata()
         .map(|metadata| (metadata.source.clone(), metadata))
@@ -435,6 +440,7 @@ async fn validate_candidates(
 async fn validate_lock(
     lock: &ProviderLock,
     store: &ProviderStore,
+    options: BrokerHostOptions,
 ) -> Result<Vec<LoadedProviderMetadata>, ProviderManagerError> {
     let uid = socket::current_uid();
     for provider in &lock.providers {
@@ -445,7 +451,7 @@ async fn validate_lock(
         lock.sources(store)?,
         BrokerHostLimits::default(),
         None,
-        &BrokerHostOptions::default(),
+        &options,
     )
     .await
     .map_err(ProviderManagerError::Host)?;
@@ -1418,6 +1424,14 @@ impl ProviderStore {
         open_operation_lock(&self.root.join(".provider-manager.lock"), self.uid)
     }
 
+    fn cache_options(&self) -> BrokerHostOptions {
+        BrokerHostOptions {
+            cwasm_dir: Some(self.root.join("cwasm")),
+            compiled_cache_mode: CompiledCacheMode::Publisher,
+            ..BrokerHostOptions::default()
+        }
+    }
+
     fn blob_path(&self, digest: &str) -> Result<PathBuf, ProviderManagerError> {
         Ok(self.sha256.join(format!("{}.wasm", digest_hex(digest)?)))
     }
@@ -2220,7 +2234,20 @@ impl ProviderManagerError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tracing::{
+        field::{Field, Visit},
+        span::{Attributes, Id},
+    };
+    use tracing_subscriber::{
+        layer::{Context, SubscriberExt as _},
+        registry::LookupSpan,
+        util::SubscriberInitExt as _,
+    };
 
     use axum::{
         Router,
@@ -2232,6 +2259,68 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[derive(Default)]
+    struct SyncCompileState {
+        source: Option<PathBuf>,
+        stages: usize,
+    }
+
+    struct SyncCompileStages(Arc<parking_lot::Mutex<SyncCompileState>>);
+    struct TrackedSource;
+
+    #[derive(Default)]
+    struct StageFields {
+        path: String,
+        stage: String,
+    }
+
+    impl Visit for StageFields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "path" => self.path = format!("{value:?}"),
+                "stage" => self.stage = format!("{value:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SyncCompileStages
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
+            let mut fields = StageFields::default();
+            attributes.record(&mut fields);
+            if attributes.metadata().name() == "provider.compile" {
+                let source = self.0.lock().source.clone();
+                if source.is_some_and(|source| fields.path.contains(&source.display().to_string()))
+                    && let Some(span) = context.span(id)
+                {
+                    span.extensions_mut().insert(TrackedSource);
+                }
+            } else if attributes.metadata().name() == "provider.load_stage"
+                && fields.stage == "\"compile\""
+                && context
+                    .span(id)
+                    .and_then(|span| span.parent())
+                    .is_some_and(|parent| parent.extensions().get::<TrackedSource>().is_some())
+            {
+                self.0.lock().stages += 1;
+            }
+        }
+    }
+
+    fn sync_compile_probe() -> Arc<parking_lot::Mutex<SyncCompileState>> {
+        static PROBE: OnceLock<Arc<parking_lot::Mutex<SyncCompileState>>> = OnceLock::new();
+        Arc::clone(PROBE.get_or_init(|| {
+            let state = Arc::new(parking_lot::Mutex::new(SyncCompileState::default()));
+            tracing_subscriber::registry()
+                .with(SyncCompileStages(Arc::clone(&state)))
+                .init();
+            state
+        }))
+    }
 
     #[derive(Clone)]
     struct RegistryState {
@@ -2404,6 +2493,92 @@ mod tests {
         })
         .expect("manager fixture");
         (manager, paths)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_publishes_what_it_compiles() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        manager.sync().await.expect("initial sync publishes");
+        let lock = load_lock(&paths.lock_file, socket::current_uid())
+            .await
+            .expect("lock");
+        let blob = paths.store.join("blobs/sha256").join(format!(
+            "{}.wasm",
+            digest_hex(&lock.providers[0].component_digest).expect("digest")
+        ));
+        let cache = paths.store.join("cwasm/v1");
+        let indexes = fs::read_dir(&cache)
+            .expect("cache")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir() && path.file_name().is_some_and(|name| name != "sha256"))
+            .expect("engine generation");
+        let index = fs::read_dir(indexes)
+            .expect("indexes")
+            .next()
+            .expect("published index")
+            .expect("index entry")
+            .path();
+        let before = fs::read(&index).expect("index bytes");
+        BrokerProviderRegistry::load_locked_with_options(
+            lock.sources(
+                &ProviderStore::open(&paths.store, socket::current_uid(), false).expect("store"),
+            )
+            .expect("sources"),
+            BrokerHostLimits::default(),
+            None,
+            &BrokerHostOptions {
+                cwasm_dir: Some(paths.store.join("cwasm")),
+                ..BrokerHostOptions::default()
+            },
+        )
+        .await
+        .expect("broker reads published artifact");
+        let probe = sync_compile_probe();
+        {
+            let mut state = probe.lock();
+            state.source = Some(blob.clone());
+            state.stages = 0;
+        }
+        manager.sync().await.expect("second sync");
+        assert_eq!(
+            probe.lock().stages,
+            0,
+            "unchanged sync must not enter compile stage"
+        );
+        assert_eq!(fs::read(&index).expect("warm index preserved"), before);
+        fs::remove_file(&index).expect("force locked-sync cache miss");
+        manager
+            .sync_locked()
+            .await
+            .expect("locked sync publishes missing index");
+        assert_eq!(probe.lock().stages, 1, "locked miss enters compile stage");
+        manager.sync_locked().await.expect("warm locked sync");
+        assert_eq!(
+            probe.lock().stages,
+            1,
+            "unchanged locked sync skips compile"
+        );
+        probe.lock().source = None;
+        assert_eq!(fs::read(&index).expect("locked sync republished"), before);
+        BrokerProviderRegistry::load_locked_with_options(
+            lock.sources(
+                &ProviderStore::open(&paths.store, socket::current_uid(), false).expect("store"),
+            )
+            .expect("sources"),
+            BrokerHostLimits::default(),
+            None,
+            &BrokerHostOptions {
+                cwasm_dir: Some(paths.store.join("cwasm")),
+                ..BrokerHostOptions::default()
+            },
+        )
+        .await
+        .expect("broker reads locked-sync publication");
+        assert!(blob.exists());
     }
 
     #[test]

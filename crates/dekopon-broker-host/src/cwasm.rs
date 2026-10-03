@@ -1,6 +1,3 @@
-//! Only a missing index counts as a cache miss; every other failure stops startup, and the operator
-//! must never modify or truncate a mapped artifact in place.
-
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -31,6 +28,12 @@ struct Entry {
     bytes: u64,
 }
 
+#[derive(Debug)]
+pub(crate) enum Lookup {
+    Mapped(Component),
+    Missing,
+}
+
 pub(crate) struct Cache {
     root: PathBuf,
     engine_key: String,
@@ -46,22 +49,106 @@ impl Cache {
         }
     }
 
+    pub(crate) fn publish_component(
+        &self,
+        engine: &Engine,
+        wasm: &[u8],
+        source_sha256: &str,
+    ) -> wasmtime::Result<Component> {
+        match self.load(engine, wasm, source_sha256) {
+            Ok(Lookup::Mapped(component)) => return Ok(component),
+            Ok(Lookup::Missing) => {}
+            Err(error) => {
+                let index = self
+                    .root
+                    .join(&self.engine_key)
+                    .join(format!("{source_sha256}.json"));
+                let mut bytes = Vec::new();
+                File::open(&index)?
+                    .take(MAX_INDEX_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if let Ok(entry) = serde_json::from_slice::<Entry>(&bytes)
+                    && entry.sha256.len() == 64
+                    && entry
+                        .sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && entry.bytes > 0
+                    && entry.bytes <= MAX_CWASM_BYTES
+                {
+                    let object = self.object(&entry);
+                    match File::open(&object) {
+                        Ok(_) => {
+                            if let Err(fault) = verify(&object, &entry) {
+                                refuse_unreadable(&fault)?;
+                                fs::remove_file(&object)?;
+                            }
+                        }
+                        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(io_error) => return Err(io_error.into()),
+                    }
+                }
+                fs::remove_file(&index)?;
+                tracing::warn!(path = %index.display(), reason = %error, "repairing compiled index");
+            }
+        }
+        let compiled = stage("compile", wasm.len() as u64, || {
+            engine.precompile_component(wasm)
+        })?;
+        wasmtime::ensure!(
+            compiled.len() as u64 <= MAX_CWASM_BYTES,
+            "compiled component exceeds {MAX_CWASM_BYTES} bytes"
+        );
+        let artifact = stage("artifact_hash", compiled.len() as u64, || {
+            Ok(identify_bytes(&compiled))
+        })?;
+        let entry = Entry {
+            sha256: artifact.sha256,
+            bytes: artifact.bytes,
+        };
+        let object = self.object(&entry);
+        let existing = object.try_exists().map_err(|error| {
+            wasmtime::Error::msg(format!(
+                "stat compiled artifact {}: {error}",
+                object.display()
+            ))
+        })?;
+        let mut reusable = existing;
+        if existing && let Err(error) = stage("verify", entry.bytes, || verify(&object, &entry)) {
+            refuse_unreadable(&error)?;
+            fs::remove_file(&object)?;
+            tracing::warn!(path = %object.display(), reason = %error, "repairing compiled artifact");
+            reusable = false;
+        }
+        let index = self
+            .root
+            .join(&self.engine_key)
+            .join(format!("{source_sha256}.json"));
+        stage("publish", entry.bytes, || {
+            fs::create_dir_all(self.root.join(&self.engine_key))?;
+            if !reusable {
+                fs::create_dir_all(self.root.join("sha256"))?;
+                ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
+                publish(&object, &compiled)?;
+            }
+            publish(&index, &serde_json::to_vec(&entry)?)
+        })?;
+        drop(compiled);
+        let mut loaded = self.loaded.lock();
+        self.map(engine, entry, &mut loaded)
+    }
+
     pub(crate) fn load(
         &self,
         engine: &Engine,
-        wasm: &[u8],
+        _wasm: &[u8],
         source_sha256: &str,
-    ) -> wasmtime::Result<Component> {
-        self.load_inner(engine, wasm, source_sha256)
+    ) -> wasmtime::Result<Lookup> {
+        self.load_inner(engine, source_sha256)
             .map_err(|error| error.context(format!("cwasm cache {}", self.root.display())))
     }
 
-    fn load_inner(
-        &self,
-        engine: &Engine,
-        wasm: &[u8],
-        source_sha256: &str,
-    ) -> wasmtime::Result<Component> {
+    fn load_inner(&self, engine: &Engine, source_sha256: &str) -> wasmtime::Result<Lookup> {
         let started = Instant::now();
         let mut loaded = self.loaded.lock();
         tracing::Span::current().record("cache_wait_us", micros(started));
@@ -104,47 +191,7 @@ impl Cache {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::Span::current().record("cache", "miss");
-                let compiled = stage("compile", wasm.len() as u64, || {
-                    engine.precompile_component(wasm)
-                })?;
-                wasmtime::ensure!(
-                    compiled.len() as u64 <= MAX_CWASM_BYTES,
-                    "compiled component exceeds {MAX_CWASM_BYTES} bytes"
-                );
-                let artifact = stage("artifact_hash", compiled.len() as u64, || {
-                    Ok(identify_bytes(&compiled))
-                })?;
-                let entry = Entry {
-                    sha256: artifact.sha256,
-                    bytes: artifact.bytes,
-                };
-                let object = self.object(&entry);
-                // An engine-key change can compile bytes another index already published.
-                let existing = object.try_exists().map_err(|error| {
-                    wasmtime::Error::msg(format!(
-                        "stat compiled artifact {}: {error}",
-                        object.display()
-                    ))
-                })?;
-                if existing {
-                    stage("verify", entry.bytes, || verify(&object, &entry)).map_err(|error| {
-                        error.context(format!(
-                            "compiled artifact {} cannot be reused; stop its users and remove the cwasm directory, or set compileOnLoad: true",
-                            object.display()
-                        ))
-                    })?;
-                }
-                stage("publish", entry.bytes, || {
-                    fs::create_dir_all(self.root.join(&self.engine_key))?;
-                    if !existing {
-                        fs::create_dir_all(self.root.join("sha256"))?;
-                        ensure_capacity(&self.root.join("sha256"), entry.bytes)?;
-                        publish(&object, &compiled)?;
-                    }
-                    publish(&index, &serde_json::to_vec(&entry)?)
-                })?;
-                drop(compiled);
-                return self.map(engine, entry, &mut loaded);
+                return Ok(Lookup::Missing);
             }
             Err(error) => {
                 return Err(wasmtime::Error::msg(format!(
@@ -156,11 +203,11 @@ impl Cache {
         if let Some(component) = loaded.get(&entry.sha256) {
             tracing::Span::current().record("cache", "reuse");
             record_artifact(&entry);
-            return Ok(component.clone());
+            return Ok(Lookup::Mapped(component.clone()));
         }
         let object = self.object(&entry);
         stage("verify", entry.bytes, || verify(&object, &entry))?;
-        self.map(engine, entry, &mut loaded)
+        self.map(engine, entry, &mut loaded).map(Lookup::Mapped)
     }
 
     fn object(&self, entry: &Entry) -> PathBuf {
@@ -183,6 +230,19 @@ impl Cache {
     }
 }
 
+fn refuse_unreadable(error: &wasmtime::Error) -> wasmtime::Result<()> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && io_error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(wasmtime::Error::msg(format!(
+                "cannot repair unreadable compiled artifact: {error:#}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn record_artifact(entry: &Entry) {
     let span = tracing::Span::current();
     span.record("cwasm_sha256", &entry.sha256);
@@ -191,10 +251,7 @@ fn record_artifact(entry: &Entry) {
 
 fn verify(path: &Path, entry: &Entry) -> wasmtime::Result<()> {
     let mut file = File::open(path).map_err(|error| {
-        wasmtime::Error::msg(format!(
-            "open compiled artifact {}: {error}",
-            path.display()
-        ))
+        wasmtime::Error::new(error).context(format!("open compiled artifact {}", path.display()))
     })?;
     let actual = file.metadata()?.len();
     wasmtime::ensure!(
@@ -229,7 +286,7 @@ fn ensure_capacity(objects: &Path, requested: u64) -> wasmtime::Result<()> {
         bytes = bytes.saturating_add(entry.metadata()?.len());
         wasmtime::ensure!(
             count + 1 < MAX_CACHE_OBJECTS && bytes <= MAX_CACHE_BYTES,
-            "compiled cache {} is full (maximum {MAX_CACHE_OBJECTS} objects / {MAX_CACHE_BYTES} bytes); stop its users and remove the cwasm directory, or set compileOnLoad: true",
+            "compiled cache {} is full (maximum {MAX_CACHE_OBJECTS} objects / {MAX_CACHE_BYTES} bytes); delete the pod; `provider precompile` repairs it, or set compileOnLoad: true",
             objects.display()
         );
     }
@@ -242,8 +299,7 @@ fn publish(path: &Path, bytes: &[u8]) -> wasmtime::Result<()> {
         .ok_or_else(|| wasmtime::Error::msg("compiled artifact has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
-    // Never overwrites an inode another broker may already have mapped; concurrent publishers fail
-    // visibly, with no locking, retry, or recovery transaction.
+    // Never overwrite a mapped inode; publishers hold the store lock.
     temporary.persist_noclobber(path).map_err(|error| {
         wasmtime::Error::msg(format!(
             "publish compiled artifact {}: {error}",
@@ -258,8 +314,8 @@ fn publish(path: &Path, bytes: &[u8]) -> wasmtime::Result<()> {
     reason = "Wasmtime's trusted-file deserializer; the only unsafe call in the broker host"
 )]
 fn deserialize(engine: &Engine, path: &Path) -> wasmtime::Result<Component> {
-    // SAFETY: cache misses originate in Engine::precompile_component. Hits have a verified
-    // content hash and a trusted local index binding them to source/engine identity. The
+    // SAFETY: publishers produce cache objects with Engine::precompile_component. Hits have a
+    // verified hash and a trusted local index binding them to source/engine identity. The
     // operator owns the cache and keeps mapped files immutable until all users exit.
     // Adversarial filesystem mutation is explicitly outside this feature's trust model.
     unsafe { Component::deserialize_file(engine, path) }
@@ -326,8 +382,8 @@ mod tests {
         let cache = Cache::new(root.to_owned(), engine);
         let source = identify_bytes(EMPTY_COMPONENT);
         cache
-            .load(engine, EMPTY_COMPONENT, &source.sha256)
-            .expect("cold load");
+            .publish_component(engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("cold publish");
         let index = cache
             .root
             .join(&cache.engine_key)
@@ -351,6 +407,9 @@ mod tests {
         );
         let cache = Cache::new(directory.path().to_owned(), &engine);
         let source = identify_bytes(EMPTY_COMPONENT);
+        cache
+            .publish_component(&engine, b"not wasm", &source.sha256)
+            .expect("publisher does not recompile a warm entry");
         cache
             .load(&engine, b"not wasm", &source.sha256)
             .expect("warm mapped load");
@@ -411,8 +470,8 @@ mod tests {
         fs::remove_file(&index).expect("remove index");
         let source = identify_bytes(EMPTY_COMPONENT);
         Cache::new(directory.path().to_owned(), &engine)
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect("load existing object");
+            .publish_component(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("publish index for existing object");
         assert!(index.is_file());
         let entry: Entry =
             serde_json::from_slice(&fs::read(&index).expect("index")).expect("entry");
@@ -423,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_index_refuses_mismatched_object_with_reset_path() {
+    fn missing_index_repairs_mismatched_object() {
         let directory = tempfile::tempdir().expect("directory");
         let engine = Engine::default();
         let (index, object) = populate(directory.path(), &engine);
@@ -432,20 +491,30 @@ mod tests {
         damaged[0] ^= 1;
         fs::write(&object, &damaged).expect("corrupt unmapped object");
         let source = identify_bytes(EMPTY_COMPONENT);
-        let error = Cache::new(directory.path().to_owned(), &engine)
-            .load(&engine, EMPTY_COMPONENT, &source.sha256)
-            .expect_err("mismatched object");
-        let message = format!("{error:#}");
-        assert!(message.contains(&object.display().to_string()), "{message}");
-        assert!(message.contains("SHA-256 mismatch"), "{message}");
-        assert!(
-            message.contains(
-                "stop its users and remove the cwasm directory, or set compileOnLoad: true"
-            ),
-            "{message}"
-        );
-        assert!(!index.exists());
-        assert_eq!(fs::read(&object).expect("unchanged object"), damaged);
+        Cache::new(directory.path().to_owned(), &engine)
+            .publish_component(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("replace mismatched object");
+        assert!(index.exists());
+        assert_ne!(fs::read(&object).expect("replaced object"), damaged);
+    }
+
+    #[test]
+    fn publisher_repairs_a_faulty_index_and_dangling_object() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Engine::default();
+        let (index, object) = populate(directory.path(), &engine);
+        fs::remove_file(&object).expect("simulate missing object");
+        let source = identify_bytes(EMPTY_COMPONENT);
+        Cache::new(directory.path().to_owned(), &engine)
+            .publish_component(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("repair missing object");
+        assert!(object.exists());
+        fs::write(&index, b"not json").expect("damage index");
+        Cache::new(directory.path().to_owned(), &engine)
+            .publish_component(&engine, EMPTY_COMPONENT, &source.sha256)
+            .expect("repair malformed index");
+        assert!(index.exists());
+        assert!(object.exists());
     }
 
     #[test]

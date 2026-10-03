@@ -193,13 +193,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Do not modify mapped artifacts while the harness is alive; loading fails without fallback.
-    #[must_use]
-    pub fn compile_cache(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.host_options.cwasm_dir = Some(directory.into());
-        self
-    }
-
     #[must_use]
     pub fn continuity(mut self, continuity: ContinuityPolicy) -> Self {
         self.continuity = continuity;

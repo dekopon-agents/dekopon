@@ -51,9 +51,10 @@ beyond that.
 into the broker's authority surface:
 
 - `cwasm_dir` enables immutable, content-addressed, mmap-backed compiled artifacts in a trusted
-  operator-owned directory. `None` compiles directly with no cache. A missing source/engine index
-  compiles once; a hit stream-verifies compiled bytes once per registry boot before mapping.
-  Errors fail loading, never trigger fallback or repair. No invocation rehashes or reopens files.
+  operator-owned directory. `None` compiles directly with no cache. The default reader mode
+  refuses a missing source/engine index; publisher mode is used by provider sync under the store
+  lock to fill the cache. A hit stream-verifies compiled bytes once per registry boot before
+  mapping. Reader errors fail loading, never trigger fallback or repair. No invocation rehashes or reopens files.
   The operator must keep mapped inodes unchanged until every registry using them exits. One private
   `cwasm::deserialize` function is the sole scoped unsafe exception, calling Wasmtime's file API;
   the rest of the crate denies unsafe code. See the [broker configuration contract](../dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
