@@ -21,8 +21,6 @@ use rustls::{
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 use tokio_rustls::TlsAcceptor;
 
-/// Connections served at once; one more waits in the kernel backlog until one closes.
-const MAX_CONNECTIONS: usize = 32;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,9 +249,15 @@ impl Listener {
     }
 
     /// Serves until `shutdown` resolves, then aborts every connection; a stream cut there settles
-    /// its admission as cancelled.
-    pub async fn serve(self, router: Router, shutdown: impl Future<Output = ()>) {
-        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    /// its admission as cancelled. Past `max_connections` one more connection waits in the kernel
+    /// backlog until one closes.
+    pub async fn serve(
+        self,
+        router: Router,
+        max_connections: usize,
+        shutdown: impl Future<Output = ()>,
+    ) {
+        let permits = Arc::new(Semaphore::new(max_connections));
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
         loop {
@@ -397,7 +401,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let router = Router::new().route("/", axum::routing::get(|| async { "served" }));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(listener.serve(router, async {
+        tokio::spawn(listener.serve(router, 4, async {
             let _stopped = stopped.await;
         }));
         (address, stop)

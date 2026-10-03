@@ -26,8 +26,18 @@ pub struct ProxyConfig {
     pub bind: SocketAddr,
     pub tls: ProxyTlsConfig,
     pub jail_identity: String,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     #[serde(default)]
     pub guests: BTreeMap<String, GuestConfig>,
+}
+
+/// Each connection briefly holds two copies of a body of up to 8 MiB, so 16 keeps request bodies
+/// under 256 MiB together.
+const DEFAULT_MAX_CONNECTIONS: usize = 16;
+
+const fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,6 +69,8 @@ pub enum ProxyProblem {
     EmptySubject,
     #[error("proxy jailIdentity must be a URI")]
     InvalidJailIdentity,
+    #[error("proxy maxConnections must be at least 1")]
+    NoConnections,
     #[error("proxy TLS files are unusable")]
     Tls(#[source] dekopon_model_proxy::tls::TlsError),
 }
@@ -68,6 +80,7 @@ pub struct ResolvedProxy {
     pub bind: SocketAddr,
     pub files: TlsFiles,
     pub jail_identity: String,
+    pub max_connections: usize,
     pub guests: BTreeMap<String, (AgentId, BTreeSet<String>)>,
 }
 
@@ -86,6 +99,9 @@ pub(crate) fn resolve(
     };
     if !config.jail_identity.contains("://") {
         problems.push(ProxyProblem::InvalidJailIdentity);
+    }
+    if config.max_connections == 0 {
+        problems.push(ProxyProblem::NoConnections);
     }
     if let Err(error) = dekopon_model_proxy::tls::server_config(&files, &config.jail_identity) {
         problems.push(ProxyProblem::Tls(error));
@@ -133,6 +149,7 @@ pub(crate) fn resolve(
         bind: config.bind,
         files,
         jail_identity: config.jail_identity,
+        max_connections: config.max_connections,
         guests,
     })
 }
@@ -248,7 +265,7 @@ pub(crate) async fn start_with(
                 bind: proxy.bind,
                 source,
             })?;
-    tasks.spawn(listener.serve(router, std::future::pending()));
+    tasks.spawn(listener.serve(router, proxy.max_connections, std::future::pending()));
     tracing::info!(
         event = "gateway_proxy_listening",
         proxy.port = address.port()
@@ -372,6 +389,7 @@ mod tests {
         let (agent, models) = &proxy.guests["dekopon:gylmar-vm"];
         assert_eq!(agent.as_str(), "gylmar");
         assert_eq!(models.len(), 2);
+        assert_eq!(proxy.max_connections, 16);
     }
 
     #[test]
@@ -380,7 +398,7 @@ mod tests {
         std::fs::remove_file(pki.directory.path().join("ca.crt")).unwrap();
         let document = document(
             pki.directory.path(),
-            "  guests:\n    'dekopon:ghost-vm': {agent: ghost, models: [nope, local]}\n",
+            "  maxConnections: 0\n  guests:\n    'dekopon:ghost-vm': {agent: ghost, models: [nope, local]}\n",
         )
         .replace("agent: gylmar}", "agent: gylmar, model: claude-opus}");
         let Err(ConfigError::Invalid { problems, .. }) = resolved(&document) else {
@@ -393,6 +411,7 @@ mod tests {
             "model \"local\", whose kind openaiCompatible",
             "TLS files are unusable",
             "served only through the guest model proxy",
+            "maxConnections must be at least 1",
         ] {
             assert!(
                 rendered.iter().any(|problem| problem.contains(expected)),

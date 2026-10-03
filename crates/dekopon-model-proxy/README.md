@@ -20,8 +20,10 @@ with a client certificate and asserts which VM it serves in `x-dekopon-vm-subjec
   what was observed. While the upstream is silent the proxy writes `: ping` every 20 s.
 - `tls::Listener` requires a client certificate that chains to the configured CA and carries the
   configured URI SAN, and rereads its files when their mtime changes.
-- Bodies are capped at 8 MiB (`MAX_BODY_BYTES`); past it the proxy answers 413. At most 32
-  connections are served at once, so request bodies stay under 256 MiB together.
+- Bodies are capped at 8 MiB (`MAX_BODY_BYTES`); past it the proxy answers 413. `Listener::serve`
+  takes the connection cap (`dekopond`'s `proxy.maxConnections`, default 16). Each connection
+  briefly holds two copies of its body while reading and rewriting it, so request bodies take up to
+  `max_connections × 2 × 8 MiB` together: 256 MiB at the default.
 
 It owns no budgets, usage parsing or credential refresh: those live in
 `dekopon-model-token-governor`, `dekopon_model::wire` and `dekopon_model::chatgpt::CredentialFile`.
