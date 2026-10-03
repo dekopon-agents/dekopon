@@ -601,7 +601,9 @@ component. The socket binds only after the entire registry validates.
 Cache faults stop broker startup without fallback. Run `provider precompile` before starting a
 managed broker; with the chart's precompile init container, delete the pod to rerun it. It
 repairs faulty indexes and objects, then prunes old generations and unreferenced files. Set
-`compileOnLoad: true` to bypass cwasm if there is no precompile step. Never rewrite or truncate mapped
+`compileOnLoad: true` to bypass cwasm if there is no precompile step. Under the chart,
+`compileOnLoad: true` does not skip the precompile init container; a cache precompile cannot read
+is reset by deleting `store/cwasm` on the claim before the pod restarts. Never rewrite or truncate mapped
 files. The filesystem and local index are trusted; adversarial same-UID file replacement is outside
 this feature's model. Publishers hold the store lock. Compiled artifacts
 are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or

@@ -261,6 +261,8 @@ emits **no audit record**.
   Managed providers default to verified mmap-backed cwasm on the provider store's persistent disk;
   `compileOnLoad: true` bypasses it. The precompile init container builds or repairs a cold cache
   before the broker starts; with the cache enabled, startup only verifies and maps artifacts.
+  `compileOnLoad: true` does not skip the init container; a cache precompile cannot read is reset
+  by deleting `store/cwasm` on the claim before the pod restarts.
   Do not put the cache on the chart's memory-backed `/tmp`. The probe budget covers startup
   validation, and must also cover compilation when `compileOnLoad: true`.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
