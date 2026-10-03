@@ -3,6 +3,7 @@ dekopon-core
 dekopon-telemetry
 dekopon-capability
 dekopon-storage-host
+dekopon-model-token-governor
 dekopon-model
 dekopon-shell
 dekopon-process

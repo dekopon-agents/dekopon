@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(items[1]["arguments"], r#"{"message":"hello"}"#);
         assert_eq!(
             turn.usage,
-            Some(crate::model::ModelUsage {
+            Some(dekopon_model_token_governor::ModelUsage {
                 input_tokens: Some(120),
                 cache_write_tokens: None,
                 cached_input_tokens: Some(100),

@@ -272,6 +272,8 @@ pub struct DekopondConfig {
     pub shutdown_grace_ms: Option<u64>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    #[serde(default)]
+    pub metering: Option<crate::metering::MeteringConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -873,6 +875,7 @@ pub struct ResolvedConfig {
     pub wakes: Option<ResolvedWakes>,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
+    pub metering: crate::metering::ResolvedMetering,
 }
 
 /// `Check` keeps going past a directory's fragment refusals so they are reported beside whatever
@@ -1273,6 +1276,23 @@ pub(crate) fn resolve(
         }
     }
 
+    let mut metering_problems = Vec::new();
+    let metering = crate::metering::resolve(
+        config.metering,
+        &config
+            .routes
+            .iter()
+            .map(|route| route.agent.to_string())
+            .collect(),
+        &model_names,
+        config.telemetry.is_some(),
+        &mut metering_problems,
+    );
+    problems.extend(metering_problems.into_iter().map(ConfigProblem::Metering));
+    if let Some(crate::metering::RestoreConfig::Openobserve { auth_env, .. }) = &metering.restore {
+        check_env_name(auth_env, &mut problems);
+    }
+
     let mut routes = Vec::with_capacity(config.routes.len());
     for (index, route) in config.routes.into_iter().enumerate() {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
@@ -1616,6 +1636,7 @@ pub(crate) fn resolve(
                 wakes,
                 shutdown_grace,
                 telemetry,
+                metering,
             })
         }
         _ => Err(ConfigError::Invalid {
@@ -1996,6 +2017,8 @@ pub enum ConfigError {
 
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error(transparent)]
+    Metering(crate::metering::MeteringProblem),
     #[error("model {name:?} requires a nonempty model identifier")]
     EmptyModelId { name: String },
     #[error("model {name:?}: {problem}")]

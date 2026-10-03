@@ -9,6 +9,7 @@ members = [
     "crates/dekopon-config",
     "crates/dekopon-core",
     "crates/dekopon-model",
+    "crates/dekopon-model-token-governor",
     "crates/dekopon-http-host",
     "crates/dekopon-policy",
     "crates/dekopon-provider-sdk",
@@ -41,6 +42,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 http = "1.4.2"
 http-body = "1.1.0"
+humantime = "2.4.0"
 cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
 form_urlencoded = "1.2.2"
@@ -110,6 +112,7 @@ dekopon-config = { version = "0.30.0", path = "crates/dekopon-config" }
 dekopon-core = { version = "0.30.0", path = "crates/dekopon-core", default-features = false }
 dekopon-http-host = { version = "0.30.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.30.0", path = "crates/dekopon-model" }
+dekopon-model-token-governor = { version = "0.30.0", path = "crates/dekopon-model-token-governor" }
 dekopon-policy = { version = "0.30.0", path = "crates/dekopon-policy" }
 dekopon-provider-sdk = { version = "0.30.0", path = "crates/dekopon-provider-sdk" }
 dekopon-provider-sdk-testkit = { version = "0.30.0", path = "crates/dekopon-provider-sdk-testkit" }

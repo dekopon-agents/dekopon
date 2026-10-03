@@ -9,10 +9,11 @@ use std::{
 use dekopon_config::Skill;
 use dekopon_model::error::InferenceError;
 use dekopon_model::model::{
-    ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+    ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall,
     assistant_message,
 };
 use dekopon_model::{ModelText, TurnEvent};
+use dekopon_model_token_governor::ModelUsage;
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -473,6 +474,9 @@ fn report_end(
     let Some(sink) = progress else {
         return;
     };
+    if let PromptError::Model(InferenceError::OverBudget(_)) = error {
+        return;
+    }
     sink.emit(match FailureClass::of(error) {
         Some(class) => ProgressEvent::Failed { class },
         None => ProgressEvent::Cancelled {
@@ -660,6 +664,21 @@ where
                     continue;
                 }
                 return Err(PromptError::Cancelled);
+            }
+            Err(InferenceError::OverBudget(refusal)) => {
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "accounting.model.turn",
+                        model.turn = model_turns,
+                        agent = agent,
+                        duration_ms = milliseconds(model_started.elapsed()),
+                        outcome = "refused",
+                        refusal = %refusal,
+                    },
+                    "model turn refused by the token budget"
+                );
+                return Err(InferenceError::OverBudget(refusal).into());
             }
             Err(error) => {
                 tracing::error!(
@@ -1642,8 +1661,9 @@ mod tests {
     use dekopon_model::error::InferenceError;
     use dekopon_model::model::{
         AssistantTurn, ChatModel, CompletionOptions, ModelFunctionCall, ModelMessage, ModelTool,
-        ModelToolCall, ModelUsage,
+        ModelToolCall,
     };
+    use dekopon_model_token_governor::ModelUsage;
     use dekopon_shell::{
         CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
     };

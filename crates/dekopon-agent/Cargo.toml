@@ -22,6 +22,7 @@ dekopon-process.workspace = true
 dekopon-config.workspace = true
 dekopon-core = { workspace = true, features = ["native"] }
 dekopon-model.workspace = true
+dekopon-model-token-governor.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 # A session that exports no telemetry still mints its own W3C trace, and the invocation

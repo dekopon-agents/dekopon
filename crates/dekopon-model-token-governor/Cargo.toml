@@ -1,0 +1,26 @@
+[package]
+name = "dekopon-model-token-governor"
+description = "In-memory token budgets and per-call metering for Dekopon model traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-model-token-governor"
+readme = "README.md"
+keywords = ["agents", "llm", "tokens", "budget", "rate-limit"]
+categories = ["development-tools"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+dekopon-core.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

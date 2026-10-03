@@ -174,6 +174,7 @@ impl InferenceHttp {
                     InferenceError::InvalidRequest(_) => ("invalid-request", None),
                     InferenceError::Cancelled => ("cancelled", None),
                     InferenceError::DeadlineExceeded => ("deadline-exceeded", None),
+                    InferenceError::OverBudget(_) => ("over-budget", None),
                 };
                 span.record("outcome", "failed");
                 // Upstream messages and parser sources may echo sensitive request data.

@@ -1,3 +1,4 @@
+use dekopon_model_token_governor::ModelUsage;
 pub mod settings;
 
 use crate::{
@@ -6,12 +7,10 @@ use crate::{
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
     http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
-    model::{
-        AssistantTurn, ClientIdentity, ModelMessage, ModelToolCall, ModelUsage, compact_json_body,
-    },
+    model::{AssistantTurn, ClientIdentity, ModelMessage, ModelToolCall, compact_json_body},
     openai::{
-        ChunkError, FinishReason, OpenAiTool, WireChatUsage, WireMessage, WireToolCall,
-        complete_turn, stream_failure,
+        ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall, complete_turn,
+        stream_failure,
     },
     sse::SseEvent,
     stream::{ModelText, TurnEvent},
@@ -359,7 +358,7 @@ struct RouterChunk {
     error: Option<ChunkError>,
     #[serde(default)]
     choices: Vec<RouterChoice>,
-    usage: Option<WireChatUsage<u64>>,
+    usage: Option<crate::wire::ChatUsage<u64>>,
 }
 
 #[derive(Deserialize)]

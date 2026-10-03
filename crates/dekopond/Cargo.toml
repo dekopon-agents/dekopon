@@ -24,6 +24,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
+dekopon-model-token-governor.workspace = true
 # The cancel handle a native Stop fires into the broker leg's in-flight command run.
 dekopon-process.workspace = true
 dekopon-shell.workspace = true
@@ -32,6 +33,7 @@ form_urlencoded.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
+humantime.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 libc.workspace = true

@@ -1229,6 +1229,95 @@ dekopon-brokerd         attestor grant bounds the namespace
 The broker is the sole authority. `dekopond` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and a chat-attested `invoke` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
 
 
+## Token budgets
+
+An optional `metering` block gives an agent a token budget. A model call that would exceed it is
+refused before it is sent, and the turn ends with a sentence that says why:
+
+> I'm at 99% of my token budget (5-hour rolling window): 10 tokens left, this message needs about
+> 100. Try again in 15 minutes.
+
+```yaml
+metering:
+  budgets:
+    gylmar:                       # agent id; it must be served by a route
+      models: [astra, terra]      # optional; default every model
+      meters:
+      - {kind: rolling, limit: 200000, period: 5h}
+      - {kind: fixed,   limit: 1000000, period: 1d}
+      - {kind: session, limit: 300000, length: 5h}
+      - {kind: credit,  capacity: 2000000, refill: 500000, per: 1d, initial: full}
+  restore:                        # optional; see below
+    kind: openobserve             # or quickwit
+    endpoint: https://openobserve.openobserve.svc.cluster.local:5080/openobserve
+    org: default
+    stream: dekopon               # quickwit: `index: otel-logs-v0_9`, and no org or authEnv
+    authEnv: DEKOPON_METER_SEARCH_AUTH
+    delay: 30s                    # default 30s
+    timeout: 10s                  # default 10s
+    lookbackMax: 7d               # default 7d
+```
+
+| Meter | Allows a call when | A refusal waits |
+|---|---|---|
+| `fixed` | the current window's spend plus the call fits `limit`; windows start at UTC multiples of `period` | until the window ends |
+| `rolling` | the spend in the trailing `period` plus the call fits `limit`; spend is kept in buckets of `period / 60` and leaves the window when its bucket does | until enough of the oldest buckets leave |
+| `session` | no session is open, or the open session's spend plus the call fits `limit`; a session opens on the first charge and lasts `length` | until the open session ends |
+| `credit` | the balance, refilling at `refill` per `per` up to `capacity`, covers the call | until enough has refilled |
+
+A budget allows a call only if every meter does; the refusal names the meter with the longest wait,
+and a call larger than a meter's whole limit is refused outright ("It can't run as is."). Durations
+are `humantime` strings (`30m`, `5h`, `1d`) of at least one minute and at most 366 days. `initial`
+is `full` or a token count no greater than `capacity`. Unknown keys are denied, and every unknown
+agent, unknown model, empty `meters` or `models` list, zero limit, oversized `initial`, and too-short
+or too-long period is reported in one startup failure.
+
+A call costs its input plus output tokens, raw and unweighted. Before a call the gateway reserves an
+estimate — the request's JSON bytes divided by four plus 1,000 per image, raised to the session's
+last reported input plus the new messages' bytes divided by four and 1,000 per new image, plus an output reserve of the
+model's `generation.maxOutputTokens`, else 4,096 for a `reasoning`-class model, else 1,024 — so two
+concurrent sessions cannot both pass and both overspend. When the call ends the reservation is
+swapped for the provider's reported usage; a provider that reports nothing is charged the input
+estimate and a quarter-token per streamed byte. A call that was never sent (an invalid request, an
+authentication failure, an attachment failure, an upstream 429) is charged nothing; a cancelled,
+timed-out, or failed call is charged its input estimate and the text it already streamed. A call may
+settle above its estimate; that is real spend, and it shows as debt that delays the next allow.
+
+Without `metering`, or for an agent with no budget, spend is unbounded and still recorded: every
+model call writes one [`meter` record](observability.md#the-meter-charge-record), so a budget added
+later restores real history. A refusal mid-turn ends the turn with the sentence; capability calls
+that already ran stay run. It is logged as `gateway_session_refused` with category `over-budget`,
+never as `gateway_session_failed` or a `gateway.progress kind="failed"` record; its terminal is still
+recorded as `kind="terminal_failed"`. The message's outcome is `refused`.
+
+Budgets live in gateway memory. They need neither `telemetry` nor `restore`: without them every boot
+starts every window empty. `restore` without `telemetry` is a startup error, because it reads
+records this gateway never exports.
+
+### Restoring token windows at boot is best effort
+
+With `restore` and at least one budget, the gateway serves at once and, after `delay`, sends one
+search, bounded by `timeout`, for the `meter` records in `[boot − lookback, boot)`, summed per agent, model, and time
+bucket. The lookback is the longest history any meter can still see (a fixed window's start, a
+rolling period, twice a session length, or a credit bucket's time to fill), capped at `lookbackMax`;
+the bucket is the larger of one minute and the lookback divided by 500. Fresh meters are built from
+that history, the charges made since boot are replayed on top, and the result replaces the live
+meters; calls in flight keep their reservations. The search trusts the same CA as the OTLP exporter
+(`OTEL_EXPORTER_OTLP_CERTIFICATE`). For OpenObserve, `authEnv` names the variable holding the whole
+`Authorization` header value; Quickwit's searcher takes none.
+
+A restored window can under-count. The OTLP exporter drops records when its queue is full, a crash
+loses the batch in flight, and the store may not have ingested the last seconds before boot when
+the search runs. OpenObserve rejects records older than its `ZO_INGEST_ALLOWED_UPTO`. A partial or
+truncated search result, an error, a timeout, or a clock earlier than this release (an unsynced
+clock) applies nothing: the gateway logs one `meter.restore` warning and keeps the live meters, with
+no retry. Within a complete result, a rolling or fixed window is restored within one bucket; a
+session is exact when the history holds a gap of at least one session length and otherwise may open
+early; a credit bucket starts at `initial` at the start of the lookback and over-credits by at most
+one capacity. Restore also assumes that two gateways never run at once, which the chart's `Recreate`
+deployment strategy guarantees: a rolling update would let the old process spend while the new one
+restores. No serving path waits on restore, and nothing reconciles it later.
+
 ## Telemetry
 
 Spans follow [`observability.md`](observability.md):
@@ -1236,7 +1325,7 @@ Spans follow [`observability.md`](observability.md):
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below. A receipt the transport declines to route records `drop.reason` instead — one word for why, such as `self-authored`, `content-withheld`, or `duplicate` — so a message that produced no reply says so in its own trace.
@@ -1247,7 +1336,7 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_steer_refused` (`mailbox-full`), `gateway_steer_ack_failed` (debug); `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_cancelled`,
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_refused` (a token budget ended the turn), `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_silent` (transport and phase), `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transport_stopped` and `gateway_transport_task_failed` (additional reader failures observed during drain), `gateway_transport_recovering` (configured name, error category, episode failure count and delay in milliseconds), `gateway_stopped` (`shutdown`, `transport-failed` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_steer_refused` (`mailbox-full`), `gateway_steer_ack_failed` (debug); `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_wake_fired`, `gateway_wake_orphaned`, `gateway_wake_cancelled`,
 `gateway_wake_tick_failed`, `gateway_wake_tick_skipped`, `gateway_wake_probe_unavailable`, and
 `gateway_wake_task_failed`, `gateway_wake_store_failed` (a failed write refuses that one change; a
 failed write while firing or leasing stops wake firing until restart), `gateway_memory_record_skipped`

@@ -161,7 +161,8 @@ impl FailureClass {
     #[must_use]
     pub fn of(error: &PromptError) -> Option<Self> {
         match error {
-            PromptError::Cancelled | PromptError::Model(InferenceError::Cancelled) => None,
+            PromptError::Cancelled
+            | PromptError::Model(InferenceError::Cancelled | InferenceError::OverBudget(_)) => None,
             PromptError::MaxSteps { .. } => Some(Self::StepBudget),
             PromptError::ZeroSteps => Some(Self::Internal),
             PromptError::Model(_)
@@ -307,6 +308,22 @@ mod tests {
             FailureClass::of(&PromptError::ZeroSteps),
             Some(FailureClass::Internal),
             "a zero-step session is the embedder asking for something impossible"
+        );
+    }
+
+    #[test]
+    fn a_budget_refusal_is_not_a_failure() {
+        let refusal = dekopon_model_token_governor::Refusal {
+            agent: "gylmar".parse().unwrap(),
+            meter: dekopon_model_token_governor::MeterKind::Credit,
+            limit: dekopon_model_token_governor::Tokens(10),
+            remaining: 0,
+            requested: dekopon_model_token_governor::Tokens(5),
+            retry: dekopon_model_token_governor::Retry::Never,
+        };
+        assert_eq!(
+            FailureClass::of(&PromptError::Model(InferenceError::OverBudget(refusal))),
+            None
         );
     }
 }

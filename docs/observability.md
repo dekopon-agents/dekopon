@@ -42,6 +42,39 @@ These duplicate span fields: the span answers "why was this request slow", the a
 answers "how many did we make last month". Neither substitutes for broker audit, the record of what
 was authorized.
 
+Both are emitted inside their spans, and today they reach the exporter as span events, not as OTLP
+log records: the gateway's OTLP log filter carries only the `job` and `meter` targets. They are
+therefore sampled and expire with the trace that holds them. The record that outlives a trace for
+model spend is the `meter` record below.
+
+### The `meter` charge record
+
+Every model call — the agent's own and, once the guest proxy lands, a proxied one — writes exactly
+one OTLP log record on the `meter` target, message `model call charged`, whether or not its agent
+has a [token budget](dekopond.md#token-budgets). It is a log record rather than a span event
+because the log queue carries only `job` and `meter`, while the span queue carries every debug span
+and is the one that fills. The trace filter does not include `meter`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `meter.schema` | i64 | `1` |
+| `agent` | string | the calling agent |
+| `model.name` | string | the configured model name, never a wire model id |
+| `model.backend` | string | `codex`, `openrouter`, or `openai-compatible` |
+| `meter.via` | string | `agent` or `proxy` |
+| `usage.input_tokens`, `usage.output_tokens` | i64 | what was charged: the reported count, or the estimate when unreported |
+| `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.reasoning_output_tokens` | i64 | as reported, `0` when unreported |
+| `usage.source` | string | `reported`, `estimated`, or `partial` |
+| `meter.estimate.input_tokens` | i64 | the admission estimate, kept to measure the estimator |
+| `outcome` | string | `succeeded`, `failed`, `cancelled`, or `refused` |
+
+The record holds raw usage and no budget name, so a changed budget re-applies to history rather than
+invalidating it. A `refused` record carries zeros, and a call that was never sent is `failed` with
+zeros; restore skips both. Every number is recorded as an integer, so neither OpenObserve nor
+Quickwit sees it as a string. The boot restore that reads these records logs one `meter.restore`
+record on the same target: at info with the row count when it applies, at warn with `error.kind`
+when it keeps the live meters ([best effort](dekopond.md#restoring-token-windows-at-boot-is-best-effort)).
+
 Whatever the model provider reports for usage lands as `usage.input_tokens`,
 `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.output_tokens`, `usage.reasoning_output_tokens`, and
 `usage.total_tokens` — normalized across the chat-completions and Codex Responses wire shapes — on
