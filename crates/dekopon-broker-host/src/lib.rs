@@ -58,7 +58,6 @@ pub use http::{
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
-use random::RandomState;
 use settings::SettingsState;
 pub use stdio::{
     MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError, StdioTrap,
@@ -395,10 +394,6 @@ impl Runtime {
         clock: ClockState,
         settings: SettingsState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
-        let random = match clock {
-            ClockState::Granted { .. } => RandomState::invoke(),
-            ClockState::Refused { .. } => RandomState::describe(),
-        };
         let mut store = Store::new(
             &self.engine,
             StoreState {
@@ -410,7 +405,6 @@ impl Runtime {
                 http,
                 storage,
                 clock,
-                random,
                 settings,
                 assets: asset::AssetState::disabled(),
                 stdio: stdio::StdioState::none(),
@@ -449,9 +443,9 @@ struct StoreState {
     limits: memory::MemoryLimiter,
     http: HttpState,
     storage: storage::StorageState,
-    /// Granted only in an invocation's store; descriptions and command runs are pure.
+    /// Granted only in an invocation's store, where it also gates entropy; descriptions and command
+    /// runs are pure.
     clock: ClockState,
-    random: RandomState,
     settings: SettingsState,
     stdio: stdio::StdioState,
     table: wasmtime::component::ResourceTable,
@@ -967,10 +961,7 @@ impl BrokerWasmProvider {
                 });
         record_store_outcome(&mut store, self.runtime.limits.fuel);
         // Check refused host reads before the trap surfaces or their cause is lost.
-        if store.data().clock.attempted()
-            || store.data().random.attempted()
-            || store.data().settings.attempted()
-        {
+        if store.data().clock.attempted() || store.data().settings.attempted() {
             return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
             });
@@ -1288,12 +1279,7 @@ impl BrokerWasmProvider {
         })?;
         // Host policy violations win even if the guest catches the error or a failing destructor
         // turns it into a trap; check policy before trusting the guest's result.
-        if let Some(reason) = store
-            .data()
-            .clock
-            .failure()
-            .or(store.data().random.failure())
-        {
+        if let Some(reason) = store.data().clock.failure() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
@@ -1857,10 +1843,7 @@ async fn describe_component(
             });
     record_store_outcome(&mut store, runtime.limits.fuel);
     // Check refused host reads before the trap surfaces or their cause is lost.
-    if store.data().clock.attempted()
-        || store.data().random.attempted()
-        || store.data().settings.attempted()
-    {
+    if store.data().clock.attempted() || store.data().settings.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });

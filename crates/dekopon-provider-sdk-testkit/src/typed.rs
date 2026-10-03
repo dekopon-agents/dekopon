@@ -575,21 +575,21 @@ impl Port for FakePort {
     fn now_nanos(&mut self) -> u64 {
         self.monotonic
     }
-    fn fill_random(
-        &mut self,
-        out: &mut [u8],
-    ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
-        if let Some(entropy) = &self.entropy {
-            let end = self.entropy_cursor.saturating_add(out.len());
-            let source = entropy
-                .get(self.entropy_cursor..end)
-                .ok_or(dekopon_provider_sdk::random::RandomError::SourceUnavailable)?;
-            out.copy_from_slice(source);
-            self.entropy_cursor = end;
-        } else {
+    fn fill_random(&mut self, out: &mut [u8]) {
+        let Some(entropy) = &self.entropy else {
             out.fill(0xa5);
-        }
-        Ok(())
+            return;
+        };
+        let end = self.entropy_cursor.saturating_add(out.len());
+        let Some(source) = entropy.get(self.entropy_cursor..end) else {
+            panic!(
+                "scripted entropy exhausted: read wants {} bytes, {} remain",
+                out.len(),
+                entropy.len() - self.entropy_cursor
+            );
+        };
+        out.copy_from_slice(source);
+        self.entropy_cursor = end;
     }
     fn settings(&mut self) -> Option<String> {
         None

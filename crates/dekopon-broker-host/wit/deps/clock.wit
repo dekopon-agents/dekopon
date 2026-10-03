@@ -6,6 +6,9 @@ interface wall {
     now-unix-millis: func() -> u64;
 }
 
+/// Elapsed time within one invocation, readable during `invoke` only.
 interface monotonic {
+    /// Nanoseconds since this invocation started, shared by every component in the invocation.
+    /// Not comparable across invocations.
     now-nanos: func() -> u64;
 }

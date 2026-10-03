@@ -1,5 +1,8 @@
 package dekopon:random@0.1.0;
 
+/// The broker host's operating-system entropy.
 interface source {
+    /// `length` bytes of OS entropy, at most 4096 per call. A larger request, or any call outside
+    /// `invoke`, ends the invocation.
     get-random-bytes: func(length: u32) -> list<u8>;
 }

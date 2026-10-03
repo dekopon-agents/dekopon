@@ -613,12 +613,8 @@ mod tests {
             fn now_nanos(&mut self) -> u64 {
                 0
             }
-            fn fill_random(
-                &mut self,
-                out: &mut [u8],
-            ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
+            fn fill_random(&mut self, out: &mut [u8]) {
                 out.fill(0xa5);
-                Ok(())
             }
             fn settings(&mut self) -> Option<String> {
                 None

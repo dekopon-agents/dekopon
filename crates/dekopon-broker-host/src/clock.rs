@@ -102,10 +102,102 @@ fn unix_millis(now: SystemTime) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use wasmtime::Store;
+    use wasmtime::component::{Component, Instance};
+
     use super::{ClockState, unix_millis};
+    use crate::{
+        BrokerHostLimits, BrokerHostOptions, Runtime, StoreState, http::HttpState,
+        settings::SettingsState, storage::StorageState,
+    };
+
+    pub(crate) async fn component_in(
+        runtime: &Runtime,
+        clock: ClockState,
+        wat: &str,
+    ) -> (Store<StoreState>, Instance) {
+        let component = Component::new(&runtime.engine, wat).expect("valid component fixture");
+        let http = HttpState::describe(runtime.http_ceilings(), Duration::from_secs(5))
+            .expect("disabled HTTP");
+        let mut store = runtime
+            .store_for_provider(
+                "test-provider",
+                http,
+                StorageState::disabled(),
+                clock,
+                SettingsState::describe(),
+            )
+            .expect("bounded store");
+        let instance = runtime
+            .linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .expect("fixture instantiates");
+        (store, instance)
+    }
+
+    pub(crate) const SERVICES: &str = include_str!("../tests/fixtures/services.wat");
+
+    #[tokio::test]
+    async fn a_store_shares_monotonic_origin_across_components() {
+        let runtime = Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default())
+            .expect("host runtime");
+        let (mut store, first) = component_in(&runtime, ClockState::invoke(None), SERVICES).await;
+        let component = Component::new(&runtime.engine, SERVICES).expect("fixture");
+        let second = runtime
+            .linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .expect("second component");
+        let read_first = first
+            .get_typed_func::<(), (u64,)>(&mut store, "read-clock")
+            .expect("clock export");
+        let read_second = second
+            .get_typed_func::<(), (u64,)>(&mut store, "read-clock")
+            .expect("clock export");
+        let ClockState::Granted { origin, .. } = &store.data().clock else {
+            panic!("invocation store has a monotonic origin");
+        };
+        let origin = *origin;
+        let first_before = origin.elapsed().as_nanos();
+        let start = read_first
+            .call_async(&mut store, ())
+            .await
+            .expect("first reading")
+            .0;
+        let first_after = origin.elapsed().as_nanos();
+        let second_before = origin.elapsed().as_nanos();
+        let end = read_second
+            .call_async(&mut store, ())
+            .await
+            .expect("second reading")
+            .0;
+        let second_after = origin.elapsed().as_nanos();
+        assert!(first_before <= u128::from(start) && u128::from(start) <= first_after);
+        assert!(second_before <= u128::from(end) && u128::from(end) <= second_after);
+    }
+
+    #[tokio::test]
+    async fn a_provider_importing_wall_1_0_loads_through_the_broker_linker() {
+        let runtime = Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default())
+            .expect("host runtime");
+        let wat = r#"(component
+            (import "dekopon:clock/wall@1.0.0" (instance $wall
+                (export "now-unix-millis" (func (result u64)))))
+            (core func $now (canon lower (func $wall "now-unix-millis")))
+            (core module $m (import "host" "now" (func $now (result i64)))
+                (func (export "read") (result i64) call $now))
+            (core instance $i (instantiate $m (with "host" (instance (export "now" (func $now))))))
+            (func (export "read") (result u64) (canon lift (core func $i "read"))))"#;
+        let (mut store, instance) = component_in(&runtime, ClockState::invoke(None), wat).await;
+        let read = instance
+            .get_typed_func::<(), (u64,)>(&mut store, "read")
+            .expect("wall export");
+        assert!(read.call_async(&mut store, ()).await.expect("wall read").0 > 0);
+    }
 
     #[test]
     fn unix_millis_truncates_and_saturates_at_the_epoch() {

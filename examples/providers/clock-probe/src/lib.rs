@@ -32,7 +32,6 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug)]
 enum ClockError {
     OutOfRange(u64),
-    Entropy(dekopon_provider_sdk::random::RandomError),
     Output,
 }
 impl std::fmt::Display for ClockError {
@@ -42,7 +41,6 @@ impl std::fmt::Display for ClockError {
                 f,
                 "the host clock reads {millis} ms, past 9999-12-31T23:59:59.999Z"
             ),
-            Self::Entropy(error) => write!(f, "entropy read failed: {error}"),
             Self::Output => f.write_str("stdout closed"),
         }
     }
@@ -51,12 +49,6 @@ impl Failure for ClockError {
     fn code(&self) -> Code {
         match self {
             Self::OutOfRange(_) => Code::new("clock-out-of-range"),
-            Self::Entropy(dekopon_provider_sdk::random::RandomError::SourceUnavailable) => {
-                Code::new("entropy-unavailable")
-            }
-            Self::Entropy(dekopon_provider_sdk::random::RandomError::InvalidLength) => {
-                Code::new("entropy-invalid-length")
-            }
             Self::Output => Code::new("output-closed"),
         }
     }
@@ -94,7 +86,7 @@ impl Capability for Now {
         if input.services {
             let elapsed = monotonic.now_nanos();
             let mut bytes = [0; 8];
-            random.fill(&mut bytes).map_err(ClockError::Entropy)?;
+            random.fill(&mut bytes);
             value["monotonicNanos"] = json!(elapsed);
             value["entropyBytes"] = json!(bytes.len());
         }

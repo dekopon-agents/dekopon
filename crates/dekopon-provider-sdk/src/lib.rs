@@ -23,7 +23,7 @@ pub mod asset;
 mod clock;
 mod http;
 pub mod provider;
-pub mod random;
+mod random;
 mod storage;
 
 pub use provider::{

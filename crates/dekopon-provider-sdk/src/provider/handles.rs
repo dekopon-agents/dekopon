@@ -121,7 +121,7 @@ pub struct Random(PhantomData<()>);
 
 impl Random {
     /// Fills a buffer with OS entropy, splitting calls at the broker's per-read ceiling.
-    pub fn fill(&self, out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+    pub fn fill(&self, out: &mut [u8]) {
         #[cfg(target_arch = "wasm32")]
         {
             crate::random::fill_chunks(out, crate::random::read)
