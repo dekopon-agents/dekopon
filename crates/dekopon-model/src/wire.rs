@@ -144,17 +144,73 @@ pub enum PeekError {
     NotObject,
     #[error("request names no model")]
     NoModel,
+    #[error("request repeats the top-level key `{0}`")]
+    Duplicate(Field),
+}
+
+/// The top-level keys a proxy reads or edits. Every other key is skipped without being stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Field {
+    Model,
+    Stream,
+    Store,
+    Models,
+    Route,
+}
+
+impl Field {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Stream => "stream",
+            Self::Store => "store",
+            Self::Models => "models",
+            Self::Route => "route",
+        }
+    }
+}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum TopKey {
+    Model,
+    Stream,
+    Store,
+    Models,
+    Route,
+    #[serde(other)]
+    Other,
+}
+
+impl TopKey {
+    const fn field(self) -> Option<Field> {
+        match self {
+            Self::Model => Some(Field::Model),
+            Self::Stream => Some(Field::Stream),
+            Self::Store => Some(Field::Store),
+            Self::Models => Some(Field::Models),
+            Self::Route => Some(Field::Route),
+            Self::Other => None,
+        }
+    }
 }
 
 /// What a proxy reads from a request before forwarding it: the configured model it names, its
-/// stream flag, its image count, and where each top-level field sits so a rewrite can leave every
-/// other byte as the client sent it.
+/// stream flag, its image count, and where each recorded top-level field sits so a rewrite can
+/// leave every other byte as the client sent it.
 #[derive(Debug)]
 pub struct RequestPeek {
     pub model: String,
     pub stream: Option<bool>,
     pub images: usize,
-    fields: Vec<(String, std::ops::Range<usize>)>,
+    fields: Vec<(Field, std::ops::Range<usize>)>,
 }
 
 impl RequestPeek {
@@ -162,17 +218,17 @@ impl RequestPeek {
         let images = serde_json::from_slice::<Scan>(body)
             .map_err(|_invalid| PeekError::NotJson)?
             .images;
-        let fields = top_level_fields(body).ok_or(PeekError::NotObject)?;
-        let model = values(body, &fields, "model")
-            .next_back()
+        let fields = top_level_fields(body)?;
+        let raw = |wanted: Field| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == wanted)
+                .and_then(|(_, range)| body.get(range.clone()))
+        };
+        let model = raw(Field::Model)
             .and_then(|raw| serde_json::from_slice::<String>(raw).ok())
             .ok_or(PeekError::NoModel)?;
-        let stream = {
-            let mut streams =
-                values(body, &fields, "stream").map(|raw| serde_json::from_slice::<bool>(raw).ok());
-            let first = streams.next().flatten();
-            first.filter(|first| streams.all(|other| other == Some(*first)))
-        };
+        let stream = raw(Field::Stream).and_then(|raw| serde_json::from_slice::<bool>(raw).ok());
         Ok(Self {
             model,
             stream,
@@ -181,25 +237,27 @@ impl RequestPeek {
         })
     }
 
-    /// Replaces every copy of each named top-level value with the given raw JSON, inserting a
-    /// field the request lacks at the front of the object.
     #[must_use]
-    pub fn rewrite(&self, body: &[u8], replacements: &[(&str, &str)]) -> Vec<u8> {
+    pub fn has(&self, wanted: Field) -> bool {
+        self.fields.iter().any(|(field, _)| *field == wanted)
+    }
+
+    /// Replaces each named top-level value with the given raw JSON, inserting a field the request
+    /// lacks at the front of the object, which always holds `model`.
+    #[must_use]
+    pub fn rewrite(&self, body: &[u8], replacements: &[(Field, &str)]) -> Vec<u8> {
         let mut edits = Vec::new();
         let mut inserted = String::new();
-        for (key, raw) in replacements {
-            let before = edits.len();
-            edits.extend(
-                self.fields
-                    .iter()
-                    .filter(|(field, _)| field == key)
-                    .map(|(_, range)| (range.clone(), *raw)),
-            );
-            if edits.len() == before {
-                inserted.push_str(&serde_json::Value::from(*key).to_string());
-                inserted.push(':');
-                inserted.push_str(raw);
-                inserted.push(',');
+        for (wanted, raw) in replacements {
+            match self.fields.iter().find(|(field, _)| field == wanted) {
+                Some((_, range)) => edits.push((range.clone(), *raw)),
+                None => {
+                    inserted.push('"');
+                    inserted.push_str(wanted.name());
+                    inserted.push_str("\":");
+                    inserted.push_str(raw);
+                    inserted.push(',');
+                }
             }
         }
         edits.sort_by_key(|(range, _)| range.start);
@@ -209,11 +267,7 @@ impl RequestPeek {
             .position(|byte| *byte == b'{')
             .map_or(0, |index| index + 1);
         out.extend_from_slice(body.get(..open).unwrap_or_default());
-        if self.fields.is_empty() {
-            out.extend_from_slice(inserted.trim_end_matches(',').as_bytes());
-        } else {
-            out.extend_from_slice(inserted.as_bytes());
-        }
+        out.extend_from_slice(inserted.as_bytes());
         let mut cursor = open;
         for (range, raw) in edits {
             out.extend_from_slice(body.get(cursor..range.start).unwrap_or_default());
@@ -223,17 +277,6 @@ impl RequestPeek {
         out.extend_from_slice(body.get(cursor..).unwrap_or_default());
         out
     }
-}
-
-fn values<'a>(
-    body: &'a [u8],
-    fields: &'a [(String, std::ops::Range<usize>)],
-    name: &'a str,
-) -> impl DoubleEndedIterator<Item = &'a [u8]> {
-    fields
-        .iter()
-        .filter(move |(key, _)| key == name)
-        .filter_map(|(_, range)| body.get(range.clone()))
 }
 
 /// Validates the body and counts its image blocks in one pass; a `serde_json::Value` tree of the
@@ -319,27 +362,36 @@ impl<'de> serde::de::Visitor<'de> for ScanVisitor {
     }
 }
 
-/// Walks a body serde_json already accepted, so every step is on valid JSON.
-fn top_level_fields(body: &[u8]) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+/// Walks a body serde_json already accepted, so every step is on valid JSON. Only the recorded
+/// keys are kept, once each, so the list never outgrows `Field`.
+fn top_level_fields(body: &[u8]) -> Result<Vec<(Field, std::ops::Range<usize>)>, PeekError> {
     let mut fields = Vec::new();
     let mut at = skip_space(body, 0);
-    if *body.get(at)? != b'{' {
-        return None;
+    if body.get(at) != Some(&b'{') {
+        return Err(PeekError::NotObject);
     }
     at = skip_space(body, at + 1);
-    while *body.get(at)? != b'}' {
-        let key_end = string_end(body, at)?;
-        let key = serde_json::from_slice::<String>(body.get(at..key_end)?).ok()?;
+    while body.get(at).ok_or(PeekError::NotObject)? != &b'}' {
+        let key_end = string_end(body, at).ok_or(PeekError::NotObject)?;
+        let key = body
+            .get(at..key_end)
+            .and_then(|raw| serde_json::from_slice::<TopKey>(raw).ok())
+            .ok_or(PeekError::NotObject)?;
         at = skip_space(body, key_end);
         at = skip_space(body, at + 1);
-        let value_end = value_end(body, at)?;
-        fields.push((key, at..value_end));
+        let value_end = value_end(body, at).ok_or(PeekError::NotObject)?;
+        if let Some(field) = key.field() {
+            if fields.iter().any(|(seen, _)| *seen == field) {
+                return Err(PeekError::Duplicate(field));
+            }
+            fields.push((field, at..value_end));
+        }
         at = skip_space(body, value_end);
-        if *body.get(at)? == b',' {
+        if body.get(at) == Some(&b',') {
             at = skip_space(body, at + 1);
         }
     }
-    Some(fields)
+    Ok(fields)
 }
 
 fn skip_space(body: &[u8], mut at: usize) -> usize {
@@ -480,7 +532,10 @@ mod tests {
         assert_eq!(peek.model, "astra");
         assert_eq!(peek.stream, Some(true));
         assert_eq!(peek.images, 1);
-        let rewritten = peek.rewrite(body, &[("model", "\"gpt-5\""), ("store", "false")]);
+        let rewritten = peek.rewrite(
+            body,
+            &[(Field::Model, "\"gpt-5\""), (Field::Store, "false")],
+        );
         let expected = br#"{"store":false, "model" : "gpt-5",
   "messages":[{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"a \"model\": b"}]}],
   "stream":true }"#;
@@ -488,28 +543,58 @@ mod tests {
             String::from_utf8(rewritten).unwrap(),
             String::from_utf8(expected.to_vec()).unwrap()
         );
-        assert_eq!(peek.rewrite(body, &[("stream", "true")]), body);
+        assert_eq!(peek.rewrite(body, &[(Field::Stream, "true")]), body);
+        assert!(peek.has(Field::Stream) && !peek.has(Field::Store));
     }
 
     #[test]
-    fn a_rewrite_replaces_every_copy_of_a_duplicated_key() {
-        let body = br#"{"model":"astra","store":false,"stream":true,"store":true}"#;
-        let peek = RequestPeek::of(body).unwrap();
-        let rewritten = peek.rewrite(body, &[("model", "\"gpt-5\""), ("store", "false")]);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap(),
-            json!({"model": "gpt-5", "store": false, "stream": true})
-        );
-        assert_eq!(
-            String::from_utf8(rewritten).unwrap(),
-            r#"{"model":"gpt-5","store":false,"stream":true,"store":false}"#
-        );
+    fn a_duplicated_key_is_refused() {
+        for (body, field) in [
+            (
+                &br#"{"model":"astra","store":false,"stream":true,"store":true}"#[..],
+                Field::Store,
+            ),
+            (
+                br#"{"model":"astra","stream":false,"stream":true}"#,
+                Field::Stream,
+            ),
+            (br#"{"m\u006fdel":"astra","model":"terra"}"#, Field::Model),
+        ] {
+            assert_eq!(
+                RequestPeek::of(body).unwrap_err(),
+                PeekError::Duplicate(field)
+            );
+        }
+        let peek = RequestPeek::of(br#"{"model":"astra","x":1,"x":2}"#).unwrap();
+        assert_eq!(peek.fields.len(), 1);
     }
 
     #[test]
-    fn a_stream_flag_whose_copies_disagree_is_unknown() {
-        let peek = RequestPeek::of(br#"{"model":"astra","stream":false,"stream":true}"#).unwrap();
-        assert_eq!(peek.stream, None);
+    fn a_body_of_a_million_keys_keeps_only_the_recorded_ones() {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut body = Vec::with_capacity(8 * 1024 * 1024);
+        body.extend_from_slice(br#"{"model":"astra","#);
+        let mut keys = 0_usize;
+        'fill: for a in ALPHABET {
+            for b in ALPHABET {
+                for c in ALPHABET {
+                    for d in ALPHABET {
+                        if body.len() + 16 > 8 * 1024 * 1024 {
+                            break 'fill;
+                        }
+                        body.extend_from_slice(&[b'"', *a, *b, *c, *d, b'"', b':', b'0', b',']);
+                        keys += 1;
+                    }
+                }
+            }
+        }
+        body.extend_from_slice(br#""route":1}"#);
+        assert!(keys > 900_000, "{keys}");
+        let peek = RequestPeek::of(&body).unwrap();
+        assert_eq!(peek.model, "astra");
+        assert!(peek.has(Field::Route) && !peek.has(Field::Models));
+        assert_eq!(peek.fields.len(), 2);
+        assert!(peek.fields.capacity() <= 8);
     }
 
     #[test]

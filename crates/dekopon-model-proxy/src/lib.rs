@@ -31,7 +31,10 @@ use axum::{
 };
 use bytes::Bytes;
 use dekopon_core::{AgentId, Redacted};
-use dekopon_model::{chatgpt::CredentialFile, wire::RequestPeek};
+use dekopon_model::{
+    chatgpt::CredentialFile,
+    wire::{Field, RequestPeek},
+};
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 
 pub use dialect::Dialect;
@@ -225,11 +228,12 @@ async fn handle(
         Upstream::Codex { .. } if peek.stream != Some(true) => {
             return dialect.error(Problem::Invalid, "this endpoint requires \"stream\": true");
         }
-        Upstream::Codex { .. } => {
-            peek.rewrite(&body, &[("model", &wire_model), ("store", "false")])
-        }
+        Upstream::Codex { .. } => peek.rewrite(
+            &body,
+            &[(Field::Model, &wire_model), (Field::Store, "false")],
+        ),
         Upstream::Anthropic { .. } | Upstream::OpenRouter { .. } => {
-            peek.rewrite(&body, &[("model", &wire_model)])
+            peek.rewrite(&body, &[(Field::Model, &wire_model)])
         }
     };
     drop(body);
