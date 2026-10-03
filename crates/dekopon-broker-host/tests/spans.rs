@@ -736,20 +736,6 @@ async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
     assert_eq!(rfc3339.len(), "1970-01-01T00:00:00Z".len(), "{rfc3339}");
     assert!(rfc3339.ends_with('Z'), "{rfc3339}");
 
-    let reads = capture
-        .events()
-        .into_iter()
-        .filter(|(fields, _)| fields.contains("provider_clock_read"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        reads,
-        vec![(
-            format!(" event=\"provider_clock_read\" unix_millis={unix_millis}"),
-            Some("provider.invoke".to_owned())
-        )],
-        "one read, carrying the value the guest returned, inside provider.invoke:\n{}",
-        capture.text()
-    );
     assert_one_store_each(&capture, "provider.describe", 1);
     assert_one_store_each(&capture, "provider.invoke", 1);
 }

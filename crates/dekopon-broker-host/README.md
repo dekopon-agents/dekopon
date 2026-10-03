@@ -95,13 +95,11 @@ at `0` for a clock set before 1970. The import has no error channel, so a store 
 description or command run traps the read and records the attempt, and the operation fails as
 `DescribeUsedHostImport` or `RunCommandUsedHostImport`. A read is not charged against any host-call
 limit: it has no effect and allocates nothing, and fuel and the operation deadline already bound
-the guest loop around it. Each read inside an invocation emits one info-level `provider_clock_read`
-event carrying `unix_millis`, parented by `provider.invoke`, so the value the guest received is in
-the trace.
+the guest loop around it. A successful read is not recorded.
 
 Wasmtime resolves compatible `wall@1.0.0` and `wall@1.1.0` imports against either host definition because the interface is unchanged. New `monotonic@1.1.0` and `random/source@0.1.0` imports require a broker that links those services (v0.32.0 or later).
 
-`monotonic.now-nanos` measures elapsed time since the invocation store was created and is shared across components in that store. Overflow refuses the invocation. `random.get-random-bytes` uses OS entropy only, refuses more than 4096 bytes before allocation and never returns partial bytes on failure. Its event records requested length and status, never bytes; both services trap outside invoke.
+`monotonic.now-nanos` measures elapsed time since the invocation store was created and is shared across components in that store. Overflow refuses the invocation. `random.get-random-bytes` uses OS entropy only, refuses more than 4096 bytes before allocation and never returns partial bytes on failure. A successful read is not recorded; a refusal or entropy failure records the requested length and status, never bytes. Both services trap outside invoke.
 
 ## Buffered and asset-streamed HTTP enforcement
 

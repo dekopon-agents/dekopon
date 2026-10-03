@@ -30,7 +30,6 @@ fn read(
     }
     let mut bytes = vec![0; length as usize];
     if length == 0 {
-        tracing::info!(event = "provider_random_read", length, status = "succeeded");
         return Ok(bytes);
     }
     if let Err(source) = fill(&mut bytes) {
@@ -43,7 +42,6 @@ fn read(
         );
         return Err(wasmtime::Error::msg("OS entropy unavailable"));
     }
-    tracing::info!(event = "provider_random_read", length, status = "succeeded");
     Ok(bytes)
 }
 
@@ -124,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn entropy_trace_records_length_and_status_without_bytes() {
+    fn entropy_bytes_never_reach_a_record() {
         use dekopon_test_support::CaptureLayer;
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -137,13 +135,22 @@ mod tests {
             })
             .expect("entropy read");
             assert_eq!(bytes, [111, 222, 111, 222]);
+            assert!(capture.events().is_empty());
+
+            assert!(
+                read(&mut ClockState::invoke(None), 4, |out| {
+                    out.copy_from_slice(&[111, 222, 111, 222]);
+                    Err(getrandom::Error::UNEXPECTED)
+                })
+                .is_err()
+            );
         });
         let recorded = capture.events();
         assert_eq!(recorded.len(), 1);
         let fields = &recorded[0].0;
         assert!(fields.contains("provider_random_read"));
         assert!(fields.contains("length=4"));
-        assert!(fields.contains("status=\"succeeded\""));
+        assert!(fields.contains("status=\"entropy-failed\""));
         assert!(!fields.contains("111"));
         assert!(!fields.contains("222"));
     }
