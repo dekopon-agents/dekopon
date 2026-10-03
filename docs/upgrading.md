@@ -10,9 +10,9 @@ do not understand rather than guessing.
 
 ## Host time and entropy (0.32.0)
 
-No broker configuration changes are needed. Providers already built against `dekopon:clock/wall@1.0.0` continue to load without rebuilding: the broker's `wall@1.1.0` definition satisfies their 1.x import. New SDK builds import `wall@1.1.0`; providers that use the new `monotonic@1.1.0` or `random/source@0.1.0` interfaces need a v0.32.0 broker before installation. Rebuild and inspect only providers that opt into the new services; there is no compatibility shim or deployment in this change.
+No broker configuration changes are needed. Providers already built against `dekopon:clock/wall@1.0.0` continue to load without rebuilding: the broker's `wall@1.1.0` definition satisfies their 1.x import. New SDK builds import `wall@1.1.0`; providers that use the new `monotonic@1.1.0` or `random/source@0.1.0` interfaces need a v0.32.0 broker before installation. Rebuild and inspect only providers that opt into the new services; there is no compatibility shim.
 
-## Managed provider precompile (unreleased)
+## Managed provider precompile (0.32.0)
 
 A managed `providerSet` now requires compiled artifacts before the broker starts: the broker
 verifies and maps the cache, and refuses a missing index instead of compiling. The chart runs
@@ -23,6 +23,13 @@ source change and before broker startup, or set `compileOnLoad: true` to bypass 
 Precompile checks locked local blobs, fills or repairs compiled artifacts, and prunes stale engine
 generations. Stop the broker before manually removing mapped artifacts; a pod delete reruns chart
 initialization. Direct `providers:` configurations still compile from source without a cache.
+
+Ship order: the chart and the image move together. Chart 0.21.0 deploys application v0.32.0 and
+adds the precompile init container; that init container needs the v0.32.0 image, and a v0.32.0
+broker with a managed set needs the compiled artifacts it writes. Upgrade to chart 0.21.0 and the
+v0.32.0 image in one rollout. A non-chart managed set runs `provider precompile` before the new
+broker starts, or sets `compileOnLoad: true`. Install providers built with the 0.32.0 SDK that
+import `monotonic@1.1.0` or `random/source@0.1.0` only after the broker runs v0.32.0.
 
 ## Provider streams, model budgets, and image distribution (0.31.0)
 

@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-10-03
+
+### Added
+
+- `dekopon:clock/monotonic@1.1.0` gives providers real elapsed nanoseconds during invoke.
+- `dekopon:random/source@0.1.0` gives providers OS entropy during invoke, at most 4096 bytes a call.
+- `dekopon-provider-sdk` adds `now_nanos()` and `random::fill()`, with test-kit `ImportSet::MONOTONIC` and `ImportSet::RANDOM`.
+- `dekopon-brokerd provider precompile` compiles every locked component into the cwasm cache, repairs faulty entries and prunes other engine generations.
+
+### Changed
+
+- **Breaking:** with a cwasm cache the broker only reads compiled artifacts; a missing one refuses startup with `CompiledArtifactMissing` instead of compiling in the long-lived process. Run `provider precompile` before startup or set `compileOnLoad: true`; see [upgrading](docs/upgrading.md#managed-provider-precompile-0320).
+- `provider sync` publishes the components it compiles into the cwasm cache.
+- cwasm cache errors name the index or object path they failed on.
+- `dekopon:clock` is 1.1.0; the broker links only 1.1.0 and still loads providers built against `wall@1.0.0`.
+- `dekopon-provider-sdk` `Random::fill` is infallible; a refused or failed entropy read ends the invocation.
+- The broker no longer records a trace event for each successful clock or entropy read; refusals and failures are still recorded.
+
+### Security
+
+- Wasmtime 49.0.2 addresses RUSTSEC-2026-0327 and the 49.0.1 advisories.
+
 ## [dekopon-chart-0.20.0] - 2026-10-03
 
 ### Changed

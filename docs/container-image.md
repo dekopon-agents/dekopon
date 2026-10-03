@@ -190,7 +190,7 @@ This is the same script the workflow runs, with the same arguments.
 
 ```console
 work=$(mktemp -d)
-ci/stage-image-context.sh v0.31.0 "$work"
+ci/stage-image-context.sh v0.32.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker run --rm dekopon:local dekopond --help
 ci/verify-image-broker.sh dekopon:local
@@ -200,7 +200,7 @@ The script prints what it staged and the digest of each executable, so the allow
 rather than asserted in prose:
 
 ```text
-==> verified dekopon-0.31.0-aarch64-unknown-linux-gnu.tar.gz (sha256 and attestation) -> dist/arm64
+==> verified dekopon-0.32.0-aarch64-unknown-linux-gnu.tar.gz (sha256 and attestation) -> dist/arm64
 ==> every binary needs at most glibc 2.41
 ==> staged context (/tmp/tmp.AbC123/context):
           5057  Dockerfile
