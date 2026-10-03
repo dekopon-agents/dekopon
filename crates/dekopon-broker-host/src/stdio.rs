@@ -614,7 +614,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_closed_splice_consumer_records_one_abandoned_body_with_read_bytes() {
-            use dekopon_test_support::{CaptureLayer, Record};
+            use dekopon_test_support::CaptureLayer;
             use tracing_subscriber::layer::SubscriberExt as _;
 
             let capture = CaptureLayer::workspace();
@@ -633,19 +633,12 @@ mod tests {
                 splice(&mut state, &server).await,
                 Err(http_wit::SpliceError::Closed)
             ));
-            let records = capture.records();
-            let bodies = records
-                .iter()
-                .filter_map(|record| match record {
-                    Record::Event { fields, parent, .. }
-                        if fields.contains("accounting.http.response_body") =>
-                    {
-                        Some((fields, parent))
-                    }
-                    _ => None,
-                })
+            let bodies = capture
+                .events()
+                .into_iter()
+                .filter(|(fields, _)| fields.contains("accounting.http.response_body"))
                 .collect::<Vec<_>>();
-            assert_eq!(bodies.len(), 1, "{records:?}");
+            assert_eq!(bodies.len(), 1, "{}", capture.text());
             assert!(bodies[0].0.contains("outcome=\"abandoned\""), "{bodies:?}");
             assert!(
                 bodies[0]

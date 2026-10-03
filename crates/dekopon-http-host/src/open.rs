@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_an_unread_body_records_one_abandoned_outcome_under_its_request() {
-        use dekopon_test_support::{CaptureLayer, Record};
+        use dekopon_test_support::CaptureLayer;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let capture = CaptureLayer::workspace();
@@ -313,19 +313,12 @@ mod tests {
         );
         let mut client = client(&server, Duration::from_secs(5));
         drop(client.open(get(&server)).await.unwrap());
-        let records = capture.records();
-        let bodies = records
-            .iter()
-            .filter_map(|record| match record {
-                Record::Event { fields, parent, .. }
-                    if fields.contains("accounting.http.response_body") =>
-                {
-                    Some((fields, parent))
-                }
-                _ => None,
-            })
+        let bodies = capture
+            .events()
+            .into_iter()
+            .filter(|(fields, _)| fields.contains("accounting.http.response_body"))
             .collect::<Vec<_>>();
-        assert_eq!(bodies.len(), 1, "{records:?}");
+        assert_eq!(bodies.len(), 1, "{}", capture.text());
         assert!(bodies[0].0.contains("outcome=\"abandoned\""), "{bodies:?}");
         assert!(
             bodies[0]
