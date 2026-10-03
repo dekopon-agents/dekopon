@@ -353,7 +353,7 @@ OPENOBSERVE_ROOT_EMAIL=dev@example.com OPENOBSERVE_ROOT_PASSWORD=devpassword \
 
 ### Provider example workspaces
 
-Run these commands for each affected in-tree fixture manifest (`cli-probe`, `clock-probe`, `http-probe`, `memory-reservation-probe`, and `storage-probe`). Standalone provider repositories own their own source gates:
+Run these commands for each affected in-tree fixture manifest (`cli-probe`, `clock-probe`, `clock-raw-probe`, `http-probe`, `http-raw-probe`, `memory-reservation-probe`, and `storage-probe`). Standalone provider repositories own their own source gates:
 
 ```console
 cargo fmt --manifest-path examples/providers/<PROVIDER>/Cargo.toml -- --check
@@ -362,12 +362,19 @@ cargo test --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml
 cargo check --locked --manifest-path examples/providers/<PROVIDER>/Cargo.toml --target wasm32-unknown-unknown
 ```
 
-For `cli-probe`, `memory-reservation-probe`, and `storage-probe`, additionally run their
-`build.sh`, `wasm-tools validate`, and `wasm-tools component wit --json`; assert zero imports
-(`cli-probe` and `memory-reservation-probe`) or durable-files (`storage-probe`), `run-command` as
-the third export of each, and no WASI. `clock-probe` gets the same three steps and must decode to
-exactly `dekopon:clock/wall@1.0.0` with `run-command` as its third export. Fetch standalone
-memory-chat and assert its exact pinned component is JSONL-only with no WASI:
+For every checked probe, also run its pinned `build.sh`, `wasm-tools validate`, and
+`wasm-tools component wit --json`. Decode the root world and assert these **exact imports**:
+
+| Component | Root-world imports |
+|---|---|
+| `cli-probe`, `memory-reservation-probe` | `dekopon:stdio/streams@0.1.0` |
+| `clock-probe`, `clock-raw-probe` | stdio streams plus `dekopon:clock/wall@1.0.0` |
+| `http-probe`, `http-raw-probe` | stdio streams, `dekopon:http/client@1.2.0`, `dekopon:asset/asset@0.1.0` |
+| `storage-probe` | stdio streams plus `dekopon:storage/durable-files@0.1.1` |
+
+All seven export `run-command` **first**, followed by `describe` and `invoke`; none imports WASI.
+Raw fixtures deliberately exercise refusal paths, not a legacy no-stdio contract. Fetch standalone
+memory-chat only for explicit refusal tests and assert its pinned component is JSONL-only with no WASI:
 
 ```console
 ci/fetch-external-provider-components.sh examples/providers memory-chat
@@ -531,11 +538,12 @@ exactly that for all four before it pushes anything, and the staging script refu
 binary that needs a glibc newer than the runtime base provides.
 
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits
-under a deadline for its post-load socket. The workflow runs this component-load check on release
-tags, when the broker binaries match the checked probes. Pull requests stage against the newest
-published release and check image structure and binary identity but skip the cross-version broker
-load when the new probes use a newer provider epoch; a green PR is **not** evidence of 0.31.0
-broker startup. The tag workflow retains the real load gate. This validates released image bytes,
+under a deadline for its post-load socket. The workflow always runs this component-load check on
+release tags. Pull requests stage against the newest published release and check image structure
+and binary identity; they also run broker startup when that release is v0.31.0 or newer. Only PRs
+staged with an earlier, pre-stdio archive skip the incompatible component-load check, with a
+notice. A green PR staged with 0.30.0 is **not** evidence of 0.31.0 broker startup. The tag
+workflow retains the mandatory real load gate. This validates released image bytes,
 not a native build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
 checked in-tree components must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
