@@ -290,8 +290,8 @@ rotation, and intentional export for a cluster.
   real authenticated subject and broker grant before replacing the local transport.
 - The [conditional writer](../examples/conditional-write/README.md) remains the credential-holding,
   conditional-write walkthrough. It requires a matching source checkout's `http-probe` fixture,
-  Slack setup, and your own API endpoint and token; Homebrew's bundled JSONPlaceholder component
-  does not supply that example.
+  Slack setup, and your own API endpoint and token. The JSONPlaceholder component bundled with
+  the 0.30.0 Homebrew formula does not supply that example; the 0.31.0 formula bundles no provider.
 - The [OpenObserve example](../examples/otel-traces/README.md) adds a receiver and a real-daemon smoke
   test. Telemetry is optional for local startup; without a receiver, audit lasts only as long as
   you retain stdout. Prompts and outputs can reach telemetry; secret bytes must not.
