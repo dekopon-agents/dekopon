@@ -1287,8 +1287,8 @@ Without `metering`, or for an agent with no budget, spend is unbounded and still
 model call writes one [`meter` record](observability.md#the-meter-charge-record), so a budget added
 later restores real history. A refusal mid-turn ends the turn with the sentence; capability calls
 that already ran stay run. It is logged as `gateway_session_refused` with category `over-budget`,
-never as `gateway_session_failed` or a `failed` `gateway.progress` record, and the message's outcome
-is `refused`.
+never as `gateway_session_failed` or a `gateway.progress kind="failed"` record; its terminal is still
+recorded as `kind="terminal_failed"`. The message's outcome is `refused`.
 
 Budgets live in gateway memory. They need neither `telemetry` nor `restore`: without them every boot
 starts every window empty. `restore` without `telemetry` is a startup error, because it reads

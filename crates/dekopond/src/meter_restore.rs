@@ -112,9 +112,11 @@ pub(crate) async fn restore_once(
         tokio::time::sleep(config.delay()).await;
         let lookback = metering.lookback(boot).min(config.lookback_max());
         let window = Window::at_boot(boot, lookback);
-        let rows = tokio::time::timeout(config.timeout(), query(&config, ca_certificate, window))
-            .await
-            .map_err(|_elapsed| RestoreError::Timeout)??;
+        let mut rows =
+            tokio::time::timeout(config.timeout(), query(&config, ca_certificate, window))
+                .await
+                .map_err(|_elapsed| RestoreError::Timeout)??;
+        rows.retain(|row| row.at >= window.since && row.at < window.until);
         Ok((window, rows))
     }
     .await;
@@ -526,15 +528,15 @@ mod tests {
         "aggregations":{"agent":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[
           {"key":"gylmar","doc_count":3,"model":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[
             {"key":"astra","doc_count":3,"bucket":{"buckets":[
-              {"key":1759226400000.0,"key_as_string":"2026-09-30T10:00:00Z","doc_count":2,"input":{"value":1200.0},"output":{"value":34.0}},
-              {"key":1759226700000.0,"key_as_string":"2026-09-30T10:05:00Z","doc_count":1,"input":{"value":5.0},"output":{"value":null}}
+              {"key":1790762400000.0,"key_as_string":"2026-09-30T10:00:00Z","doc_count":2,"input":{"value":1200.0},"output":{"value":34.0}},
+              {"key":1790762700000.0,"key_as_string":"2026-09-30T10:05:00Z","doc_count":1,"input":{"value":5.0},"output":{"value":null}}
             ]}}]}}]}}}"#;
 
     #[test]
     fn quickwit_buckets_parse_into_rows() {
         let rows = parse_quickwit(QUICKWIT.as_bytes()).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].at, UnixMillis(1_759_226_400_000));
+        assert_eq!(rows[0].at, UnixMillis(1_790_762_400_000));
         assert_eq!(rows[0].tokens, Tokens(1_234));
         assert_eq!(rows[1].tokens, Tokens(5));
     }
@@ -655,8 +657,8 @@ mod tests {
         let now = UnixMillis::now().0;
         let bucket = now - HOUR;
         let body = QUICKWIT
-            .replace("1759226400000.0", &format!("{bucket}.0"))
-            .replace("1759226700000.0", &format!("{}.0", bucket + 300_000));
+            .replace("1790762400000.0", &format!("{bucket}.0"))
+            .replace("1790762700000.0", &format!("{}.0", bucket + 300_000));
         let (endpoint, server) = serve_once(Some(body)).await;
         let metering = metering();
         charge(&metering, 7);
@@ -669,6 +671,26 @@ mod tests {
         .await;
         server.await.unwrap();
         assert_eq!(used(&metering), 1_234 + 5 + 7);
+    }
+
+    #[tokio::test]
+    async fn a_row_outside_the_window_restores_nothing() {
+        let now = UnixMillis::now().0;
+        let body = QUICKWIT
+            .replace("1790762400000.0", &format!("{}.0", now - HOUR))
+            .replace("1790762700000.0", "253402300800000000.0");
+        let (endpoint, server) = serve_once(Some(body)).await;
+        let metering = metering();
+        charge(&metering, 7);
+        restore_once(
+            Arc::clone(&metering),
+            quickwit(endpoint, Duration::from_secs(5)),
+            None,
+            UnixMillis(now),
+        )
+        .await;
+        server.await.unwrap();
+        assert_eq!(used(&metering), 1_234 + 7);
     }
 
     #[tokio::test]
