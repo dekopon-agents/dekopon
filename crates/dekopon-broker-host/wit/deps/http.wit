@@ -1,8 +1,9 @@
-package dekopon:http@1.1.0;
+package dekopon:http@1.2.0;
 
-/// Buffered, broker-mediated HTTP for Dekopon provider components.
+/// Buffered, streamed and spliced broker-mediated HTTP for Dekopon provider components.
 interface client {
     use dekopon:asset/asset@0.1.0.{handle, encoding};
+    use dekopon:stdio/streams@0.1.0.{reader, writer};
 
     /// One HTTP header. Names are ASCII tokens; values are opaque bytes.
     record header {
@@ -90,4 +91,29 @@ interface client {
     /// Executes one authorized request whose body streams from assets. Only `stream` spools;
     /// `send` stays in memory under `maxHttpResponseBytes`.
     %stream: func(request: streamed-request) -> result<streamed-response, http-error>;
+
+    /// A response whose body is read live from the connection. The headers were scanned before
+    /// it is returned; body bytes become readable only as scanned clean prefixes, and the final
+    /// bytes only at a clean end of body. A read that meets a body failure traps.
+    record opened-response {
+        status: u16,
+        headers: list<header>,
+        body: reader,
+    }
+
+    /// Executes one authorized request and returns once the response head has arrived. The
+    /// request's deadline counts only the time spent waiting on the connection.
+    open: func(request: request) -> result<opened-response, http-error>;
+
+    /// Why a splice stopped before the end of its reader.
+    variant splice-error {
+        /// The writer's reader has gone.
+        closed,
+        /// The body failed; bytes already written stand and the withheld tail is dropped.
+        failed(http-error),
+    }
+
+    /// Copies every byte of `source` into `sink` inside the host and returns the byte count. Time
+    /// waiting on a slow `sink` is bounded by its reader closing, not by the request deadline.
+    splice: func(source: reader, sink: borrow<writer>) -> result<u64, splice-error>;
 }

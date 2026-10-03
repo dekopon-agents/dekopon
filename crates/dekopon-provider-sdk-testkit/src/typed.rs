@@ -15,8 +15,8 @@ use dekopon_capability::{
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
 use dekopon_http_host::LoopbackHttpsPin;
 use dekopon_provider_sdk::provider::{
-    self, Header, HttpError, HttpErrorCode, NativeExit, NativeStdio, Port, Provider, Request,
-    Response, StreamedRequest, StreamedResponse,
+    self, Body, Header, HttpError, HttpErrorCode, NativeExit, NativeStdio, OpenedResponse, Port,
+    Provider, Request, Response, StreamedRequest, StreamedResponse,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -545,6 +545,14 @@ impl Port for FakePort {
             });
         }
         Ok(script.response.clone())
+    }
+    fn open(&mut self, request: Request) -> Result<OpenedResponse, HttpError> {
+        let response = self.send(request)?;
+        Ok(OpenedResponse {
+            status: response.status,
+            headers: response.headers,
+            body: Body::native(std::io::Cursor::new(response.body)),
+        })
     }
     fn stream(&mut self, _: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
         Err(HttpError {

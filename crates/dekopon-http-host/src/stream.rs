@@ -1,9 +1,10 @@
 use super::asset::{AssetDirectory, AssetFile, AssetIoError, AssetReader, Completed};
 use super::{
-    BufferedHttpClient, ErrorCode, Header, HttpError, Request, Response, http_error,
-    is_forbidden_response_header, map_reqwest_error,
+    BoundCredential, BufferedHttpClient, ErrorCode, Header, HttpError, Request, Response,
+    http_error, is_forbidden_response_header, map_reqwest_error,
 };
 use bytes::Bytes;
+use dekopon_capability::HttpConstraints;
 use dekopon_core::base64::{self, Engine as _};
 use futures_util::StreamExt as _;
 use http_body::{Body, Frame, SizeHint};
@@ -356,6 +357,70 @@ impl BufferedHttpClient {
         .await
         .map_err(|_elapsed| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
         .map_err(|error| map_reqwest_error(&error))?;
+        let (status, headers, mut response_bytes) = self.accept_head(&response, &grant, index)?;
+        let overlap = self
+            .credential
+            .as_ref()
+            .map_or(0, BoundCredential::echo_overlap);
+        let mut window = Vec::with_capacity(CHUNK_BYTES + overlap);
+        let mut response = response.bytes_stream();
+        while let Some(chunk) = timeout(self.remaining()?, response.next())
+            .await
+            .map_err(|_elapsed| http_error(ErrorCode::Timeout, "response body timed out"))?
+        {
+            let chunk = chunk.map_err(|error| map_reqwest_error(&error))?;
+            response_bytes = response_bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
+            self.evidence[index].response_bytes = response_bytes;
+            if response_bytes > grant.max_response_bytes {
+                return Err(http_error(
+                    ErrorCode::ResponseTooLarge,
+                    "response exceeds the authorized byte limit",
+                ));
+            }
+            for bytes in chunk.chunks(CHUNK_BYTES) {
+                if let Some(credential) = &self.credential {
+                    let clean = credential
+                        .scan_stream_chunk(&mut window, bytes, overlap)
+                        .ok_or_else(echoed)?;
+                    window.drain(..clean);
+                }
+                spool = spool
+                    .write(bytes.to_vec())
+                    .await
+                    .map_err(|error| self.asset_error(error))?;
+            }
+        }
+        self.evidence[index].status = Some(status);
+        self.evidence[index].response_bytes = response_bytes;
+        Ok(StreamedResponse {
+            status,
+            headers,
+            body: spool
+                .finish()
+                .await
+                .map_err(|error| self.asset_error(error))?,
+        })
+    }
+}
+
+pub(crate) fn echoed() -> HttpError {
+    http_error(
+        ErrorCode::Denied,
+        "credentialed response echoed the credential",
+    )
+}
+
+impl BufferedHttpClient {
+    /// The one response-head path for `stream` and `open`: encoded bodies are refused, the header
+    /// bounds hold and the visible headers are scanned before any body byte is read.
+    pub(crate) fn accept_head(
+        &mut self,
+        response: &reqwest::Response,
+        grant: &HttpConstraints,
+        index: usize,
+    ) -> Result<(u16, Vec<Header>, u64), HttpError> {
         if response
             .headers()
             .contains_key(reqwest::header::CONTENT_ENCODING)
@@ -394,72 +459,22 @@ impl BufferedHttpClient {
                 });
             }
         }
-        if self.credential.as_ref().is_some_and(|credential| {
-            credential.echoes_credential(&Response {
-                status,
-                headers: headers.clone(),
-                body: vec![],
-            })
-        }) {
-            return Err(http_error(
-                ErrorCode::Denied,
-                "credentialed response echoed the credential",
-            ));
-        }
-        let overlap = self.credential.as_ref().map_or(0, |credential| {
-            credential
-                .echo_values
-                .iter()
-                .map(|secret| secret.expose().len().saturating_sub(1))
-                .max()
-                .unwrap_or(0)
-        });
-        let mut window = Vec::with_capacity(CHUNK_BYTES + overlap);
-        let mut response = response.bytes_stream();
-        while let Some(chunk) = timeout(self.remaining()?, response.next())
-            .await
-            .map_err(|_elapsed| http_error(ErrorCode::Timeout, "response body timed out"))?
-        {
-            let chunk = chunk.map_err(|error| map_reqwest_error(&error))?;
-            response_bytes = response_bytes
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
-            self.evidence[index].response_bytes = response_bytes;
-            if response_bytes > grant.max_response_bytes {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
-                    "response exceeds the authorized byte limit",
-                ));
-            }
-            for bytes in chunk.chunks(CHUNK_BYTES) {
-                if let Some(credential) = &self.credential
-                    && credential.echoes_stream_chunk(&mut window, bytes, overlap)
-                {
-                    return Err(http_error(
-                        ErrorCode::Denied,
-                        "credentialed response echoed the credential",
-                    ));
-                }
-                spool = spool
-                    .write(bytes.to_vec())
-                    .await
-                    .map_err(|error| self.asset_error(error))?;
-            }
-        }
-        self.evidence[index].status = Some(status);
-        self.evidence[index].response_bytes = response_bytes;
-        Ok(StreamedResponse {
+        let head = Response {
             status,
             headers,
-            body: spool
-                .finish()
-                .await
-                .map_err(|error| self.asset_error(error))?,
-        })
+            body: vec![],
+        };
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(|credential| credential.echoes_credential(&head))
+        {
+            return Err(echoed());
+        }
+        self.evidence[index].response_bytes = response_bytes;
+        Ok((status, head.headers, response_bytes))
     }
-}
 
-impl BufferedHttpClient {
     fn asset_error(&mut self, error: AssetIoError) -> HttpError {
         if matches!(error, AssetIoError::OverBudget) {
             self.asset_over_budget = true;
@@ -770,16 +785,16 @@ mod tests {
         .unwrap();
         for split in 1..secret.len() {
             let mut window = Vec::new();
-            assert!(!credential.echoes_stream_chunk(
-                &mut window,
-                &secret.as_bytes()[..split],
-                secret.len() - 1
-            ));
-            assert!(credential.echoes_stream_chunk(
-                &mut window,
-                &secret.as_bytes()[split..],
-                secret.len() - 1
-            ));
+            assert!(
+                credential
+                    .scan_stream_chunk(&mut window, &secret.as_bytes()[..split], secret.len() - 1)
+                    .is_some()
+            );
+            assert!(
+                credential
+                    .scan_stream_chunk(&mut window, &secret.as_bytes()[split..], secret.len() - 1)
+                    .is_none()
+            );
         }
     }
 

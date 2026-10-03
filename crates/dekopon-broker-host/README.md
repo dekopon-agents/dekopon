@@ -1,7 +1,7 @@
 # dekopon-broker-host
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
-`dekopon:http@1.1.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.1`, or
+`dekopon:http@1.2.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.1`, or
 `dekopon:clock@1.0.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
@@ -76,7 +76,7 @@ The linker exposes only these imports; generic WASI and unknown imports fail bef
 
 | Import | Answered during | Outside `invoke` |
 |---|---|---|
-| `dekopon:http/client@1.1.0` (`send` and `stream`), buffered `client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
+| `dekopon:http/client@1.2.0` (`send`, `stream`, `open`, `splice`), buffered `client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
 | `dekopon:asset/asset@0.1.0` | invocation-scoped inputs and exact attach/send grants | typed `denied`, then the tripwire |
 | `dekopon:storage/jsonl@0.1.1`, `dekopon:storage/durable-files@0.1.1` | an invocation carrying an exact storage grant of that interface | typed `permission-denied`, then the tripwire |
 | `dekopon:clock/wall@1.0.0` | every invocation; no grant | traps, then the tripwire |

@@ -23,6 +23,22 @@ impl Http {
         }
     }
 
+    /// Sends a request and returns once the response head arrives; the body stays on the
+    /// connection until read or spliced.
+    pub fn open(
+        &self,
+        request: crate::http::Request,
+    ) -> Result<crate::http::OpenedResponse, crate::http::HttpError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::http::open(request)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::port::open(request)
+        }
+    }
+
     /// Sends an asset-backed request and returns a spooled response body.
     pub fn stream(
         &self,

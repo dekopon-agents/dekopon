@@ -2,9 +2,12 @@
 [overrides."dekopon:asset"]
 path = "../asset"
 
+[overrides."dekopon:stdio"]
+path = "../stdio"
+
 [metadata]
 authors = "Dekopon contributors"
-description = "Buffered and asset-streamed broker-mediated HTTP interface for Dekopon WebAssembly components"
+description = "Buffered, asset-streamed and spliced broker-mediated HTTP interface for Dekopon WebAssembly components"
 license = "Apache-2.0 OR MIT"
 homepage = "https://github.com/dekopon-agents/dekopon"
 repository = "https://github.com/dekopon-agents/dekopon"

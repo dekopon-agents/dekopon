@@ -94,7 +94,7 @@ fn decoded_imports(bytes: &[u8]) -> Result<BTreeSet<String>, ConformanceError> {
 
 fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     [
-        (ImportSet::HTTP, "dekopon:http/client@1.1.0"),
+        (ImportSet::HTTP, "dekopon:http/client@1.2.0"),
         (ImportSet::CLOCK, "dekopon:clock/wall@1.0.0"),
         (ImportSet::SETTINGS, "dekopon:settings/config@0.1.0"),
         (ImportSet::JSONL, "dekopon:storage/jsonl@0.1.1"),

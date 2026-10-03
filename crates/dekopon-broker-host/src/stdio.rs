@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use wasmtime::component::Resource;
 
 use crate::StoreState;
+use crate::bindings::dekopon::http::client as http_wit;
 use crate::bindings::dekopon::stdio::streams as wit;
 
 // Lowered before the read buffer is allocated, so a guest cannot ask the host for 4 GiB.
@@ -54,6 +55,8 @@ pub enum StdioTrap {
     TooManyHandles,
     #[error("the provider asked to read zero bytes, which would read as end of input")]
     ZeroRead,
+    #[error("an opened HTTP body failed: {0}")]
+    HttpBody(dekopon_http_host::HttpError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +67,10 @@ pub enum StdioAdmissionError {
     Io(#[from] std::io::Error),
 }
 
-pub struct ReaderResource;
+pub enum ReaderResource {
+    Stdin,
+    Http(Box<dekopon_http_host::ResponseBody>),
+}
 pub struct WriterResource;
 
 #[derive(Debug, Default)]
@@ -247,19 +253,10 @@ impl WorkClock {
     }
 }
 
-impl wit::HostReader for StoreState {
-    async fn read(
-        &mut self,
-        resource: Resource<ReaderResource>,
-        max: u32,
-    ) -> wasmtime::Result<Vec<u8>> {
-        self.table.get(&resource)?;
-        if max == 0 {
-            return Err(StdioTrap::ZeroRead.into());
-        }
-        let length = usize::try_from(max.min(MAX_READ_BYTES))?;
+impl StoreState {
+    async fn read_stdin(&mut self, length: usize) -> Vec<u8> {
         let Some(stream) = self.stdio.stdin.as_mut() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let mut buffer = vec![0; length];
         let parked = self.stdio.clock.park();
@@ -272,13 +269,105 @@ impl wit::HostReader for StoreState {
                 if count == 0 {
                     self.stdio.stdin = None;
                 }
-                Ok(buffer)
+                buffer
             }
             Err(_) => {
                 self.stdio.stdin = None;
-                Ok(Vec::new())
+                Vec::new()
             }
         }
+    }
+
+    async fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), wit::WriteError> {
+        let Some(stream) = self.stdio.stdout.as_mut() else {
+            return Err(wit::WriteError::Closed);
+        };
+        let parked = self.stdio.clock.park();
+        let written = stream.write_all(bytes).await;
+        drop(parked);
+        if written.is_err() {
+            self.stdio.stdout = None;
+            return Err(wit::WriteError::Closed);
+        }
+        self.stdio.stdout_trace.record(bytes);
+        Ok(())
+    }
+
+    pub(crate) async fn open_http(
+        &mut self,
+        request: http_wit::Request,
+    ) -> wasmtime::Result<Result<http_wit::OpenedResponse, http_wit::HttpError>> {
+        self.stdio.mint()?;
+        let opened = match self.http.open(request).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.stdio.release();
+                return Ok(Err(error));
+            }
+        };
+        Ok(Ok(http_wit::OpenedResponse {
+            status: opened.status,
+            headers: crate::http::wit_headers(opened.headers),
+            body: self
+                .table
+                .push(ReaderResource::Http(Box::new(opened.body)))?,
+        }))
+    }
+
+    // Only the body's socket reads are timed; a write parked on a slow reader is bounded by that
+    // reader closing.
+    pub(crate) async fn splice(
+        &mut self,
+        from: Resource<ReaderResource>,
+        to: Resource<WriterResource>,
+    ) -> wasmtime::Result<Result<u64, http_wit::SpliceError>> {
+        self.table.get(&to)?;
+        let mut source = self.table.delete(from)?;
+        self.stdio.release();
+        let mut written = 0_u64;
+        loop {
+            let bytes = match &mut source {
+                ReaderResource::Stdin => self.read_stdin(MAX_READ_BYTES as usize).await,
+                ReaderResource::Http(body) => match body.read(MAX_READ_BYTES as usize).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.http.client.record_body_failure(&error);
+                        return Ok(Err(http_wit::SpliceError::Failed(crate::http::map_error(
+                            error,
+                        ))));
+                    }
+                },
+            };
+            if bytes.is_empty() {
+                return Ok(Ok(written));
+            }
+            if self.write_stdout(&bytes).await.is_err() {
+                return Ok(Err(http_wit::SpliceError::Closed));
+            }
+            written += bytes.len() as u64;
+        }
+    }
+}
+
+impl wit::HostReader for StoreState {
+    async fn read(
+        &mut self,
+        resource: Resource<ReaderResource>,
+        max: u32,
+    ) -> wasmtime::Result<Vec<u8>> {
+        self.table.get(&resource)?;
+        if max == 0 {
+            return Err(StdioTrap::ZeroRead.into());
+        }
+        let length = usize::try_from(max.min(MAX_READ_BYTES))?;
+        let body = match self.table.get_mut(&resource)? {
+            ReaderResource::Stdin => return Ok(self.read_stdin(length).await),
+            ReaderResource::Http(body) => body.read(length).await,
+        };
+        body.map_err(|error| {
+            self.http.client.record_body_failure(&error);
+            StdioTrap::HttpBody(error).into()
+        })
     }
 
     async fn drop(&mut self, resource: Resource<ReaderResource>) -> wasmtime::Result<()> {
@@ -295,18 +384,7 @@ impl wit::HostWriter for StoreState {
         bytes: Vec<u8>,
     ) -> wasmtime::Result<Result<(), wit::WriteError>> {
         self.table.get(&resource)?;
-        let Some(stream) = self.stdio.stdout.as_mut() else {
-            return Ok(Err(wit::WriteError::Closed));
-        };
-        let parked = self.stdio.clock.park();
-        let written = stream.write_all(&bytes).await;
-        drop(parked);
-        if written.is_err() {
-            self.stdio.stdout = None;
-            return Ok(Err(wit::WriteError::Closed));
-        }
-        self.stdio.stdout_trace.record(&bytes);
-        Ok(Ok(()))
+        Ok(self.write_stdout(&bytes).await)
     }
 
     async fn drop(&mut self, resource: Resource<WriterResource>) -> wasmtime::Result<()> {
@@ -322,7 +400,7 @@ impl wit::Host for StoreState {
             return Ok(None);
         }
         self.stdio.mint()?;
-        Ok(Some(self.table.push(ReaderResource)?))
+        Ok(Some(self.table.push(ReaderResource::Stdin)?))
     }
 
     async fn stdout(&mut self) -> wasmtime::Result<Resource<WriterResource>> {
@@ -415,5 +493,184 @@ mod tests {
             )
             .await;
         assert_eq!(outcome, None);
+    }
+
+    mod splice {
+        use std::io::Read as _;
+        use std::time::Duration;
+
+        use dekopon_core::Redacted;
+        use dekopon_test_support::LoopbackServer;
+
+        use crate::bindings::dekopon::http::client as http_wit;
+        use crate::bindings::dekopon::stdio::streams::Host as _;
+        use crate::http::{BoundCredential, HttpState};
+        use crate::stdio::StdioState;
+        use crate::{
+            BrokerHostLimits, BrokerHostOptions, Runtime, StoreState, clock::ClockState,
+            settings::SettingsState, storage::StorageState,
+        };
+
+        const SECRET: &[u8] = b"secret-with-sixteen-bytes";
+
+        fn head(length: usize) -> Vec<u8> {
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n")
+                .into_bytes()
+        }
+
+        fn state(
+            server: &LoopbackServer,
+            timeout: Duration,
+            stdout: std::os::unix::net::UnixStream,
+        ) -> StoreState {
+            let runtime =
+                Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
+            let credential = BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(String::from_utf8(SECRET.to_vec()).unwrap()),
+                vec![server.authority().to_owned()],
+            )
+            .unwrap();
+            let http = HttpState::invoke(
+                Some(dekopon_capability::HttpConstraints {
+                    allowed_hosts: vec![server.authority().to_owned()],
+                    allowed_methods: vec!["GET".to_owned()],
+                    max_requests: 1,
+                    max_request_bytes: 4096,
+                    max_response_bytes: 4 << 20,
+                    allow_plaintext_loopback: true,
+                    propagate_trace: false,
+                }),
+                None,
+                Some(credential),
+                runtime.http_ceilings(),
+                timeout,
+            )
+            .unwrap();
+            let mut state = runtime
+                .store_for_provider(
+                    "test-provider",
+                    http,
+                    StorageState::disabled(),
+                    ClockState::invoke(None),
+                    SettingsState::invoke(None),
+                )
+                .unwrap()
+                .into_data();
+            state.stdio = StdioState::invoke(Some(crate::Streams {
+                stdin: None,
+                stdout: stdout.into(),
+            }))
+            .unwrap();
+            state
+        }
+
+        async fn splice(
+            state: &mut StoreState,
+            server: &LoopbackServer,
+        ) -> Result<u64, http_wit::SpliceError> {
+            let opened = state
+                .open_http(http_wit::Request {
+                    method: "GET".to_owned(),
+                    uri: server.url(),
+                    headers: vec![],
+                    body: vec![],
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let writer = state.stdout().await.unwrap();
+            state.splice(opened.body, writer).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_late_echo_reaches_neither_stdout_nor_its_trace_and_fails_the_invocation() {
+            let first = [vec![b'a'; 64], SECRET[..8].to_vec()].concat();
+            let second = [SECRET[8..].to_vec(), b"tail".to_vec()].concat();
+            let server = LoopbackServer::paced(
+                vec![[head(first.len() + second.len()), first].concat(), second],
+                Duration::from_millis(100),
+                Duration::ZERO,
+            );
+            let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut state = state(&server, Duration::from_secs(5), host);
+            let outcome = splice(&mut state, &server).await;
+            assert!(matches!(
+                outcome,
+                Err(http_wit::SpliceError::Failed(http_wit::HttpError {
+                    code: http_wit::ErrorCode::Denied,
+                    ..
+                }))
+            ));
+            let clean = "a".repeat(64 + 8 - (SECRET.len() - 1));
+            assert_eq!(state.stdio.stdout_trace.prefix(), clean);
+            assert_eq!(state.http.policy_violation(), Some("denied"));
+            state.stdio.close();
+            let mut written = Vec::new();
+            peer.read_to_end(&mut written).unwrap();
+            assert_eq!(written, clean.as_bytes());
+            server.join();
+        }
+
+        #[tokio::test]
+        async fn a_closed_splice_consumer_records_one_abandoned_body_with_read_bytes() {
+            use dekopon_test_support::CaptureLayer;
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let capture = CaptureLayer::workspace();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let body = vec![b'a'; 64];
+            let server = LoopbackServer::paced(
+                vec![[head(body.len()), body].concat()],
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let (host, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(peer);
+            let mut state = state(&server, Duration::from_secs(5), host);
+            assert!(matches!(
+                splice(&mut state, &server).await,
+                Err(http_wit::SpliceError::Closed)
+            ));
+            let bodies = capture
+                .events()
+                .into_iter()
+                .filter(|(fields, _)| fields.contains("accounting.http.response_body"))
+                .collect::<Vec<_>>();
+            assert_eq!(bodies.len(), 1, "{}", capture.text());
+            assert!(bodies[0].0.contains("outcome=\"abandoned\""), "{bodies:?}");
+            assert!(
+                bodies[0]
+                    .0
+                    .contains("dekopon.http.response.accounted_bytes=119"),
+                "{bodies:?}"
+            );
+            assert_eq!(bodies[0].1.as_deref(), Some("http.request"));
+            server.join();
+        }
+
+        #[tokio::test]
+        async fn a_downstream_slower_than_the_request_deadline_still_receives_the_whole_body() {
+            let body = vec![b'b'; 2 << 20];
+            let server = LoopbackServer::paced(
+                vec![[head(body.len()), body.clone()].concat()],
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let (host, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let reader = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                let mut written = Vec::new();
+                peer.read_to_end(&mut written).unwrap();
+                written
+            });
+            let mut state = state(&server, Duration::from_millis(500), host);
+            let spliced = splice(&mut state, &server).await;
+            assert!(matches!(spliced, Ok(bytes) if bytes == body.len() as u64));
+            state.stdio.close();
+            assert_eq!(reader.join().unwrap(), body);
+            server.join();
+        }
     }
 }

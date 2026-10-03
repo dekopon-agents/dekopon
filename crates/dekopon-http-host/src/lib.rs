@@ -12,7 +12,9 @@
     )
 )]
 pub mod asset;
+mod open;
 mod stream;
+pub use open::{OpenedResponse, ResponseBody};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
 };
@@ -516,20 +518,32 @@ impl BoundCredential {
         }
     }
 
-    fn echoes_stream_chunk(&self, window: &mut Vec<u8>, bytes: &[u8], overlap: usize) -> bool {
+    /// Appends `bytes` behind the held tail and scans the window. `None` is an echo; otherwise the
+    /// count of leading window bytes that no later byte can complete into a secret, leaving
+    /// exactly `overlap` bytes held.
+    fn scan_stream_chunk(
+        &self,
+        window: &mut Vec<u8>,
+        bytes: &[u8],
+        overlap: usize,
+    ) -> Option<usize> {
         window.extend_from_slice(bytes);
         if self
             .echo_values
             .iter()
             .any(|secret| !secret.expose().is_empty() && contains_bytes(window, secret.expose()))
         {
-            return true;
+            return None;
         }
-        let keep = window.len().min(overlap);
-        let start = window.len() - keep;
-        window.copy_within(start.., 0);
-        window.truncate(keep);
-        false
+        Some(window.len() - window.len().min(overlap))
+    }
+
+    fn echo_overlap(&self) -> usize {
+        self.echo_values
+            .iter()
+            .map(|secret| secret.expose().len().saturating_sub(1))
+            .max()
+            .unwrap_or(0)
     }
 
     fn echoes_credential(&self, response: &Response) -> bool {
@@ -647,6 +661,7 @@ pub struct BufferedHttpClient {
     secret_grant: Option<SecretUseGrant>,
     credential: Option<BoundCredential>,
     ceilings: HttpHostCeilings,
+    timeout: Duration,
     deadline: Instant,
     calls: u32,
     secret_injections: u32,
@@ -741,6 +756,7 @@ impl BufferedHttpClient {
             secret_grant,
             credential,
             ceilings,
+            timeout,
             deadline,
             calls: 0,
             secret_injections: 0,
@@ -767,6 +783,12 @@ impl BufferedHttpClient {
 
     pub fn into_evidence(self) -> Vec<HttpCallEvidence> {
         self.evidence
+    }
+
+    /// An opened body's failure is the invocation's failure too: a late echo stays a policy
+    /// violation even when the guest ignores the error.
+    pub fn record_body_failure(&mut self, error: &HttpError) {
+        self.policy_violation = violation_label(error.code).or(self.policy_violation);
     }
 
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
@@ -869,6 +891,10 @@ impl BufferedHttpClient {
             ));
         }
         self.calls = self.calls.saturating_add(1);
+        // Each request gets the whole timeout: a provider parked on its stdin has done no work.
+        self.deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| http_error(ErrorCode::Internal, "request deadline overflowed"))?;
 
         if self.secret_grant.is_some() && secret_raw_path_is_ambiguous(&request.uri) {
             return Err(http_error(
@@ -1352,7 +1378,6 @@ impl BufferedHttpClient {
             .redirect(redirect::Policy::none())
             .no_proxy()
             .connect_timeout(budget)
-            .timeout(budget)
             .resolve_to_addrs(host, addresses);
         let pinned_ca = self
             .ceilings

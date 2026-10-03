@@ -1,6 +1,6 @@
 # dekopon-http-host
 
-Statically linked native implementation behind Dekopon's buffered `send` and asset-backed `stream` HTTP provider primitives (`dekopon:http@1.1.0`).
+Statically linked native implementation behind Dekopon's buffered `send`, asset-backed `stream`, and response `open`/`splice` HTTP provider primitives (`dekopon:http@1.2.0`).
 
 This crate is transport machinery for `dekopon-broker-host`, not a provider API and not an authorization engine. A `BufferedHttpClient` consumes one broker-produced `HttpConstraints` grant under independent `HttpHostCeilings`. Disabled contexts deny every call.
 

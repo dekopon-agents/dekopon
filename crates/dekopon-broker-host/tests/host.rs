@@ -15,7 +15,7 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
+    BoundCredential, BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
     CommandRunOutcome, HARD_MAX_PROVIDER_COMPONENT_BYTES, HTTP_WIT, LockedProviderSource,
     PROVIDER_WIT, STORAGE_WIT,
 };
@@ -23,7 +23,7 @@ use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, HttpConstraints, ProposedInvocation, StorageAccess,
     StorageConstraints, StorageInterface, StorageScope, broker::AuthorizationGate,
 };
-use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, Redacted, TraceId};
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
 use dekopon_test_support::{LoopbackServer, provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
@@ -244,6 +244,125 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
         2
     );
     server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checked_http_probe_splices_a_clean_response_without_a_json_envelope() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap();
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello body",
+    );
+    let authority = server.authority().to_owned();
+    let (assets, stdout) = fixture::piped_stdout();
+    registry
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri":server.url(), "spliceBody":true}),
+                http_constraints(authority, "GET"),
+            ),
+            None,
+            assets,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stdout.bytes(), b"hello body");
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checked_http_probe_late_echo_never_reaches_stdout() {
+    let secret = "secret-with-sixteen-bytes";
+    let first = [vec![b'a'; 64], secret.as_bytes()[..8].to_vec()].concat();
+    let second = [secret.as_bytes()[8..].to_vec(), b"tail".to_vec()].concat();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        first.len() + second.len()
+    );
+    let server = LoopbackServer::paced(
+        vec![[head.into_bytes(), first].concat(), second],
+        Duration::from_millis(100),
+        Duration::ZERO,
+    );
+    let authority = server.authority().to_owned();
+    let credential = BoundCredential::bearer(
+        "Bearer",
+        Redacted::new(secret.to_owned()),
+        vec![authority.clone()],
+    )
+    .unwrap();
+    let (assets, stdout) = fixture::piped_stdout();
+    let error = registry_for_http_probe()
+        .await
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri":server.url(), "spliceBody":true}),
+                http_constraints(authority, "GET"),
+            ),
+            Some(credential),
+            assets,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.error.as_ref(),
+        BrokerHostError::HostCallRejected {
+            reason: "denied",
+            ..
+        }
+    ));
+    assert_eq!(stdout.bytes(), vec![b'a'; 64 + 8 - (secret.len() - 1)]);
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checked_http_probe_times_out_on_a_parked_body_read() {
+    let server = LoopbackServer::paced(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort".to_vec(),
+            b"remaining bytes!".to_vec(),
+        ],
+        Duration::from_secs(2),
+        Duration::ZERO,
+    );
+    let authority = server.authority().to_owned();
+    let mut constraints = http_constraints(authority, "GET");
+    constraints.timeout_ms = 500;
+    let (assets, stdout) = fixture::piped_stdout();
+    let error = registry_for_http_probe()
+        .await
+        .invoke(
+            authorized(
+                "http-probe.fetch".parse().unwrap(),
+                json!({"uri":server.url(), "spliceBody":true}),
+                constraints,
+            ),
+            None,
+            assets,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.error.as_ref(),
+        BrokerHostError::ProviderFailure { .. } | BrokerHostError::Timeout { .. }
+    ));
+    assert!(!stdout.bytes().ends_with(b"remaining bytes!"));
+    server.join();
+}
+
+async fn registry_for_http_probe() -> BrokerProviderRegistry {
+    BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
