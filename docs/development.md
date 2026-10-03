@@ -508,7 +508,7 @@ the same one. Contract and deployment details are in [`container-image.md`](cont
 actionlint .github/workflows/container-image.yml
 shellcheck ci/stage-image-context.sh
 work=$(mktemp -d)
-ci/stage-image-context.sh v0.3.0 "$work"
+ci/stage-image-context.sh v0.31.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker buildx build --platform linux/amd64 --load -t dekopon:local-amd64 "$work/context"
 docker run --rm dekopon:local dekopond --help
@@ -516,7 +516,7 @@ ci/verify-image-broker.sh dekopon:local
 docker export "$(docker create dekopon:local unused)" | tar -tvf - opt/dekopon/providers
 ```
 
-The script prints the twelve files it staged and the digest of each executable, then the build
+The script prints the staged files and the digest of each executable, then the build
 context is exactly those files: there is no `.dockerignore` denylist to keep correct as the
 repository grows. The repository root cannot be used as a context and fails in about a second if
 someone tries.
@@ -533,8 +533,8 @@ binary that needs a glibc newer than the runtime base provides.
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits
 under a deadline for its post-load socket. Releases exposing `probe` exercise that command;
 older ones use version-appropriate configuration and prove component-load/startup only. This validates released image bytes, not a native build of source
-HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The four
-default components and optional memory component must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
+HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
+checked in-tree components must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 
 ## Before opening a pull request
