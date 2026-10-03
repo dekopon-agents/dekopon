@@ -15,8 +15,8 @@ use dekopon_provider_sdk::{
     EffectKind, RiskLevel,
     clap::{Parser, Subcommand},
     provider::{
-        Capability, Clock, Code, DurableFiles, Failure, Header, Http, Proposal, Provider, Request,
-        Response, Stdout, Storage, Usage,
+        Capability, Clock, Code, DurableFiles, Failure, Header, Http, Monotonic, Proposal,
+        Provider, Random, Request, Response, Stdout, Storage, Usage,
     },
 };
 use dekopon_provider_sdk_testkit::{
@@ -365,9 +365,33 @@ fn typed_storage_component_matches_durable_files_imports() {
 
 struct TypedClock;
 struct ClockNow;
+
+enum ClockNeedError {
+    Entropy(dekopon_provider_sdk::random::RandomError),
+    Output,
+}
+impl fmt::Display for ClockNeedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entropy(error) => write!(f, "entropy: {error}"),
+            Self::Output => f.write_str("stdout is closed"),
+        }
+    }
+}
+impl Failure for ClockNeedError {
+    fn code(&self) -> Code {
+        match self {
+            Self::Entropy(_) => Code::new("entropy-failed"),
+            Self::Output => Code::new("output-closed"),
+        }
+    }
+}
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct EmptyInput {}
+struct EmptyInput {
+    #[serde(default)]
+    services: bool,
+}
 impl Provider for TypedClock {
     const ID: &'static str = "clock-probe";
     const COMMAND_WORDS: &'static [&'static str] = &["date"];
@@ -375,7 +399,7 @@ impl Provider for TypedClock {
     type Args = NoArgs;
     type Capabilities = (ClockNow,);
     fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
-        Ok(Proposal::to::<ClockNow>(EmptyInput {}))
+        Ok(Proposal::to::<ClockNow>(EmptyInput { services: false }))
     }
 }
 impl Capability for ClockNow {
@@ -385,11 +409,23 @@ impl Capability for ClockNow {
     const EFFECT: EffectKind = EffectKind::ReadOnly;
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = EmptyInput;
-    type Needs = Clock;
-    type Error = Gone;
-    fn run(_: EmptyInput, clock: Clock, out: &mut Stdout) -> Result<(), Self::Error> {
-        let value = Ok(json!({"unixMillis":clock.now_unix_millis()}));
-        emit(out, value)
+    type Needs = (Clock, Monotonic, Random);
+    type Error = ClockNeedError;
+    fn run(
+        input: EmptyInput,
+        (clock, monotonic, random): Self::Needs,
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let mut value = json!({"unixMillis":clock.now_unix_millis()});
+        if input.services {
+            value["monotonicNanos"] = json!(monotonic.now_nanos());
+            let mut bytes = [0; 8];
+            random.fill(&mut bytes).map_err(ClockNeedError::Entropy)?;
+            value["entropyBytes"] = json!(bytes.len());
+            value["entropyChecksum"] =
+                json!(bytes.iter().map(|byte| u64::from(*byte)).sum::<u64>());
+        }
+        writeln!(out, "{value}").map_err(|_closed| ClockNeedError::Output)
     }
 }
 
@@ -407,6 +443,34 @@ fn typed_clock_component_matches_imports_and_uses_injected_clock() {
         component_stdout(output),
         json!({"unixMillis":951_782_400_123_u64,"rfc3339":"2000-02-29T00:00:00Z"})
     );
+}
+
+#[test]
+fn typed_clock_component_reads_new_services_during_invoke() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/clock-probe-provider.wasm");
+    let output = Harness::<TypedClock>::get(path)
+        .call("clock-probe.now", json!({"services":true}))
+        .unwrap();
+    let value = component_stdout(output);
+    assert!(value["monotonicNanos"].as_u64().is_some());
+    assert_eq!(value["entropyBytes"], 8);
+    assert!(value.get("entropy").is_none());
+}
+
+#[test]
+fn native_monotonic_and_entropy_are_injected_without_guest_mode() {
+    let fixed = UNIX_EPOCH + Duration::from_millis(951_782_400_123);
+    let output = Native::<TypedClock>::new()
+        .clock(fixed)
+        .monotonic(42)
+        .entropy([7; 8])
+        .call("clock-probe.now", r#"{"services":true}"#);
+    let value = stdout_value(&output);
+    assert_eq!(value["unixMillis"], 951_782_400_123_u64);
+    assert_eq!(value["monotonicNanos"], 42);
+    assert_eq!(value["entropyBytes"], 8);
+    assert_eq!(value["entropyChecksum"], 56);
 }
 
 struct RawHttp;

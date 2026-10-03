@@ -1,6 +1,6 @@
 use dekopon_provider_sdk::clap::Parser;
 use dekopon_provider_sdk::provider::{
-    Capability, Clock, Code, Failure, Proposal, Provider, Stdout, Usage,
+    Capability, Clock, Code, Failure, Monotonic, Proposal, Provider, Random, Stdout, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
@@ -13,26 +13,52 @@ struct Now;
 
 #[derive(Parser)]
 #[command(name = "date")]
-struct Date {}
+struct Date {
+    #[arg(long)]
+    services: bool,
+}
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Empty {}
+struct Empty {
+    #[serde(default, skip_serializing_if = "is_false")]
+    services: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug)]
-struct ClockError(u64);
+enum ClockError {
+    OutOfRange(u64),
+    Entropy(dekopon_provider_sdk::random::RandomError),
+    Output,
+}
 impl std::fmt::Display for ClockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the host clock reads {} ms, past 9999-12-31T23:59:59.999Z",
-            self.0
-        )
+        match self {
+            Self::OutOfRange(millis) => write!(
+                f,
+                "the host clock reads {millis} ms, past 9999-12-31T23:59:59.999Z"
+            ),
+            Self::Entropy(error) => write!(f, "entropy read failed: {error}"),
+            Self::Output => f.write_str("stdout closed"),
+        }
     }
 }
 impl Failure for ClockError {
     fn code(&self) -> Code {
-        Code::new("clock-out-of-range")
+        match self {
+            Self::OutOfRange(_) => Code::new("clock-out-of-range"),
+            Self::Entropy(dekopon_provider_sdk::random::RandomError::SourceUnavailable) => {
+                Code::new("entropy-unavailable")
+            }
+            Self::Entropy(dekopon_provider_sdk::random::RandomError::InvalidLength) => {
+                Code::new("entropy-invalid-length")
+            }
+            Self::Output => Code::new("output-closed"),
+        }
     }
 }
 
@@ -43,8 +69,10 @@ impl Provider for ClockProbe {
         "Clock provider fixture: the date word and the host wall clock";
     type Args = Date;
     type Capabilities = (Now,);
-    fn propose(_: Date, _: bool) -> Result<Proposal<Self>, Usage> {
-        Ok(Proposal::to::<Now>(Empty {}))
+    fn propose(args: Date, _: bool) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<Now>(Empty {
+            services: args.services,
+        }))
     }
 }
 
@@ -55,11 +83,22 @@ impl Capability for Now {
     const EFFECT: EffectKind = EffectKind::ReadOnly;
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Empty;
-    type Needs = Clock;
+    type Needs = (Clock, Monotonic, Random);
     type Error = ClockError;
-    fn run(_: Empty, clock: Clock, out: &mut Stdout) -> Result<(), ClockError> {
-        writeln!(out, "{}", reading(clock.now_unix_millis())?)
-            .map_err(|_| ClockError(clock.now_unix_millis()))
+    fn run(
+        input: Empty,
+        (clock, monotonic, random): (Clock, Monotonic, Random),
+        out: &mut Stdout,
+    ) -> Result<(), ClockError> {
+        let mut value = reading(clock.now_unix_millis())?;
+        if input.services {
+            let elapsed = monotonic.now_nanos();
+            let mut bytes = [0; 8];
+            random.fill(&mut bytes).map_err(ClockError::Entropy)?;
+            value["monotonicNanos"] = json!(elapsed);
+            value["entropyBytes"] = json!(bytes.len());
+        }
+        writeln!(out, "{value}").map_err(|_| ClockError::Output)
     }
 }
 
@@ -71,7 +110,7 @@ fn reading(unix_millis: u64) -> Result<Value, ClockError> {
 
 fn rfc3339(unix_millis: u64) -> Result<String, ClockError> {
     if unix_millis > MAX_RFC3339_UNIX_MILLIS {
-        return Err(ClockError(unix_millis));
+        return Err(ClockError::OutOfRange(unix_millis));
     }
     let seconds = unix_millis / 1_000;
     let (year, month, day) = civil_from_days(seconds / 86_400);
@@ -145,7 +184,9 @@ mod tests {
         }
         let error = rfc3339(MAX_RFC3339_UNIX_MILLIS + 1).unwrap_err();
         assert_eq!(error.code().as_str(), "clock-out-of-range");
-        assert!(matches!(error, ClockError(millis) if millis == MAX_RFC3339_UNIX_MILLIS + 1));
+        assert!(
+            matches!(error, ClockError::OutOfRange(millis) if millis == MAX_RFC3339_UNIX_MILLIS + 1)
+        );
         assert_eq!(
             reading(951_782_400_000).unwrap(),
             json!({"unixMillis": 951_782_400_000_u64, "rfc3339": "2000-02-29T00:00:00Z"})

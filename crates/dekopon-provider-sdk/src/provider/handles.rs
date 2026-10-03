@@ -90,6 +90,57 @@ impl Needs for Clock {
     const IMPORTS: ImportSet = ImportSet::CLOCK;
 }
 
+/// Authorized invocation-relative monotonic clock.
+pub struct Monotonic(PhantomData<()>);
+
+impl Monotonic {
+    /// Reads elapsed nanoseconds since this invocation's store was created.
+    #[must_use]
+    pub fn now_nanos(&self) -> u64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::clock::now_nanos()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::port::now_nanos()
+        }
+    }
+}
+impl sealed::Needs for Monotonic {
+    fn grant() -> Result<Self, SdkFailure> {
+        Ok(Self(PhantomData))
+    }
+}
+impl Needs for Monotonic {
+    const IMPORTS: ImportSet = ImportSet::MONOTONIC;
+}
+
+/// Authorized broker OS entropy source.
+pub struct Random(PhantomData<()>);
+
+impl Random {
+    /// Fills a buffer with OS entropy, splitting calls at the broker's per-read ceiling.
+    pub fn fill(&self, out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::random::fill_chunks(out, crate::random::read)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::random::fill_chunks(out, super::port::fill_random)
+        }
+    }
+}
+impl sealed::Needs for Random {
+    fn grant() -> Result<Self, SdkFailure> {
+        Ok(Self(PhantomData))
+    }
+}
+impl Needs for Random {
+    const IMPORTS: ImportSet = ImportSet::RANDOM;
+}
+
 /// Parsed provider settings, loaded once for this authorized call.
 pub struct Settings<T> {
     value: T,

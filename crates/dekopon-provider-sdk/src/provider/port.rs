@@ -4,6 +4,10 @@ use std::cell::RefCell;
 pub trait Port {
     /// Reads the broker wall clock.
     fn now_unix_millis(&mut self) -> u64;
+    /// Reads elapsed nanoseconds on the native test port.
+    fn now_nanos(&mut self) -> u64;
+    /// Fills a bounded buffer from the native test port's entropy source.
+    fn fill_random(&mut self, out: &mut [u8]) -> Result<(), crate::random::RandomError>;
     /// Reads provider settings under the invocation grant.
     fn settings(&mut self) -> Option<String>;
     /// Sends a buffered HTTP request.
@@ -51,6 +55,26 @@ pub(crate) fn now_unix_millis() -> u64 {
             .as_mut()
             .expect("native call requires an installed Port")
             .now_unix_millis()
+    })
+}
+
+pub(crate) fn now_nanos() -> u64 {
+    CURRENT.with(|current| {
+        current
+            .borrow_mut()
+            .as_mut()
+            .expect("native call requires an installed Port")
+            .now_nanos()
+    })
+}
+
+pub(crate) fn fill_random(out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+    CURRENT.with(|current| {
+        current
+            .borrow_mut()
+            .as_mut()
+            .expect("native call requires an installed Port")
+            .fill_random(out)
     })
 }
 
@@ -107,6 +131,13 @@ mod tests {
     impl Port for Fake {
         fn now_unix_millis(&mut self) -> u64 {
             self.0
+        }
+        fn now_nanos(&mut self) -> u64 {
+            self.0
+        }
+        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+            out.fill(42);
+            Ok(())
         }
         fn settings(&mut self) -> Option<String> {
             Some(self.0.to_string())

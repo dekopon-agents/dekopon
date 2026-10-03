@@ -271,6 +271,16 @@ fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
         fn now_unix_millis(&mut self) -> u64 {
             123
         }
+        fn now_nanos(&mut self) -> u64 {
+            0
+        }
+        fn fill_random(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
+            out.fill(0xa5);
+            Ok(())
+        }
         fn settings(&mut self) -> Option<String> {
             None
         }
@@ -435,6 +445,16 @@ fn native_http_and_http_clock_tuple_reach_the_fake_port() {
         fn now_unix_millis(&mut self) -> u64 {
             123
         }
+        fn now_nanos(&mut self) -> u64 {
+            0
+        }
+        fn fill_random(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
+            out.fill(0xa5);
+            Ok(())
+        }
         fn settings(&mut self) -> Option<String> {
             None
         }
@@ -499,6 +519,15 @@ fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple(
     struct SettingsFake;
     impl Port for SettingsFake {
         fn now_unix_millis(&mut self) -> u64 {
+            unreachable!()
+        }
+        fn now_nanos(&mut self) -> u64 {
+            unreachable!()
+        }
+        fn fill_random(
+            &mut self,
+            _: &mut [u8],
+        ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
             unreachable!()
         }
         fn settings(&mut self) -> Option<String> {

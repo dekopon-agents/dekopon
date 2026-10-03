@@ -1,0 +1,5 @@
+package dekopon:provider@0.4.0;
+
+world random-client {
+    import dekopon:random/source@0.1.0;
+}

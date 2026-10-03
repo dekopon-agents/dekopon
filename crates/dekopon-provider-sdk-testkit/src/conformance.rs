@@ -98,6 +98,8 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     [
         (ImportSet::HTTP, "dekopon:http/client@1.2.0"),
         (ImportSet::CLOCK, "dekopon:clock/wall@1.1.0"),
+        (ImportSet::MONOTONIC, "dekopon:clock/monotonic@1.1.0"),
+        (ImportSet::RANDOM, "dekopon:random/source@0.1.0"),
         (ImportSet::SETTINGS, "dekopon:settings/config@0.1.0"),
         (ImportSet::JSONL, "dekopon:storage/jsonl@0.1.1"),
         (

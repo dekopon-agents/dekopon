@@ -9,7 +9,7 @@ pub use crate::http::{
 };
 pub use crate::storage::{durable_files, jsonl};
 pub use bounded::{Bounded, TooLong, Truncated};
-pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Settings, Storage};
+pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Monotonic, Random, Settings, Storage};
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{Port, with_port};
 #[cfg(not(target_arch = "wasm32"))]
@@ -112,6 +112,10 @@ impl ImportSet {
     pub const DURABLE_FILES: Self = Self(16);
     /// Conversation assets.
     pub const ASSETS: Self = Self(32);
+    /// Invocation-relative monotonic time.
+    pub const MONOTONIC: Self = Self(64);
+    /// OS entropy.
+    pub const RANDOM: Self = Self(128);
 
     /// Combines two declarations without granting either one.
     #[must_use]

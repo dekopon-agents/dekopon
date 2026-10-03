@@ -448,6 +448,8 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
 /// Native typed dispatch with fake clock and buffered HTTP imports, recording every request.
 pub struct Native<P: Provider> {
     clock: Option<SystemTime>,
+    monotonic: u64,
+    entropy: Option<Vec<u8>>,
     http: Option<HttpScript>,
     stdin: Option<Vec<u8>>,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -458,6 +460,8 @@ impl<P: Provider> Default for Native<P> {
     fn default() -> Self {
         Self {
             clock: None,
+            monotonic: 0,
+            entropy: None,
             http: None,
             stdin: None,
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -481,6 +485,16 @@ impl<P: Provider> Native<P> {
         self.http = Some(script);
         self
     }
+    #[must_use]
+    pub fn monotonic(mut self, nanos: u64) -> Self {
+        self.monotonic = nanos;
+        self
+    }
+    #[must_use]
+    pub fn entropy(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.entropy = Some(bytes.into());
+        self
+    }
     /// Supplies piped bytes to the native provider invocation.
     #[must_use]
     pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
@@ -496,6 +510,9 @@ impl<P: Provider> Native<P> {
     pub fn call(&self, capability: &str, input: &str) -> NativeOutput {
         let port = FakePort {
             clock: self.clock,
+            monotonic: self.monotonic,
+            entropy: self.entropy.clone(),
+            entropy_cursor: 0,
             http: self.http.clone(),
             requests: Arc::clone(&self.requests),
         };
@@ -541,6 +558,9 @@ impl std::io::Write for Captured {
 
 struct FakePort {
     clock: Option<SystemTime>,
+    monotonic: u64,
+    entropy: Option<Vec<u8>>,
+    entropy_cursor: usize,
     http: Option<HttpScript>,
     requests: Arc<Mutex<Vec<Request>>>,
 }
@@ -551,6 +571,25 @@ impl Port for FakePort {
             .unwrap_or_else(SystemTime::now)
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+    fn now_nanos(&mut self) -> u64 {
+        self.monotonic
+    }
+    fn fill_random(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<(), dekopon_provider_sdk::random::RandomError> {
+        if let Some(entropy) = &self.entropy {
+            let end = self.entropy_cursor.saturating_add(out.len());
+            let source = entropy
+                .get(self.entropy_cursor..end)
+                .ok_or(dekopon_provider_sdk::random::RandomError::SourceUnavailable)?;
+            out.copy_from_slice(source);
+            self.entropy_cursor = end;
+        } else {
+            out.fill(0xa5);
+        }
+        Ok(())
     }
     fn settings(&mut self) -> Option<String> {
         None
