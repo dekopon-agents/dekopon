@@ -191,39 +191,77 @@ impl Refusal {
     }
 }
 
-impl fmt::Display for Refusal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Refusal {
+    /// The same refusal for a guest's model client, in the third person.
+    #[must_use]
+    pub const fn for_guest(&self) -> GuestRefusal<'_> {
+        GuestRefusal(self)
+    }
+
+    fn render(&self, formatter: &mut fmt::Formatter<'_>, voice: Voice<'_>) -> fmt::Result {
         let window = WindowName(self.meter);
+        let (subject, its, whole, item) = match voice {
+            Voice::First => ("I'm".to_owned(), "my", "my".to_owned(), "message"),
+            Voice::Third(agent) => (
+                format!("The agent {agent} is"),
+                "its",
+                format!("the agent {agent}'s"),
+                "request",
+            ),
+        };
         match self.retry {
             Retry::Never => write!(
                 formatter,
-                "This message needs about {} tokens, more than my whole {}-token budget ({window}). It can't run as is.",
+                "This {item} needs about {} tokens, more than {whole} whole {}-token budget ({window}). It can't run as is.",
                 self.requested, self.limit
             ),
             Retry::After(wait) if self.remaining < 0 => write!(
                 formatter,
-                "I'm over my token budget ({window}) by {} tokens. It resets in {}.",
+                "{subject} over {its} token budget ({window}) by {} tokens. It resets in {}.",
                 grouped(-i128::from(self.remaining)),
                 Rounded(wait)
             ),
-            Retry::After(wait) => {
-                let used = i128::from(self.limit.0) - i128::from(self.remaining);
-                let percent = (used * 100)
-                    .checked_div(i128::from(self.limit.0))
-                    .unwrap_or(100)
-                    .clamp(0, 100);
-                write!(
-                    formatter,
-                    "I'm at {percent}% of my token budget ({window}): {} tokens left, this message needs about {}. Try again in {}.",
-                    grouped(i128::from(self.remaining)),
-                    self.requested,
-                    Rounded(wait)
-                )
-            }
+            Retry::After(wait) => write!(
+                formatter,
+                "{subject} at {}% of {its} token budget ({window}): {} tokens left, this {item} needs about {}. Try again in {}.",
+                self.percent(),
+                grouped(i128::from(self.remaining)),
+                self.requested,
+                Rounded(wait)
+            ),
         }
+    }
+
+    fn percent(&self) -> i128 {
+        let used = i128::from(self.limit.0) - i128::from(self.remaining);
+        (used * 100)
+            .checked_div(i128::from(self.limit.0))
+            .unwrap_or(100)
+            .clamp(0, 100)
     }
 }
 
+#[derive(Clone, Copy)]
+enum Voice<'a> {
+    First,
+    Third(&'a AgentId),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.render(formatter, Voice::First)
+    }
+}
+
+pub struct GuestRefusal<'a>(&'a Refusal);
+
+impl fmt::Display for GuestRefusal<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.render(formatter, Voice::Third(&self.0.agent))
+    }
+}
+
+#[derive(Clone, Copy)]
 struct WindowName(MeterKind);
 
 impl fmt::Display for WindowName {

@@ -368,6 +368,26 @@ fn the_refusal_reads_as_one_of_three_sentences() {
     );
 }
 
+#[test]
+fn a_guest_refusal_speaks_of_the_agent() {
+    let near = refusal(
+        MeterKind::Session { length: hours(5) },
+        1_000,
+        10,
+        100,
+        Retry::After(Duration::from_secs(90)),
+    );
+    assert_eq!(
+        near.for_guest().to_string(),
+        "The agent gylmar is at 99% of its token budget (5-hour session window): 10 tokens left, this request needs about 100. Try again in 2 minutes."
+    );
+    let never = refusal(MeterKind::Credit, 100, 100, 180, Retry::Never);
+    assert_eq!(
+        never.for_guest().to_string(),
+        "This request needs about 180 tokens, more than the agent gylmar's whole 100-token budget (credit bucket). It can't run as is."
+    );
+}
+
 type RecordFields = Vec<(String, String)>;
 
 #[derive(Clone, Default)]

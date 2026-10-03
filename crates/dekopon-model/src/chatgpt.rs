@@ -149,7 +149,7 @@ impl CredentialFile {
         })
     }
 
-    pub(crate) fn force_refresh(
+    pub fn force_refresh(
         &self,
         rejected: &Redacted<String>,
     ) -> Result<ResolvedCredential, ChatGptError> {

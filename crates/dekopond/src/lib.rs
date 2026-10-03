@@ -23,6 +23,7 @@ mod journal;
 mod meter_restore;
 mod metering;
 mod progress;
+mod proxy;
 mod routes;
 mod session;
 mod transport;
@@ -158,13 +159,16 @@ where
         )),
         None => None,
     };
+    let configured = Arc::new(ConfiguredModels::default());
     let metering = Arc::new(metering::build(
         &config.metering,
         dekopon_model_token_governor::Metering::system_clock(),
     ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
-        models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels::default()))),
+        models: Arc::new(ModelCache::new(
+            Arc::clone(&configured) as Arc<dyn session::ModelFactory>
+        )),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
@@ -181,16 +185,7 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
     });
-    let mut restores = JoinSet::new();
-    meter_restore::spawn(
-        &metering,
-        config.metering.restore.clone(),
-        config
-            .telemetry
-            .as_ref()
-            .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
-        &mut restores,
-    );
+    let mut owned_tasks = start_metering_tasks(&config, &configured, &metering).await?;
 
     tracing::info!(
         event = "gateway_started",
@@ -216,7 +211,7 @@ where
     )
     .await;
     readers.abort_all();
-    restores.shutdown().await;
+    owned_tasks.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {
             Ok(Err(problem)) => tracing::warn!(
@@ -248,6 +243,37 @@ where
             Err(DekopondError::TransportsLost)
         }
     }
+}
+
+/// The restore task and the guest model proxy listener, owned by the gateway and aborted at
+/// shutdown.
+async fn start_metering_tasks(
+    config: &ResolvedConfig,
+    configured: &ConfiguredModels,
+    metering: &Arc<dekopon_model_token_governor::Metering>,
+) -> Result<JoinSet<()>, DekopondError> {
+    let mut owned_tasks = JoinSet::new();
+    if let Some(resolved) = &config.proxy {
+        proxy::start(
+            resolved,
+            &config.models,
+            configured,
+            metering,
+            &mut owned_tasks,
+        )
+        .await
+        .map_err(DekopondError::Proxy)?;
+    }
+    meter_restore::spawn(
+        metering,
+        config.metering.restore.clone(),
+        config
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
+        &mut owned_tasks,
+    );
+    Ok(owned_tasks)
 }
 
 #[derive(Debug, Default)]
@@ -1015,6 +1041,8 @@ pub enum DekopondError {
     Journal { kind: std::io::ErrorKind },
     #[error(transparent)]
     WakeStore(#[from] WakeStoreError),
+    #[error("guest model proxy could not start")]
+    Proxy(#[source] proxy::ProxyStartError),
 }
 
 #[derive(Debug, Error)]

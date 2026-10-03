@@ -396,10 +396,11 @@ impl ModelConfig {
             Self::OpenaiCompatible { .. } => "openai-compatible",
             Self::Openrouter { .. } => "openrouter",
             Self::ChatgptSubscription { .. } => "codex",
+            Self::Anthropic { .. } => "anthropic",
         }
     }
 
-    fn output_reserve(&self) -> Tokens {
+    pub(crate) fn output_reserve(&self) -> Tokens {
         let max_output = match self {
             Self::Openrouter {
                 generation: Some(generation),
@@ -409,7 +410,8 @@ impl ModelConfig {
                 .map(|tokens| u64::from(tokens.get())),
             Self::Openrouter { .. }
             | Self::OpenaiCompatible { .. }
-            | Self::ChatgptSubscription { .. } => None,
+            | Self::ChatgptSubscription { .. }
+            | Self::Anthropic { .. } => None,
         };
         Estimate::output_reserve(
             max_output,
