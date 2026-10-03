@@ -1960,6 +1960,153 @@ fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
     file
 }
 
+#[derive(Clone, Copy)]
+enum ServiceRead {
+    None,
+    Monotonic,
+    Random,
+}
+
+fn service_provider(
+    describe_read: ServiceRead,
+    command_read: ServiceRead,
+    length: u32,
+) -> tempfile::NamedTempFile {
+    use std::io::Write as _;
+
+    let base = post_return_component("");
+    let wat = std::fs::read_to_string(base.path()).expect("base component text");
+    let wat = wat.replace(
+        "(component\n",
+        r#"(component
+            (import "dekopon:clock/monotonic@1.1.0" (instance $mono
+                (export "now-nanos" (func (result u64)))))
+            (import "dekopon:random/source@0.1.0" (instance $random
+                (export "get-random-bytes" (func (param "length" u32) (result (list u8))))))
+            (core module $heap-module
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+            (core instance $heap (instantiate $heap-module))
+            (core func $mono-lowered (canon lower (func $mono "now-nanos")))
+            (core func $random-lowered (canon lower (func $random "get-random-bytes")
+                (memory (core memory $heap "memory")) (realloc (core func $heap "realloc"))))
+"#,
+    );
+    let wat = wat.replace(
+        "(core module $m\n",
+        "(core module $m\n                (import \"host\" \"mono\" (func $mono (result i64)))\n                (import \"host\" \"random\" (func $random (param i32 i32)))\n",
+    );
+    let call = |read| match read {
+        ServiceRead::None => "",
+        ServiceRead::Monotonic => "call $mono drop ",
+        ServiceRead::Random => "i32.const 0 i32.const 16 call $random ",
+    };
+    let describe_call = call(describe_read);
+    let wat = wat.replace(
+        "(func (export \"describe\") (result i32) i32.const 0)",
+        &format!("(func (export \"describe\") (result i32) {describe_call}i32.const 0)"),
+    );
+    let command_call = call(command_read);
+    let wat = wat.replace(
+        "(func (export \"command\") (param i32 i32 i32) (result i32) i32.const 8)",
+        &format!(
+            "(func (export \"command\") (param i32 i32 i32) (result i32) {command_call}i32.const 8)"
+        ),
+    );
+    let wat = wat.replace(
+        "(func (export \"invoke\") (param i32 i32 i32 i32) (result i32) i32.const 16)",
+        &format!("(func (export \"invoke\") (param i32 i32 i32 i32) (result i32) call $mono drop i32.const {length} i32.const 16 call $random i32.const 16)"),
+    );
+    let wat = wat.replace(
+        "(core instance $i (instantiate $m))",
+        "(core instance $i (instantiate $m\n                (with \"host\" (instance (export \"mono\" (func $mono-lowered)) (export \"random\" (func $random-lowered))))))",
+    );
+    let mut file = tempfile::NamedTempFile::new().expect("temporary component");
+    file.write_all(wat.as_bytes())
+        .expect("write service component");
+    file
+}
+
+#[tokio::test]
+async fn describe_cannot_read_either_service() {
+    for read in [ServiceRead::Random, ServiceRead::Monotonic] {
+        let component = service_provider(read, ServiceRead::None, 0);
+        let error = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+            .await
+            .expect_err("describe cannot read host services");
+        assert!(matches!(
+            error,
+            BrokerHostError::DescribeUsedHostImport { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn command_cannot_read_either_service() {
+    for read in [ServiceRead::Monotonic, ServiceRead::Random] {
+        let component = service_provider(ServiceRead::None, read, 0);
+        let registry =
+            BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+                .await
+                .expect("pure describe loads");
+        let error = registry
+            .run_command("cleanup", &[], false)
+            .await
+            .expect_err("command cannot read host services");
+        assert!(matches!(
+            error,
+            BrokerHostError::RunCommandUsedHostImport { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn oversize_random_read_is_a_terminal_host_refusal() {
+    let component = service_provider(ServiceRead::None, ServiceRead::None, 4097);
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .expect("pure describe loads");
+    let error = registry
+        .invoke(
+            authorized(
+                "cleanup-probe.noop".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("oversize is refused");
+    assert!(matches!(
+        error.error.as_ref(),
+        BrokerHostError::HostCallRejected {
+            reason: "random-too-large",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn valid_service_provider_reads_both_services() {
+    let component = service_provider(ServiceRead::None, ServiceRead::None, 32);
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .expect("pure describe loads");
+    registry
+        .invoke(
+            authorized(
+                "cleanup-probe.noop".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints::default(),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("invocation services succeed");
+}
+
 #[tokio::test]
 async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
     let component = post_return_component("unreachable");
