@@ -92,9 +92,11 @@ fn decoded_imports(bytes: &[u8]) -> Result<BTreeSet<String>, ConformanceError> {
     Ok(imports)
 }
 
+const ASSET_IMPORT: &str = "dekopon:asset/asset@0.1.0";
+
 fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     [
-        (ImportSet::HTTP, "dekopon:http/client@1.1.0"),
+        (ImportSet::HTTP, "dekopon:http/client@1.2.0"),
         (ImportSet::CLOCK, "dekopon:clock/wall@1.0.0"),
         (ImportSet::SETTINGS, "dekopon:settings/config@0.1.0"),
         (ImportSet::JSONL, "dekopon:storage/jsonl@0.1.1"),
@@ -102,12 +104,28 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
             ImportSet::DURABLE_FILES,
             "dekopon:storage/durable-files@0.1.1",
         ),
-        (ImportSet::ASSETS, "dekopon:asset/asset@0.1.0"),
+        (ImportSet::ASSETS, ASSET_IMPORT),
     ]
     .into_iter()
     .filter_map(|(bit, name)| set.contains(bit).then_some(name.to_owned()))
     .chain(std::iter::once("dekopon:stdio/streams@0.1.0".to_owned()))
     .collect()
+}
+
+fn check_imports(declared: ImportSet, component: BTreeSet<String>) -> Result<(), ConformanceError> {
+    let allowed = declared_imports(declared);
+    let mut required = allowed.clone();
+    if declared.contains(ImportSet::HTTP) {
+        required.remove(ASSET_IMPORT);
+    }
+    if required.is_subset(&component) && component.is_subset(&allowed) {
+        Ok(())
+    } else {
+        Err(ConformanceError::Imports {
+            declared,
+            component,
+        })
+    }
 }
 
 fn rendered(outcome: &CommandRunOutcome, help: bool) -> bool {
@@ -141,13 +159,7 @@ pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), Confo
     let path = component.as_ref();
     let bytes = std::fs::read(path)?;
     let imports = decoded_imports(&bytes)?;
-    let declared = <P::Capabilities as Capabilities<P>>::IMPORTS;
-    if imports != declared_imports(declared) {
-        return Err(ConformanceError::Imports {
-            declared,
-            component: imports,
-        });
-    }
+    check_imports(<P::Capabilities as Capabilities<P>>::IMPORTS, imports)?;
     let native = provider::manifest::<P>()?;
     let registry =
         super::typed::cached_registry::<P>(path.canonicalize()?, BrokerHostLimits::default())?;
@@ -219,6 +231,36 @@ mod tests {
             let mut schema = json!({"type":"object","additionalProperties":false});
             schema[keyword] = json!({"nested":{"type":"object"}});
             assert!(!closed(&schema), "open nested object under {keyword}");
+        }
+    }
+
+    fn imports(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    const HTTP: &str = "dekopon:http/client@1.2.0";
+    const STDIO: &str = "dekopon:stdio/streams@0.1.0";
+
+    #[test]
+    fn http_need_conforms_without_the_asset_import_stream_would_add() {
+        let http = <provider::Http as provider::Needs>::IMPORTS;
+        check_imports(http, imports(&[HTTP, STDIO])).unwrap();
+        check_imports(http, imports(&[HTTP, ASSET_IMPORT, STDIO])).unwrap();
+    }
+
+    #[test]
+    fn http_need_refuses_an_undeclared_import_or_a_missing_client() {
+        let http = <provider::Http as provider::Needs>::IMPORTS;
+        for component in [
+            imports(&[HTTP, STDIO, "dekopon:clock/wall@1.0.0"]),
+            imports(&[ASSET_IMPORT, STDIO]),
+            imports(&[STDIO]),
+            imports(&[HTTP]),
+        ] {
+            assert!(
+                check_imports(http, component.clone()).is_err(),
+                "{component:?}"
+            );
         }
     }
 

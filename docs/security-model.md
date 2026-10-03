@@ -68,7 +68,7 @@ gateway-owned and absent from broker mounts. Private files remain **0600**, priv
 directories **0700**; `fsGroup` is not used to widen them. The init container alone
 sees projected sources, and separate claim subdirectories and temporary volumes keep
 one daemon from replacing the other's private files. See the
-[chart layout](../charts/dekopon/README.md#paths-the-chart-owns).
+[chart layout](kubernetes.md#paths-the-chart-owns).
 
 Attestor namespaces and `via` policy constrain a distinct gateway peer rather than a
 broker-UID process. A compromised gateway can speak for subjects inside its configured

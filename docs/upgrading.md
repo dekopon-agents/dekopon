@@ -100,7 +100,7 @@ A daemon whose configuration comes from `broker.configDirectory` or the gateway'
 `configDirectory` now needs its `drainBudget.assumedBrokerShutdownGraceMs` or
 `drainBudget.assumedGatewayShutdownGraceMs` set, or the chart refuses to render instead of
 assuming 120000 ms. Inline configurations keep reading the grace from the config. See
-[draining takes both graces](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence).
+[draining takes both graces](kubernetes.md#draining-takes-both-graces-in-sequence).
 Chart 0.18.0 defaults to application 0.28.0.
 
 ## Kubernetes TokenRequest secret source (0.27.0)
@@ -1382,7 +1382,7 @@ The chart is versioned independently of the application: `dekopon-chart-*` tags 
 `v*.*.*` tags publish crates, archives, and the container image. `appVersion` is what `image.tag`
 defaults to, so a chart release and an application release are two separate upgrades. To run a newer
 application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
-for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
+for a chart release. [Kubernetes guide](kubernetes.md#two-version-numbers)
 has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
 state claim and the credentials it holds in place.
 
