@@ -367,13 +367,11 @@ struct TypedClock;
 struct ClockNow;
 
 enum ClockNeedError {
-    Entropy(dekopon_provider_sdk::random::RandomError),
     Output,
 }
 impl fmt::Display for ClockNeedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Entropy(error) => write!(f, "entropy: {error}"),
             Self::Output => f.write_str("stdout is closed"),
         }
     }
@@ -381,7 +379,6 @@ impl fmt::Display for ClockNeedError {
 impl Failure for ClockNeedError {
     fn code(&self) -> Code {
         match self {
-            Self::Entropy(_) => Code::new("entropy-failed"),
             Self::Output => Code::new("output-closed"),
         }
     }
@@ -420,7 +417,7 @@ impl Capability for ClockNow {
         if input.services {
             value["monotonicNanos"] = json!(monotonic.now_nanos());
             let mut bytes = [0; 8];
-            random.fill(&mut bytes).map_err(ClockNeedError::Entropy)?;
+            random.fill(&mut bytes);
             value["entropyBytes"] = json!(bytes.len());
             value["entropyChecksum"] =
                 json!(bytes.iter().map(|byte| u64::from(*byte)).sum::<u64>());
@@ -471,6 +468,14 @@ fn native_monotonic_and_entropy_are_injected_without_guest_mode() {
     assert_eq!(value["monotonicNanos"], 42);
     assert_eq!(value["entropyBytes"], 8);
     assert_eq!(value["entropyChecksum"], 56);
+}
+
+#[test]
+#[should_panic(expected = "scripted entropy exhausted: read wants 8 bytes, 4 remain")]
+fn native_entropy_exhaustion_panics_naming_the_shortfall() {
+    let _output = Native::<TypedClock>::new()
+        .entropy([7; 4])
+        .call("clock-probe.now", r#"{"services":true}"#);
 }
 
 struct RawHttp;

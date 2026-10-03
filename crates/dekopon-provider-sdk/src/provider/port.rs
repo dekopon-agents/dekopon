@@ -7,7 +7,7 @@ pub trait Port {
     /// Reads elapsed nanoseconds on the native test port.
     fn now_nanos(&mut self) -> u64;
     /// Fills a bounded buffer from the native test port's entropy source.
-    fn fill_random(&mut self, out: &mut [u8]) -> Result<(), crate::random::RandomError>;
+    fn fill_random(&mut self, out: &mut [u8]);
     /// Reads provider settings under the invocation grant.
     fn settings(&mut self) -> Option<String>;
     /// Sends a buffered HTTP request.
@@ -68,7 +68,7 @@ pub(crate) fn now_nanos() -> u64 {
     })
 }
 
-pub(crate) fn fill_random(out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+pub(crate) fn fill_random(out: &mut [u8]) {
     CURRENT.with(|current| {
         current
             .borrow_mut()
@@ -135,9 +135,8 @@ mod tests {
         fn now_nanos(&mut self) -> u64 {
             self.0
         }
-        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), crate::random::RandomError> {
+        fn fill_random(&mut self, out: &mut [u8]) {
             out.fill(42);
-            Ok(())
         }
         fn settings(&mut self) -> Option<String> {
             Some(self.0.to_string())

@@ -16,7 +16,7 @@ dekopon_provider_sdk::export!(MyProvider);
 The SDK owns guest bindings for buffered HTTP, asset-backed request bodies,
 wall and monotonic clocks, OS entropy, settings, and storage. `provider::Http`, `Clock`,
 `Monotonic`, `Random`, `Settings<T>`, `Storage<K>` and `Assets` are private-construction handles; the broker alone
-grants their imports. `Clock` remains wall-only; `Random::fill` splits a buffer into 4096-byte host reads and returns `RandomError` for native source failure or an invalid guest result length. `Bounded<N>` validates input by UTF-8 byte length, and
+grants their imports. `Clock` remains wall-only; `Random::fill` splits a buffer into 4096-byte host reads. `Bounded<N>` validates input by UTF-8 byte length, and
 `Truncated<N>` cuts output on a character boundary. `manifest::<P>()`,
 `call::<P>()` and `command::<P>()` use the same typed dispatch as the component
 export. The wire response and published WIT remain unchanged.

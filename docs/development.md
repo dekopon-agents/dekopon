@@ -104,7 +104,7 @@ The storage package is mirrored byte-for-byte at:
 - `crates/dekopon-broker-host/wit/deps/storage.wit`
 - `examples/providers/storage-probe/wit/deps/storage.wit`
 
-The wall clock package is mirrored byte-for-byte at:
+The clock package is mirrored byte-for-byte at:
 
 - `wit/clock/clock.wit`
 - `crates/dekopon-provider-sdk/wit/deps/clock.wit`
