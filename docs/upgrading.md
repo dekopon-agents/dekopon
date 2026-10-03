@@ -486,14 +486,16 @@ change.
 Remove broker `compileCachePath`; it is now an unknown field. Managed `providerSet` startup uses
 `storePath/cwasm/v1` by default. In 0.17.0 its first boot compiled and wrote the cache; subsequent
 compatible boots verified selected compiled hashes once and mapped the files. The precompile
-change above moves that initial publication before startup. Legacy `providers:` paths continue source compilation without writing a cache.
+change above moves that initial publication before startup. Legacy `providers:` paths continue
+source compilation without writing a cache.
 
-Set `compileOnLoad: true` to disable all cwasm reads/writes, including when a cache error blocks
-startup. Errors do not trigger repair or fallback. For manual cache removal, first stop every
-process using it; never modify mapped artifacts in place. The old compressed cache is unused and
-can be removed offline. Engine upgrades select new compatibility indexes rather than reusing
-incompatible compiled objects. No automatic pruning occurs; see the [cache limits and tracing
-contract](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
+In 0.17.0, `compileOnLoad: true` disabled cwasm reads/writes, including when a cache error blocked
+startup. Errors did not trigger repair or fallback; no automatic pruning occurred. The new
+`provider precompile` command above repairs faulty entries and prunes stale artifacts before boot.
+For manual cache removal, first stop every process using it; never modify mapped artifacts in
+place. The old compressed cache is unused and can be removed offline. Engine upgrades select new
+compatibility indexes rather than reusing incompatible compiled objects; see the
+[cache limits and tracing contract](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
 
 Embeddings: rename `BrokerHostOptions::compile_cache_dir` to `cwasm_dir` and honor its immutable
 trusted-file contract, or use `None`. SDK `host::engine` now takes only `Config`; Wasmtime's
