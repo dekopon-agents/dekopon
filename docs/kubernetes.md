@@ -259,10 +259,10 @@ emits **no audit record**.
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker loads and validates every
   component before binding the socket, so "the socket answers" is exactly "fully started".
   Managed providers default to verified mmap-backed cwasm on the provider store's persistent disk;
-  `compileOnLoad: true` bypasses it. Components load one at a time; a cold cache still runs Cranelift
-  and the probe budget has to cover it. Do not put the cache on the chart's memory-backed `/tmp`. The
-  margin is large because a startup probe that gives up restarts the container, and every restart
-  starts the compile over.
+  `compileOnLoad: true` bypasses it. The precompile init container builds or repairs a cold cache
+  before the broker starts; with the cache enabled, startup only verifies and maps artifacts.
+  Do not put the cache on the chart's memory-backed `/tmp`. The probe budget covers startup
+  validation, and must also cover compilation when `compileOnLoad: true`.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
   webhook Service is enabled, prevents traffic while the broker is unavailable.
 - **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
@@ -507,15 +507,17 @@ claim is not the path the daemon reads. The broker mounts that subdirectory by `
 of its ChatGPT credential mount rather than a child of it. The gateway gets no mount for it, which
 is the same boundary the two credential directories have.
 
-**The pod does not write the lock or the store.** `dekopon-brokerd provider sync` does, and it has
+**The pod does not write the lock or source blobs.** `dekopon-brokerd provider sync` does, and it has
 to have completed before the pod rolls: either `broker.providerSync` below, or your own step against
-the same claim. The pod does the one thing only it can do: the init container
-creates the subdirectory if it is absent and hands it to `65532` as `0700`. Both halves are
+the same claim. `prepare-files` creates the subdirectory if absent and hands it to `65532` as `0700`;
+then `precompile` writes compiled artifacts before the broker starts. These steps are
 load-bearing, because the broker refuses a lock or a store that is not owned by its own UID and
 refuses any ancestor that is group- or world-writable without the sticky bit, and a fresh
 `local-path` volume arrives root-owned and `0777`. The chown names that subtree only, and is not
 recursive: no other subdirectory of the claim is touched, the gateway's credential directory keeps
-its own `65533`, and the blobs the sync step wrote are already `65532`.
+its own `65533`, and the blobs the sync step wrote are already `65532`. Precompile mounts only the
+provider-set subPath, runs with the broker UID and resource limits, and uses the broker image; pin an
+image that includes `provider precompile` (the chart's default v0.31.0 image predates it).
 
 Off by default. A release that leaves `broker.providerSet.enabled` false renders exactly what it
 rendered before, and a release that enables it must also stop naming `providers` in its

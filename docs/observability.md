@@ -684,6 +684,7 @@ migration is implemented here.
 
 | Span | Crate | Fields |
 |---|---|---|
+| `provider.precompile` | `dekopon-brokerd` | `providers`, `compiled`, `repaired`, `removed_files`, `removed_bytes`, and `error` on failure; one offline command span, including lock acquisition, source checks, compilation and pruning |
 | `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`ok`/`error`); one root for complete registry startup, including engine creation and descriptions |
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
@@ -737,9 +738,11 @@ alongside these spans to measure memory savings. Neither cwasm size nor latency 
 RAM. Boot hashing touches every selected byte; clean mapped pages remain reclaimable afterward.
 
 Each loaded-provider event also carries provider ID, source digest prefix/size, capability and
-command-word counts, and `command_export`. The offline `dekopon-brokerd provider sync` and `verify`
-commands reuse uncached host validation and emit these spans to their stderr subscriber, but install
-no OTLP exporter. No startup verification/compilation spans recur during command runs or invocations.
+command-word counts, and `command_export`. Offline `provider sync` publishes cached components; `provider precompile` verifies or repairs
+locked sources before pruning and records one `provider.precompile` span. Its `compiled` count
+includes repairs; removed counts advance with each successful unlink, even if a later prune fails.
+The offline `dekopon-brokerd provider sync` and `verify` commands emit their host spans to their
+stderr subscriber, but install no OTLP exporter. No startup verification/compilation spans recur during command runs or invocations.
 
 `stores` and `instantiations` are on all three guest-executing spans because the host resolves each
 provider's imports into one `InstancePre` at load: every description, command run, and invocation

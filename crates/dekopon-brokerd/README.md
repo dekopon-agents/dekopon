@@ -592,7 +592,7 @@ at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine com
 fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
 
 `compileOnLoad: true` disables cache reads and writes and compiles from source at every startup.
-Legacy `providers:` paths and offline provider-manager commands other than sync compile without a cache.
+Legacy `providers:` paths and offline provider-manager commands other than sync and precompile compile without a cache.
 `compileCachePath` is removed, not aliased; remove it from old configurations. The old compressed
 Wasmtime cache is neither read nor migrated. Component startup runs one at a time off Tokio to bound
 compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
@@ -605,9 +605,8 @@ repairs faulty indexes and objects, then prunes old generations and unreferenced
 files. The filesystem and local index are trusted; adversarial same-UID file replacement is outside
 this feature's model. Publishers hold the store lock. Compiled artifacts
 are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or
-2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Historical objects are
-not automatically pruned. Keep the cache on persistent disk, not memory-backed `/tmp`, for
-reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
+2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Keep the cache on
+persistent disk, not memory-backed `/tmp`, for reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
 
 See [startup tracing](../../docs/observability.md#broker-execution-spans) for cache status, sizes,
 source verification, compile/hash/publish/map stage timings, and total registry load time. These
