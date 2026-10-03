@@ -691,7 +691,7 @@ fn prepare_component(
     let component = match &runtime.cwasm {
         Some(cache) => match runtime.compiled_cache_mode {
             CompiledCacheMode::Reader => match cache
-                .load(&runtime.engine, &bytes, &artifact.sha256)
+                .load(&runtime.engine, &artifact.sha256)
                 .map_err(|error| BrokerHostError::CompiledArtifact {
                     path: source.clone(),
                     source: error,
