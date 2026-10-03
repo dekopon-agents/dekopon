@@ -483,7 +483,7 @@ fn closing_real_stdout_after_a_prefix_stops_a_streaming_producer() {
             Response {
                 status: 200,
                 headers: vec![],
-                body: vec![b'x'; 64 * 1024],
+                body: vec![b'x'; 16 * 1024 * 1024],
             },
         ))
         .close_stdout_after(1);
