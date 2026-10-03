@@ -8,6 +8,8 @@ world provider {
     import dekopon:http/client@1.2.0;
     import dekopon:storage/jsonl@0.1.1;
     import dekopon:storage/durable-files@0.1.1;
-    import dekopon:clock/wall@1.0.0;
+    import dekopon:clock/wall@1.1.0;
+    import dekopon:clock/monotonic@1.1.0;
+    import dekopon:random/source@0.1.0;
     import dekopon:settings/config@0.1.0;
 }

@@ -1,0 +1,5 @@
+package dekopon:random@0.1.0;
+
+interface source {
+    get-random-bytes: func(length: u32) -> list<u8>;
+}

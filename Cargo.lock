@@ -919,6 +919,7 @@ dependencies = [
  "dekopon-provider-sdk-testkit",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "getrandom 0.4.3",
  "parking_lot",
  "rcgen",
  "rustix",

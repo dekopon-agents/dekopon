@@ -97,7 +97,7 @@ const ASSET_IMPORT: &str = "dekopon:asset/asset@0.1.0";
 fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     [
         (ImportSet::HTTP, "dekopon:http/client@1.2.0"),
-        (ImportSet::CLOCK, "dekopon:clock/wall@1.0.0"),
+        (ImportSet::CLOCK, "dekopon:clock/wall@1.1.0"),
         (ImportSet::SETTINGS, "dekopon:settings/config@0.1.0"),
         (ImportSet::JSONL, "dekopon:storage/jsonl@0.1.1"),
         (
@@ -252,7 +252,7 @@ mod tests {
     fn http_need_refuses_an_undeclared_import_or_a_missing_client() {
         let http = <provider::Http as provider::Needs>::IMPORTS;
         for component in [
-            imports(&[HTTP, STDIO, "dekopon:clock/wall@1.0.0"]),
+            imports(&[HTTP, STDIO, "dekopon:clock/wall@1.1.0"]),
             imports(&[ASSET_IMPORT, STDIO]),
             imports(&[STDIO]),
             imports(&[HTTP]),
