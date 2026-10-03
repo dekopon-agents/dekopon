@@ -149,11 +149,10 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 
 ## Deployment notes
 
-The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
-The image's default UID is the broker/provider owner; the gateway container overrides it.
-Private credentials and state do not acquire group permissions. The init container creates
-separate private mounts and the broker-owned IPC directory; a bare `emptyDir` is insufficient.
-See the [chart layout and upgrade instructions](../charts/dekopon/README.md#paths-the-chart-owns).
+For installation, runtime identities, private mounts, and upgrades, use the
+[Kubernetes guide](kubernetes.md). A bare `emptyDir` does not supply the required ownership and modes;
+the guide explains the [init copy boundary](kubernetes.md#why-an-init-container-and-not-a-volume-mount)
+and [chart-owned paths](kubernetes.md#paths-the-chart-owns).
 
 ## Publication
 

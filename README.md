@@ -55,73 +55,17 @@ There is no catalog operator CLI and no general invocation CLI. Secret sources n
 
 ## Install
 
-### Homebrew (macOS and Linux)
+- **Mac:** [Run Dekopon on a Mac](docs/run-on-mac.md) covers Homebrew, verified archives,
+  source builds, model authentication, and a read-only local session. No Kubernetes is required.
+- **Kubernetes:** [Deploy Dekopon on Kubernetes](docs/kubernetes.md) covers the Helm chart,
+  ArgoCD, configuration and credentials, storage, upgrades, and shutdown ordering.
 
-```console
-brew tap dekopon-agents/tap
-brew trust dekopon-agents/tap
-brew install dekopon
-```
-
-That installs **both daemon** executables — `dekopon-brokerd` and `dekopond` — plus the example JSONPlaceholder provider component, so one machine can run the broker and the gateway and actually exercise the authority boundary rather than only read the catalog. `brew install` prints where `BROKER.md`, `GATEWAY.md`, and the component landed. `brew trust` is not optional: Homebrew 6 refuses to load a formula from a non-official tap until you trust it.
-
-The tap is [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap), and its formula is regenerated from the archives each release actually publishes rather than from a platform list maintained by hand. It covers **macOS on ARM64, and Linux on ARM64 and x86-64**.
-
-Not Intel Macs. The release matrix has no `x86_64-apple-darwin` target, and the tap refuses to offer one an older release shipped rather than dead-ending at the next `brew upgrade`. Build from a checkout instead.
-
-From there, [`examples/conditional-write`](examples/conditional-write/README.md) is the next step: it is the only walkthrough that puts the gateway, broker, policy, and a credential-holding provider to work together.
-
-### Prebuilt archives
-
-Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
-
-```console
-gh release download v0.30.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.30.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.30.0-aarch64-apple-darwin.tar.gz.sha256
-gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.30.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.30.0-aarch64-apple-darwin.tar.gz
-```
-
-### crates.io
-
-The workspace publishes twenty-two crates, and each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
-
-```console
-cargo install --locked dekopon-brokerd
-cargo install --locked dekopond
-```
-
-The newest crate version on crates.io can trail the newest Git tag, because a tag's publication job can stop partway. Recovery is a manual dispatch of the `Release` workflow against the existing tag ([Maintainer release process](#maintainer-release-process)), which skips immutable versions already published. Take the tap or the archives above for a version crates.io does not carry.
-
-### From a checkout
-
-With the Rust that [`rust-toolchain.toml`](rust-toolchain.toml) pins (also the MSRV; edition 2024):
-
-```console
-git clone https://github.com/dekopon-agents/dekopon.git
-cd dekopon
-cargo install --locked --path crates/dekopon-brokerd
-cargo install --locked --path crates/dekopond
-dekopond --version
-```
-
-### Container image
-
-A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopon` when a release is published. [`.github/workflows/container-image.yml`](.github/workflows/container-image.yml) builds it. It carries the executables from the archives above, byte for byte, rather than a separately compiled set, alongside one repository-owned fixture and exact checksum- and provenance-verified standalone provider releases. It runs as UID 65532 and lets the command select the binary. Read [`docs/container-image.md`](docs/container-image.md) before deploying it: the broker refuses to start unless its runtime directories are owned by that UID and mode `0700`.
-
-### Before running the broker
-
-`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory, and pinned provider component paths:
-
-```console
-dekopon-brokerd --config /path/to/broker.yaml
-```
-
-See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. The gateway submits proposals over its authenticated broker connection.
-
-For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons as one pod sharing the broker socket. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` on `dekopon-chart-*` tags, a namespace separate from the `v*.*.*` tags that publish crates, archives, and the container image, so a chart fix ships without an application release. The chart's `appVersion` picks the application release it deploys by default; a deployment selects any other through the chart's `image.tag` or `image.digest` value.
+The [Homebrew tap](https://github.com/dekopon-agents/homebrew-tap) and
+[release archives](https://github.com/dekopon-agents/dekopon/releases) also support Linux on ARM64
+and x86-64. See the [native installation methods](docs/run-on-mac.md#install) for the daemon pair;
+select the Linux archive for your architecture. Both daemons are Unix-only and must come from the
+same release. [Container image details](docs/container-image.md) cover image contents, provenance,
+and local image builds; [development](docs/development.md) covers building and checking a checkout.
 
 ## Run the flagship example
 

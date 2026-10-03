@@ -34,7 +34,7 @@ daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-broker
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
-| Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — managed providers default to boot-verified, mapped cwasm under the provider store; `compileOnLoad: true` bypasses it. Cold misses still compile before the socket binds, within the chart's [startup probe budget](../charts/dekopon/README.md#probes) |
+| Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — managed providers default to boot-verified, mapped cwasm under the provider store; `compileOnLoad: true` bypasses it. Cold misses still compile before the socket binds, within the chart's [startup probe budget](kubernetes.md#probes) |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
 | Configuration changed between versions — what do I edit? | [`upgrading.md`](upgrading.md) |
 | Can I run a newer broker against an older gateway? | No. [`dekopon-brokerd` contract § Version and compatibility](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) |
@@ -68,7 +68,8 @@ DRNs. This is committed direction, not an upgrade required today
 
 | Question | Read |
 |---|---|
-| Kubernetes | [`charts/dekopon/README.md`](../charts/dekopon/README.md) |
+| Native macOS | [Run on a Mac](run-on-mac.md) |
+| Kubernetes | [Kubernetes guide](kubernetes.md) |
 | The container image — what is in it and what does it assume? | [`container-image.md`](container-image.md) |
 | Getting an ordinary daemon file or a projection-backed DRN source into a pod | [`1password-eso.md`](1password-eso.md) and [`secrets.md` § `kubernetesProjection`](secrets.md#kubernetesprojection) |
 | Optional provider storage and durable chat memory | [`dekopon-brokerd` § Optional provider storage and chat memory](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory) |
