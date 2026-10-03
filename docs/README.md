@@ -4,6 +4,12 @@ Start with [`design.md`](design.md). It carries the [constitution](design.md#con
 
 ## Reading paths
 
+### Install and run
+
+- [Run on a Mac](run-on-mac.md): native installation, model setup, and a read-only local session
+- [Run on Kubernetes](kubernetes.md): Helm and ArgoCD installation, credentials, storage, and upgrades
+- [Operations](operations.md): startup refusals, audit, shutdown, and the detailed daemon contracts
+
 ### Understand the project
 
 Read in this order:
@@ -77,7 +83,7 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 
 Implementation-level contracts live beside their code in `crates/*/README.md`, including the bounded native [`dekopon-http-host`](../crates/dekopon-http-host/README.md) engine, the namespace-bound [`dekopon-storage-host`](../crates/dekopon-storage-host/README.md) quota and direct-write engine, the privileged async [`dekopon-broker-host`](../crates/dekopon-broker-host/README.md) adapter, the bounded Cedar [`dekopon-policy`](../crates/dekopon-policy/README.md) adapter, [`dekopon-broker`](../crates/dekopon-broker/README.md) authorization, evidence, and audit coordination, identity-free [`dekopon-broker-protocol`](../crates/dekopon-broker-protocol/README.md) wire and client boundaries, the authenticated Unix [`dekopon-brokerd`](../crates/dekopon-brokerd/README.md) service, the [`dekopon-provider-sdk-testkit`](../crates/dekopon-provider-sdk-testkit/README.md) typed native/real-component harness, the shared bounded prompt loop in [`dekopon-agent`](../crates/dekopon-agent/README.md), and the unprivileged [`dekopond`](../crates/dekopond/README.md) gateway.
 
-Provider fixtures and exact standalone-release fetches are documented under [`../examples/providers/`](../examples/providers/README.md); JSONPlaceholder, memory-chat, and the nineteen-capability GitHub provider ship from their own repositories. SDK-owned guest HTTP, storage, and clock handles are documented in [`../crates/dekopon-provider-sdk/README.md`](../crates/dekopon-provider-sdk/README.md). [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the end-to-end deployment those pieces assemble into: a Slack DM, a bounded read, a broker-injected credential, and an audited etag-pinned write with no delete authority. [`../examples/discord/`](../examples/discord/README.md) documents Discord bot installation, least-privilege permissions, routing, identity mapping, and bounded photo and file handling. [`../charts/dekopon/`](../charts/dekopon/README.md) is the Slack worked deployment as a Helm chart, and records why a Secret or ConfigMap volume cannot hold a file either daemon will accept.
+Provider fixtures and exact standalone-release fetches are documented under [`../examples/providers/`](../examples/providers/README.md); JSONPlaceholder, memory-chat, and the nineteen-capability GitHub provider ship from their own repositories. SDK-owned guest HTTP, storage, and clock handles are documented in [`../crates/dekopon-provider-sdk/README.md`](../crates/dekopon-provider-sdk/README.md). [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the end-to-end deployment those pieces assemble into: a Slack DM, a bounded read, a broker-injected credential, and an audited etag-pinned write with no delete authority. [`../examples/discord/`](../examples/discord/README.md) documents Discord bot installation, least-privilege permissions, routing, identity mapping, and bounded photo and file handling. [`kubernetes.md`](kubernetes.md) is the Slack worked deployment as a Helm chart, and records why a Secret or ConfigMap volume cannot hold a file either daemon will accept.
 
 Also read [`../CONTRIBUTING.md`](../CONTRIBUTING.md) before submitting a change and [`../SECURITY.md`](../SECURITY.md) before reporting a vulnerability.
 

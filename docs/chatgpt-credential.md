@@ -112,7 +112,7 @@ protection.
 ## What the pod must do with it
 
 Under `gateway.chatgpt.*`,
-[`charts/dekopon`](../charts/dekopon/README.md#the-chatgpt-credential-is-seeded-once) seeds the
+[`charts/dekopon`](kubernetes.md#the-chatgpt-credential-is-seeded-once) seeds the
 exported credential once into the `state` claim, refuses to overwrite it on later starts, and
 re-seeds only under the explicit `gateway.chatgpt.reseed: true` gate.
 `charts/dekopon/ci/verify-init-permissions.sh` runs the rendered init-container command against a
