@@ -7,6 +7,35 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-03
+
+### Added
+
+- `dekopon-model-token-governor` adds per-agent fixed, rolling, session and credit token budgets; `dekopond` can refuse over-budget calls and restore windows at boot from OpenObserve or Quickwit.
+- Guest model proxy supports bounded request handling and upstream usage metering without moving broker authority to the gateway (core side, #431).
+- Provider SDK and real-component testkit expose typed provider, capability and conformance APIs, including bounded HTTP and clock imports and stdout-close checks (#439).
+- `dekopon:http@1.2.0` streams HTTP response bodies through `open` and broker-side `splice` with credential scanning.
+
+### Changed
+
+- **Breaking:** `dekopon:provider@0.4.0` uses `dekopon:stdio@0.1.0` streams for stdin/stdout, returns an exit status instead of a buffered value, and removes the `provider-commands` world. Old 0.3.0 components are refused at load.
+- Provider pipeline stages stream through bounded pipes; a downstream close gives status 141. Stderr and byte accounting are bounded, with typed failure codes preserved.
+- Checked probes and host tests use the typed SDK and current stdio, HTTP, clock, storage and asset imports; the raw legacy memory-chat fixture remains a refusal test, not a supported provider.
+- WIT package publication runs on core release tags, not on pushes to main.
+
+### Removed
+
+- Core images and CLI archives no longer bundle out-of-tree providers built for the previous provider contract; Homebrew no longer installs the legacy JSONPlaceholder example.
+
+### Fixed
+
+- The provider testkit accepts HTTP-only components without an asset import, and the downstream-close test forces backpressure (#439).
+- Meter restore ignores history rows outside its window so a corrupt bucket time cannot freeze the budget clock.
+
+### Security
+
+- Wasmtime 48.0.5 addresses RUSTSEC-2026-0327.
+
 ## [0.30.0] - 2026-10-01
 
 ### Added
