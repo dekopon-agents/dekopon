@@ -123,29 +123,18 @@ jobs:
           cache-bin: false
       - name: Build CLIs
         run: cargo build --release --locked -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
-      - name: Fetch exact attested JSONPlaceholder provider release
-        env:
-          DEKOPON_VERIFY_PROVIDER_ATTESTATIONS: "1"
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          ci/fetch-external-provider-components.sh
-          "$RUNNER_TEMP/external-providers" jsonplaceholder
       - name: Create archive and checksum
         shell: bash
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           archive="dekopon-${version}-${{ matrix.target }}"
-          mkdir -p "staging/$archive/providers"
+          mkdir -p "staging/$archive"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopond" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
           cp crates/dekopond/README.md "staging/$archive/GATEWAY.md"
-          cp "$RUNNER_TEMP/external-providers/jsonplaceholder-provider.wasm" \
-            "staging/$archive/providers/"
-          cp examples/providers/JSONPLACEHOLDER.md \
-            "staging/$archive/providers/JSONPLACEHOLDER.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - name: Upload CLI archive

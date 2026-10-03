@@ -2,7 +2,7 @@
 # Stage a minimal build context for the Dekopon container image, from a published release.
 #
 # The image needs exactly three things: the executables a release already published, the
-# exact provider release components, and the two licences. Everything else here — workspace crates,
+# checked in-tree provider components, and the two licences. Everything else here — workspace crates,
 # a Cargo target directory that reaches tens of gigabytes, documentation, examples — is not a
 # build input. Excluding all of it with a `.dockerignore` would be correct only for as long as
 # every file added to the repository afterwards stays matched by it, which is a standing
@@ -24,7 +24,7 @@
 # Produces:
 #   <work>/archives/        the release archives and their published .sha256 sidecars
 #   <work>/context/         the build context: Dockerfile, dist/<arch>/<binary>, providers/,
-#                           optional-providers/, LICENSE-APACHE, LICENSE-MIT — and nothing else
+#                           LICENSE-APACHE, LICENSE-MIT — and nothing else
 #   <work>/binaries.sha256  the four staged executables, for the byte-identity check after the
 #                           image is built
 set -euo pipefail
@@ -49,10 +49,6 @@ max_glibc="2.41"
 
 binaries="dekopon-brokerd dekopond"
 providers="cli-probe http-probe"
-standalone_default_providers="jsonplaceholder"
-# Other out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful
-# without assembling a provider set by hand; each one releases on its own schedule.
-external_providers="dekopon-agents/dekopon-provider-gh@v0.1.0"
 
 # macOS ships shasum, Linux ships sha256sum, and their --check flags differ. Comparing the digests
 # directly avoids the difference and produces a better message than either.
@@ -85,8 +81,7 @@ glibc_exceeds() {
 }
 
 rm -rf "$archives" "$context"
-mkdir -p "$archives" "$context/dist" "$context/providers" "$context/optional-providers" \
-  "$work/external" "$work/standalone-providers"
+mkdir -p "$archives" "$context/dist" "$context/providers"
 
 # Derive the Linux targets from the release rather than assuming a fixed set: a target added or
 # dropped upstream changes the release, and this follows it.
@@ -133,45 +128,9 @@ for provider in $providers; do
   fi
   cp "$component" "$context/providers/"
 done
-# JSONPlaceholder and optional memory are independently released. The shared fetcher pins each
-# release tag and expected checksum; image staging additionally requires provenance.
-DEKOPON_VERIFY_PROVIDER_ATTESTATIONS=1 \
-  "$source_dir/ci/fetch-external-provider-components.sh" \
-    "$work/standalone-providers" jsonplaceholder memory-chat
-for provider in $standalone_default_providers; do
-  cp "$work/standalone-providers/$provider-provider.wasm" "$context/providers/"
-done
-# Other out-of-tree providers, pinned by version and verified the same way the release archives are.
-#
-# The official image ships a useful default set, but a provider with its own repository has its own
-# release cadence, so it is fetched at a pinned tag rather than vendored. Bump these when a provider
-# release matters; nothing else in this repository moves when that provider does.
-for entry in $external_providers; do
-  repo=${entry%%@*}
-  version=${entry##*@}
-  name=$(basename "$repo")
-  component="${name#dekopon-provider-}-provider.wasm"
-  gh release download "$version" --repo "$repo" --pattern "$component" \
-    --pattern "$component.sha256" --dir "$work/external" --clobber
-  expected_digest=$(cut -d' ' -f1 < "$work/external/$component.sha256")
-  actual_digest=$(digest_of "$work/external/$component")
-  if [ "$expected_digest" != "$actual_digest" ]; then
-    echo "error: $component digest mismatch: expected $expected_digest, got $actual_digest" >&2
-    exit 1
-  fi
-  # Provenance, not just integrity: a matching digest proves the file was not corrupted, and this
-  # proves which workflow in which repository produced it.
-  gh attestation verify "$work/external/$component" --repo "$repo"
-  cp "$work/external/$component" "$context/providers/"
-done
 # Normalised rather than inherited: the Dockerfile deliberately copies the components without
 # --chmod, so whatever mode they have here is the mode dekopon-brokerd will check in the image.
 chmod 0644 "$context/providers"/*.wasm
-# Durable memory is shipped but never joins the default scan directory. An operator must name this
-# exact file or explicitly scan the optional directory.
-cp "$work/standalone-providers/memory-chat-provider.wasm" \
-  "$context/optional-providers/memory-chat-provider.wasm"
-chmod 0644 "$context/optional-providers/memory-chat-provider.wasm"
 
 cp "$source_dir/Dockerfile" "$context/Dockerfile"
 cp "$source_dir/LICENSE-APACHE" "$source_dir/LICENSE-MIT" "$context/"
@@ -188,14 +147,9 @@ expected=$(
     for arch in amd64 arm64; do
       for binary in $binaries; do echo "dist/$arch/$binary"; done
     done
-    for provider in $providers $standalone_default_providers; do
+    for provider in $providers; do
       echo "providers/$provider-provider.wasm"
     done
-    for entry in $external_providers; do
-      name=$(basename "${entry%%@*}")
-      echo "providers/${name#dekopon-provider-}-provider.wasm"
-    done
-    echo "optional-providers/memory-chat-provider.wasm"
   } | sort
 )
 staged=$(cd "$context" && find . -type f | sed 's|^\./||' | sort)
