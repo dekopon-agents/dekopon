@@ -103,8 +103,8 @@ jobs:
             push=true
           else
             # A pull request has no release of its own. Check its staging and image
-            # ownership/byte identity against the latest release; component startup is
-            # meaningful only after the matching release binaries exist (tag mode).
+            # identity against the latest release. The stdio probes need a broker from
+            # v0.31.0 or later; earlier releases cannot load them.
             tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             push=false
           fi
@@ -112,9 +112,21 @@ jobs:
             echo "::error::could not resolve a release tag to package"
             exit 1
           fi
+          verify_broker=true
+          if [ "$push" = false ]; then
+            # Fail closed on an unknown release label rather than silently waive startup.
+            if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::unexpected published release tag: $tag"
+              exit 1
+            fi
+            major=$((10#${BASH_REMATCH[1]}))
+            minor=$((10#${BASH_REMATCH[2]}))
+            if (( major == 0 && minor < 31 )); then verify_broker=false; fi
+          fi
           {
             echo "tag=$tag"
             echo "push=$push"
+            echo "verify_broker=$verify_broker"
             # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
             # cannot push to the wrong package. The published WIT packages are separate GHCR
             # packages under the same owner (dekopon/provider, dekopon/http, dekopon/storage) and
@@ -124,7 +136,7 @@ jobs:
             # release; a pull request checks out itself, which is the point.
             if [ "$push" = "true" ]; then echo "checkout_ref=$tag"; else echo "checkout_ref="; fi
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::packaging $tag (push=$push)"
+          echo "::notice::packaging $tag (push=$push, verify_broker=$verify_broker)"
 
       # Keep verification tooling from the workflow revision, not the requested release.
       # The release checkout below still owns every staged image input and its attribution.
@@ -235,13 +247,13 @@ jobs:
           docker run --rm dekopon-proof:amd64 dekopond --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopond --version
-          # On a PR, the newest released binary predates the new checked stdio probes and
-          # refuses them. Never call that cross-version refusal a provider regression or
-          # claim startup passed: tag mode runs the real broker against matching bytes.
-          if [ "${{ steps.plan.outputs.push }}" = "true" ]; then
+          # Tag mode always checks startup. PRs check it too once the latest published
+          # broker is from the stdio epoch; only older cross-epoch archives cannot load
+          # the checked probes and must defer this proof to the matching release tag.
+          if [ "${{ steps.plan.outputs.verify_broker }}" = "true" ]; then
             "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
           else
-            echo "::notice::broker component startup deferred to tag mode: PR probes and released binary have different provider epochs"
+            echo "::notice::broker startup deferred: ${{ steps.plan.outputs.tag }} predates the v0.31.0 stdio epoch"
           fi
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
           human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
@@ -250,7 +262,7 @@ jobs:
             echo "|---|---|"
             echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
-            echo "| binaries executed (amd64) | 2/2; broker component load only on matching release tag |"
+            echo "| binaries executed (amd64) | 2/2; broker component load when released binary supports stdio probes |"
             echo "| unpacked size | $human |"
           } >> "$GITHUB_STEP_SUMMARY"
 

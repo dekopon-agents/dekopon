@@ -937,12 +937,13 @@ operator-owned. Rendering fails when the resolved state and provider-storage cla
 
 The gateway does not mount the provider-storage PVC. Every chart mount path must be a canonical
 absolute sequence of safe non-dot segments (no repeated slash). The storage root must not overlap
-another chart mount, projected init sources, or baked image paths including
-`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`. Invalid combinations fail during
-`helm template` before a volume can shadow configuration, packaged providers, or init-script text.
-The `storage-probe` and malicious `memory-reservation-probe` fixtures are not present in the image;
-`memory-chat-provider.wasm` is baked only under `/opt/dekopon/optional-providers`, outside the
-default scan.
+another chart mount, projected init sources, or image-reserved paths including
+`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`. The chart still reserves the
+optional path even though the current image creates no such directory. Invalid combinations fail
+during `helm template` before a volume can shadow configuration, packaged providers, or init-script
+text. Neither `storage-probe` nor the malicious `memory-reservation-probe` fixture is packaged,
+and no memory-chat component is bundled. Supply a compatible memory provider explicitly through
+a reviewed provider set if one is needed.
 
 Directory names under the root are unkeyed SHA-256 derivations of the chat scope, and the store
 makes no encryption-at-rest claim. The provider-storage filesystem must support retained
