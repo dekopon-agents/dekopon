@@ -48,11 +48,12 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const PASSED_HEADERS: [&str; 3] = ["anthropic-version", "anthropic-beta", "x-request-id"];
-const RETURNED_HEADERS: [&str; 4] = [
+const RETURNED_HEADERS: [&str; 5] = [
     "content-type",
     "x-request-id",
     "request-id",
     "cache-control",
+    "retry-after",
 ];
 
 pub const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com";

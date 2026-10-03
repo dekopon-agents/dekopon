@@ -7,7 +7,10 @@ use std::{
 };
 
 use axum::Router;
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
+};
 use parking_lot::Mutex;
 use rustls::{
     DistinguishedName, RootCertStore, ServerConfig, SignatureScheme,
@@ -296,6 +299,7 @@ impl Listener {
                     }
                 };
                 if let Err(error) = hyper::server::conn::http1::Builder::new()
+                    .timer(TokioTimer::new())
                     .serve_connection(TokioIo::new(tls), service)
                     .await
                 {

@@ -1376,7 +1376,8 @@ proxy:
   total timeout; the jail's `maxConnectionSeconds` (1800 seconds by default) bounds a proxied
   call. A stream cut there is charged as cancelled, and the client's retry is charged again.
 - **Bounds.** A request body over 8 MiB gets a 413 in the dialect's error shape. At most
-  `maxConnections` connections (default 16) are served at once; 0 is a startup error. The proxy
+  `maxConnections` connections (default 16) are served at once; 0 is a startup error. A request's
+  headers must arrive within 30 seconds; its body is bounded by the jail's `maxConnectionSeconds`. The proxy
   validates a body without parsing it into a tree and records only the top-level keys it reads.
   Each connection briefly holds two copies of its body while reading and rewriting it, so request
   bodies take up to `maxConnections × 2 × 8 MiB` together: 256 MiB at the default. Raise it only

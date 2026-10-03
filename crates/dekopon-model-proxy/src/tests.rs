@@ -580,7 +580,14 @@ async fn an_upstream_error_status_is_charged_nothing() {
     let (records, _guard) = capture();
     let overloaded =
         r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-    let upstream = FakeUpstream::start(vec![json("529 Overloaded", overloaded)]).await;
+    let upstream = FakeUpstream::start(vec![Step::Write(
+        format!(
+            "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\nretry-after: 7\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{overloaded}",
+            overloaded.len()
+        )
+        .into_bytes(),
+    )])
+    .await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post(
@@ -591,6 +598,7 @@ async fn an_upstream_error_status_is_charged_nothing() {
         .await
         .unwrap();
     assert_eq!(response.status(), 529);
+    assert_eq!(response.headers()["retry-after"], "7");
     assert_eq!(response.text().await.unwrap(), overloaded);
     assert_eq!(used(&running.metering), 0);
     let records = records.0.lock().clone();
