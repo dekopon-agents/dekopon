@@ -576,6 +576,35 @@ fn a_cap_sized_body_of_deeply_nested_arrays_is_peeked() {
 }
 
 #[tokio::test]
+async fn an_upstream_error_status_is_charged_nothing() {
+    let (records, _guard) = capture();
+    let overloaded =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+    let upstream = FakeUpstream::start(vec![json("529 Overloaded", overloaded)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post(
+            "/v1/messages",
+            r#"{"model":"claude-opus","stream":true,"messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 529);
+    assert_eq!(response.text().await.unwrap(), overloaded);
+    assert_eq!(used(&running.metering), 0);
+    let records = records.0.lock().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    for field in [
+        "outcome=\"failed\"",
+        "usage.input_tokens=0 ",
+        "usage.output_tokens=0 ",
+    ] {
+        assert!(records[0].contains(field), "{field}: {records:?}");
+    }
+}
+
+#[tokio::test]
 async fn count_tokens_is_forwarded_and_never_charged() {
     let (records, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", r#"{"input_tokens":2095}"#)]).await;

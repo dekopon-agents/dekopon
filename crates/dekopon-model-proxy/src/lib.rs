@@ -426,11 +426,7 @@ async fn respond(
     }
     if !status.is_success() {
         if let Some(admission) = admission {
-            admission.settle(if status.is_client_error() {
-                Outcome::NotSent
-            } else {
-                Outcome::Failed
-            });
+            admission.settle(Outcome::NotSent);
         }
         let body = bounded(upstream, MAX_ERROR_BYTES).await;
         let mut response = Response::new(Body::from(body));

@@ -1365,6 +1365,11 @@ proxy:
   `invalid_request_error`, never worded as "prompt is too long", which Claude Code would read as
   a reason to compact and retry. Usage is read from each streamed event as it passes. A client
   that disconnects is charged what had streamed, and the `meter` record says `meter.via = "proxy"`.
+- **Accounting.** A proxied call that gets an error status from the upstream is charged zero
+  tokens, because nothing ran, so a client retrying an overload (529, 503) spends no budget. A call
+  that streams and then fails is charged what was observed. The agent's own model path still
+  charges the input estimate when its provider fails; that path has no automatic retry, so the
+  difference is deliberate.
 - **Streaming.** Responses stream back unbuffered. While the upstream is silent, the proxy
   writes an SSE comment `: ping` every 20 seconds, under the jail's 90-second idle timer; both SDKs
   ignore comment lines. An upstream silent for 300 seconds ends the stream. The proxy sets no
