@@ -5,7 +5,10 @@ The typed test kit runs a provider against the same SDK dispatch in two modes:
 WebAssembly component loaded by the real broker host. `conformance::<P>(path)`
 checks the component manifest, help and usage, decoded imports against the
 provider's declared `Needs`, and closed input schemas. `Run` can script a
-loopback HTTPS origin, inject a guest clock and narrow host limits.
+loopback HTTPS origin, inject a guest clock and narrow host limits. It can also
+close the real stdout reader after a bounded prefix (`close_stdout_after(0)`
+closes it before invocation) to assert early producer exit without buffering
+the rest of the stream.
 
 Storage and external components have no native typed provider; their fixture
 integration tests live in `dekopon-broker-host/tests/fixture_host.rs` and use

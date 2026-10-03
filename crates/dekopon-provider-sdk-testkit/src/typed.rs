@@ -80,6 +80,7 @@ pub struct Run<P: Provider> {
     clock: Option<SystemTime>,
     http: Option<Result<ScriptServer, HarnessError>>,
     stdin: Option<Vec<u8>>,
+    close_stdout_after: Option<usize>,
     _provider: PhantomData<P>,
 }
 
@@ -96,6 +97,7 @@ impl<P: Provider> Harness<P> {
             clock: None,
             http: None,
             stdin: None,
+            close_stdout_after: None,
             _provider: PhantomData,
         }
     }
@@ -152,6 +154,13 @@ impl<P: Provider> Run<P> {
     #[must_use]
     pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());
+        self
+    }
+
+    /// Closes the real stdout reader after at most `bytes` bytes; zero closes it before invocation.
+    #[must_use]
+    pub fn close_stdout_after(mut self, bytes: usize) -> Self {
+        self.close_stdout_after = Some(bytes);
         self
     }
 
@@ -249,22 +258,40 @@ impl<P: Provider> Run<P> {
             ..Default::default()
         };
         let (result, captured, fed) = runtime().block_on(async {
-            let invoke =
-                registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
+            let close_after = self.close_stdout_after;
+            let (closed, ready) = tokio::sync::oneshot::channel();
             let capture = tokio::task::spawn_blocking(move || {
                 use std::io::Read;
+                if close_after == Some(0) {
+                    drop(stdout);
+                    closed.send(()).map_err(|_cancelled| {
+                        std::io::Error::other("stdout reader startup cancelled")
+                    })?;
+                    return Ok::<_, std::io::Error>(Vec::new());
+                }
+                closed.send(()).map_err(|_cancelled| {
+                    std::io::Error::other("stdout reader startup cancelled")
+                })?;
                 let mut bytes = Vec::new();
-                stdout.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                let limit = close_after
+                    .unwrap_or(16 * 1024 * 1024 + 1)
+                    .min(16 * 1024 * 1024 + 1);
+                stdout.take(limit as u64).read_to_end(&mut bytes)?;
                 Ok::<_, std::io::Error>(bytes)
             });
+            ready
+                .await
+                .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
+            let invoke =
+                registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
             let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
             let (result, captured) = tokio::join!(invoke, capture);
             let fed = match feed {
                 Some(task) => Some(task.await),
                 None => None,
             };
-            (result, captured, fed)
-        });
+            Ok::<_, HarnessError>((result, captured, fed))
+        })?;
         drop(server);
         if fed.is_some_and(|result| result.is_err()) {
             return Err(HarnessError::Fixture("stdin feeder"));
