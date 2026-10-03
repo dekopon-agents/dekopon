@@ -186,6 +186,35 @@ impl LoopbackServer {
         .expect("bind loopback fixture")
     }
 
+    /// Writes each part of one response with `pause` between them, then holds the connection open
+    /// for `hold` without ending the body.
+    #[must_use]
+    pub fn paced(parts: Vec<Vec<u8>>, pause: Duration, hold: Duration) -> Self {
+        Self::bind_with("127.0.0.1:0", move |listener, sender| {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(FIXTURE_TIMEOUT))
+                .expect("set fixture timeout");
+            sender
+                .send(read_request(&mut stream))
+                .expect("record fixture request");
+            for part in parts {
+                if stream
+                    .write_all(&part)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(pause);
+            }
+            thread::sleep(hold);
+        })
+        .expect("bind loopback fixture")
+    }
+
     #[must_use]
     pub fn pooled(response: &[u8], calls: usize) -> Self {
         let response = response.to_vec();

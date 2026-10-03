@@ -1,10 +1,11 @@
 # HTTP import probe
 
-A test fixture for the broker host's `dekopon:http/client@1.1.0` and `dekopon:asset/asset@0.1.0` imports, not a provider to deploy. It composes the `dekopon:provider@0.3.0` `provider-cli` world with those imports, exercising unchanged buffered `send`, additive asset-backed `stream`, and authorized attach/send effects. The separate, unchanged JSONPlaceholder fixture retains HTTP `@1.0.0` compatibility coverage.
+A test fixture for the broker host's `dekopon:http/client@1.2.0`, `dekopon:stdio/streams@0.1.0`, and `dekopon:asset/asset@0.1.0` imports, not a provider to deploy. It composes the `dekopon:provider@0.4.0` `provider-cli` world with those imports, exercising buffered `send`, asset-backed `stream`, response `open`/`splice`, and authorized attach/send effects. The separate, unchanged JSONPlaceholder fixture retains HTTP `@1.0.0` compatibility coverage.
 
 Its word is `httpprobe`, built on typed SDK clap arguments: one subcommand per capability and one flag per input field, the flag being the field's kebab-case spelling. The dispatch assembles exactly the input object `invoke` reads, and an optional field is present only when its flag was given.
 
 - `httpprobe fetch --uri <URI> [--method <METHOD>] [--header <NAME> <VALUE>]... [--body <BODY>] [--catch-error] [--bearer <DRN> | --basic <USER> <DRN>]` proposes `http-probe.fetch`: the required `uri` plus an optional arbitrary method token, ordered text headers, and a buffered text body. The test-only `--catch-error` (`catchError`) demonstrates that guest code cannot mask a policy rejection. `--bearer` and `--basic` are not input fields: each proposes secret use, returned as the proposal's `secretUse` (`httpBearer`, or `httpBasic` with the username) and never placed in the input. The value is the bare public DRN, `drn:<authority>:secret:<realm>:<path>`, passed on argv as [Agent syntax](../../../docs/secrets.md#agent-syntax) describes, not the `${drn:…}` marker the retired `curl` builtin took. The broker authorizes it like any secret use: a `secret.use` policy decision plus a private binding matching the DRN, sink, and username.
+- A direct `fetch` input with `spliceBody: true` calls `open`, then splices the response body into stdout without a JSON envelope; the command-line `fetch` continues to exercise buffered `send`.
 - `httpprobe conditional-write --uri <URI> [--expected-etag <ETAG>]` proposes `http-probe.conditional-write`, the two-call capability: it reads the resource, then writes only if the etag it observed is unchanged, refusing in between. It exists so the broker host has an in-tree capability that makes *two* authorized calls in one invocation, which is what exercises `maxRequests`, per-call evidence, and the host-call limit.
 - `httpprobe purge --uri <URI>` proposes `http-probe.purge`, which deletes one resource and exists so the manifest exposes something [`../../conditional-write/`](../../conditional-write/README.md) grants nowhere.
 
@@ -26,4 +27,4 @@ wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
 ```
 
-The decoded component must export exactly `describe`, `invoke`, and `run-command`, import exactly `dekopon:http/client@1.1.0` and `dekopon:asset/asset@0.1.0`, and import no WASI interfaces.
+The decoded component must export exactly `describe`, `invoke`, and `run-command`, import exactly `dekopon:http/client@1.2.0`, `dekopon:asset/asset@0.1.0`, and `dekopon:stdio/streams@0.1.0`, and import no WASI interfaces.
