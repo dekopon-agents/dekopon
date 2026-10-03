@@ -57,9 +57,7 @@ impl wall::Host for StoreState {
             ClockState::Granted { fixed, .. } => fixed.unwrap_or_else(SystemTime::now),
             ClockState::Refused { .. } => unreachable!("refused clock returned above"),
         };
-        let unix_millis = unix_millis(now);
-        tracing::info!(event = "provider_clock_read", unix_millis);
-        Ok(unix_millis)
+        Ok(unix_millis(now))
     }
 }
 
@@ -88,13 +86,10 @@ impl monotonic::Host for StoreState {
                 );
             }
         };
-        tracing::info!(event = "provider_monotonic_read", nanos);
         Ok(nanos)
     }
 }
 
-/// Saturates to zero only when the host clock predates 1970; that same reading is what gets logged,
-/// so the cause stays visible.
 fn unix_millis(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
         u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
