@@ -524,7 +524,7 @@ the same one. Contract and deployment details are in [`container-image.md`](cont
 actionlint .github/workflows/container-image.yml
 shellcheck ci/stage-image-context.sh
 work=$(mktemp -d)
-ci/stage-image-context.sh v0.31.0 "$work"
+ci/stage-image-context.sh v0.32.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker buildx build --platform linux/amd64 --load -t dekopon:local-amd64 "$work/context"
 docker run --rm dekopon:local dekopond --help
