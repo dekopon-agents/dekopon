@@ -8,6 +8,29 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider streams, model budgets, and image distribution (0.31.0)
+
+Upgrade broker and gateway together before installing providers compiled against
+`dekopon:provider@0.4.0`. This version refuses old `provider@0.3.0` components: providers now
+stream stdin and stdout through `dekopon:stdio@0.1.0` and return an exit status instead of a
+buffered value. Rebuild/release provider components against the 0.31.0 SDK and check decoded
+imports, including HTTP `client@1.2.0` for providers that use HTTP. Re-pin each provider set to
+compatible components; there is no compatibility shim.
+
+The image now bundles only in-tree `cli-probe` and `http-probe`; release archives and the Homebrew
+formula no longer ship the old JSONPlaceholder example. Mount/install each reviewed out-of-tree
+component explicitly instead of relying on baked GitHub, JSONPlaceholder, or memory-chat bytes.
+Remove references to `/opt/dekopon/optional-providers/memory-chat-provider.wasm` and any baked
+out-of-tree provider path from local configuration before restarting. The chart is independently
+versioned; chart 0.19.0 is unchanged by this application release.
+
+Optional `metering.budgets` refuses model calls that exceed an agent's token budget; optional
+`metering.restore` restores budget windows from OpenObserve or Quickwit on boot, best effort.
+Without these settings the old budget behavior remains. The guest model proxy runs under the
+gateway's model credentials, not the broker's provider authority; review its listener and upstream
+settings in [`dekopond.md`](dekopond.md) before enabling it. Neither is enabled by the version
+bump alone.
+
 ## Background jobs (0.30.0)
 
 Jobs are off until a route opts in. With no configuration change, 0.30.0 behaves as 0.29.0 except

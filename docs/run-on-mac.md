@@ -24,27 +24,27 @@ Homebrew 6 requires `brew trust` before loading a non-official tap. The
 [tap](https://github.com/dekopon-agents/homebrew-tap) is regenerated from each release's actual
 archives; it also supports Linux on ARM64 and x86-64.
 
-The formula installs both executables, the bundled JSONPlaceholder provider under
-`$(brew --prefix dekopon)/share/dekopon/providers/`, and `BROKER.md` / `GATEWAY.md` under
-`$(brew --prefix dekopon)/share/doc/dekopon/`. It starts neither daemon, generates no configuration,
-and defines no `brew services` service. The [local walkthrough](#run-a-read-only-local-session)
-below supplies the configuration and policy the bundled provider needs.
+The 0.31.0 formula installs both executables and `BROKER.md` / `GATEWAY.md` under
+`$(brew --prefix dekopon)/share/doc/dekopon/`. It installs no provider, starts neither daemon,
+generates no configuration, and defines no `brew services` service. The
+[local walkthrough](#run-a-read-only-local-session) below uses the *older 0.30.0 release* and its
+bundled provider; do not combine that component or configuration with 0.31.0.
 
 ### Prebuilt archives
 
 Each [GitHub release](https://github.com/dekopon-agents/dekopon/releases) carries three
 provenance-attested archives: macOS ARM64, Linux ARM64, and Linux x86-64. Each includes both
-daemons, the JSONPlaceholder component, licences, and broker/gateway reference documents, with a
-`.sha256` sidecar beside it. This example selects one release deliberately:
+daemons, licences, and broker/gateway reference documents in 0.31.0, with a
+`.sha256` sidecar beside each. This example selects 0.31.0 deliberately (run it only after publication):
 
 ```console
-gh release download v0.30.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.30.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.30.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.31.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.31.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.31.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.30.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.30.0-aarch64-apple-darwin.tar.gz
-export PATH="$PWD/dekopon-0.30.0-aarch64-apple-darwin:$PATH"
+  dekopon-0.31.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.31.0-aarch64-apple-darwin.tar.gz
+export PATH="$PWD/dekopon-0.31.0-aarch64-apple-darwin:$PATH"
 ```
 
 Use the configuration contracts and examples from the same tag as the binaries; a checkout of
@@ -57,12 +57,12 @@ The application release publishes the workspace's crates in dependency order thr
 trusted publishing. Install both daemons at the same available version:
 
 ```console
-cargo install --locked --version 0.30.0 dekopon-brokerd
-cargo install --locked --version 0.30.0 dekopond
+cargo install --locked --version 0.31.0 dekopon-brokerd
+cargo install --locked --version 0.31.0 dekopond
 ```
 
 A crate publication can trail the Git tag or stop partway; use the tap or release archives if the
-selected version is unavailable. This installs executables only, not the bundled provider. Release
+selected version is unavailable. This installs executables only, not provider components. Release
 recovery belongs to the [maintainer release process](../README.md#maintainer-release-process).
 
 ### From a checkout

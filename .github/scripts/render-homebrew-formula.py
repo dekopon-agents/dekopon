@@ -82,7 +82,6 @@ class Dekopon < Formula
 {platforms}
   def install
     bin.install {bin_install}
-    pkgshare.install "providers"
     doc.install "README.md", "BROKER.md", "GATEWAY.md", "LICENSE-APACHE", "LICENSE-MIT"
   end
 
@@ -110,14 +109,6 @@ class Dekopon < Formula
       The broker holds provider credentials and the only authorization path;
       read BROKER.md before enabling it.
 
-      The example JSONPlaceholder provider component is at
-
-        #{{pkgshare}}/providers/jsonplaceholder-provider.wasm
-
-      It imports broker-owned HTTP, which makes it a broker provider:
-      name its path in broker.yaml. The constraint set and Cedar policy it needs are
-      in #{{pkgshare}}/providers/JSONPLACEHOLDER.md.
-
       The end-to-end walkthrough is examples/conditional-write in the source tree:
       https://github.com/{repository}/tree/{tag}/examples/conditional-write/README.md
     EOS
@@ -125,10 +116,6 @@ class Dekopon < Formula
 
   test do
 {smoke}
-
-    component = pkgshare/"providers/jsonplaceholder-provider.wasm"
-    assert_path_exists component
-    assert_equal "\\x00asm", component.binread(4), "example provider is not a Wasm component"
 
     assert_match "--expose-credential",
                  shell_output("#{{bin}}/dekopond auth chatgpt export --help")

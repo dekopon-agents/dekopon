@@ -26,8 +26,7 @@ that one image with two `command`s does not.
 |---|---|
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
-| `/opt/dekopon/providers/*.wasm` | The in-tree `cli-probe` and `http-probe` fixtures plus exact pinned standalone JSONPlaceholder and GitHub releases |
-| `/opt/dekopon/optional-providers/memory-chat-provider.wasm` | Exact pinned standalone durable-memory release; never in the default scan |
+| `/opt/dekopon/providers/*.wasm` | The checked in-tree `cli-probe` and `http-probe` fixtures only |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
 The image runs as UID/GID `65532:65532` — numeric, because Kubernetes `runAsNonRoot` compares a UID
@@ -64,8 +63,8 @@ from.
 ## The build context is constructed, not filtered
 
 The image needs three things: the release executables, exact checksum- and provenance-verified
-provider components, and the two licences. The staging script copies exactly those into a scratch
-directory alongside the `Dockerfile`, asserts that the result is precisely that twelve-file set,
+in-tree provider components, and the two licences. The staging script copies exactly those into a scratch
+directory alongside the `Dockerfile`, asserts the context allowlist,
 and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
@@ -80,12 +79,11 @@ updating.
 
 ## Baked provider components
 
-Core retains `cli-probe` and `http-probe` as checked conformance fixtures. JSONPlaceholder and
-memory-chat are fetched from their standalone immutable releases by
-`ci/fetch-external-provider-components.sh`; the script requires the release tag, checksum, and size
-pinned in core, and image staging additionally verifies GitHub attestations. The GitHub provider follows its own
-pinned standalone-release path. Docker build remains network-free because every download and
-verification happens while constructing the context.
+Core ships only the checked `cli-probe` and `http-probe` conformance fixtures. Out-of-tree
+providers are not bundled in the image; operators supply compatible components explicitly
+through their reviewed provider set. `ci/fetch-external-provider-components.sh` still fetches
+legacy fixtures for explicit refusal tests, never for image staging. Docker build remains
+network-free.
 
 `dekopon-brokerd` refuses a provider path that is not a regular file owned by its own euid, that is
 group- or world-writable, or that has more than one link, and it applies the owner and writability
@@ -99,19 +97,13 @@ The `COPY` that places them uses `--chown` and no `--chmod`, because BuildKit ap
 the directories it creates as well and a `0644` directory cannot be traversed. The components keep
 the mode they carry in the staged context, which the staging script normalises to `0644`.
 
-The in-tree `cli-probe-provider.wasm` is import-free. The other default components import HTTP,
-and fetched optional `memory-chat` imports JSONL. All are loaded only through the broker,
-whose exact grants and independent ceilings constrain every invocation.
-Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
-retention. An operator must name the exact optional file or explicitly scan its directory. The
-`storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
-the image.
+Both checked probes import stdio; `http-probe` also imports HTTP and assets. They are loaded
+only through the broker, whose exact grants and independent ceilings constrain every invocation.
+No memory provider is bundled. The `storage-probe` and malicious `memory-reservation-probe`
+fixtures are not packaged in the image.
 
-Image staging does not use `dekopon-brokerd provider sync --locked`. The external provider path
-verifies GitHub build provenance as well as SHA-256 integrity, while the manager's exact-reference
-slice proves byte identity only. Staging may use `provider sync --locked` to materialize reviewed
-OCI digests only if it retains an independent `gh attestation verify` (or an equivalent reviewed
-provenance policy) for every component. Docker build itself remains network-free either way.
+Image staging does not use `dekopon-brokerd provider sync --locked`. The archive path verifies GitHub build provenance as well as SHA-256 integrity, while the
+manager's exact-reference slice proves byte identity only. Docker build itself remains network-free.
 
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.
@@ -193,12 +185,12 @@ can actually break: the image's layout, the provider ownership, and the byte-ide
 ## Build and check it locally
 
 The image is assembled from a release, so stage one first. A release must contain both daemon
-archives and supported provider inputs; the `Dockerfile` copies their bytes without compiling them.
+archives; checked in-tree probes come from this checkout. The `Dockerfile` copies their bytes without compiling them.
 This is the same script the workflow runs, with the same arguments.
 
 ```console
 work=$(mktemp -d)
-ci/stage-image-context.sh v0.3.0 "$work"
+ci/stage-image-context.sh v0.31.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker run --rm dekopon:local dekopond --help
 ci/verify-image-broker.sh dekopon:local
@@ -208,7 +200,7 @@ The script prints what it staged and the digest of each executable, so the allow
 rather than asserted in prose:
 
 ```text
-==> verified dekopon-0.3.0-aarch64-unknown-linux-gnu.tar.gz (sha256 and attestation) -> dist/arm64
+==> verified dekopon-0.31.0-aarch64-unknown-linux-gnu.tar.gz (sha256 and attestation) -> dist/arm64
 ==> every binary needs at most glibc 2.41
 ==> staged context (/tmp/tmp.AbC123/context):
           5057  Dockerfile
@@ -216,7 +208,7 @@ rather than asserted in prose:
           1064  LICENSE-MIT
        4764024  dist/amd64/dekopond
        ...
-        585394  providers/gh-provider.wasm
+        ...  providers/http-probe-provider.wasm
 ```
 
 Both platforms build anywhere, because nothing executes during the build:
