@@ -1,15 +1,21 @@
 //! Describe and command runs must be pure, so a refused clock read traps rather than errors, and
 //! the store records the attempt instead of charging it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::StoreState;
-use crate::bindings::dekopon::clock::wall;
+use crate::bindings::dekopon::clock::{monotonic, wall};
 
 #[derive(Debug)]
 pub(crate) enum ClockState {
-    Granted { fixed: Option<SystemTime> },
-    Refused { attempted: bool },
+    Granted {
+        fixed: Option<SystemTime>,
+        origin: Instant,
+        failure: Option<&'static str>,
+    },
+    Refused {
+        attempted: bool,
+    },
 }
 
 impl ClockState {
@@ -17,8 +23,19 @@ impl ClockState {
         Self::Refused { attempted: false }
     }
 
-    pub(crate) const fn invoke(fixed: Option<SystemTime>) -> Self {
-        Self::Granted { fixed }
+    pub(crate) fn invoke(fixed: Option<SystemTime>) -> Self {
+        Self::Granted {
+            fixed,
+            origin: Instant::now(),
+            failure: None,
+        }
+    }
+
+    pub(crate) const fn failure(&self) -> Option<&'static str> {
+        match self {
+            Self::Granted { failure, .. } => *failure,
+            Self::Refused { .. } => None,
+        }
     }
 
     pub(crate) const fn attempted(&self) -> bool {
@@ -27,7 +44,8 @@ impl ClockState {
 }
 
 const CLOCK_REFUSED: &str =
-    "provider read dekopon:clock/wall@1.0.0 outside invoke; describe and command runs are pure";
+    "provider read dekopon:clock/wall@1.1.0 outside invoke; describe and command runs are pure";
+const MONOTONIC_REFUSED: &str = "provider read dekopon:clock/monotonic@1.1.0 outside invoke; describe and command runs are pure";
 
 impl wall::Host for StoreState {
     async fn now_unix_millis(&mut self) -> wasmtime::Result<u64> {
@@ -36,12 +54,42 @@ impl wall::Host for StoreState {
             return Err(wasmtime::Error::msg(CLOCK_REFUSED));
         }
         let now = match self.clock {
-            ClockState::Granted { fixed } => fixed.unwrap_or_else(SystemTime::now),
+            ClockState::Granted { fixed, .. } => fixed.unwrap_or_else(SystemTime::now),
             ClockState::Refused { .. } => unreachable!("refused clock returned above"),
         };
         let unix_millis = unix_millis(now);
         tracing::info!(event = "provider_clock_read", unix_millis);
         Ok(unix_millis)
+    }
+}
+
+impl monotonic::Host for StoreState {
+    async fn now_nanos(&mut self) -> wasmtime::Result<u64> {
+        let (origin, failure) = match &mut self.clock {
+            ClockState::Granted {
+                origin, failure, ..
+            } => (*origin, failure),
+            ClockState::Refused { attempted } => {
+                *attempted = true;
+                return Err(wasmtime::Error::msg(MONOTONIC_REFUSED));
+            }
+        };
+        let nanos = match u64::try_from(origin.elapsed().as_nanos()) {
+            Ok(nanos) => nanos,
+            Err(source) => {
+                failure.get_or_insert("monotonic-overflow");
+                tracing::error!(
+                    event = "provider_monotonic_read",
+                    status = "overflow",
+                    ?source
+                );
+                return Err(
+                    wasmtime::Error::new(source).context("monotonic invocation duration overflow")
+                );
+            }
+        };
+        tracing::info!(event = "provider_monotonic_read", nanos);
+        Ok(nanos)
     }
 }
 

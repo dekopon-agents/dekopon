@@ -15,6 +15,7 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 parking_lot.workspace = true
+getrandom.workspace = true
 dekopon-capability.workspace = true
 dekopon-core = { workspace = true, features = ["native"] }
 dekopon-broker-protocol.workspace = true
