@@ -30,14 +30,15 @@ parent and duration besides.
 
 ## Accounting
 
-Two events record calls that cost money or consume a rate limit:
+Three events record calls that cost money or consume a rate limit:
 
 | Event | Emitted by | Carries |
 |---|---|---|
 | `accounting.model.turn` | `dekopon-agent` | turn index, the calling agent (when the embedder supplied one), duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
 | `accounting.http.request` | `dekopon-http-host` | method, authority, status, accounted request/response bytes, outcome, and `error.code`/`error.message` on failure |
+| `accounting.http.response_body` | `dekopon-http-host` | when an opened (streamed) response body ends, emitted under the `http.request` span: `outcome` (`succeeded`, `failed`, or `abandoned` when the guest drops the body unfinished), `dekopon.http.response.accounted_bytes`, and `error.code`/`error.message` when the outcome is `failed` |
 
-Both duplicate span fields: the span answers "why was this request slow", the accounting record
+These duplicate span fields: the span answers "why was this request slow", the accounting record
 answers "how many did we make last month". Neither substitutes for broker audit, the record of what
 was authorized.
 
