@@ -18,6 +18,25 @@ fn asset_dependency_mirrors_match_the_canonical_package() {
 }
 
 #[test]
+fn stdio_dependency_mirrors_match_the_canonical_package() {
+    let canonical = include_str!("../../../wit/stdio/stdio.wit");
+    for mirror in [
+        include_str!("../../../wit/http/deps/stdio.wit"),
+        include_str!("../wit/deps/stdio.wit"),
+        include_str!("../../dekopon-broker-host/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/cli-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/clock-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/clock-raw-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/http-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/http-raw-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/memory-reservation-probe/wit/deps/stdio.wit"),
+        include_str!("../../../examples/providers/storage-probe/wit/deps/stdio.wit"),
+    ] {
+        assert_eq!(canonical, mirror);
+    }
+}
+
+#[test]
 fn sdk_import_packages_match_broker_host_byte_for_byte() {
     for (sdk, broker) in [
         (

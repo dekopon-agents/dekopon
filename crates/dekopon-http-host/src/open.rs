@@ -28,7 +28,14 @@ pub struct ResponseBody {
     limit: u64,
     // Only time waiting on the connection is charged, so a slow consumer never times a request out.
     budget: Duration,
+    span: tracing::Span,
     state: State,
+}
+
+enum BodyOutcome<'a> {
+    Succeeded,
+    Failed(&'a HttpError),
+    Abandoned,
 }
 
 enum State {
@@ -48,7 +55,7 @@ impl ResponseBody {
             }
             if let Err(error) = self.pull().await {
                 self.window = Vec::new();
-                self.finish(Some(&error));
+                self.finish(BodyOutcome::Failed(&error));
                 self.state = State::Failed(error);
             }
         }
@@ -64,7 +71,7 @@ impl ResponseBody {
             next.map_err(|_elapsed| http_error(ErrorCode::Timeout, "response body timed out"))?
         else {
             self.released = Bytes::from(std::mem::take(&mut self.window));
-            self.finish(None);
+            self.finish(BodyOutcome::Succeeded);
             self.state = State::Ended;
             return Ok(());
         };
@@ -90,18 +97,36 @@ impl ResponseBody {
         Ok(())
     }
 
-    fn finish(&self, failure: Option<&HttpError>) {
-        tracing::info!(
-            target: "dekopon_http_host::audit",
-            {
-                audit.event = "accounting.http.response_body",
-                "dekopon.http.response.accounted_bytes" = self.accounted,
-                "error.code" = failure.map(|error| tracing::field::debug(error.code)),
-                "error.message" = failure.map(|error| error.message.as_str()),
-                outcome = if failure.is_some() { "failed" } else { "succeeded" },
-            },
-            "opened HTTP response body ended"
-        );
+    fn finish(&self, outcome: BodyOutcome<'_>) {
+        self.span
+            .record("dekopon.http.response.accounted_bytes", self.accounted);
+        self.span.in_scope(|| {
+            let (label, failure) = match outcome {
+                BodyOutcome::Succeeded => ("succeeded", None),
+                BodyOutcome::Failed(error) => ("failed", Some(error)),
+                BodyOutcome::Abandoned => ("abandoned", None),
+            };
+            tracing::info!(
+                target: "dekopon_http_host::audit",
+                {
+                    audit.event = "accounting.http.response_body",
+                    "dekopon.http.response.accounted_bytes" = self.accounted,
+                    "error.code" = failure.map(|error| tracing::field::debug(error.code)),
+                    "error.message" = failure.map(|error| error.message.as_str()),
+                    outcome = label,
+                },
+                "opened HTTP response body ended"
+            );
+        });
+    }
+}
+
+impl Drop for ResponseBody {
+    fn drop(&mut self) {
+        match self.state {
+            State::Open => self.finish(BodyOutcome::Abandoned),
+            State::Ended | State::Failed(_) => {}
+        }
     }
 }
 
@@ -122,12 +147,19 @@ impl BufferedHttpClient {
             outcome = tracing::field::Empty
         );
         let index = self.evidence.len();
-        let result = self.open_checked(request).instrument(span.clone()).await;
+        let result = self
+            .open_checked(request, span.clone())
+            .instrument(span.clone())
+            .await;
         self.record_request(&span, index, &result);
         result
     }
 
-    async fn open_checked(&mut self, request: Request) -> Result<OpenedResponse, HttpError> {
+    async fn open_checked(
+        &mut self,
+        request: Request,
+        span: tracing::Span,
+    ) -> Result<OpenedResponse, HttpError> {
         let (prepared, grant, index) = self.authorize_request(request, None).await?;
         let remaining = self.remaining()?;
         let client = self.pinned_client(&prepared.host, &prepared.addresses, remaining)?;
@@ -158,6 +190,7 @@ impl BufferedHttpClient {
                 accounted,
                 limit: grant.max_response_bytes,
                 budget: self.remaining()?,
+                span,
                 state: State::Open,
             },
         })
@@ -265,6 +298,43 @@ mod tests {
         let (delivered, outcome) = drain(&mut opened.body).await;
         assert_eq!(outcome.unwrap_err().code, ErrorCode::Timeout);
         assert_eq!(delivered, first[..first.len() - HELD]);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unread_body_records_one_abandoned_outcome_under_its_request() {
+        use dekopon_test_support::{CaptureLayer, Record};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::workspace();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let server = LoopbackServer::once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let mut client = client(&server, Duration::from_secs(5));
+        drop(client.open(get(&server)).await.unwrap());
+        let records = capture.records();
+        let bodies = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Event { fields, parent, .. }
+                    if fields.contains("accounting.http.response_body") =>
+                {
+                    Some((fields, parent))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 1, "{records:?}");
+        assert!(bodies[0].0.contains("outcome=\"abandoned\""), "{bodies:?}");
+        assert!(
+            bodies[0]
+                .0
+                .contains("dekopon.http.response.accounted_bytes=54"),
+            "{bodies:?}"
+        );
+        assert_eq!(bodies[0].1.as_deref(), Some("http.request"));
+        server.join();
     }
 
     #[tokio::test]

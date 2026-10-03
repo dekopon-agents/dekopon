@@ -613,6 +613,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_closed_splice_consumer_records_one_abandoned_body_with_read_bytes() {
+            use dekopon_test_support::{CaptureLayer, Record};
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let capture = CaptureLayer::workspace();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let body = vec![b'a'; 64];
+            let server = LoopbackServer::paced(
+                vec![[head(body.len()), body].concat()],
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let (host, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(peer);
+            let mut state = state(&server, Duration::from_secs(5), host);
+            assert!(matches!(
+                splice(&mut state, &server).await,
+                Err(http_wit::SpliceError::Closed)
+            ));
+            let records = capture.records();
+            let bodies = records
+                .iter()
+                .filter_map(|record| match record {
+                    Record::Event { fields, parent, .. }
+                        if fields.contains("accounting.http.response_body") =>
+                    {
+                        Some((fields, parent))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bodies.len(), 1, "{records:?}");
+            assert!(bodies[0].0.contains("outcome=\"abandoned\""), "{bodies:?}");
+            assert!(
+                bodies[0]
+                    .0
+                    .contains("dekopon.http.response.accounted_bytes=119"),
+                "{bodies:?}"
+            );
+            assert_eq!(bodies[0].1.as_deref(), Some("http.request"));
+            server.join();
+        }
+
+        #[tokio::test]
         async fn a_downstream_slower_than_the_request_deadline_still_receives_the_whole_body() {
             let body = vec![b'b'; 2 << 20];
             let server = LoopbackServer::paced(
