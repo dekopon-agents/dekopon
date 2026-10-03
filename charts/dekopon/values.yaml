@@ -10,9 +10,9 @@ image:
   # Empty means "v" + .Chart.AppVersion, which names the application release this chart deploys.
   # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
   # image for v0.3.0 or earlier — the image workflow landed after that release.
-  tag: ""
+  tag: "v0.31.0"
   # Prefer a digest once one exists; it pins across the arm64/amd64 index.
-  digest: ""
+  digest: "sha256:f8874ef28fd366b98a9702e2c594204161d5e157733b8f49601f705a3a4e3a8f"
   pullPolicy: IfNotPresent
   # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
   # chart itself — are public, so every pull on this path is anonymous. A dangling

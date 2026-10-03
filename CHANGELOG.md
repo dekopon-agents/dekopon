@@ -7,6 +7,17 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.20.0] - 2026-10-03
+
+### Changed
+
+- Deploy application v0.31.0 and pin the default image to its published multi-platform index digest.
+- Consolidate native Mac and Kubernetes installation guides under docs with a read-only local walkthrough; retain the packaged chart README pointer.
+
+### Removed
+
+- Remove the stale baked-gh provider reference from the PR summarizer/linter example; application images no longer bundle that out-of-tree provider.
+
 ## [0.31.0] - 2026-10-03
 
 ### Added

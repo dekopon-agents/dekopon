@@ -3,9 +3,6 @@
 # decision exported as an audit log record.
 #
 # The walkthrough itself lives with the provider it exercises, in dekopon-agents/dekopon-provider-gh.
-# This file stays here because it is a test of *this* chart against the component the image ships:
-# ci/stage-image-context.sh fetches gh-provider.wasm at a pinned tag, verifies its digest and build
-# provenance, and stages it to the path referenced below.
 #
 # Every real secret is a reference. Nothing here holds a token.
 #
@@ -19,8 +16,6 @@ broker:
       credentialsPath: /etc/dekopon/broker-credentials.yaml
       policiesPath: /etc/dekopon/policies.cedar
       strict: true
-      providers:
-        - /opt/dekopon/providers/gh-provider.wasm
       identities:
         - uid: 65533
           principal: dekopond-gateway
