@@ -98,9 +98,7 @@ the guest loop around it. Each read inside an invocation emits one info-level `p
 event carrying `unix_millis`, parented by `provider.invoke`, so the value the guest received is in
 the trace.
 
-A component importing the clock does not load on a host older than this import: instantiation
-fails with `component imports instance \`dekopon:clock/wall@1.1.0\`, but a matching implementation
-was not found in the linker`. Providers importing `wall@1.0.0` still instantiate against the 1.1.0 definition.
+Wasmtime resolves compatible `wall@1.0.0` and `wall@1.1.0` imports against either host definition because the interface is unchanged. New `monotonic@1.1.0` and `random/source@0.1.0` imports require a broker that links those services (v0.32.0 or later).
 
 `monotonic.now-nanos` measures elapsed time since the invocation store was created and is shared across components in that store. Overflow refuses the invocation. `random.get-random-bytes` uses OS entropy only, refuses more than 4096 bytes before allocation and never returns partial bytes on failure. Its event records requested length and status, never bytes; both services trap outside invoke.
 
