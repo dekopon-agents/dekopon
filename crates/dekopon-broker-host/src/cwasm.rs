@@ -275,9 +275,15 @@ impl Cache {
 
     fn read_entry(&self, source_sha256: &str) -> wasmtime::Result<Option<Entry>> {
         let index = self.index(source_sha256);
-        read_index(&index)?
-            .map(|bytes| parse_entry(&bytes, &index))
-            .transpose()
+        let Some(bytes) = read_index(&index)? else {
+            return Ok(None);
+        };
+        wasmtime::ensure!(
+            bytes.len() as u64 <= MAX_INDEX_BYTES,
+            "index {} exceeds {MAX_INDEX_BYTES} bytes",
+            index.display()
+        );
+        parse_entry(&bytes, &index).map(Some)
     }
 
     fn index(&self, source_sha256: &str) -> PathBuf {
@@ -325,11 +331,6 @@ fn read_index(index: &Path) -> wasmtime::Result<Option<Vec<u8>>> {
 }
 
 fn parse_entry(bytes: &[u8], index: &Path) -> wasmtime::Result<Entry> {
-    wasmtime::ensure!(
-        bytes.len() as u64 <= MAX_INDEX_BYTES,
-        "index {} exceeds {MAX_INDEX_BYTES} bytes",
-        index.display()
-    );
     let entry: Entry = serde_json::from_slice(bytes).map_err(|error| {
         wasmtime::Error::msg(format!(
             "invalid compiled index {}: {error}",
