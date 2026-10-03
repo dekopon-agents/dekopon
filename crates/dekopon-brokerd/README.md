@@ -598,8 +598,10 @@ Wasmtime cache is neither read nor migrated. Component startup runs one at a tim
 compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
 component. The socket binds only after the entire registry validates.
 
-Cache faults stop broker startup without fallback. Delete the pod to rerun `provider precompile`
-and repair the cache, or set `compileOnLoad: true` to bypass it. Never rewrite or truncate mapped
+Cache faults stop broker startup without fallback. Run `provider precompile` before starting a
+managed broker; with the chart's precompile init container, delete the pod to rerun it. It
+repairs faulty indexes and objects, then prunes old generations and unreferenced files. Set
+`compileOnLoad: true` to bypass cwasm if there is no precompile step. Never rewrite or truncate mapped
 files. The filesystem and local index are trusted; adversarial same-UID file replacement is outside
 this feature's model. Publishers hold the store lock. Compiled artifacts
 are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or
@@ -710,7 +712,17 @@ dekopon-brokerd provider list \
 dekopon-brokerd provider verify \
   --lock-file /etc/dekopon/providers.lock.yaml \
   --store /var/lib/dekopon/provider-store
+
+# Before starting a managed broker (and after every upgrade without a chart init container):
+dekopon-brokerd provider --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store --output=json precompile
 ```
+
+`precompile` reads only the lock and checked local blobs; it holds the activation and store locks
+while filling or repairing each cache entry, then prunes old indexes and orphaned objects. Its
+report contains `providers`, `compiled`, `repaired`, `removedFiles` and `removedBytes`; repaired
+components are included in `compiled`. An error exits non-zero without pruning. `verify` neither
+locks nor publishes compiled artifacts.
 
 `--output json` gives deterministic machine-readable command results. A successful lock change
 applies on the next broker restart; there is no hot reload.
