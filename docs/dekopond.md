@@ -1372,7 +1372,9 @@ proxy:
   difference is deliberate.
 - **Streaming.** Responses stream back unbuffered. While the upstream is silent, the proxy
   writes an SSE comment `: ping` every 20 seconds, under the jail's 90-second idle timer; both SDKs
-  ignore comment lines. An upstream silent for 300 seconds ends the stream. The proxy sets no
+  ignore comment lines. Pings exist only inside an SSE body: a `stream: false` call gets nothing
+  until it completes, and the jail's 90-second idle timer cuts one that runs longer, which is then
+  charged as cancelled. An upstream silent for 300 seconds ends the stream. The proxy sets no
   total timeout; the jail's `maxConnectionSeconds` (1800 seconds by default) bounds a proxied
   call. A stream cut there is charged as cancelled, and the client's retry is charged again.
 - **Bounds.** A request body over 8 MiB gets a 413 in the dialect's error shape. At most
@@ -1408,12 +1410,12 @@ an outage. It never quotes the request; it names the grant's configured models i
 An upstream's own error passes through unchanged, and an unreachable upstream is a 502; neither is a
 sandbox rule.
 
-Claude Code needs its model names pointed at configured ones. The exec environment sets
-`ANTHROPIC_BASE_URL=https://models.vm.internal`, `ANTHROPIC_MODEL`,
-`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and
-`ANTHROPIC_DEFAULT_HAIKU_MODEL` to names in the guest's grant, plus
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. OpenAI clients use `https://models.vm.internal/v1` as
-their base URL. The token any client sends is ignored.
+Nothing points a guest's client at the proxy for it: the agent's `vm exec` script passes the
+settings in `env`. For Claude Code that is `ANTHROPIC_BASE_URL=https://models.vm.internal`,
+`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` set to names in the guest's grant, and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. An OpenAI client gets `https://models.vm.internal/v1`
+as its base URL. The token any client sends is ignored.
 
 **Cost warning.** A Claude Code turn re-sends tens of thousands of cached input tokens on every
 request, and the budget counts cached input at the full rate, because a call costs its raw input
