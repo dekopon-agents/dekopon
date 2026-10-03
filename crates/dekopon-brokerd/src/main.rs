@@ -118,6 +118,8 @@ enum ProviderCommand {
     },
     /// Show locked references and local verification state without network access.
     List,
+    /// Compile and repair locked components, then prune obsolete cwasm files.
+    Precompile,
     /// Verify locked bytes and the complete provider set without network access.
     Verify,
 }
@@ -159,6 +161,15 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
             ErrorKind::ArgumentConflict,
             "--config cannot be used with an offline operator command",
         )),
+        (Some(Command::Provider(provider)), _)
+            if matches!(provider.command, ProviderCommand::Precompile)
+                && provider.provider_set.is_some() =>
+        {
+            Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "provider precompile reads the lock and does not take --provider-set",
+            ))
+        }
         (Some(Command::Provider(provider)), _)
             if provider.lock_file.is_none()
                 || provider.store.is_none()
@@ -365,6 +376,19 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
                 format!("verified {} locked provider(s)", report.providers)
             })?;
         }
+        ProviderCommand::Precompile => {
+            let report = manager.precompile().await.map_err(AppError::Provider)?;
+            render(output, &report, || {
+                format!(
+                    "PROVIDERS\tCOMPILED\tREPAIRED\tREMOVED-FILES\tREMOVED-BYTES\n{}\t{}\t{}\t{}\t{}",
+                    report.providers,
+                    report.compiled,
+                    report.repaired,
+                    report.removed_files,
+                    report.removed_bytes
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -544,6 +568,46 @@ mod tests {
         ])
         .expect("offline list parses without desired state");
         assert!(validate_cli(&list).is_ok());
+    }
+
+    #[test]
+    fn precompile_uses_only_global_provider_flags() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "provider",
+            "--lock-file=providers.lock.yaml",
+            "--store=store",
+            "--output=json",
+            "precompile",
+        ])
+        .expect("precompile parses without a provider set");
+        assert!(validate_cli(&cli).is_ok());
+        let Some(Command::Provider(provider)) = cli.command else {
+            panic!("provider command");
+        };
+        assert!(matches!(provider.command, ProviderCommand::Precompile));
+        assert_eq!(provider.output, OutputFormat::Json);
+        assert!(
+            Cli::try_parse_from([
+                "dekopon-brokerd",
+                "provider",
+                "--lock-file=lock",
+                "--store=store",
+                "precompile",
+                "--compile-threads=2",
+            ])
+            .is_err()
+        );
+        let with_set = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "provider",
+            "--lock-file=lock",
+            "--store=store",
+            "--provider-set=providers.yaml",
+            "precompile",
+        ])
+        .expect("global syntax parses");
+        assert!(validate_cli(&with_set).is_err());
     }
 
     #[test]

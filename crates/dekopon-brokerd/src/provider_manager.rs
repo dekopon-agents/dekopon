@@ -34,6 +34,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tracing::Instrument as _;
 
 use crate::{HARD_MAX_PROVIDERS, socket};
 
@@ -159,6 +160,16 @@ pub struct ProviderStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderVerifyReport {
     pub providers: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPrecompileReport {
+    pub providers: usize,
+    pub compiled: usize,
+    pub repaired: usize,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
 }
 
 pub struct ProviderManager {
@@ -301,6 +312,45 @@ impl ProviderManager {
             });
         }
         Ok(statuses)
+    }
+
+    pub async fn precompile(&self) -> Result<ProviderPrecompileReport, ProviderManagerError> {
+        let span = tracing::info_span!(
+            "provider.precompile",
+            providers = tracing::field::Empty,
+            compiled = 0_u64,
+            repaired = 0_u64,
+            removed_files = 0_u64,
+            removed_bytes = 0_u64,
+            error = tracing::field::Empty,
+        );
+        let result = async {
+            let uid = socket::current_uid();
+            let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
+            let store = ProviderStore::open(&self.paths.store, uid, false)?;
+            let _store_operation = store.lock()?;
+            let sources =
+                load_locked_sources(&self.paths.lock_file, &self.paths.store, uid).await?;
+            tracing::Span::current().record("providers", sources.len());
+            let report = dekopon_broker_host::precompile(sources, store.root.join("cwasm"))
+                .await
+                .map_err(ProviderManagerError::Host)?;
+            Ok(ProviderPrecompileReport {
+                providers: report.providers,
+                compiled: report.compiled,
+                repaired: report.repaired,
+                removed_files: report.removed_files,
+                removed_bytes: report.removed_bytes,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        if let Err(error) = &result {
+            let chain = dekopon_core::error_chain(error);
+            let message = dekopon_core::bounded_attribute(&chain);
+            span.record("error", message.as_ref());
+        }
+        result
     }
 
     pub async fn verify(&self) -> Result<ProviderVerifyReport, ProviderManagerError> {
@@ -2262,12 +2312,11 @@ mod tests {
 
     #[derive(Default)]
     struct SyncCompileState {
-        source: Option<PathBuf>,
-        stages: usize,
+        stages: BTreeMap<PathBuf, usize>,
     }
 
     struct SyncCompileStages(Arc<parking_lot::Mutex<SyncCompileState>>);
-    struct TrackedSource;
+    struct TrackedSource(PathBuf);
 
     #[derive(Default)]
     struct StageFields {
@@ -2293,20 +2342,33 @@ mod tests {
             let mut fields = StageFields::default();
             attributes.record(&mut fields);
             if attributes.metadata().name() == "provider.compile" {
-                let source = self.0.lock().source.clone();
-                if source.is_some_and(|source| fields.path.contains(&source.display().to_string()))
+                let source = self
+                    .0
+                    .lock()
+                    .stages
+                    .keys()
+                    .find(|source| fields.path.contains(&source.display().to_string()))
+                    .cloned();
+                if let Some(source) = source
                     && let Some(span) = context.span(id)
                 {
-                    span.extensions_mut().insert(TrackedSource);
+                    span.extensions_mut().insert(TrackedSource(source));
                 }
             } else if attributes.metadata().name() == "provider.load_stage"
                 && fields.stage == "\"compile\""
-                && context
-                    .span(id)
-                    .and_then(|span| span.parent())
-                    .is_some_and(|parent| parent.extensions().get::<TrackedSource>().is_some())
+                && let Some(source) =
+                    context
+                        .span(id)
+                        .and_then(|span| span.parent())
+                        .and_then(|parent| {
+                            parent
+                                .extensions()
+                                .get::<TrackedSource>()
+                                .map(|tracked| tracked.0.clone())
+                        })
+                && let Some(count) = self.0.lock().stages.get_mut(&source)
             {
-                self.0.lock().stages += 1;
+                *count += 1;
             }
         }
     }
@@ -2538,15 +2600,11 @@ mod tests {
         .await
         .expect("broker reads published artifact");
         let probe = sync_compile_probe();
-        {
-            let mut state = probe.lock();
-            state.source = Some(blob.clone());
-            state.stages = 0;
-        }
+        probe.lock().stages.insert(blob.clone(), 0);
         manager.sync().await.expect("second sync");
         assert_eq!(
-            probe.lock().stages,
-            0,
+            probe.lock().stages.get(&blob),
+            Some(&0),
             "unchanged sync must not enter compile stage"
         );
         assert_eq!(fs::read(&index).expect("warm index preserved"), before);
@@ -2555,14 +2613,18 @@ mod tests {
             .sync_locked()
             .await
             .expect("locked sync publishes missing index");
-        assert_eq!(probe.lock().stages, 1, "locked miss enters compile stage");
+        assert_eq!(
+            probe.lock().stages.get(&blob),
+            Some(&1),
+            "locked miss enters compile stage"
+        );
         manager.sync_locked().await.expect("warm locked sync");
         assert_eq!(
-            probe.lock().stages,
-            1,
+            probe.lock().stages.get(&blob),
+            Some(&1),
             "unchanged locked sync skips compile"
         );
-        probe.lock().source = None;
+        probe.lock().stages.remove(&blob);
         assert_eq!(fs::read(&index).expect("locked sync republished"), before);
         BrokerProviderRegistry::load_locked_with_options(
             lock.sources(
@@ -2579,6 +2641,212 @@ mod tests {
         .await
         .expect("broker reads locked-sync publication");
         assert!(blob.exists());
+    }
+
+    fn local_precompile_fixture(
+        directory: &Path,
+        names: &[&str],
+    ) -> (ProviderManager, ProviderManagerPaths) {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("private fixture directory");
+        let paths = ProviderManagerPaths {
+            provider_set: None,
+            lock_file: directory.join("providers.lock.yaml"),
+            store: directory.join("store"),
+        };
+        let store = ProviderStore::open(&paths.store, socket::current_uid(), true).expect("store");
+        let providers = names
+            .iter()
+            .map(|name| {
+                let bytes = fs::read(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../..")
+                        .join(format!("examples/providers/{name}-provider.wasm")),
+                )
+                .expect("checked component");
+                let digest = prefixed_sha256(&bytes);
+                let path = store.blob_path(&digest).expect("blob path");
+                fs::write(&path, &bytes).expect("install component");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure blob");
+                LockedProvider {
+                    source: format!("ghcr.io/example/{name}:1.0.0"),
+                    resolved_version: Some(Version::new(1, 0, 0)),
+                    manifest_digest: format!("sha256:{}", "a".repeat(64)),
+                    component_digest: digest,
+                    component_bytes: bytes.len() as u64,
+                    provider_id: name.parse().expect("provider id"),
+                }
+            })
+            .collect();
+        let lock = ProviderLock {
+            api_version: ProviderLockApiVersion::V1Alpha1,
+            providers,
+        };
+        fs::write(&paths.lock_file, encode_lock(&lock).expect("lock")).expect("write lock");
+        fs::set_permissions(&paths.lock_file, fs::Permissions::from_mode(0o600))
+            .expect("secure lock");
+        let manager = ProviderManager::new(ProviderManagerOptions {
+            paths: paths.clone(),
+            plaintext_loopback_registries: Vec::new(),
+        })
+        .expect("manager");
+        (manager, paths)
+    }
+
+    async fn boot_locked(paths: &ProviderManagerPaths) {
+        let sources = load_locked_sources(&paths.lock_file, &paths.store, socket::current_uid())
+            .await
+            .expect("locked sources");
+        BrokerProviderRegistry::load_locked_with_options(
+            sources,
+            BrokerHostLimits::default(),
+            None,
+            &BrokerHostOptions {
+                cwasm_dir: Some(paths.store.join("cwasm")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("broker maps every compiled component");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precompile_then_boot_maps_every_component_without_compiling() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (manager, paths) =
+            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]);
+        let cold = manager.precompile().await.expect("cold precompile");
+        assert_eq!((cold.providers, cold.compiled, cold.repaired), (2, 2, 0));
+        let warm = manager.precompile().await.expect("warm precompile");
+        assert_eq!(
+            serde_json::to_value(&warm).expect("JSON report"),
+            serde_json::json!({
+                "providers": 2, "compiled": 0, "repaired": 0,
+                "removedFiles": 0, "removedBytes": 0,
+            })
+        );
+        let sources = load_locked_sources(&paths.lock_file, &paths.store, socket::current_uid())
+            .await
+            .expect("sources");
+        let probe = sync_compile_probe();
+        for source in &sources {
+            probe.lock().stages.insert(source.path().to_owned(), 0);
+        }
+        boot_locked(&paths).await;
+        for source in &sources {
+            assert_eq!(
+                probe.lock().stages.remove(source.path()),
+                Some(0),
+                "boot must not compile {}",
+                source.path().display()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precompile_repairs_a_truncated_object_and_a_dangling_index() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (manager, paths) =
+            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]);
+        manager.precompile().await.expect("populate cache");
+        let root = paths.store.join("cwasm/v1");
+        let indexes = fs::read_dir(&root)
+            .expect("generations")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir() && path.file_name().is_some_and(|name| name != "sha256"))
+            .expect("current generation");
+        let mut indexes = fs::read_dir(indexes)
+            .expect("indexes")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        indexes.sort();
+        assert_eq!(indexes.len(), 2);
+        let objects = indexes
+            .iter()
+            .map(|path| {
+                let entry: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).expect("index")).expect("entry");
+                root.join("sha256").join(format!(
+                    "{}.cwasm",
+                    entry["sha256"].as_str().expect("digest")
+                ))
+            })
+            .collect::<Vec<_>>();
+        let bytes = fs::read(&objects[0]).expect("compiled bytes");
+        fs::write(&objects[0], &bytes[..bytes.len() / 2]).expect("truncate first object");
+        fs::remove_file(&objects[1]).expect("dangling second index");
+        let repaired = manager.precompile().await.expect("repair both faults");
+        assert_eq!((repaired.compiled, repaired.repaired), (2, 2));
+        boot_locked(&paths).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precompile_replaces_a_short_object_left_at_its_own_address() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        manager.precompile().await.expect("populate cache");
+        let root = paths.store.join("cwasm/v1");
+        let generation = fs::read_dir(&root)
+            .expect("generations")
+            .map(|entry| entry.expect("entry").path())
+            .find(|path| path.is_dir() && path.file_name().is_some_and(|name| name != "sha256"))
+            .expect("current generation");
+        let index = fs::read_dir(generation)
+            .expect("indexes")
+            .next()
+            .expect("index")
+            .expect("entry")
+            .path();
+        let entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index).expect("index")).expect("entry");
+        let object = root.join("sha256").join(format!(
+            "{}.cwasm",
+            entry["sha256"].as_str().expect("digest")
+        ));
+        let bytes = fs::read(&object).expect("compiled bytes");
+        fs::write(&object, &bytes[..bytes.len() / 2]).expect("power cut leaves short object");
+        fs::remove_file(&index).expect("index not published");
+        let report = manager.precompile().await.expect("repair short object");
+        assert_eq!((report.compiled, report.repaired), (1, 1));
+        boot_locked(&paths).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precompile_does_not_prune_after_a_source_failure() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        manager.precompile().await.expect("populate cache");
+        let stale = paths.store.join("cwasm/v1/old-engine/stale.json");
+        fs::create_dir_all(stale.parent().expect("parent")).expect("old generation");
+        fs::write(&stale, b"stale").expect("old index");
+        let source = load_locked_sources(&paths.lock_file, &paths.store, socket::current_uid())
+            .await
+            .expect("sources")
+            .remove(0);
+        fs::write(source.path(), b"damaged").expect("damage blob");
+        assert!(matches!(
+            manager.precompile().await,
+            Err(ProviderManagerError::Host(
+                BrokerHostError::ArtifactSizeMismatch { .. }
+            ))
+        ));
+        assert!(
+            stale.exists(),
+            "failed publish leaves the old generation untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precompile_refuses_while_sync_holds_the_store() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        let store = ProviderStore::open(&paths.store, socket::current_uid(), false).expect("store");
+        let _owner = store.lock().expect("sync owns store");
+        assert!(matches!(
+            manager.precompile().await,
+            Err(ProviderManagerError::OperationInProgress { .. })
+        ));
     }
 
     #[test]
