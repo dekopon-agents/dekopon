@@ -324,7 +324,8 @@ async fn a_codex_request_is_forced_unstored_and_must_stream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), 400);
+    let message = sandbox_refusal(refused, "/v1/responses", 400, "invalid_request").await;
+    assert!(message.contains("Set `stream` to true"), "{message}");
 
     let streamed = running
         .post(
@@ -402,7 +403,7 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
         assert_eq!(refusal_shape(path, &body), Some(expected), "{body}");
         let message = body["error"]["message"].as_str().unwrap();
         assert!(
-            message.starts_with("The agent gylmar is at 99% of its token budget"),
+            message.starts_with("dekopon sandbox: The agent gylmar is at 99% of its token budget"),
             "{message}"
         );
     }
@@ -416,12 +417,35 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
     let body: serde_json::Value = json_body(response).await;
     assert_eq!(body["error"]["type"], "invalid_request_error");
     let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("dekopon sandbox: "), "{message}");
     assert!(!message.contains("prompt is too long"), "{message}");
     assert!(message.contains("can't run as is"), "{message}");
 }
 
+/// Asserts the dialect's error shape, the status and the sandbox prefix, and returns the message.
+async fn sandbox_refusal(
+    response: reqwest::Response,
+    path: &str,
+    status: u16,
+    kind: &str,
+) -> String {
+    assert_eq!(response.status(), status, "{path}");
+    let body = json_body(response).await;
+    if path.starts_with("/v1/messages") {
+        assert_eq!(body["type"], "error", "{body}");
+        assert_eq!(body["error"]["type"], kind, "{body}");
+    } else {
+        assert_eq!(body["error"]["code"], kind, "{body}");
+        assert!(body["error"]["type"].is_string(), "{body}");
+        assert!(body["error"]["param"].is_null(), "{body}");
+    }
+    let message = body["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.starts_with("dekopon sandbox: "), "{message}");
+    message
+}
+
 #[tokio::test]
-async fn an_unknown_subject_is_forbidden_and_an_ungranted_model_is_not_found() {
+async fn an_unknown_subject_and_an_ungranted_model_are_sandbox_permission_errors() {
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
         .client
@@ -431,20 +455,94 @@ async fn an_unknown_subject_is_forbidden_and_an_ungranted_model_is_not_found() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 403);
-    let body: serde_json::Value = json_body(response).await;
-    assert_eq!(body["error"]["type"], "permission_error");
-    for (path, model) in [
-        ("/v1/messages", "terra"),
-        ("/v1/messages", "glm-flash"),
-        ("/v1/chat/completions", "claude-opus"),
+    let message = sandbox_refusal(response, "/v1/messages", 403, "permission_error").await;
+    assert!(message.contains("granted no model"), "{message}");
+    let long = "terra".repeat(10_000);
+    for (path, model, kind, expected) in [
+        (
+            "/v1/messages",
+            long.as_str(),
+            "permission_error",
+            "configured models: `claude-opus`. Set the model to one of them.",
+        ),
+        (
+            "/v1/messages",
+            "glm-flash",
+            "permission_error",
+            "configured models: `claude-opus`.",
+        ),
+        (
+            "/v1/chat/completions",
+            "claude-opus",
+            "permission_denied",
+            "configured models: `glm-flash`.",
+        ),
+        (
+            "/v1/responses",
+            "astra",
+            "permission_denied",
+            "none is served on this path: `claude-opus` on `/v1/messages`, `glm-flash` on `/v1/chat/completions`.",
+        ),
     ] {
         let response = running
             .post(path, format!(r#"{{"model":"{model}"}}"#))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 404, "{path} {model}");
+        let message = sandbox_refusal(response, path, 403, kind).await;
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains("terra"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn every_malformed_request_is_a_sandbox_invalid_request() {
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    for (path, body, kind, expected) in [
+        (
+            "/v1/messages",
+            "{",
+            "invalid_request_error",
+            "must be a JSON object",
+        ),
+        (
+            "/v1/chat/completions",
+            "[1]",
+            "invalid_request",
+            "must be a JSON object",
+        ),
+        (
+            "/v1/messages",
+            r#"{"messages":[]}"#,
+            "invalid_request_error",
+            "must name a model. Set `model` to one of this agent's configured models: `astra`, `claude-opus`, `glm-flash`.",
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","stream":true,"stream":false}"#,
+            "invalid_request",
+            "repeats the top-level key `stream`; send it once.",
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","models":["x/y"]}"#,
+            "invalid_request",
+            "OpenRouter fallback routing (`models` / `route`) is not allowed",
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","route":"fallback"}"#,
+            "invalid_request",
+            "Remove the field.",
+        ),
+    ] {
+        let response = running.post(path, body).send().await.unwrap();
+        let message = sandbox_refusal(response, path, 400, kind).await;
+        assert!(message.contains(expected), "{message}");
+        assert!(
+            !message.contains("x/y") && !message.contains("fallback\""),
+            "{message}"
+        );
     }
 }
 
@@ -459,9 +557,8 @@ async fn a_body_over_the_cap_is_refused_with_413() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 413);
-    let body: serde_json::Value = json_body(response).await;
-    assert_eq!(body["error"]["code"], "request_too_large");
+    let message = sandbox_refusal(response, "/v1/chat/completions", 413, "request_too_large").await;
+    assert!(message.contains("at most 8 MiB"), "{message}");
 }
 
 #[test]

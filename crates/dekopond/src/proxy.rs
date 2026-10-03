@@ -486,8 +486,14 @@ mod tests {
             r#"{"model":"glm-flash"}"#,
         )
         .await;
-        assert!(ungranted.starts_with("HTTP/1.1 404"), "{ungranted}");
-        assert!(ungranted.contains("not_found_error"), "{ungranted}");
+        assert!(ungranted.starts_with("HTTP/1.1 403"), "{ungranted}");
+        assert!(ungranted.contains("permission_error"), "{ungranted}");
+        assert!(
+            ungranted.contains(
+                "dekopon sandbox: this agent may only call its configured models: `claude-opus`."
+            ),
+            "{ungranted}"
+        );
         tasks.shutdown().await;
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }

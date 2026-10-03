@@ -1347,12 +1347,12 @@ proxy:
   URI SAN, or the TLS handshake fails. The jail names the VM in `x-dekopon-vm-subject`; an
   unlisted subject gets a 403. See [the security model](security-model.md#the-guest-model-proxy-trusts-the-jail-to-name-its-vm).
 - **Models.** A guest names a configured model (`astra`, `claude-opus`), never an upstream id.
-  A model outside the guest's list, or one the path's dialect cannot reach, gets a 404. The proxy
+  A model outside the guest's list, or one the path's dialect cannot reach, gets a 403. The proxy
   rewrites `model` to the configured upstream id and injects the upstream credential. It drops
   the guest's `authorization` and `x-api-key`, and passes `anthropic-version`, `anthropic-beta`
   and `x-request-id` unchanged. Every other body byte is forwarded as the guest sent it.
-- **Codex.** The proxy forces `store: false` and refuses `stream: false` with a 400, because the
-  ChatGPT backend requires both. On a 401 it retries once after a forced refresh of the same
+- **Codex.** The proxy forces `store: false` and refuses a call without `stream: true` with a 400,
+  because the ChatGPT backend requires both. On a 401 it retries once after a forced refresh of the same
   credential file the gateway's own client uses.
 - **`kind: anthropic`** (`name`, `model`, `apiKeyEnv`) is proxy-only for now. A route that selects
   one is a startup error.
@@ -1377,6 +1377,26 @@ proxy:
 - **Startup.** No `proxy` block means no listener. Every unknown agent, unknown model, model the
   proxy cannot serve (`openaiCompatible`), and unreadable TLS file is reported in one startup
   failure.
+
+**The model jail.** A VM agent calls only the models its grant names, each on its own path. Every
+refusal the proxy sends itself uses the dialect's error shape, starts with `dekopon sandbox:`, names
+the rule and says what to do instead, so `claude`, `pi` and `codex` print it as a rule rather than
+an outage. It never quotes the request; it names the grant's configured models instead.
+
+| Refusal | Status |
+|---|---|
+| The VM's subject has no grant | 403 (`permission_error` / `permission_denied`) |
+| A model outside the grant, or not served on this path | 403, listing the granted models |
+| A body over 8 MiB | 413 |
+| A body that is not a JSON object, or names no `model` | 400 |
+| A repeated top-level `model`, `stream`, `store`, `models` or `route` | 400 |
+| A Codex call without `stream: true` | 400 |
+| OpenRouter fallback routing (`models` or `route`) | 400 |
+| A budget wait | 429 with `retry-after` |
+| A request that can never fit the budget | 400 |
+
+An upstream's own error passes through unchanged, and an unreachable upstream is a 502; neither is a
+sandbox rule.
 
 Claude Code needs its model names pointed at configured ones. The exec environment sets
 `ANTHROPIC_BASE_URL=https://models.vm.internal`, `ANTHROPIC_MODEL`,

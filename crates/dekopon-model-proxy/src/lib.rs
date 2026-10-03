@@ -33,12 +33,12 @@ use bytes::Bytes;
 use dekopon_core::{AgentId, Redacted};
 use dekopon_model::{
     chatgpt::CredentialFile,
-    wire::{Field, RequestPeek},
+    wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 
-pub use dialect::Dialect;
 use dialect::Problem;
+pub use dialect::{Dialect, SANDBOX};
 use tee::{Shape, Timing};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -87,6 +87,14 @@ impl Upstream {
                 Self::OpenRouter { .. },
                 Dialect::Messages | Dialect::CountTokens | Dialect::Responses,
             ) => false,
+        }
+    }
+
+    const fn path(&self) -> &'static str {
+        match self {
+            Self::Anthropic { .. } => "/v1/messages",
+            Self::Codex { .. } => "/v1/responses",
+            Self::OpenRouter { .. } => "/v1/chat/completions",
         }
     }
 
@@ -161,6 +169,29 @@ impl ModelProxy {
         self
     }
 
+    /// Names only configured models, never anything from the request.
+    fn model_rule(&self, grant: &Grant, dialect: Dialect) -> String {
+        let granted = || grant.models.iter().filter_map(|name| self.models.get(name));
+        let served = granted()
+            .filter(|model| model.upstream.serves(dialect))
+            .map(|model| format!("`{}`", model.name))
+            .collect::<Vec<_>>();
+        if served.is_empty() {
+            let elsewhere = granted()
+                .map(|model| format!("`{}` on `{}`", model.name, model.upstream.path()))
+                .collect::<Vec<_>>();
+            format!(
+                "this agent may only call its configured models, and none is served on this path: {}. Call one on its own path.",
+                elsewhere.join(", ")
+            )
+        } else {
+            format!(
+                "this agent may only call its configured models: {}. Set the model to one of them.",
+                served.join(", ")
+            )
+        }
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route(
@@ -194,44 +225,50 @@ async fn handle(
         .and_then(|subject| subject.to_str().ok())
         .and_then(|subject| proxy.guests.get(subject))
     else {
-        return dialect.error(Problem::Forbidden, "this VM is not granted any model");
+        return dialect.sandbox(
+            Problem::Forbidden,
+            "this VM is granted no model. Ask the operator to grant its agent one.",
+        );
     };
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             tracing::debug!(target: "model", error = %error, "proxy request body refused");
-            return dialect.error(
+            return dialect.sandbox(
                 Problem::TooLarge,
-                "request body exceeds the proxy's 8 MiB limit",
+                "a request body may be at most 8 MiB. Send a smaller request.",
             );
         }
     };
     let peek = match RequestPeek::of(&body) {
         Ok(peek) => peek,
-        Err(error) => return dialect.error(Problem::Invalid, &error.to_string()),
+        Err(error) => return dialect.sandbox(Problem::Invalid, &peek_rule(&error, grant)),
     };
     let Some(model) = proxy
         .models
         .get(&peek.model)
         .filter(|model| grant.models.contains(&model.name) && model.upstream.serves(dialect))
     else {
-        return dialect.error(
-            Problem::NotFound,
-            &format!(
-                "model {:?} is not available to this VM on this endpoint",
-                peek.model
-            ),
-        );
+        return dialect.sandbox(Problem::Forbidden, &proxy.model_rule(grant, dialect));
     };
     let wire_model = serde_json::Value::from(model.wire_model.as_str()).to_string();
     let rewritten = match &model.upstream {
         Upstream::Codex { .. } if peek.stream != Some(true) => {
-            return dialect.error(Problem::Invalid, "this endpoint requires \"stream\": true");
+            return dialect.sandbox(
+                Problem::Invalid,
+                "this model is served only as a stream. Set `stream` to true.",
+            );
         }
         Upstream::Codex { .. } => peek.rewrite(
             &body,
             &[(Field::Model, &wire_model), (Field::Store, "false")],
         ),
+        Upstream::OpenRouter { .. } if peek.has(Field::Models) || peek.has(Field::Route) => {
+            return dialect.sandbox(
+                Problem::Invalid,
+                "OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field.",
+            );
+        }
         Upstream::Anthropic { .. } | Upstream::OpenRouter { .. } => {
             peek.rewrite(&body, &[(Field::Model, &wire_model)])
         }
@@ -420,6 +457,26 @@ async fn respond(
     }
     *response.headers_mut() = headers;
     response
+}
+
+fn peek_rule(error: &PeekError, grant: &Grant) -> String {
+    match error {
+        PeekError::NotJson | PeekError::NotObject => {
+            "the request body must be a JSON object. Send one.".to_owned()
+        }
+        PeekError::NoModel => format!(
+            "the request must name a model. Set `model` to one of this agent's configured models: {}.",
+            grant
+                .models
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PeekError::Duplicate(field) => {
+            format!("the request repeats the top-level key `{field}`; send it once.")
+        }
+    }
 }
 
 async fn bounded(mut upstream: reqwest::Response, limit: usize) -> Vec<u8> {

@@ -7,6 +7,8 @@ use dekopon_model::wire::{ChatUsage, MessagesUsage, ResponsesUsage};
 use dekopon_model_token_governor::{ModelUsage, Refusal};
 use serde_json::{Value, json};
 
+pub const SANDBOX: &str = "dekopon sandbox:";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dialect {
     Messages,
@@ -19,7 +21,6 @@ pub enum Dialect {
 pub(crate) enum Problem {
     Invalid,
     Forbidden,
-    NotFound,
     TooLarge,
     Throttled,
     Upstream,
@@ -30,7 +31,6 @@ impl Problem {
         match self {
             Self::Invalid => StatusCode::BAD_REQUEST,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::NotFound => StatusCode::NOT_FOUND,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
             Self::Upstream => StatusCode::BAD_GATEWAY,
@@ -41,7 +41,6 @@ impl Problem {
         match self {
             Self::Invalid => "invalid_request_error",
             Self::Forbidden => "permission_error",
-            Self::NotFound => "not_found_error",
             Self::TooLarge => "request_too_large",
             Self::Throttled => "rate_limit_error",
             Self::Upstream => "api_error",
@@ -52,7 +51,6 @@ impl Problem {
         match self {
             Self::Invalid => ("invalid_request_error", "invalid_request"),
             Self::Forbidden => ("invalid_request_error", "permission_denied"),
-            Self::NotFound => ("invalid_request_error", "model_not_found"),
             Self::TooLarge => ("invalid_request_error", "request_too_large"),
             Self::Throttled => ("tokens", "rate_limit_exceeded"),
             Self::Upstream => ("server_error", "upstream_unavailable"),
@@ -77,6 +75,11 @@ impl Dialect {
         json_response(problem.status(), &body)
     }
 
+    /// A rule of the guest's sandbox, worded so a client prints it as a rule, not an outage.
+    pub(crate) fn sandbox(self, problem: Problem, rule: &str) -> Response {
+        self.error(problem, &format!("{SANDBOX} {rule}"))
+    }
+
     /// A wait becomes the dialect's throttling error with `retry-after`; a request that can never
     /// fit is a plain invalid request, never worded as "prompt is too long", which Claude Code
     /// reads as a compaction trigger.
@@ -84,14 +87,14 @@ impl Dialect {
         let message = refusal.for_guest().to_string();
         match refusal.retry_after() {
             Some(wait) => {
-                let mut response = self.error(Problem::Throttled, &message);
+                let mut response = self.sandbox(Problem::Throttled, &message);
                 let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
                 if let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string()) {
                     response.headers_mut().insert(header::RETRY_AFTER, value);
                 }
                 response
             }
-            None => self.error(Problem::Invalid, &message),
+            None => self.sandbox(Problem::Invalid, &message),
         }
     }
 
