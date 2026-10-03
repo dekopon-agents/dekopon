@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.21.0] - 2026-10-03
+
+### Added
+
+- Run `dekopon-brokerd provider precompile` as an init container before the broker when `broker.providerSet.enabled` is true; it uses the broker image, UID, resource limits and only the provider-set subPath.
+
+### Changed
+
+- Deploy application v0.32.0; the default image renders `ghcr.io/dekopon-agents/dekopon:v0.32.0` by tag, and the v0.31.0 index digest pin is removed. Chart 0.21.0 and the v0.32.0 image move together.
+
 ## [0.32.0] - 2026-10-03
 
 ### Added
