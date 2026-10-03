@@ -112,9 +112,11 @@ pub(crate) async fn restore_once(
         tokio::time::sleep(config.delay()).await;
         let lookback = metering.lookback(boot).min(config.lookback_max());
         let window = Window::at_boot(boot, lookback);
-        let rows = tokio::time::timeout(config.timeout(), query(&config, ca_certificate, window))
-            .await
-            .map_err(|_elapsed| RestoreError::Timeout)??;
+        let mut rows =
+            tokio::time::timeout(config.timeout(), query(&config, ca_certificate, window))
+                .await
+                .map_err(|_elapsed| RestoreError::Timeout)??;
+        rows.retain(|row| row.at >= window.since && row.at < window.until);
         Ok((window, rows))
     }
     .await;
@@ -669,6 +671,26 @@ mod tests {
         .await;
         server.await.unwrap();
         assert_eq!(used(&metering), 1_234 + 5 + 7);
+    }
+
+    #[tokio::test]
+    async fn a_row_outside_the_window_restores_nothing() {
+        let now = UnixMillis::now().0;
+        let body = QUICKWIT
+            .replace("1790762400000.0", &format!("{}.0", now - HOUR))
+            .replace("1790762700000.0", "253402300800000000.0");
+        let (endpoint, server) = serve_once(Some(body)).await;
+        let metering = metering();
+        charge(&metering, 7);
+        restore_once(
+            Arc::clone(&metering),
+            quickwit(endpoint, Duration::from_secs(5)),
+            None,
+            UnixMillis(now),
+        )
+        .await;
+        server.await.unwrap();
+        assert_eq!(used(&metering), 1_234 + 7);
     }
 
     #[tokio::test]
