@@ -531,7 +531,8 @@ overlap another of the broker's own mounts.
 
 `broker.providerSync.enabled` renders a hook Job that runs `dekopon-brokerd provider sync` with the
 image the Deployment runs — the same `image.digest` or `image.tag`, through the same helper — so the
-package manager and the broker that consumes its lock cannot drift apart. It needs
+package manager and the broker that consumes its lock cannot drift apart. It compiles new components,
+so it takes `broker.resources`, the same limits as the precompile init container. It needs
 `broker.providerSet.enabled` and a ConfigMap whose `providers.yaml` key holds the desired set:
 
 ```yaml

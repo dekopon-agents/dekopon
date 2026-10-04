@@ -313,9 +313,10 @@ broker:
       cpu: 100m
       memory: 256Mi
     limits:
-      # The precompile init container compiles and exits before the broker starts, releasing its
-      # compiler memory. This shared limit covers its cold-compile peak (about 416 MiB) as well
-      # as the broker's warm startup; the broker retains its mapped components until it exits.
+      # The provider sync Job and the precompile init container compile with these too, and exit
+      # before the broker starts, releasing their compiler memory. The limit covers the largest
+      # provider's cold-compile peak (a 49 MB python component peaks near 1.7 GB) as well as the
+      # broker's warm startup; the broker retains its mapped components until it exits.
       cpu: "2"
       memory: 1Gi
 
