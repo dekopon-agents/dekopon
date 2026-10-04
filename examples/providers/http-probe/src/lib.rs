@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_provider_sdk::clap::{Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
     Assets, Capability, Code, Failure, Header, Http, HttpBuildError, HttpError, Part, Proposal,
-    Provider, Request, SpliceError, Stdout, StreamedRequest, Usage,
+    Provider, Request, Stdout, StreamedRequest, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel, SecretDrn, SecretUseProposal};
 use schemars::JsonSchema;
@@ -83,8 +83,6 @@ struct FetchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     catch_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    splice_body: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     asset_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<u64>,
@@ -129,7 +127,6 @@ enum ProbeError {
     InvalidRequest(HttpBuildError),
     HttpFailed(HttpError),
     StreamHttp(HttpError),
-    Splice(SpliceError),
     Asset(dekopon_provider_sdk::asset::AssetError),
     PreconditionFailed { expected: String, observed: String },
     AssetTestFailure,
@@ -143,7 +140,6 @@ impl std::fmt::Display for ProbeError {
             Self::InvalidRequest(error) => write!(f, "{error}"),
             Self::HttpFailed(error) => write!(f, "{error}"),
             Self::StreamHttp(error) => f.write_str(&error.message),
-            Self::Splice(error) => error.fmt(f),
             Self::Asset(error) => f.write_str(&error.message),
             Self::PreconditionFailed { expected, observed } => {
                 write!(
@@ -163,8 +159,6 @@ impl Failure for ProbeError {
             Self::InvalidRequest(_) => "invalid-request",
             Self::HttpFailed(_) => "http-failed",
             Self::StreamHttp(error) => error.code.as_str(),
-            Self::Splice(SpliceError::Closed) => "output-error",
-            Self::Splice(SpliceError::Http(error)) => error.code.as_str(),
             Self::Asset(error) => error.code.as_str(),
             Self::PreconditionFailed { .. } => "precondition-failed",
             Self::AssetTestFailure => "asset-test-failure",
@@ -199,7 +193,6 @@ impl Provider for HttpProbe {
                     method: fetch.method,
                     body: fetch.body,
                     catch_error: fetch.catch_error.then_some(true),
-                    splice_body: None,
                     headers: (!fetch.header.is_empty()).then(|| {
                         fetch
                             .header
@@ -268,9 +261,9 @@ impl Capability for Fetch {
         (http, assets): (Http, Assets),
         out: &mut Stdout,
     ) -> Result<(), ProbeError> {
-        let value = (|| -> Result<Option<Value>, ProbeError> {
+        let value = (|| -> Result<Value, ProbeError> {
             if let Some(mode) = input.asset_mode.as_deref() {
-                return asset_probe(mode, &input, &http, &assets).map(Some);
+                return asset_probe(mode, &input, &http, &assets);
             }
             let uri = input.uri.ok_or(ProbeError::UriRequired)?;
             let mut request = Request::new(input.method.as_deref().unwrap_or("GET"), uri)
@@ -282,26 +275,19 @@ impl Capability for Fetch {
             if let Some(body) = input.body {
                 request = request.with_body(body.into_bytes());
             }
-            if input.splice_body.unwrap_or(false) {
-                let response = http.open(request).map_err(http_failed)?;
-                response.body.splice(out).map_err(ProbeError::Splice)?;
-                return Ok(None);
-            }
             match http.send(request) {
-                Ok(response) => Ok(Some(describe_response(
+                Ok(response) => Ok(describe_response(
                     response.status,
                     &response.body,
                     response.headers.len(),
-                ))),
+                )),
                 Err(error) if input.catch_error.unwrap_or(false) => {
-                    Ok(Some(json!({"caughtError":format!("{:?}", error.code)})))
+                    Ok(json!({"caughtError":format!("{:?}", error.code)}))
                 }
                 Err(error) => Err(http_failed(error)),
             }
         })()?;
-        if let Some(value) = value {
-            writeln!(out, "{value}").map_err(|_| ProbeError::Output)?;
-        }
+        writeln!(out, "{value}").map_err(|_| ProbeError::Output)?;
         Ok(())
     }
 }
@@ -366,7 +352,6 @@ impl Capability for Purge {
                     headers: None,
                     body: None,
                     catch_error: None,
-                    splice_body: None,
                     asset_mode: None,
                     bytes: input.bytes,
                     after_write_error: None,
@@ -624,12 +609,6 @@ mod tests {
                     code: HttpErrorCode::Denied,
                     message: "unexpected buffered request".into(),
                 })
-            }
-            fn open(
-                &mut self,
-                _: Request,
-            ) -> Result<dekopon_provider_sdk::provider::OpenedResponse, HttpError> {
-                unreachable!("stream-only witness")
             }
             fn stream(&mut self, _: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
                 Err(HttpError {

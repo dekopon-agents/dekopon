@@ -1,7 +1,6 @@
-use std::{error::Error, fmt, io};
+use std::{error::Error, fmt};
 
 use crate::asset::{Encoding, Handle};
-use crate::provider::Stdout;
 
 #[cfg(test)]
 const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
@@ -25,7 +24,6 @@ mod bindings {
         world: "http-client",
         with: {
             "dekopon:asset/asset@0.1.0": crate::asset::bindings::dekopon::asset::asset,
-            "dekopon:stdio/streams@0.1.0": crate::export_bindings::dekopon::stdio::streams,
         },
         generate_all,
     });
@@ -159,110 +157,6 @@ pub struct StreamedResponse {
     pub headers: Vec<Header>,
     pub body: Handle,
 }
-
-/// A response whose body is still on the connection.
-pub struct OpenedResponse {
-    pub status: u16,
-    pub headers: Vec<Header>,
-    pub body: Body,
-}
-
-/// An opened response body. The broker releases only bytes it has scanned clean of the
-/// credential; reading one into guest memory is the provider's choice, [`Body::splice`] avoids it.
-pub struct Body(BodySource);
-
-enum BodySource {
-    #[cfg(target_arch = "wasm32")]
-    Guest(crate::export_bindings::dekopon::stdio::streams::Reader),
-    #[cfg(not(target_arch = "wasm32"))]
-    Native(Box<dyn io::Read>),
-}
-
-impl Body {
-    /// A native body for a [`crate::provider::Port`]; a read error carrying an [`HttpError`]
-    /// becomes [`SpliceError::Http`].
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn native(reader: impl io::Read + 'static) -> Self {
-        Self(BodySource::Native(Box::new(reader)))
-    }
-
-    /// Copies the whole body to `out` inside the broker and returns the byte count.
-    pub fn splice(self, out: &mut Stdout) -> Result<u64, SpliceError> {
-        match self.0 {
-            #[cfg(target_arch = "wasm32")]
-            BodySource::Guest(reader) => {
-                use bindings::dekopon::http::client as wit;
-                wit::splice(reader, out.guest_writer()).map_err(|error| match error {
-                    wit::SpliceError::Closed => {
-                        out.mark_closed();
-                        SpliceError::Closed
-                    }
-                    wit::SpliceError::Failed(error) => SpliceError::Http(HttpError {
-                        code: map_error_code(error.code),
-                        message: error.message,
-                    }),
-                })
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            BodySource::Native(mut reader) => io::copy(&mut reader, out).map_err(|error| {
-                if out.closed() {
-                    return SpliceError::Closed;
-                }
-                SpliceError::Http(
-                    error
-                        .into_inner()
-                        .and_then(|inner| inner.downcast::<HttpError>().ok())
-                        .map_or_else(
-                            || HttpError {
-                                code: HttpErrorCode::Internal,
-                                message: "the native body failed".to_owned(),
-                            },
-                            |error| *error,
-                        ),
-                )
-            }),
-        }
-    }
-}
-
-impl io::Read for Body {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        match &mut self.0 {
-            #[cfg(target_arch = "wasm32")]
-            BodySource::Guest(reader) => {
-                let bytes = reader.read(u32::try_from(buffer.len()).unwrap_or(u32::MAX));
-                let count = bytes.len().min(buffer.len());
-                buffer[..count].copy_from_slice(&bytes[..count]);
-                Ok(count)
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            BodySource::Native(reader) => reader.read(buffer),
-        }
-    }
-}
-
-/// Why [`Body::splice`] stopped before the end of the body.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SpliceError {
-    /// Stdout's reader has gone; the invocation exits 141.
-    Closed,
-    /// The body failed; bytes already written stand.
-    Http(HttpError),
-}
-
-impl fmt::Display for SpliceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Closed => formatter.write_str("stdout's reader has gone"),
-            Self::Http(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl Error for SpliceError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpErrorCode {
@@ -424,42 +318,6 @@ pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, H
                 })
                 .collect(),
             body: Handle::from_inner(response.body),
-        })
-        .map_err(|error| HttpError {
-            code: map_error_code(error.code),
-            message: error.message,
-        })
-}
-
-/// Grants no authority; the host checks the request exactly as [`send`] does.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn open(request: Request) -> Result<OpenedResponse, HttpError> {
-    use bindings::dekopon::http::client as wit;
-    let request = wit::Request {
-        method: request.method,
-        uri: request.uri,
-        headers: request
-            .headers
-            .into_iter()
-            .map(|header| wit::Header {
-                name: header.name,
-                value: header.value,
-            })
-            .collect(),
-        body: request.body,
-    };
-    wit::open(&request)
-        .map(|response| OpenedResponse {
-            status: response.status,
-            headers: response
-                .headers
-                .into_iter()
-                .map(|header| Header {
-                    name: header.name,
-                    value: header.value,
-                })
-                .collect(),
-            body: Body(BodySource::Guest(response.body)),
         })
         .map_err(|error| HttpError {
             code: map_error_code(error.code),

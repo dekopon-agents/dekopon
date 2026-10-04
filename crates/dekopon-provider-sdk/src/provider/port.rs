@@ -15,11 +15,6 @@ pub trait Port {
         &mut self,
         request: crate::http::Request,
     ) -> Result<crate::http::Response, crate::http::HttpError>;
-    /// Opens a request whose body is read live.
-    fn open(
-        &mut self,
-        request: crate::http::Request,
-    ) -> Result<crate::http::OpenedResponse, crate::http::HttpError>;
     /// Sends an asset-backed request.
     fn stream(
         &mut self,
@@ -100,18 +95,6 @@ pub(crate) fn send(
     })
 }
 
-pub(crate) fn open(
-    request: crate::http::Request,
-) -> Result<crate::http::OpenedResponse, crate::http::HttpError> {
-    CURRENT.with(|current| {
-        current
-            .borrow_mut()
-            .as_mut()
-            .expect("native call requires an installed Port")
-            .open(request)
-    })
-}
-
 pub(crate) fn stream(
     request: crate::http::StreamedRequest<'_>,
 ) -> Result<crate::http::StreamedResponse, crate::http::HttpError> {
@@ -151,12 +134,6 @@ mod tests {
             &mut self,
             _: crate::http::StreamedRequest<'_>,
         ) -> Result<crate::http::StreamedResponse, crate::http::HttpError> {
-            unreachable!()
-        }
-        fn open(
-            &mut self,
-            _: crate::http::Request,
-        ) -> Result<crate::http::OpenedResponse, crate::http::HttpError> {
             unreachable!()
         }
     }

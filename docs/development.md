@@ -89,7 +89,7 @@ The SDK and host provider WIT files are mirrored and must remain byte-identical:
 
 - `crates/dekopon-provider-sdk/wit/provider.wit`
 
-The HTTP 1.2 WIT package (buffered `send`, asset-backed `stream`, and response `open`/`splice`) and guest/host copies are also mirrored:
+The HTTP 1.1 WIT package (buffered `send` and asset-backed `stream`) and guest/host copies are also mirrored:
 
 - `wit/http/http.wit`
 - `crates/dekopon-provider-sdk/wit/deps/http.wit`
@@ -142,9 +142,9 @@ the WIT interface versions they import; a broker host crate may register adapter
 for multiple supported WIT versions. Compatible native HTTP-library upgrades do not
 require provider rebuilds.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock), independently define the HTTP, storage, clock, and random packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.2.0` (including its `dekopon:asset@0.1.0` and `dekopon:stdio@0.1.0` dependencies), `dekopon:storage@0.1.1`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0` packages independently. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock), independently define the HTTP, storage, clock, and random packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0` packages independently. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
-`dekopon-broker-host` links only project-owned HTTP (current `@1.2.0` plus buffered `@1.0.0` compatibility),
+`dekopon-broker-host` links project-owned HTTP `@1.1.0` only,
 asset `@0.1.0`, storage, both clock interfaces, and OS entropy, consumes `AuthorizedInvocation` and an exact optional storage
 grant, and maps WIT values to native engines enforcing exact grants beneath independent ceilings.
 Both clocks and entropy are readable only in an invocation's store; a read during a description or command run traps.
@@ -167,7 +167,7 @@ The repository-owned checked components are generated:
 | `examples/providers/memory-reservation-probe/src/lib.rs` | `examples/providers/memory-reservation-probe/build.sh` | `examples/providers/memory-reservation-probe-provider.wasm` |
 | `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. JSONPlaceholder and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored fixtures — the release tag, checksum, and size pinned per provider in that script — after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (the [`rust-toolchain.toml`](../rust-toolchain.toml) compiler and the [`ci/toolchain.env`](../ci/toolchain.env) wasm-tools) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` decodes to HTTP `client@1.2.0`, stdio `streams@0.1.0`, and asset `asset@0.1.0` imports; the unchanged fetched JSONPlaceholder fixture retains only buffered HTTP `client@1.0.0`. `clock-probe` decodes to the wall clock and stdio imports; its separate raw fixture checks clock refusal during `run-command`. The fetched 0.3.0 memory-chat fixture decodes to JSONL only and is refused by the 0.4.0 host; its JSONL invocation scenarios await a 0.4.0 external release (step 7). All seven checked 0.4.0 probes import stdio; the memory-reservation raw fixture retains adversarial escape behavior, and `storage-probe` also imports durable-files. None may import WASI. Broker-host tests enforce the supported imports and reject WASI.
+Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. JSONPlaceholder and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored fixtures — the release tag, checksum, and size pinned per provider in that script — after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (the [`rust-toolchain.toml`](../rust-toolchain.toml) compiler and the [`ci/toolchain.env`](../ci/toolchain.env) wasm-tools) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` decodes to HTTP `client@1.1.0`, stdio `streams@0.1.0`, and asset `asset@0.1.0` imports; the unchanged fetched JSONPlaceholder fixture retains only buffered HTTP `client@1.0.0`. `clock-probe` decodes to the wall clock and stdio imports; its separate raw fixture checks clock refusal during `run-command`. The fetched 0.3.0 memory-chat fixture decodes to JSONL only and is refused by the 0.4.0 host; its JSONL invocation scenarios await a 0.4.0 external release (step 7). All seven checked 0.4.0 probes import stdio; the memory-reservation raw fixture retains adversarial escape behavior, and `storage-probe` also imports durable-files. None may import WASI. Broker-host tests enforce the supported imports and reject WASI.
 
 ### Dependencies, crates, CI, or releases
 
@@ -367,7 +367,7 @@ For every checked probe, also run its pinned `build.sh`, `wasm-tools validate`, 
 | `cli-probe`, `memory-reservation-probe` | `dekopon:stdio/streams@0.1.0` |
 | `clock-probe` | stdio streams plus `dekopon:clock/wall@1.1.0`, `monotonic@1.1.0` and `dekopon:random/source@0.1.0` |
 | `clock-raw-probe` | stdio streams plus `dekopon:clock/wall@1.1.0` |
-| `http-probe`, `http-raw-probe` | stdio streams, `dekopon:http/client@1.2.0`, `dekopon:asset/asset@0.1.0` |
+| `http-probe`, `http-raw-probe` | stdio streams, `dekopon:http/client@1.1.0`, `dekopon:asset/asset@0.1.0` |
 | `storage-probe` | stdio streams plus `dekopon:storage/durable-files@0.1.1` |
 
 All seven export `run-command` **first**, followed by `describe` and `invoke`; none imports WASI.
@@ -447,7 +447,7 @@ wasm-tools component wit target/wit-package/dekopon-clock.wasm
 wasm-tools component wit target/wit-package/dekopon-random.wasm
 ```
 
-The builds must leave all five `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.4.0` with a `dekopon:stdio@0.1.0` dependency and two worlds: `provider` exporting `describe` and `invoke(capability, input-json) -> result<_, u8>`, and `provider-cli` adding `run-command(argv, stdin-piped: bool) -> string`. The HTTP package must identify `dekopon:http@1.2.0`, its `client` interface with buffered `send`, asset-backed `stream`, response `open` and `splice`, its `dekopon:asset@0.1.0` and `dekopon:stdio@0.1.0` dependencies, and no worlds. Validation pins the buffered and streamed signatures, response reader, writer borrow, and error types. The storage package must identify `dekopon:storage@0.1.1`, the complete pinned JSONL and durable-files signatures/types, and no worlds. The clock package must identify `dekopon:clock@1.1.0`, `wall.now-unix-millis` and `monotonic.now-nanos` returning `u64`, and no worlds. The random package must identify `dekopon:random@0.1.0`, one `source.get-random-bytes(length: u32) -> list<u8>` interface and no worlds. Exercise the configured fetch path with:
+The builds must leave all five `wkg.lock` files unchanged. The decoded provider package must identify `dekopon:provider@0.4.0` with a `dekopon:stdio@0.1.0` dependency and two worlds: `provider` exporting `describe` and `invoke(capability, input-json) -> result<_, u8>`, and `provider-cli` adding `run-command(argv, stdin-piped: bool) -> string`. The HTTP package must identify `dekopon:http@1.1.0`, its `client` interface with buffered `send`, asset-backed `stream`, its `dekopon:asset@0.1.0` dependency, and no worlds. Validation pins the buffered and streamed signatures and error types. The storage package must identify `dekopon:storage@0.1.1`, the complete pinned JSONL and durable-files signatures/types, and no worlds. The clock package must identify `dekopon:clock@1.1.0`, `wall.now-unix-millis` and `monotonic.now-nanos` returning `u64`, and no worlds. The random package must identify `dekopon:random@0.1.0`, one `source.get-random-bytes(length: u32) -> list<u8>` interface and no worlds. Exercise the configured fetch path with:
 
 ```console
 wkg get \
@@ -457,7 +457,7 @@ wkg get \
 wkg get \
   --config wkg/config.toml \
   --output target/wit-package/fetched-http.wasm \
-  dekopon:http@1.2.0
+  dekopon:http@1.1.0
 wkg get \
   --config wkg/config.toml \
   --output target/wit-package/fetched-storage.wasm \
