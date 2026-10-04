@@ -59,6 +59,26 @@ against these; a change that moves away from one stops for a human decision.
   nothing in a serving path waits on an exporter. One complete trace per message is the aim,
   never a reason to stall a reply.
 
+## Proportionate remedies
+
+Audits and plans default to over-building, and the owner reels them back. Before proposing a remedy:
+
+- **Delete before adding.** Check whether an existing owner already makes the hazard impossible
+  (a session gate, `&mut self`, a lock that already serializes the effect); if so, remove the
+  redundant primitive instead of adding coordination.
+- **Enforcement is compiler-native only:** `clippy.toml` `disallowed-*` with a `reason`, a site
+  `#[expect(..., reason)]`, workspace lints. No CI checker scripts, grep gates, exception
+  registries, negative-fixture suites or per-boundary inventory docs.
+- **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
+  that cannot fix anything ([non-goals](docs/design.md#non-goals)).
+- **Calibrate severity to the one deployment,** a Raspberry Pi serving family chats. Owner-only
+  and dev-only paths are P3; a process-killing input is P1 whatever the path.
+- **Compatibility is a constraint only when the owner set it.** Everything is pre-1.0; breakage in
+  core and providers is expected. Before designing around a break, ask what breaking it would delete.
+- **Fix it where it runs first.** A defect found in the chart is fixed in the deployment's values
+  first; the chart fix rides the next release.
+- **Recommend; don't enumerate.** Bring one proposal plus the few decisions only the owner can make.
+
 ## Change and verify
 
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
@@ -88,6 +108,12 @@ against these; a change that moves away from one stops for a human decision.
   set to `llvm-ar`; the system `ar` writes an empty archive. Linux CI is unaffected.
 - Verify a provider release by its release assets: the shared workflow attests the Wasm and SBOM
   files, so `gh attestation verify oci://…` returns 404 by design.
+- Gitignored fixtures go stale in a fresh worktree after a fixture bump: a red local run that CI
+  passes means refetch (`ci/fetch-external-provider-components.sh`) before bisecting.
+- A wire-format, WIT or config-key change fixes the ship order before the code does: enumerate
+  every consumer at its *deployed* version, verify each claim against the real artifact (the
+  binary's imports, a decode of real data), and write the order into the PR. Each repo has its
+  own release ritual; read its tags and release commits before trusting its README or automation.
 - Report checks actually observed, exact head/artifact tested and verification gaps.
   Local tests do not prove deployed behavior or remote CI; never claim otherwise.
 - Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and review precede merge.
