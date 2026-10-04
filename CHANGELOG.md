@@ -7,6 +7,53 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.22.0] - 2026-10-04
+
+### Changed
+
+- Prepare chart 0.22.0 for application v0.33.0; replace the temporary v0.32.0 image digest with the published v0.33.0 index digest in a reviewed digest-only PR before tagging.
+
+## [0.33.0] - 2026-10-04
+
+### Added
+
+- A provider can run a child shell script through `dekopon:spawn/run@0.1.0`; the broker sends the gateway an `Upcall` frame with the child's stream descriptors and hands the gateway's `UpcallResult` status and stderr to the waiting provider, discarding unread child output first.
+- Bound child stdin fixture capture while draining the remaining input.
+- Check that a refused child import leaves the broker host usable.
+- Client-side capacity-refusal integration witness.
+- Declare the spawn import contract and refuse unsolicited child frames with owned descriptors.
+- Exercise reader-backed child stdin across native and component harnesses.
+- Gateway child-upcall integration witnesses for nested input, cancellation and broker policy.
+- Real-broker nested probe refusal and bounded panic cleanup witnesses.
+- Verify reader child stdin in both harness modes.
+- `Run::child`, `Native::child` and `ChildScript`/`ChildRun`/`ChildInput` child-script evidence in dekopon-provider-sdk-testkit.
+- `dekopon:spawn@0.1.0` WIT package for child shell scripts, built and published by the WIT package workflow; broker hosts link it.
+- Broker protocol `Upcall` and `UpcallResult` frames with a strict descriptor rule.
+- Native `Spawn` through `Port::spawn` (`NativeChild`, `NativeChildStdin`) in dekopon-provider-sdk.
+- Provider SDK `Spawn` need with `Child`, `ChildStdin`, `Exit` and `SpawnError`; `ImportSet` is now `u16` with `ImportSet::SPAWN`.
+- Provider child scripts (dekopon:spawn) run by the gateway on the caller's leg, tree, budget and trace.
+
+### Changed
+
+- A broker at its connection limit answers with a `capacity-exhausted` error frame instead of closing the connection silently.
+- Broker connection-limit refusals and child conversation failures are documented with their bounded wire and telemetry behavior.
+- Clarified the broker-only parked-read behavior pending gateway integration.
+- Document child stdin, output and status semantics across protocol, SDK and security guides.
+- Document nesting upgrade and historical provider compatibility precisely.
+- Document the HTTP 1.1-only broker import boundary.
+- Document the v0.33 nesting upgrade order and child stream limits.
+- HTTP providers use the immutable client@1.1.0 buffered send and asset-backed stream contract.
+- Native child fixtures refuse unused scripts like the component harness.
+- Verify nested job and watch-probe invocations terminate at their shared tree deadline.
+- `CapabilityInvoker::invoke` takes the script's `&TreeContext`; `TreeContext::limits` returns its limits.
+- The gateway no longer times out an invocation parked on a child script or stdio; only a frame body is timed once it starts arriving.
+- Bring the provider docs to the stdio SDK and name the provider world imports.
+
+### Removed
+
+- HTTP client@1.0.0 and client@1.2.0 broker linking and open/splice operations.
+- The unused HTTP WIT stdio dependency mirror.
+
 ## [dekopon-chart-0.21.1] - 2026-10-04
 
 ### Fixed

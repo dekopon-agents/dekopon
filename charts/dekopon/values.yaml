@@ -10,8 +10,9 @@ image:
   # Empty means "v" + .Chart.AppVersion, which names the application release this chart deploys.
   # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
   # image for v0.3.0 or earlier — the image workflow landed after that release.
-  tag: "v0.32.0"
-  # Prefer a digest once one exists; it pins across the arm64/amd64 index.
+  tag: "v0.33.0"
+  # The v0.32.0 digest remains only until the v0.33.0 image is published. Do not tag or
+  # deploy chart 0.22.0 before the mandatory reviewed digest-only PR replaces it.
   digest: "sha256:defeecf813250ec4f3edf5189884522ac255923819e8b24f9961819ac79b1128"
   pullPolicy: IfNotPresent
   # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
