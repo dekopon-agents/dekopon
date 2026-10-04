@@ -80,6 +80,8 @@ against these; a change that moves away from one stops for a human decision.
 - A fleet re-pin moves every exact pin a provider carries, not only `dekopon-provider-*`: providers
   also pin `dekopon-core`, `-capability`, `-broker`, `-broker-protocol` and `-broker-host` at the
   workspace version.
+- A non-essential provider does not hold up a fleet rollout. When one is stuck (a release snag,
+  a failing review, an owner-only step), ship without it and journal why it blocked.
 - A provider named like an interface it imports takes a distinct package name
   (`dekopon:asset-provider` beside `dekopon:asset`).
 - On macOS, a local Wasm build of a provider that links zstd needs `AR_wasm32_unknown_unknown`
