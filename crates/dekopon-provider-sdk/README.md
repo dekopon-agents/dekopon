@@ -23,8 +23,9 @@ export. `Spawn::run(script, ChildStdin)` exposes a child stdout reader and a sta
 resource; `Child::wait(self)` consumes and drops that reader before waiting.
 `ChildStdin` is `None`, `Inherit`, or `Reader(Stdin)`; running twice before a wait
 is refused as `SpawnError::Busy`. `Inherit` shares the remaining bytes of the
-caller's stdin with the child: the gateway pump can read ahead, so the parent
-must not read its stdin after `run(Inherit)`. Child stdout is bounded script
+caller's stdin with the child: the component host duplicates the descriptor,
+while the native test port moves the caller's stdin into the child. The gateway
+pump can read ahead, so the parent must not read its stdin after `run(Inherit)`. Child stdout is bounded script
 text yielded at exit, with a trailing newline when nonempty; ordinary
 `exit.stderr` is empty (the shell has no separate script stderr), and a child
 panic yields status 70. Native `Spawn::run` calls the installed `Port::spawn`,

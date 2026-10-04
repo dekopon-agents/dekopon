@@ -2543,6 +2543,28 @@ fn an_upcall_with_a_non_socket_descriptor_is_refused() {
 }
 
 #[test]
+fn datagram_upcall_descriptors_are_refused_in_both_positions() {
+    use super::{UpcallStdin, UpcallStreams};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    let (datagram, _peer) = UnixDatagram::pair().expect("datagram pair");
+    assert!(matches!(
+        UpcallStreams::receive(UpcallStdin::None, vec![OwnedFd::from(datagram)]),
+        Err(ProtocolError::UnexpectedDescriptors)
+    ));
+    let (stdout, _reader) = UnixStream::pair().expect("stream pair");
+    let (datagram, _peer) = UnixDatagram::pair().expect("datagram pair");
+    assert!(matches!(
+        UpcallStreams::receive(
+            UpcallStdin::Reader,
+            vec![OwnedFd::from(stdout), OwnedFd::from(datagram)]
+        ),
+        Err(ProtocolError::UnexpectedDescriptors)
+    ));
+}
+
+#[test]
 fn upcall_streams_own_stdout_then_stdin_in_wire_order() {
     use super::{UpcallStdin, UpcallStreams};
     use std::os::fd::{AsRawFd as _, OwnedFd};

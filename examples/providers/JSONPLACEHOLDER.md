@@ -10,9 +10,9 @@ The JSONPlaceholder provider is maintained and released independently from Dekop
 It exposes a bounded post read and a separately named non-idempotent synthetic create operation,
 both through the `placeholder` command word: `placeholder posts get --post-id <ID>` and
 `placeholder posts create --user-id <ID> --title <TEXT> --body <TEXT|->`.
-The component imports only `dekopon:http/client@1.0.0`; direct mode therefore rejects it, while the
-broker may link it only under explicit destination, method, request-count, byte, and timeout
-constraints. Tests use injected or loopback responses and do not contact the public service.
+The historical component imports only `dekopon:http/client@1.0.0`; the current broker rejects it
+because that interface is no longer linked. It is a fetched fixture, not a supported provider.
+Tests use injected or loopback responses and do not contact the public service.
 
 Core release and image automation download the exact v0.3.0 asset, verify its published sidecar
 against the checksum pinned above, and optionally verify its GitHub attestation. No provider source

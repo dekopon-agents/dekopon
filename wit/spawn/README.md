@@ -6,7 +6,7 @@ broker host imports it in its private provider world; the SDK imports it in
 
 `run(script, stdin)` returns one stdout reader and one status resource, or
 `busy` if a child remains outstanding. Stdin is `none`, `inherit` (the caller's
-remaining stdin descriptor), or `reader` (host-pumped bounded input). With
+remaining stdin descriptor), or `reader` (host-pumped input). With
 `inherit`, the gateway pump can read ahead; the parent must not read its stdin
 after `run(inherit)`. The gateway yields
 the child's bounded UTF-8 script output at exit; EOF precedes status. `wait`

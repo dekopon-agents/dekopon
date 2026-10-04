@@ -2235,6 +2235,63 @@ mod tests {
                 assert!(parked >= Duration::from_secs(280));
             }
 
+            #[tokio::test(flavor = "current_thread", start_paused = true)]
+            async fn job_and_probe_child_invocations_end_at_tree_deadline() {
+                for trigger in [Trigger::Job, Trigger::Probe] {
+                    let directory = private_broker_directory();
+                    let (listener, socket) = listen(directory.path());
+                    let scope = ChatScopeClaim {
+                        transport: "scientist-slack".parse().expect("transport"),
+                        kind: ChatTransportKind::Slack,
+                        conversation: Conversation {
+                            kind: ConversationKind::Channel,
+                            container: Some("t0123abc".to_owned()),
+                            id: "c0123abc".to_owned(),
+                            thread: None,
+                        },
+                        trigger,
+                    };
+                    let attestation = Attestation::for_chat(
+                        SUBJECT.parse().expect("subject"),
+                        "reviewer".parse().expect("agent"),
+                        scope,
+                    );
+                    let leg = probe_leg(&socket, Some(attestation));
+                    let (parked, child_parked) = oneshot::channel();
+                    let broker = tokio::spawn(async move {
+                        let mut parent = accept(&listener).await;
+                        let stdout = parent.upcall("probe --uri http://child/", None).await;
+                        let mut child = accept(&listener).await;
+                        // The guest is waiting for status, not reading stdout. A real host
+                        // owns the descriptor; discard this fixture's copy to permit EOF.
+                        child.descriptors.clear();
+                        parked.send(()).expect("the test advances the clock");
+                        let ended = child.hung_up().await;
+                        drop(stdout);
+                        ended && parent.hung_up().await
+                    });
+                    let root = tokio::task::spawn_blocking(move || {
+                        let limits = Limits {
+                            timeout: Duration::from_secs(30),
+                            ..Limits::default()
+                        };
+                        call(&leg, &TreeContext::new(limits, CallBudget::new(64)))
+                    });
+                    child_parked.await.expect("child invocation parked");
+                    let start = tokio::time::Instant::now();
+                    tokio::time::advance(Duration::from_secs(30)).await;
+                    assert!(matches!(
+                        tokio::time::timeout(Duration::from_secs(1), root)
+                            .await
+                            .expect("deadline ends outstanding invocation")
+                            .expect("blocking call completes"),
+                        CapabilityCallResult::Denied { reason } if reason == "script-cancelled"
+                    ));
+                    assert!(start.elapsed() <= Duration::from_secs(31));
+                    assert!(broker.await.expect("both connections close"));
+                }
+            }
+
             #[tokio::test(flavor = "multi_thread")]
             async fn nested_job_and_probe_denied_write() {
                 for trigger in [Trigger::Probe, Trigger::Job] {
