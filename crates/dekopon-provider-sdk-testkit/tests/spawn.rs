@@ -272,27 +272,17 @@ fn component() -> tempfile::NamedTempFile {
             i32.const 17 i32.const 2064 i32.load8_u i32.store8
             i32.const 16)
         (func (export "invoke") (param i32 i32 i32 i32) (result i32) (local $out i32) (local $count i32)
-            local.get 1 i32.const 16 i32.eq
+            local.get 1 i32.const 16 i32.eq local.get 1 i32.const 15 i32.eq i32.or
             if
                 call $stdout local.set $out
-                i32.const 2200 call $stdin
-                i32.const 2200 i32.load i32.eqz if unreachable end
-                i32.const 2 i32.const 2200 i32.load offset=4 call $start
-                block $reader-done
-                    loop $reader-more
-                        i32.const 2052 i32.load i32.const 4096 i32.const 2080 call $read
-                        i32.const 2084 i32.load local.tee $count
-                        i32.eqz br_if $reader-done
-                        local.get $out i32.const 2080 i32.load local.get $count i32.const 2096 call $write
-                        br $reader-more
-                    end
+                local.get 1 i32.const 16 i32.eq
+                if
+                    i32.const 2200 call $stdin
+                    i32.const 2200 i32.load i32.eqz if unreachable end
+                    i32.const 2 i32.const 2200 i32.load offset=4 call $start
+                else
+                    i32.const 1 i32.const 0 call $start
                 end
-                call $finish return
-            end
-            local.get 1 i32.const 15 i32.eq
-            if
-                call $stdout local.set $out
-                i32.const 1 i32.const 0 call $start
                 block $done
                     loop $more
                         i32.const 2052 i32.load i32.const 4096 i32.const 2080 call $read
@@ -311,8 +301,7 @@ fn component() -> tempfile::NamedTempFile {
             end
             call $stdout local.set $out
             i32.const 2112 call $now i64.store
-            i32.const 0 i32.const 0 call $start
-            call $finish drop
+            i32.const 0 i32.const 0 call $start call $finish drop
             i32.const 2120 call $now i32.const 2112 i64.load i64.sub i64.store
             local.get $out i32.const 2120 i32.const 8 i32.const 2096 call $write
             i32.const 16))
