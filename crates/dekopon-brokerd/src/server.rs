@@ -590,18 +590,22 @@ impl Upcaller<'_> {
             let exchanged = self
                 .upcall(stream, &mut operation, &mut finished, request)
                 .await;
+            let outcome = finished.take();
             if let Err(error) = &exchanged {
+                if outcome.is_none() {
+                    cancel.send_replace(true);
+                }
                 tracing::warn!(
                     event = "broker_upcall_failed",
                     error.kind = error.kind(),
                     error = %dekopon_core::error_chain(error),
                 );
             }
-            if let Some(outcome) = finished.take() {
+            if let Some(outcome) = outcome {
                 return outcome;
             }
             if exchanged.is_err() {
-                break;
+                return operation.await;
             }
         }
         cancel.send_replace(true);

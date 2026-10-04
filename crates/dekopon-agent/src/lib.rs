@@ -859,6 +859,7 @@ impl BrokerLeg {
                         async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
                     ) => Some(result),
                     () = wait_for_cancel(self.effective_cancel().watch()) => None,
+                    () = tokio::time::sleep(tree.remaining()) => None,
                 }
             })
         });
@@ -2213,7 +2214,13 @@ mod tests {
                     parent.answer(InvocationOutcome::Succeeded, "").await;
                     (exit, started.elapsed())
                 });
-                let root = tokio::spawn(invoke_in(leg));
+                let root = tokio::task::spawn_blocking(move || {
+                    let limits = Limits {
+                        timeout: Duration::from_secs(300),
+                        ..Limits::default()
+                    };
+                    call(&leg, &TreeContext::new(limits, CallBudget::new(64)))
+                });
                 child_parked.await.expect("the child call is parked");
                 for _ in 0..280 {
                     tokio::time::advance(Duration::from_secs(1)).await;

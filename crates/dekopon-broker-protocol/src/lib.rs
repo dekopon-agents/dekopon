@@ -964,7 +964,11 @@ fn stream_socket(descriptor: OwnedFd) -> Result<OwnedFd, ProtocolError> {
         .map_err(|source| ProtocolError::Io { source })?
         .file_type()
         .is_socket();
-    if socket {
+    if socket
+        && rustix::net::sockopt::socket_type(&file).map_err(|source| ProtocolError::Io {
+            source: source.into(),
+        })? == rustix::net::SocketType::STREAM
+    {
         Ok(OwnedFd::from(file))
     } else {
         Err(ProtocolError::UnexpectedDescriptors)
