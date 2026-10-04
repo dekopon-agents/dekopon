@@ -538,38 +538,6 @@ fn typed_http_component_matches_http_and_asset_imports() {
 }
 
 #[test]
-fn closing_real_stdout_after_a_prefix_stops_a_streaming_producer() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/providers/http-probe-provider.wasm");
-    let run = Harness::<RawHttp>::get(&path)
-        .host_limits(BrokerHostLimits {
-            max_timeout: Duration::from_secs(2),
-            ..BrokerHostLimits::default()
-        })
-        .http(HttpScript::new(
-            "fixture.example.test",
-            "GET",
-            Response {
-                status: 200,
-                headers: vec![],
-                body: vec![b'x'; 16 * 1024 * 1024],
-            },
-        ))
-        .close_stdout_after(1);
-    let origin = run.origin().unwrap().to_owned();
-    let result = run
-        .call(
-            "http-probe.fetch",
-            json!({"uri": format!("{origin}/resource"), "spliceBody": true}),
-        )
-        .unwrap();
-    assert_eq!(result.stdout, b"x");
-    assert_eq!(result.status, 141, "{}", result.stderr);
-    assert_eq!(result.http_calls.len(), 1);
-    assert_eq!(Harness::<RawHttp>::compiled_identities(), 1);
-}
-
-#[test]
 fn scripted_response_headers_match_native_and_typed_component() {
     let response = Response {
         status: 200,

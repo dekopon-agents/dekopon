@@ -3,7 +3,7 @@ use std::time::Duration;
 use dekopon_capability::{HttpConstraints, SecretUseGrant};
 use dekopon_http_host::{
     BufferedHttpClient, ConfigurationError, ErrorCode as NativeErrorCode, Header as NativeHeader,
-    HttpError as NativeHttpError, HttpHostCeilings, OpenedResponse, Request as NativeRequest,
+    HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest,
 };
 
 use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Request, Response};
@@ -75,13 +75,6 @@ impl HttpState {
                 headers: wit_headers(response.headers),
                 body: response.body,
             })
-            .map_err(map_error)
-    }
-
-    pub(crate) async fn open(&mut self, request: Request) -> Result<OpenedResponse, HttpError> {
-        self.client
-            .open(native_request(request))
-            .await
             .map_err(map_error)
     }
 }

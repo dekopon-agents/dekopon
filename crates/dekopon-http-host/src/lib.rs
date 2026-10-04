@@ -12,9 +12,7 @@
     )
 )]
 pub mod asset;
-mod open;
 mod stream;
-pub use open::{OpenedResponse, ResponseBody};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
 };

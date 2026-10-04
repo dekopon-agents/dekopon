@@ -298,15 +298,6 @@ fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
         > {
             unreachable!()
         }
-        fn open(
-            &mut self,
-            _: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::OpenedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
     }
     assert_eq!(
         with_port(Fake, || call::<ClockFixture>("clock-fixture.read", "{}")).stdout,
@@ -473,15 +464,6 @@ fn native_http_and_http_clock_tuple_reach_the_fake_port() {
         > {
             unreachable!()
         }
-        fn open(
-            &mut self,
-            _: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::OpenedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
     }
     assert_eq!(
         with_port(Fake, || call::<HttpFixture>("native-http.send", "{}")).stdout,
@@ -536,15 +518,6 @@ fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple(
             _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
         ) -> Result<
             dekopon_provider_sdk::provider::StreamedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
-        fn open(
-            &mut self,
-            _: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::OpenedResponse,
             dekopon_provider_sdk::provider::HttpError,
         > {
             unreachable!()

@@ -96,7 +96,7 @@ const ASSET_IMPORT: &str = "dekopon:asset/asset@0.1.0";
 
 fn declared_imports(set: ImportSet) -> BTreeSet<String> {
     [
-        (ImportSet::HTTP, "dekopon:http/client@1.2.0"),
+        (ImportSet::HTTP, "dekopon:http/client@1.1.0"),
         (ImportSet::CLOCK, "dekopon:clock/wall@1.1.0"),
         (ImportSet::MONOTONIC, "dekopon:clock/monotonic@1.1.0"),
         (ImportSet::RANDOM, "dekopon:random/source@0.1.0"),
@@ -240,7 +240,7 @@ mod tests {
         names.iter().map(|&name| name.to_owned()).collect()
     }
 
-    const HTTP: &str = "dekopon:http/client@1.2.0";
+    const HTTP: &str = "dekopon:http/client@1.1.0";
     const STDIO: &str = "dekopon:stdio/streams@0.1.0";
 
     #[test]

@@ -4,8 +4,8 @@ mod handles;
 mod port;
 mod stdio;
 pub use crate::http::{
-    Body, BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, OpenedResponse, Part,
-    Request, Response, SpliceError, StreamedRequest, StreamedResponse, method,
+    BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, Part, Request, Response,
+    StreamedRequest, StreamedResponse, method,
 };
 pub use crate::storage::{durable_files, jsonl};
 pub use bounded::{Bounded, TooLong, Truncated};

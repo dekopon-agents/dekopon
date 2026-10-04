@@ -578,28 +578,7 @@ impl bindings::dekopon::http::client::Host for StoreState {
     > {
         Ok(self.http.send(request).await)
     }
-
-    async fn open(
-        &mut self,
-        request: bindings::dekopon::http::client::Request,
-    ) -> wasmtime::Result<
-        Result<
-            bindings::dekopon::http::client::OpenedResponse,
-            bindings::dekopon::http::client::HttpError,
-        >,
-    > {
-        self.open_http(request).await
-    }
-
-    async fn splice(
-        &mut self,
-        from: wasmtime::component::Resource<stdio::ReaderResource>,
-        to: wasmtime::component::Resource<stdio::WriterResource>,
-    ) -> wasmtime::Result<Result<u64, bindings::dekopon::http::client::SpliceError>> {
-        self.splice(from, to).await
-    }
 }
-
 struct CompiledComponent {
     source: PathBuf,
     expected_provider_id: Option<ProviderId>,

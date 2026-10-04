@@ -87,18 +87,6 @@ impl Stdout {
     pub const fn closed(&self) -> bool {
         self.closed
     }
-
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) const fn guest_writer(&self) -> &streams::Writer {
-        match &self.sink {
-            Sink::Guest(writer) => writer,
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn mark_closed(&mut self) {
-        self.closed = true;
-    }
 }
 
 impl io::Write for Stdout {

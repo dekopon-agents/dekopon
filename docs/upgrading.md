@@ -8,6 +8,10 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## HTTP contract rollback (0.33.0)
+
+Upgrade broker and gateway together, then rebuild and install all HTTP-using providers against the 0.33 SDK and testkit. The broker links only `dekopon:http/client@1.1.0`: buffered `send` and asset-backed `stream`; imports of `client@1.0.0` or `client@1.2.0` cannot load, and `open`/`splice` are removed. Decode each newly built provider's actual Wasm imports before pinning it. The fetched historical JSONPlaceholder artifact still imports 1.0 and is not a new compatibility probe. Published 1.1 package bytes are immutable; the retired 1.2 registry artifact may remain remotely available but is not supported by this broker. Curl's buffered `send` consumes a full bounded response under its effective 256 KiB per-provider grant (the global host ceiling is 12 MiB); larger responses fail rather than streaming. No broker configuration or grants change.
+
 ## Host time and entropy (0.32.0)
 
 No broker configuration changes are needed. Providers already built against `dekopon:clock/wall@1.0.0` continue to load without rebuilding: the broker's `wall@1.1.0` definition satisfies their 1.x import. New SDK builds import `wall@1.1.0`; providers that use the new `monotonic@1.1.0` or `random/source@0.1.0` interfaces need a v0.32.0 broker before installation. Rebuild and inspect only providers that opt into the new services; there is no compatibility shim.
@@ -37,7 +41,7 @@ Upgrade broker and gateway together before installing providers compiled against
 `dekopon:provider@0.4.0`. This version refuses old `provider@0.3.0` components: providers now
 stream stdin and stdout through `dekopon:stdio@0.1.0` and return an exit status instead of a
 buffered value. Rebuild/release provider components against the 0.31.0 SDK and check decoded
-imports, including HTTP `client@1.2.0` for providers that use HTTP. Re-pin each provider set to
+imports, including the then-current HTTP `client@1.2.0` for providers that use HTTP. Re-pin each provider set to
 compatible components; there is no compatibility shim.
 
 The image now bundles only in-tree `cli-probe` and `http-probe`; release archives and the Homebrew
