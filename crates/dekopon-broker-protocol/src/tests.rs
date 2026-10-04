@@ -164,6 +164,74 @@ fn invocation_request_requires_one_well_formed_trace_parent() {
     assert!(serde_json::from_value::<InvocationRequest>(omitted).is_err());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn epiped_request_write_still_reads_capacity_refusal() {
+    use std::io;
+    use tokio::net::UnixStream;
+
+    use super::{ClientError, DescriptorStream, ERROR_CAPACITY_EXHAUSTED};
+
+    let (client, server) = UnixStream::pair().expect("socketpair");
+    let mut client = DescriptorStream::new(client);
+    let mut server = DescriptorStream::new(server);
+    let limits = FrameLimits {
+        max_frame_bytes: 4096,
+        io_timeout: Duration::from_secs(1),
+    };
+    server
+        .write_frame(
+            &ResponseEnvelope::error(ERROR_CAPACITY_EXHAUSTED, "no permit"),
+            &[],
+            limits,
+        )
+        .await
+        .expect("refusal written before close");
+    drop(server);
+    let result = super::refusal_after_write_failure(
+        &mut client,
+        ProtocolError::Io {
+            source: io::Error::from(io::ErrorKind::BrokenPipe),
+        },
+        limits,
+    )
+    .await;
+    assert!(matches!(result, ClientError::Remote { code, .. } if code == ERROR_CAPACITY_EXHAUSTED));
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn parked_peer_does_not_start_the_frame_body_timer() {
+    use super::DescriptorStream;
+    use tokio::net::UnixStream;
+
+    let (reader, writer) = UnixStream::pair().expect("socketpair");
+    let mut reader = DescriptorStream::new(reader);
+    let mut writer = DescriptorStream::new(writer);
+    let limits = FrameLimits {
+        max_frame_bytes: 4096,
+        io_timeout: Duration::from_secs(1),
+    };
+    let read = tokio::spawn(async move {
+        reader
+            .read_frame_when_ready::<ResponseEnvelope>(limits)
+            .await
+    });
+    tokio::time::advance(Duration::from_secs(280)).await;
+    writer
+        .write_frame(&ResponseEnvelope::error("test", "parked"), &[], limits)
+        .await
+        .expect("response");
+    let (response, descriptors) = read
+        .await
+        .expect("reader task")
+        .expect("parked read survives");
+    assert!(descriptors.is_empty());
+    assert!(
+        matches!(response.response, super::BrokerResponse::Error { code, .. } if code == "test")
+    );
+}
+
 #[tokio::test]
 async fn round_trips_one_strict_bounded_frame() {
     let limits = FrameLimits {

@@ -48,7 +48,7 @@ before allocation, and an in-bound length is a claim the reader never pre-alloca
 payload buffers grow with the bytes that actually arrive, and a frame shorter than its prefix fails
 rather than decoding. Frames without descriptors remain one write; an asset frame sends its first
 byte with `SCM_RIGHTS`, then the remaining bytes. `DescriptorStream` uses `recvmsg` for every read,
-including the four-byte prefix, and refuses truncated control data or more than five descriptors.
+including the four-byte prefix, and refuses truncated control data or more than eight descriptors.
 Linux receives descriptors with `MSG_CMSG_CLOEXEC`; macOS immediately sets `FD_CLOEXEC` before
 exposing them. Rejected frames close their received descriptors. Each client operation uses a fresh
 Unix connection and validates the exact protocol version and response variant.
@@ -71,23 +71,17 @@ is the gateway request carrying the child's status byte and bounded stderr, with
 no descriptors. A stray `UpcallResult` as a first request is `invalid-request`;
 an unexpected `Upcall` to a single-response client is `UnexpectedResponse`. These
 frames carry neither authority nor identity; the broker still authorizes each
-child invocation under the original attested leg. Until the conversation loop is
-wired, the host refuses the import and the ordinary client rejects an upcall.
+child invocation under the original attested leg. The broker alternates between
+an idle upcall request and one pending result: while a result is open, its read
+also detects hangup, so a second peer-disconnect read cannot consume its prefix.
+The broker and gateway wait for readability without charging the frame timer;
+once a byte is ready, the frame body is timed. An ordinary one-shot client
+still rejects an unexpected upcall.
 
 An inventory row's `bytes` is nullable: null means unknown, while numeric zero means a known
 empty file. The gateway snapshots rows after resolving referenced inputs; each passed descriptor
 must have a known length matching fstat. Unreferenced unknown rows remain listable without fetches.
 Attached-output lengths remain mandatory. Upgrade both daemons together for this wire change.
-
-The staged nesting protocol adds `Upcall { parent, script, traceParent, stdin }`
-responses and `UpcallResult { status, stderr }` requests on the same connection.
-The upcall carries the child stdout write descriptor first, then a child stdin
-read descriptor for `inherit` or `reader`; `none` carries only stdout. Missing,
-extra, or unknown descriptor declarations are protocol failures and close all
-received descriptors. An unsolicited upcall on the current one-shot client is
-an unexpected response; an unsolicited `UpcallResult` at broker entry receives
-`invalid-request`. The conversation loop and actual child execution are not yet
-wired at this intermediate head.
 
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's
 `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases
@@ -181,7 +175,7 @@ message is human-facing and may change. Codes are exported as constants from
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
-| `capacity-exhausted` | A bounded broker resource — the in-memory audit log of an embedding that serves `BrokerServer` over one — is full and does not evict. `dekopon-brokerd`'s own audit sink never fills. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
+| `capacity-exhausted` | A bounded broker resource is full (including the connection limit, which sends one non-blocking refusal frame before closing, or an embedding's non-evicting audit log). No provider work began. | Safe to reassess; a connection permit may become available, but an exhausted audit log needs operator intervention. Do not blindly retry. |
 | `provider-error` | A `runCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. A `storage-corrupt` whose message says the storage was reset has already moved that conversation to fresh, empty storage. | Yes under a fresh identifier after correcting or reconciling the storage condition; after a reset, immediately. |

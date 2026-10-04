@@ -1722,6 +1722,39 @@ async fn capacity_exhausted_frame() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn malformed_upcall_result_cancels_parent_and_releases_child() {
+    use std::os::fd::AsFd as _;
+
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker.invoke("invoke-malformed-reply", json!({})).await;
+    let streams = receive_upcall(&mut gateway, "invoke-malformed-reply").await;
+    let (extra, _) = std::os::unix::net::UnixStream::pair().unwrap();
+    gateway
+        .write_frame(
+            &RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                request: BrokerRequest::UpcallResult {
+                    status: 0,
+                    stderr: String::new(),
+                },
+            },
+            &[extra.as_fd()],
+            server_limits().frame,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_peer_close(streams.stdout).await,
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        terminal(&mut gateway).await.outcome,
+        InvocationOutcome::Failed
+    );
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn child_panic_terminal() {
     let broker = SpawnBroker::start(4).await;
     let mut gateway = broker.invoke("invoke-child-panic", json!({})).await;
