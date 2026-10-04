@@ -13,13 +13,13 @@ do not understand rather than guessing.
 Upgrade the gateway and broker together: a v0.32 gateway cannot answer the
 v0.33 broker's `Upcall` frame. Upgrade core first, publish/install the 0.33.0
 SDK and testkit crates next, and only then rebuild and re-pin providers. Decode
-the actual component imports before installing them; older HTTP components
-cannot load under this broker.
+the actual component imports before installing them; components importing
+`dekopon:http/client@1.2.0` cannot load under this broker.
 
 `dekopon:http/client@1.2.0` is removed. Its `open`/`splice` calls are gone;
 use `client@1.1.0` buffered `send` or asset-backed `stream`. Curl moves to
-buffered `send`: the effective provider response grant is 256 KiB (the global
-host ceiling is 12 MiB), so larger bodies fail instead of streaming. The
+buffered `send`: the effective provider response grant on the RPi is 256 KiB,
+so larger bodies fail instead of streaming. The
 published 1.2.0 registry artifact may remain historical, not supported.
 
 Providers may use `dekopon:spawn/run@0.1.0` for one child at a time. `inherit`
@@ -32,8 +32,7 @@ work clock but still counts toward the shared shell tree deadline and call
 budget; monotonic time includes that wait. No new grants or configuration are
 needed.
 
-The fetched historical JSONPlaceholder artifact still imports HTTP 1.0 and is
-not a new compatibility probe. Published HTTP 1.1 package bytes are immutable.
+Published HTTP 1.1 package bytes are immutable.
 
 ## Host time and entropy (0.32.0)
 
