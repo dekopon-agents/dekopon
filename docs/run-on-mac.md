@@ -139,7 +139,6 @@ capabilities:
       jsonplaceholder.posts.get:
         constraints:
           timeoutMs: 10000
-          maxOutputBytes: 262144
           http:
             allowedHosts: [jsonplaceholder.typicode.com]
             allowedMethods: [GET]
@@ -147,6 +146,7 @@ capabilities:
             maxRequestBytes: 16384
             maxResponseBytes: 262144
 EOF_BROKER
+# Provider output is bounded by hostLimits.maxOutputBytes in broker configuration.
 cat > policies.cedar <<'EOF_POLICY'
 @id("local-user-may-prompt-reader")
 permit(principal == Dekopon::Principal::"local-user",
