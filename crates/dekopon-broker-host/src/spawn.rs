@@ -18,6 +18,16 @@ impl wit::Host for StoreState {
     }
 }
 
+impl wit::HostStatus for StoreState {
+    async fn wait(&mut self, _status: Resource<wit::Status>) -> wasmtime::Result<wit::Exit> {
+        Err(SpawnTrap::Unavailable.into())
+    }
+
+    async fn drop(&mut self, _status: Resource<wit::Status>) -> wasmtime::Result<()> {
+        Err(SpawnTrap::Unavailable.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -54,15 +64,5 @@ mod tests {
                 .expect_err("staged host refuses child");
             assert!(error.downcast_ref::<SpawnTrap>().is_some());
         }
-    }
-}
-
-impl wit::HostStatus for StoreState {
-    async fn wait(&mut self, _status: Resource<wit::Status>) -> wasmtime::Result<wit::Exit> {
-        Err(SpawnTrap::Unavailable.into())
-    }
-
-    async fn drop(&mut self, _status: Resource<wit::Status>) -> wasmtime::Result<()> {
-        Err(SpawnTrap::Unavailable.into())
     }
 }
