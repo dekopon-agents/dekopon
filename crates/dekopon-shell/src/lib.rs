@@ -1147,6 +1147,83 @@ mod tests {
         assert_eq!(*invoker.seen.lock(), [true]);
     }
 
+    struct PanickingInputInvoker {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CapabilityInvoker for PanickingInputInvoker {
+        fn cancelled(&self) -> bool {
+            self.stop.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn granted(&self) -> Vec<String> {
+            vec!["http-probe.fetch".to_owned()]
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["httpprobe".to_owned()]
+        }
+
+        fn run_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<CommandRun> {
+            assert!(stdin_piped, "child stage inherits script stdin");
+            (word == "httpprobe").then(|| CommandRun::Proposed {
+                capability: "http-probe.fetch".to_owned(),
+                input: serde_json::Value::Null,
+                secret_use: None,
+                report: None,
+            })
+        }
+
+        fn invoke(
+            &self,
+            _proposal: super::CommandProposal,
+            _streams: super::Streams,
+            _tree: &crate::TreeContext,
+        ) -> CapabilityCallResult {
+            panic!("the provider panicked with idle inherited stdin")
+        }
+    }
+
+    #[test]
+    fn panicking_provider_with_idle_inherited_stdin_releases_the_feeder() {
+        use std::sync::atomic::AtomicBool;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (read, _idle_writer) = std::os::unix::net::UnixStream::pair().expect("idle stdin");
+        let stdin = super::ChildStdin::adopt(read).expect("adopt before peer closes");
+        let (finished, result) = std::sync::mpsc::channel();
+        let stop_for_worker = std::sync::Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let limits = Limits::default();
+            let invoker = PanickingInputInvoker {
+                stop: stop_for_worker,
+            };
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Interpreter::new(limits).run_child(
+                    "httpprobe",
+                    Some(stdin),
+                    &invoker,
+                    &TreeContext::new(limits, CallBudget::new(16)),
+                )
+            }))
+            .is_err();
+            finished.send(panicked).expect("test receives the panic");
+        });
+        let answer = result.recv_timeout(std::time::Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if answer.is_err() {
+            result
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("worker cleans up after cancel");
+        }
+        worker.join().expect("worker joined before asserting");
+        assert!(answer.expect("provider panic returns promptly"));
+    }
+
     #[test]
     fn exit_codes_follow_the_documented_mapping() {
         assert_eq!(ExitCode::SUCCESS.get(), 0);

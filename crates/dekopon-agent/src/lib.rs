@@ -1992,6 +1992,7 @@ mod tests {
 
                 async fn upcall_with_stdin(
                     &mut self,
+                    script: &str,
                     kind: UpcallStdin,
                     source: &std::os::unix::net::UnixStream,
                 ) -> UnixStream {
@@ -2003,7 +2004,7 @@ mod tests {
                                 api_version: ProtocolVersion::V1Alpha2,
                                 response: BrokerResponse::Upcall {
                                     parent: "invoke-parent".parse().expect("invocation"),
-                                    script: "probe --uri http://stdin/".to_owned(),
+                                    script: script.to_owned(),
                                     trace_parent: None,
                                     stdin: kind,
                                 },
@@ -2283,7 +2284,9 @@ mod tests {
                             std::os::unix::net::UnixStream::pair().expect("input");
                         writer.write_all(b"child input").expect("input bytes");
                         drop(writer);
-                        let stdout = parent.upcall_with_stdin(kind, &source).await;
+                        let stdout = parent
+                            .upcall_with_stdin("probe --uri http://stdin/", kind, &source)
+                            .await;
                         let mut child = accept(&listener).await;
                         drop(source);
                         assert_eq!(child.uri, "http://stdin/");
@@ -2354,6 +2357,33 @@ mod tests {
                 let (output, status) = broker.await.expect("fake broker");
                 assert_eq!(status, 70);
                 assert!(output.is_empty(), "panicked child does not claim stdout");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn idle_child_stdin_and_panicking_job_deliver_status_70() {
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let leg =
+                    probe_leg(&socket, None).with_job_control(std::sync::Arc::new(PanickingJobs));
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let (source, _idle_writer) =
+                        std::os::unix::net::UnixStream::pair().expect("idle child stdin");
+                    let stdout = parent
+                        .upcall_with_stdin("echo hi &", UpcallStdin::Reader, &source)
+                        .await;
+                    let (output, status) = parent.child_exit(stdout).await;
+                    assert_eq!(status, 70);
+                    parent.answer(InvocationOutcome::Succeeded, "").await;
+                    output
+                });
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(4), invoke_in(leg))
+                        .await
+                        .expect("parent terminates after child panic"),
+                    CapabilityCallResult::Succeeded
+                );
+                assert!(broker.await.expect("fake broker").is_empty());
             }
 
             #[tokio::test(flavor = "multi_thread")]

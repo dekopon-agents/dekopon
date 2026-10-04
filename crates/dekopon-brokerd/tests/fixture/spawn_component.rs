@@ -9,6 +9,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn component() -> tempfile::NamedTempFile {
+    component_for(SCRIPT)
+}
+
+pub fn component_for(script: &str) -> tempfile::NamedTempFile {
+    let proposal = json!({
+        "outcome": "proposed",
+        "capability": "cli-probe.write",
+        "input": {}
+    })
+    .to_string();
     let manifest = json!({
         "apiVersion": "dekopon.dev/provider/v1alpha1",
         "id": "cli-probe",
@@ -67,11 +77,12 @@ pub fn component() -> tempfile::NamedTempFile {
         (import "host" "read" (func $read (param i32 i32 i32)))
         (data (i32.const 0) "{descriptor}")
         (data (i32.const 64) "{manifest}")
-        (data (i32.const 1024) "{SCRIPT}")
+        (data (i32.const 1024) "{script_bytes}")
+        (data (i32.const 3072) "{proposal_bytes}")
         (func (export "describe") (result i32) i32.const 0)
         (func (export "run-command") (param i32 i32 i32) (result i32)
-            i32.const 128 i32.const 2 i32.store
-            i32.const 132 i32.const 2 i32.store
+            i32.const 128 i32.const 3072 i32.store
+            i32.const 132 i32.const {proposal_len} i32.store
             i32.const 128)
         (func (export "invoke") (param i32 i32 i32 i32) (result i32)
             i32.const 1024 i32.const {script_len} i32.const 0 i32.const 0 i32.const 2048 call $run
@@ -102,7 +113,10 @@ pub fn component() -> tempfile::NamedTempFile {
 )"#,
         descriptor = descriptor,
         manifest = hex(manifest.as_bytes()),
-        script_len = SCRIPT.len(),
+        script_bytes = hex(script.as_bytes()),
+        script_len = script.len(),
+        proposal_bytes = hex(proposal.as_bytes()),
+        proposal_len = proposal.len(),
     );
     let mut file = tempfile::NamedTempFile::new().expect("temporary component");
     file.write_all(&wat::parse_str(wat).expect("valid inline component"))

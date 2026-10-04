@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_agent::BrokerLeg;
 use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, CapabilityRoute,
     ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
@@ -31,6 +32,10 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretUseProposal,
+};
+use dekopon_shell::{
+    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandProposal, ExitCode, Interpreter,
+    JobControl, JobId, JobRefusal, JobSeed, JobSummary, JobWait, Limits, Streams, TreeContext,
 };
 use dekopon_test_support::{provider_fixture, shutdown_on};
 use serde_json::{Value, json};
@@ -1568,7 +1573,15 @@ struct SpawnBroker {
 
 impl SpawnBroker {
     async fn start(max_connections: usize) -> Self {
-        let component = spawn_component::component();
+        Self::start_for(max_connections, spawn_component::SCRIPT).await
+    }
+
+    async fn start_for(max_connections: usize, script: &str) -> Self {
+        let component = if script == spawn_component::SCRIPT {
+            spawn_component::component()
+        } else {
+            spawn_component::component_for(script)
+        };
         let registry =
             BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
                 .await
@@ -1643,6 +1656,131 @@ impl SpawnBroker {
             .await
             .expect("server task")
             .expect("clean shutdown");
+    }
+}
+
+struct ProbeJobs {
+    leg: parking_lot::Mutex<Option<std::sync::Weak<BrokerLeg>>>,
+    exit: parking_lot::Mutex<Option<ExitCode>>,
+}
+
+impl JobControl for ProbeJobs {
+    fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal> {
+        let leg = self
+            .leg
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("probe job uses the same live broker leg");
+        let tree = seed.tree().clone();
+        let outcome = Interpreter::new(Limits::default()).run_seed(seed, leg.as_ref(), &tree);
+        *self.exit.lock() = Some(outcome.exit_code);
+        Ok(JobId::new(1))
+    }
+
+    fn list(&self) -> Vec<JobSummary> {
+        Vec::new()
+    }
+
+    fn wait(
+        &self,
+        ids: &[JobId],
+        _keep_waiting: &dyn Fn() -> bool,
+    ) -> Vec<Result<JobWait, JobRefusal>> {
+        ids.iter()
+            .map(|id| {
+                assert_eq!(*id, JobId::new(1));
+                Ok(JobWait::Exited(
+                    self.exit.lock().expect("probe job already ran"),
+                ))
+            })
+            .collect()
+    }
+
+    fn kill(&self, _id: JobId) -> Result<(), JobRefusal> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg() {
+    for script in ["probe", "probe & wait $!"] {
+        let broker = SpawnBroker::start_for(4, script).await;
+        let claim = Attestation::for_chat(
+            subject(),
+            agent("chat-agent"),
+            ChatScopeClaim {
+                transport: "scientist-slack".parse().unwrap(),
+                kind: ChatTransportKind::Slack,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("t0123abc".to_owned()),
+                    id: "c0123abc".to_owned(),
+                    thread: Some("1712345678.000100".to_owned()),
+                },
+                trigger: Trigger::Probe,
+            },
+        );
+        let client = BrokerClient::new(&broker.socket, current_uid(), server_limits().frame)
+            .expect("real broker client");
+        let control = Arc::new(ProbeJobs {
+            leg: parking_lot::Mutex::new(None),
+            exit: parking_lot::Mutex::new(None),
+        });
+        let leg = Arc::new(
+            BrokerLeg::connect(client, Some(claim))
+                .await
+                .expect("broker-owned probe surface")
+                .with_job_control(Arc::clone(&control) as Arc<dyn JobControl>),
+        );
+        *control.leg.lock() = Some(Arc::downgrade(&leg));
+        assert!(
+            !leg.is_granted("cli-probe.write"),
+            "broker withheld write from probe"
+        );
+        let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let tree = TreeContext::new(Limits::default(), CallBudget::new(64));
+                leg.invoke(
+                    CommandProposal::new("cli-probe.upper", json!({}), None),
+                    Streams {
+                        stdin: None,
+                        stdout: stdout.into(),
+                    },
+                    &tree,
+                )
+            }),
+        )
+        .await
+        .expect("gateway child terminates")
+        .expect("blocking worker joins");
+        assert!(
+            matches!(result, CapabilityCallResult::Exited { status, .. } if status.get() == 127),
+            "child's write is unavailable at the leg surface: {result:?}"
+        );
+        assert_eq!(
+            control.exit.lock().map(ExitCode::get),
+            (script.contains('&')).then_some(ExitCode::NOT_FOUND.get()),
+            "a probe-started job ran on the same leg"
+        );
+        let audit = serde_json::to_value(broker.audit.records()).unwrap();
+        let records = audit.as_array().expect("audit records");
+        let invocations = records
+            .iter()
+            .filter_map(|row| row["invocation"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "parent decision and outcome audited: {audit}"
+        );
+        assert_eq!(
+            invocations[0], invocations[1],
+            "no child Invoke reached the real broker: {audit}"
+        );
+        broker.stop().await;
     }
 }
 
