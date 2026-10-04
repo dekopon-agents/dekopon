@@ -3351,6 +3351,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
+            _tree: &dekopon_shell::TreeContext,
         ) -> CapabilityCallResult {
             panic!(
                 "a refused construct must never reach {}",
@@ -3492,6 +3493,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
+            _tree: &dekopon_shell::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;

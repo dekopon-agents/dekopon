@@ -41,7 +41,12 @@ impl CapabilityInvoker for Processes {
         })
     }
 
-    fn invoke(&self, proposal: CommandProposal, streams: Streams) -> CapabilityCallResult {
+    fn invoke(
+        &self,
+        proposal: CommandProposal,
+        streams: Streams,
+        _tree: &dekopon_shell::TreeContext,
+    ) -> CapabilityCallResult {
         self.seen.lock().push((
             proposal.capability.clone(),
             proposal.input["stdinPiped"] == Value::Bool(true),

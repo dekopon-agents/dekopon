@@ -1,0 +1,40 @@
+package dekopon:spawn@0.1.0;
+
+/// A child shell script, run by the gateway running the caller, under the caller's person,
+/// agent, conversation and budget. Its stdout is a stream; its status arrives when it exits.
+interface run {
+    use dekopon:stdio/streams@0.1.0.{reader};
+
+    variant stdin {
+        /// Nothing piped into the child.
+        none,
+        /// The caller's own stdin, shared as a Unix child shares a descriptor.
+        inherit,
+        /// Bytes the host pumps from this reader; the caller never writes a child's stdin.
+        reader(reader),
+    }
+
+    enum spawn-error {
+        /// One child at a time: wait on the running child first. Concurrency is shell syntax.
+        busy,
+    }
+
+    /// Status and the bounded stderr the gateway kept, as for any provider.
+    record exit {
+        status: u8,
+        stderr: string,
+    }
+
+    /// The child's exit, awaited once. Unread stdout is discarded first, as a closed pipe would.
+    resource status {
+        wait: static func(this: status) -> exit;
+    }
+
+    /// A running child: its stdout and the way to wait for it.
+    record child {
+        stdout: reader,
+        status: status,
+    }
+
+    run: func(script: string, stdin: stdin) -> result<child, spawn-error>;
+}

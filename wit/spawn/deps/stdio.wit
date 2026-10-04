@@ -1,0 +1,35 @@
+package dekopon:stdio@0.1.0;
+
+/// A provider invocation's standard streams, as a Unix process sees them.
+///
+/// Reads and writes may park the guest until the peer moves; parked time does not count against
+/// the invocation's timeout. A peer closing its end is what bounds a parked call.
+interface streams {
+    /// Why a write did not complete.
+    enum write-error {
+        /// The reader has gone. Further writes return this too; the provider should stop.
+        closed,
+    }
+
+    /// Bytes piped into the invocation.
+    resource reader {
+        /// Returns at most `max` bytes, waiting for at least one. The host lowers `max` to its own
+        /// per-call bound. An empty list is end of input.
+        read: func(max: u32) -> list<u8>;
+    }
+
+    /// The invocation's standard output.
+    resource writer {
+        /// Writes every byte, waiting while the reader is slow.
+        write: func(bytes: list<u8>) -> result<_, write-error>;
+    }
+
+    /// The piped input, absent when nothing was piped into the invocation.
+    stdin: func() -> option<reader>;
+
+    /// The invocation's standard output.
+    stdout: func() -> writer;
+
+    /// Appends to the invocation's standard error. The host keeps a bounded prefix.
+    write-stderr: func(text: string);
+}

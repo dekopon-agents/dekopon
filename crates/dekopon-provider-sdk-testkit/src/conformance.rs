@@ -107,6 +107,7 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
             "dekopon:storage/durable-files@0.1.1",
         ),
         (ImportSet::ASSETS, ASSET_IMPORT),
+        (ImportSet::SPAWN, "dekopon:spawn/run@0.1.0"),
     ]
     .into_iter()
     .filter_map(|(bit, name)| set.contains(bit).then_some(name.to_owned()))
@@ -264,6 +265,17 @@ mod tests {
                 "{component:?}"
             );
         }
+    }
+
+    #[test]
+    fn spawn_need_declares_the_spawn_run_import() {
+        let spawn = <provider::Spawn as provider::Needs>::IMPORTS;
+        assert_eq!(
+            declared_imports(spawn),
+            imports(&["dekopon:spawn/run@0.1.0", STDIO])
+        );
+        check_imports(spawn, imports(&["dekopon:spawn/run@0.1.0", STDIO])).unwrap();
+        assert!(check_imports(spawn, imports(&[STDIO])).is_err());
     }
 
     #[test]

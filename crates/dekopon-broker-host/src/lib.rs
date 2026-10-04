@@ -47,6 +47,7 @@ mod memory;
 mod metadata;
 mod random;
 mod settings;
+mod spawn;
 mod stdio;
 mod storage;
 use clock::ClockState;

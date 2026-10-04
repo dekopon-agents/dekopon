@@ -50,6 +50,7 @@ impl CapabilityInvoker for Replay {
         &self,
         proposal: CommandProposal,
         mut streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         if let Some(stdin) = streams.stdin.take() {
             let mut text = String::new();

@@ -125,6 +125,50 @@ impl Needs for Random {
     const IMPORTS: ImportSet = ImportSet::RANDOM;
 }
 
+/// Authorized child shell scripts, run by the gateway under this invocation's person, agent and
+/// budget.
+pub struct Spawn(SpawnGrant);
+
+#[cfg(target_arch = "wasm32")]
+struct SpawnGrant;
+#[cfg(not(target_arch = "wasm32"))]
+enum SpawnGrant {}
+
+impl Spawn {
+    /// Starts `script` as a child; one child runs at a time.
+    pub fn run(
+        &self,
+        script: &str,
+        stdin: crate::spawn::ChildStdin,
+    ) -> Result<crate::spawn::Child, crate::spawn::SpawnError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let SpawnGrant = self.0;
+            crate::spawn::run(script, stdin)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (script, stdin);
+            match self.0 {}
+        }
+    }
+}
+impl sealed::Needs for Spawn {
+    fn grant() -> Result<Self, SdkFailure> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self(SpawnGrant))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Err(SdkFailure::ComponentHarnessRequired)
+        }
+    }
+}
+impl Needs for Spawn {
+    const IMPORTS: ImportSet = ImportSet::SPAWN;
+}
+
 /// Parsed provider settings, loaded once for this authorized call.
 pub struct Settings<T> {
     value: T,

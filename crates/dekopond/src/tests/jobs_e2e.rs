@@ -931,6 +931,7 @@ impl CapabilityInvoker for ProbeInvoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
@@ -1369,7 +1370,8 @@ fn attested(
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
-            | BrokerRequest::RecordDeliveredTurn { .. } => {}
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. } => {}
         }
     }
     (surfaces, invocations)

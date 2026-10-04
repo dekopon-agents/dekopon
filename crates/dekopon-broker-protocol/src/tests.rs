@@ -2286,3 +2286,87 @@ fn every_trigger_round_trips_as_its_wire_name() {
         assert_eq!(trigger.as_str(), name);
     }
 }
+
+fn upcall(stdin: super::UpcallStdin) -> super::BrokerResponse {
+    super::BrokerResponse::Upcall {
+        parent: "parent-invocation"
+            .parse::<InvocationId>()
+            .expect("valid invocation id"),
+        script: "gh pr list | rg x".to_owned(),
+        trace_parent: Some(SAMPLE_TRACE_PARENT.parse().expect("valid trace parent")),
+        stdin,
+    }
+}
+
+#[test]
+fn an_upcall_whose_descriptors_do_not_match_its_stdin_is_refused() {
+    use super::{UpcallStdin, validate_response_descriptors};
+    for (stdin, count) in [
+        (UpcallStdin::None, 1),
+        (UpcallStdin::Inherit, 2),
+        (UpcallStdin::Reader, 2),
+    ] {
+        validate_response_descriptors(&upcall(stdin), count).expect("matching descriptors");
+    }
+    for (stdin, count) in [(UpcallStdin::None, 0), (UpcallStdin::Reader, 1)] {
+        assert!(matches!(
+            validate_response_descriptors(&upcall(stdin), count),
+            Err(ProtocolError::MissingStreamDescriptors)
+        ));
+    }
+    for (stdin, count) in [(UpcallStdin::None, 2), (UpcallStdin::Inherit, 3)] {
+        assert!(matches!(
+            validate_response_descriptors(&upcall(stdin), count),
+            Err(ProtocolError::UnexpectedDescriptors)
+        ));
+    }
+}
+
+#[test]
+fn an_upcall_with_an_unknown_stdin_kind_is_refused() {
+    let mut frame = serde_json::to_value(ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: upcall(super::UpcallStdin::Reader),
+    })
+    .expect("serializes");
+    assert_eq!(frame["response"]["stdin"], json!("reader"));
+    assert_eq!(frame["response"]["traceParent"], json!(SAMPLE_TRACE_PARENT));
+    serde_json::from_value::<ResponseEnvelope>(frame.clone()).expect("known stdin parses");
+    frame["response"]["stdin"] = json!("pipe");
+    assert!(serde_json::from_value::<ResponseEnvelope>(frame).is_err());
+}
+
+#[test]
+fn upcall_streams_own_stdout_then_stdin_in_wire_order() {
+    use super::{UpcallStdin, UpcallStreams};
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    let (stdout, stdin) = UnixStream::pair().expect("socketpair");
+    let (stdout_fd, stdin_fd) = (stdout.as_raw_fd(), stdin.as_raw_fd());
+    let streams = UpcallStreams::receive(
+        UpcallStdin::Inherit,
+        vec![OwnedFd::from(stdout), OwnedFd::from(stdin)],
+    )
+    .expect("two descriptors for an inherited stdin");
+    assert_eq!(streams.stdout.as_raw_fd(), stdout_fd);
+    assert_eq!(
+        streams.stdin.as_ref().map(|fd| fd.as_raw_fd()),
+        Some(stdin_fd)
+    );
+    assert_eq!(
+        streams
+            .descriptors()
+            .iter()
+            .map(|fd| fd.as_raw_fd())
+            .collect::<Vec<_>>(),
+        vec![stdout_fd, stdin_fd]
+    );
+    let (extra, other) = UnixStream::pair().expect("socketpair");
+    assert!(matches!(
+        UpcallStreams::receive(
+            UpcallStdin::None,
+            vec![OwnedFd::from(extra), OwnedFd::from(other)]
+        ),
+        Err(ProtocolError::UnexpectedDescriptors)
+    ));
+}

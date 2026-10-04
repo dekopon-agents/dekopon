@@ -105,6 +105,7 @@
 //!         &self,
 //!         proposal: dekopon_shell::CommandProposal,
 //!         streams: Streams,
+//!         _tree: &dekopon_shell::TreeContext,
 //!     ) -> CapabilityCallResult {
 //!         let dekopon_shell::CommandProposal { capability, input, secret_use, .. } = proposal;
 //!         if secret_use.is_some() {
@@ -304,7 +305,12 @@ pub trait CapabilityInvoker: Send + Sync {
         None
     }
 
-    fn invoke(&self, proposal: CommandProposal, streams: Streams) -> CapabilityCallResult;
+    fn invoke(
+        &self,
+        proposal: CommandProposal,
+        streams: Streams,
+        tree: &TreeContext,
+    ) -> CapabilityCallResult;
 }
 
 #[must_use]
@@ -363,8 +369,13 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().job_control()
     }
 
-    fn invoke(&self, proposal: CommandProposal, streams: Streams) -> CapabilityCallResult {
-        self.as_ref().invoke(proposal, streams)
+    fn invoke(
+        &self,
+        proposal: CommandProposal,
+        streams: Streams,
+        tree: &TreeContext,
+    ) -> CapabilityCallResult {
+        self.as_ref().invoke(proposal, streams, tree)
     }
 }
 
@@ -577,6 +588,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             let input = proposal.input;
             let secret_use = proposal.secret_use;
@@ -602,6 +614,7 @@ mod tests {
             &self,
             _: super::CommandProposal,
             _streams: super::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -869,14 +882,16 @@ mod tests {
         assert_eq!(
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({"url": "https://x"}), None),
-                streams().0
+                streams().0,
+                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
             ),
             CapabilityCallResult::Succeeded
         );
         assert_eq!(
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({}), Some(proposal())),
-                streams().0
+                streams().0,
+                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
             ),
             CapabilityCallResult::Succeeded
         );
@@ -964,6 +979,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;

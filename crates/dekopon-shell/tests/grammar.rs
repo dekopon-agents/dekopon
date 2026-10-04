@@ -113,6 +113,7 @@ impl CapabilityInvoker for Fixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         mut streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         let capability = proposal.capability;
         let mut input = proposal.input;
@@ -2323,6 +2324,7 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
+            _tree: &dekopon_shell::TreeContext,
         ) -> CapabilityCallResult {
             let input = proposal.input;
             std::thread::sleep(Duration::from_millis(20));
@@ -2907,8 +2909,9 @@ impl CapabilityInvoker for OrderedFixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
+        tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
-        self.fixture.invoke(proposal, streams)
+        self.fixture.invoke(proposal, streams, tree)
     }
 }
 
@@ -2972,8 +2975,9 @@ impl CapabilityInvoker for StdinFixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
+        tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
-        self.fixture.invoke(proposal, streams)
+        self.fixture.invoke(proposal, streams, tree)
     }
 }
 
@@ -3168,8 +3172,9 @@ impl CapabilityInvoker for WithJobs {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
+        tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
-        self.fixture.invoke(proposal, streams)
+        self.fixture.invoke(proposal, streams, tree)
     }
 }
 
@@ -3290,6 +3295,7 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
             &self,
             _: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
+            _tree: &dekopon_shell::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }

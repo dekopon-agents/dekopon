@@ -473,6 +473,21 @@ where
                 Err(error) => return write_broker_failure(&mut stream, limits, error).await,
             }
         }
+        BrokerRequest::UpcallResult { .. } => {
+            tracing::warn!(
+                event = "broker_request_frame_invalid",
+                error.kind = "unexpected-upcall-result",
+            );
+            stream
+                .write_frame(
+                    &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid"),
+                    &[],
+                    limits,
+                )
+                .await
+                .map_err(ConnectionError::Write)?;
+            return Err(ConnectionError::InvalidRequest);
+        }
         BrokerRequest::RecordDeliveredTurn { attestation, turn } => {
             if !claim_is_valid(Some(&attestation), Some(&turn.id))
                 || !turn.is_bounded()

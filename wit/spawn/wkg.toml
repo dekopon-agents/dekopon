@@ -1,0 +1,10 @@
+# Resolve the stdio dependency from its canonical local WIT, not a registry release.
+[overrides."dekopon:stdio"]
+path = "../stdio"
+
+[metadata]
+authors = "Dekopon contributors"
+description = "Child shell scripts run by the gateway for Dekopon WebAssembly components"
+license = "Apache-2.0 OR MIT"
+homepage = "https://github.com/dekopon-agents/dekopon"
+repository = "https://github.com/dekopon-agents/dekopon"

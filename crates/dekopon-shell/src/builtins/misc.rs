@@ -552,6 +552,7 @@ mod tests {
             &self,
             _: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             panic!("progress must not invoke a capability")
         }

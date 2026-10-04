@@ -7,9 +7,12 @@ pub use crate::http::{
     BuildError as HttpBuildError, Header, HttpError, HttpErrorCode, Part, Request, Response,
     StreamedRequest, StreamedResponse, method,
 };
+pub use crate::spawn::{Child, ChildStdin, Exit, SpawnError};
 pub use crate::storage::{durable_files, jsonl};
 pub use bounded::{Bounded, TooLong, Truncated};
-pub use handles::{Assets, Clock, DurableFiles, Http, Jsonl, Monotonic, Random, Settings, Storage};
+pub use handles::{
+    Assets, Clock, DurableFiles, Http, Jsonl, Monotonic, Random, Settings, Spawn, Storage,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{Port, with_port};
 #[cfg(not(target_arch = "wasm32"))]
@@ -95,7 +98,7 @@ impl Needs for () {
 
 /// A set of guest import interfaces declared by a capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ImportSet(u8);
+pub struct ImportSet(u16);
 
 impl ImportSet {
     /// No guest imports.
@@ -116,6 +119,8 @@ impl ImportSet {
     pub const MONOTONIC: Self = Self(64);
     /// OS entropy.
     pub const RANDOM: Self = Self(128);
+    /// Child shell scripts run by the gateway.
+    pub const SPAWN: Self = Self(256);
 
     /// Combines two declarations without granting either one.
     #[must_use]

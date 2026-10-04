@@ -72,6 +72,7 @@ impl CapabilityInvoker for Fixture {
         &self,
         proposal: crate::CommandProposal,
         mut streams: crate::Streams,
+        _tree: &crate::TreeContext,
     ) -> CapabilityCallResult {
         let capability = proposal.capability;
         let input = proposal.input;

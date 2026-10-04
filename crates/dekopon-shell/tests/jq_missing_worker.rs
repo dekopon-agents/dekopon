@@ -9,6 +9,7 @@ impl CapabilityInvoker for Invoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }

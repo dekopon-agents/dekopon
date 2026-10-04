@@ -49,6 +49,7 @@ env:
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.1.0
   RANDOM_WIT_PACKAGE: dekopon:random@0.1.0
+  SPAWN_WIT_PACKAGE: dekopon:spawn@0.1.0
 
 jobs:
   validate:
@@ -229,6 +230,13 @@ jobs:
             cmp wit/storage/storage.wit "$mirror"
           done
           for mirror in \
+            crates/dekopon-provider-sdk/wit/deps/spawn.wit \
+            crates/dekopon-broker-host/wit/deps/spawn.wit
+          do
+            cmp wit/spawn/spawn.wit "$mirror"
+          done
+          for mirror in \
+            wit/spawn/deps/stdio.wit \
             crates/dekopon-provider-sdk/wit/deps/stdio.wit \
             crates/dekopon-broker-host/wit/deps/stdio.wit \
             examples/providers/cli-probe/wit/deps/stdio.wit \
@@ -281,7 +289,15 @@ jobs:
               --config ../../wkg/config.toml \
               --cache "$RUNNER_TEMP/wkg-build-cache"
           )
-          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock wit/random/wkg.lock
+          (
+            cd wit/spawn
+            wkg build \
+              --wit-dir . \
+              --output ../../target/wit-package/dekopon-spawn.wasm \
+              --config ../../wkg/config.toml \
+              --cache "$RUNNER_TEMP/wkg-build-cache"
+          )
+          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock wit/random/wkg.lock wit/spawn/wkg.lock
 
       - name: Verify provider exports and the stdio import
         shell: bash
@@ -390,6 +406,39 @@ jobs:
             (.types | length == 25) and
             (.worlds == [])
           ' target/wit-package/dekopon-http.json
+
+      - name: Verify the child script interface
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=target/wit-package/dekopon-spawn.wasm
+          wasm-tools validate "$package"
+          wasm-tools component wit --json "$package" > target/wit-package/dekopon-spawn.json
+          jq --exit-status --arg package "$SPAWN_WIT_PACKAGE" --arg stdio "$STDIO_WIT_PACKAGE" '
+            (.packages == [
+              {"name": $stdio, "interfaces": {"streams": 0}, "worlds": {}},
+              {"name": $package, "interfaces": {"run": 1}, "worlds": {}}
+            ]) and
+            (.worlds == []) and
+            (.interfaces | length == 2) and
+            (.interfaces[1].name == "run") and
+            ((.interfaces[1].functions | with_entries(.value |= {kind, params, result})) == {
+              "[static]status.wait": {"kind": {"static": 8}, "params": [{"name": "this", "type": 9}], "result": 7},
+              "run": {"kind": "freestanding", "params": [{"name": "script", "type": "string"}, {"name": "stdin", "type": 5}], "result": 11}
+            }) and
+            (.types[3].kind == {"type": 1}) and
+            (.types[4].kind == {"handle": {"own": 3}}) and
+            (.types[5].kind.variant.cases | map({name, type}) == [
+              {"name": "none", "type": null}, {"name": "inherit", "type": null}, {"name": "reader", "type": 4}
+            ]) and
+            (.types[6].kind.enum.cases | map(.name) == ["busy"]) and
+            (.types[7].kind.record.fields == [{"name": "status", "type": "u8"}, {"name": "stderr", "type": "string"}]) and
+            (.types[8].kind == "resource") and
+            (.types[9].kind == {"handle": {"own": 8}}) and
+            (.types[10].kind.record.fields == [{"name": "stdout", "type": 4}, {"name": "status", "type": 9}]) and
+            (.types[11].kind == {"result": {"ok": 10, "err": 6}}) and
+            (.types | length == 12)
+          ' target/wit-package/dekopon-spawn.json
 
       - name: Verify namespace-bound storage interfaces
         shell: bash
@@ -653,7 +702,7 @@ jobs:
           [registry."local.test".local]
           root = "$registry/packages"
           EOF
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn; do
             wkg publish \
               --config "$registry/config.toml" \
               --cache "$registry/publish-cache" \
@@ -680,11 +729,13 @@ jobs:
             --output "$registry/fetched-clock.wasm" \
             "$CLOCK_WIT_PACKAGE"
           wkg get --config "$registry/config.toml" --cache "$registry/fetch-cache" --output "$registry/fetched-random.wasm" "$RANDOM_WIT_PACKAGE"
+          wkg get --config "$registry/config.toml" --cache "$registry/fetch-cache" --output "$registry/fetched-spawn.wasm" "$SPAWN_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$registry/fetched-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$registry/fetched-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$registry/fetched-storage.wasm"
           cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
           cmp target/wit-package/dekopon-random.wasm "$registry/fetched-random.wasm"
+          cmp target/wit-package/dekopon-spawn.wasm "$registry/fetched-spawn.wasm"
 
       - name: Upload the verified packages
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -697,6 +748,7 @@ jobs:
             target/wit-package/dekopon-storage.wasm
             target/wit-package/dekopon-clock.wasm
             target/wit-package/dekopon-random.wasm
+            target/wit-package/dekopon-spawn.wasm
           if-no-files-found: error
           retention-days: 1
 
@@ -750,7 +802,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn; do
             wkg publish \
               --skip-dupes \
               --config wkg/config.toml \
@@ -783,11 +835,13 @@ jobs:
             --output "$RUNNER_TEMP/published-clock.wasm" \
             "$CLOCK_WIT_PACKAGE"
           wkg get --config wkg/config.toml --cache "$RUNNER_TEMP/wkg-verify-cache" --output "$RUNNER_TEMP/published-random.wasm" "$RANDOM_WIT_PACKAGE"
+          wkg get --config wkg/config.toml --cache "$RUNNER_TEMP/wkg-verify-cache" --output "$RUNNER_TEMP/published-spawn.wasm" "$SPAWN_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$RUNNER_TEMP/published-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$RUNNER_TEMP/published-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$RUNNER_TEMP/published-storage.wasm"
           cmp target/wit-package/dekopon-clock.wasm "$RUNNER_TEMP/published-clock.wasm"
           cmp target/wit-package/dekopon-random.wasm "$RUNNER_TEMP/published-random.wasm"
+          cmp target/wit-package/dekopon-spawn.wasm "$RUNNER_TEMP/published-spawn.wasm"
 
       - name: Log out of GHCR
         if: always()
