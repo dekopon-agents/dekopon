@@ -20,6 +20,12 @@ pub fn component() -> tempfile::NamedTempFile {
             "effect": "read-only",
             "risk": "Low",
             "inputSchema": {"type": "object"}
+        }, {
+            "id": "cli-probe.write",
+            "description": "Tests denial of a nested write",
+            "effect": "external-write",
+            "risk": "High",
+            "inputSchema": {"type": "object"}
         }]
     })
     .to_string();

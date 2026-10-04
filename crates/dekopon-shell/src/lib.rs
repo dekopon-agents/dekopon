@@ -1034,6 +1034,119 @@ mod tests {
         }
     }
 
+    struct ChildInputInvoker {
+        seen: Mutex<Vec<bool>>,
+        read: bool,
+    }
+
+    impl CapabilityInvoker for ChildInputInvoker {
+        fn granted(&self) -> Vec<String> {
+            vec!["http-probe.fetch".to_owned()]
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["httpprobe".to_owned()]
+        }
+
+        fn run_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<CommandRun> {
+            self.seen.lock().push(stdin_piped);
+            (word == "httpprobe").then(|| CommandRun::Proposed {
+                capability: "http-probe.fetch".to_owned(),
+                input: serde_json::Value::Null,
+                secret_use: None,
+                report: None,
+            })
+        }
+
+        fn invoke(
+            &self,
+            _proposal: super::CommandProposal,
+            streams: super::Streams,
+            _tree: &crate::TreeContext,
+        ) -> CapabilityCallResult {
+            if self.read {
+                let Some(fd) = streams.stdin else {
+                    panic!("provider must receive its script stdin");
+                };
+                let mut stdin = std::os::unix::net::UnixStream::from(fd);
+                use std::io::Read as _;
+                let mut bytes = [0; 64];
+                let _ = stdin.read(&mut bytes).expect("provider reads stdin");
+            }
+            CapabilityCallResult::Succeeded
+        }
+    }
+
+    fn child_with_input(
+        script: &str,
+        invoker: &ChildInputInvoker,
+        input: &[u8],
+    ) -> super::ScriptOutcome {
+        use std::io::Write as _;
+        let (read, mut write) = std::os::unix::net::UnixStream::pair().expect("script stdin");
+        let stdin = super::ChildStdin::adopt(read).expect("child adopts stdin");
+        write.write_all(input).expect("input bytes");
+        drop(write);
+        let limits = Limits::default();
+        Interpreter::new(limits).run_child(
+            script,
+            Some(stdin),
+            invoker,
+            &TreeContext::new(limits, CallBudget::new(16)),
+        )
+    }
+
+    #[test]
+    fn compound_and_function_pipes_do_not_pass_input_to_inner_provider() {
+        let invoker = ChildInputInvoker {
+            seen: Mutex::new(Vec::new()),
+            read: false,
+        };
+        let output = child_with_input(
+            "f() { httpprobe; }; printf pipe | f; printf pipe | { httpprobe; }",
+            &invoker,
+            b"script input",
+        );
+        assert_eq!(output.exit_code, ExitCode::SUCCESS, "{}", output.output);
+        assert_eq!(*invoker.seen.lock(), [false, false]);
+    }
+
+    #[test]
+    fn sequential_provider_then_read_share_script_stdin() {
+        let invoker = ChildInputInvoker {
+            seen: Mutex::new(Vec::new()),
+            read: true,
+        };
+        let output = child_with_input("httpprobe; read x; echo done", &invoker, b"first\nsecond\n");
+        assert_eq!(output.exit_code, ExitCode::SUCCESS, "{}", output.output);
+        assert_eq!(*invoker.seen.lock(), [true]);
+    }
+
+    #[test]
+    fn provider_that_never_reads_idle_script_stdin_returns_promptly() {
+        let invoker = ChildInputInvoker {
+            seen: Mutex::new(Vec::new()),
+            read: false,
+        };
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("idle stdin");
+        let limits = Limits::default();
+        let start = std::time::Instant::now();
+        let outcome = Interpreter::new(limits).run_child(
+            "httpprobe",
+            Some(super::ChildStdin::adopt(reader).expect("child adopts stdin")),
+            &invoker,
+            &TreeContext::new(limits, CallBudget::new(16)),
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500));
+        assert_eq!(*invoker.seen.lock(), [true]);
+    }
+
     #[test]
     fn exit_codes_follow_the_documented_mapping() {
         assert_eq!(ExitCode::SUCCESS.get(), 0);
