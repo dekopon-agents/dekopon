@@ -416,6 +416,46 @@ fn wait_consumes_reader() {
 }
 
 #[test]
+fn child_stdin_capture_is_bounded_without_blocking_the_feeder() {
+    let file = component();
+    let path = file.path().to_path_buf();
+    let input = vec![b'x'; 1024 * 1024 + 8192];
+    let component = bounded({
+        let input = input.clone();
+        move || {
+            Harness::<Kit>::get(path)
+                .stdin(input)
+                .child(child(b"", 0))
+                .call("spawn-kit.relay", json!({}))
+        }
+    })
+    .unwrap();
+    assert_eq!(component.status, 0, "{}", component.stderr);
+    assert_eq!(
+        component.children[0].stdin,
+        ChildInput::Inherit(input[..1024 * 1024].to_vec())
+    );
+    let native = Native::<Kit>::new().stdin(input).child(child(b"", 0));
+    assert_eq!(native.call("spawn-kit.relay", "{}").status, 0);
+    assert_eq!(native.children(), component.children);
+}
+
+#[test]
+fn unused_child_script_is_a_typed_fixture_refusal() {
+    let file = component();
+    let path = file.path().to_path_buf();
+    let result = bounded(move || {
+        Harness::<Kit>::get(path)
+            .child(child(b"", 0))
+            .call("spawn-kit.unknown", json!({}))
+    });
+    assert!(
+        matches!(result, Err(HarnessError::Fixture("expected child not run"))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn monotonic_includes_child_wait() {
     let file = component();
     let path = file.path().to_path_buf();

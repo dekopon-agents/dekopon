@@ -8,9 +8,32 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## HTTP contract rollback (0.33.0)
+## Nesting (0.33.0)
 
-Upgrade broker and gateway together, then rebuild and install all HTTP-using providers against the 0.33 SDK and testkit. The broker links only `dekopon:http/client@1.1.0`: buffered `send` and asset-backed `stream`; imports of `client@1.0.0` or `client@1.2.0` cannot load, and `open`/`splice` are removed. Decode each newly built provider's actual Wasm imports before pinning it. The fetched historical JSONPlaceholder artifact still imports 1.0 and is not a new compatibility probe. Published 1.1 package bytes are immutable; the retired 1.2 registry artifact may remain remotely available but is not supported by this broker. Curl's buffered `send` consumes a full bounded response under its effective 256 KiB per-provider grant (the global host ceiling is 12 MiB); larger responses fail rather than streaming. No broker configuration or grants change.
+Upgrade the gateway and broker together: a v0.32 gateway cannot answer the
+v0.33 broker's `Upcall` frame. Upgrade core first, publish/install the 0.33.0
+SDK and testkit crates next, and only then rebuild and re-pin providers. Decode
+the actual component imports before installing them; older HTTP components
+cannot load under this broker.
+
+`dekopon:http/client@1.2.0` is removed. Its `open`/`splice` calls are gone;
+use `client@1.1.0` buffered `send` or asset-backed `stream`. Curl moves to
+buffered `send`: the effective provider response grant is 256 KiB (the global
+host ceiling is 12 MiB), so larger bodies fail instead of streaming. The
+published 1.2.0 registry artifact may remain historical, not supported.
+
+Providers may use `dekopon:spawn/run@0.1.0` for one child at a time. `inherit`
+shares the remaining parent stdin and its pump can read ahead; the parent must
+not read stdin after `run(inherit)`. Child stdout is bounded script text emitted
+at exit, with a trailing newline when nonempty. `exit.stderr` is empty for an
+ordinary child (no separate script stderr); a child panic exits with status 70.
+The host drains unread child stdout on `wait`. A child's wait parks the provider
+work clock but still counts toward the shared shell tree deadline and call
+budget; monotonic time includes that wait. No new grants or configuration are
+needed.
+
+The fetched historical JSONPlaceholder artifact still imports HTTP 1.0 and is
+not a new compatibility probe. Published HTTP 1.1 package bytes are immutable.
 
 ## Host time and entropy (0.32.0)
 

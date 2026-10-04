@@ -391,10 +391,16 @@ async fn answer_children(
         };
         let mut input = Vec::new();
         if let Some(fd) = streams.stdin {
-            async_stream(fd)?
-                .take(CHILD_INPUT_LIMIT)
-                .read_to_end(&mut input)
-                .await?;
+            let mut stream = async_stream(fd)?;
+            let mut chunk = [0; 8192];
+            loop {
+                let size = stream.read(&mut chunk).await?;
+                if size == 0 {
+                    break;
+                }
+                let remaining = (CHILD_INPUT_LIMIT as usize).saturating_sub(input.len());
+                input.extend_from_slice(&chunk[..size.min(remaining)]);
+            }
         }
         runs.push(ChildRun {
             script,
@@ -412,6 +418,9 @@ async fn answer_children(
             status: expected.status,
             stderr: expected.stderr,
         }));
+    }
+    if !scripts.is_empty() {
+        return Err(HarnessError::Fixture("expected child not run"));
     }
     Ok(runs)
 }

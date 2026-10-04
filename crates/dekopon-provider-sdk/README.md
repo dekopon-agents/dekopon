@@ -27,12 +27,12 @@ caller's stdin with the child: the gateway pump can read ahead, so the parent
 must not read its stdin after `run(Inherit)`. Child stdout is bounded script
 text yielded at exit, with a trailing newline when nonempty; ordinary
 `exit.stderr` is empty (the shell has no separate script stderr), and a child
-panic yields status 70. The native handle currently refuses with
-`ComponentHarnessRequired` until the native fake is wired; the component host
-currently traps the spawn import as unavailable. Gateway handling of broker
-upcalls is wired, but SDK-driven guest execution remains staged in this
-intermediate commit. The monotonic clock includes elapsed
-child wait time; the separate work clock will park during a child wait.
+panic yields status 70. Native `Spawn::run` calls the installed `Port::spawn`,
+which receives `NativeChildStdin` and returns `NativeChild` (stdout and exit).
+The default `Port::spawn` panics for ports that do not script children; the SDK
+enforces the one-live-child `Busy` rule and releases the slot on wait or drop.
+The monotonic clock includes elapsed child wait time; the separate work clock
+parks during a child wait.
 The wire response and published provider WIT remain unchanged.
 
 See the repository-owned probes under `examples/providers/` for working typed
