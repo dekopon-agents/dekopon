@@ -190,6 +190,7 @@ The name states the invariant and the primitives are real; one test per behaviou
 - Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
 - No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`, exactly-the-ceiling beside one-over twins, a 1 ns-over timeout cap, `assert!(elapsed < Duration::from_millis(50))`, production bytes canonicalized so a golden fixture is stable (compare parsed `Value`s instead).
 - An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
+- A fake that receives `Invoke` reads its frames with `DescriptorStream`, never plain `read(2)`: on macOS a passed `SCM_RIGHTS` descriptor stays open in the receiver (Linux closes it), so the pipe never sees EOF and the test hangs only on the Mac.
 
 ### Telemetry
 
