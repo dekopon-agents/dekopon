@@ -172,6 +172,19 @@ mod tests {
         }
     }
     #[test]
+    fn a_native_port_without_spawn_refuses_the_child() {
+        let error = std::panic::catch_unwind(|| {
+            with_port(Fake(1), || spawn("gh pr list", NativeChildStdin::None))
+        })
+        .err()
+        .expect("default port refuses spawn");
+        assert_eq!(
+            error.downcast_ref::<String>().map(String::as_str),
+            Some("this native Port runs no child script: gh pr list")
+        );
+    }
+
+    #[test]
     fn nested_ports_restore_the_outer_value_even_on_panic() {
         with_port(Fake(1), || {
             assert_eq!(now_unix_millis(), 1);

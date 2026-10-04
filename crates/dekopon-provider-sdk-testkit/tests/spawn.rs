@@ -10,7 +10,7 @@ use dekopon_provider_sdk::{
     clap::Parser,
     provider::{
         Capability, ChildStdin, Code, Exit, Failure, Monotonic, Proposal, Provider, Spawn,
-        SpawnError, Stdout, Usage,
+        SpawnError, Stdout, Usage, stdin,
     },
 };
 use dekopon_provider_sdk_testkit::{
@@ -75,6 +75,7 @@ fn finished(exit: Exit) -> Result<(), KitError> {
 
 struct Kit;
 struct Relay;
+struct ReaderRelay;
 struct Waits;
 struct Elapsed;
 
@@ -83,7 +84,7 @@ impl Provider for Kit {
     const COMMAND_WORDS: &'static [&'static str] = &["kit"];
     const DESCRIPTION: &'static str = "Runs child scripts";
     type Args = KitArgs;
-    type Capabilities = (Relay, Waits, Elapsed);
+    type Capabilities = (Relay, ReaderRelay, Waits, Elapsed);
     fn propose(_: KitArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Relay>(Empty {}))
     }
@@ -100,6 +101,22 @@ impl Capability for Relay {
     type Error = KitError;
     fn run(_: Empty, spawn: Spawn, out: &mut Stdout) -> Result<(), KitError> {
         let mut child = started(&spawn, ChildStdin::Inherit)?;
+        std::io::copy(&mut child.stdout, out).map_err(|_closed| KitError::Output)?;
+        finished(child.wait())
+    }
+}
+
+impl Capability for ReaderRelay {
+    type Provider = Kit;
+    const NAME: &'static str = "reader";
+    const DESCRIPTION: &'static str = "Passes a piped reader to a child";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = Empty;
+    type Needs = Spawn;
+    type Error = KitError;
+    fn run(_: Empty, spawn: Spawn, out: &mut Stdout) -> Result<(), KitError> {
+        let mut child = started(&spawn, ChildStdin::Reader(stdin().expect("piped stdin")))?;
         std::io::copy(&mut child.stdout, out).map_err(|_closed| KitError::Output)?;
         finished(child.wait())
     }
@@ -156,7 +173,7 @@ fn documents() -> (String, String, String) {
         "id": "spawn-kit",
         "description": "Runs child scripts",
         "commandWords": ["kit"],
-        "capabilities": [capability("relay"), capability("wait"), capability("elapsed")]
+        "capabilities": [capability("relay"), capability("reader"), capability("wait"), capability("elapsed")]
     })
     .to_string();
     let help = json!({"outcome": "rendered", "stdout": "Usage: kit\n", "stderr": "", "status": 0})
@@ -182,6 +199,7 @@ fn component() -> tempfile::NamedTempFile {
         (export "write-error" (type $write-error (eq $write-error-enum)))
         (export "[method]reader.read" (func (param "self" (borrow $reader)) (param "max" u32) (result (list u8))))
         (export "[method]writer.write" (func (param "self" (borrow $writer)) (param "bytes" (list u8)) (result (result (error $write-error)))))
+        (export "stdin" (func (result (option (own $reader)))))
         (export "stdout" (func (result (own $writer))))
     ))
     (alias export $streams "reader" (type $reader))
@@ -217,6 +235,7 @@ fn component() -> tempfile::NamedTempFile {
     (core func $wait (canon lower (func $spawn "[static]status.wait") (memory $memory) (realloc $realloc)))
     (core func $read (canon lower (func $streams "[method]reader.read") (memory $memory) (realloc $realloc)))
     (core func $write (canon lower (func $streams "[method]writer.write") (memory $memory)))
+    (core func $stdin (canon lower (func $streams "stdin") (memory $memory)))
     (core func $stdout (canon lower (func $streams "stdout")))
     (core func $now (canon lower (func $monotonic "now-nanos")))
     (core module $guest
@@ -225,6 +244,7 @@ fn component() -> tempfile::NamedTempFile {
         (import "host" "wait" (func $wait (param i32 i32)))
         (import "host" "read" (func $read (param i32 i32 i32)))
         (import "host" "write" (func $write (param i32 i32 i32 i32)))
+        (import "host" "stdin" (func $stdin (param i32)))
         (import "host" "stdout" (func $stdout (result i32)))
         (import "host" "now" (func $now (result i64)))
         (data (i32.const 0) "{descriptor}")
@@ -243,8 +263,8 @@ fn component() -> tempfile::NamedTempFile {
                 i32.const 132 i32.const {usage_len} i32.store
             end
             i32.const 128)
-        (func $start (param $stdin i32)
-            i32.const 1024 i32.const {script_len} local.get $stdin i32.const 0 i32.const 2048 call $run
+        (func $start (param $stdin i32) (param $reader i32)
+            i32.const 1024 i32.const {script_len} local.get $stdin local.get $reader i32.const 2048 call $run
             i32.const 2048 i32.load8_u if unreachable end)
         (func $finish (result i32)
             i32.const 2056 i32.load i32.const 2064 call $wait
@@ -252,10 +272,27 @@ fn component() -> tempfile::NamedTempFile {
             i32.const 17 i32.const 2064 i32.load8_u i32.store8
             i32.const 16)
         (func (export "invoke") (param i32 i32 i32 i32) (result i32) (local $out i32) (local $count i32)
+            local.get 1 i32.const 16 i32.eq
+            if
+                call $stdout local.set $out
+                i32.const 2200 call $stdin
+                i32.const 2200 i32.load i32.eqz if unreachable end
+                i32.const 2 i32.const 2200 i32.load offset=4 call $start
+                block $reader-done
+                    loop $reader-more
+                        i32.const 2052 i32.load i32.const 4096 i32.const 2080 call $read
+                        i32.const 2084 i32.load local.tee $count
+                        i32.eqz br_if $reader-done
+                        local.get $out i32.const 2080 i32.load local.get $count i32.const 2096 call $write
+                        br $reader-more
+                    end
+                end
+                call $finish return
+            end
             local.get 1 i32.const 15 i32.eq
             if
                 call $stdout local.set $out
-                i32.const 1 call $start
+                i32.const 1 i32.const 0 call $start
                 block $done
                     loop $more
                         i32.const 2052 i32.load i32.const 4096 i32.const 2080 call $read
@@ -269,12 +306,12 @@ fn component() -> tempfile::NamedTempFile {
             end
             local.get 1 i32.const 14 i32.eq
             if
-                i32.const 0 call $start
+                i32.const 0 i32.const 0 call $start
                 call $finish return
             end
             call $stdout local.set $out
             i32.const 2112 call $now i64.store
-            i32.const 0 call $start
+            i32.const 0 i32.const 0 call $start
             call $finish drop
             i32.const 2120 call $now i32.const 2112 i64.load i64.sub i64.store
             local.get $out i32.const 2120 i32.const 8 i32.const 2096 call $write
@@ -283,7 +320,8 @@ fn component() -> tempfile::NamedTempFile {
         (with "memory" (instance $mem))
         (with "host" (instance
             (export "run" (func $run)) (export "wait" (func $wait)) (export "read" (func $read))
-            (export "write" (func $write)) (export "stdout" (func $stdout)) (export "now" (func $now))))))
+            (export "write" (func $write)) (export "stdin" (func $stdin))
+            (export "stdout" (func $stdout)) (export "now" (func $now))))))
     (func (export "describe") (result string)
         (canon lift (core func $guest "describe") (memory $memory)))
     (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
@@ -347,6 +385,32 @@ fn native_guest_spawn_parity() {
     let expected = vec![ChildRun {
         script: SCRIPT.to_owned(),
         stdin: ChildInput::Inherit(b"parent input".to_vec()),
+    }];
+    assert_eq!(native.children(), expected);
+    assert_eq!(component.children, expected);
+}
+
+#[test]
+fn reader_child_stdin_native_guest_parity() {
+    let file = component();
+    let path = file.path().to_path_buf();
+    let native = Native::<Kit>::new()
+        .stdin(b"reader bytes".to_vec())
+        .child(child(b"ok", 0));
+    let native_output = native.call("spawn-kit.reader", "{}");
+    let component = bounded(move || {
+        Harness::<Kit>::get(path)
+            .stdin(b"reader bytes".to_vec())
+            .child(child(b"ok", 0))
+            .call("spawn-kit.reader", json!({}))
+    })
+    .unwrap();
+    assert_eq!(native_output.status, 0, "{}", native_output.stderr);
+    assert_eq!(native_output.stdout, b"ok");
+    assert_eq!(component.stdout, native_output.stdout);
+    let expected = vec![ChildRun {
+        script: SCRIPT.to_owned(),
+        stdin: ChildInput::Reader(b"reader bytes".to_vec()),
     }];
     assert_eq!(native.children(), expected);
     assert_eq!(component.children, expected);

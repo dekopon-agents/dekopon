@@ -126,6 +126,40 @@ impl Child {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_child_slot_is_busy_until_wait_or_drop() {
+        let first = Child::native(
+            crate::provider::NativeChild {
+                stdout: Box::new(std::io::empty()),
+                exit: Exit {
+                    status: 0,
+                    stderr: String::new(),
+                },
+            },
+            Live::claim().expect("first child"),
+        );
+        assert!(Live::claim().is_none());
+        assert_eq!(first.wait().status, 0);
+        let second = Child::native(
+            crate::provider::NativeChild {
+                stdout: Box::new(std::io::empty()),
+                exit: Exit {
+                    status: 0,
+                    stderr: String::new(),
+                },
+            },
+            Live::claim().expect("wait releases slot"),
+        );
+        assert!(Live::claim().is_none());
+        drop(second);
+        assert!(Live::claim().is_some());
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn run(script: &str, stdin: ChildStdin) -> Result<Child, SpawnError> {
     use bindings::dekopon::spawn::run as wit;
