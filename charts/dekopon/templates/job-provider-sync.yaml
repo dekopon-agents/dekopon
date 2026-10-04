@@ -109,12 +109,7 @@ spec:
           securityContext:
             {{- toYaml $runtimeSecurityContext | nindent 12 }}
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: "1"
-              memory: 1Gi
+            {{- toYaml .Values.broker.resources | nindent 12 }}
           volumeMounts:
             - name: state
               mountPath: {{ $mount }}
