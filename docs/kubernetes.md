@@ -46,12 +46,12 @@ and its chat/model credentials. The chart supplies file placement and permission
 references define their contents. [ChatGPT subscription credentials](#the-chatgpt-credential-is-seeded-once)
 and [managed provider sets](#the-managed-provider-set-comes-from-the-claim) have additional preparation steps.
 
-From the registry, using **chart version `0.21.0`**, not application version `0.32.0`:
+From the registry, using **chart version `0.21.1`**, not application version `0.32.0`:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.21.0
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.21.1
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.21.0 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.21.1 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 `helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
@@ -636,7 +636,7 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-The current [Chart.yaml](../charts/dekopon/Chart.yaml) declares chart version `0.21.0` and
+The current [Chart.yaml](../charts/dekopon/Chart.yaml) declares chart version `0.21.1` and
 `appVersion: "0.32.0"`. The application version is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and

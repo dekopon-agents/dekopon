@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.21.1] - 2026-10-04
+
+### Fixed
+
+- The provider sync Job uses `broker.resources` instead of a hard-coded 1 GiB limit, so large components compile.
+
 ## [dekopon-chart-0.21.0] - 2026-10-03
 
 ### Added
