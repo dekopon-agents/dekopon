@@ -50,6 +50,7 @@ pub struct AssetInputs {
     /// Stream ends ride the asset descriptor path but are admitted by the stdio host.
     pub streams: Option<dekopon_broker_protocol::Streams>,
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    pub upcalls: Option<tokio::sync::mpsc::Sender<crate::UpcallRequest>>,
 }
 
 #[derive(Debug, Default)]
@@ -965,6 +966,7 @@ mod tests {
             sends_remaining: 1,
             streams: None,
             cancel: None,
+            upcalls: None,
         }
     }
 

@@ -60,6 +60,7 @@ use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
 use settings::SettingsState;
+pub use spawn::{UpcallExit, UpcallRequest};
 pub use stdio::{
     MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError, StdioTrap,
     ZERO_FAILURE_STATUS_NOTE,
@@ -77,6 +78,7 @@ pub(crate) mod bindings {
             "dekopon:asset/asset.writer": crate::asset::WriterResource,
             "dekopon:stdio/streams.reader": crate::stdio::ReaderResource,
             "dekopon:stdio/streams.writer": crate::stdio::WriterResource,
+            "dekopon:spawn/run.status": crate::spawn::StatusResource,
         },
     });
 }
@@ -420,6 +422,7 @@ impl Runtime {
                 settings,
                 assets: asset::AssetState::disabled(),
                 stdio: stdio::StdioState::none(),
+                spawn: spawn::SpawnState::default(),
                 table: storage::new_table(),
                 instantiations: 0,
             },
@@ -460,6 +463,7 @@ struct StoreState {
     clock: ClockState,
     settings: SettingsState,
     stdio: stdio::StdioState,
+    spawn: spawn::SpawnState,
     table: wasmtime::component::ResourceTable,
     instantiations: u64,
 }
@@ -1144,6 +1148,8 @@ impl BrokerWasmProvider {
         let cancel = assets.cancel.take();
         store.data_mut().stdio = stdio::StdioState::invoke(assets.streams.take())
             .map_err(|source| BrokerHostError::StdioAdmission { source })?;
+        store.data_mut().spawn =
+            spawn::SpawnState::invoke(assets.upcalls.take(), self.runtime.limits.max_input_bytes);
         store.data_mut().assets = asset::AssetState::invoke(
             assets,
             asset::references(input),
@@ -1175,6 +1181,7 @@ impl BrokerWasmProvider {
         executed = executed
             .map_err(|error| invocation_budget_failure(error, store.data().limits.refusal()));
         store.data_mut().stdio.close();
+        store.data_mut().spawn = spawn::SpawnState::default();
         store.data().assets.drain().await;
         // A caught, typed disk failure stays terminal even if later guest work times out or is
         // refused; never infer exhaustion from cancellation itself.

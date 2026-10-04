@@ -1634,13 +1634,9 @@ impl BrokerClient {
             });
         }
         let mut stream = DescriptorStream::new(stream);
-        stream
-            .write_frame(&request, descriptors, self.limits)
-            .await
-            .map_err(|source| ClientError::Protocol {
-                phase: ExchangePhase::Request,
-                source,
-            })?;
+        if let Err(source) = stream.write_frame(&request, descriptors, self.limits).await {
+            return Err(refusal_after_write_failure(&mut stream, source, self.limits).await);
+        }
         let (response, descriptors) = stream
             .read_frame::<ResponseEnvelope>(self.limits)
             .await
@@ -1655,6 +1651,35 @@ impl BrokerClient {
             }
         })?;
         Ok((response.response, descriptors))
+    }
+}
+
+// A broker over its connection limit writes its refusal without reading the request and closes,
+// so the request write can fail while the refusal is still readable.
+#[cfg(unix)]
+async fn refusal_after_write_failure(
+    stream: &mut DescriptorStream,
+    source: ProtocolError,
+    limits: FrameLimits,
+) -> ClientError {
+    if let ProtocolError::Io { source: error } = &source
+        && matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        )
+        && let Ok((
+            ResponseEnvelope {
+                response: BrokerResponse::Error { code, message },
+                ..
+            },
+            _,
+        )) = stream.read_frame::<ResponseEnvelope>(limits).await
+    {
+        return ClientError::Remote { code, message };
+    }
+    ClientError::Protocol {
+        phase: ExchangePhase::Request,
+        source,
     }
 }
 

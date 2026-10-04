@@ -2122,6 +2122,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
             sends_remaining: 0,
             streams: piped.streams,
             cancel: None,
+            upcalls: None,
         };
         let mut constraints = http_constraints(server.authority().to_owned(), "POST");
         constraints.asset = Some(AssetConstraints {
