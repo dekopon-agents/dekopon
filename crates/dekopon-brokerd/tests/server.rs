@@ -1853,6 +1853,12 @@ async fn capacity_exhausted_frame() {
         panic!("expected a capacity refusal, got {refusal:?}");
     };
     assert_eq!(code, ERROR_CAPACITY_EXHAUSTED);
+    let client = BrokerClient::new(&broker.socket, current_uid(), server_limits().frame)
+        .expect("capacity client");
+    assert!(matches!(
+        client.session_surface(None).await,
+        Err(ClientError::Remote { code, .. }) if code == ERROR_CAPACITY_EXHAUSTED
+    ));
     drop(streams);
     answer_upcall(&mut parent, 0, "").await;
     assert_eq!(
