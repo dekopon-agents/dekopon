@@ -506,6 +506,16 @@ fn unused_child_script_is_a_typed_fixture_refusal() {
         matches!(result, Err(HarnessError::Fixture("expected child not run"))),
         "{result:?}"
     );
+    let native = std::panic::catch_unwind(|| {
+        Native::<Kit>::new()
+            .child(child(b"", 0))
+            .call("spawn-kit.unknown", "{}")
+    })
+    .expect_err("unused native child is a fixture refusal");
+    assert_eq!(
+        native.downcast_ref::<String>().map(String::as_str),
+        Some("invalid fixture: expected child not run")
+    );
 }
 
 #[test]
