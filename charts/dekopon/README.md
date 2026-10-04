@@ -1,6 +1,6 @@
 # Dekopon Helm chart
 
-Chart `0.21.0` deploys application `v0.32.0`. With empty `image.tag` and `image.digest`, defaults
+Chart `0.21.1` deploys application `v0.32.0`. With empty `image.tag` and `image.digest`, defaults
 render `ghcr.io/dekopon-agents/dekopon:v0.32.0`; set `image.digest` to the published
 multi-platform index digest to pin it. The image helper selects `image.digest` before `image.tag`.
 With `broker.providerSet.enabled: true`, the chart runs `dekopon-brokerd provider precompile`
