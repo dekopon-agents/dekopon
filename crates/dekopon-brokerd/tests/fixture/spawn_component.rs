@@ -8,9 +8,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("\\{byte:02x}")).collect()
 }
 
-// With input `{}` it waits on the child without reading its stdout and exits with the child's
-// status; with any other input it reads one byte of the child's stdout, then traps while the child
-// is still running.
 pub fn component() -> tempfile::NamedTempFile {
     let manifest = json!({
         "apiVersion": "dekopon.dev/provider/v1alpha1",

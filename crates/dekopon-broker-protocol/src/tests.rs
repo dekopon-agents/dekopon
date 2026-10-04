@@ -202,30 +202,44 @@ async fn epiped_request_write_still_reads_capacity_refusal() {
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
 async fn parked_peer_does_not_start_the_frame_body_timer() {
+    use std::{future::Future as _, task::Poll};
+
     use super::DescriptorStream;
     use tokio::net::UnixStream;
 
     let (reader, writer) = UnixStream::pair().expect("socketpair");
     let mut reader = DescriptorStream::new(reader);
     let mut writer = DescriptorStream::new(writer);
+    let (old_reader, _old_writer) = UnixStream::pair().expect("control socketpair");
+    let mut old_reader = DescriptorStream::new(old_reader);
     let limits = FrameLimits {
         max_frame_bytes: 4096,
         io_timeout: Duration::from_secs(1),
     };
-    let read = tokio::spawn(async move {
-        reader
-            .read_frame_when_ready::<ResponseEnvelope>(limits)
-            .await
-    });
+    let mut read = Box::pin(reader.read_frame_when_ready::<ResponseEnvelope>(limits));
+    let mut old_read = Box::pin(old_reader.read_frame::<ResponseEnvelope>(limits));
+    std::future::poll_fn(|cx| {
+        assert!(
+            read.as_mut().poll(cx).is_pending(),
+            "read enters readiness wait"
+        );
+        assert!(
+            old_read.as_mut().poll(cx).is_pending(),
+            "control enters timed read"
+        );
+        Poll::Ready(())
+    })
+    .await;
     tokio::time::advance(Duration::from_secs(280)).await;
+    assert!(
+        matches!(old_read.await, Err(ProtocolError::Timeout)),
+        "old whole-read timer expires while peer is parked"
+    );
     writer
         .write_frame(&ResponseEnvelope::error("test", "parked"), &[], limits)
         .await
         .expect("response");
-    let (response, descriptors) = read
-        .await
-        .expect("reader task")
-        .expect("parked read survives");
+    let (response, descriptors) = read.await.expect("parked read survives");
     assert!(descriptors.is_empty());
     assert!(
         matches!(response.response, super::BrokerResponse::Error { code, .. } if code == "test")

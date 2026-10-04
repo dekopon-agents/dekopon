@@ -74,9 +74,10 @@ frames carry neither authority nor identity; the broker still authorizes each
 child invocation under the original attested leg. The broker alternates between
 an idle upcall request and one pending result: while a result is open, its read
 also detects hangup, so a second peer-disconnect read cannot consume its prefix.
-The broker and gateway wait for readability without charging the frame timer;
-once a byte is ready, the frame body is timed. An ordinary one-shot client
-still rejects an unexpected upcall.
+The broker waits for readability without charging the frame timer; once a
+byte is ready, the frame body is timed. The gateway's terminal client still
+times the entire read; switching it to wait-readable-then-timed is pending
+N1-2. An ordinary one-shot client still rejects an unexpected upcall.
 
 An inventory row's `bytes` is nullable: null means unknown, while numeric zero means a known
 empty file. The gateway snapshots rows after resolving referenced inputs; each passed descriptor
