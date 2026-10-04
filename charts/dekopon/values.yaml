@@ -13,7 +13,7 @@ image:
   tag: "v0.33.0"
   # The v0.32.0 digest remains only until the v0.33.0 image is published. Do not tag or
   # deploy chart 0.22.0 before the mandatory reviewed digest-only PR replaces it.
-  digest: "sha256:defeecf813250ec4f3edf5189884522ac255923819e8b24f9961819ac79b1128"
+  digest: "sha256:a3ec90d9c7d0075d540b842061852f125bd927133903a2af9db037fe8da9506d"
   pullPolicy: IfNotPresent
   # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
   # chart itself — are public, so every pull on this path is anonymous. A dangling
