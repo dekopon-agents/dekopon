@@ -2,7 +2,7 @@
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
 `dekopon:http@1.1.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.1`, or
-`dekopon:clock@1.1.0` or `dekopon:random@0.1.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
+`dekopon:clock@1.1.0` or `dekopon:random@0.1.0` interfaces.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
 `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a
