@@ -58,6 +58,30 @@ impl DescriptorStream {
         }
     }
 
+    /// Only the frame body is timed: a peer parked on a child script is bounded by its hangup and
+    /// the caller's cancellation, never by the io timer.
+    pub async fn read_frame_when_ready<T: DeserializeOwned>(
+        &mut self,
+        limits: FrameLimits,
+    ) -> Result<(T, Vec<OwnedFd>), ProtocolError> {
+        loop {
+            self.stream
+                .readable()
+                .await
+                .map_err(|source| ProtocolError::Io { source })?;
+            let peeked = self.stream.try_io(Interest::READABLE, || {
+                rustix::net::recv(&self.stream, &mut [0_u8; 1], RecvFlags::PEEK)
+                    .map_err(io::Error::from)
+            });
+            match peeked {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(source) => return Err(ProtocolError::Io { source }),
+            }
+        }
+        self.read_frame(limits).await
+    }
+
     pub async fn read_frame<T: DeserializeOwned>(
         &mut self,
         limits: FrameLimits,

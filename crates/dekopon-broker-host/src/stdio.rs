@@ -66,12 +66,13 @@ pub enum StdioAdmissionError {
 
 pub enum ReaderResource {
     Stdin,
+    Child(u64),
 }
 pub struct WriterResource;
 
 #[derive(Debug, Default)]
 pub(crate) struct StdioState {
-    stdin: Option<UnixStream>,
+    pub(crate) stdin: Option<UnixStream>,
     stdout: Option<UnixStream>,
     stderr: String,
     stderr_truncated: bool,
@@ -123,7 +124,7 @@ impl StdioState {
         self.stderr_truncated = true;
     }
 
-    fn mint(&mut self) -> wasmtime::Result<()> {
+    pub(crate) fn mint(&mut self) -> wasmtime::Result<()> {
         if self.handles >= MAX_LIVE_HANDLES {
             return Err(StdioTrap::TooManyHandles.into());
         }
@@ -148,7 +149,7 @@ impl StdioState {
             .record(ZERO_FAILURE_STATUS_NOTE.as_bytes());
     }
 
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         self.handles = self.handles.saturating_sub(1);
     }
 
@@ -205,7 +206,7 @@ impl Drop for ParkGuard {
 }
 
 impl WorkClock {
-    fn park(&self) -> ParkGuard {
+    pub(crate) fn park(&self) -> ParkGuard {
         self.0.parked.lock().since = Some(Instant::now());
         self.0.changed.notify_one();
         ParkGuard(self.clone())
@@ -303,6 +304,7 @@ impl wit::HostReader for StoreState {
         let length = usize::try_from(max.min(MAX_READ_BYTES))?;
         match self.table.get(&resource)? {
             ReaderResource::Stdin => Ok(self.read_stdin(length).await),
+            &ReaderResource::Child(generation) => Ok(self.read_child(generation, length).await),
         }
     }
 

@@ -191,6 +191,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             sends_remaining: 0,
             streams: piped.streams,
             cancel: None,
+            upcalls: None,
         };
         let _result = registry
             .invoke(

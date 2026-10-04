@@ -1,11 +1,12 @@
-use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
+use dekopon_broker_host::{UpcallExit, UpcallRequest};
 use dekopon_broker_protocol::{
     Attestation, BrokerRequest, CommandRunOutcome, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
     ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER,
-    ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, Streams, TraceParent,
+    ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, ProtocolVersion,
+    RequestEnvelope, ResponseEnvelope, Streams, TraceParent, write_frame,
 };
 use dekopon_core::{
     ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
@@ -14,7 +15,7 @@ use dekopon_telemetry::TraceContextParts;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -78,6 +79,9 @@ where
         let semaphore = Arc::new(Semaphore::new(self.limits.max_connections));
         let mut tasks = JoinSet::new();
         let mut accept_backoff_ms = ACCEPT_BACKOFF_MS;
+        let refusal = capacity_refusal(self.limits.frame)
+            .await
+            .map_err(|source| ServerError::InvalidFrameLimits { source })?;
         tokio::pin!(shutdown);
 
         loop {
@@ -109,8 +113,12 @@ where
                         }
                     };
                     let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-                        drop(stream);
-                        tracing::warn!(event = "broker_connection_rejected", reason = "connection_limit");
+                        let refused = refuse_over_capacity(stream, &refusal);
+                        tracing::warn!(
+                            event = "broker_connection_rejected",
+                            reason = "connection_limit",
+                            refusal.written = refused,
+                        );
                         continue;
                     };
                     let broker = Arc::clone(&self.broker);
@@ -147,6 +155,29 @@ where
             }
         }
     }
+}
+
+async fn capacity_refusal(limits: FrameLimits) -> Result<Vec<u8>, ProtocolError> {
+    let mut frame = Vec::new();
+    write_frame(
+        &mut frame,
+        &ResponseEnvelope::error(
+            ERROR_CAPACITY_EXHAUSTED,
+            "the broker is at its connection limit; this call did not run",
+        ),
+        limits,
+    )
+    .await?;
+    Ok(frame)
+}
+
+// One non-blocking write into a fresh socket's empty buffer: the refusal never waits for a permit,
+// a task or the peer.
+fn refuse_over_capacity(stream: UnixStream, frame: &[u8]) -> bool {
+    stream
+        .into_std()
+        .and_then(|mut stream| io::Write::write(&mut stream, frame))
+        .is_ok_and(|written| written == frame.len())
 }
 
 fn observe_task(
@@ -436,7 +467,9 @@ where
             }
             let span = invocation_span(&invocation, attestation.as_ref());
             adopt_trace_parent(&span, invocation.trace_parent);
-            let (cancel, signal) = tokio::sync::watch::channel(false);
+            let parent = invocation.id.clone();
+            let (cancel, signal) = watch::channel(false);
+            let (upcalls, requests) = mpsc::channel(1);
             let operation = broker
                 .invoke(
                     context,
@@ -449,17 +482,18 @@ where
                         sends_remaining,
                         streams,
                         cancel: Some(signal),
+                        upcalls: Some(upcalls),
                     },
                 )
-                .instrument(span);
-            tokio::pin!(operation);
-            let outcome = tokio::select! {
-                result = &mut operation => result,
-                () = stream.peer_disconnected() => {
-                    cancel.send_replace(true);
-                    operation.await
-                }
+                .instrument(span.clone());
+            let upcaller = Upcaller {
+                parent: &parent,
+                span: &span,
+                limits,
             };
+            let outcome = upcaller
+                .converse(&mut stream, operation, requests, &cancel)
+                .await;
             match outcome {
                 Ok(outcome) => {
                     outputs = outcome.assets;
@@ -526,6 +560,126 @@ where
         .write_frame(&response, &descriptors, limits)
         .await
         .map_err(ConnectionError::Write)
+}
+
+struct Upcaller<'a> {
+    parent: &'a InvocationId,
+    span: &'a tracing::Span,
+    limits: FrameLimits,
+}
+
+impl Upcaller<'_> {
+    // The hangup detector consumes a byte, so it runs only between upcalls; while one is open the
+    // reply read is what notices the gateway leaving.
+    async fn converse<F: Future>(
+        &self,
+        stream: &mut DescriptorStream,
+        operation: F,
+        mut requests: mpsc::Receiver<UpcallRequest>,
+        cancel: &watch::Sender<bool>,
+    ) -> F::Output {
+        tokio::pin!(operation);
+        let mut finished = None;
+        loop {
+            let request = tokio::select! {
+                biased;
+                outcome = &mut operation => return outcome,
+                Some(request) = requests.recv() => request,
+                () = stream.peer_disconnected() => break,
+            };
+            let exchanged = self
+                .upcall(stream, &mut operation, &mut finished, request)
+                .await;
+            if let Err(error) = &exchanged {
+                tracing::warn!(
+                    event = "broker_upcall_failed",
+                    error.kind = error.kind(),
+                    error = %dekopon_core::error_chain(error),
+                );
+            }
+            if let Some(outcome) = finished.take() {
+                return outcome;
+            }
+            if exchanged.is_err() {
+                break;
+            }
+        }
+        cancel.send_replace(true);
+        operation.await
+    }
+
+    async fn upcall<F: Future>(
+        &self,
+        stream: &mut DescriptorStream,
+        operation: &mut Pin<&mut F>,
+        finished: &mut Option<F::Output>,
+        request: UpcallRequest,
+    ) -> Result<(), UpcallError> {
+        let UpcallRequest {
+            script,
+            stdin,
+            streams,
+            reply,
+        } = request;
+        let trace_parent = self
+            .span
+            .in_scope(dekopon_telemetry::current_trace_context)
+            .and_then(|parts| TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok());
+        let frame = ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: dekopon_broker_protocol::BrokerResponse::Upcall {
+                parent: self.parent.clone(),
+                script,
+                trace_parent,
+                stdin,
+            },
+        };
+        stream
+            .write_frame(&frame, &streams.descriptors(), self.limits)
+            .await
+            .map_err(UpcallError::Frame)?;
+        drop(streams);
+        let read = stream.read_frame_when_ready::<RequestEnvelope>(self.limits);
+        tokio::pin!(read);
+        let received = loop {
+            tokio::select! {
+                received = &mut read => break received,
+                outcome = operation.as_mut(), if finished.is_none() => *finished = Some(outcome),
+            }
+        };
+        let (envelope, descriptors) = received.map_err(UpcallError::Frame)?;
+        match envelope.request {
+            BrokerRequest::UpcallResult { status, stderr } => {
+                if !descriptors.is_empty() {
+                    return Err(UpcallError::Frame(ProtocolError::UnexpectedDescriptors));
+                }
+                // The guest may already be gone; its exit then has no reader.
+                drop(reply.send(UpcallExit { status, stderr }));
+                Ok(())
+            }
+            BrokerRequest::Capabilities { .. }
+            | BrokerRequest::RunCommand { .. }
+            | BrokerRequest::Invoke { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. } => Err(UpcallError::UnexpectedRequest),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum UpcallError {
+    #[error("an upcall frame failed")]
+    Frame(#[source] ProtocolError),
+    #[error("the gateway answered an upcall with another request")]
+    UnexpectedRequest,
+}
+
+impl UpcallError {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Frame(error) => protocol_error_kind(error),
+            Self::UnexpectedRequest => "unexpected-request",
+        }
+    }
 }
 
 /// Collapsing this into one wire code would invite retries that duplicate a non-idempotent external

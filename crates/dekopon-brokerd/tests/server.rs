@@ -17,9 +17,10 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, BrokerResponse, ClientError, CommandRunOutcome,
-    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError, CommandRunOutcome,
+    DescriptorStream, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
+    UpcallStdin, UpcallStreams, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, capabilities,
@@ -40,6 +41,8 @@ use tokio::{
 
 #[path = "fixture/parked_component.rs"]
 mod parked_component;
+#[path = "fixture/spawn_component.rs"]
+mod spawn_component;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
@@ -1485,4 +1488,278 @@ async fn a_capability_the_owner_did_not_list_gets_no_constraint_set() {
         sets.keys().map(CapabilityId::as_str).collect::<Vec<_>>(),
         ["cli-probe.upper"]
     );
+}
+
+struct SpawnBroker {
+    _directory: tempfile::TempDir,
+    _component: tempfile::NamedTempFile,
+    socket: std::path::PathBuf,
+    audit: Arc<InMemoryAuditLog>,
+    shutdown: oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<Result<(), dekopon_brokerd::ServerError>>,
+}
+
+impl SpawnBroker {
+    async fn start(max_connections: usize) -> Self {
+        let component = spawn_component::component();
+        let registry =
+            BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+                .await
+                .expect("spawn fixture loads");
+        let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit bound"));
+        let broker = Arc::new(
+            Broker::new(
+                registry,
+                "broker-test".parse().unwrap(),
+                "policy-test".to_owned(),
+                probe_engine(POLICY, ["caller", "cpetersen"]),
+                probe_catalog(),
+                CredentialStore::empty(),
+                identities(),
+                Arc::clone(&audit),
+                BrokerLimits::default(),
+            )
+            .expect("broker starts"),
+        );
+        let directory = private_directory();
+        let socket = directory.path().join("broker.sock");
+        let listener = bind_fixture(&socket);
+        let identities = BTreeMap::from([(
+            current_uid(),
+            MappedPeer {
+                context: context("caller"),
+                attestor: Some(attestor_grant()),
+            },
+        )]);
+        let limits = ServerLimits {
+            max_connections,
+            ..server_limits()
+        };
+        let server = BrokerServer::new(broker, identities, limits).expect("server starts");
+        let (shutdown, stop) = oneshot::channel::<()>();
+        let server = tokio::spawn(server.serve(listener, shutdown_on(stop)));
+        Self {
+            _directory: directory,
+            _component: component,
+            socket,
+            audit,
+            shutdown,
+            server,
+        }
+    }
+
+    async fn invoke(&self, id: &str, input: Value) -> DescriptorStream {
+        let mut invocation = request(id);
+        invocation.input = input;
+        let attestation = session().bound_to(invocation.id.clone());
+        let mut gateway = DescriptorStream::new(UnixStream::connect(&self.socket).await.unwrap());
+        gateway
+            .write_frame(
+                &RequestEnvelope::invoke(Some(attestation), invocation, vec![], 0, None),
+                &[],
+                server_limits().frame,
+            )
+            .await
+            .unwrap();
+        gateway
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(()).expect("stop broker");
+        self.server
+            .await
+            .expect("server task")
+            .expect("clean shutdown");
+    }
+}
+
+async fn read_response(
+    gateway: &mut DescriptorStream,
+) -> (BrokerResponse, Vec<std::os::fd::OwnedFd>) {
+    let (envelope, descriptors) = tokio::time::timeout(
+        Duration::from_secs(10),
+        gateway.read_frame::<ResponseEnvelope>(server_limits().frame),
+    )
+    .await
+    .expect("broker answers without hanging")
+    .expect("well-formed frame");
+    (envelope.response, descriptors)
+}
+
+async fn receive_upcall(gateway: &mut DescriptorStream, id: &str) -> UpcallStreams {
+    let (response, descriptors) = read_response(gateway).await;
+    let BrokerResponse::Upcall {
+        parent,
+        script,
+        stdin,
+        ..
+    } = response
+    else {
+        panic!("expected an upcall, got {response:?}");
+    };
+    assert_eq!(parent.as_str(), id);
+    assert_eq!(script, spawn_component::SCRIPT);
+    assert_eq!(stdin, UpcallStdin::None);
+    UpcallStreams::receive(stdin, descriptors).expect("upcall descriptors")
+}
+
+async fn answer_upcall(gateway: &mut DescriptorStream, status: u8, stderr: &str) {
+    gateway
+        .write_frame(
+            &RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                request: BrokerRequest::UpcallResult {
+                    status,
+                    stderr: stderr.to_owned(),
+                },
+            },
+            &[],
+            server_limits().frame,
+        )
+        .await
+        .unwrap();
+}
+
+async fn terminal(gateway: &mut DescriptorStream) -> dekopon_capability::InvocationResult {
+    let response = read_response(gateway).await.0;
+    let BrokerResponse::Invocation { result, .. } = response else {
+        panic!("expected the invocation result, got {response:?}");
+    };
+    result
+}
+
+async fn wait_for_peer_close(stdout: std::os::fd::OwnedFd) -> std::io::ErrorKind {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut stdout = std::os::unix::net::UnixStream::from(stdout);
+        for _ in 0..300 {
+            if let Err(error) = stdout.write_all(b"x") {
+                return error.kind();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the host kept the child's stdout open");
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_wait_before_300k_stdout() {
+    const CHILD_OUTPUT_BYTES: usize = 300 * 1024;
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker.invoke("invoke-wait-first", json!({})).await;
+    let streams = receive_upcall(&mut gateway, "invoke-wait-first").await;
+    let written = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut stdout = std::os::unix::net::UnixStream::from(streams.stdout);
+        stdout.write_all(&vec![b'x'; CHILD_OUTPUT_BYTES])
+    });
+    tokio::time::timeout(Duration::from_secs(10), written)
+        .await
+        .expect("the host drains a waiting guest's stdout")
+        .unwrap()
+        .expect("the whole child output is accepted");
+    answer_upcall(&mut gateway, 0, "").await;
+    let result = terminal(&mut gateway).await;
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upcall_result_reaches_the_guest_byte_for_byte() {
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker.invoke("invoke-intact-result", json!({})).await;
+    let streams = receive_upcall(&mut gateway, "invoke-intact-result").await;
+    drop(streams);
+    answer_upcall(&mut gateway, 42, "child stderr").await;
+    let result = terminal(&mut gateway).await;
+    assert_eq!(result.outcome, InvocationOutcome::Failed);
+    assert_eq!(result.exit_status.map(std::num::NonZeroU8::get), Some(42));
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_hangup_mid_upcall() {
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker.invoke("invoke-gateway-hangup", json!({})).await;
+    let streams = receive_upcall(&mut gateway, "invoke-gateway-hangup").await;
+    drop(gateway);
+    assert_eq!(
+        wait_for_peer_close(streams.stdout).await,
+        std::io::ErrorKind::BrokenPipe
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while broker.audit.records().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal audit after the gateway hangs up");
+    let encoded = serde_json::to_value(broker.audit.records()).unwrap();
+    assert_eq!(encoded[1]["error"], "peer-disconnected");
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capacity_exhausted_frame() {
+    let broker = SpawnBroker::start(1).await;
+    let mut parent = broker.invoke("invoke-holds-the-permit", json!({})).await;
+    let streams = receive_upcall(&mut parent, "invoke-holds-the-permit").await;
+    let mut child = DescriptorStream::new(UnixStream::connect(&broker.socket).await.unwrap());
+    let refusal = read_response(&mut child).await.0;
+    let BrokerResponse::Error { code, .. } = refusal else {
+        panic!("expected a capacity refusal, got {refusal:?}");
+    };
+    assert_eq!(code, ERROR_CAPACITY_EXHAUSTED);
+    drop(streams);
+    answer_upcall(&mut parent, 0, "").await;
+    assert_eq!(
+        terminal(&mut parent).await.outcome,
+        InvocationOutcome::Succeeded
+    );
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn child_panic_terminal() {
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker.invoke("invoke-child-panic", json!({})).await;
+    let streams = receive_upcall(&mut gateway, "invoke-child-panic").await;
+    {
+        use std::io::Write as _;
+        std::os::unix::net::UnixStream::from(streams.stdout)
+            .write_all(b"partial")
+            .unwrap();
+    }
+    answer_upcall(&mut gateway, 70, "child script panicked").await;
+    let result = terminal(&mut gateway).await;
+    assert_eq!(result.outcome, InvocationOutcome::Failed);
+    assert_eq!(result.exit_status.map(std::num::NonZeroU8::get), Some(70));
+    broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_trap_mid_upcall_still_ends_the_conversation() {
+    let broker = SpawnBroker::start(4).await;
+    let mut gateway = broker
+        .invoke("invoke-parent-trap", json!({"trap": true}))
+        .await;
+    let streams = receive_upcall(&mut gateway, "invoke-parent-trap").await;
+    {
+        use std::io::Write as _;
+        (&std::os::unix::net::UnixStream::from(streams.stdout.try_clone().unwrap()))
+            .write_all(b"x")
+            .unwrap();
+    }
+    assert_eq!(
+        wait_for_peer_close(streams.stdout).await,
+        std::io::ErrorKind::BrokenPipe
+    );
+    answer_upcall(&mut gateway, 0, "").await;
+    assert_eq!(
+        terminal(&mut gateway).await.outcome,
+        InvocationOutcome::Failed
+    );
+    broker.stop().await;
 }
