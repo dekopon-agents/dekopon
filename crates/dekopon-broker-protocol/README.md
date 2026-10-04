@@ -62,10 +62,32 @@ callers reject descriptors on other variants; the generic frame codec does not i
 `ClientError` and its execution-phase distinction. Metadata and descriptor possession grant no
 provider authority.
 
+`Upcall` is a broker response within an invocation, carrying the parent invocation ID,
+script, optional `traceParent`, and stdin kind (`none`, `inherit`, or `reader`). Its
+SCM_RIGHTS descriptors are ordered `[child_stdout_write]`, then
+`[child_stdin_read]` unless stdin is `none`; a missing or extra descriptor is a
+typed protocol error and the received descriptors close on refusal. `UpcallResult`
+is the gateway request carrying the child's status byte and bounded stderr, with
+no descriptors. A stray `UpcallResult` as a first request is `invalid-request`;
+an unexpected `Upcall` to a single-response client is `UnexpectedResponse`. These
+frames carry neither authority nor identity; the broker still authorizes each
+child invocation under the original attested leg. Until the conversation loop is
+wired, the host refuses the import and the ordinary client rejects an upcall.
+
 An inventory row's `bytes` is nullable: null means unknown, while numeric zero means a known
 empty file. The gateway snapshots rows after resolving referenced inputs; each passed descriptor
 must have a known length matching fstat. Unreferenced unknown rows remain listable without fetches.
 Attached-output lengths remain mandatory. Upgrade both daemons together for this wire change.
+
+The staged nesting protocol adds `Upcall { parent, script, traceParent, stdin }`
+responses and `UpcallResult { status, stderr }` requests on the same connection.
+The upcall carries the child stdout write descriptor first, then a child stdin
+read descriptor for `inherit` or `reader`; `none` carries only stdout. Missing,
+extra, or unknown descriptor declarations are protocol failures and close all
+received descriptors. An unsolicited upcall on the current one-shot client is
+an unexpected response; an unsolicited `UpcallResult` at broker entry receives
+`invalid-request`. The conversation loop and actual child execution are not yet
+wired at this intermediate head.
 
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's
 `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases

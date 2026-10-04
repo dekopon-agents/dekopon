@@ -21,7 +21,6 @@ fn asset_dependency_mirrors_match_the_canonical_package() {
 fn stdio_dependency_mirrors_match_the_canonical_package() {
     let canonical = include_str!("../../../wit/stdio/stdio.wit");
     for mirror in [
-        include_str!("../../../wit/http/deps/stdio.wit"),
         include_str!("../../../wit/spawn/deps/stdio.wit"),
         include_str!("../wit/deps/stdio.wit"),
         include_str!("../../dekopon-broker-host/wit/deps/stdio.wit"),

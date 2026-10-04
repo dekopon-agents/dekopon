@@ -97,6 +97,19 @@ The HTTP 1.1 WIT package (buffered `send` and asset-backed `stream`) and guest/h
 - `examples/providers/http-probe/wit/deps/http.wit`
 - `examples/providers/http-raw-probe/wit/deps/http.wit`
 
+The spawn package is mirrored byte-for-byte at:
+
+- `wit/spawn/spawn.wit`
+- `crates/dekopon-provider-sdk/wit/deps/spawn.wit`
+- `crates/dekopon-broker-host/wit/deps/spawn.wit`
+
+The SDK's `wit/spawn-client.wit` imports stdio and `dekopon:spawn/run@0.1.0`; the
+broker host's private provider world imports the same interface. The published
+`provider@0.4.0` package and all seven checked probes remain unchanged at their
+import boundaries: none declares spawn. The publication workflow checks the spawn
+and stdio mirrors, builds and validates the spawn package, checks its interface,
+and round-trips its bytes through the local registry before publishing on a tag.
+
 The storage package is mirrored byte-for-byte at:
 
 - `wit/storage/storage.wit`
@@ -142,7 +155,7 @@ the WIT interface versions they import; a broker host crate may register adapter
 for multiple supported WIT versions. Compatible native HTTP-library upgrades do not
 require provider rebuilds.
 
-The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock), independently define the HTTP, storage, clock, and random packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0` packages independently. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
+The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock), and [`../wit/spawn/wkg.toml`](../wit/spawn/wkg.toml) plus [`../wit/spawn/wkg.lock`](../wit/spawn/wkg.lock), independently define the HTTP, storage, clock, random, and spawn packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0`, and `dekopon:spawn@0.1.0` packages independently. Spawn depends on `dekopon:stdio@0.1.0` and declares no world. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
 `dekopon-broker-host` links project-owned HTTP `@1.1.0` only,
 asset `@0.1.0`, storage, both clock interfaces, and OS entropy, consumes `AuthorizedInvocation` and an exact optional storage
