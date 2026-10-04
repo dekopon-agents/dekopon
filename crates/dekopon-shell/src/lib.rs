@@ -475,7 +475,26 @@ impl Interpreter {
         invoker: &dyn CapabilityInvoker,
         tree: &TreeContext,
     ) -> ScriptOutcome {
-        interp::run_with_tree(script, None, invoker, self.limits, tree)
+        interp::run_with_tree(script, None, None, invoker, self.limits, tree)
+    }
+
+    pub fn run_child(
+        &self,
+        script: &str,
+        stdin: Option<std::os::unix::net::UnixStream>,
+        invoker: &dyn CapabilityInvoker,
+        tree: &TreeContext,
+    ) -> ScriptOutcome {
+        match stdin.map(pipe::PipeReader::from_socket).transpose() {
+            Ok(stdin) => interp::run_with_tree(script, None, stdin, invoker, self.limits, tree),
+            Err(_unreadable) => ScriptOutcome {
+                output: "dekopon-shell: the child script's stdin could not be opened".to_owned(),
+                exit_code: ExitCode::FAILURE,
+                truncated: false,
+                capability_calls: 0,
+                steps: 0,
+            },
+        }
     }
 
     pub fn run_seed(

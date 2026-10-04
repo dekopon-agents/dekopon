@@ -352,6 +352,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
                 input,
             },
             streams,
+            async |_upcall| unreachable!(),
         )
         .await
         .expect("invoke the proposal");
@@ -410,7 +411,12 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
         .expect("inspect the surface");
     assert!(capabilities.is_empty() && words.is_empty());
     let result = client
-        .invoke(None, request("invoke-direct"), Default::default())
+        .invoke(
+            None,
+            request("invoke-direct"),
+            Default::default(),
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect("a denial is a completed invocation response");
     assert_eq!(result.result.outcome, InvocationOutcome::Denied);
@@ -591,7 +597,12 @@ when { context.capability == "http-probe.fetch"
     };
     let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(Some(session()), invocation.clone(), streams)
+        .invoke(
+            Some(session()),
+            invocation.clone(),
+            streams,
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect("secret invocation succeeds");
     assert_eq!(
@@ -612,7 +623,12 @@ when { context.capability == "http-probe.fetch"
         "method": "GET"
     });
     let denied = client
-        .invoke(Some(session()), invocation, Default::default())
+        .invoke(
+            Some(session()),
+            invocation,
+            Default::default(),
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect("host refusal is accounted");
     assert_eq!(denied.result.outcome, InvocationOutcome::Failed);
@@ -669,6 +685,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
             Some(session()),
             request("invoke-outcome-unaudited"),
             Default::default(),
+            async |_upcall| unreachable!(),
         )
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
@@ -687,6 +704,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
             Some(session()),
             request("invoke-never-ran"),
             Default::default(),
+            async |_upcall| unreachable!(),
         )
         .await
         .expect_err("a full audit cannot authorize");
@@ -740,7 +758,12 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let (streams, stdout) = stdio(None);
     let result = client
-        .invoke(Some(session()), request("invoke-attested-socket"), streams)
+        .invoke(
+            Some(session()),
+            request("invoke-attested-socket"),
+            streams,
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect("attested invocation completes");
     assert_eq!(
@@ -816,6 +839,7 @@ async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
                     }),
                     ..Default::default()
                 },
+                async |_upcall| unreachable!(),
             )
             .await
     });
@@ -884,6 +908,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
             Some(session()),
             request("invoke-ungranted-socket"),
             Default::default(),
+            async |_upcall| unreachable!(),
         )
         .await
         .expect("a refused attestation is still a completed invocation response");
@@ -1352,7 +1377,12 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     invocation.input = json!({"assetMode": "attach"});
     let (streams, attached_stdout) = stdio(None);
     let attached = client
-        .invoke(Some(session()), invocation, streams)
+        .invoke(
+            Some(session()),
+            invocation,
+            streams,
+            async |_upcall| unreachable!(),
+        )
         .await
         .unwrap();
     assert_eq!(attached.result.outcome, InvocationOutcome::Succeeded);
@@ -1386,6 +1416,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
                 sends_remaining: 1,
                 streams: streams.streams,
             },
+            async |_upcall| unreachable!(),
         )
         .await
         .unwrap();
@@ -1399,7 +1430,12 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     invocation.capability = capability.clone();
     invocation.input = json!({"assetMode": "budget-write", "bytes": 1025});
     let refused = client
-        .invoke(Some(session()), invocation, InvokeAssets::default())
+        .invoke(
+            Some(session()),
+            invocation,
+            InvokeAssets::default(),
+            async |_upcall| unreachable!(),
+        )
         .await
         .unwrap();
     assert_eq!(refused.result.outcome, InvocationOutcome::Failed);

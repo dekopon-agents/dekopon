@@ -438,6 +438,7 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
                 }),
                 ..Default::default()
             },
+            async |_upcall| unreachable!(),
         )
         .await
         .expect("the authorized invocation completes");

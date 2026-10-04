@@ -725,7 +725,12 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     });
     let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
     let lost = client
-        .invoke(None, invocation(), super::InvokeAssets::default())
+        .invoke(
+            None,
+            invocation(),
+            super::InvokeAssets::default(),
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect_err("a lost response must fail");
     server.await.expect("server fixture exits");
@@ -751,7 +756,12 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     };
     let client = BrokerClient::new(&unread, uid, tight).expect("valid client limits");
     let oversized = client
-        .invoke(None, invocation(), super::InvokeAssets::default())
+        .invoke(
+            None,
+            invocation(),
+            super::InvokeAssets::default(),
+            async |_upcall| unreachable!(),
+        )
         .await
         .expect_err("an oversized proposal must fail");
     drop(listener);

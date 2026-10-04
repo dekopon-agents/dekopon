@@ -158,6 +158,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
                 }),
                 ..Default::default()
             },
+            async |_upcall| unreachable!(),
         )
         .await
         .expect("the authorized invocation completes");
