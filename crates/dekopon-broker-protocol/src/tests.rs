@@ -552,6 +552,69 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn unsolicited_upcall_is_refused_and_its_descriptor_is_closed() {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use tokio::net::UnixListener;
+
+    use super::{BrokerClient, BrokerResponse, ClientError, DescriptorStream, UpcallStdin};
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind fixture");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .expect("private socket");
+    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let mut stream = DescriptorStream::new(stream);
+        stream
+            .read_frame::<RequestEnvelope>(limits)
+            .await
+            .expect("request");
+        let (mut reader, writer) = tokio::net::UnixStream::pair().expect("stdout pipe");
+        stream
+            .write_frame(
+                &ResponseEnvelope {
+                    api_version: ProtocolVersion::V1Alpha2,
+                    response: BrokerResponse::Upcall {
+                        parent: invocation().id,
+                        script: "echo child".to_owned(),
+                        trace_parent: None,
+                        stdin: UpcallStdin::None,
+                    },
+                },
+                &[writer.as_fd()],
+                limits,
+            )
+            .await
+            .expect("upcall frame");
+        drop(writer);
+        let mut byte = [0];
+        use tokio::io::AsyncReadExt as _;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reader.read(&mut byte))
+                .await
+                .expect("received descriptor is released")
+                .expect("pipe read"),
+            0
+        );
+    });
+    let client = BrokerClient::new(&socket, uid, limits).expect("client");
+    assert!(matches!(
+        client.capabilities().await,
+        Err(ClientError::UnexpectedResponse)
+    ));
+    server.await.expect("server exits");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn framing_failures_keep_the_executed_or_not_distinction() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 

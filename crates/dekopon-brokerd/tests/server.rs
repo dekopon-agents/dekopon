@@ -963,6 +963,54 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unsolicited_upcall_result_is_an_invalid_request() {
+    use dekopon_broker_protocol::BrokerRequest;
+
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("unsolicited.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        &RequestEnvelope {
+            api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::UpcallResult {
+                status: 0,
+                stderr: String::new(),
+            },
+        },
+        limits.frame,
+    )
+    .await
+    .expect("send stray result");
+    let response = read_frame::<_, ResponseEnvelope>(&mut stream, limits.frame)
+        .await
+        .expect("refusal");
+    assert!(
+        matches!(response.response, BrokerResponse::Error { code, .. } if code == ERROR_INVALID_REQUEST)
+    );
+    assert!(audit.records().is_empty());
+    assert_eq!(stream.read(&mut [0]).await.expect("connection closes"), 0);
+    shutdown_send.send(()).expect("shutdown");
+    task.await.expect("join").expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_over_the_socket() {
     let uid = current_uid();
     let directory = private_directory();
