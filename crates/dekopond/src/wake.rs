@@ -177,6 +177,14 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(script: &str) -> Self {
+        Self {
+            script: script.to_owned(),
+            prev: String::new(),
+        }
+    }
+
     pub(crate) fn baseline(
         script: String,
         leg: &dyn CapabilityInvoker,
