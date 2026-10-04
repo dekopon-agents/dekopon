@@ -2926,11 +2926,11 @@ impl<'a> Evaluator<'a> {
                 })
             });
             let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
-            let result = call
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let result = call.join();
             finished.store(true, atomic::Ordering::Relaxed);
-            let unread = match feeder.map(ScopedJoinHandle::join) {
+            let fed = feeder.map(ScopedJoinHandle::join);
+            let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let unread = match fed {
                 Some(Err(panic)) => std::panic::resume_unwind(panic),
                 Some(Ok(unread)) => unread,
                 None => None,
