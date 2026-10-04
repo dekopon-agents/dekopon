@@ -442,6 +442,17 @@ pub struct ScriptOutcome {
     pub steps: u64,
 }
 
+#[derive(Debug)]
+pub struct ChildStdin(pipe::PipeReader);
+
+impl ChildStdin {
+    /// Adopt the socket before anything writes to its peer: macOS refuses the read timeout on a
+    /// socket whose peer has already closed.
+    pub fn adopt(socket: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
+        pipe::PipeReader::from_socket(socket).map(Self)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Interpreter {
     limits: Limits,
@@ -481,20 +492,12 @@ impl Interpreter {
     pub fn run_child(
         &self,
         script: &str,
-        stdin: Option<std::os::unix::net::UnixStream>,
+        stdin: Option<ChildStdin>,
         invoker: &dyn CapabilityInvoker,
         tree: &TreeContext,
     ) -> ScriptOutcome {
-        match stdin.map(pipe::PipeReader::from_socket).transpose() {
-            Ok(stdin) => interp::run_with_tree(script, None, stdin, invoker, self.limits, tree),
-            Err(_unreadable) => ScriptOutcome {
-                output: "dekopon-shell: the child script's stdin could not be opened".to_owned(),
-                exit_code: ExitCode::FAILURE,
-                truncated: false,
-                capability_calls: 0,
-                steps: 0,
-            },
-        }
+        let stdin = stdin.map(|ChildStdin(reader)| reader);
+        interp::run_with_tree(script, None, stdin, invoker, self.limits, tree)
     }
 
     pub fn run_seed(

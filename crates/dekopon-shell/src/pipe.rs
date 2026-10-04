@@ -4,6 +4,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         Arc,
+        atomic::{self, AtomicBool},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::Duration,
@@ -141,6 +142,17 @@ impl PipeReader {
         budget: &Budget,
         invoker: &dyn CapabilityInvoker,
     ) -> Result<ReadOutcome, LimitExceeded> {
+        self.read_unless(budget, invoker, &AtomicBool::new(false))
+    }
+
+    /// Reads as [`Self::read`] until `stopped` is set, then reports the end without ending the
+    /// stream, so a later reader still finds whatever was not yet read.
+    pub(crate) fn read_unless(
+        &mut self,
+        budget: &Budget,
+        invoker: &dyn CapabilityInvoker,
+        stopped: &AtomicBool,
+    ) -> Result<ReadOutcome, LimitExceeded> {
         if !self.pending.is_empty() {
             let bytes: Vec<u8> = self
                 .pending
@@ -156,6 +168,9 @@ impl PipeReader {
             if let Source::Fixed = self.source {
                 self.ended = true;
                 continue;
+            }
+            if stopped.load(atomic::Ordering::Relaxed) {
+                return Ok(ReadOutcome::End);
             }
             if invoker.cancelled() {
                 return Err(LimitExceeded::Cancelled);
