@@ -58,7 +58,7 @@ input descriptors in reference order; `RunCommand` carries neither. `Invocation`
 `attached`, `removed`, and `sent` fields. Each attached output's `descriptor` equals its position,
 and the output count must exactly match the received descriptor count. Typed request/response
 callers reject descriptors on other variants; the generic frame codec does not inspect metadata.
-`BrokerClient::invoke` accepts `InvokeAssets` and returns `AssetInvocationOutcome`, preserving
+`BrokerClient::invoke` accepts `InvokeAssets` and an async child-upcall handler and returns `AssetInvocationOutcome`, preserving
 `ClientError` and its execution-phase distinction. Metadata and descriptor possession grant no
 provider authority.
 
@@ -75,9 +75,12 @@ child invocation under the original attested leg. The broker alternates between
 an idle upcall request and one pending result: while a result is open, its read
 also detects hangup, so a second peer-disconnect read cannot consume its prefix.
 The broker waits for readability without charging the frame timer; once a
-byte is ready, the frame body is timed. The gateway's terminal client still
-times the entire read; switching it to wait-readable-then-timed is pending
-N1-2. An ordinary one-shot client still rejects an unexpected upcall.
+byte is ready, the frame body is timed. The gateway also waits for readability without charging the frame timer while a
+child runs, then times the frame body. It alternates one upcall and one result
+until the terminal invocation frame. An ordinary one-shot client still rejects
+an unexpected upcall. Gateway cancellation closes the connection before
+joining the bounded child tree; invalid descriptors or frames are typed
+protocol errors that close received descriptors.
 
 An inventory row's `bytes` is nullable: null means unknown, while numeric zero means a known
 empty file. The gateway snapshots rows after resolving referenced inputs; each passed descriptor

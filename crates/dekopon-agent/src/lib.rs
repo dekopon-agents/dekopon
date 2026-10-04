@@ -1990,6 +1990,35 @@ mod tests {
                     UnixStream::from_std(read).expect("child stdout")
                 }
 
+                async fn upcall_with_stdin(
+                    &mut self,
+                    kind: UpcallStdin,
+                    source: &std::os::unix::net::UnixStream,
+                ) -> UnixStream {
+                    let (read, write) =
+                        std::os::unix::net::UnixStream::pair().expect("child stdout");
+                    self.stream
+                        .write_frame(
+                            &ResponseEnvelope {
+                                api_version: ProtocolVersion::V1Alpha2,
+                                response: BrokerResponse::Upcall {
+                                    parent: "invoke-parent".parse().expect("invocation"),
+                                    script: "probe --uri http://stdin/".to_owned(),
+                                    trace_parent: None,
+                                    stdin: kind,
+                                },
+                            },
+                            &[write.as_fd(), source.as_fd()],
+                            FrameLimits::default(),
+                        )
+                        .await
+                        .expect("fake broker writes stdin upcall");
+                    drop(write);
+                    read.set_nonblocking(true)
+                        .expect("nonblocking child stdout");
+                    UnixStream::from_std(read).expect("child stdout")
+                }
+
                 async fn child_exit(&mut self, mut stdout: UnixStream) -> (String, u8) {
                     let mut text = String::new();
                     stdout
@@ -2240,6 +2269,116 @@ mod tests {
                         (Some(trigger), ExitCode::DENIED.get())
                     );
                 }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn inherited_and_reader_stdin_reach_the_child_provider_stage() {
+                for kind in [UpcallStdin::Inherit, UpcallStdin::Reader] {
+                    let directory = private_broker_directory();
+                    let (listener, socket) = listen(directory.path());
+                    let leg = probe_leg(&socket, None);
+                    let broker = tokio::spawn(async move {
+                        let mut parent = accept(&listener).await;
+                        let (source, mut writer) =
+                            std::os::unix::net::UnixStream::pair().expect("input");
+                        writer.write_all(b"child input").expect("input bytes");
+                        drop(writer);
+                        let stdout = parent.upcall_with_stdin(kind, &source).await;
+                        let mut child = accept(&listener).await;
+                        drop(source);
+                        assert_eq!(child.uri, "http://stdin/");
+                        assert_eq!(child.descriptors.len(), 2, "child stage has piped stdin");
+                        let stdin = child.descriptors.remove(0);
+                        let mut stdin = std::os::unix::net::UnixStream::from(stdin);
+                        use std::io::Read as _;
+                        let mut bytes = String::new();
+                        stdin
+                            .read_to_string(&mut bytes)
+                            .expect("child provider stdin");
+                        drop(stdin);
+                        child.answer(InvocationOutcome::Succeeded, &bytes).await;
+                        let exit = parent.child_exit(stdout).await;
+                        parent.answer(InvocationOutcome::Succeeded, "").await;
+                        exit
+                    });
+                    assert_eq!(invoke_in(leg).await, CapabilityCallResult::Succeeded);
+                    assert_eq!(
+                        broker.await.expect("fake broker"),
+                        ("child input\n".to_owned(), 0)
+                    );
+                }
+            }
+
+            struct PanickingJobs;
+
+            impl dekopon_shell::JobControl for PanickingJobs {
+                fn start(
+                    &self,
+                    _seed: dekopon_shell::JobSeed,
+                ) -> Result<dekopon_shell::JobId, dekopon_shell::JobRefusal> {
+                    panic!("child job controller panicked")
+                }
+
+                fn list(&self) -> Vec<dekopon_shell::JobSummary> {
+                    Vec::new()
+                }
+
+                fn wait(
+                    &self,
+                    _ids: &[dekopon_shell::JobId],
+                    _keep_waiting: &dyn Fn() -> bool,
+                ) -> Vec<Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal>>
+                {
+                    Vec::new()
+                }
+
+                fn kill(&self, _id: dekopon_shell::JobId) -> Result<(), dekopon_shell::JobRefusal> {
+                    Ok(())
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn child_panic_yields_status_70_and_terminal_parent_result() {
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let leg =
+                    probe_leg(&socket, None).with_job_control(std::sync::Arc::new(PanickingJobs));
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let stdout = parent.upcall("echo hi &", None).await;
+                    let (output, status) = parent.child_exit(stdout).await;
+                    parent.answer(InvocationOutcome::Succeeded, "").await;
+                    (output, status)
+                });
+                assert_eq!(invoke_in(leg).await, CapabilityCallResult::Succeeded);
+                let (output, status) = broker.await.expect("fake broker");
+                assert_eq!(status, 70);
+                assert!(output.is_empty(), "panicked child does not claim stdout");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn dropped_child_stdout_still_receives_a_terminal_status() {
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let leg = probe_leg(&socket, None);
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let stdout = parent.upcall("printf child", None).await;
+                    drop(stdout);
+                    let (result, descriptors) = parent
+                        .stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .expect("child still completes after its reader drops");
+                    assert!(descriptors.is_empty());
+                    let BrokerRequest::UpcallResult { status, .. } = result.request else {
+                        panic!("expected child status");
+                    };
+                    parent.answer(InvocationOutcome::Succeeded, "").await;
+                    status
+                });
+                assert_eq!(invoke_in(leg).await, CapabilityCallResult::Succeeded);
+                assert_eq!(broker.await.expect("fake broker"), 0);
             }
 
             #[tokio::test(flavor = "multi_thread")]

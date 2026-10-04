@@ -17,10 +17,11 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError, CommandRunOutcome,
-    DescriptorStream, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    Attestation, BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
+    ClientError, CommandRunOutcome, Conversation, ConversationKind, DescriptorStream,
+    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
     ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
-    UpcallStdin, UpcallStreams, read_frame, write_frame,
+    Trigger, UpcallStdin, UpcallStreams, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, capabilities,
@@ -1526,6 +1527,36 @@ async fn a_capability_the_owner_did_not_list_gets_no_constraint_set() {
     );
 }
 
+fn spawn_catalog() -> ConstraintCatalog {
+    let mut write = probe_constraint_set();
+    write.effect = EffectKind::ExternalWrite;
+    write.risk = RiskLevel::High;
+    ConstraintCatalog::new([
+        ("cli-probe.upper".parse().unwrap(), probe_constraint_set()),
+        ("cli-probe.write".parse().unwrap(), write),
+    ])
+    .expect("both fixture capabilities have constraints")
+}
+
+fn spawn_policy() -> PolicyEngine {
+    let world = PolicyWorld::new(
+        ["caller", "cpetersen"]
+            .into_iter()
+            .map(|name| name.parse().unwrap()),
+        ["cli-probe.upper", "cli-probe.write"]
+            .into_iter()
+            .map(|name| (name.parse().unwrap(), "cli-probe".parse().unwrap())),
+    )
+    .expect("spawn policy world");
+    PolicyEngine::new(
+        &format!(
+            "{POLICY}\n@id(\"chat-agent-write\")\npermit(principal == Dekopon::Principal::\"cpetersen\", action == Dekopon::Action::\"cli-probe.write\", resource == Dekopon::Provider::\"cli-probe\") when {{ context.via == \"caller\" && context.agent == \"chat-agent\" && context has trigger && context.trigger == \"message\" }};"
+        ),
+        &world,
+    )
+    .expect("write allowed by policy but not by probe")
+}
+
 struct SpawnBroker {
     _directory: tempfile::TempDir,
     _component: tempfile::NamedTempFile,
@@ -1548,8 +1579,8 @@ impl SpawnBroker {
                 registry,
                 "broker-test".parse().unwrap(),
                 "policy-test".to_owned(),
-                probe_engine(POLICY, ["caller", "cpetersen"]),
-                probe_catalog(),
+                spawn_policy(),
+                spawn_catalog(),
                 CredentialStore::empty(),
                 identities(),
                 Arc::clone(&audit),
@@ -1563,7 +1594,13 @@ impl SpawnBroker {
         let identities = BTreeMap::from([(
             current_uid(),
             MappedPeer {
-                context: context("caller"),
+                context: AuthenticatedContext::new(
+                    "caller".parse().unwrap(),
+                    Actor::Service {
+                        principal: "caller".parse().unwrap(),
+                    },
+                )
+                .unwrap(),
                 attestor: Some(attestor_grant()),
             },
         )]);
@@ -1606,6 +1643,74 @@ impl SpawnBroker {
             .await
             .expect("server task")
             .expect("clean shutdown");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_broker_refuses_probe_and_job_child_writes_during_spawn_upcalls() {
+    for trigger in [Trigger::Probe, Trigger::Job] {
+        let broker = SpawnBroker::start(4).await;
+        let claim = Attestation::for_chat(
+            subject(),
+            agent("chat-agent"),
+            ChatScopeClaim {
+                transport: "scientist-slack".parse().unwrap(),
+                kind: ChatTransportKind::Slack,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("t0123abc".to_owned()),
+                    id: "c0123abc".to_owned(),
+                    thread: Some("1712345678.000100".to_owned()),
+                },
+                trigger,
+            },
+        );
+        let mut parent = DescriptorStream::new(UnixStream::connect(&broker.socket).await.unwrap());
+        let parent_id = "parent-child-write";
+        parent
+            .write_frame(
+                &RequestEnvelope::invoke(
+                    Some(claim.clone().bound_to(parent_id.parse().unwrap())),
+                    request(parent_id),
+                    Vec::new(),
+                    0,
+                    None,
+                ),
+                &[],
+                server_limits().frame,
+            )
+            .await
+            .unwrap();
+        let stdout = receive_upcall(&mut parent, parent_id).await;
+        let client = BrokerClient::new(&broker.socket, current_uid(), server_limits().frame)
+            .expect("authenticated child client");
+        let mut child = request("nested-write");
+        child.capability = "cli-probe.write".parse().unwrap();
+        let result = client
+            .invoke(
+                Some(claim),
+                child,
+                Default::default(),
+                async |_upcall| unreachable!(),
+            )
+            .await
+            .expect("real broker answers child proposal");
+        assert_eq!(result.result.outcome, InvocationOutcome::Denied);
+        assert_eq!(
+            result.result.error.as_deref(),
+            Some(match trigger {
+                Trigger::Probe => "probe-write",
+                Trigger::Job => "policy-denied",
+                Trigger::Message | Trigger::Wake => unreachable!(),
+            })
+        );
+        drop(stdout);
+        answer_upcall(&mut parent, 126, "").await;
+        assert_eq!(
+            terminal(&mut parent).await.outcome,
+            InvocationOutcome::Failed
+        );
+        broker.stop().await;
     }
 }
 

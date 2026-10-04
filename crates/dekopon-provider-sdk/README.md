@@ -22,10 +22,16 @@ grants their imports. `Clock` remains wall-only; `Random::fill` splits a buffer 
 export. `Spawn::run(script, ChildStdin)` exposes a child stdout reader and a status
 resource; `Child::wait(self)` consumes and drops that reader before waiting.
 `ChildStdin` is `None`, `Inherit`, or `Reader(Stdin)`; running twice before a wait
-is refused as `SpawnError::Busy`. The native handle currently refuses with
+is refused as `SpawnError::Busy`. `Inherit` shares the remaining bytes of the
+caller's stdin with the child: the gateway pump can read ahead, so the parent
+must not read its stdin after `run(Inherit)`. Child stdout is bounded script
+text yielded at exit, with a trailing newline when nonempty; ordinary
+`exit.stderr` is empty (the shell has no separate script stderr), and a child
+panic yields status 70. The native handle currently refuses with
 `ComponentHarnessRequired` until the native fake is wired; the component host
-currently traps the spawn import as unavailable. Neither is a working child
-execution in this intermediate commit. The monotonic clock includes elapsed
+currently traps the spawn import as unavailable. Gateway handling of broker
+upcalls is wired, but SDK-driven guest execution remains staged in this
+intermediate commit. The monotonic clock includes elapsed
 child wait time; the separate work clock will park during a child wait.
 The wire response and published provider WIT remain unchanged.
 

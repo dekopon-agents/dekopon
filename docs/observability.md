@@ -850,6 +850,8 @@ the refresh failure classes remain part of the migration contract.
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
 | `broker_connection_rejected` | warn | `dekopon-brokerd` | `reason=connection_limit`, `refusal.written` (whether the single non-blocking capacity frame fit) |
 | `broker_upcall_failed` | warn | `dekopon-brokerd` | `error.kind` classifies a gateway hangup, invalid result or failed frame exchange; the parent is cancelled and a terminal frame is attempted |
+| `gateway_child_stdin_unavailable` | warn | `dekopon-agent` | local error if child stdin cannot be adopted; the gateway answers the upcall with a failure status, without stdin bytes |
+| `gateway_child_script_panicked` | warn | `dekopon-agent` | parent invocation ID; the gateway answers with status 70 and releases child stdout |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 | `broker_peer_unmapped` | warn | `dekopon-brokerd` | `peer.uid`, the UID the refused connection authenticated as |
@@ -877,6 +879,8 @@ failure names its kind, not the bytes that failed to decode.
 its `capacity-exhausted` frame is best effort, and `refusal.written=false` means the peer may
 only see a closed connection. `broker_upcall_failed` records the reason an open child conversation
 was cancelled without recording the child's script or stderr.
+
+The `gateway.upcall` span adopts the broker-provided trace parent, carries the parent invocation ID and parents the child script's nested broker calls; it does not record script or stdin bytes. The warn events above are diagnostics, not new `audit.event` names.
 
 `broker_capacity_exhausted` and `broker_accept_retried` report a condition outside any one request.
 The first says a bounded broker resource — the in-memory audit log of an embedding that serves

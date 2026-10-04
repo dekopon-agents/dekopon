@@ -2491,6 +2491,57 @@ fn an_upcall_with_an_unknown_stdin_kind_is_refused() {
     assert!(serde_json::from_value::<ResponseEnvelope>(frame).is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_peer_credentials_enotconn_believes_only_capacity_refusal() {
+    use super::{ClientError, DescriptorStream, ERROR_CAPACITY_EXHAUSTED};
+    for code in [ERROR_CAPACITY_EXHAUSTED, "untrusted"] {
+        let (client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let response = ResponseEnvelope::error(code, "fixture refusal");
+        let peer = tokio::spawn(async move {
+            DescriptorStream::new(server)
+                .write_frame(&response, &[], FrameLimits::default())
+                .await
+                .expect("refusal written");
+        });
+        let mut client = DescriptorStream::new(client);
+        let error = super::refusal_before_credentials(
+            &mut client,
+            std::io::Error::from(std::io::ErrorKind::NotConnected),
+            FrameLimits::default(),
+        )
+        .await;
+        peer.await.expect("peer joined");
+        match code {
+            ERROR_CAPACITY_EXHAUSTED => assert!(matches!(
+                error,
+                ClientError::Remote { code, .. } if code == ERROR_CAPACITY_EXHAUSTED
+            )),
+            _ => assert!(matches!(error, ClientError::PeerCredentials { .. })),
+        }
+    }
+}
+
+#[test]
+fn an_upcall_with_a_non_socket_descriptor_is_refused() {
+    use super::{UpcallStdin, UpcallStreams};
+    use std::os::fd::OwnedFd;
+    let file = tempfile::tempfile().expect("regular file");
+    assert!(matches!(
+        UpcallStreams::receive(UpcallStdin::None, vec![OwnedFd::from(file)]),
+        Err(ProtocolError::UnexpectedDescriptors)
+    ));
+    let (stdout, _reader) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let file = tempfile::tempfile().expect("regular file");
+    assert!(matches!(
+        UpcallStreams::receive(
+            UpcallStdin::Reader,
+            vec![OwnedFd::from(stdout), OwnedFd::from(file)]
+        ),
+        Err(ProtocolError::UnexpectedDescriptors)
+    ));
+}
+
 #[test]
 fn upcall_streams_own_stdout_then_stdin_in_wire_order() {
     use super::{UpcallStdin, UpcallStreams};
