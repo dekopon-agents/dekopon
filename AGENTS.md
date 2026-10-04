@@ -74,6 +74,20 @@ against these; a change that moves away from one stops for a human decision.
   Markdown-only work uses [documentation gates](docs/development.md#documentation-gates), not Rust builds.
 - Check disk before expensive builds; follow the documented artifact lifecycle.
   Never delete active builds or another owner's artifacts.
+- Before a push, run CI's own steps for what you touched: rebuild and byte-compare the checked
+  components when the SDK or WIT changes ([provider change map](docs/development.md#provider-contract-or-host)),
+  the audit-event documentation gate when you add a trace event, rustdoc with `-D warnings`, `cargo deny`.
+- A fleet re-pin moves every exact pin a provider carries, not only `dekopon-provider-*`: providers
+  also pin `dekopon-core`, `-capability`, `-broker`, `-broker-protocol` and `-broker-host` at the
+  workspace version.
+- A non-essential provider does not hold up a fleet rollout. When one is stuck (a release snag,
+  a failing review, an owner-only step), ship without it and journal why it blocked.
+- A provider named like an interface it imports takes a distinct package name
+  (`dekopon:asset-provider` beside `dekopon:asset`).
+- On macOS, a local Wasm build of a provider that links zstd needs `AR_wasm32_unknown_unknown`
+  set to `llvm-ar`; the system `ar` writes an empty archive. Linux CI is unaffected.
+- Verify a provider release by its release assets: the shared workflow attests the Wasm and SBOM
+  files, so `gh attestation verify oci://…` returns 404 by design.
 - Report checks actually observed, exact head/artifact tested and verification gaps.
   Local tests do not prove deployed behavior or remote CI; never claim otherwise.
 - Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and review precede merge.
@@ -190,6 +204,7 @@ The name states the invariant and the primitives are real; one test per behaviou
 - Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
 - No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`, exactly-the-ceiling beside one-over twins, a 1 ns-over timeout cap, `assert!(elapsed < Duration::from_millis(50))`, production bytes canonicalized so a golden fixture is stable (compare parsed `Value`s instead).
 - An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
+- A fake that receives `Invoke` reads its frames with `DescriptorStream`, never plain `read(2)`: on macOS a passed `SCM_RIGHTS` descriptor stays open in the receiver (Linux closes it), so the pipe never sees EOF and the test hangs only on the Mac.
 
 ### Telemetry
 
