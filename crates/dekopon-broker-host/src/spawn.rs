@@ -270,7 +270,141 @@ mod tests {
         settings::SettingsState, storage::StorageState,
     };
 
-    use super::{SpawnTrap, wit};
+    use super::{SpawnState, SpawnTrap, wit};
+
+    #[tokio::test]
+    async fn one_live_child_is_busy_and_abandoning_status_closes_stdout() {
+        use std::io::Write as _;
+        use tokio::sync::mpsc;
+        use wit::{Host as _, HostStatus as _};
+
+        let runtime =
+            Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
+        let http = HttpState::describe(runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
+        let mut store = runtime
+            .store_for_provider(
+                "test-provider",
+                http,
+                StorageState::disabled(),
+                ClockState::invoke(None),
+                SettingsState::describe(),
+            )
+            .unwrap();
+        let (send, mut receive) = mpsc::channel(1);
+        store.data_mut().spawn = SpawnState::invoke(Some(send), 4);
+        let oversized = store
+            .data_mut()
+            .run("12345".into(), wit::Stdin::None)
+            .await
+            .expect_err("script byte limit");
+        assert!(
+            oversized
+                .downcast_ref::<SpawnTrap>()
+                .is_some_and(|error| matches!(error, SpawnTrap::ScriptTooLarge))
+        );
+        let first = store
+            .data_mut()
+            .run("1234".into(), wit::Stdin::None)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = receive.recv().await.expect("upcall queued");
+        assert!(matches!(
+            store
+                .data_mut()
+                .run("next".into(), wit::Stdin::None)
+                .await
+                .unwrap(),
+            Err(wit::SpawnError::Busy)
+        ));
+        store.data_mut().drop(first.status).await.unwrap();
+        assert!(
+            store.data_mut().read_child(1, 8).await.is_empty(),
+            "abandoned child reader is stale"
+        );
+        let mut stdout = std::os::unix::net::UnixStream::from(request.streams.stdout);
+        assert_eq!(
+            stdout.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(
+            store
+                .data_mut()
+                .run("next".into(), wit::Stdin::None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_stdin_is_duplicated_and_reader_stdin_is_pumped_to_eof() {
+        use crate::stdio::ReaderResource;
+        use std::io::{Read as _, Write as _};
+        use tokio::{net::UnixStream, sync::mpsc};
+        use wit::{Host as _, HostStatus as _};
+
+        let runtime =
+            Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
+        let http = HttpState::describe(runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
+        let mut store = runtime
+            .store_for_provider(
+                "test-provider",
+                http,
+                StorageState::disabled(),
+                ClockState::invoke(None),
+                SettingsState::describe(),
+            )
+            .unwrap();
+        let (send, mut receive) = mpsc::channel(1);
+        store.data_mut().spawn = SpawnState::invoke(Some(send), 32);
+        let (parent, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+        parent.set_nonblocking(true).unwrap();
+        store.data_mut().stdio.stdin = Some(UnixStream::from_std(parent).unwrap());
+        feeder.write_all(b"inherited").unwrap();
+        feeder.shutdown(std::net::Shutdown::Write).unwrap();
+        let first = store
+            .data_mut()
+            .run("one".into(), wit::Stdin::Inherit)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = receive.recv().await.unwrap();
+        assert_eq!(request.stdin, dekopon_broker_protocol::UpcallStdin::Inherit);
+        let mut inherited = std::os::unix::net::UnixStream::from(request.streams.stdin.unwrap());
+        let mut bytes = Vec::new();
+        inherited.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"inherited");
+        store.data_mut().drop(first.status).await.unwrap();
+        let (source, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+        source.set_nonblocking(true).unwrap();
+        store.data_mut().stdio.stdin = Some(UnixStream::from_std(source).unwrap());
+        feeder.write_all(b"pumped").unwrap();
+        feeder.shutdown(std::net::Shutdown::Write).unwrap();
+        let reader = store.data_mut().table.push(ReaderResource::Stdin).unwrap();
+        let second = store
+            .data_mut()
+            .run("two".into(), wit::Stdin::Reader(reader))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = receive.recv().await.unwrap();
+        assert_eq!(request.stdin, dekopon_broker_protocol::UpcallStdin::Reader);
+        let read = std::os::unix::net::UnixStream::from(request.streams.stdin.unwrap());
+        let bytes = tokio::task::spawn_blocking(move || {
+            let mut read = read;
+            let mut bytes = Vec::new();
+            read.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"pumped");
+        assert!(
+            store.data().stdio.stdin.is_none(),
+            "reader consumes parent stdin"
+        );
+        store.data_mut().drop(second.status).await.unwrap();
+    }
 
     #[tokio::test]
     async fn spawn_refusal_is_typed_and_does_not_poison_the_host() {
