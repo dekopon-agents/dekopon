@@ -629,6 +629,7 @@ impl<P: Provider> Native<P> {
     /// Runs one call with nothing piped in, capturing its stdout, stderr and exit status.
     #[must_use]
     pub fn call(&self, capability: &str, input: &str) -> NativeOutput {
+        let scripts = Arc::new(Mutex::new(self.scripts.clone()));
         let port = FakePort {
             clock: self.clock,
             monotonic: self.monotonic,
@@ -636,7 +637,7 @@ impl<P: Provider> Native<P> {
             entropy_cursor: 0,
             http: self.http.clone(),
             requests: Arc::clone(&self.requests),
-            scripts: self.scripts.clone(),
+            scripts: Arc::clone(&scripts),
             children: Arc::clone(&self.children),
         };
         let stdout = Captured::default();
@@ -649,6 +650,9 @@ impl<P: Provider> Native<P> {
         let NativeExit { status, stderr } = provider::with_port(port, || {
             provider::invoke_native::<P>(capability, input, stdio)
         });
+        if !scripts.lock().is_empty() {
+            panic!("{}", HarnessError::Fixture("expected child not run"));
+        }
         NativeOutput {
             status,
             stdout: std::mem::take(&mut *stdout.0.lock()),
@@ -686,7 +690,7 @@ struct FakePort {
     entropy_cursor: usize,
     http: Option<HttpScript>,
     requests: Arc<Mutex<Vec<Request>>>,
-    scripts: VecDeque<ChildScript>,
+    scripts: Arc<Mutex<VecDeque<ChildScript>>>,
     children: Arc<Mutex<Vec<ChildRun>>>,
 }
 
@@ -694,6 +698,7 @@ impl Port for FakePort {
     fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
         let Some(expected) = self
             .scripts
+            .lock()
             .pop_front()
             .filter(|next| next.script == script)
         else {
