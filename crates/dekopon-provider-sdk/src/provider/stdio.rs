@@ -44,6 +44,17 @@ impl Stdin {
         reader
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn from_native(reader: Box<dyn io::Read>) -> Self {
+        Self(Source::Native(reader))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn into_native(self) -> Box<dyn io::Read> {
+        let Source::Native(reader) = self.0;
+        reader
+    }
+
     /// The input's lines, without their terminators.
     #[must_use]
     pub fn lines(self) -> io::Lines<io::BufReader<Self>> {
@@ -155,6 +166,11 @@ fn write_stderr(text: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 fn write_stderr(text: &str) {
     native::append_stderr(text);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn take_native_stdin() -> Option<Box<dyn io::Read>> {
+    native::take_stdin()
 }
 
 /// The streams of one native invocation.

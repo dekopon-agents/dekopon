@@ -1193,6 +1193,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "wasmparser 0.258.3",
+ "wat",
 ]
 
 [[package]]

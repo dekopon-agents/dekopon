@@ -1,22 +1,26 @@
 use std::{
     any::TypeId,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    io::Read as _,
     marker::PhantomData,
     net::SocketAddr,
+    os::fd::OwnedFd,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, TestImports};
+use dekopon_broker_host::{
+    BrokerHostLimits, BrokerProviderRegistry, TestImports, UpcallExit, UpcallRequest, UpcallStdin,
+};
 use dekopon_capability::{
     ExecutionConstraints, HttpConstraints, ProposedInvocation, broker::AuthorizationGate,
 };
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
 use dekopon_http_host::LoopbackHttpsPin;
 use dekopon_provider_sdk::provider::{
-    self, Header, HttpError, HttpErrorCode, NativeExit, NativeStdio, Port, Provider, Request,
-    Response, StreamedRequest, StreamedResponse,
+    self, Exit, Header, HttpError, HttpErrorCode, NativeChild, NativeChildStdin, NativeExit,
+    NativeStdio, Port, Provider, Request, Response, StreamedRequest, StreamedResponse,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -73,6 +77,35 @@ impl HttpScript {
     }
 }
 
+const UNEXPECTED_CHILD: &str = "unexpected child script";
+const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
+
+/// One scripted child: the script the provider must run next, and how that child behaves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChildScript {
+    pub script: String,
+    pub status: u8,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    /// How long the child runs before it writes its output and exits.
+    pub runs_for: Duration,
+}
+
+/// Evidence of one child the provider ran: its script and the stdin it received.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildRun {
+    pub script: String,
+    pub stdin: ChildInput,
+}
+
+/// A child's stdin, captured up to its first MiB.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildInput {
+    None,
+    Inherit(Vec<u8>),
+    Reader(Vec<u8>),
+}
+
 /// A test invocation builder for a real checked provider component.
 pub struct Run<P: Provider> {
     component: PathBuf,
@@ -81,6 +114,7 @@ pub struct Run<P: Provider> {
     http: Option<Result<ScriptServer, HarnessError>>,
     stdin: Option<Vec<u8>>,
     close_stdout_after: Option<usize>,
+    children: VecDeque<ChildScript>,
     _provider: PhantomData<P>,
 }
 
@@ -98,6 +132,7 @@ impl<P: Provider> Harness<P> {
             http: None,
             stdin: None,
             close_stdout_after: None,
+            children: VecDeque::new(),
             _provider: PhantomData,
         }
     }
@@ -147,6 +182,13 @@ impl<P: Provider> Run<P> {
     #[must_use]
     pub fn http(mut self, script: HttpScript) -> Self {
         self.http = Some(serve_https(script));
+        self
+    }
+
+    /// Scripts the next child the component runs; any other script is a fixture refusal.
+    #[must_use]
+    pub fn child(mut self, script: ChildScript) -> Self {
+        self.children.push_back(script);
         self
     }
 
@@ -250,14 +292,17 @@ impl<P: Provider> Run<P> {
             Some((end, feeder)) => (Some(end.into()), Some(feeder)),
             None => (None, None),
         };
+        let (upcalls, answers) = tokio::sync::mpsc::channel(1);
         let assets = dekopon_broker_host::asset::AssetInputs {
             streams: Some(dekopon_broker_host::Streams {
                 stdin: stdin_end,
                 stdout: host_end.into(),
             }),
+            upcalls: Some(upcalls),
             ..Default::default()
         };
-        let (result, captured, fed) = runtime().block_on(async {
+        let children = self.children;
+        let (result, captured, fed, children) = runtime().block_on(async {
             let close_after = self.close_stdout_after;
             let (closed, ready) = tokio::sync::oneshot::channel();
             let capture = tokio::task::spawn_blocking(move || {
@@ -285,17 +330,19 @@ impl<P: Provider> Run<P> {
             let invoke =
                 registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
             let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
-            let (result, captured) = tokio::join!(invoke, capture);
+            let (result, captured, children) =
+                tokio::join!(invoke, capture, answer_children(answers, children));
             let fed = match feed {
                 Some(task) => Some(task.await),
                 None => None,
             };
-            Ok::<_, HarnessError>((result, captured, fed))
+            Ok::<_, HarnessError>((result, captured, fed, children))
         })?;
         drop(server);
         if fed.is_some_and(|result| result.is_err()) {
             return Err(HarnessError::Fixture("stdin feeder"));
         }
+        let children = children?;
         let stdout = captured.map_err(|_error| HarnessError::Fixture("stdout capture"))??;
         if stdout.len() > 16 * 1024 * 1024 {
             return Err(HarnessError::Fixture("stdout exceeds capture limit"));
@@ -322,8 +369,57 @@ impl<P: Provider> Run<P> {
             stdout,
             stderr,
             http_calls,
+            children,
         })
     }
+}
+
+async fn answer_children(
+    mut upcalls: tokio::sync::mpsc::Receiver<UpcallRequest>,
+    mut scripts: VecDeque<ChildScript>,
+) -> Result<Vec<ChildRun>, HarnessError> {
+    let mut runs = Vec::new();
+    while let Some(UpcallRequest {
+        script,
+        stdin,
+        streams,
+        reply,
+    }) = upcalls.recv().await
+    {
+        let Some(expected) = scripts.pop_front().filter(|next| next.script == script) else {
+            return Err(HarnessError::Fixture(UNEXPECTED_CHILD));
+        };
+        let mut input = Vec::new();
+        if let Some(fd) = streams.stdin {
+            async_stream(fd)?
+                .take(CHILD_INPUT_LIMIT)
+                .read_to_end(&mut input)
+                .await?;
+        }
+        runs.push(ChildRun {
+            script,
+            stdin: match stdin {
+                UpcallStdin::None => ChildInput::None,
+                UpcallStdin::Inherit => ChildInput::Inherit(input),
+                UpcallStdin::Reader => ChildInput::Reader(input),
+            },
+        });
+        tokio::time::sleep(expected.runs_for).await;
+        let mut stdout = async_stream(streams.stdout)?;
+        drop(stdout.write_all(&expected.stdout).await);
+        drop(stdout);
+        drop(reply.send(UpcallExit {
+            status: expected.status,
+            stderr: expected.stderr,
+        }));
+    }
+    Ok(runs)
+}
+
+fn async_stream(fd: OwnedFd) -> std::io::Result<tokio::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(stream)
 }
 
 /// Captured terminal result and HTTP evidence from one real component invocation.
@@ -333,6 +429,7 @@ pub struct ComponentOutput {
     pub stdout: Vec<u8>,
     pub stderr: String,
     pub http_calls: Vec<dekopon_http_host::HttpCallEvidence>,
+    pub children: Vec<ChildRun>,
 }
 
 struct ScriptServer {
@@ -453,6 +550,8 @@ pub struct Native<P: Provider> {
     http: Option<HttpScript>,
     stdin: Option<Vec<u8>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    scripts: VecDeque<ChildScript>,
+    children: Arc<Mutex<Vec<ChildRun>>>,
     _provider: PhantomData<P>,
 }
 
@@ -465,6 +564,8 @@ impl<P: Provider> Default for Native<P> {
             http: None,
             stdin: None,
             requests: Arc::new(Mutex::new(Vec::new())),
+            scripts: VecDeque::new(),
+            children: Arc::new(Mutex::new(Vec::new())),
             _provider: PhantomData,
         }
     }
@@ -501,9 +602,20 @@ impl<P: Provider> Native<P> {
         self.stdin = Some(bytes.into());
         self
     }
+    /// Scripts the next child each call runs; any other script panics as a fixture refusal.
+    #[must_use]
+    pub fn child(mut self, script: ChildScript) -> Self {
+        self.scripts.push_back(script);
+        self
+    }
     #[must_use]
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().clone()
+    }
+    /// The children every call so far ran, in order.
+    #[must_use]
+    pub fn children(&self) -> Vec<ChildRun> {
+        self.children.lock().clone()
     }
     /// Runs one call with nothing piped in, capturing its stdout, stderr and exit status.
     #[must_use]
@@ -515,6 +627,8 @@ impl<P: Provider> Native<P> {
             entropy_cursor: 0,
             http: self.http.clone(),
             requests: Arc::clone(&self.requests),
+            scripts: self.scripts.clone(),
+            children: Arc::clone(&self.children),
         };
         let stdout = Captured::default();
         let stdio = NativeStdio {
@@ -563,9 +677,44 @@ struct FakePort {
     entropy_cursor: usize,
     http: Option<HttpScript>,
     requests: Arc<Mutex<Vec<Request>>>,
+    scripts: VecDeque<ChildScript>,
+    children: Arc<Mutex<Vec<ChildRun>>>,
 }
 
 impl Port for FakePort {
+    fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
+        let Some(expected) = self
+            .scripts
+            .pop_front()
+            .filter(|next| next.script == script)
+        else {
+            panic!("{}", HarnessError::Fixture(UNEXPECTED_CHILD));
+        };
+        let captured = |reader: Box<dyn std::io::Read>| {
+            let mut bytes = Vec::new();
+            drop(reader.take(CHILD_INPUT_LIMIT).read_to_end(&mut bytes));
+            bytes
+        };
+        let stdin = match stdin {
+            NativeChildStdin::None => ChildInput::None,
+            NativeChildStdin::Inherit(reader) => ChildInput::Inherit(captured(reader)),
+            NativeChildStdin::Reader(reader) => ChildInput::Reader(captured(reader)),
+        };
+        self.children.lock().push(ChildRun {
+            script: script.to_owned(),
+            stdin,
+        });
+        self.monotonic = self
+            .monotonic
+            .saturating_add(u64::try_from(expected.runs_for.as_nanos()).unwrap_or(u64::MAX));
+        NativeChild {
+            stdout: Box::new(std::io::Cursor::new(expected.stdout)),
+            exit: Exit {
+                status: expected.status,
+                stderr: expected.stderr,
+            },
+        }
+    }
     fn now_unix_millis(&mut self) -> u64 {
         self.clock
             .unwrap_or_else(SystemTime::now)

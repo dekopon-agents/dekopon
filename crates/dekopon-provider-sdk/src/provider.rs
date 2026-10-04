@@ -14,7 +14,7 @@ pub use handles::{
     Assets, Clock, DurableFiles, Http, Jsonl, Monotonic, Random, Settings, Spawn, Storage,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use port::{Port, with_port};
+pub use port::{NativeChild, NativeChildStdin, Port, with_port};
 #[cfg(not(target_arch = "wasm32"))]
 pub use stdio::{NativeExit, NativeStdio, invoke_native};
 pub use stdio::{Stdin, Stdout, stdin};

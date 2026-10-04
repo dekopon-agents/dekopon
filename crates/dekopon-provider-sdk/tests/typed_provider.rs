@@ -997,16 +997,14 @@ impl Capability for SpawnCall {
 }
 
 #[test]
-fn spawn_signatures_compile_and_native_execution_requires_the_component_harness() {
+fn spawn_signatures_compile_and_declare_the_spawn_import() {
     use dekopon_provider_sdk::provider::{ImportSet, Needs};
     let imports = <SpawnNeeds as Needs>::IMPORTS;
     assert!(imports.contains(ImportSet::SPAWN));
     assert!(imports.contains(ImportSet::RANDOM));
     assert!(!ImportSet::RANDOM.contains(ImportSet::SPAWN));
-    let exit = call::<SpawnFixture>("native-spawn.run", "{}");
-    assert_eq!(exit.status, 1);
     assert_eq!(
-        exit.stderr,
-        "this capability needs the component harness (Harness<P>)\n"
+        <<SpawnFixture as Provider>::Capabilities as dekopon_provider_sdk::provider::Capabilities<SpawnFixture>>::IMPORTS,
+        imports
     );
 }

@@ -51,7 +51,7 @@ mod spawn;
 mod stdio;
 mod storage;
 use clock::ClockState;
-pub use dekopon_broker_protocol::Streams;
+pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, NonPublicHttpsAuthority,
     PlaintextHostError, PlaintextHosts, destinations_cover,
