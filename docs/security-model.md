@@ -90,6 +90,14 @@ gateway's local chat socket is **0600**, owner-only and development-only.
 
 The example reviewer has `github.pull-request.read` and the explicit external-write `github.pull-request.comment`. It does not have, and the example does not declare, `github.pull-request.approve`.
 
+Every provider may import and call `spawn.run`; there is no caller grant list.
+This is an intentional trade: providers can request child scripts, but the
+import is not authority to perform their effects. Each child's provider invoke
+is independently authorized by the broker under the same person, agent,
+attestation and tree budget. The gateway runs the script, not the broker;
+secrets remain broker-side. A probe and a probe-started job retain their
+read-only capability surface, so nesting cannot turn a read into a write.
+
 ## Public DRNs and private resolution
 
 **Status: current.** A model may propose one canonical logical DRN only through the typed top-level
