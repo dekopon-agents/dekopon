@@ -6,6 +6,104 @@ use dekopon_shell::{
     JobWait,
 };
 
+// One fake broker conversation for a job or watch tick. The child Invoke is kept
+// unanswered so only the shared tree deadline can end it.
+async fn parked_nested_broker(
+    directory: &std::path::Path,
+) -> (
+    ResolvedBroker,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use dekopon_broker_protocol::{BrokerResponse, ProtocolVersion, UpcallStdin};
+    use std::os::fd::{AsFd as _, OwnedFd};
+
+    let socket = directory.join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind fake broker");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("secure socket");
+    let frame = FrameLimits {
+        io_timeout: Duration::from_secs(300),
+        ..FrameLimits::default()
+    };
+    let (parked, observed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        async fn next(
+            listener: &UnixListener,
+            frame: FrameLimits,
+        ) -> (DescriptorStream, RequestEnvelope, Vec<OwnedFd>) {
+            let (stream, _) = listener.accept().await.expect("broker accepts connection");
+            let mut stream = DescriptorStream::new(stream);
+            let (request, descriptors) = stream
+                .read_frame::<RequestEnvelope>(frame)
+                .await
+                .expect("request");
+            (stream, request, descriptors)
+        }
+        let (mut surface, request, _) = next(&listener, frame).await;
+        assert!(matches!(
+            request.request,
+            BrokerRequest::Capabilities { .. }
+        ));
+        surface
+            .write_frame(&probe_listing(), &[], frame)
+            .await
+            .expect("surface");
+        let (mut command, request, _) = next(&listener, frame).await;
+        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
+        command
+            .write_frame(&upper_proposal("x"), &[], frame)
+            .await
+            .expect("proposal");
+        let (mut parent, request, descriptors) = next(&listener, frame).await;
+        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        drop(descriptors);
+        let (stdout, write) = std::os::unix::net::UnixStream::pair().expect("child stdout");
+        parent
+            .write_frame(
+                &ResponseEnvelope {
+                    api_version: ProtocolVersion::V1Alpha2,
+                    response: BrokerResponse::Upcall {
+                        parent: "invoke-parent".parse().expect("invocation id"),
+                        script: "probe upper".to_owned(),
+                        trace_parent: None,
+                        stdin: UpcallStdin::None,
+                    },
+                },
+                &[write.as_fd()],
+                frame,
+            )
+            .await
+            .expect("upcall");
+        drop(write);
+        let (mut child_command, request, _) = next(&listener, frame).await;
+        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
+        child_command
+            .write_frame(&upper_proposal("y"), &[], frame)
+            .await
+            .expect("child proposal");
+        let (mut child, request, mut descriptors) = next(&listener, frame).await;
+        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        descriptors.clear(); // Otherwise the fake broker holds stdout open after cancellation.
+        parked.send(()).expect("test awaits parked child");
+        assert!(
+            child.read_frame::<RequestEnvelope>(frame).await.is_err(),
+            "child Invoke must close at deadline"
+        );
+        drop(stdout);
+        // The upcall owner may answer after child cancellation, or close at the same deadline.
+        drop(parent.read_frame::<RequestEnvelope>(frame).await);
+    });
+    (
+        ResolvedBroker {
+            socket_path: socket,
+            server_uid: crate::current_uid(),
+            frame,
+        },
+        observed,
+        server,
+    )
+}
+
 fn job_route(script_timeout: Duration, job_timeout: Duration) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         script_timeout,
@@ -60,6 +158,85 @@ fn job_triggers(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> Vec<
         }
     }
     triggers
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
+    let directory = temporary();
+    let (broker, parked, server) = parked_nested_broker(directory.path()).await;
+    let jobs = Arc::new(Jobs::new(2));
+    let inbound = message("deadline");
+    let owner = JobOwner::of(&inbound);
+    let anchor =
+        crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
+    let limits = dekopon_shell::Limits {
+        timeout: Duration::from_secs(30),
+        ..dekopon_shell::Limits::default()
+    };
+    let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
+    tokio::task::spawn_blocking(move || {
+        dekopon_shell::Interpreter::new(limits).run("probe upper &", &ProbeInvoker(context))
+    })
+    .await
+    .expect("job launched");
+    parked
+        .await
+        .expect("run_seed reached its nested child Invoke");
+    let start = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rows = jobs.list(&owner);
+            if rows.len() == 1 && !running(&rows) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("job finishes at the tree deadline");
+    assert!(start.elapsed() <= Duration::from_secs(31));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("broker released")
+        .expect("broker completed");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_probe_tick_ends_its_nested_invoke_at_tree_deadline() {
+    use dekopon_agent::BrokerLeg;
+    use dekopon_broker_protocol::BrokerClient;
+
+    let directory = temporary();
+    let (broker, parked, server) = parked_nested_broker(directory.path()).await;
+    let inbound = message("watch");
+    let anchor =
+        crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
+    let client =
+        BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame).expect("client");
+    let leg = BrokerLeg::connect(client, Some(anchor.claim(Trigger::Probe)))
+        .await
+        .expect("probe leg");
+    let limits = dekopon_shell::Limits {
+        timeout: Duration::from_secs(30),
+        ..dekopon_shell::Limits::default()
+    };
+    let probe = crate::wake::Probe::scripted_for_test("probe upper");
+    let tick = tokio::task::spawn_blocking(move || probe.tick(&leg, limits));
+    parked
+        .await
+        .expect("probe tick reached its nested child Invoke");
+    let start = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::timeout(Duration::from_secs(1), tick)
+        .await
+        .expect("tick ends at tree deadline")
+        .expect("tick joins");
+    assert!(start.elapsed() <= Duration::from_secs(31));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("broker released")
+        .expect("broker completed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
