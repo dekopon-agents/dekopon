@@ -636,8 +636,10 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-The current [Chart.yaml](../charts/dekopon/Chart.yaml) declares chart version `0.21.1` and
-`appVersion: "0.32.0"`. The application version is not decorative: `dekopon.labels` renders it as
+The release-prep [Chart.yaml](../charts/dekopon/Chart.yaml) declares chart version `0.22.0` and
+`appVersion: "0.33.0"`. Until the published v0.33.0 image's index digest replaces the v0.32.0
+placeholder in a reviewed digest-only PR, this chart must not be tagged or deployed: the digest
+overrides the tag and would run v0.32.0 under a v0.33.0 version label. The application version is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
 every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -648,7 +650,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.32.0
+ghcr.io/dekopon-agents/dekopon:v0.33.0
 ```
 
 There is no `latest`. Prefer `image.digest`; it pins across the
