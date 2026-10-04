@@ -1048,11 +1048,11 @@ const CHILD_PANICKED: u8 = 70;
 fn child_stdin(
     source: OwnedFd,
 ) -> std::io::Result<(
-    std::os::unix::net::UnixStream,
+    dekopon_shell::ChildStdin,
     (OwnedFd, std::os::unix::net::UnixStream),
 )> {
     let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
-    Ok((reader, (source, writer)))
+    Ok((dekopon_shell::ChildStdin::adopt(reader)?, (source, writer)))
 }
 
 #[cfg(unix)]

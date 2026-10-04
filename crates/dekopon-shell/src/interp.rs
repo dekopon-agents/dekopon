@@ -7,7 +7,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
     os::{fd::OwnedFd, unix::net::UnixStream},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{self, AtomicBool},
+    },
     thread::{self, Scope, ScopedJoinHandle},
 };
 
@@ -104,21 +107,25 @@ struct StageSetup {
     meter: Arc<telemetry::StageMeter>,
 }
 
-/// Ends when upstream ends or the provider stops reading; either way the dropped socket is the
-/// provider's end of input and the dropped reader is upstream's closed pipe.
+/// Ends when upstream ends, the provider stops reading or `finished` is set once the call has
+/// returned; either way the dropped socket is the provider's end of input.
 fn pump_stdin(
-    mut reader: PipeReader,
+    reader: &mut PipeReader,
     mut socket: UnixStream,
     budget: &crate::limits::Budget,
     invoker: &dyn CapabilityInvoker,
+    finished: &AtomicBool,
 ) {
     if socket.set_write_timeout(Some(pipe::POLL)).is_err() {
         return;
     }
-    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read(budget, invoker) {
+    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget, invoker, finished) {
         let mut remaining = chunk.as_slice();
         while !remaining.is_empty() {
-            if invoker.cancelled() || budget.check_deadline().is_err() {
+            if invoker.cancelled()
+                || budget.check_deadline().is_err()
+                || finished.load(atomic::Ordering::Relaxed)
+            {
                 return;
             }
             match socket.write(remaining) {
@@ -169,10 +176,11 @@ mod pump_tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 pump_stdin(
-                    PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
+                    &mut PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
                     socket,
                     &budget,
                     &Idle,
+                    &AtomicBool::new(false),
                 );
                 done.send(()).unwrap();
             });
@@ -378,6 +386,7 @@ pub(crate) fn run_with_tree(
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
         testing_status: 0,
+        script_stdin: stdin.is_some(),
         stdin: stdin.into_iter().collect(),
         stdout: None,
         reader_gone: false,
@@ -423,6 +432,7 @@ pub(crate) fn run_seed(
         expansion_charges: Vec::new(),
         options: scope.options,
         testing_status: 0,
+        script_stdin: false,
         stdin: Vec::new(),
         stdout: None,
         reader_gone: false,
@@ -496,6 +506,7 @@ struct Evaluator<'a> {
     discard_capture_depth: Option<usize>,
     diagnostics_depth: Option<usize>,
     expansion_charges: Vec<crate::RetainedBytes>,
+    script_stdin: bool,
     stdin: Vec<PipeReader>,
     stdout: Option<PipeWriter>,
     reader_gone: bool,
@@ -1382,6 +1393,8 @@ impl<'a> Evaluator<'a> {
             Ok(stage) => stage,
             Err(limit) => return refused(&format_args!("{limit:?}")),
         };
+        stage.script_stdin =
+            matches!(input, StageInput::Inherited) && self.provider_reads_script_stdin();
         let enclosing = match input {
             StageInput::Inherited => self.stdin.last_mut().map(std::mem::take),
             StageInput::Piped(_) => None,
@@ -1448,6 +1461,10 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    fn provider_reads_script_stdin(&self) -> bool {
+        self.script_stdin && self.stdin.len() == 1
+    }
+
     fn snapshot(&mut self, writer: PipeWriter) -> Result<Evaluator<'a>, LimitExceeded> {
         let mut frames = Vec::with_capacity(self.frames.len());
         for frame in &self.frames {
@@ -1489,6 +1506,7 @@ impl<'a> Evaluator<'a> {
             expansion_charges: Vec::new(),
             options: self.options,
             testing_status: 0,
+            script_stdin: false,
             stdin: Vec::new(),
             stdout: Some(writer),
             reader_gone: false,
@@ -2768,14 +2786,12 @@ impl<'a> Evaluator<'a> {
                 self.run_xargs(arguments, input, stdout_sink)
             }
             Resolution::ProviderCommand => {
-                let piped = match input {
-                    StageInput::Piped(reader) => Some(reader),
-                    StageInput::Inherited => None,
+                let stdin_piped = match input {
+                    StageInput::Piped(_) => true,
+                    StageInput::Inherited => self.provider_reads_script_stdin(),
                 };
                 self.budget.check_deadline()?;
-                let run = self
-                    .invoker
-                    .run_command(command, arguments, piped.is_some());
+                let run = self.invoker.run_command(command, arguments, stdin_piped);
                 self.budget.check_deadline()?;
                 let proposal = match run {
                     Some(CommandRun::Proposed {
@@ -2824,7 +2840,7 @@ impl<'a> Evaluator<'a> {
                     ));
                     return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
                 }
-                match self.run_provider(proposal, piped, capture_output, stdout_sink) {
+                match self.run_provider(proposal, input, capture_output, stdout_sink) {
                     Ok(result) => Ok(Executed::Result(result)),
                     Err(failure) => {
                         let status = self.absorb(failure)?;
@@ -2841,11 +2857,13 @@ impl<'a> Evaluator<'a> {
 
     /// The call is charged and the deadline re-read on both sides, since capability calls are
     /// wall-clock expensive but step-cheap. The provider's stdout is copied to this stage's sink
-    /// while the call runs, and dropping that copy closes the provider's stdout.
+    /// while the call runs, and dropping that copy closes the provider's stdout. An unpiped stage
+    /// outside any compound's input reads the script's own stdin when it has one, and whatever the
+    /// provider left unread stays there for the next command.
     fn run_provider(
         &mut self,
         proposal: crate::CommandProposal,
-        piped: Option<PipeReader>,
+        input: StageInput,
         capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
@@ -2859,10 +2877,28 @@ impl<'a> Evaluator<'a> {
         };
         let (stdout, provider_stdout) = UnixStream::pair().map_err(unopened)?;
         let output = PipeReader::from_socket(stdout).map_err(unopened)?;
-        let (feed, provider_stdin) = match piped {
-            Some(reader) => {
-                let (socket, provider_stdin) = UnixStream::pair().map_err(unopened)?;
-                (Some((reader, socket)), Some(OwnedFd::from(provider_stdin)))
+        let stdin = match input {
+            StageInput::Inherited if !self.provider_reads_script_stdin() => None,
+            StageInput::Piped(_) | StageInput::Inherited => {
+                Some(UnixStream::pair().map_err(unopened)?)
+            }
+        };
+        let (feed, provider_stdin) = match stdin {
+            Some((socket, provider_stdin)) => {
+                let (reader, inherited) = match input {
+                    StageInput::Piped(reader) => (reader, false),
+                    StageInput::Inherited => (
+                        self.stdin
+                            .last_mut()
+                            .map(std::mem::take)
+                            .unwrap_or_default(),
+                        true,
+                    ),
+                };
+                (
+                    Some((reader, socket, inherited)),
+                    Some(OwnedFd::from(provider_stdin)),
+                )
             }
             None => (None, None),
         };
@@ -2875,24 +2911,35 @@ impl<'a> Evaluator<'a> {
         let feeder_budget = self.budget.fork();
         let span = tracing::Span::current();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
-        let (result, copied) = thread::scope(|scope| {
+        let finished = AtomicBool::new(false);
+        let (result, copied, unread) = thread::scope(|scope| {
             let call = scope.spawn(|| {
                 tracing::dispatcher::with_default(&dispatcher, || {
                     span.in_scope(|| invoker.invoke(proposal, streams, &tree))
                 })
             });
-            let feeder = feed.map(|(reader, socket)| {
-                scope.spawn(move || pump_stdin(reader, socket, &feeder_budget, invoker))
+            let feeder = feed.map(|(mut reader, socket, inherited)| {
+                let (feeder_budget, finished) = (&feeder_budget, &finished);
+                scope.spawn(move || {
+                    pump_stdin(&mut reader, socket, feeder_budget, invoker, finished);
+                    inherited.then_some(reader)
+                })
             });
             let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
             let result = call
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            if let Some(Err(panic)) = feeder.map(ScopedJoinHandle::join) {
-                std::panic::resume_unwind(panic);
-            }
-            (result, copied)
+            finished.store(true, atomic::Ordering::Relaxed);
+            let unread = match feeder.map(ScopedJoinHandle::join) {
+                Some(Err(panic)) => std::panic::resume_unwind(panic),
+                Some(Ok(unread)) => unread,
+                None => None,
+            };
+            (result, copied, unread)
         });
+        if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), unread) {
+            *slot = reader;
+        }
         self.budget.check_deadline()?;
         let mut copied = copied?;
         let status = ExitCode::from_capability_result(&result);

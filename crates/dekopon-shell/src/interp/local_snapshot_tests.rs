@@ -59,6 +59,7 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
         discard_capture_depth: None,
         diagnostics_depth: None,
         expansion_charges: Vec::new(),
+        script_stdin: false,
         stdin: Vec::new(),
         stdout: None,
         reader_gone: false,
