@@ -873,6 +873,8 @@ dependencies = [
  "dekopon-telemetry",
  "dekopon-test-support",
  "getrandom 0.4.3",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "rustix",
  "serde",
@@ -881,6 +883,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

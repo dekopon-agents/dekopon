@@ -795,6 +795,17 @@ impl RequestEnvelope {
     }
 
     #[must_use]
+    pub fn upcall_result(exit: UpcallExit) -> Self {
+        Self {
+            api_version: ProtocolVersion::V1Alpha2,
+            request: BrokerRequest::UpcallResult {
+                status: exit.status,
+                stderr: exit.stderr,
+            },
+        }
+    }
+
+    #[must_use]
     pub const fn record_delivered_turn(
         attestation: Attestation,
         turn: DeliveredTurnRequest,
@@ -912,13 +923,13 @@ pub struct UpcallStreams {
 impl UpcallStreams {
     pub fn receive(stdin: UpcallStdin, descriptors: Vec<OwnedFd>) -> Result<Self, ProtocolError> {
         stdin.check(descriptors.len())?;
-        let mut descriptors = descriptors.into_iter();
+        let mut descriptors = descriptors.into_iter().map(stream_socket);
         let stdout = descriptors
             .next()
-            .ok_or(ProtocolError::MissingStreamDescriptors)?;
+            .ok_or(ProtocolError::MissingStreamDescriptors)??;
         Ok(Self {
             stdout,
-            stdin: descriptors.next(),
+            stdin: descriptors.next().transpose()?,
         })
     }
 
@@ -927,6 +938,36 @@ impl UpcallStreams {
         std::iter::once(self.stdout.as_fd())
             .chain(self.stdin.as_ref().map(AsFd::as_fd))
             .collect()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Upcall {
+    pub parent: InvocationId,
+    pub script: String,
+    pub trace_parent: Option<TraceParent>,
+    pub streams: UpcallStreams,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpcallExit {
+    pub status: u8,
+    pub stderr: String,
+}
+
+#[cfg(unix)]
+fn stream_socket(descriptor: OwnedFd) -> Result<OwnedFd, ProtocolError> {
+    let file = std::fs::File::from(descriptor);
+    let socket = file
+        .metadata()
+        .map_err(|source| ProtocolError::Io { source })?
+        .file_type()
+        .is_socket();
+    if socket {
+        Ok(OwnedFd::from(file))
+    } else {
+        Err(ProtocolError::UnexpectedDescriptors)
     }
 }
 
@@ -1144,7 +1185,7 @@ pub enum BrokerResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
     pub max_frame_bytes: usize,
-    /// Bounds IPC frame I/O, including waiting for an invocation parked on stdio; peer closure is not the only bound.
+    /// Bounds a frame once its first byte is readable; an invocation parked on a child or on stdio is bounded by hangup and cancellation instead.
     pub io_timeout: Duration,
 }
 
@@ -1522,11 +1563,14 @@ impl BrokerClient {
         }
     }
 
+    /// Strict alternation: the broker writes nothing while a child runs, so no read is outstanding
+    /// and a parked invocation is bounded by the caller's cancellation, not the io timer.
     pub async fn invoke(
         &self,
         attestation: Option<Attestation>,
         request: InvocationRequest,
         assets: InvokeAssets,
+        mut upcalls: impl AsyncFnMut(Upcall) -> UpcallExit,
     ) -> Result<AssetInvocationOutcome, ClientError> {
         let attestation = attestation.map(|claim| claim.bound_to(request.id.clone()));
         if assets.descriptors.len() > MAX_ASSET_DESCRIPTORS {
@@ -1548,8 +1592,8 @@ impl BrokerClient {
             .chain(assets.streams.as_ref().map(|streams| &streams.stdout))
             .map(|fd| fd.as_fd())
             .collect();
-        let (response, descriptors) = self
-            .exchange_assets(
+        let mut stream = self
+            .open(
                 RequestEnvelope::invoke(
                     attestation,
                     request,
@@ -1560,6 +1604,37 @@ impl BrokerClient {
                 &descriptors,
             )
             .await?;
+        let (response, descriptors) = loop {
+            let (response, descriptors) = stream
+                .read_frame_when_ready::<ResponseEnvelope>(self.limits)
+                .await
+                .and_then(|(response, descriptors)| {
+                    validate_response_descriptors(&response.response, descriptors.len())?;
+                    Ok((response.response, descriptors))
+                })
+                .map_err(response_failure)?;
+            let BrokerResponse::Upcall {
+                parent,
+                script,
+                trace_parent,
+                stdin,
+            } = response
+            else {
+                break (response, descriptors);
+            };
+            let streams = UpcallStreams::receive(stdin, descriptors).map_err(response_failure)?;
+            let exit = upcalls(Upcall {
+                parent,
+                script,
+                trace_parent,
+                streams,
+            })
+            .await;
+            stream
+                .write_frame(&RequestEnvelope::upcall_result(exit), &[], self.limits)
+                .await
+                .map_err(response_failure)?;
+        };
         match response {
             BrokerResponse::Invocation {
                 result,
@@ -1599,14 +1674,21 @@ impl BrokerClient {
     }
 
     async fn exchange(&self, request: RequestEnvelope) -> Result<BrokerResponse, ClientError> {
-        Ok(self.exchange_assets(request, &[]).await?.0)
+        let mut stream = self.open(request, &[]).await?;
+        let (response, descriptors) = stream
+            .read_frame::<ResponseEnvelope>(self.limits)
+            .await
+            .map_err(response_failure)?;
+        validate_response_descriptors(&response.response, descriptors.len())
+            .map_err(response_failure)?;
+        Ok(response.response)
     }
 
-    async fn exchange_assets(
+    async fn open(
         &self,
         request: RequestEnvelope,
         descriptors: &[BorrowedFd<'_>],
-    ) -> Result<(BrokerResponse, Vec<OwnedFd>), ClientError> {
+    ) -> Result<DescriptorStream, ClientError> {
         request
             .request
             .validate()
@@ -1624,9 +1706,13 @@ impl BrokerClient {
             .await
             .map_err(|_| ClientError::ConnectTimeout)?
             .map_err(|source| ClientError::Connect { source })?;
-        let credentials = stream
-            .peer_cred()
-            .map_err(|source| ClientError::PeerCredentials { source })?;
+        let credentials = match stream.peer_cred() {
+            Ok(credentials) => credentials,
+            Err(source) => {
+                let mut stream = DescriptorStream::new(stream);
+                return Err(refusal_before_credentials(&mut stream, source, self.limits).await);
+            }
+        };
         if credentials.uid() != self.expected_server_uid {
             return Err(ClientError::ServerIdentity {
                 expected: self.expected_server_uid,
@@ -1637,21 +1723,39 @@ impl BrokerClient {
         if let Err(source) = stream.write_frame(&request, descriptors, self.limits).await {
             return Err(refusal_after_write_failure(&mut stream, source, self.limits).await);
         }
-        let (response, descriptors) = stream
-            .read_frame::<ResponseEnvelope>(self.limits)
-            .await
-            .map_err(|source| ClientError::Protocol {
-                phase: ExchangePhase::Response,
-                source,
-            })?;
-        validate_response_descriptors(&response.response, descriptors.len()).map_err(|source| {
-            ClientError::Protocol {
-                phase: ExchangePhase::Response,
-                source,
-            }
-        })?;
-        Ok((response.response, descriptors))
+        Ok(stream)
     }
+}
+
+#[cfg(unix)]
+const fn response_failure(source: ProtocolError) -> ClientError {
+    ClientError::Protocol {
+        phase: ExchangePhase::Response,
+        source,
+    }
+}
+
+// macOS drops a refused connection's peer credentials before its refusal frame is read; only the
+// broker's own capacity refusal is believed from a peer whose identity could not be checked.
+#[cfg(unix)]
+async fn refusal_before_credentials(
+    stream: &mut DescriptorStream,
+    source: io::Error,
+    limits: FrameLimits,
+) -> ClientError {
+    if source.kind() == io::ErrorKind::NotConnected
+        && let Ok((
+            ResponseEnvelope {
+                response: BrokerResponse::Error { code, message },
+                ..
+            },
+            _,
+        )) = stream.read_frame::<ResponseEnvelope>(limits).await
+        && code == ERROR_CAPACITY_EXHAUSTED
+    {
+        return ClientError::Remote { code, message };
+    }
+    ClientError::PeerCredentials { source }
 }
 
 // A broker over its connection limit writes its refusal without reading the request and closes,

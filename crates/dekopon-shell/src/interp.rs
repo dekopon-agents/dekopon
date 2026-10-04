@@ -326,6 +326,7 @@ pub(crate) fn run(
     run_with_tree(
         script,
         prev,
+        None,
         invoker,
         limits,
         &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls)),
@@ -335,6 +336,7 @@ pub(crate) fn run(
 pub(crate) fn run_with_tree(
     script: &str,
     prev: Option<&str>,
+    stdin: Option<PipeReader>,
     invoker: &dyn CapabilityInvoker,
     limits: Limits,
     tree: &TreeContext,
@@ -376,7 +378,7 @@ pub(crate) fn run_with_tree(
         expansion_charges: Vec::new(),
         options: ShellOptions::default(),
         testing_status: 0,
-        stdin: Vec::new(),
+        stdin: stdin.into_iter().collect(),
         stdout: None,
         reader_gone: false,
         stdout_redirected: false,

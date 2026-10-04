@@ -24,7 +24,7 @@ use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatMemorySurface, ClientError, CommandRunOutcome,
-    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
+    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest, Upcall, UpcallExit, UpcallStreams,
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, TraceId};
@@ -34,10 +34,12 @@ use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, JobControl,
-    Limits as ShellLimits, ScriptOutcome, TreeContext,
+    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, Interpreter,
+    JobControl, Limits as ShellLimits, ScriptOutcome, TreeContext,
 };
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -705,7 +707,7 @@ impl CapabilityInvoker for BrokerLeg {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         let dekopon_shell::CommandProposal {
             capability,
@@ -744,7 +746,7 @@ impl CapabilityInvoker for BrokerLeg {
                 ToolOutcome::Cancelled,
             )
         } else {
-            let result = self.submit(capability, input, secret_use, streams);
+            let result = self.submit(capability, input, secret_use, streams, tree);
             let outcome = call_outcome(&result);
             (result, outcome)
         };
@@ -803,6 +805,7 @@ impl BrokerLeg {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
         streams: dekopon_shell::Streams,
+        tree: &TreeContext,
     ) -> CapabilityCallResult {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
@@ -842,11 +845,22 @@ impl BrokerLeg {
         // Safe only because this runs on a spawn_blocking thread; calling block_on here from an
         // ordinary runtime worker would deadlock the executor.
         let invocation = request.id.to_string();
-        let submitted = self.runtime.block_on(async {
-            tokio::select! {
-                result = self.client.invoke(self.attestation.clone(), request, assets) => Some(result),
-                () = wait_for_cancel(self.effective_cancel().watch()) => None,
-            }
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        // A child script runs on its own scoped thread, never inside this future: its broker calls
+        // re-enter `Handle::block_on`, which panics on a thread already inside one. Cancel drops this
+        // future and its connection first; the scope then joins a child that sees the same cancel.
+        let submitted = std::thread::scope(|scope| {
+            self.runtime.block_on(async {
+                tokio::select! {
+                    result = self.client.invoke(
+                        self.attestation.clone(),
+                        request,
+                        assets,
+                        async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
+                    ) => Some(result),
+                    () = wait_for_cancel(self.effective_cancel().watch()) => None,
+                }
+            })
         });
         drop(asset_pins);
         match submitted {
@@ -933,6 +947,137 @@ impl BrokerLeg {
             },
         }
     }
+}
+
+#[cfg(unix)]
+impl BrokerLeg {
+    async fn answer<'scope>(
+        &'scope self,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        upcall: Upcall,
+        tree: &'scope TreeContext,
+        dispatcher: &tracing::Dispatch,
+    ) -> UpcallExit {
+        let Upcall {
+            parent,
+            script,
+            trace_parent,
+            streams: UpcallStreams { stdout, stdin },
+        } = upcall;
+        let (script_stdin, feed) = match stdin.map(child_stdin).transpose() {
+            Ok(Some((reader, feed))) => (Some(reader), Some(feed)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                tracing::warn!(event = "gateway_child_stdin_unavailable", error = %error);
+                return UpcallExit {
+                    status: ExitCode::FAILURE.get(),
+                    stderr: "dekopon-shell: the child script's stdin could not be opened"
+                        .to_owned(),
+                };
+            }
+        };
+        let span = tracing::info_span!("gateway.upcall", parent = %parent);
+        if let Some(trace_parent) = trace_parent
+            && let Err(error) = dekopon_telemetry::parent_remote(
+                &span,
+                dekopon_telemetry::TraceContextParts {
+                    trace_id: trace_parent.trace_id(),
+                    span_id: trace_parent.parent_id(),
+                    flags: trace_parent.flags(),
+                },
+            )
+        {
+            tracing::debug!(event = "gateway_upcall_trace_parent_ignored", error = %error);
+        }
+        let (finished, outcome) = tokio::sync::oneshot::channel();
+        let dispatcher = dispatcher.clone();
+        scope.spawn(move || {
+            let outcome = tracing::dispatcher::with_default(&dispatcher, || {
+                span.in_scope(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Interpreter::new(*tree.limits()).run_child(
+                            &script,
+                            script_stdin,
+                            self,
+                            tree,
+                        )
+                    }))
+                })
+            });
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a closed receiver means the invocation was cancelled and nobody waits"
+            )]
+            let _ = finished.send(outcome.ok());
+        });
+        let pumped = async {
+            if let Some((source, sink)) = feed {
+                pump_child_stdin(source, sink).await;
+            }
+            std::future::pending::<std::convert::Infallible>().await
+        };
+        let outcome = tokio::select! {
+            outcome = outcome => outcome.ok().flatten(),
+            never = pumped => match never {},
+        };
+        let Some(outcome) = outcome else {
+            tracing::warn!(event = "gateway_child_script_panicked", parent = %parent);
+            return UpcallExit {
+                status: CHILD_PANICKED,
+                stderr: "dekopon-shell: the child script panicked".to_owned(),
+            };
+        };
+        let mut text = outcome.output;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if let Err(error) = write_child_stdout(stdout, text.as_bytes()).await {
+            tracing::debug!(event = "gateway_child_stdout_unread", error = %error);
+        }
+        UpcallExit {
+            status: outcome.exit_code.get(),
+            stderr: String::new(),
+        }
+    }
+}
+
+#[cfg(unix)]
+const CHILD_PANICKED: u8 = 70;
+
+#[cfg(unix)]
+fn child_stdin(
+    source: OwnedFd,
+) -> std::io::Result<(
+    std::os::unix::net::UnixStream,
+    (OwnedFd, std::os::unix::net::UnixStream),
+)> {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    Ok((reader, (source, writer)))
+}
+
+#[cfg(unix)]
+fn nonblocking(socket: std::os::unix::net::UnixStream) -> std::io::Result<tokio::net::UnixStream> {
+    socket.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(socket)
+}
+
+#[cfg(unix)]
+async fn pump_child_stdin(source: OwnedFd, sink: std::os::unix::net::UnixStream) {
+    let pumped = async {
+        let mut source = nonblocking(std::os::unix::net::UnixStream::from(source))?;
+        let mut sink = nonblocking(sink)?;
+        tokio::io::copy(&mut source, &mut sink).await
+    };
+    if let Err(error) = pumped.await {
+        tracing::debug!(event = "gateway_child_stdin_ended", error = %error);
+    }
+}
+
+#[cfg(unix)]
+async fn write_child_stdout(stdout: OwnedFd, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut stdout = nonblocking(std::os::unix::net::UnixStream::from(stdout))?;
+    stdout.write_all(bytes).await
 }
 
 #[cfg(unix)]
@@ -1774,6 +1919,367 @@ mod tests {
             })
             .await
             .expect("blocking dispatch completes")
+        }
+
+        mod nesting {
+            use std::{
+                io::Write as _,
+                os::fd::{AsFd as _, OwnedFd},
+                os::unix::fs::PermissionsExt as _,
+                path::{Path, PathBuf},
+                time::Duration,
+            };
+
+            use dekopon_broker_protocol::{
+                BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
+                CommandRunOutcome, Conversation, ConversationKind, DescriptorStream, FrameLimits,
+                InvocationOutcome, ProtocolVersion, RequestEnvelope, ResponseEnvelope, TraceParent,
+                Trigger, UpcallStdin,
+            };
+            use dekopon_process::CancelSignal;
+            use dekopon_shell::{
+                CallBudget, CapabilityCallResult, CapabilityInvoker as _, CommandProposal,
+                ExitCode, Limits, TreeContext,
+            };
+            use opentelemetry::trace::TracerProvider as _;
+            use serde_json::json;
+            use tokio::{
+                io::AsyncReadExt as _,
+                net::{UnixListener, UnixStream},
+                sync::oneshot,
+            };
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            use super::{
+                CAPABILITY, SUBJECT, leg_with, private_broker_directory, result, server_uid,
+            };
+            use crate::{Attestation, BrokerLeg};
+
+            struct Call {
+                stream: DescriptorStream,
+                uri: String,
+                attestation: Option<Attestation>,
+                trace_parent: TraceParent,
+                descriptors: Vec<OwnedFd>,
+            }
+
+            impl Call {
+                async fn upcall(
+                    &mut self,
+                    script: &str,
+                    trace_parent: Option<TraceParent>,
+                ) -> UnixStream {
+                    let (read, write) =
+                        std::os::unix::net::UnixStream::pair().expect("child stdout");
+                    let upcall = ResponseEnvelope {
+                        api_version: ProtocolVersion::V1Alpha2,
+                        response: BrokerResponse::Upcall {
+                            parent: "invoke-parent".parse().expect("invocation"),
+                            script: script.to_owned(),
+                            trace_parent,
+                            stdin: UpcallStdin::None,
+                        },
+                    };
+                    self.stream
+                        .write_frame(&upcall, &[write.as_fd()], FrameLimits::default())
+                        .await
+                        .expect("fake broker writes the upcall");
+                    drop(write);
+                    read.set_nonblocking(true)
+                        .expect("nonblocking child stdout");
+                    UnixStream::from_std(read).expect("child stdout")
+                }
+
+                async fn child_exit(&mut self, mut stdout: UnixStream) -> (String, u8) {
+                    let mut text = String::new();
+                    stdout
+                        .read_to_string(&mut text)
+                        .await
+                        .expect("child stdout text");
+                    let (request, _) = self
+                        .stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .expect("the gateway answers the upcall");
+                    let BrokerRequest::UpcallResult { status, .. } = request.request else {
+                        panic!("expected an upcall result");
+                    };
+                    (text, status)
+                }
+
+                async fn answer(mut self, outcome: InvocationOutcome, stdout: &str) {
+                    let mut out = std::os::unix::net::UnixStream::from(
+                        self.descriptors
+                            .pop()
+                            .expect("the invoke carries its stdout"),
+                    );
+                    out.write_all(stdout.as_bytes()).expect("provider stdout");
+                    drop(out);
+                    self.stream
+                        .write_frame(
+                            &ResponseEnvelope::invocation(
+                                result(outcome, None),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            ),
+                            &[],
+                            FrameLimits::default(),
+                        )
+                        .await
+                        .expect("fake broker answers");
+                }
+
+                async fn hung_up(mut self) -> bool {
+                    self.stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .is_err()
+                }
+            }
+
+            fn listen(directory: &Path) -> (UnixListener, PathBuf) {
+                let socket = directory.join("broker.sock");
+                let listener = UnixListener::bind(&socket).expect("bind fake broker");
+                std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                    .expect("secure fake socket");
+                (listener, socket)
+            }
+
+            async fn accept(listener: &UnixListener) -> Call {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("fake broker accepts");
+                    let mut stream = DescriptorStream::new(stream);
+                    let (request, descriptors) = stream
+                        .read_frame::<RequestEnvelope>(FrameLimits::default())
+                        .await
+                        .expect("fake broker reads a request");
+                    let (attestation, invocation) = match request.request {
+                        BrokerRequest::RunCommand { argv, .. } => {
+                            let proposal =
+                                ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
+                                    capability: CAPABILITY.parse().expect("capability"),
+                                    input: json!({"uri": argv.last()}),
+                                    secret_use: None,
+                                });
+                            stream
+                                .write_frame(&proposal, &[], FrameLimits::default())
+                                .await
+                                .expect("fake broker proposes");
+                            continue;
+                        }
+                        BrokerRequest::Invoke {
+                            attestation,
+                            invocation,
+                            ..
+                        } => (attestation, invocation),
+                        other @ (BrokerRequest::Capabilities { .. }
+                        | BrokerRequest::RecordDeliveredTurn { .. }
+                        | BrokerRequest::UpcallResult { .. }) => {
+                            panic!("unexpected request {other:?}")
+                        }
+                    };
+                    return Call {
+                        stream,
+                        uri: invocation.input["uri"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        attestation,
+                        trace_parent: invocation.trace_parent,
+                        descriptors,
+                    };
+                }
+            }
+
+            fn probe_leg(socket: &Path, attestation: Option<Attestation>) -> BrokerLeg {
+                let mut leg = leg_with(socket, attestation);
+                leg.command_words.insert("probe".to_owned());
+                leg
+            }
+
+            fn tree(calls: &CallBudget) -> TreeContext {
+                TreeContext::new(Limits::default(), calls.clone())
+            }
+
+            fn call(leg: &BrokerLeg, tree: &TreeContext) -> CapabilityCallResult {
+                let (stdout, _reader) = std::os::unix::net::UnixStream::pair().expect("stdout");
+                leg.invoke(
+                    CommandProposal::new(CAPABILITY, json!({"uri": "http://a/"}), None),
+                    dekopon_shell::Streams {
+                        stdin: None,
+                        stdout: OwnedFd::from(stdout),
+                    },
+                    tree,
+                )
+            }
+
+            async fn invoke_in(leg: BrokerLeg) -> CapabilityCallResult {
+                tokio::task::spawn_blocking(move || call(&leg, &tree(&CallBudget::new(64))))
+                    .await
+                    .expect("blocking dispatch completes")
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn cancel_depth_two_descendants() {
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let (handle, signal) = CancelSignal::pair();
+                let leg = probe_leg(&socket, None).with_cancel_signal(signal);
+                let (reached, depth_two) = oneshot::channel();
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let _parent_stdout = parent.upcall("probe --uri http://b/", None).await;
+                    let mut child = accept(&listener).await;
+                    let _child_stdout = child.upcall("probe --uri http://c/", None).await;
+                    let grandchild = accept(&listener).await;
+                    reached
+                        .send(grandchild.uri.clone())
+                        .expect("the test waits");
+                    [
+                        grandchild.hung_up().await,
+                        child.hung_up().await,
+                        parent.hung_up().await,
+                    ]
+                });
+                let call = tokio::spawn(invoke_in(leg));
+                assert_eq!(depth_two.await.expect("depth two reached"), "http://c/");
+                handle.cancel();
+                assert!(matches!(
+                    call.await.expect("the root call returns"),
+                    CapabilityCallResult::Denied { reason } if reason == "script-cancelled"
+                ));
+                let ended = tokio::time::timeout(Duration::from_secs(10), broker)
+                    .await
+                    .expect("every connection closes")
+                    .expect("fake broker");
+                assert_eq!(ended, [true; 3]);
+            }
+
+            #[tokio::test(flavor = "current_thread", start_paused = true)]
+            async fn child_280s_gateway_io_270s_paused() {
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let mut leg = probe_leg(&socket, None);
+                leg.client = BrokerClient::new(
+                    &socket,
+                    server_uid(),
+                    FrameLimits {
+                        io_timeout: Duration::from_secs(270),
+                        ..FrameLimits::default()
+                    },
+                )
+                .expect("client");
+                let (parked, child_parked) = oneshot::channel();
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let stdout = parent.upcall("probe --uri http://slow/", None).await;
+                    let child = accept(&listener).await;
+                    let started = tokio::time::Instant::now();
+                    parked.send(()).expect("the test advances the clock");
+                    tokio::time::sleep(Duration::from_secs(280)).await;
+                    child.answer(InvocationOutcome::Succeeded, "slow\n").await;
+                    let exit = parent.child_exit(stdout).await;
+                    parent.answer(InvocationOutcome::Succeeded, "").await;
+                    (exit, started.elapsed())
+                });
+                let root = tokio::spawn(invoke_in(leg));
+                child_parked.await.expect("the child call is parked");
+                for _ in 0..280 {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    root.await.expect("the root call returns"),
+                    CapabilityCallResult::Succeeded
+                );
+                let ((stdout, status), parked) = broker.await.expect("fake broker");
+                assert_eq!((stdout.as_str(), status), ("slow\n", 0));
+                assert!(parked >= Duration::from_secs(280));
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn nested_job_and_probe_denied_write() {
+                for trigger in [Trigger::Probe, Trigger::Job] {
+                    let directory = private_broker_directory();
+                    let (listener, socket) = listen(directory.path());
+                    let scope = ChatScopeClaim {
+                        transport: "scientist-slack".parse().expect("transport"),
+                        kind: ChatTransportKind::Slack,
+                        conversation: Conversation {
+                            kind: ConversationKind::Channel,
+                            container: Some("t0123abc".to_owned()),
+                            id: "c0123abc".to_owned(),
+                            thread: None,
+                        },
+                        trigger,
+                    };
+                    let attestation = Attestation::for_chat(
+                        SUBJECT.parse().expect("subject"),
+                        "chat-agent".parse().expect("agent"),
+                        scope,
+                    );
+                    let leg = probe_leg(&socket, Some(attestation));
+                    let broker = tokio::spawn(async move {
+                        let mut parent = accept(&listener).await;
+                        let stdout = parent.upcall("probe --uri http://write/", None).await;
+                        let child = accept(&listener).await;
+                        let seen = child
+                            .attestation
+                            .as_ref()
+                            .and_then(|claim| claim.scope.as_ref())
+                            .map(|scope| scope.trigger);
+                        child.answer(InvocationOutcome::Denied, "").await;
+                        let (_, status) = parent.child_exit(stdout).await;
+                        parent.answer(InvocationOutcome::Succeeded, "").await;
+                        (seen, status)
+                    });
+                    assert_eq!(invoke_in(leg).await, CapabilityCallResult::Succeeded);
+                    assert_eq!(
+                        broker.await.expect("fake broker"),
+                        (Some(trigger), ExitCode::DENIED.get())
+                    );
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn child_trace_and_shared_call_budget() {
+                let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+                let dispatch =
+                    tracing::Dispatch::new(tracing_subscriber::registry().with(
+                        tracing_opentelemetry::layer().with_tracer(provider.tracer("nesting")),
+                    ));
+                let directory = private_broker_directory();
+                let (listener, socket) = listen(directory.path());
+                let leg = probe_leg(&socket, None);
+                let session = leg.identifiers.parent;
+                let upcall_parent =
+                    TraceParent::new(session.trace_id(), [7; 8], 1).expect("trace parent");
+                let broker = tokio::spawn(async move {
+                    let mut parent = accept(&listener).await;
+                    let stdout = parent
+                        .upcall("probe --uri http://b/", Some(upcall_parent))
+                        .await;
+                    let child = accept(&listener).await;
+                    let child_parent = child.trace_parent;
+                    child.answer(InvocationOutcome::Succeeded, "").await;
+                    let (_, status) = parent.child_exit(stdout).await;
+                    parent.answer(InvocationOutcome::Succeeded, "").await;
+                    (child_parent, status)
+                });
+                let calls = CallBudget::new(1);
+                let shared = tree(&calls);
+                let result = tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&dispatch, || call(&leg, &shared))
+                })
+                .await
+                .expect("blocking dispatch completes");
+                assert_eq!(result, CapabilityCallResult::Succeeded);
+                let (child_parent, status) = broker.await.expect("fake broker");
+                assert_eq!(child_parent.trace(), session.trace());
+                assert_ne!(child_parent.parent_id(), session.parent_id());
+                assert_eq!((calls.used(), status), (1, 0));
+            }
         }
 
         #[tokio::test(flavor = "multi_thread")]

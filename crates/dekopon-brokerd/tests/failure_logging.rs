@@ -263,6 +263,7 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
             )),
             request,
             Default::default(),
+            async |_upcall| unreachable!(),
         )
         .await
         .expect_err("a terminal audit failure is not a successful invocation");

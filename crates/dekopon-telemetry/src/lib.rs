@@ -43,6 +43,13 @@ pub fn link_remote(execution: &tracing::Span, parts: TraceContextParts) {
     execution.add_link(span.span_context().clone());
 }
 
+pub fn parent_remote(
+    span: &tracing::Span,
+    parts: TraceContextParts,
+) -> Result<(), tracing_opentelemetry::SetParentError> {
+    span.set_parent(remote_context(parts))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceContextParts {
     pub trace_id: [u8; 16],
