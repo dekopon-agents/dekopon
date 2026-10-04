@@ -126,13 +126,9 @@ impl Needs for Random {
 }
 
 /// Authorized child shell scripts, run by the gateway under this invocation's person, agent and
-/// budget.
-pub struct Spawn(SpawnGrant);
-
-#[cfg(target_arch = "wasm32")]
-struct SpawnGrant;
-#[cfg(not(target_arch = "wasm32"))]
-enum SpawnGrant {}
+/// budget. The monotonic clock keeps running while a child runs; the invocation's work time does
+/// not.
+pub struct Spawn(PhantomData<()>);
 
 impl Spawn {
     /// Starts `script` as a child; one child runs at a time.
@@ -143,26 +139,26 @@ impl Spawn {
     ) -> Result<crate::spawn::Child, crate::spawn::SpawnError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let SpawnGrant = self.0;
             crate::spawn::run(script, stdin)
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (script, stdin);
-            match self.0 {}
+            use super::port::NativeChildStdin;
+            use crate::spawn::{Child, ChildStdin, Live, SpawnError};
+            let live = Live::claim().ok_or(SpawnError::Busy)?;
+            let stdin = match stdin {
+                ChildStdin::None => NativeChildStdin::None,
+                ChildStdin::Inherit => super::stdio::take_native_stdin()
+                    .map_or(NativeChildStdin::None, NativeChildStdin::Inherit),
+                ChildStdin::Reader(reader) => NativeChildStdin::Reader(reader.into_native()),
+            };
+            Ok(Child::native(super::port::spawn(script, stdin), live))
         }
     }
 }
 impl sealed::Needs for Spawn {
     fn grant() -> Result<Self, SdkFailure> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            Ok(Self(SpawnGrant))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            Err(SdkFailure::ComponentHarnessRequired)
-        }
+        Ok(Self(PhantomData))
     }
 }
 impl Needs for Spawn {

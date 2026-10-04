@@ -7,4 +7,7 @@ mod typed;
 
 pub use conformance::{ConformanceError, conformance};
 pub use dekopon_broker_host::BrokerHostLimits;
-pub use typed::{ComponentOutput, Harness, HarnessError, HttpScript, Native, NativeOutput, Run};
+pub use typed::{
+    ChildInput, ChildRun, ChildScript, ComponentOutput, Harness, HarnessError, HttpScript, Native,
+    NativeOutput, Run,
+};

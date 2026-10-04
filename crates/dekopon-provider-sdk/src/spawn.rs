@@ -60,10 +60,53 @@ pub struct Child {
 #[cfg(target_arch = "wasm32")]
 use bindings::dekopon::spawn::run::Status;
 #[cfg(not(target_arch = "wasm32"))]
-enum Status {}
+struct Status {
+    exit: Exit,
+    _live: Live,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Live(());
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Live {
+    pub(crate) fn claim() -> Option<Self> {
+        LIVE.with(|live| (!live.replace(true)).then_some(Self(())))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Live {
+    fn drop(&mut self) {
+        LIVE.with(|live| live.set(false));
+    }
+}
 
 impl Child {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn native(child: crate::provider::NativeChild, live: Live) -> Self {
+        Self {
+            stdout: Stdin::from_native(child.stdout),
+            status: Status {
+                exit: child.exit,
+                _live: live,
+            },
+        }
+    }
+
     /// Waits for the child to exit; stdout not yet read is discarded first.
+    ///
+    /// ```compile_fail
+    /// fn read_after_wait(child: dekopon_provider_sdk::provider::Child) {
+    ///     let _exit = child.wait();
+    ///     let _stdout = child.stdout;
+    /// }
+    /// ```
     #[must_use]
     pub fn wait(self) -> Exit {
         let Self { stdout, status } = self;
@@ -77,7 +120,9 @@ impl Child {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        match status {}
+        {
+            status.exit
+        }
     }
 }
 

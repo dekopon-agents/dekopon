@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io;
 
 /// Native import implementation installed for one scoped provider invocation.
 pub trait Port {
@@ -20,6 +21,29 @@ pub trait Port {
         &mut self,
         request: crate::http::StreamedRequest<'_>,
     ) -> Result<crate::http::StreamedResponse, crate::http::HttpError>;
+    /// Runs a child script; a port that scripts no child refuses the call by panicking.
+    fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
+        drop(stdin);
+        panic!("this native Port runs no child script: {script}");
+    }
+}
+
+/// What a native child script reads as its stdin.
+pub enum NativeChildStdin {
+    /// Nothing piped into the child.
+    None,
+    /// The rest of the invocation's own stdin.
+    Inherit(Box<dyn io::Read>),
+    /// A reader the capability passed.
+    Reader(Box<dyn io::Read>),
+}
+
+/// A child script run by a native port: its output and how it exited.
+pub struct NativeChild {
+    /// The child's standard output.
+    pub stdout: Box<dyn io::Read>,
+    /// The child's exit.
+    pub exit: crate::spawn::Exit,
 }
 
 thread_local! {
@@ -104,6 +128,16 @@ pub(crate) fn stream(
             .as_mut()
             .expect("native call requires an installed Port")
             .stream(request)
+    })
+}
+
+pub(crate) fn spawn(script: &str, stdin: NativeChildStdin) -> NativeChild {
+    CURRENT.with(|current| {
+        current
+            .borrow_mut()
+            .as_mut()
+            .expect("native call requires an installed Port")
+            .spawn(script, stdin)
     })
 }
 
