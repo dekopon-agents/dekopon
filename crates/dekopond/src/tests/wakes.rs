@@ -21,6 +21,7 @@ impl dekopon_shell::CapabilityInvoker for NoProviders {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> dekopon_shell::CapabilityCallResult {
         dekopon_shell::secret_use_unsupported()
     }

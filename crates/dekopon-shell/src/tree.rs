@@ -168,6 +168,11 @@ impl TreeContext {
     }
 
     #[must_use]
+    pub const fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    #[must_use]
     pub(crate) fn calls(&self) -> &CallBudget {
         &self.calls
     }

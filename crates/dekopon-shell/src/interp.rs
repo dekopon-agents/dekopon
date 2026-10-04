@@ -152,6 +152,7 @@ mod pump_tests {
             &self,
             _proposal: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> crate::CapabilityCallResult {
             unreachable!("pump test never invokes")
         }
@@ -2868,13 +2869,14 @@ impl<'a> Evaluator<'a> {
             stdout: OwnedFd::from(provider_stdout),
         };
         let invoker = self.invoker;
+        let tree = self.budget.tree().clone();
         let feeder_budget = self.budget.fork();
         let span = tracing::Span::current();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let (result, copied) = thread::scope(|scope| {
             let call = scope.spawn(|| {
                 tracing::dispatcher::with_default(&dispatcher, || {
-                    span.in_scope(|| invoker.invoke(proposal, streams))
+                    span.in_scope(|| invoker.invoke(proposal, streams, &tree))
                 })
             });
             let feeder = feed.map(|(reader, socket)| {

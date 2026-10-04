@@ -18,6 +18,7 @@ impl CapabilityInvoker for Invoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
@@ -199,6 +200,7 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
             &self,
             _: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
+            _tree: &dekopon_shell::TreeContext,
         ) -> CapabilityCallResult {
             self.release
                 .lock()
@@ -410,6 +412,7 @@ impl CapabilityInvoker for Cancelled {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }

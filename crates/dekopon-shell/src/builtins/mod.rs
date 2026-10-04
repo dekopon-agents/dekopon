@@ -242,6 +242,7 @@ pub(crate) mod test_support {
             &self,
             _: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -398,6 +399,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();

@@ -33,6 +33,17 @@ pub fn stdin() -> Option<Stdin> {
 }
 
 impl Stdin {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) const fn from_guest(reader: streams::Reader) -> Self {
+        Self(Source::Guest(reader))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn into_guest(self) -> streams::Reader {
+        let Source::Guest(reader) = self.0;
+        reader
+    }
+
     /// The input's lines, without their terminators.
     #[must_use]
     pub fn lines(self) -> io::Lines<io::BufReader<Self>> {

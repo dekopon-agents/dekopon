@@ -279,6 +279,7 @@ mod tests {
             &self,
             _proposal: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> crate::CapabilityCallResult {
             unreachable!("pipe tests never invoke")
         }

@@ -951,3 +951,62 @@ fn a_ref_named_property_or_default_is_data_not_a_reference() {
     assert_eq!(link["default"], json!({"$ref": ""}));
     assert_eq!(link["properties"]["$ref"]["type"], "string");
 }
+
+struct SpawnFixture;
+struct SpawnCall;
+
+type SpawnNeeds = (
+    dekopon_provider_sdk::provider::Http,
+    dekopon_provider_sdk::provider::Clock,
+    dekopon_provider_sdk::provider::Monotonic,
+    dekopon_provider_sdk::provider::Random,
+    dekopon_provider_sdk::provider::Spawn,
+);
+
+impl Provider for SpawnFixture {
+    const ID: &'static str = "native-spawn";
+    const COMMAND_WORDS: &'static [&'static str] = &["native-spawn"];
+    const DESCRIPTION: &'static str = "Native spawn fixture";
+    type Args = ClockArgs;
+    type Capabilities = (SpawnCall,);
+    fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<SpawnCall>(ClockInput {}))
+    }
+}
+
+impl Capability for SpawnCall {
+    type Provider = SpawnFixture;
+    const NAME: &'static str = "run";
+    const DESCRIPTION: &'static str = "Runs a child script";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = ClockInput;
+    type Needs = SpawnNeeds;
+    type Error = Gone;
+    fn run(_: ClockInput, needs: SpawnNeeds, out: &mut Stdout) -> Result<(), Gone> {
+        use dekopon_provider_sdk::provider::{ChildStdin, Exit, SpawnError};
+        let (_, _, _, _, spawn) = needs;
+        let mut child = spawn
+            .run("gh pr list | rg x", ChildStdin::Inherit)
+            .map_err(|SpawnError::Busy| Gone)?;
+        io::copy(&mut child.stdout, out)?;
+        let Exit { status, stderr } = child.wait();
+        writeln!(out, "{status} {stderr}")?;
+        Ok(())
+    }
+}
+
+#[test]
+fn spawn_signatures_compile_and_native_execution_requires_the_component_harness() {
+    use dekopon_provider_sdk::provider::{ImportSet, Needs};
+    let imports = <SpawnNeeds as Needs>::IMPORTS;
+    assert!(imports.contains(ImportSet::SPAWN));
+    assert!(imports.contains(ImportSet::RANDOM));
+    assert!(!ImportSet::RANDOM.contains(ImportSet::SPAWN));
+    let exit = call::<SpawnFixture>("native-spawn.run", "{}");
+    assert_eq!(exit.status, 1);
+    assert_eq!(
+        exit.stderr,
+        "this capability needs the component harness (Harness<P>)\n"
+    );
+}

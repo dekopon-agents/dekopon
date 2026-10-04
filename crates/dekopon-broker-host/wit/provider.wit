@@ -12,4 +12,5 @@ world provider {
     import dekopon:clock/monotonic@1.1.0;
     import dekopon:random/source@0.1.0;
     import dekopon:settings/config@0.1.0;
+    import dekopon:spawn/run@0.1.0;
 }

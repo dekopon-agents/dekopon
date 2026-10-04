@@ -1,0 +1,6 @@
+package dekopon:provider@0.4.0;
+
+world spawn-client {
+    import dekopon:stdio/streams@0.1.0;
+    import dekopon:spawn/run@0.1.0;
+}

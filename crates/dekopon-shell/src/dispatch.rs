@@ -84,6 +84,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -111,6 +112,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             _streams: crate::Streams,
+            _tree: &crate::TreeContext,
         ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();

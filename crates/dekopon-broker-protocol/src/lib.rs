@@ -29,7 +29,7 @@ mod descriptor;
 #[cfg(unix)]
 pub use descriptor::DescriptorStream;
 #[cfg(unix)]
-use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 pub use conversation::{
     Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
@@ -838,6 +838,10 @@ pub enum BrokerRequest {
         attestation: Attestation,
         turn: DeliveredTurnRequest,
     },
+    UpcallResult {
+        status: u8,
+        stderr: String,
+    },
 }
 
 impl BrokerRequest {
@@ -865,6 +869,64 @@ impl StreamDescriptors {
     #[must_use]
     pub const fn count(self) -> usize {
         if self.stdin { 2 } else { 1 }
+    }
+}
+
+/// What an Upcall frame's child reads as stdin, and so which descriptors follow its stdout.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpcallStdin {
+    None,
+    Inherit,
+    Reader,
+}
+
+impl UpcallStdin {
+    #[must_use]
+    pub const fn descriptor_count(self) -> usize {
+        match self {
+            Self::None => 1,
+            Self::Inherit | Self::Reader => 2,
+        }
+    }
+
+    fn check(self, count: usize) -> Result<(), ProtocolError> {
+        match count.cmp(&self.descriptor_count()) {
+            std::cmp::Ordering::Less => Err(ProtocolError::MissingStreamDescriptors),
+            std::cmp::Ordering::Greater => Err(ProtocolError::UnexpectedDescriptors),
+            std::cmp::Ordering::Equal => Ok(()),
+        }
+    }
+}
+
+/// An Upcall frame's descriptors in wire order, owned from receipt: the child's stdout write end,
+/// then its stdin read end unless the child reads none.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UpcallStreams {
+    pub stdout: OwnedFd,
+    pub stdin: Option<OwnedFd>,
+}
+
+#[cfg(unix)]
+impl UpcallStreams {
+    pub fn receive(stdin: UpcallStdin, descriptors: Vec<OwnedFd>) -> Result<Self, ProtocolError> {
+        stdin.check(descriptors.len())?;
+        let mut descriptors = descriptors.into_iter();
+        let stdout = descriptors
+            .next()
+            .ok_or(ProtocolError::MissingStreamDescriptors)?;
+        Ok(Self {
+            stdout,
+            stdin: descriptors.next(),
+        })
+    }
+
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<BorrowedFd<'_>> {
+        std::iter::once(self.stdout.as_fd())
+            .chain(self.stdin.as_ref().map(AsFd::as_fd))
+            .collect()
     }
 }
 
@@ -1061,6 +1123,17 @@ pub enum BrokerResponse {
     },
     CommandRun {
         result: CommandRunOutcome,
+    },
+    Upcall {
+        parent: InvocationId,
+        script: String,
+        #[serde(
+            default,
+            rename = "traceParent",
+            skip_serializing_if = "Option::is_none"
+        )]
+        trace_parent: Option<TraceParent>,
+        stdin: UpcallStdin,
     },
     Error {
         code: String,
@@ -1411,9 +1484,9 @@ impl BrokerClient {
                 chat_memory,
             } => Ok((capabilities, command_words, command_word_help, chat_memory)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::CommandRun { .. } | BrokerResponse::Invocation { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1443,9 +1516,9 @@ impl BrokerClient {
         {
             BrokerResponse::CommandRun { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } | BrokerResponse::Invocation { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1501,9 +1574,9 @@ impl BrokerClient {
                 descriptors,
             }),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1519,9 +1592,9 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result, .. } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
-                Err(ClientError::UnexpectedResponse)
-            }
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1595,6 +1668,7 @@ fn validate_response_descriptors(
     count: usize,
 ) -> Result<(), ProtocolError> {
     match response {
+        BrokerResponse::Upcall { stdin, .. } => stdin.check(count)?,
         BrokerResponse::Invocation { attached, .. } => {
             if attached.len() != count
                 || attached

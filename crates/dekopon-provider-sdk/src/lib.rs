@@ -24,6 +24,7 @@ mod clock;
 mod http;
 pub mod provider;
 mod random;
+mod spawn;
 mod storage;
 
 pub use provider::{
