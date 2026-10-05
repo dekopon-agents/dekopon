@@ -39,7 +39,7 @@ use tokio::signal::unix::{SignalKind, signal};
 const OTEL_LOG_FILTER: &str = "job=debug,meter=info";
 
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopon-gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
+const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
 /// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
 /// non-preemptible blocking work already in flight; anything still running past this timeout is
