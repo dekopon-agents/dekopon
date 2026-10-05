@@ -1039,6 +1039,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-gatewayd"
+version = "0.33.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "dekopon-agent",
+ "dekopon-broker-protocol",
+ "dekopon-brokerd",
+ "dekopon-config",
+ "dekopon-core",
+ "dekopon-model",
+ "dekopon-model-proxy",
+ "dekopon-model-token-governor",
+ "dekopon-process",
+ "dekopon-shell",
+ "dekopon-storage-host",
+ "dekopon-telemetry",
+ "dekopon-test-support",
+ "form_urlencoded",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "rcgen",
+ "reqwest",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dekopon-http-host"
 version = "0.33.0"
 dependencies = [
@@ -1263,56 +1313,6 @@ dependencies = [
  "parking_lot",
  "tokio",
  "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dekopond"
-version = "0.33.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.23.1",
- "clap",
- "dekopon-agent",
- "dekopon-broker-protocol",
- "dekopon-brokerd",
- "dekopon-config",
- "dekopon-core",
- "dekopon-model",
- "dekopon-model-proxy",
- "dekopon-model-token-governor",
- "dekopon-process",
- "dekopon-shell",
- "dekopon-storage-host",
- "dekopon-telemetry",
- "dekopon-test-support",
- "form_urlencoded",
- "futures-util",
- "getrandom 0.4.3",
- "hmac",
- "humantime",
- "hyper",
- "hyper-util",
- "libc",
- "opentelemetry",
- "opentelemetry_sdk",
- "parking_lot",
- "rcgen",
- "reqwest",
- "rustix",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

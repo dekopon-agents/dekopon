@@ -122,7 +122,7 @@ jobs:
           cache-workspace-crates: true
           cache-bin: false
       - name: Build CLIs
-        run: cargo build --release --locked -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd --target ${{ matrix.target }}
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -131,10 +131,10 @@ jobs:
           archive="dekopon-${version}-${{ matrix.target }}"
           mkdir -p "staging/$archive"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
-          cp "target/${{ matrix.target }}/release/dekopond" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopon-gatewayd" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
-          cp crates/dekopond/README.md "staging/$archive/GATEWAY.md"
+          cp crates/dekopon-gatewayd/README.md "staging/$archive/GATEWAY.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - name: Upload CLI archive
@@ -278,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "dekopond") | .version')
+            | jq -r '.packages[] | select(.name == "dekopon-gatewayd") | .version')
           publish() {
             crate="$1"
             status=$(curl --silent --show-error --retry 3 \

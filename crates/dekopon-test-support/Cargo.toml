@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 # Test scaffolding, not product surface. It is reachable only as a path `[dev-dependencies]` entry,
 # so it stays out of `.github/release-crates.txt`, out of every published archive, and out of the
-# dependency tree CI checks for broker crates inside `dekopond`.
+# dependency tree CI checks for broker crates inside `dekopon-gatewayd`.
 publish = false
 
 [features]
@@ -23,8 +23,8 @@ required-features = ["agent-runtime"]
 parking_lot.workspace = true
 # The three crates whose boundaries the shared doubles stand on: the prompt loop's script runtime,
 # the model client's streaming contract, and the script outcome both of them speak. Every one of
-# them is already a normal dependency of `dekopond`, and this crate reaches every consumer as a
-# dev-dependency only, so `cargo tree --edges normal` for `dekopond` and `dekopon-brokerd` is
+# them is already a normal dependency of `dekopon-gatewayd`, and this crate reaches every consumer as a
+# dev-dependency only, so `cargo tree --edges normal` for `dekopon-gatewayd` and `dekopon-brokerd` is
 # unchanged by their presence here.
 dekopon-agent = { workspace = true, optional = true }
 dekopon-model.workspace = true

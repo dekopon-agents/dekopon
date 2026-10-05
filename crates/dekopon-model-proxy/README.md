@@ -1,7 +1,7 @@
 # dekopon-model-proxy
 
 `dekopon-model-proxy` lets `claude`, `pi` or `codex` inside a Firecracker guest call a model
-with no credentials of their own, spending the agent's token budget. `dekopond` serves it on its
+with no credentials of their own, spending the agent's token budget. `dekopon-gatewayd` serves it on its
 own mTLS listener. The guest reaches it through the jail's egress gateway, which authenticates
 with a client certificate and asserts which VM it serves in `x-dekopon-vm-subject`.
 
@@ -21,7 +21,7 @@ with a client certificate and asserts which VM it serves in `x-dekopon-vm-subjec
 - `tls::Listener` requires a client certificate that chains to the configured CA and carries the
   configured URI SAN, and rereads its files when their mtime changes.
 - Bodies are capped at 8 MiB (`MAX_BODY_BYTES`); past it the proxy answers 413. `Listener::serve`
-  takes the connection cap (`dekopond`'s `proxy.maxConnections`, default 16). Each connection
+  takes the connection cap (`dekopon-gatewayd`'s `proxy.maxConnections`, default 16). Each connection
   briefly holds two copies of its body while reading and rewriting it, so request bodies take up to
   `max_connections × 2 × 8 MiB` together: 256 MiB at the default.
 

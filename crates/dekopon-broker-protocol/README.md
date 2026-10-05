@@ -97,7 +97,7 @@ as non-retryable rather than resubmitting.
 
 This crate depends only on wire, domain, and provider-metadata types, not `dekopon-broker`,
 `dekopon-broker-host`, or the native HTTP engine. It binds no socket and grants no authority.
-`BrokerClient` can submit proposals and receive public capabilities and results only. `dekopond` is
+`BrokerClient` can submit proposals and receive public capabilities and results only. `dekopon-gatewayd` is
 a consumer, reaching the broker through `dekopon-agent`, carrying the attested on-behalf-of claim
 this protocol defines.
 
@@ -162,7 +162,7 @@ surface the refusal withheld.
 
 ## Version and compatibility
 
-Upgrade `dekopond` and `dekopon-brokerd` together. The alpha protocol has no cross-release
+Upgrade `dekopon-gatewayd` and `dekopon-brokerd` together. The alpha protocol has no cross-release
 compatibility promise or negotiation. Start the broker first and stop it last: the gateway probes
 capabilities before connecting transports. Unknown operation tags fail strict decoding as
 `invalid-request`; no compatibility sink accepts them. The broker's `--http-bind` argument and chart

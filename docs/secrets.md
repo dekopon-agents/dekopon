@@ -116,7 +116,7 @@ canonical does not decode, and the owner's binding — never the argv — fixes 
 destination, and injection count. Bare DRN characters elsewhere are ordinary public text with no
 resolution semantics. Immediate/direct invokers refuse secret use; only a broker-backed leg
 forwards the typed top-level proposal. Invocation is one method, so every
-broker-backed session reaches it, a `dekopond` chat session included, and a wrapper that records a
+broker-backed session reaches it, a `dekopon-gatewayd` chat session included, and a wrapper that records a
 call or stops one at a cancellation boundary cannot drop the proposal on the way through.
 
 ## Two independent policies
@@ -616,7 +616,7 @@ with one destination binding, not a generic header sink (see
 [Current non-goals](#current-non-goals)): a guest that sets the companion name is refused rather than
 overwritten, its bytes stay outside accounted request size, and evidence gained no field for it.
 
-**One file per holder.** Give the broker its own `dekopond auth chatgpt login --auth-file <path>`.
+**One file per holder.** Give the broker its own `dekopon-gatewayd auth chatgpt login --auth-file <path>`.
 Pointing it at a `chatgptSubscription` *model*'s file would have two independent holders spending one
 rotating refresh token, and the authorization server retires a predecessor on every rotation, so the
 family is eventually revoked for both. See

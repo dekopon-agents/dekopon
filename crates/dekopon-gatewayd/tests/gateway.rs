@@ -132,7 +132,7 @@ fn gateway_config_with(
     stream: bool,
 ) -> Value {
     let mut config = json!({
-        "apiVersion": dekopond::CONFIG_API_VERSION,
+        "apiVersion": dekopon_gatewayd::CONFIG_API_VERSION,
         "catalogPath": directory.join("dekopon.yaml"),
         "broker": {
             "socketPath": directory.join("broker.sock"),
@@ -523,7 +523,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     broker: tokio::task::JoinHandle<Result<(), dekopon_brokerd::BrokerdError>>,
     stop_broker: oneshot::Sender<()>,
-    gateway: tokio::task::JoinHandle<Result<(), dekopond::DekopondError>>,
+    gateway: tokio::task::JoinHandle<Result<(), dekopon_gatewayd::DekopondError>>,
     stop_gateway: oneshot::Sender<()>,
     model_requests: Arc<AtomicUsize>,
     model_prompts: Arc<Mutex<Vec<Value>>>,
@@ -696,7 +696,7 @@ async fn boot_with(
     timing: &Timing,
 ) -> Fixture {
     let _already_set =
-        dekopon_shell::set_jq_worker_executable(env!("CARGO_BIN_EXE_dekopond").into());
+        dekopon_shell::set_jq_worker_executable(env!("CARGO_BIN_EXE_dekopon-gatewayd").into());
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
@@ -743,7 +743,7 @@ async fn boot_with(
         &serde_json::to_vec(&config).expect("gateway config serializes"),
     );
     let (stop_gateway, gateway_stopped) = oneshot::channel::<()>();
-    let mut gateway = tokio::spawn(dekopond::run(gateway_path, async move {
+    let mut gateway = tokio::spawn(dekopon_gatewayd::run(gateway_path, async move {
         #[allow(
             clippy::let_underscore_must_use,
             reason = "a dropped sender means the fixture went away, which is the same instruction \
@@ -1646,7 +1646,7 @@ async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_non
     );
     let log_path = directory.join("child.log");
     let mut child = GatewayChild(
-        std::process::Command::new(env!("CARGO_BIN_EXE_dekopond"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_dekopon-gatewayd"))
             .arg("--config")
             .arg(&path)
             .stdout(fs::File::create(&log_path).expect("log file"))

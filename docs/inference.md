@@ -1,6 +1,6 @@
 # Model inference, prompt caching, and memory
 
-This document follows a Slack message from `dekopond` into the selected async model adapter: what Dekopon caches, what it remembers, and what reaches the wire.
+This document follows a Slack message from `dekopon-gatewayd` into the selected async model adapter: what Dekopon caches, what it remembers, and what reaches the wire.
 
 **Status: Current, except where marked Exploration.** Dekopon sends cache-affinity hints, preserves
 append-only model turns, reports provider-declared cache usage, streams a turn's visible text to its
@@ -20,7 +20,7 @@ public OpenAI Platform API. Public OpenAI documentation is context, not a contra
 | Mechanism | Owner | Purpose | Current Dekopon behavior |
 |---|---|---|---|
 | Prompt-prefix cache | Model provider | Avoid recomputing an identical leading prompt | Sends stable prefixes and dialect-specific hints; OpenRouter can mark an explicit system prefix; cannot manage provider entries |
-| Conversation history | `dekopond` | Let a person—or an explicitly configured exact-conversation audience—ask a follow-up | Optional bounded `(question, final answer)` window in process memory, private per subject by default |
+| Conversation history | `dekopon-gatewayd` | Let a person—or an explicitly configured exact-conversation audience—ask a follow-up | Optional bounded `(question, final answer)` window in process memory, private per subject by default |
 | Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns, no deduplication; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
 
 A cache hit never substitutes an old answer. The provider evaluates the complete request and produces a new response, so “fresh” refers to whether prefix computation can be reused, not to the answer or its underlying data.
@@ -120,7 +120,7 @@ The source contracts are in:
 - [`codex.rs`](../crates/dekopon-model/src/codex.rs), [`openai.rs`](../crates/dekopon-model/src/openai.rs), and [`openrouter.rs`](../crates/dekopon-model/src/openrouter.rs) — the three typed wire codecs and reducers;
 - [`crates/dekopon-agent/src/prompt.rs`](../crates/dekopon-agent/src/prompt.rs) — the bounded model/tool loop;
 - [`crates/dekopon-agent/src/prompt/history.rs`](../crates/dekopon-agent/src/prompt/history.rs) — compacted cross-message history; and
-- [`crates/dekopond/src/cache_key.rs`](../crates/dekopond/src/cache_key.rs), [`conversation.rs`](../crates/dekopond/src/conversation.rs), and [`session.rs`](../crates/dekopond/src/session.rs) — key lifetime, history lifetime, and Slack-session assembly.
+- [`crates/dekopon-gatewayd/src/cache_key.rs`](../crates/dekopon-gatewayd/src/cache_key.rs), [`conversation.rs`](../crates/dekopon-gatewayd/src/conversation.rs), and [`session.rs`](../crates/dekopon-gatewayd/src/session.rs) — key lifetime, history lifetime, and Slack-session assembly.
 
 ### What is not optimized or cached
 
@@ -128,7 +128,7 @@ The source contracts are in:
   OpenRouter alone supports the explicit system-prefix marker described below.
 - Codex requests set `store: false` and use neither `previous_response_id` nor a provider conversation identifier.
 - Completed answers are not memoized. Each incoming message makes a fresh model request after authorization.
-- `dekopond` builds one model client per configured model on first use and shares it across every later message and session (`ModelCache` in [`crates/dekopond/src/session.rs`](../crates/dekopond/src/session.rs)); each session gets a fresh bridge and watch receiver, while the prompt cache key and `CompletionOptions` stay request-scoped. Sharing the client reuses TCP/TLS connections and the loaded credential; it does not make the remote prompt cache more durable.
+- `dekopon-gatewayd` builds one model client per configured model on first use and shares it across every later message and session (`ModelCache` in [`crates/dekopon-gatewayd/src/session.rs`](../crates/dekopon-gatewayd/src/session.rs)); each session gets a fresh bridge and watch receiver, while the prompt cache key and `CompletionOptions` stay request-scoped. Sharing the client reuses TCP/TLS connections and the loaded credential; it does not make the remote prompt cache more durable.
 - The gateway does not estimate tokens before a request. Its history bound is bytes plus whole turns because provider token counts arrive only after a billed call.
 - Cross-message compaction preserves conversational meaning, not the full prior wire transcript. A follow-up can reuse a leading prefix, but it is not necessarily an append-only extension of the last tool-loop request.
 
@@ -138,7 +138,7 @@ Within one session, the second request is the first request plus more items. Bet
 
 `generation`, `reasoning`, `routing` and `cache` are immutable client settings, not arbitrary JSON
 or request-scoped overrides. The strict configuration and every accepted spelling/bound are in
-[`dekopond.md`](dekopond.md#openrouter-model-settings). Omitted members remain absent on the wire:
+[`gatewayd.md](gatewayd.md#openrouter-model-settings). Omitted members remain absent on the wire:
 `maxOutputTokens` maps to `max_tokens`, `topP` to `top_p`, reasoning effort to `reasoning.effort`,
 and routing to snake-case members of `provider`. Forwarding a control does not prove that a remote
 provider honored it; telemetry labels these as requested settings.
@@ -178,7 +178,7 @@ counts are a subset of output, not an extra charge added to it.
 A key is a routing hint, not a cache handle: `prompt_cache_key` on Codex and compatible requests,
 `session_id` on OpenRouter. Dekopon cannot use it to read another response,
 enumerate cache contents, or delete provider state, and it is minted from entropy rather than from a
-subject, channel, phone number, or account ID. [`dekopond.md`](dekopond.md#the-prompt-cache-key) owns
+subject, channel, phone number, or account ID. [`gatewayd.md](gatewayd.md#the-prompt-cache-key) owns
 its scope, minting, and rotation.
 
 Sharing a one-shot route's key does not share answers: two requests reuse only their identical
@@ -240,7 +240,7 @@ Not by staying alive.
 
 A local object has no lease on provider memory. The official public API model is request-driven: matching requests are routed toward cached prefixes, and the provider controls retention and eviction. There is no documented mechanism where any of these pins the cache:
 
-- a running `dekopond` process;
+- a running `dekopon-gatewayd` process;
 - a live `CodexClient`, `OpenRouterClient`, or pooled `reqwest::Client`;
 - an HTTP keep-alive connection;
 - an OAuth access token or ChatGPT login;
@@ -249,11 +249,11 @@ A local object has no lease on provider memory. The official public API model is
 
 Synthetic keep-alive prompts would consume quota, create more retained input, and buy no subscription-endpoint guarantee. Dekopon does not send them.
 
-One long-lived optimization is in place: `dekopond` shares one model client per configured model across gateway messages, reusing connections and the loaded credential, with refreshes coordinated through the client's credential mutex and the cross-process advisory lock beside the auth file. `CompletionOptions` stays request-scoped so a shared client cannot apply one conversation's key to another.
+One long-lived optimization is in place: `dekopon-gatewayd` shares one model client per configured model across gateway messages, reusing connections and the loaded credential, with refreshes coordinated through the client's credential mutex and the cross-process advisory lock beside the auth file. `CompletionOptions` stays request-scoped so a shared client cannot apply one conversation's key to another.
 
 ## How scoped conversation memory works
 
-A route selects replay behavior with a `memory:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
+A route selects replay behavior with a `memory:` block, and [`gatewayd.md](gatewayd.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
@@ -310,7 +310,7 @@ storage is decoded by the native codec on consumption. Model wire serialization 
 streaming model request bodies is a separate change, not claimed by descriptor integration.
 
 For adapter types, storage ceilings and transport paths, see
-[asset handles and delivery](dekopond.md#asset-handles-and-delivery). Memory retains text and scoped
+[asset handles and delivery](gatewayd.md#asset-handles-and-delivery). Memory retains text and scoped
 reference notes, never provider payload bytes. A partial native delivery suppresses durable recording.
 
 
@@ -340,7 +340,7 @@ message becomes a second stored turn. Malformed complete records remain `memory-
 Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
 files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage
 root and never in its audit, spans, metrics, public errors, or provider metadata.
-[`dekopond.md`](dekopond.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
+[`gatewayd.md](gatewayd.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
 Retrieval is explicit: a durable turn never enters a later prompt on its own, and what comes back is
 untrusted model context.
 
@@ -491,7 +491,7 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 ## Related documents
 
-- [`dekopond.md`](dekopond.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
+- [`gatewayd.md](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
 - [`cli.md`](cli.md) — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.

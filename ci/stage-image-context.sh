@@ -47,7 +47,7 @@ context="$work/context"
 # a build can bake in a binary that cannot start.
 max_glibc="2.41"
 
-binaries="dekopon-brokerd dekopond"
+binaries="dekopon-brokerd dekopon-gatewayd"
 providers="cli-probe http-probe"
 
 # macOS ships shasum, Linux ships sha256sum, and their --check flags differ. Comparing the digests

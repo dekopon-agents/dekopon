@@ -1,7 +1,7 @@
 # Catalog resource reference
 
 **Status: current.** This is the field-by-field contract for the `dekopon.dev/v1alpha1` catalog —
-the `Agent` documents in the file `dekopond`'s `catalogPath` points at. [`cli.md`](cli.md) covers
+the `Agent` documents in the file `dekopon-gatewayd`'s `catalogPath` points at. [`cli.md`](cli.md) covers
 the separate model-auth commands; this document covers the schema and, for every field, what
 actually consumes it today.
 
@@ -13,7 +13,7 @@ shipped component reads. Authoring one correctly means knowing which is which.
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, and mounts its `skills` on every session the route serves. |
+| `dekopon-gatewayd` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, and mounts its `skills` on every session the route serves. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
@@ -86,11 +86,11 @@ status: Ready
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
 | `description` | string | yes | Bound into the gateway route and returned by `inspect_agent_config`. |
-| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Authored status does not override it. |
-| `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
+| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopon-gatewayd`.** A route naming a disabled agent is a startup failure. Authored status does not override it. |
+| `instructions` | string | no | **Load-bearing in `dekopon-gatewayd`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
 | `instructionsFile` | path | no | Read at load, relative to the catalog file (or directory), into `instructions`. An agent names one or the other. |
-| `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
-| `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
+| `skills` | list of directory paths | no | **Load-bearing in `dekopon-gatewayd`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopon-gatewayd` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
+| `modelClass` | string | no, but see below | **Load-bearing in `dekopon-gatewayd`.** Selects which configured model serves the agent. |
 | `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | **Reserved.** Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 ### `instructions` is untrusted model text, and it is readable
@@ -138,11 +138,11 @@ show a model a skill, and a skill that cannot be read refuses the catalog rather
 
 What consumes a loaded skill:
 
-- `dekopond` binds an agent's skills to every route naming it and mounts them on every session on
+- `dekopon-gatewayd` binds an agent's skills to every route naming it and mounts them on every session on
   that route: a second system message after `instructions` lists each skill by name and
   description, and the `read_skill` tool returns a skill's body, or one resource's text, when the
   model asks. Bodies and resources are never in a prompt until read; each read is recorded as
-  `agent.skill.read`. See [`dekopond.md`](dekopond.md#sessions) and
+  `agent.skill.read`. See [`gatewayd.md](gatewayd.md#sessions) and
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text.
@@ -156,7 +156,7 @@ token, credential, or internal hostname belongs in a `SKILL.md` or in any resour
 
 ### `modelClass` decides which model runs the agent
 
-`dekopond`'s configuration lists model endpoints, each declaring the classes it satisfies. For each
+`dekopon-gatewayd`'s configuration lists model endpoints, each declaring the classes it satisfies. For each
 route, the agent's `modelClass` picks the first configured model offering that class, in declaration
 order, so an operator controls preference by ordering `models` rather than by a hidden score.
 
@@ -165,13 +165,13 @@ It is optional for an unrouted agent or a route with an explicit model. Gateway
 
 - a route that names `model:` explicitly overrides the class, and then `modelClass` selects nothing
   (`inspect_agent_config` returns it regardless);
-- a route with no `model:` and an agent with no `modelClass` is a **`dekopond` startup failure**;
+- a route with no `model:` and an agent with no `modelClass` is a **`dekopon-gatewayd` startup failure**;
 - a route with no `model:`, an agent with a `modelClass`, and no configured model offering that
   class is also a startup failure.
 
 Failing at startup rather than per-session is the point: a catalog typo here is one refused boot, not
 an agent that appears configured and answers nobody. See
-[`dekopond.md`](dekopond.md#configuration) for the model list and route syntax.
+[`gatewayd.md](gatewayd.md#configuration) for the model list and route syntax.
 
 ## Reserved and inert fields
 
@@ -193,13 +193,13 @@ broker's configuration can disagree with every one of them without either proces
   `ObjectMeta`, `AgentSpec` and `AgentStatus` own the typed serde storage of labels,
   descriptions and the optional authored status.
   Storage and serialization are not a catalog display command.
-- [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
+- [`dekopond/src/routes.rs`](../crates/dekopon-gatewayd/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
 - [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:
   retain license, compatibility, scalar metadata and allowed-tools with typed accessors.
   [`dekopon-agent/src/skills.rs`](../crates/dekopon-agent/src/skills.rs), `prompt_block` and
   `render_skill`, use name, description, body and resource paths/text, not those optional
-  front-matter fields. [`dekopond/src/session.rs`](../crates/dekopond/src/session.rs)
+  front-matter fields. [`dekopond/src/session.rs`](../crates/dekopon-gatewayd/src/session.rs)
   constructs self-inspection with name, description and resource paths only. The gateway mounts
   the loaded skills through the shared agent layer; no surviving renderer promises to
   display the optional front matter. Metadata scalars remain converted to text by the loader.
@@ -232,7 +232,7 @@ a catalog that disagrees with it produces no error here and no error there.
 ## Related documents
 
 - [`cli.md`](cli.md) — model-auth formats and exit codes.
-- [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
+- [`gatewayd.md](gatewayd.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`improvement.md`](improvement.md) — catalog-mounted skills and suggestions.
 - [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries) —

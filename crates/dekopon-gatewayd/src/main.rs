@@ -8,7 +8,7 @@
     )
 )]
 #[cfg(unix)]
-use dekopond::cli;
+use dekopon_gatewayd::cli;
 #[cfg(unix)]
 mod auth;
 #[cfg(unix)]
@@ -26,9 +26,9 @@ use clap::Parser as _;
 #[cfg(unix)]
 use dekopon_core::error_chain;
 #[cfg(unix)]
-use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
+use dekopon_gatewayd::cli::Cli;
 #[cfg(unix)]
-use dekopond::cli::Cli;
+use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
 #[cfg(unix)]
 use thiserror::Error;
 #[cfg(unix)]
@@ -39,7 +39,7 @@ use tokio::signal::unix::{SignalKind, signal};
 const OTEL_LOG_FILTER: &str = "job=debug,meter=info";
 
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
+const OTEL_TRACE_FILTER: &str = "dekopon-gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
 /// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
 /// non-preemptible blocking work already in flight; anything still running past this timeout is
@@ -63,13 +63,13 @@ fn main() -> ExitCode {
         }
         Some(cli::Command::Check(check)) => {
             if cli.config.is_some() {
-                eprintln!("dekopond: --config cannot be used with check");
+                eprintln!("dekopon-gatewayd: --config cannot be used with check");
                 return ExitCode::from(2);
             }
             return match bounded_runtime(BLOCKING_EXIT_TIMEOUT, run_check(check)) {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("dekopond: could not start the async runtime: {error}");
+                    eprintln!("dekopon-gatewayd: could not start the async runtime: {error}");
                     ExitCode::FAILURE
                 }
             };
@@ -77,24 +77,24 @@ fn main() -> ExitCode {
         None => {}
     }
     let Some(config) = cli.config else {
-        eprintln!("dekopond: --config is required for serving");
+        eprintln!("dekopon-gatewayd: --config is required for serving");
         return ExitCode::from(2);
     };
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("dekopond: could not locate jq worker executable: {error}");
+            eprintln!("dekopon-gatewayd: could not locate jq worker executable: {error}");
             return ExitCode::FAILURE;
         }
     };
     if dekopon_shell::set_jq_worker_executable(executable).is_err() {
-        eprintln!("dekopond: jq worker executable already supplied");
+        eprintln!("dekopon-gatewayd: jq worker executable already supplied");
         return ExitCode::FAILURE;
     }
     match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(config)) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("dekopond: could not start the async runtime: {error}");
+            eprintln!("dekopon-gatewayd: could not start the async runtime: {error}");
             ExitCode::FAILURE
         }
     }
@@ -123,7 +123,7 @@ struct CheckOutput {
 
 #[cfg(unix)]
 async fn run_check(check: &cli::CheckArgs) -> ExitCode {
-    let report = dekopond::check(&check.config, check.catalog.as_deref()).await;
+    let report = dekopon_gatewayd::check(&check.config, check.catalog.as_deref()).await;
     let output = CheckOutput {
         ok: report.problems.is_empty(),
         problems: report
@@ -148,7 +148,7 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
         cli::CheckFormat::Json => match serde_json::to_string_pretty(&output) {
             Ok(json) => println!("{json}"),
             Err(error) => {
-                eprintln!("dekopond: could not render check output: {error}");
+                eprintln!("dekopon-gatewayd: could not render check output: {error}");
                 return ExitCode::FAILURE;
             }
         },
@@ -162,19 +162,19 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
 
 #[cfg(unix)]
 async fn serve(config: std::path::PathBuf) -> ExitCode {
-    let settings = dekopond::telemetry_settings(&config, dekopond::current_uid())
+    let settings = dekopon_gatewayd::telemetry_settings(&config, dekopon_gatewayd::current_uid())
         .await
         .ok()
         .flatten();
 
     let tracer_provider = dekopon_telemetry::optional_tracer_provider(
         settings.as_ref().map(|telemetry| &telemetry.settings),
-        "dekopond",
+        "dekopon-gatewayd",
     );
 
     let logger_provider = dekopon_telemetry::optional_logger_provider(
         settings.as_ref().map(|telemetry| &telemetry.settings),
-        "dekopond",
+        "dekopon-gatewayd",
     );
     let mut install = Install::new(Console {
         format: ConsoleFormat::Json,
@@ -182,7 +182,7 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         filter: ConsoleFilter::Environment("info".to_owned()),
     });
     if let Some(provider) = tracer_provider {
-        install = install.with_traces(provider, "dekopond", OTEL_TRACE_FILTER);
+        install = install.with_traces(provider, "dekopon-gatewayd", OTEL_TRACE_FILTER);
     }
     if let Some(provider) = logger_provider {
         install = install.with_logs(provider, OTEL_LOG_FILTER);
@@ -190,7 +190,7 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
     let telemetry = match install.install() {
         Ok(guard) => guard,
         Err(error) => {
-            eprintln!("dekopond: could not install tracing subscriber: {error}");
+            eprintln!("dekopon-gatewayd: could not install tracing subscriber: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -222,7 +222,7 @@ async fn execute(config: std::path::PathBuf) -> Result<(), AppError> {
             _ = terminate.recv() => {}
         }
     };
-    dekopond::run(config, shutdown)
+    dekopon_gatewayd::run(config, shutdown)
         .await
         .map_err(AppError::Gateway)?;
     Ok(())
@@ -234,7 +234,7 @@ enum AppError {
     #[error("could not install termination signal handler")]
     Signal(#[source] io::Error),
     #[error("gateway service failed")]
-    Gateway(#[source] dekopond::DekopondError),
+    Gateway(#[source] dekopon_gatewayd::DekopondError),
 }
 
 #[cfg(all(test, unix))]
@@ -242,7 +242,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use clap::CommandFactory as _;
-    use dekopond::cli::Cli;
+    use dekopon_gatewayd::cli::Cli;
 
     #[test]
     fn cli_definition_is_internally_consistent() {
@@ -279,6 +279,6 @@ mod tests {
 
 #[cfg(not(unix))]
 fn main() -> std::process::ExitCode {
-    eprintln!("dekopond requires Unix peer credentials and Unix-domain sockets");
+    eprintln!("dekopon-gatewayd requires Unix peer credentials and Unix-domain sockets");
     std::process::ExitCode::FAILURE
 }

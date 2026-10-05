@@ -23,7 +23,7 @@ no-op and the final reply is unchanged.
 
 ## Create the app and credentials
 
-`dekopond` needs two different Slack credentials:
+`dekopon-gatewayd` needs two different Slack credentials:
 
 | Credential | Prefix | Purpose | Environment variable |
 |---|---|---|---|
@@ -67,7 +67,7 @@ itself routed as a prompt, and ambient channel-history events are discarded insi
    should contain one row named `dekopon` with the `connections:write` scope. Select the token name
    in that table to reopen its **Copy** and **Revoke** controls.
 
-Treat the token as a secret. Do not paste it into `manifest.yaml`, `dekopond.yaml`, an issue, or a
+Treat the token as a secret. Do not paste it into `manifest.yaml`, `gatewayd.yaml`, an issue, or a
 commit. Use **Revoke** in the token details if it is exposed.
 
 ### Install the app and get the bot token (`xoxb-…`)
@@ -88,7 +88,7 @@ attachment. The bot token is attached only to the two fixed Slack Web API calls 
 upload URL. Files are delivered only after explicit broker authorization of `asset.send`; attaching
 alone retains them. This adapter accepts any concrete valid media type. Route instructions should
 state that accepted set; invalid labels are refused. See
-[asset handles](../../docs/dekopond.md#asset-handles-and-delivery) for the bounds.
+[asset handles](../../docs/gatewayd.md#asset-handles-and-delivery) for the bounds.
 
 ## Configure in-flight liveness
 
@@ -126,12 +126,12 @@ liveness:
 
 The Agent manifest already requests `assistant:write`; no new scope is needed. This transport
 option needs a route with `progressNotes: true` to hand over. See the
-[Slack status-text contract](../../docs/dekopond.md#slack-socket-mode) for its lease and hidden Stop
+[Slack status-text contract](../../docs/gatewayd.md#slack-socket-mode) for its lease and hidden Stop
 control. Omit `statusText` to retain the native-only default.
 
 `cancelButton` is refused on `experience: agent`: Slack renders its own Stop control there. On both
 profiles a reply of `stop` or `cancel` in the conversation stops the run — see
-[Liveness, progress, and stopping a run](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
+[Liveness, progress, and stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
 
 `experience` controls conversation semantics and never changes in response to a cosmetic API
 failure. Classic DMs retain top-level replies and one whole-DM conversation. Agent DMs use one
@@ -168,7 +168,7 @@ session successfully added; a failed cleanup may leave a harmless `:tangerine:` 
 
 ### Export the credentials
 
-Export the values under the environment-variable names referenced by `dekopond.yaml`:
+Export the values under the environment-variable names referenced by `gatewayd.yaml`:
 
 ```console
 export DEKOPOND_SLACK_APP_TOKEN=xapp-...

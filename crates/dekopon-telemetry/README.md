@@ -2,7 +2,7 @@
 
 Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 
-`dekopon-brokerd` and `dekopond` each export their own spans, so exporter construction lives here
+`dekopon-brokerd` and `dekopon-gatewayd` each export their own spans, so exporter construction lives here
 rather than in each binary. The crate depends on no other Dekopon crate: it must stay linkable from
 the gateway without pulling broker code into the gateway's dependency tree, which CI rejects.
 
@@ -12,7 +12,7 @@ Without features the crate is only the [trace context](#trace-context) surface, 
 `opentelemetry`, `tracing-opentelemetry` and `tracing`. The `exporter` feature adds everything that
 installs or exports telemetry — `ExporterSettings`, `Transport`, `Install` and its console types,
 `TelemetryError` — together with the OTLP exporter, the OpenTelemetry SDK, the log bridge and the
-blocking reqwest client they need. Only the processes that export enable it (`dekopond` and
+blocking reqwest client they need. Only the processes that export enable it (`dekopon-gatewayd` and
 `dekopon-brokerd`), so `dekopon-http-host`, `dekopon-broker-host` and every provider test build that
 links them read the active trace without linking an exporter.
 

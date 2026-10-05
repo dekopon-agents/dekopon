@@ -1,6 +1,6 @@
 # Run Dekopon on Kubernetes
 
-The [Helm chart](../charts/dekopon/) runs `dekopon-brokerd` and `dekopond` as one pod
+The [Helm chart](../charts/dekopon/) runs `dekopon-brokerd` and `dekopon-gatewayd` as one pod
 with separate runtime UIDs. Its reference deployment is a single-node arm64 k3s cluster. It is
 published to `oci://ghcr.io/dekopon-agents/charts/dekopon` and consumed from ArgoCD by registry
 path, not by Git path; both GHCR packages are public. See
@@ -12,7 +12,7 @@ against a live Kubernetes API server. Treat the manifests as reviewed rather tha
 [What is not proven](#what-is-not-proven).
 
 Read [the broker configuration reference](../crates/dekopon-brokerd/README.md) and
-[the gateway configuration reference](dekopond.md) first. The chart places files and sets
+[the gateway configuration reference](gatewayd.md) first. The chart places files and sets
 permissions; it does not define or validate their contents, and the two daemons' own documentation
 is the only description of what goes in them.
 
@@ -82,7 +82,7 @@ routing; it is disabled by default. The broker never receives a TCP surface.
 |---|---|---|
 | `prepare-files` | init, runs to completion, **root** | `busybox`, copies configuration into an `emptyDir` with the right owner and mode |
 | `broker` | native sidecar (`restartPolicy: Always`) when the gateway is enabled, otherwise the pod's only regular container | `dekopon-brokerd --config /etc/dekopon/broker.yaml` |
-| `gateway` | regular container, only when `gateway.enabled` | `dekopond --config /etc/dekopon/dekopond.yaml` |
+| `gateway` | regular container, only when `gateway.enabled` | `dekopon-gatewayd --config /etc/dekopon/gatewayd.yaml` |
 
 `broker.providerSync.enabled` adds a hook `Job` that runs `dekopon-brokerd provider sync`; see
 [Syncing the set with the chart's hook Job](#syncing-the-set-with-the-charts-hook-job).
@@ -97,9 +97,9 @@ and their owner must supply it. The gateway receives no broker configuration, se
 mount, and the broker receives no gateway configuration, model credential, or temporary volume.
 
 The broker is a native sidecar rather than a second regular container because ordering matters in
-both directions. `dekopond` probes the broker once at startup and exits non-zero when the socket
+both directions. `dekopon-gatewayd` probes the broker once at startup and exits non-zero when the socket
 does not answer, so a plain second container would crash-loop its way to a working state; a sidecar
-with a startup probe means Kubernetes does not start `dekopond` at all until the broker answers a
+with a startup probe means Kubernetes does not start `dekopon-gatewayd` at all until the broker answers a
 real request. Termination runs the other way — the gateway drains first, the broker second — which
 lets the gateway's in-flight invocations finish against a broker that is still serving, and is the
 reason the pod's grace is a sum rather than a maximum;
@@ -115,7 +115,7 @@ wrong:
 | Tier | Applies to | Rule |
 |---|---|---|
 | A | `broker-credentials.yaml`, `secret-map.yaml` | rejected if `mode & 0o077 != 0` |
-| B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
+| B | `broker.yaml`, `policies.cedar`, `gatewayd.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
 | C | `providerSet.storePath` (the parent of generated `cwasm`) and the parent of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
@@ -158,13 +158,13 @@ file rather than a broker that starts and then refuses to serve.
 
 ### What does not need any of this
 
-- **Chat-service, chat-model, and optional image-model credentials.** `dekopond.yaml` names environment variable *names*, never values,
+- **Chat-service, chat-model, and optional image-model credentials.** `gatewayd.yaml` names environment variable *names*, never values,
   so those are ordinary `secretKeyRef` entries under `gateway.env` with no file hygiene at all.
 - **`OTEL_EXPORTER_OTLP_HEADERS`.** The broker's `telemetry` block has no credential field by
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters
   `broker.yaml`. A receiver on a private CA needs `otlp.caBundle` (a ConfigMap and key of PEM
   roots), which both daemons read as `OTEL_EXPORTER_OTLP_CERTIFICATE`.
-- **The agent catalog.** Tier E. `dekopond` reads `catalogPath` with a plain `read_to_string`, so a
+- **The agent catalog.** Tier E. `dekopon-gatewayd` reads `catalogPath` with a plain `read_to_string`, so a
   ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
   for the catalog files alone. For agents declaring `spec.skills`, use `gateway.skills.configMap`
   and `gateway.skills.items` to map flat ConfigMap keys to nested paths such as
@@ -174,7 +174,7 @@ file rather than a broker that starts and then refuses to serve.
   the gateway and console mount it read-only at `paths.skillsDir` (default `/etc/dekopon-skills`).
   Neither the broker nor either runtime container mounts the symlinked source. Credentials must
   never be placed in this ConfigMap. An Agent can mount `/etc/dekopon-skills/pull-request-review`
-  without changing its existing catalog mount or widening any broker grant. `dekopond` still
+  without changing its existing catalog mount or widening any broker grant. `dekopon-gatewayd` still
   refuses unreadable, invalid or symlinked skill resources at startup.
   Like other externally supplied startup files, skill changes need a pod rollout; configure
   your existing ConfigMap reloader or roll the pod explicitly. The chart cannot checksum an
@@ -199,12 +199,12 @@ the broker UID/GID is changed, even with a custom image. Gateway container UID/G
 
 ## Paths the chart owns
 
-Your `broker.yaml` and `dekopond.yaml` must name files inside these directories. The chart places
+Your `broker.yaml` and `gatewayd.yaml` must name files inside these directories. The chart places
 files; it does not rewrite configuration.
 
 Both containers use `paths.configDir` at runtime, but these are **different tmpfs volumes**.
 Init mounts the gateway volume at `paths.gatewayConfigDir` (default `/etc/dekopon-gateway`)
-only to copy its `dekopond.yaml` as UID 65533. Broker copies remain UID 65532.
+only to copy its `gatewayd.yaml` as UID 65533. Broker copies remain UID 65532.
 The state claim root stays root-owned `0700` and neither daemon mounts it. With `broker.chatgpt`
 enabled the broker mounts only its own credential subdirectory, and the gateway mounts only the
 configured ChatGPT subdirectory. Neither daemon can rename the other's directory.
@@ -235,15 +235,15 @@ action performed by this chart.
 | `broker-credentials.yaml` | `/etc/dekopon/broker-credentials.yaml` | A | init container |
 | private `secret-map.yaml` | `/etc/dekopon/secret-map.yaml` | A | init container; broker only |
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
-| `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
+| `gatewayd.yaml` | `/etc/dekopon/gatewayd.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
 | broker assets | `/var/lib/dekopon-assets` (`brokerAssets.rootPath`) | owned `0700` dir, broker-only disk `emptyDir` | init sets ownership; broker writes spools and outputs; match `brokerAssets` in operator inline `assets` config |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
-| gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
+| gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopon-gatewayd` owns it |
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 | managed provider set | `/var/lib/dekopon/providers/` | owned `0700` dir, broker-only | the directory by the init container; the lock and the store by the operator's sync step |
-| gateway conversation journal | `gateway.journal.mountPath` (default `/var/lib/dekopond/journal`), `gateway.journal.subdir` on the claim | owned `0700` dir, gateway-only | the directory by the init container when `gateway.journal.enabled`; `0600` files by `dekopond`. Set `sessions.journal.path` in `dekopond.yaml` to the mount path |
+| gateway conversation journal | `gateway.journal.mountPath` (default `/var/lib/dekopond/journal`), `gateway.journal.subdir` on the claim | owned `0700` dir, gateway-only | the directory by the init container when `gateway.journal.enabled`; `0600` files by `dekopon-gatewayd`. Set `sessions.journal.path` in `gatewayd.yaml` to the mount path |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
 socket never reach the node's disk. `/var/lib/dekopon` is the retained model-credential claim.
@@ -268,7 +268,7 @@ emits **no audit record**.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
   webhook Service is enabled, prevents traffic while the broker is unavailable.
 - **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
-  on the configured webhook port. It fails closed when `dekopond.yaml` binds loopback, names a
+  on the configured webhook port. It fails closed when `gatewayd.yaml` binds loopback, names a
   different port, or does not configure an inbound listener.
 - **No `livenessProbe`.** An automatic restart could kill a broker mid-invocation or lose an
   acknowledged in-memory webhook delivery. Process failure and readiness already remain visible.
@@ -283,7 +283,7 @@ It loads no configuration, components or credentials and initializes no telemetr
 The sidecar ordering that makes startup work also makes shutdown serial. The kubelet stops the
 gateway's container first and only starts stopping the broker sidecar once that container is gone,
 so the pod's `terminationGracePeriodSeconds` has to cover **both** drains added together — not the
-larger of the two. `dekopond` drains in-flight sessions for its own `shutdownGraceMs`,
+larger of the two. `dekopon-gatewayd` drains in-flight sessions for its own `shutdownGraceMs`,
 `dekopon-brokerd` then drains connections for `serverLimits.shutdownGraceMs`, and both default to
 `120000`.
 
@@ -299,7 +299,7 @@ a kill nobody notices until an invocation is cut off:
 ```console
 $ helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml \
     --set terminationGracePeriodSeconds=180
-Error: ... terminationGracePeriodSeconds is 180, but the containers stop in sequence: dekopond
+Error: ... terminationGracePeriodSeconds is 180, but the containers stop in sequence: dekopon-gatewayd
 drains for 120000 ms and then dekopon-brokerd drains for 120000 ms ... That needs 270 seconds.
 ```
 
@@ -319,10 +319,10 @@ A longer shutdown window does not promise crash recovery.
 
 ## The ChatGPT credential is seeded once
 
-`dekopond auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
+`dekopon-gatewayd auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
 waits for a human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription`
 model has to be handed a credential exported from a local login.
-`dekopond auth chatgpt export --expose-credential` produces it, and
+`dekopon-gatewayd auth chatgpt export --expose-credential` produces it, and
 [the ChatGPT credential guide](chatgpt-credential.md)
 is the full lifecycle.
 
@@ -332,7 +332,7 @@ Set `gateway.chatgpt.enabled` and point it at the Secret:
 gateway:
   chatgpt:
     enabled: true
-    existingSecret: dekopon-chatgpt-auth   # what `dekopond auth chatgpt export --expose-credential --namespace <ns>` emits
+    existingSecret: dekopon-chatgpt-auth   # what `dekopon-gatewayd auth chatgpt export --expose-credential --namespace <ns>` emits
 ```
 
 The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65533`, in a
@@ -394,7 +394,7 @@ root, and distinct UID ownership additionally denies access to the other's priva
 `DEKOPON_CHATGPT_AUTH_FILE` is set on the gateway container to that path. Without it, a model with
 no explicit `authFile` falls back to `$XDG_CONFIG_HOME` and then `$HOME`, which is on the read-only
 root filesystem, where `save_credentials` cannot create its temporary sibling. Naming `authFile` in
-`dekopond.yaml` is clearer, and then neither the environment nor the fallback matters.
+`gatewayd.yaml` is clearer, and then neither the environment nor the fallback matters.
 
 ### The broker has a second, independent family
 
@@ -425,8 +425,8 @@ Everything above applies to it unchanged: seeded once into the claim, `0600` own
 `0700` directory owned by `65532`, and never overwritten again. Three things differ.
 
 **It is a separate token family, and must be.** Produce it with a second
-`dekopond auth chatgpt login --auth-file <path>` against the same ChatGPT account, then
-`dekopond auth chatgpt export --expose-credential --auth-file <path>`. Never point the broker and the
+`dekopon-gatewayd auth chatgpt login --auth-file <path>` against the same ChatGPT account, then
+`dekopon-gatewayd auth chatgpt export --expose-credential --auth-file <path>`. Never point the broker and the
 gateway at one file: the refresh token rotates and the authorization server retires its predecessor,
 so two independent holders of one file eventually present a retired token and revoke the family for
 both. The chart refuses to render when `broker.chatgpt.subdir` equals `gateway.chatgpt.subdir`, and
@@ -777,7 +777,7 @@ to an object that already exists. Setting both is an error.
 | `policies.cedar` | `broker.policies.inline` | `broker.policies.existingSecret` / `.existingSecretKey` |
 | `broker-credentials.yaml` | `broker.credentials.inline` | `broker.credentials.existingSecret` / `.existingSecretKey` |
 | private secret map | `broker.secretMap.inline` | `broker.secretMap.existingSecret` / `.existingSecretKey` |
-| `dekopond.yaml` | `gateway.config.inline` | `gateway.config.existingSecret` / `.existingSecretKey` |
+| `gatewayd.yaml` | `gateway.config.inline` | `gateway.config.existingSecret` / `.existingSecretKey` |
 | agent catalog | `gateway.catalog.inline` | `gateway.catalog.existingConfigMap` / `.existingConfigMapKey` |
 | gateway ChatGPT credential | `gateway.chatgpt.inline` | `gateway.chatgpt.existingSecret` / `.existingSecretKey` |
 | broker ChatGPT credential | `broker.chatgpt.inline` | `broker.chatgpt.existingSecret` / `.existingSecretKey` |
@@ -802,7 +802,7 @@ the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespac
 [<console.subject>]` when the console is enabled with a subject. A ConfigMap key named
 `peers.yaml` fails the init container while this is on.
 
-`gateway.configDirectory.configMap` does the same for dekopond: every `*.yaml` key lands in
+`gateway.configDirectory.configMap` does the same for dekopon-gatewayd: every `*.yaml` key lands in
 `dekopond.d`, owned by `65533`, and `gateway.config` must be empty.
 
 The chart cannot hash a ConfigMap it did not render, so Reloader is the restart path: annotate the

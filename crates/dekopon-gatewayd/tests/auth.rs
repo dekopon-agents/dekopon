@@ -7,7 +7,7 @@ use std::{
 };
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dekopond"))
+    Command::new(env!("CARGO_BIN_EXE_dekopon-gatewayd"))
 }
 
 fn stdout(output: &Output) -> String {

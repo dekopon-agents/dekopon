@@ -32,7 +32,7 @@ Effort: S  one PR, one crate, under ~300 changed lines (#246)
         L  ~1,500-5,000 lines, or gateway and broker together, or a new host import or provider
            repo (#238, #217)
         XL over ~5,000 lines, or a fleet-wide provider re-pin (#260, #257)
-Gateway: yes if it touches dekopond, dekopon-agent, dekopon-shell or dekopon-model
+Gateway: yes if it touches dekopon-gatewayd, dekopon-agent, dekopon-shell or dekopon-model
 Broker: yes if it touches dekopon-brokerd, -broker, -broker-host, -http-host, -storage-host,
   -policy or -capability
 Provider contract: none | SDK (additive Rust API, no re-pin) | WIT add (new import, no package

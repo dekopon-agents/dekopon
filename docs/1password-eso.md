@@ -258,11 +258,11 @@ Three things compose with an ESO-written Secret, and all are described in [`secr
 
 ### The checks
 
-`dekopon-brokerd` reads its configuration, its Cedar policy, and its credentials under one hygiene discipline and refuses anything that does not meet it; `dekopond` applies the same rule to its own configuration file. The file predicate has one definition, [`crates/dekopon-core/src/trusted_file.rs`](../crates/dekopon-core/src/trusted_file.rs) (`read_trusted_file` with `FileTier::Private` for `mode & 0o077` and `FileTier::NotWorldWritable` for `mode & 0o022`), which [`crates/dekopon-brokerd/src/config.rs`](../crates/dekopon-brokerd/src/config.rs), [`crates/dekopon-brokerd/src/credentials.rs`](../crates/dekopon-brokerd/src/credentials.rs), [`crates/dekopon-brokerd/src/secrets.rs`](../crates/dekopon-brokerd/src/secrets.rs), and [`crates/dekopond/src/config.rs`](../crates/dekopond/src/config.rs) call; the directory, provider-component, and compile-cache parent checks are in [`crates/dekopon-brokerd/src/socket.rs`](../crates/dekopon-brokerd/src/socket.rs):
+`dekopon-brokerd` reads its configuration, its Cedar policy, and its credentials under one hygiene discipline and refuses anything that does not meet it; `dekopon-gatewayd` applies the same rule to its own configuration file. The file predicate has one definition, [`crates/dekopon-core/src/trusted_file.rs`](../crates/dekopon-core/src/trusted_file.rs) (`read_trusted_file` with `FileTier::Private` for `mode & 0o077` and `FileTier::NotWorldWritable` for `mode & 0o022`), which [`crates/dekopon-brokerd/src/config.rs`](../crates/dekopon-brokerd/src/config.rs), [`crates/dekopon-brokerd/src/credentials.rs`](../crates/dekopon-brokerd/src/credentials.rs), [`crates/dekopon-brokerd/src/secrets.rs`](../crates/dekopon-brokerd/src/secrets.rs), and [`crates/dekopon-gatewayd/src/config.rs`](../crates/dekopon-gatewayd/src/config.rs) call; the directory, provider-component, and compile-cache parent checks are in [`crates/dekopon-brokerd/src/socket.rs`](../crates/dekopon-brokerd/src/socket.rs):
 
 | File | Opened with | Must be |
 |---|---|---|
-| `broker.yaml`, `policies.cedar`, `dekopond.yaml` | `O_NOFOLLOW` | regular, `uid == geteuid()`, `nlink == 1`, `mode & 0o022 == 0`, byte-capped |
+| `broker.yaml`, `policies.cedar`, `gatewayd.yaml` | `O_NOFOLLOW` | regular, `uid == geteuid()`, `nlink == 1`, `mode & 0o022 == 0`, byte-capped |
 | `broker-credentials.yaml` | `O_NOFOLLOW` | the same, but `mode & 0o077 == 0` |
 | provider `.wasm` | `symlink_metadata` | regular, server-owned, `nlink == 1`, `mode & 0o022 == 0`, protected parents, no group/world-writable non-sticky ancestor |
 
@@ -294,6 +294,6 @@ The lifecycle it needs instead is seed-once: export a working local credential, 
 
 - [`security-model.md`](security-model.md) — the trust boundaries the file hygiene above enforces, and the current distinct-UID deployment boundary.
 - [`../crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the configuration, credentials, and policy file contracts in full, including the credentials file this guide's Secret would eventually become.
-- [`dekopond.md`](dekopond.md) — the gateway's configuration, which names environment variables rather than secrets and so consumes an ESO-provisioned Secret differently from the broker.
+- [`gatewayd.md](gatewayd.md) — the gateway's configuration, which names environment variables rather than secrets and so consumes an ESO-provisioned Secret differently from the broker.
 - [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — how a resolved credential is bound to a destination and injected, once it exists as a file.
 - [`observability.md`](observability.md) — the other half of this cluster's deployment story, including the OpenObserve endpoint the same host serves.

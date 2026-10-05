@@ -3,7 +3,7 @@
 **Status: current.** This is the operator's index, not a second copy of the manuals. Dekopon keeps
 each implementation contract beside its code, so the authoritative text for running the privileged
 broker is [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) and for the
-gateway it is [`dekopond.md`](dekopond.md). This page exists so an operator can find them by the
+gateway it is [`gatewayd.md](gatewayd.md). This page exists so an operator can find them by the
 question they arrived with, rather than by guessing that a crate README is the operations manual.
 
 ## Audit
@@ -32,7 +32,7 @@ daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-broker
 | How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
 | Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
-| Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
+| Why did the gateway refuse to start? | [`gatewayd.md § Startup fails closed](gatewayd.md#startup-fails-closed) |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — managed providers boot from verified, mapped cwasm under the provider store. `provider sync` publishes compiled artifacts; run `provider precompile` to fill, repair and prune the cache before a broker boot. A missing index refuses startup; `compileOnLoad: true` bypasses the cache |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |

@@ -1,6 +1,6 @@
-# `dekopond` — the chat gateway and agent daemon
+# `dekopon-gatewayd` — the chat gateway and agent daemon
 
-`dekopond` is the unprivileged half of the deployment boundary in [`design.md`](design.md): it connects to chat services, waits for a wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model session with the sandboxed shell and safe on-demand meta tools, and replies with the answer.
+`dekopon-gatewayd` is the unprivileged half of the deployment boundary in [`design.md`](design.md): it connects to chat services, waits for a wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model session with the sandboxed shell and safe on-demand meta tools, and replies with the answer.
 
 It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
@@ -18,7 +18,7 @@ it is the configuration this one describes in the abstract.
 ## Run
 
 ```console
-dekopond --config /path/to/dekopond.yaml
+dekopon-gatewayd --config /path/to/gatewayd.yaml
 ```
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
@@ -26,8 +26,8 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 ## Check a configuration
 
 ```console
-dekopond check dekopond.d --catalog agents.d
-dekopond check dekopond.yaml --output json
+dekopon-gatewayd check dekopond.d --catalog agents.d
+dekopon-gatewayd check gatewayd.yaml --output json
 ```
 
 `check` runs the configuration, catalog and route validation startup runs and stops before the
@@ -188,7 +188,7 @@ shutdownGraceMs: 120000                       # optional, default 120000
 telemetry:                                    # optional, identical in shape to broker.yaml's
   endpoint: http://127.0.0.1:5080/api/default
   transport: http
-  serviceName: dekopond
+  serviceName: dekopon-gatewayd
   exportTimeoutMs: 10000
 ```
 
@@ -287,7 +287,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
 - a route with `limits.maxDurationMs: 0`, which would cancel every session the instant it started;
 - a route with `limits.scriptTimeoutMs: 0`, which would end every script the instant it started, or one whose `scriptTimeoutMs` is greater than its `maxDurationMs`, where the session bound is reached first and the script deadline could never take effect; that refusal names both numbers;
-- an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
+- an unreachable broker. `dekopon-gatewayd` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
 - an empty `transports:`, `models:`, or `routes:` list;
 - a model with `timeoutMs: 0`, or `shutdownGraceMs: 0`;
 - a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`;
@@ -1123,7 +1123,7 @@ What the key is worth is measured, not assumed — [`inference.md`](inference.md
 
 ### What this means for retention
 
-On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. Without `sessions.journal` the daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); with it, journal routes keep their windows in the journal directory until the file is compacted, evicted, or deleted by the operator; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
+On a `persistent` route, chat text sits in `dekopon-gatewayd`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. Without `sessions.journal` the daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); with it, journal routes keep their windows in the journal directory until the file is compacted, evicted, or deleted by the operator; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
 
 ## Wakes
 
@@ -1213,7 +1213,7 @@ no deletion/export UX or encryption-at-rest claim.
 chat service            authenticates the sender
       |
       v
-dekopond                subject = ExternalSubject::{slack,discord,telegram,whatsapp}(...), or the local caller's declared subject (routing metadata, not authority)
+dekopon-gatewayd                subject = ExternalSubject::{slack,discord,telegram,whatsapp}(...), or the local caller's declared subject (routing metadata, not authority)
       |                 agent   = the route's catalog agent
       |
       | capabilities(subject, agent, scope)  ── empty ⇒ refuse, no model call
@@ -1226,7 +1226,7 @@ dekopon-brokerd         attestor grant bounds the namespace
                         credentials resolve, the provider executes, audit records it
 ```
 
-The broker is the sole authority. `dekopond` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and a chat-attested `invoke` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
+The broker is the sole authority. `dekopon-gatewayd` supplies the subject and never the principal; a refused attestation is an audited denial recorded against the gateway's own peer identity. Driving an agent at all is its own policy statement — `Dekopon::Action::"agent.prompt"` over `Dekopon::Agent::"<name>"` — so a mapped subject the owner never permitted to use this agent is refused before the capability listing is even assembled, and a chat-attested `invoke` under such a session is the audited denial `agent-denied`. See [`security-model.md`](security-model.md) for the complete attestation contract, and note in particular that **a policy written for direct peers can never authorize an attested context and vice versa** — adding a gateway cannot widen a grant that already existed.
 
 
 ## Token budgets
@@ -1466,6 +1466,6 @@ declared subject.
 
 ## Isolated model authentication
 
-`dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
+`dekopon-gatewayd auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
 ordinary serving requires `--config PATH`. See [`cli.md`](cli.md) for auth-only flags, output, exit codes and both export guards.

@@ -20,7 +20,7 @@ can outlive a `cancelled` outcome. A node that must not leave such work behind m
 `task-cancelled` a runtime-driven abort records.
 
 `dekopon-agent`'s broker leg runs each command word as one cancellable `broker-command` node
-around the broker round trip. `dekopond` ties its `CancelSignal` to the session's Stop, so a run in
+around the broker round trip. `dekopon-gatewayd` ties its `CancelSignal` to the session's Stop, so a run in
 flight is aborted at its next await and joined before the script reads `session-cancelled`.
 `CancelSignal::is_cancelled` is the same request read synchronously, for a caller deciding whether
 to start work rather than awaiting the end of work already running; the leg takes it before

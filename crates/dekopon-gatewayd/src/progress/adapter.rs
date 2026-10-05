@@ -134,22 +134,22 @@ impl ProgressSink for ProgressAdapter {
 pub(crate) fn record(event: &ProgressEvent) {
     match event {
         ProgressEvent::Started { agent, max_steps } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "started", agent = agent.as_str(), max_steps = *max_steps },
             "gateway progress"
         ),
         ProgressEvent::ModelTurn { turn, of } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "model_turn", turn = *turn, of = *of },
             "gateway progress"
         ),
         ProgressEvent::Steered { turn } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "steered", turn = *turn },
             "gateway progress"
         ),
         ProgressEvent::Note { text, eta } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "note", note = text.as_str(), note.eta_s = eta.map(|eta| eta.as_secs()) },
             "gateway progress"
         ),
@@ -160,7 +160,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             duration,
             first_delta,
         } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "answered",
@@ -177,7 +177,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             calls_used,
             calls_max,
         } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "tool_started",
@@ -193,7 +193,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             outcome,
             duration,
         } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "tool_finished",
@@ -208,7 +208,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             media_type,
             bytes,
         } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "attachment",
@@ -219,7 +219,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             "gateway progress"
         ),
         ProgressEvent::KeepAlive { elapsed, count } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "keep_alive",
@@ -229,12 +229,12 @@ pub(crate) fn record(event: &ProgressEvent) {
             "gateway progress"
         ),
         ProgressEvent::Cancelled { by } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "cancelled", by = ?by },
             "gateway progress"
         ),
         ProgressEvent::Failed { class } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "failed", class = ?class },
             "gateway progress"
         ),
@@ -244,7 +244,7 @@ pub(crate) fn record(event: &ProgressEvent) {
             turns,
             tool_calls,
         } => tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = "finished",

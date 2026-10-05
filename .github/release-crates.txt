@@ -19,4 +19,4 @@ dekopon-agent
 dekopon-policy
 dekopon-broker
 dekopon-brokerd
-dekopond
+dekopon-gatewayd

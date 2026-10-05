@@ -21,7 +21,7 @@ The model proposes; a separate broker authorizes and executes provider effects.
   Read authority never grants writes. External writes require explicit narrow capabilities.
 - Identity comes from authenticated transport, never model, repository, or payload text.
   Instructions and skills are untrusted model text and grant no authority.
-- Keep `dekopond` and `dekopon-brokerd` separate processes with separate UIDs.
+- Keep `dekopon-gatewayd` and `dekopon-brokerd` separate processes with separate UIDs.
   The gateway gains no policy, provider credentials, or authorization path;
   the broker gains no model orchestration. Preserve both dependency-boundary gates.
 - Provider secrets stay broker-side, outside prompts, gateway/protocol, provider memory,

@@ -347,7 +347,7 @@ impl WakeRegistrar for SessionWakes {
             }
         };
         tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.wake.scheduled",
                 wake.id = %summary.id,

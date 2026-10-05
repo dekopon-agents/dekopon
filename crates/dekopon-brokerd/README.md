@@ -341,7 +341,7 @@ public DRNs, retaining the refresh and injection behavior below
 A `bearerToken` is a value an operator rotates by hand. A ChatGPT subscription token is not: the
 access token expires hourly and the refresh token rotates on every renewal, so the value to present
 exists only at the moment of use. `authFile` names the credential document
-[`dekopond auth chatgpt login --auth-file <path>`](../../docs/chatgpt-credential.md) writes, and the
+[`dekopon-gatewayd auth chatgpt login --auth-file <path>`](../../docs/chatgpt-credential.md) writes, and the
 broker runs exactly the same refresh protocol the gateway's model client runs — one definition,
 `dekopon_model::chatgpt::CredentialFile` — 60 s before expiry, serialized across processes on an
 advisory lock on a sibling `.lock` file, with the rotated record written back atomically.
@@ -366,7 +366,7 @@ other capability. The two classes are separate reasons because an operator acts 
 a refresh-token family the authorization server has retired (`invalid_grant`,
 `refresh_token_reused`, `refresh_token_invalidated`, `refresh_token_expired`) fails the invocation as
 `credential-unavailable` and logs `broker_chatgpt_credential_reauth_required`, which means someone
-has to run `dekopond auth chatgpt login --auth-file <path>` again; anything else — transport, a 5xx, a
+has to run `dekopon-gatewayd auth chatgpt login --auth-file <path>` again; anything else — transport, a 5xx, a
 malformed token response — fails as `credential-refresh-failed` and needs nobody. A renewal that
 reached the authorization server but could not be written back logs
 `chatgpt_credential_save_failed` and continues on the in-memory token, because by then the record on

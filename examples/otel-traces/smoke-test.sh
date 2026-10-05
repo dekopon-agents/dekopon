@@ -96,11 +96,11 @@ done
 curl --connect-timeout 3 --max-time 10 --max-filesize 8388608 --fail --silent --show-error "http://127.0.0.1:$port/healthz" >/dev/null
 
 if [ "${DEKOPON_OTEL_SKIP_BUILD:-0}" != "1" ]; then
-  (cd "$root" && cargo build --locked -p dekopon-brokerd -p dekopond)
+  (cd "$root" && cargo build --locked -p dekopon-brokerd -p dekopon-gatewayd)
 fi
 
 provider="$root/examples/providers/cli-probe-provider.wasm"
-for binary in dekopon-brokerd dekopond; do
+for binary in dekopon-brokerd dekopon-gatewayd; do
   test -x "$root/target/debug/$binary" || {
     echo "$binary is missing; rerun without DEKOPON_OTEL_SKIP_BUILD=1" >&2
     exit 1

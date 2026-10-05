@@ -14,11 +14,11 @@ been validated, and audit records `credentialInjected: true` and never a value.
 
 | File | What it is | Who reads it |
 |---|---|---|
-| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent and its standing orders | `dekopond` |
+| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent and its standing orders | `dekopon-gatewayd` |
 | [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
 | [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
 | [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The API token, after you copy it | `dekopon-brokerd` |
-| [`dekopond.yaml`](dekopond.yaml) | Gateway configuration: transport, model, route | `dekopond` |
+| [`gatewayd.yaml`](gatewayd.yaml) | Gateway configuration: transport, model, route | `dekopon-gatewayd` |
 
 Nothing here is a mock. `crates/dekopon-brokerd/tests/examples.rs` loads the checked-in
 `http-probe` component, compiles this policy against the world these files declare, and asserts the
@@ -28,7 +28,7 @@ noticing.
 ## 1. Create the Slack app
 
 Follow [`../slack/README.md`](../slack/README.md): create the app from
-[`manifest-agent.yaml`](../slack/manifest-agent.yaml) (this example's `dekopond.yaml` sets
+[`manifest-agent.yaml`](../slack/manifest-agent.yaml) (this example's `gatewayd.yaml` sets
 `experience: agent`; the classic `manifest.yaml` pairs with `experience: classic`), generate the
 app-level token (`xapp-…`, scope `connections:write`), install it for the bot token (`xoxb-…`), and
 find the two identifiers you will need below — the workspace `T…` team ID and the sender's `U…`
@@ -69,9 +69,9 @@ Exactly these, and nothing else:
 
 | Placeholder | File | Replace with |
 |---|---|---|
-| `/home/xavier/.local/run/dekopon/broker.sock` | `broker.yaml`, `dekopond.yaml` | your own socket path, the same in both |
+| `/home/xavier/.local/run/dekopon/broker.sock` | `broker.yaml`, `gatewayd.yaml` | your own socket path, the same in both |
 | `uid: 501` | `broker.yaml` | your UID (`id -u`) |
-| `serverUid: 501` | `dekopond.yaml` | the same UID |
+| `serverUid: 501` | `gatewayd.yaml` | the same UID |
 | `slack.t0123abcd` | `broker.yaml`, `attestor.namespaces` | `slack.` + your lowercased team ID |
 | `slack.t0123abcd.u0123abcd` | `broker.yaml`, `principals` | the lowercased `slack.<team>.<user>` of the person allowed to use this |
 | `replace-me_XXXX…` | `broker-credentials.yaml` | the token from step 2 |
@@ -83,7 +83,7 @@ configuration file's own directory, so `../providers/http-probe-provider.wasm`, 
 Two names appear in several files and must agree with each other rather than with anything of
 yours: the principal `cpetersen` (`broker.yaml` mapping, both statements in `policies.cedar`), the
 gateway principal `dekopond-gateway` (`broker.yaml` identity, both `via` conditions), and the agent
-`xaviers-conditional-writer` (`dekopon.yaml` metadata, `dekopond.yaml` route, both policy statements).
+`xaviers-conditional-writer` (`dekopon.yaml` metadata, `gatewayd.yaml` route, both policy statements).
 Rename them together or not at all.
 
 Then make the directories private and the configurations owner-only:
@@ -91,7 +91,7 @@ Then make the directories private and the configurations owner-only:
 ```console
 mkdir -p ~/.local/run/dekopon
 chmod 700 ~/.local/run/dekopon
-chmod 600 broker.yaml policies.cedar dekopond.yaml
+chmod 600 broker.yaml policies.cedar gatewayd.yaml
 ```
 
 The catalog half is checked before anything runs: the gateway loads and validates the complete
@@ -118,13 +118,13 @@ surprise at 2 a.m.
 ```console
 export DEKOPOND_SLACK_APP_TOKEN=xapp-...
 export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
-dekopond --config dekopond.yaml
+dekopon-gatewayd --config gatewayd.yaml
 ```
 
 ```json
-{"level":"INFO","event":"gateway_broker_ready","capability.count":0,"target":"dekopond"}
-{"level":"INFO","event":"gateway_transport_connected","transport":"workspace-slack","kind":"slackSocketMode","target":"dekopond"}
-{"level":"INFO","event":"gateway_started","transport.count":1,"route.count":1,"target":"dekopond"}
+{"level":"INFO","event":"gateway_broker_ready","capability.count":0,"target":"dekopon-gatewayd"}
+{"level":"INFO","event":"gateway_transport_connected","transport":"workspace-slack","kind":"slackSocketMode","target":"dekopon-gatewayd"}
+{"level":"INFO","event":"gateway_started","transport.count":1,"route.count":1,"target":"dekopon-gatewayd"}
 ```
 
 `capability.count: 0` is the point, not a warning. That probe asks the broker what the *gateway's
@@ -132,7 +132,7 @@ own identity* may do, and the answer is nothing: both policy statements require 
 a directly connected peer has no `via`. The gateway can reach capabilities only while carrying a
 subject it is authorized to vouch for.
 
-The tokens live in the environment because `dekopond.yaml` names variables and never values;
+The tokens live in the environment because `gatewayd.yaml` names variables and never values;
 pasting a token where a variable name belongs is a startup failure rather than a secret sitting in
 a config file.
 
@@ -142,7 +142,7 @@ a config file.
 
 The session:
 
-1. **Attestation.** `dekopond` derives the canonical subject `slack.t0123abcd.u0123abcd` from the
+1. **Attestation.** `dekopon-gatewayd` derives the canonical subject `slack.t0123abcd.u0123abcd` from the
    authenticated Slack envelope and opens a broker leg with `capabilities(subject, agent)`. The
    broker checks its attestor grant covers that namespace, maps the subject to `cpetersen`, checks
    `agent.prompt` on `Dekopon::Agent::"xaviers-conditional-writer"`, and answers with two
@@ -167,7 +167,7 @@ The session:
    token can reach".
 3. **The answer.** The session's final text goes back to the DM:
 
-   > **dekopond:** Set incident-4711 to resolved. Read and wrote against etag `"v7"`, both
+   > **dekopon-gatewayd:** Set incident-4711 to resolved. Read and wrote against etag `"v7"`, both
    > calls returned 200.
 
    A failed session says exactly one thing instead: `The agent could not complete this request.` A
@@ -289,7 +289,7 @@ the gateway, the subject, and the reason. Both refuse; only one of them ever pro
 
 ## What this deployment does not buy yet
 
-`dekopond` and `dekopon-brokerd` run under one UID in this local walkthrough. The attestor grant
+`dekopon-gatewayd` and `dekopon-brokerd` run under one UID in this local walkthrough. The attestor grant
 buys attribution and deny-by-default scoping, not OS isolation: any process running as you can act
 as the configured gateway peer. That is an example choice — the chart splits the two UIDs and the
 IPC group; see the
@@ -303,7 +303,7 @@ not enabled here.
 - [`../slack/`](../slack/README.md) — the Slack app manifest, both tokens, and finding the `T…`/`U…` identifiers.
 - [`../providers/http-probe/`](../providers/http-probe/README.md) — the component this deployment executes, and the `http-probe.purge` it never grants.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
-- [`../../docs/dekopond.md`](../../docs/dekopond.md) — transports, routing, session bounds, and the authorization flow.
+- [`../../docs/gatewayd.md`](../../docs/gatewayd.md) — transports, routing, session bounds, and the authorization flow.
 - [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
 - [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it does not.
 - [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and holds no approval capability.

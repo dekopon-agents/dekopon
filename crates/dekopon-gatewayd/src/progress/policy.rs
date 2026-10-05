@@ -977,7 +977,7 @@ impl Surface {
 
     fn record_terminal(&self, terminal: &Terminal) {
         tracing::info!(
-            target: "dekopond::audit",
+            target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = match terminal {

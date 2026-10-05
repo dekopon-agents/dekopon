@@ -343,7 +343,7 @@ fn record_admission(message: &InboundMessage, outcome: &str, depth: usize, cause
         tracing::Span::current().record("busy.cause", cause);
     }
     tracing::info!(
-        target: "dekopond::audit",
+        target: "dekopon_gatewayd::audit",
         { audit.event = "gateway.admission", outcome, busy.cause = cause,
           transport = %message.transport, conversation.id = %message.conversation.key(),
           queue.depth = depth },
@@ -1320,7 +1320,7 @@ async fn session(
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
     tracing::info!(
-        target: "dekopond::audit",
+        target: "dekopon_gatewayd::audit",
         {
             audit.event = "gateway.session.cache_key",
             prompt.cache_key = cache_key.as_str(),

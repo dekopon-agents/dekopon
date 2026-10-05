@@ -137,7 +137,7 @@ jobs:
       - name: Warm stable lint objects
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Warm release CLI objects
-        run: cargo check --release --locked -p dekopon-brokerd -p dekopond
+        run: cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd
 
   test-dependencies:
     name: warm Rust test dependencies
@@ -202,4 +202,4 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Build only: no tests, provider downloads, packaging, signing or publication.
       - name: Warm release CLI dependencies
-        run: cargo build --release --locked -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd --target ${{ matrix.target }}

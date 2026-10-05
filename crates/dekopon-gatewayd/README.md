@@ -1,4 +1,4 @@
-# dekopond
+# dekopon-gatewayd
 
 The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services, waits for a
 wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model
@@ -13,7 +13,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   ten failures per episode, reset only after five continuously connected minutes. Healthy peers
   serve during recovery. Any terminal reader failure drains sessions and exits nonzero so the
   supervisor can restart the gateway container. No outbound effects are replayed. See
-  [policy and lifecycle](../../docs/dekopond.md#connection-recovery).
+  [policy and lifecycle](../../docs/gatewayd.md#connection-recovery).
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
@@ -34,7 +34,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
   notices. Slack/Discord/local accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
-  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/dekopond.md#asset-handles-and-delivery).
+  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gatewayd.md#asset-handles-and-delivery).
 - **Liveness** — disabled unless opted in, and only after fresh authorization. Default `progress: auto`
   prefers native status, then typing/reaction, avoiding redundant progress messages; explicit
   `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits
@@ -42,7 +42,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   prose only: explicitly requested `stream` remains independent of progress/detail Off. WhatsApp
   session progress stays typing-only. Separate best-effort 👀 acknowledgments cover accepted steers and queued
   non-wake messages with liveness targets, independent of Slack's classic fallback.
-  See [presentation limits](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
+  See [presentation limits](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
   A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
@@ -85,7 +85,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 
 ## Authority
 
-`dekopond` has none. It holds chat bot credentials and model credentials — the things it
+`dekopon-gatewayd` has none. It holds chat bot credentials and model credentials — the things it
 needs to hear a question and to ask a model — and it never holds a provider credential, a
 policy, or an authorization. Every effect a session drives is submitted to
 `dekopon-brokerd` as an on-behalf-of proposal, and the broker alone maps the subject to a
@@ -114,17 +114,17 @@ is a development tool, not a production transport.
 
 Configuration, transport semantics, session bounds, telemetry, the conversation contract,
 and the distinct-UID deployment boundary are documented in
-[`docs/dekopond.md`](../../docs/dekopond.md).
+[`docs/gatewayd.md`](../../docs/gatewayd.md).
 
 WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
 `debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
 an enabled maximum must be at least the quiet interval. See the
-[multi-message contract](../../docs/dekopond.md#multi-message-media-inputs) for bounds and isolation.
+[multi-message contract](../../docs/gatewayd.md#multi-message-media-inputs) for bounds and isolation.
 
 ## Run
 
 ```console
-dekopond --config /path/to/dekopond.yaml
+dekopon-gatewayd --config /path/to/gatewayd.yaml
 ```
 
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
@@ -142,7 +142,7 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 
 ## Isolated model authentication
 
-`dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
+`dekopon-gatewayd auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
 ordinary serving requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.
 
@@ -150,5 +150,5 @@ Asset retention is process-wide: `sessions.assetRetentionBytes` defaults to 2684
 private disk scratch. Zero disables asset retention and attachment delivery, not the bound;
 text-only sessions remain usable. Weak model references cannot prevent LRU reclamation. Generated
 PNG results publish gateway-owned `chat-asset:<N>` markers for successive edits; availability is
-not delivery confirmation. See [chat assets](../../docs/dekopond.md#chat-assets) for lifecycle,
+not delivery confirmation. See [chat assets](../../docs/gatewayd.md#chat-assets) for lifecycle,
 limits, explicit release notices and no-refetch/no-blind-retry behavior.
