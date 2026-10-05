@@ -913,7 +913,7 @@ fn unix_time() -> Result<u64, ChatGptError> {
 pub enum ChatGptError {
     #[error("invalid ChatGPT configuration: {0}")]
     Configuration(String),
-    #[error("not logged in to ChatGPT; run `dekopond auth chatgpt login` (expected {})", path.display())]
+    #[error("not logged in to ChatGPT; run `dekopon-gatewayd auth chatgpt login` (expected {})", path.display())]
     NotLoggedIn { path: PathBuf },
     #[error("could not read ChatGPT credentials at {}", path.display())]
     ReadAuth {
@@ -1165,7 +1165,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("dekopond auth chatgpt login"));
+        assert!(
+            error
+                .to_string()
+                .contains("dekopon-gatewayd auth chatgpt login")
+        );
     }
 
     #[test]
@@ -2408,7 +2412,11 @@ mod tests {
 
         let error = export_credentials(Some(&path)).expect_err("missing credentials must fail");
 
-        assert!(error.to_string().contains("dekopond auth chatgpt login"));
+        assert!(
+            error
+                .to_string()
+                .contains("dekopon-gatewayd auth chatgpt login")
+        );
     }
 
     #[test]

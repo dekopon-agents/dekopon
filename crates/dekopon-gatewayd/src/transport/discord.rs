@@ -231,8 +231,8 @@ impl DiscordTransport {
                     "intents": INTENTS,
                     "properties": {
                         "os": std::env::consts::OS,
-                        "browser": "dekopond",
-                        "device": "dekopond",
+                        "browser": "dekopon-gatewayd",
+                        "device": "dekopon-gatewayd",
                     }
                 }
             });
@@ -1934,7 +1934,7 @@ fn is_loopback_host(host: Option<&str>) -> bool {
 fn client() -> Result<reqwest::Client, TransportError> {
     credential_client(REST_TIMEOUT)
         .user_agent(concat!(
-            "dekopond/",
+            "dekopon-gatewayd/",
             env!("CARGO_PKG_VERSION"),
             " (+https://github.com/dekopon-agents/dekopon)"
         ))

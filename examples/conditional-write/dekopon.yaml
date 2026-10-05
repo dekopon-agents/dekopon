@@ -1,6 +1,6 @@
 # The gateway's catalog: which agent answers, on whose standing orders.
 #
-# This file grants nothing. `dekopond` reads it to decide which agent a route names, which model
+# This file grants nothing. `dekopon-gatewayd` reads it to decide which agent a route names, which model
 # serves it, and what its system prompt says. Every proposal the agent then makes still has to pass
 # the broker's Cedar policy in `policies.cedar`, against the constraint sets in `broker.yaml` and
 # the http-probe provider manifest (examples/providers/http-probe/src/lib.rs) — none of which read

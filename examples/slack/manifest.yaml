@@ -1,4 +1,4 @@
-# Slack app manifest for the dekopond gateway.
+# Slack app manifest for the dekopon-gatewayd gateway.
 #
 # Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest",
 # pick the workspace, and paste this file.
@@ -10,7 +10,7 @@
 #   needs no public HTTP endpoint.
 # - `message.im` events (requires `im:history`), so direct messages reach DM routes.
 # - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
-#   when the bot is explicitly addressed — dekopond ignores unaddressed channel
+#   when the bot is explicitly addressed — dekopon-gatewayd ignores unaddressed channel
 #   traffic by design.
 # - `channels:read`, `groups:read`, `im:read`, `mpim:read`, so `conversations.info` can say what
 #   kind of conversation a mention arrived in. Slack sends no `channel_type` on `app_mention`, and
@@ -29,7 +29,7 @@
 #   `block_actions` envelope over the same socket.
 #
 # Two tokens exist after creation, and neither lives in any Dekopon config file —
-# dekopond reads both from environment variables named in its `transports` entry:
+# dekopon-gatewayd reads both from environment variables named in its `transports` entry:
 #
 # 1. App-level token (`xapp-...`): "Basic Information" → "App-Level Tokens" →
 #    "Generate Token and Scopes" with the `connections:write` scope. Manifests cannot

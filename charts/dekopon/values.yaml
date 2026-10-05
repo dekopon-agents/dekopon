@@ -82,12 +82,12 @@ initSecurityContext:
 # Paths the chart owns
 # ---------------------------------------------------------------------------------------------
 # These are the directories the chart creates and hands to the daemons. Your broker.yaml and
-# dekopond.yaml must name files inside them — the chart places files, it does not rewrite configs.
+# gatewayd.yaml must name files inside them — the chart places files, it does not rewrite configs.
 #
 #   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
 #   <configDir>/policies.cedar            0600 65532  (Tier B)
 #   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
-#   <configDir>/dekopond.yaml             0600 65533  (gateway-only volume)
+#   <configDir>/gatewayd.yaml             0600 65533  (gateway-only volume)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
 #   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
@@ -188,7 +188,7 @@ broker:
   # It is a SEPARATE token family from gateway.chatgpt below, and the two must never point at one
   # file. The refresh token rotates on every renewal and the authorization server retires its
   # predecessor, so two independent holders of one file would eventually present a retired token and
-  # revoke the family for both. Run `dekopond auth chatgpt login --auth-file <path>` a second time and
+  # revoke the family for both. Run `dekopon-gatewayd auth chatgpt login --auth-file <path>` a second time and
   # export that file instead. Same ChatGPT account, independent refresh token, independent
   # revocation. The chart refuses a shared subdir.
   #
@@ -199,7 +199,7 @@ broker:
   # for it.
   chatgpt:
     enabled: false
-    # Prefer existingSecret. `dekopond auth chatgpt export --expose-credential --auth-file <path>`
+    # Prefer existingSecret. `dekopon-gatewayd auth chatgpt export --expose-credential --auth-file <path>`
     # produces the document; an External Secrets Operator ExternalSecret against a 1Password item
     # projects the same shape. An inline value is stored in the release and returned by
     # `helm get values`.
@@ -332,7 +332,7 @@ broker:
   # client: `dekopon-brokerd probe` connects over the socket, passes SO_PEERCRED both
   # ways, and gets an authorized capability list back. It appends no audit record.
   #
-  # The startup probe is also the ordering primitive: Kubernetes does not start dekopond until the
+  # The startup probe is also the ordering primitive: Kubernetes does not start dekopon-gatewayd until the
   # broker sidecar's startup probe succeeds.
   startupProbe:
     periodSeconds: 5
@@ -352,21 +352,21 @@ broker:
 # Gateway
 # ---------------------------------------------------------------------------------------------
 gateway:
-  # Off by default. Unlike the broker, dekopond cannot have a working default: it needs a chat
+  # Off by default. Unlike the broker, dekopon-gatewayd cannot have a working default: it needs a chat
   # transport, a model endpoint, and an agent catalog, and the chart can invent none of them.
   enabled: false
 
   config:
     inline: ""
     existingSecret: ""
-    existingSecretKey: dekopond.yaml
+    existingSecretKey: gatewayd.yaml
 
   # The alternative to config: a ConfigMap whose every *.yaml key becomes a fragment in
-  # dekopond.d, and dekopond starts with --config on that directory. gateway.config must be empty.
+  # gatewayd.d, and dekopon-gatewayd starts with --config on that directory. gateway.config must be empty.
   configDirectory:
     configMap: ""
 
-  # catalogPath is the one file with no hygiene rules at all — dekopond reads it with a plain
+  # catalogPath is the one file with no hygiene rules at all — dekopon-gatewayd reads it with a plain
   # read_to_string. A ConfigMap mount is fine and nothing is copied.
   catalog:
     inline: ""
@@ -398,9 +398,9 @@ gateway:
 
   # Seed a ChatGPT subscription credential once, and never again.
   #
-  # `dekopond auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
+  # `dekopon-gatewayd auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
   # human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription` model has
-  # to be handed a credential exported from a local login — `dekopond auth chatgpt export`, which
+  # to be handed a credential exported from a local login — `dekopon-gatewayd auth chatgpt export`, which
   # lands with the auth-export change.
   #
   # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
@@ -415,7 +415,7 @@ gateway:
   # dies with the pod, which would quietly turn "seed once" into "seed on every reschedule".
   chatgpt:
     enabled: false
-    # Prefer existingSecret. `dekopond auth chatgpt export --expose-credential --namespace <ns>`
+    # Prefer existingSecret. `dekopon-gatewayd auth chatgpt export --expose-credential --namespace <ns>`
     # emits exactly this Secret, named dekopon-chatgpt-auth with the key chatgpt-auth.json; an
     # External Secrets Operator ExternalSecret against a 1Password item projects the same shape.
     # An inline value is stored in the release and returned by `helm get values`.
@@ -439,30 +439,30 @@ gateway:
     # container's arguments.
     reseed: false
 
-  # The gateway's conversation journal (dekopond `sessions.journal`), a directory on the state
+  # The gateway's conversation journal (dekopon-gatewayd `sessions.journal`), a directory on the state
   # claim so windows survive a reschedule. Point `sessions.journal.path` at mountPath.
   journal:
     enabled: false
     subdir: gateway-journal
-    mountPath: /var/lib/dekopond/journal
+    mountPath: /var/lib/dekopon-gatewayd/journal
 
-  # The gateway's wake store (dekopond `sessions.wakes.path`), a directory on the state claim
+  # The gateway's wake store (dekopon-gatewayd `sessions.wakes.path`), a directory on the state claim
   # beside the journal and never inside it: the journal adopts every *.jsonl in its directory.
   # Point `sessions.wakes.path` at a file under mountPath, such as <mountPath>/wakes.jsonl.
   wakes:
     enabled: false
     subdir: gateway-wakes
-    mountPath: /var/lib/dekopond/wakes
+    mountPath: /var/lib/dekopon-gatewayd/wakes
 
-  # dekopond.yaml names environment variable NAMES, never values, so every chat and model
+  # gatewayd.yaml names environment variable NAMES, never values, so every chat and model
   # credential is an ordinary secretKeyRef with no file hygiene involved. Example:
   #
   #   env:
-  #     - name: DEKOPOND_SLACK_APP_TOKEN
+  #     - name: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
   #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: appToken } }
-  #     - name: DEKOPOND_SLACK_BOT_TOKEN
+  #     - name: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
   #       valueFrom: { secretKeyRef: { name: dekopon-slack, key: botToken } }
-  #     - name: DEKOPOND_DISCORD_BOT_TOKEN
+  #     - name: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
   #       valueFrom: { secretKeyRef: { name: dekopon-discord, key: botToken } }
   #     - name: OPENAI_API_KEY
   #       valueFrom: { secretKeyRef: { name: dekopon-model, key: apiKey } }
@@ -473,7 +473,7 @@ gateway:
 
   # Optional ClusterIP target for an inbound webhook listener such as WhatsApp Cloud API. This
   # exposes only a pod port inside the cluster; put an exact-path Traefik route and public TLS
-  # boundary in a separate operator-owned manifest. dekopond.yaml must bind 0.0.0.0 at this same
+  # boundary in a separate operator-owned manifest. gatewayd.yaml must bind 0.0.0.0 at this same
   # port—a loopback bind is unreachable from a Kubernetes Service. No Ingress is chart-created.
   service:
     enabled: false
@@ -556,7 +556,7 @@ volumeSizes:
 # Termination
 # ---------------------------------------------------------------------------------------------
 # The containers stop in SEQUENCE — the gateway's container first, then the broker sidecar — so
-# this is the SUM of both drains, not the larger of the two. dekopond drains in-flight sessions
+# this is the SUM of both drains, not the larger of the two. dekopon-gatewayd drains in-flight sessions
 # for its own shutdownGraceMs and dekopon-brokerd only then drains connections for its
 # serverLimits.shutdownGraceMs; both default to 120000, so the default here is 120 + 120 +
 # drainBudget.bufferSeconds. Whichever daemon is still draining when this expires is SIGKILLed,

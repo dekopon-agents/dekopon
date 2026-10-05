@@ -1,9 +1,9 @@
 //! A prompt cache key is a routing hint only, never an access-control boundary; every message still
 //! opens its own attested broker leg regardless of a shared key.
 
-const CONVERSATION_PREFIX: &str = "dekopond-conversation";
+const CONVERSATION_PREFIX: &str = "gatewayd-conversation";
 
-const ROUTE_PREFIX: &str = "dekopond-route";
+const ROUTE_PREFIX: &str = "gatewayd-route";
 
 pub(crate) fn for_conversation() -> String {
     mint(CONVERSATION_PREFIX)

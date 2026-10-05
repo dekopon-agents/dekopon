@@ -14,7 +14,7 @@ use serde::Deserialize;
 const GRANTED: [&str; 2] = ["http-probe.conditional-write", "http-probe.fetch"];
 const UNGRANTED: [&str; 1] = ["http-probe.purge"];
 const PRINCIPAL: &str = "cpetersen";
-const GATEWAY: &str = "dekopond-gateway";
+const GATEWAY: &str = "dekopon-gatewayd";
 const AGENT: &str = "xaviers-conditional-writer";
 
 fn repository_root() -> PathBuf {

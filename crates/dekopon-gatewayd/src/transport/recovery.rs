@@ -323,7 +323,7 @@ mod tests {
         let error = crate::supervise_transports(&mut readers, std::future::pending())
             .await
             .expect_err("one exhausted reader is enough to stop the gateway");
-        let crate::DekopondError::TransportConnect { problems } = error else {
+        let crate::GatewaydError::TransportConnect { problems } = error else {
             panic!("expected transport failure");
         };
         assert!(matches!(
@@ -348,7 +348,7 @@ mod tests {
         let error = crate::supervise_transports(&mut readers, std::future::pending())
             .await
             .expect_err("task failure stops gateway");
-        assert!(matches!(error, crate::DekopondError::TransportTask(source) if source.is_panic()));
+        assert!(matches!(error, crate::GatewaydError::TransportTask(source) if source.is_panic()));
     }
     #[tokio::test(start_paused = true)]
     async fn a_changed_identity_is_terminal_instead_of_using_stale_routing_metadata() {

@@ -30,7 +30,7 @@ use crate::{
     session::{FAILURE_REPLY, STOPPED_REPLY},
 };
 
-pub const CONFIG_API_VERSION: &str = "dekopon.dev/dekopond/v1alpha1";
+pub const CONFIG_API_VERSION: &str = "dekopon.dev/gatewayd/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 4;
 pub const DEFAULT_MAX_JOBS: usize = 2;
@@ -50,7 +50,7 @@ pub const WHATSAPP_GRAPH_ENDPOINT: &str = "https://graph.facebook.com";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum ConfigApiVersion {
-    #[serde(rename = "dekopon.dev/dekopond/v1alpha1")]
+    #[serde(rename = "dekopon.dev/gatewayd/v1alpha1")]
     V1Alpha1,
 }
 
@@ -256,7 +256,7 @@ impl Default for ResolvedLiveness {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct DekopondConfig {
+pub struct GatewaydConfig {
     pub api_version: ConfigApiVersion,
     pub catalog_path: PathBuf,
     #[serde(default)]
@@ -987,7 +987,7 @@ async fn load_directory(
     // A later refusal is reported as the fragment refusal it may well be caused by.
     let later =
         |error: ConfigError, mut refusals: Vec<ConfigError>| refusals.pop().unwrap_or(error);
-    let config = match serde_yaml::from_value::<DekopondConfig>(serde_yaml::Value::Mapping(merged))
+    let config = match serde_yaml::from_value::<GatewaydConfig>(serde_yaml::Value::Mapping(merged))
     {
         Ok(config) => config,
         Err(source) => return Err(later(ConfigError::Decode { source }, refusals)),
@@ -1003,8 +1003,8 @@ async fn load_directory(
     }
 }
 
-fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {
-    serde_yaml::from_slice::<DekopondConfig>(document)
+fn decode(document: &[u8]) -> Result<GatewaydConfig, ConfigError> {
+    serde_yaml::from_slice::<GatewaydConfig>(document)
         .map_err(|source| ConfigError::Decode { source })
 }
 
@@ -1067,7 +1067,7 @@ fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
     reason = "reshaped by the unit that next rewrites this"
 )]
 pub(crate) fn resolve(
-    config: DekopondConfig,
+    config: GatewaydConfig,
     source: PathBuf,
     discovery: &BrokerSocketDiscovery,
     current_uid: u32,
@@ -1644,7 +1644,7 @@ pub(crate) fn resolve(
             &telemetry.endpoint,
             telemetry.transport,
             &telemetry.service_name,
-            "dekopond",
+            "dekopon-gatewayd",
             env!("CARGO_PKG_VERSION"),
             Duration::from_millis(telemetry.export_timeout_ms),
         )
@@ -2306,7 +2306,7 @@ mod tests {
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
 
-    const PREAMBLE: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
+    const PREAMBLE: &str = "apiVersion: dekopon.dev/gatewayd/v1alpha1\n\
          catalogPath: dekopon.yaml\n\
          broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n\
          models:\n\
@@ -2317,12 +2317,26 @@ mod tests {
          \x20   timeoutMs: 1000\n\
          \x20   classes: [reasoning]\n";
 
+    #[test]
+    fn only_the_gatewayd_api_version_decodes() {
+        let valid = format!("{PREAMBLE}{TAIL}");
+        assert!(super::decode(valid.as_bytes()).is_ok());
+        let old = valid.replace(
+            super::CONFIG_API_VERSION,
+            concat!("dekopon.dev/deko", "pond/v1alpha1"),
+        );
+        assert!(matches!(
+            super::decode(old.as_bytes()),
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+
     fn resolved(document: &str) -> Result<super::ResolvedConfig, ConfigError> {
         let config =
             super::decode(format!("{PREAMBLE}{document}").as_bytes()).expect("the fixture decodes");
         resolve(
             config,
-            PathBuf::from("/tmp/dekopond.yaml"),
+            PathBuf::from("/tmp/gatewayd.yaml"),
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
         )
@@ -2665,7 +2679,7 @@ routes:
         );
     }
 
-    const HEAD: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
+    const HEAD: &str = "apiVersion: dekopon.dev/gatewayd/v1alpha1\n\
          catalogPath: dekopon.yaml\n\
          broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n";
     const TAIL: &str = "transports:\n\

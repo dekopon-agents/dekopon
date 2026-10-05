@@ -45,10 +45,10 @@ identities:
   # any process under this UID can already act as this peer. A dedicated gateway UID is where
   # `via` becomes real isolation.
   - uid: 501
-    principal: dekopond-gateway
+    principal: dekopon-gatewayd
     actor:
       type: service
-      principal: dekopond-gateway
+      principal: dekopon-gatewayd
     attestor:
       # Segment-boundary prefixes, service name first. This grant lets the gateway *name* Slack
       # subjects in this workspace; it resolves none of them to a principal.

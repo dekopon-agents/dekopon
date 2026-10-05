@@ -127,8 +127,8 @@ policiesPath: policies.cedar
 providers: [providers/jsonplaceholder-provider.wasm]
 identities:
   - uid: $DEMO_UID
-    principal: dekopond-gateway
-    actor: {type: service, principal: dekopond-gateway}
+    principal: dekopon-gatewayd
+    actor: {type: service, principal: dekopon-gatewayd}
     attestor: {namespaces: [tel.16034700182]}
 principals:
   local-user:
@@ -152,12 +152,12 @@ cat > policies.cedar <<'EOF_POLICY'
 permit(principal == Dekopon::Principal::"local-user",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"local-reader")
-when { context.via == "dekopond-gateway" };
+when { context.via == "dekopon-gatewayd" };
 @id("local-reader-may-get-posts")
 permit(principal == Dekopon::Principal::"local-user",
        action == Dekopon::Action::"jsonplaceholder.posts.get",
        resource == Dekopon::Provider::"jsonplaceholder")
-when { context.via == "dekopond-gateway" && context.agent == "local-reader" };
+when { context.via == "dekopon-gatewayd" && context.agent == "local-reader" };
 EOF_POLICY
 ```
 
@@ -179,7 +179,7 @@ spec:
   modelClass: reasoning
 EOF_CATALOG
 cat > gateway.yaml <<EOF_GATEWAY
-apiVersion: dekopon.dev/dekopond/v1alpha1
+apiVersion: dekopon.dev/gatewayd/v1alpha1
 catalogPath: catalog.yaml
 broker:
   socketPath: "$DEMO_DIR/run/broker.sock"

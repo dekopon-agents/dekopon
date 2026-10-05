@@ -260,9 +260,9 @@ cannot drift apart.
   key: {{ .existingSecretKey }}
 {{- end }}
 {{- if and .Values.gateway.enabled (not .Values.gateway.configDirectory.configMap) }}
-- file: dekopond.yaml
+- file: gatewayd.yaml
   secret: {{ default (include "dekopon.configSecretName" .) .Values.gateway.config.existingSecret }}
-  key: {{ if .Values.gateway.config.existingSecret }}{{ .Values.gateway.config.existingSecretKey }}{{ else }}dekopond.yaml{{ end }}
+  key: {{ if .Values.gateway.config.existingSecret }}{{ .Values.gateway.config.existingSecretKey }}{{ else }}gatewayd.yaml{{ end }}
 {{- end }}
 {{- end -}}
 
@@ -277,10 +277,10 @@ identities:
       principal: dekopon-probe
 {{- if .Values.gateway.enabled }}
   - uid: 65533
-    principal: dekopond-gateway
+    principal: dekopon-gatewayd
     actor:
       type: service
-      principal: dekopond-gateway
+      principal: dekopon-gatewayd
     attestor: {}
 {{- end }}
 {{- if and .Values.console.enabled .Values.console.subject }}
@@ -429,7 +429,7 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- fail "gateway.config.inline and gateway.config.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.gateway.config.inline) (not .Values.gateway.config.existingSecret) -}}
-{{- fail "gateway.enabled is true, so a dekopond.yaml is required: set gateway.config.inline, gateway.config.existingSecret or gateway.configDirectory.configMap" -}}
+{{- fail "gateway.enabled is true, so a gatewayd.yaml is required: set gateway.config.inline, gateway.config.existingSecret or gateway.configDirectory.configMap" -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.gateway.catalog.inline .Values.gateway.catalog.existingConfigMap -}}
@@ -458,7 +458,7 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.gateway.chatgpt.inline) (not .Values.gateway.chatgpt.existingSecret) -}}
-{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopond auth chatgpt export`." -}}
+{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopon-gatewayd auth chatgpt export`." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.subdir) -}}
 {{- fail (printf "gateway.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.gateway.chatgpt.subdir) -}}
@@ -471,7 +471,7 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.gateway.chatgpt.enabled (not .Values.gateway.enabled) -}}
-{{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
+{{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopon-gatewayd, not by the broker" -}}
 {{- end -}}
 
 {{/* The broker's own ChatGPT family. Every problem is collected and reported together, because an
@@ -482,7 +482,7 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- $problems = append $problems "broker.chatgpt.inline and broker.chatgpt.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.broker.chatgpt.inline) (not .Values.broker.chatgpt.existingSecret) -}}
-{{- $problems = append $problems "broker.chatgpt.enabled is true, so a credential is required: set broker.chatgpt.inline or broker.chatgpt.existingSecret. Produce one with `dekopond auth chatgpt login --auth-file <path>` and then `dekopond auth chatgpt export --expose-credential --auth-file <path>`." -}}
+{{- $problems = append $problems "broker.chatgpt.enabled is true, so a credential is required: set broker.chatgpt.inline or broker.chatgpt.existingSecret. Produce one with `dekopon-gatewayd auth chatgpt login --auth-file <path>` and then `dekopon-gatewayd auth chatgpt export --expose-credential --auth-file <path>`." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.broker.chatgpt.subdir) -}}
 {{- $problems = append $problems (printf "broker.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.broker.chatgpt.subdir) -}}
@@ -612,7 +612,7 @@ broker that lands mid-invocation. */}}
 {{- if lt (mul $budgetSeconds 1000) $requiredMs -}}
 {{- $drains := printf "dekopon-brokerd drains for %d ms" $brokerGraceMs -}}
 {{- if .Values.gateway.enabled -}}
-{{- $drains = printf "dekopond drains for %d ms and then %s" $gatewayGraceMs $drains -}}
+{{- $drains = printf "dekopon-gatewayd drains for %d ms and then %s" $gatewayGraceMs $drains -}}
 {{- end -}}
 {{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
@@ -643,7 +643,7 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 {{- end -}}
 
-{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "dekopond.yaml" true "broker.d" true -}}
+{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "gatewayd.yaml" true "broker.d" true -}}
 {{- range (include "dekopon.seedFiles" . | fromYamlArray) -}}
 {{- $_ := set $bootstrapNames .source true -}}
 {{- end -}}
@@ -735,17 +735,17 @@ broker that lands mid-invocation. */}}
 
 {{/*
 The broker container. Emitted either as a native sidecar (an initContainer with
-restartPolicy: Always, so it starts and passes its startup probe before dekopond runs and is torn
-down after dekopond stops) or, when the gateway is disabled, as the pod's only regular container.
+restartPolicy: Always, so it starts and passes its startup probe before dekopon-gatewayd runs and is torn
+down after dekopon-gatewayd stops) or, when the gateway is disabled, as the pod's only regular container.
 Arguments: dict "ctx" $ "sidecar" bool
 */}}
 {{- define "dekopon.brokerContainer" -}}
 {{- $ := .ctx -}}
 - name: broker
   {{- if .sidecar }}
-  # Native sidecar. This is the ordering primitive: Kubernetes does not start dekopond until this
-  # container's startup probe succeeds, and it terminates this container only after dekopond has
-  # stopped. Without it the gateway races the broker, and dekopond exits non-zero when the socket
+  # Native sidecar. This is the ordering primitive: Kubernetes does not start dekopon-gatewayd until this
+  # container's startup probe succeeds, and it terminates this container only after dekopon-gatewayd has
+  # stopped. Without it the gateway races the broker, and dekopon-gatewayd exits non-zero when the socket
   # is absent, so the pod would crash-loop its way to a working state.
   restartPolicy: Always
   {{- end }}

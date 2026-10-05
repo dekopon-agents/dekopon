@@ -498,7 +498,7 @@ ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
 
-Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopond::audit`, with `outcome`
+Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopon_gatewayd::audit`, with `outcome`
 (`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
 plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
 Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with

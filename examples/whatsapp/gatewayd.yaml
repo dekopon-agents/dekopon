@@ -1,4 +1,4 @@
-apiVersion: dekopon.dev/dekopond/v1alpha1
+apiVersion: dekopon.dev/gatewayd/v1alpha1
 catalogPath: /etc/dekopon/dekopon.yaml
 broker:
   socketPath: /run/dekopon/broker.sock
@@ -7,9 +7,9 @@ transports:
     kind: whatsappCloudApi
     debounceMs: 5000 # quiet interval; 0 preserves immediate admission
     debounceMaxWaitMs: 15000 # hard deadline from the first media receipt
-    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
-    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
-    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    appSecretEnv: DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPON_GATEWAYD_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPON_GATEWAYD_WHATSAPP_ACCESS_TOKEN
     bind: 0.0.0.0:9080
     callbackPath: /webhooks/whatsapp
     wabaId: "REPLACE_WITH_CANONICAL_NUMERIC_WABA_ID"

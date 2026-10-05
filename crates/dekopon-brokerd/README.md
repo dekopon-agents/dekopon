@@ -73,8 +73,8 @@ providers:
   - /opt/dekopon/providers          # a directory loads every *.wasm directly inside it
 identities:
   - uid: 1000
-    principal: dekopond-gateway
-    actor: { type: service, principal: dekopond-gateway }
+    principal: dekopon-gatewayd
+    actor: { type: service, principal: dekopon-gatewayd }
     attestor: {}                    # speaks for exactly the subjects under `principals`
 principals:
   local-user:
@@ -452,10 +452,10 @@ remains separate from credential selection.
 # broker.yaml
 identities:
   - uid: 1000
-    principal: dekopond-gateway
+    principal: dekopon-gatewayd
     actor:
       type: service
-      principal: dekopond-gateway
+      principal: dekopon-gatewayd
     attestor:
       namespaces: [slack.t0123abc]     # optional segment-boundary prefixes; omitted = every mapped subject
 principals:

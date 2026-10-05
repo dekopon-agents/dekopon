@@ -56,7 +56,7 @@ fn chatgpt_export_emits_secret_manifests_and_raw_credentials() {
     assert_eq!(
         stdout(&output),
         format!(
-            "# Exported by `dekopond auth chatgpt export`. This manifest carries a live ChatGPT access token and\n\
+            "# Exported by `dekopon-gatewayd auth chatgpt export`. This manifest carries a live ChatGPT access token and\n\
              # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.\n\
              #\n\
              # The refresh token rotates: whichever process refreshes next invalidates this copy. Seed it once\n\

@@ -38,9 +38,6 @@ use tokio::signal::unix::{SignalKind, signal};
 #[cfg(unix)]
 const OTEL_LOG_FILTER: &str = "job=debug,meter=info";
 
-#[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
-
 /// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
 /// non-preemptible blocking work already in flight; anything still running past this timeout is
 /// left to die with the process.
@@ -182,7 +179,11 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         filter: ConsoleFilter::Environment("info".to_owned()),
     });
     if let Some(provider) = tracer_provider {
-        install = install.with_traces(provider, "dekopon-gatewayd", OTEL_TRACE_FILTER);
+        install = install.with_traces(
+            provider,
+            "dekopon-gatewayd",
+            dekopon_gatewayd::OTEL_TRACE_FILTER,
+        );
     }
     if let Some(provider) = logger_provider {
         install = install.with_logs(provider, OTEL_LOG_FILTER);
@@ -234,7 +235,7 @@ enum AppError {
     #[error("could not install termination signal handler")]
     Signal(#[source] io::Error),
     #[error("gateway service failed")]
-    Gateway(#[source] dekopon_gatewayd::DekopondError),
+    Gateway(#[source] dekopon_gatewayd::GatewaydError),
 }
 
 #[cfg(all(test, unix))]

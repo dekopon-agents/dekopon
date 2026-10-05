@@ -82,7 +82,7 @@ configuration file's own directory, so `../providers/http-probe-provider.wasm`, 
 
 Two names appear in several files and must agree with each other rather than with anything of
 yours: the principal `cpetersen` (`broker.yaml` mapping, both statements in `policies.cedar`), the
-gateway principal `dekopond-gateway` (`broker.yaml` identity, both `via` conditions), and the agent
+gateway principal `dekopon-gatewayd` (`broker.yaml` identity, both `via` conditions), and the agent
 `xaviers-conditional-writer` (`dekopon.yaml` metadata, `gatewayd.yaml` route, both policy statements).
 Rename them together or not at all.
 
@@ -116,8 +116,8 @@ surprise at 2 a.m.
 ## 5. Run the gateway
 
 ```console
-export DEKOPOND_SLACK_APP_TOKEN=xapp-...
-export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
+export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
+export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
 dekopon-gatewayd --config gatewayd.yaml
 ```
 
@@ -217,7 +217,7 @@ one is the write's, pretty-printed and trimmed to the record's fields and its in
   "principal": "cpetersen",
   "actor.kind": "agent",
   "actor.id": "xaviers-conditional-writer",
-  "via": "dekopond-gateway",
+  "via": "dekopon-gatewayd",
   "subject": "slack.t0123abcd.u0123abcd",
   "provider": "http-probe",
   "authorized.by": "local-broker",
@@ -243,7 +243,7 @@ one is the write's, pretty-printed and trimmed to the record's fields and its in
 What each part is doing:
 
 - `principal: cpetersen` — the effect is attributed to the person who asked, not to the process
-  that relayed the message. `via: dekopond-gateway` records which gateway vouched, and `subject`
+  that relayed the message. `via: dekopon-gatewayd` records which gateway vouched, and `subject`
   records the claim it made. All three, or none of them: a direct peer's record has no `via` and no
   subject.
 - `policy.ids` — the `@id("…")` names from `policies.cedar`, comma-separated. That is why writing
@@ -280,7 +280,7 @@ spans in the telemetry store.
 | Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
 | Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |
 | Broker exits: `constraint set for X allows host "…" outside credential "api-token" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
-| Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN` or `DEKOPOND_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
+| Gateway exits at startup naming a variable | `DEKOPON_GATEWAYD_SLACK_APP_TOKEN` or `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 
 The split matters when you are debugging: a session refused *before* it starts leaves a gateway log

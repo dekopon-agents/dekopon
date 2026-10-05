@@ -74,7 +74,7 @@
 //!         risk: RiskLevel::Low,
 //!     },
 //!     context: PolicyContext {
-//!         via: Some("dekopond-gateway".to_owned()),
+//!         via: Some("dekopon-gatewayd".to_owned()),
 //!         agent: Some("reviewer".to_owned()),
 //!         ..PolicyContext::default()
 //!     },

@@ -109,7 +109,7 @@ requires an `@id("…")` annotation naming it, because Cedar's positional names 
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"cli-probe.upper",
        resource == Dekopon::Provider::"cli-probe")
-when { context.via == "dekopond-gateway" };
+when { context.via == "dekopon-gatewayd" };
 ```
 
 Names must be bounded portable identifiers and unique across the set; two policies sharing one name

@@ -77,7 +77,7 @@ Optional `metering.budgets` refuses model calls that exceed an agent's token bud
 `metering.restore` restores budget windows from OpenObserve or Quickwit on boot, best effort.
 Without these settings the old budget behavior remains. The guest model proxy runs under the
 gateway's model credentials, not the broker's provider authority; review its listener and upstream
-settings in [`dekopond.md`](dekopond.md) before enabling it. Neither is enabled by the version
+settings in [`dekopond.md`](gatewayd.md) before enabling it. Neither is enabled by the version
 bump alone.
 
 ## Background jobs (0.30.0)
@@ -96,7 +96,7 @@ Add either key only after the 0.30.0 image runs: 0.29.0 refuses configuration it
 understand. Jobs are lost at restart, cannot send files or images, and a job started by a probe
 stays read-only. A notice turn may start further jobs, so on a route with `jobTimeoutMs` an agent
 can keep itself alive through successive notices; the person's stop word ends them. See
-[detached jobs](dekopond.md#detached-jobs).
+[detached jobs](gatewayd.md#detached-jobs).
 
 Library consumers: `CapabilityInvoker` gains a job-control method whose default reports no job
 control, and the broker protocol's `Trigger` gains `Job`.
@@ -320,7 +320,7 @@ the same provider and scope refuses startup. Shutdown now waits for a running sw
   `progress: off` or `auto`; any other combination refuses startup. Slack hides its native Stop
   while the text shows; stop words still work.
 
-See [progress notes](dekopond.md#liveness-progress-and-stopping-a-run) and
+See [progress notes](gatewayd.md#liveness-progress-and-stopping-a-run) and
 [chat progress](chat-progress.md).
 
 ## Chat steering (0.24.0)
@@ -346,7 +346,7 @@ cancellable; a completed answer cannot be cancelled while it is being delivered.
 Queues are memory-only: shutdown grace lets them finish, but aborting the owner loses pending
 follow-ups, including wakes. Consumed steers join recorded user text; no journal migration is needed.
 
-See [session behavior](dekopond.md#sessions) and [admission telemetry](observability.md#gateway-spans).
+See [session behavior](gatewayd.md#sessions) and [admission telemetry](observability.md#gateway-spans).
 
 ## Broker-owned HTTP trace headers (0.23.0)
 
@@ -501,12 +501,12 @@ this release does not claim measured production RAM savings.
 Version 0.17.0 introduced a fixed WhatsApp media-first window with `debounceMs: 3000`; the
 [0.19.0 quiet-interval correction](#whatsapp-burst-collection-and-unknown-lengths-0190)
 supersedes that timing. Telegram native media groups retain a fixed three-second collection window.
-See [asset handling](dekopond.md#chat-assets) for the retention and delivery contract.
+See [asset handling](gatewayd.md#chat-assets) for the retention and delivery contract.
 
 ## Bounded chat-transport recovery (0.17.0)
 
 No configuration changes are required. All adapters now use the
-[shared recovery defaults](dekopond.md#connection-recovery). Connections start concurrently;
+[shared recovery defaults](gatewayd.md#connection-recovery). Connections start concurrently;
 `gateway_started` no longer means every adapter is connected. Replace alerts on
 `gateway_transports_degraded` with recovery/exit monitoring: exhausting even one adapter now
 terminates the gateway nonzero after bounded draining rather than serving a permanently degraded
@@ -548,7 +548,7 @@ if that coupling previously kept answers unstreamed. Streaming still requires en
 an implemented stream surface. Explicit Auto cancel buttons retain message-backed controls; a
 button with progress Off and no stream, or an effective detail-Off route without streaming, now
 refuses startup rather than silently hiding the button. WhatsApp stream/button refusals remain.
-See [current presentation behavior and limitations](dekopond.md#liveness-progress-and-stopping-a-run).
+See [current presentation behavior and limitations](gatewayd.md#liveness-progress-and-stopping-a-run).
 
 ## `activity:` becomes `liveness:` (0.14.0)
 
@@ -1164,7 +1164,7 @@ the ordinary unknown-tool path and ends the session.
 
 There is no replacement that keeps the old shape. A deployment that wants images needs a provider
 offering an image capability, a constraint set and Cedar statement for it in the broker, and the route
-opt-in above. [`dekopond.md`](dekopond.md#asset-handles-and-delivery) has the
+opt-in above. [`dekopond.md`](gatewayd.md#asset-handles-and-delivery) has the
 conventions and their bounds.
 
 ### 0.11.1 → 0.12.0 — optional public DRNs require a private map and second policy
@@ -1251,7 +1251,7 @@ bootstrap limitations.
   transport authenticates, and reports every unusable one at once. Nothing else changes: leaving
   `apiKeyEnv` out still means the endpoint needs no key, a configured model no route reaches has
   its variable left unread, and `dekopon-run` is unchanged — an unset or blank `--api-key-env`
-  variable still means no bearer token. See [`dekopond.md`](dekopond.md#startup-fails-closed).
+  variable still means no bearer token. See [`dekopond.md`](gatewayd.md#startup-fails-closed).
 - **Model clients follow no ambient `HTTPS_PROXY` or `ALL_PROXY`.** Every
   `dekopon-model` transport — the OpenAI-compatible chat client and the ChatGPT subscription client
   with its device-flow login — is built from one agent that sets no proxy
@@ -1440,7 +1440,7 @@ update looks like a working deployment with no Working UI.
   rather than a paid-for PNG with no delivery path. (The `imageGenerator:` block itself was removed
   after 0.12.0. Current WhatsApp routes support descriptor-backed PNG/JPEG delivery through authorized
   `asset.send` and bounded image editing;
-  see the [current transport contract](dekopond.md#meta-whatsapp-cloud-api).)
+  see the [current transport contract](gatewayd.md#meta-whatsapp-cloud-api).)
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves
   the broker exactly as it was.

@@ -82,7 +82,7 @@ def broker():
     write("/var/lib/dekopon-provider-storage/private")
     write("/var/lib/dekopon-assets/private")
     owned_file("/var/lib/dekopon-assets/private", 0o022)
-    for file in ("/etc/dekopon-gateway/dekopond.yaml", "/gateway-state/chatgpt-auth.json"):
+    for file in ("/etc/dekopon-gateway/gatewayd.yaml", "/gateway-state/chatgpt-auth.json"):
         denied(lambda: read(file), "broker reading " + file)
         denied(lambda: write(file), "broker writing " + file)
         denied(lambda: os.unlink(file), "broker replacing " + file)
@@ -104,7 +104,7 @@ def broker():
 
 
 def gateway():
-    owned_file("/etc/dekopon-gateway/dekopond.yaml", 0o022)
+    owned_file("/etc/dekopon-gateway/gatewayd.yaml", 0o022)
     owned_file("/gateway-state/chatgpt-auth.json", 0o077)
     for file in ("/etc/dekopon/broker.yaml", "/etc/dekopon/policies.cedar",
                  "/etc/dekopon/broker-credentials.yaml",

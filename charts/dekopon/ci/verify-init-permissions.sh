@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prove the init container produces files dekopon-brokerd and dekopond will accept, and that the
+# Prove the init container produces files dekopon-brokerd and dekopon-gatewayd will accept, and that the
 # ChatGPT credential is seeded exactly once.
 #
 # A rendered manifest that looks right is not the same as a file that survives O_NOFOLLOW plus an
@@ -116,7 +116,7 @@ assert gm["gateway-config"]["mountPath"]==bm["config"]["mountPath"]=="/etc/dekop
 assert gm["runtime"]["mountPath"]==bm["runtime"]["mountPath"]=="/run/dekopon"
 config=next(d["stringData"] for d in docs if d["kind"]=="Secret" and "broker.yaml" in d.get("stringData",{}))
 broker_config=yaml.safe_load(config["broker.yaml"])
-gateway_config=yaml.safe_load(config["dekopond.yaml"])
+gateway_config=yaml.safe_load(config["gatewayd.yaml"])
 assert gateway_config["broker"]["serverUid"]==broker["securityContext"]["runAsUser"]
 peers={p["uid"]:p for p in broker_config["identities"]}
 assert "attestor" in peers[gateway["securityContext"]["runAsUser"]]
@@ -235,12 +235,12 @@ mkdir -p "$stamp"
 printf 'apiVersion: dekopon.dev/brokerd/v1alpha1\n' > "$stamp/broker.yaml"
 printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.cedar"
 printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
-printf 'apiVersion: dekopon.dev/dekopond/v1alpha1\n' > "$stamp/dekopond.yaml"
+printf 'apiVersion: dekopon.dev/gatewayd/v1alpha1\n' > "$stamp/gatewayd.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
+for k in broker.yaml policies.cedar broker-credentials.yaml gatewayd.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source

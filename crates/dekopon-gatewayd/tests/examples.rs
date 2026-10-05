@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use dekopon_config::LocalCatalog;
 use dekopon_gatewayd::{
-    DekopondConfig, LivenessConfig, LivenessMode, SlackExperience, SlackLivenessFallback,
+    GatewaydConfig, LivenessConfig, LivenessMode, SlackExperience, SlackLivenessFallback,
 };
 
 fn example(name: &str) -> PathBuf {
@@ -23,7 +23,7 @@ fn read(name: &str) -> String {
 
 #[test]
 fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
-    let config = serde_yaml::from_str::<DekopondConfig>(&read("gatewayd.yaml"))
+    let config = serde_yaml::from_str::<GatewaydConfig>(&read("gatewayd.yaml"))
         .expect("the example gateway configuration decodes under the daemon's strict decoder");
 
     assert_eq!(config.catalog_path, PathBuf::from("dekopon.yaml"));
@@ -173,7 +173,7 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
 
 #[test]
 fn whatsapp_example_uses_the_typed_default_media_collection_window() {
-    let config: DekopondConfig =
+    let config: GatewaydConfig =
         serde_yaml::from_str(include_str!("../../../examples/whatsapp/gatewayd.yaml"))
             .expect("WhatsApp example strictly decodes");
     assert!(matches!(

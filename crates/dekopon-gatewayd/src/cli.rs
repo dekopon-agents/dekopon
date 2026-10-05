@@ -290,7 +290,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "dekopon-gatewayd",
             "check",
-            "dekopond.d",
+            "gatewayd.d",
             "--catalog",
             "agents.d",
             "--output",
@@ -301,7 +301,7 @@ mod tests {
         let Some(Command::Check(check)) = cli.command else {
             panic!("check command");
         };
-        assert_eq!(check.config, std::path::Path::new("dekopond.d"));
+        assert_eq!(check.config, std::path::Path::new("gatewayd.d"));
         assert_eq!(
             check.catalog.as_deref(),
             Some(std::path::Path::new("agents.d"))

@@ -32,9 +32,9 @@ operator-owned deployment repository.
 
 Create three independent high-entropy values and inject them through environment variables:
 
-- `DEKOPOND_WHATSAPP_APP_SECRET`: the Meta app secret used only for webhook HMAC verification;
-- `DEKOPOND_WHATSAPP_VERIFY_TOKEN`: an operator-generated subscription verification token; and
-- `DEKOPOND_WHATSAPP_ACCESS_TOKEN`: a production system-user access token with the narrow
+- `DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET`: the Meta app secret used only for webhook HMAC verification;
+- `DEKOPON_GATEWAYD_WHATSAPP_VERIFY_TOKEN`: an operator-generated subscription verification token; and
+- `DEKOPON_GATEWAYD_WHATSAPP_ACCESS_TOKEN`: a production system-user access token with the narrow
   `whatsapp_business_messaging` permission needed to answer.
 
 The YAML names those variables; never paste values into it. The gateway holds these chat transport

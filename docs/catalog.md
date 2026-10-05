@@ -193,13 +193,13 @@ broker's configuration can disagree with every one of them without either proces
   `ObjectMeta`, `AgentSpec` and `AgentStatus` own the typed serde storage of labels,
   descriptions and the optional authored status.
   Storage and serialization are not a catalog display command.
-- [`dekopond/src/routes.rs`](../crates/dekopon-gatewayd/src/routes.rs), `RoutingTable::bind`:
+- [`dekopon-gatewayd/src/routes.rs`](../crates/dekopon-gatewayd/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
 - [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:
   retain license, compatibility, scalar metadata and allowed-tools with typed accessors.
   [`dekopon-agent/src/skills.rs`](../crates/dekopon-agent/src/skills.rs), `prompt_block` and
   `render_skill`, use name, description, body and resource paths/text, not those optional
-  front-matter fields. [`dekopond/src/session.rs`](../crates/dekopon-gatewayd/src/session.rs)
+  front-matter fields. [`dekopon-gatewayd/src/session.rs`](../crates/dekopon-gatewayd/src/session.rs)
   constructs self-inspection with name, description and resource paths only. The gateway mounts
   the loaded skills through the shared agent layer; no surviving renderer promises to
   display the optional front matter. Metadata scalars remain converted to text by the loader.

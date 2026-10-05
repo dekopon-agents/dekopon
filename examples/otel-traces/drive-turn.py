@@ -126,11 +126,11 @@ def main():
         policy = '''@id("smoke-user-may-prompt-chat-agent")
 permit(principal == Dekopon::Principal::"smoke-user",
  action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent")
- when { context has via && context.via == "dekopond-gateway" };
+ when { context has via && context.via == "dekopon-gatewayd" };
 @id("chat-agent-cli-probe-upper-surface")
 permit(principal == Dekopon::Principal::"smoke-user",
  action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe")
- when { context has via && context.via == "dekopond-gateway"
+ when { context has via && context.via == "dekopon-gatewayd"
  && context has agent && context.agent == "chat-agent" };
 '''
         broker_config = write("broker.json", {
@@ -138,8 +138,8 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "socketPath": str(directory / "broker.sock"),
             "policiesPath": write("policies.cedar", policy),
             "providers": [str(root / "examples/providers/cli-probe-provider.wasm")],
-            "identities": [{"uid": os.geteuid(), "principal": "dekopond-gateway",
-                "actor": {"type": "service", "principal": "dekopond-gateway"},
+            "identities": [{"uid": os.geteuid(), "principal": "dekopon-gatewayd",
+                "actor": {"type": "service", "principal": "dekopon-gatewayd"},
                 "attestor": {"namespaces": ["tel"]}}],
             "principals": {"smoke-user": {"subjects": ["tel.16034700182"]}},
             "capabilities": {"cli-probe": {
@@ -152,7 +152,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "metadata": {"name": "chat-agent"}, "spec": {"description": "Smoke agent",
                 "enabled": True, "instructions": "Use the authorized probe.", "modelClass": "reasoning"}})
         gateway_config = write("gateway.json", {
-            "apiVersion": "dekopon.dev/dekopond/v1alpha1", "catalogPath": catalog,
+            "apiVersion": "dekopon.dev/gatewayd/v1alpha1", "catalogPath": catalog,
             "broker": {"socketPath": str(directory / "broker.sock"), "serverUid": os.geteuid()},
             "transports": [{"name": "dev", "kind": "local", "socketPath": str(directory / "dev.sock")}],
             # The stub answers one JSON completion and ignores `stream`, which is exactly the

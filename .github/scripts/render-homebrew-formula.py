@@ -98,7 +98,7 @@ class Dekopon < Formula
       Check a configuration offline, as startup would, before deploying it:
 
         dekopon-brokerd check broker.d --provider-set providers.yaml --store DIR
-        dekopon-gatewayd check dekopond.d --catalog agents.d
+        dekopon-gatewayd check gatewayd.d --catalog agents.d
 
       dekopon-brokerd and dekopon-gatewayd are daemons. Nothing was started, and neither
       runs until you write it an owner-authored configuration file:
