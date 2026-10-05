@@ -111,7 +111,7 @@ mount will not, because those are symlink farms.
 ## Run a binary
 
 ```console
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopond --help
+docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-gatewayd --help
 docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-brokerd --version
 ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 ```
@@ -123,7 +123,7 @@ socket, which is bound only after compilation and description succeed, then runs
 private files are removed on exit. This proves the selected release's bytes, not a build of
 source HEAD.
 
-In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: ["dekopond"]` with
+In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: ["dekopon-gatewayd"]` with
 `args` carrying `--config`.
 
 ## What the image does not contain
@@ -131,7 +131,7 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 - No broker, gateway, or catalog configuration, and no Cedar policy. Every deployment supplies its
   own owner-owned files.
 - No credentials. `dekopon-brokerd` reads an optional credentials file, an optional private
-  secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
+  secret map, and any source bootstrap files the deployment provides; `dekopon-gatewayd` reads environment
   variables the deployment sets. None is baked.
 - No socket. It is runtime state on a writable volume. Audit needs no volume: it is a log record on
   the container's stdout, and an OTLP log record when `telemetry` is configured
@@ -192,7 +192,7 @@ This is the same script the workflow runs, with the same arguments.
 work=$(mktemp -d)
 ci/stage-image-context.sh v0.32.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
-docker run --rm dekopon:local dekopond --help
+docker run --rm dekopon:local dekopon-gatewayd --help
 ci/verify-image-broker.sh dekopon:local
 ```
 

@@ -14,8 +14,8 @@ Maintainers acknowledge a report when a human is available, assess scope, coordi
 
 ## Scope notes
 
-The workspace has two executable surfaces: the unprivileged `dekopond` gateway and the
-privileged `dekopon-brokerd` broker. `dekopond auth` manages an isolated ChatGPT/Codex model
+The workspace has two executable surfaces: the unprivileged `dekopon-gatewayd` gateway and the
+privileged `dekopon-brokerd` broker. `dekopon-gatewayd auth` manages an isolated ChatGPT/Codex model
 login before gateway configuration or runtime startup. The shared agent layer holds the
 bounded model/shell loop and catalog-mounted skills, without broker authority or provider
 credentials. Provider component loading and effect execution belong only to the broker. The
@@ -23,7 +23,7 @@ gateway's owner-only local development transport is the only local invocation su
 
 The broker executable authenticates distinct peer UIDs over the protected Unix socket under the [current local process boundary](docs/security-model.md#current-local-process-boundary), maps peer credentials through strict trusted configuration, emits metadata-only audit log records, resolves credentials-file entries or separately authorized public-DRN/private-map sources that no guest component can observe, and may expose policy-authorized provider HTTP. It runs a privileged asynchronous component host, a bounded native HTTP engine, Cedar authorization over owner-authored execution constraints, an evidence/audit core, and a bounded identity-free Unix client protocol. The in-tree `http-probe` fixture and the fetched standalone JSONPlaceholder component separate read-only and external-write capabilities and are tested only with injected or loopback mocks; the `gh` provider is maintained out of tree in [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh). Findings in framing/deadlines, socket lifecycle/permissions, peer/server-UID validation, configuration ownership, authority omission, trusted-context binding, policy matching, audit redaction, destination validation, DNS/IP controls, bounds, WIT adaptation, Wasmtime isolation, or authorization binding are in scope.
 
-The unprivileged `dekopond` gateway connects to chat services, listens on an owner-only Unix development transport, routes authenticated messages to catalog agents, and submits attested on-behalf-of proposals to `dekopon-brokerd`. It holds chat bot and model credentials and no provider credentials, policy, or authorization; message text and agent instructions are untrusted throughout. Findings in transport authentication, message-to-subject derivation, attestation claims, session bounds, credential handling, or the daemon's configuration hygiene are in scope.
+The unprivileged `dekopon-gatewayd` gateway connects to chat services, listens on an owner-only Unix development transport, routes authenticated messages to catalog agents, and submits attested on-behalf-of proposals to `dekopon-brokerd`. It holds chat bot and model credentials and no provider credentials, policy, or authorization; message text and agent instructions are untrusted throughout. Findings in transport authentication, message-to-subject derivation, attestation claims, session bounds, credential handling, or the daemon's configuration hygiene are in scope.
 
 Model credentials stay in the selected model client and never enter provider components. Dekopon does not import OAuth material from other applications. See [`docs/security-model.md`](docs/security-model.md) for current trust boundaries and limitations.
 

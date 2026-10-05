@@ -22,7 +22,7 @@ model-facing command. It preserves complete traced execution even when less is s
 
 ## Current implementation and the missing decision
 
-The relevant implementation is entirely inside `crates/dekopond/src/`:
+The relevant implementation is entirely inside `crates/dekopon-gatewayd/src/`:
 
 - `transport.rs`: `ChatDriver` exposes optional `NativeStatus`, `TypingLease`, `InboundReaction`,
   `ProgressMessage`, `TextStream`, and `CancelButton` objects. `Status` is Working/Idle.
@@ -216,7 +216,7 @@ false, and `policy.rs::{streams,writes_progress}` still couples both message mod
 
 ### Telegram
 
-**Current evidence:** [`transport/telegram.rs`](../crates/dekopond/src/transport/telegram.rs),
+**Current evidence:** [`transport/telegram.rs`](../crates/dekopon-gatewayd/src/transport/telegram.rs),
 `ChatDriver`, `TypingLease::renew`, `InboundReaction::set`, `post_text`, `edit_text`,
 `finalize_in_place`, and `reply_markup` implement these surfaces:
 
@@ -251,7 +251,7 @@ is an implementation acceptance requirement, not a claim that the scalar headroo
 
 ### Discord
 
-**Current evidence:** [`transport/discord.rs`](../crates/dekopond/src/transport/discord.rs),
+**Current evidence:** [`transport/discord.rs`](../crates/dekopon-gatewayd/src/transport/discord.rs),
 `ChatDriver`, `TypingLease::renew`, `InboundReaction::set`, `liveness_body`, `TextStream::show`,
 `finalize_in_place`, and `CancelButton::ack` own the mappings:
 
@@ -289,7 +289,7 @@ the UTF-16 boundary and lose that marker: test visible truncation for astral tex
 
 ### WhatsApp Cloud
 
-**Current evidence:** [`transport/whatsapp.rs`](../crates/dekopond/src/transport/whatsapp.rs),
+**Current evidence:** [`transport/whatsapp.rs`](../crates/dekopon-gatewayd/src/transport/whatsapp.rs),
 `TypingLease::renew`, `ChatDriver`, and tests `typing_is_the_read_receipt_and_the_indicator_in_one_call`,
 `a_running_session_re_posts_the_same_indicator_request`, and `whatsapp_offers_typing_and_nothing_else`.
 Only typing is exposed: one messages-endpoint request couples `status: read`, the inbound message ID,
@@ -367,7 +367,7 @@ Proposed release behavior:
 4. Resolve defaults and overrides into one typed effective configuration. Reject unknown fields
    and all incompatible combinations together, including master Off with active presentation and
    message-backed cancel controls without a surface. Do not add permissive YAML aliases.
-5. The implementation PR must update `docs/dekopond.md`, this proposal's status, `chat-progress.md`,
+5. The implementation PR must update `docs/gatewayd.md`, this proposal's status, `chat-progress.md`,
    `docs/upgrading.md`, the gateway README, affected examples, config introspection, and an
    Unreleased changelog entry together. No current operator examples are changed by this proposal.
 
@@ -419,7 +419,7 @@ Additional transport acceptance cases for the implementation PR (not tests added
 | Terminal and failure paths | Success, failed model, declined reply, cancellation, shutdown, failed final send and partial delivery cease renewal; retained streams versus deletable progress follow existing rules; stale answer/history suppressed after Stop |
 | Refusal and ambiguity | HTTP refusal, malformed success and timeout retain cause; no repeated ambiguous creation, no deletion after ambiguous finalization; oversized/image fallback preserves every supported part and partial-delivery accounting |
 
-Run package-scoped validation first (`cargo test -p dekopond --locked` and relevant gateway
+Run package-scoped validation first (`cargo test -p dekopon-gatewayd --locked` and relevant gateway
 integration tests), then the repository's required scope gates. Loopback HTTP assertions prove API
 selection, not notification delivery. Separately authorized live checks must inspect Slack native
 Working/Stop, Telegram/Discord typing and reaction eligibility, WhatsApp renewal, absence of

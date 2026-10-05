@@ -2,7 +2,7 @@
 """Real daemon fixture; only the OpenAI-compatible model is a loopback stand-in.
 
 Configuration, policy, bash response and local request follow
-crates/dekopond/tests/gateway.rs broker_config/gateway_config/ask/boot_in_with_scope.
+crates/dekopon-gatewayd/tests/gateway.rs broker_config/gateway_config/ask/boot_in_with_scope.
 """
 import http.server
 import json
@@ -164,7 +164,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
                 "agent": "chat-agent",
                 "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}}],
             "sessions": {"maxConcurrent": 1}, "shutdownGraceMs": 15000, "telemetry": telemetry})
-        gateway = start("dekopond", gateway_config, {"SMOKE_MODEL_KEY": CREDENTIAL})
+        gateway = start("dekopon-gatewayd", gateway_config, {"SMOKE_MODEL_KEY": CREDENTIAL})
         path = ready("dev.sock", gateway)
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(60)

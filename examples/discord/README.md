@@ -1,6 +1,6 @@
 # Discord bot setup
 
-`dekopond` connects to Discord Gateway v10 over an outbound WebSocket, so it needs no inbound HTTP
+`dekopon-gatewayd` connects to Discord Gateway v10 over an outbound WebSocket, so it needs no inbound HTTP
 endpoint. It answers direct messages and explicit bot mentions in guild channels, including Discord
 thread channels. Photos and files use the same lazy `Chat Asset #N` flow as Slack and Telegram: the
 model sees bounded metadata first and downloads bytes only if it calls `fetch_chat_asset`.
@@ -10,7 +10,7 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
 1. In the [Discord Developer Portal](https://discord.com/developers/applications), create an
    application and add a bot.
 2. On the bot page, reset/copy the bot token and store it as a secret. Do not put it in
-   `dekopond.yaml`.
+   `gatewayd.yaml`.
 3. Open the application's **OAuth2** page. Its address has this shape (the application ID below is
    illustrative; use the ID Discord assigned to your application):
 
@@ -91,7 +91,7 @@ limits are cosmetic and never alter the answer.
 `progress: message` adds one editable message that says what the session is doing and becomes the
 answer at the end, and `cancelButton: true` puts a Stop button on it. A reply of `stop` or `cancel`
 in the same conversation does the same thing on any transport — see
-[Liveness, progress, and stopping a run](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
+[Liveness, progress, and stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
 
 ## 3. Map Discord users at the broker
 

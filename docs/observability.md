@@ -1,6 +1,6 @@
 # Observability
 
-`dekopond` and `dekopon-brokerd` each export their own execution traces over OTLP, using either
+`dekopon-gatewayd` and `dekopon-brokerd` each export their own execution traces over OTLP, using either
 gRPC or HTTP with protobuf payloads. Gateway coverage is a routed chat message, model turns, and
 its bounded agent/script session. Broker coverage is component loading and decoded invocations
 from mapped peers. Neither collects telemetry from Kubernetes nodes or other processes.
@@ -49,9 +49,9 @@ model spend is the `meter` record below.
 
 ### The `meter` charge record
 
-Every model call — the agent's own and one a guest makes through the [model proxy](dekopond.md#guest-model-proxy) — writes exactly
+Every model call — the agent's own and one a guest makes through the [model proxy](gatewayd.md#guest-model-proxy) — writes exactly
 one OTLP log record on the `meter` target, message `model call charged`, whether or not its agent
-has a [token budget](dekopond.md#token-budgets). It is a log record rather than a span event
+has a [token budget](gatewayd.md#token-budgets). It is a log record rather than a span event
 because the log queue carries only `job` and `meter`, while the span queue carries every debug span
 and is the one that fills. The trace filter does not include `meter`.
 
@@ -73,7 +73,7 @@ invalidating it. A `refused` record carries zeros, and a call that was never sen
 zeros; restore skips both. Every number is recorded as an integer, so neither OpenObserve nor
 Quickwit sees it as a string. The boot restore that reads these records logs one `meter.restore`
 record on the same target: at info with the row count when it applies, at warn with `error.kind`
-when it keeps the live meters ([best effort](dekopond.md#restoring-token-windows-at-boot-is-best-effort)).
+when it keeps the live meters ([best effort](gatewayd.md#restoring-token-windows-at-boot-is-best-effort)).
 
 Whatever the model provider reports for usage lands as `usage.input_tokens`,
 `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.output_tokens`, `usage.reasoning_output_tokens`, and
@@ -176,8 +176,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
-| `gateway.asset.content_type_mismatch` | `dekopond` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
-| `gateway.asset.retention_miss` | `dekopond` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
+| `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
+| `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
 | `agent.skill.read` | `dekopon-agent` | model turn, tool-call index, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
@@ -259,7 +259,7 @@ Export is disabled unless an endpoint is configured in the daemon's `telemetry` 
 telemetry:
   endpoint: http://127.0.0.1:5080/api/default
   transport: http
-  serviceName: dekopond
+  serviceName: dekopon-gatewayd
   exportTimeoutMs: 5000
 ```
 
@@ -267,7 +267,7 @@ Supply authentication only through the standard header environment variables:
 
 ```console
 export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,organization=default,stream-name=dekopon'
-dekopond --config gateway.yaml
+dekopon-gatewayd --config gateway.yaml
 ```
 
 Both transports are first-class. `http` treats the endpoint as a generic OTLP/HTTP base and appends
@@ -311,8 +311,8 @@ Both daemons report the same two facts on the way out, in the same shape:
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `gateway_exit` / `broker_exit` | error | `dekopond` / `dekopon-brokerd` | `error`: the failure and its whole source chain, rendered as one `a: b: c` line |
-| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopond` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters, each naming its signal and stage |
+| `gateway_exit` / `broker_exit` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: the failure and its whole source chain, rendered as one `a: b: c` line |
+| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters, each naming its signal and stage |
 
 ## Broker export
 
@@ -387,7 +387,7 @@ derived.
 
 ## Gateway spans
 
-`dekopond` opens a message's trace in the transport that received it and wraps the routed message in
+`dekopon-gatewayd` opens a message's trace in the transport that received it and wraps the routed message in
 two further spans of its own:
 
 | Span | Fields |
@@ -465,7 +465,7 @@ Direct WIT writer calls record guest-list length and copied-byte count: oversize
 rejected before a payload copy. These are payload-copy bounds, not process RSS measurements.
 **Current:** content-type labels remain authoritative; gateway intake compares a bounded decoded
 prefix and emits the existing `gateway.asset.content_type_mismatch` event once on disagreement, with metadata
-only (see [asset handles](dekopond.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
+only (see [asset handles](gatewayd.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
 `duration_us`. Streamed HTTP uses the same `http.request` span and `accounting.http.request`
 record as buffered HTTP, including refused attempts; its request byte count is the exact total
 body length, while its request grant bounds literal parts only. An `asset.send` capability uses
@@ -509,7 +509,7 @@ but do not count toward completed steps. These records remain useful without a `
 Admission acknowledgment failures emit debug-only `gateway_steer_ack_failed`, with `transport` and
 `error`; expiration of the two-second bound is `error = deadline`.
 
-Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
+Every transport uses the shared [bounded recovery policy](gatewayd.md#connection-recovery).
 `gateway_transport_recovering` carries the configured `transport`, stable error `category`,
 episode `failure` count and `delay_ms`, never credentials or raw response bodies.
 `gateway_transport_connected` records successful initial and recovered connections.
@@ -596,7 +596,7 @@ carries a phone number, a WABA identifier, a message ID, or message text.
 
 ### What conversation history changes
 
-A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopond.md#conversations) —
+A route set to `mode: persistent` — the contract is in [`gatewayd.md](gatewayd.md#conversations) —
 is the default and changes the meaning of a field that already exists. A route explicitly set to
 `oneShot` replays no history.
 
@@ -639,7 +639,7 @@ of every shared prompt sent to the selected model provider independently of tele
 Every model request declares the key (`prompt_cache_key`; `session_id` on OpenRouter) — one per
 conversation on a `persistent` route, one per bound route on a `oneShot` one. OpenRouter can
 additionally mark an explicit system prefix.
-[`dekopond.md`](dekopond.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
+[`gatewayd.md](gatewayd.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
 
 **`usage.cached_input_tokens` is how you find out whether it works.** Plot its ratio to
 `usage.input_tokens` on a conversation's second and later turns, the requests that repeat a prefix
@@ -838,7 +838,7 @@ the refresh failure classes remain part of the migration contract.
 | `broker_policy_evaluation_error` | warn | `dekopon-broker` | `invocation`, `policy.target` (`capability` or `secret`) |
 | `broker_secret_resolution_failed` / `broker_secret_credential_failed` | warn | `dekopon-broker` | `invocation` and low-cardinality source/material `category`; structural credential errors are fixed value-free text. No DRN, locator, revision, value, or value-derived length. |
 | `broker_credential_refresh_failed` | error when `retryable = false`, warn otherwise | `dekopon-broker` | `invocation`, the symbolic `credential` name, low-cardinality `category`, and `retryable`. The invocation's classified reason is `credential-unavailable` when permanent and `credential-refresh-failed` when not; the broker keeps serving every other capability either way. |
-| `broker_chatgpt_credential_reauth_required` | error | `dekopon-brokerd` | the symbolic `credential` name, the `authFile` path, `category`, and the refresh failure's source chain. Emitted when the OAuth `error` code says the refresh-token family is retired (`invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated`, `refresh_token_expired`) or the local credential is unusable: a human must run `dekopond auth chatgpt login --auth-file` again. No token, account identifier, or document content. |
+| `broker_chatgpt_credential_reauth_required` | error | `dekopon-brokerd` | the symbolic `credential` name, the `authFile` path, `category`, and the refresh failure's source chain. Emitted when the OAuth `error` code says the refresh-token family is retired (`invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated`, `refresh_token_expired`) or the local credential is unusable: a human must run `dekopon-gatewayd auth chatgpt login --auth-file` again. No token, account identifier, or document content. |
 | `broker.credential.refresh_save_failed` | error | `dekopon-brokerd` | the `oauth2Refresh` record path and I/O error after the endpoint rotated the token but the private atomic replace failed; the new access token still serves this invocation, and no token or response body is recorded. |
 | `broker_chatgpt_credential_refresh_failed` | warn | `dekopon-brokerd` | the symbolic `credential` name, low-cardinality `category` (`transport`, `token-endpoint-unavailable`, `token-endpoint-rejected`, `token-endpoint-protocol`, `invalid-material`, `refresh-task`), and the failure's source chain. The next invocation may succeed unchanged. |
 | `broker_chatgpt_credential_loaded` | info | `dekopon-brokerd` | once per `chatgptSubscription` credential at startup: the symbolic `credential` name, the `authFile` path, `expires_at`, and `expired`. It is how an operator learns a seeded credential is already stale before the first invocation discovers it. |
@@ -1072,7 +1072,7 @@ private stable `node.id`, root parent, fixed `process.kind`, the `process.interr
 provider payloads, and raw operation errors are absent. These spans are `DEBUG` so INFO volume does
 not grow with frontend process nodes or with the command words a script runs; a diagnostic filter
 may enable them. The `broker-command` kind is one cancellable node per command word the broker leg
-runs, and `dekopond` ties it to session Stop, which aborts and joins the round trip before the
+runs, and `dekopon-gatewayd` ties it to session Stop, which aborts and joins the round trip before the
 script reads `session-cancelled`; external embedders may supply no signal. Nodes report `parent.id`
 `root`; real parent threading remains future. The gateway's trace filter includes `dekopon_process`;
 `Span::or_current` retains the current parent when a sink disables these DEBUG spans, which are not

@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 GATES = {
     "Verify gateway excludes privileged broker machinery": (
-        "dekopond", ("broker", "broker-host", "brokerd", "http-host", "storage-host", "policy")
+        "dekopon-gatewayd", ("broker", "broker-host", "brokerd", "http-host", "storage-host", "policy")
     ),
     # dekopon-model is deliberately not forbidden here: the broker's refreshing credential
     # kind resolves through `dekopon_model::chatgpt::CredentialFile`.

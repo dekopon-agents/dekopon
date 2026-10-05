@@ -2,7 +2,7 @@
 
 Dekopon is an extensible runtime for self-hosted AI agents. Providers are WebAssembly components; the model proposes, a separate broker authorizes and executes; and provider credentials can never reach the model. The three goals that decide what belongs here are the [constitution](docs/design.md#constitution).
 
-> **Status:** pre-1.0 and in active production use. The one known production deployment is the maintainer's Raspberry Pi homelab: Kubernetes on a home fiber connection, serving Discord, Slack, and WhatsApp. This is not a general production-readiness guarantee. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopond` holds chat and model credentials and no broker authority.
+> **Status:** pre-1.0 and in active production use. The one known production deployment is the maintainer's Raspberry Pi homelab: Kubernetes on a home fiber connection, serving Discord, Slack, and WhatsApp. This is not a general production-readiness guarantee. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopon-gatewayd` holds chat and model credentials and no broker authority.
 
 ## Design documentation
 
@@ -36,13 +36,13 @@ Extensibility through Wasm providers:
 The operator surface on top:
 
 - Strict YAML and JSON agent resources, with duplicate, invalid-name and unknown-field detection reported in one refusal.
-- Configuration as directories: each daemon and the agent catalog may read a folder of small files — one per tenant, provider or transport — where any collision refuses startup, and `dekopon-brokerd check` / `dekopond check` run the startup validation offline as a pre-flight. Principals carry Cedar groups and providers group their capabilities, so one statement grants a family or a provider's reads. See [upgrading to 0.22.0](docs/upgrading.md#principals-groups-and-capability-blocks-0220).
+- Configuration as directories: each daemon and the agent catalog may read a folder of small files — one per tenant, provider or transport — where any collision refuses startup, and `dekopon-brokerd check` / `dekopon-gatewayd check` run the startup validation offline as a pre-flight. Principals carry Cedar groups and providers group their capabilities, so one statement grants a family or a provider's reads. See [upgrading to 0.22.0](docs/upgrading.md#principals-groups-and-capability-blocks-0220).
 - Wakes: an agent may come back to the same conversation after a delay or when a model-free watch probe fires; probe runs are refused every writing capability.
-- Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
+- Isolated model-account authentication through `dekopon-gatewayd auth`, with table, wide, JSON, YAML, and name status output.
 - A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed Meta WhatsApp Cloud API webhook with bounded PNG/JPEG photo inputs, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Both daemons export OTLP to a receiver on a private CA: the standard `OTEL_EXPORTER_OTLP_CERTIFICATE` adds its PEM roots beside WebPKI, and chart 0.11.0 wires it through `otlp.caBundle`. See [upgrading to 0.21.0](docs/upgrading.md#otlp-private-ca-0210).
 - Provider HTTPS can add CA roots independently of exact-authority non-public egress, and the broker supplies per-provider owner settings only during authorized invocation. A URL-free, bounded OpenObserve provider can now be installed separately; it is **not** bundled or granted by this release. See [upgrading to 0.20.0](docs/upgrading.md#provider-https-and-owner-settings-0200).
-- Messages and photos from the same sender steer their running turn: routes choose model-only interruption (`abort`, default) or the next step boundary. Other senders and wakes queue follow-ups under their own broker legs; eight pending items fit per conversation. Accepted steers and queued non-wake follow-ups get a best-effort 👀 acknowledgment when a liveness target exists. Photos still download only on demand. See [chat steering](docs/dekopond.md#sessions).
+- Messages and photos from the same sender steer their running turn: routes choose model-only interruption (`abort`, default) or the next step boundary. Other senders and wakes queue follow-ups under their own broker legs; eight pending items fit per conversation. Accepted steers and queued non-wake follow-ups get a best-effort 👀 acknowledgment when a liveness target exists. Photos still download only on demand. See [chat steering](docs/gatewayd.md#sessions).
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.
 - Opt-in native liveness after fresh authorization: automatic progress prefers native status or a typing/reaction indicator over redundant progress messages; explicit editable progress and optional answer streaming remain available, driven by one per-session policy task, with Slack Agent Working/Stop sessions and a classic `:tangerine:` reaction fallback. A liveness failure never changes the answer, and a stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a wall-clock bound — is cooperative rather than rollback.
 - Slack Agent channel threads owned per authenticated sender after fresh authorization: that sender continues without repeating the mention, and the optional `decline_chat_reply` decision lets the agent post nothing when a reply would only take the last word. Ambient channel history never reaches routing or inference.
@@ -149,7 +149,7 @@ An App rather than a personal access token: the minted token expires within the 
 
 ## Organization and package names
 
-[`dekopon-agents`](https://github.com/dekopon-agents) is the GitHub organization that hosts the project. **Dekopon** is the product and Cargo workspace. The executables are `dekopond` and `dekopon-brokerd`. Organization naming does not change the product name.
+[`dekopon-agents`](https://github.com/dekopon-agents) is the GitHub organization that hosts the project. **Dekopon** is the product and Cargo workspace. The executables are `dekopon-gatewayd` and `dekopon-brokerd`. Organization naming does not change the product name.
 
 ## Contributing and license
 

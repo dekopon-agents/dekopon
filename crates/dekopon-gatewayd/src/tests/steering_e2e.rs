@@ -307,7 +307,7 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
     let driver = Arc::new(RecordingDriver::default());
     let route = persistent_route(model_config(), shared_window());
     let mut first = message("A's input");
-    first.receive_span = tracing::info_span!(target: "dekopond::tests", "holder_receipt");
+    first.receive_span = tracing::info_span!(target: "dekopon_gatewayd::tests", "holder_receipt");
     first.constituents = vec![first.receive_span.clone()];
     let held = tokio::spawn(
         run_session(
@@ -320,7 +320,7 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
     );
     models.wait_until_entered().await;
     let mut next = message_from(OTHER, "B's input");
-    next.receive_span = tracing::info_span!(target: "dekopond::tests", "followup_receipt");
+    next.receive_span = tracing::info_span!(target: "dekopon_gatewayd::tests", "followup_receipt");
     next.constituents = vec![next.receive_span.clone()];
     run_session(
         runner,

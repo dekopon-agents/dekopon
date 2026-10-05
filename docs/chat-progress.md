@@ -188,7 +188,7 @@ Rendering, for whichever capability objects the driver returns, at the route's d
 4. Keep-alive at 15 s, 45 s, then every 60 s, always an edit and never a new post.
 5. With streaming on and a `TextStream` present, the stream is the surface.
 6. Slack Agent `statusText: true` can hand over to custom status text on the first note, sharing
-   the same line selection, coalescing and edit budget. See the [Slack transport contract](dekopond.md#slack-socket-mode)
+   the same line selection, coalescing and edit budget. See the [Slack transport contract](gatewayd.md#slack-socket-mode)
    for the hidden native Stop, refresh lease, fallback and terminal ordering.
 
 Detail levels are per route: `off` suppresses progress prose but not explicitly requested answer
@@ -206,7 +206,7 @@ Default templates are operator strings overridable per transport: `Working on it
 
 A live note has priority over both tool/status and keep-alive lines, even through individual tool
 completions. A later note replaces it; a new model turn, steering, or any terminal outcome clears
-it. Staleness is checked only at keep-alive ticks, using the [note lifetime rules](dekopond.md#configuration),
+it. Staleness is checked only at keep-alive ticks, using the [note lifetime rules](gatewayd.md#configuration),
 not a new timer. Notes share the existing coalescing and 60-edit budget: an identical line still
 costs an edit, so a long polling loop can exhaust that budget before the 24-note cap is reached.
 Detailed counters still append to a note line, and note content is never parsed for placeholders.

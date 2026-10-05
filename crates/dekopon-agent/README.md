@@ -1,6 +1,6 @@
 # dekopon-agent
 
-The reusable agent session layer consumed by `dekopond` and external embeddings such as
+The reusable agent session layer consumed by `dekopon-gatewayd` and external embeddings such as
 `dekopon-console`. This crate owns one authoritative copy of each shared piece:
 
 - `prompt::run_prompt` — the bounded model tool loop that always offers one sandboxed
@@ -141,7 +141,7 @@ Nothing in this crate holds authority. The broker leg submits identity-free prop
 over an authenticated Unix socket and reports back whatever the broker decided; this
 crate never interprets policy, resolves credentials, or constructs authorization state.
 It depends only on the client half of the broker protocol, never on broker internals —
-the dependency discipline CI enforces for `dekopond`.
+the dependency discipline CI enforces for `dekopon-gatewayd`.
 
 Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.model_turn`,
 `prompt.script`, and `prompt.asset_fetch` when an embedder supplies chat assets) and

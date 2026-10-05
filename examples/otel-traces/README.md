@@ -1,6 +1,6 @@
 # Verify daemon telemetry in OpenObserve
 
-This development fixture runs real `dekopon-brokerd` and `dekopond` processes against
+This development fixture runs real `dekopon-brokerd` and `dekopon-gatewayd` processes against
 one pinned [OpenObserve](https://openobserve.ai/) container. Only the OpenAI-compatible
 model endpoint is a Python standard-library loopback stub. No real model or provider
 credential is read. The gateway receives an explicit fake model credential in its

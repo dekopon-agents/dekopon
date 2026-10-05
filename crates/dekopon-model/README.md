@@ -43,7 +43,7 @@ public DRNs without duplicating or removing this refresh implementation
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)). The gateway's model
 credential is not part of that provider-binding migration.
 
-The gateway executable owns account lifecycle through `dekopond auth`; execution clients such as
+The gateway executable owns account lifecycle through `dekopon-gatewayd auth`; execution clients such as
 external embeddings consume the resulting credentials. Model credentials are never passed to Wasm
 provider components. [`docs/inference.md`](../../docs/inference.md) traces these types into literal
 ChatGPT wire JSON and distinguishes cache affinity, gateway conversation history, optional

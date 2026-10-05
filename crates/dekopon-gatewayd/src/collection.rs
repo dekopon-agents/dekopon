@@ -286,7 +286,7 @@ impl Drop for Dispositions {
 
 pub(crate) fn record_received(message: &InboundMessage) {
     tracing::info!(
-        target: "dekopond::audit",
+        target: "dekopon_gatewayd::audit",
         { audit.event = "gateway.message.received",
         subject = %message.subject,
         channel = message.conversation.id.as_str(),

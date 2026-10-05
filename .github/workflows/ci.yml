@@ -91,14 +91,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Release-profile compile gate; tag workflows still perform the final linked builds.
       - name: Check release CLIs
-        run: cargo check --release --locked -p dekopon-brokerd -p dekopond
+        run: cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd
       - name: Detect unused dependencies
         run: cargo machete
       - name: Verify gateway excludes privileged broker machinery
         shell: bash
         run: |
           set -euo pipefail
-          tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+          tree=$(cargo tree --locked -p dekopon-gatewayd --edges normal --prefix none)
           if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
@@ -440,13 +440,13 @@ jobs:
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
-        run: cargo build --locked -p dekopon-brokerd -p dekopond
+        run: cargo build --locked -p dekopon-brokerd -p dekopon-gatewayd
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
           broker=target/debug/dekopon-brokerd
-          gateway=target/debug/dekopond
+          gateway=target/debug/dekopon-gatewayd
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null
@@ -462,7 +462,7 @@ jobs:
           cat >"$auth" <<'JSON'
           {"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","expiresAt":1700000000,"accountId":"acct-fixture"}
           JSON
-          target/debug/dekopond auth chatgpt export --auth-file "$auth" \
+          target/debug/dekopon-gatewayd auth chatgpt export --auth-file "$auth" \
             --expose-credential --namespace dekopon >"$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^apiVersion: v1$' "$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^kind: Secret$' "$RUNNER_TEMP/chatgpt-secret.yaml"
@@ -472,7 +472,7 @@ jobs:
             | base64 -d | diff - "$auth"
           # An export with no credential must fail rather than emit a half-formed secret.
           set +e
-          target/debug/dekopond auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
+          target/debug/dekopon-gatewayd auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
             --expose-credential >/dev/null 2>&1
           status=$?
           set -e

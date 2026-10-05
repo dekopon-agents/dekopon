@@ -5,14 +5,14 @@ pieces for Dekopon's WhatsApp Cloud API text and image transport.
 
 ## Network
 
-Terminate public HTTPS outside `dekopond`:
+Terminate public HTTPS outside `dekopon-gatewayd`:
 
 ```text
-Meta -> Cloudflare Tunnel -> Traefik -> dekopon ClusterIP Service -> dekopond 0.0.0.0:9080
+Meta -> Cloudflare Tunnel -> Traefik -> dekopon ClusterIP Service -> dekopon-gatewayd 0.0.0.0:9080
 ```
 
 Route only `/webhooks/whatsapp` to the configured listener. Do not expose another daemon path;
-the listener has only GET subscription verification and signed POST delivery routes. `dekopond`
+the listener has only GET subscription verification and signed POST delivery routes. `dekopon-gatewayd`
 does not terminate TLS.
 
 Enable the chart's cluster-local target on the same port as `bind`:
@@ -24,7 +24,7 @@ gateway:
     port: 9080
 ```
 
-A Kubernetes Service cannot reach a loopback listener, which is why `dekopond.yaml` binds
+A Kubernetes Service cannot reach a loopback listener, which is why `gatewayd.yaml` binds
 `0.0.0.0:9080`. The chart creates no Ingress; keep the Traefik Host plus exact-path route in the
 operator-owned deployment repository.
 
@@ -43,7 +43,7 @@ credentials and model credentials only. Provider credentials and policy remain i
 
 ## Meta configuration
 
-1. Replace the placeholder WABA and receiving phone-number IDs in `dekopond.yaml`.
+1. Replace the placeholder WABA and receiving phone-number IDs in `gatewayd.yaml`.
 2. Pin a currently supported Graph API version after checking Meta's current documentation.
 3. Configure the public HTTPS callback URL ending in `/webhooks/whatsapp` and enter the same
    verification token delivered through the environment.
@@ -90,9 +90,9 @@ The download policy permits only exact HTTPS `lookaside.fbsbx.com:443` at
 Other CDN hosts fail closed; this is deliberately not an exhaustive Meta compatibility claim.
 The request shapes are pinned by loopback tests, not live Meta validation. The example pins v25.0;
 a dashboard webhook version does not by itself establish Graph version compatibility. See the
-[transport contract](../../docs/dekopond.md#meta-whatsapp-cloud-api) for bounds and limitations.
+[transport contract](../../docs/gatewayd.md#meta-whatsapp-cloud-api) for bounds and limitations.
 
 The example uses a 5000ms media-first quiet interval (`debounceMs`) and a 15000ms hard maximum
 from the first receipt (`debounceMaxWaitMs`). Set `debounceMs: 0` for immediate admission; when
 enabled, the maximum must be at least the quiet interval. Collection does not wait for active
-sessions or fetch media. See the [collection contract](../../docs/dekopond.md#multi-message-media-inputs).
+sessions or fetch media. See the [collection contract](../../docs/gatewayd.md#multi-message-media-inputs).

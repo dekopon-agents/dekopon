@@ -17,14 +17,14 @@ This document follows one agent from a session that went badly to a catalog chan
 
 | Mechanism | Where it lives | What the model can do with it | What it never does |
 |---|---|---|---|
-| Skills | The catalog's `spec.skills` directories and the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
+| Skills | The catalog's `spec.skills` directories and the agent a `dekopon-gatewayd` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
 | `suggest_improvement` | Every session; the record in the telemetry backend | Record a typed, bounded note for the operator | Change an instruction, skill, limit, or grant; reach the person in chat |
 
 ### Skills: progressive disclosure of operator-authored knowledge
 
 A skill is a directory named after the skill, holding a `SKILL.md` — YAML front matter with `name` and `description`, then Markdown instructions — and, optionally, supporting files beside it, each addressed by its `/`-separated relative path. It is the Agent Skills directory layout: a `SKILL.md` that uses the specification's front-matter keys loads here unchanged, and a key the specification does not define is refused rather than ignored. [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) is the field-by-field contract and carries every bound. [`examples/catalog/skills/pull-request-review`](../examples/catalog/skills/pull-request-review/SKILL.md) is one, mounted by the `reviewer` agent in [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml); its body tells the model to read the `references/risk-checklist.md` resource only when a diff touches authorization, credentials, or an external write.
 
-Where a skill lives decides who mounts it. An agent's `spec.skills` names directories relative to the catalog file, and the loader reads every one whole at catalog load. `dekopond` binds the loaded skills to every route naming the agent and mounts them on every session of that route, shared rather than re-read, so a session never touches the filesystem.
+Where a skill lives decides who mounts it. An agent's `spec.skills` names directories relative to the catalog file, and the loader reads every one whole at catalog load. `dekopon-gatewayd` binds the loaded skills to every route naming the agent and mounts them on every session of that route, shared rather than re-read, so a session never touches the filesystem.
 
 The model meets a skill in three steps, each paid for only when the model decides it needs it:
 
@@ -34,7 +34,7 @@ The model meets a skill in three steps, each paid for only when the model decide
 
 The listing is the trigger. The description is the one line the model matches a request against, which is why the format asks authors to write it as a "use when" sentence and why it is the only part that sits in every prompt. The body waits behind the tool because a tool result stays in the message vector and is re-sent on every later turn: a skill the model does not need for this request would otherwise cost its full length on every turn of every session. For the same reason a second read of the same instructions or resource within one session is answered with a one-line pointer at the earlier result rather than a second copy. A `SKILL.md` past 64 KiB is refused at load; a long checklist belongs in a resource the body names, read only when the case arises, which is what the example skill does with its risk checklist.
 
-The listing is deterministic for one mounted set, and it sits with the instructions rather than with the request because it is agent-standing rather than request-scoped. On a `dekopond` route that keeps the leading prompt identical across sessions — the same instructions, the same listing, then what the conversation remembers and what the sender just said — so mounting a skill does not disturb the prompt-cache affinity [`inference.md`](inference.md#prompt-cache-key-lifecycle) describes. A `read_skill` result lands after that prefix, in the turn that read it.
+The listing is deterministic for one mounted set, and it sits with the instructions rather than with the request because it is agent-standing rather than request-scoped. On a `dekopon-gatewayd` route that keeps the leading prompt identical across sessions — the same instructions, the same listing, then what the conversation remembers and what the sender just said — so mounting a skill does not disturb the prompt-cache affinity [`inference.md`](inference.md#prompt-cache-key-lifecycle) describes. A `read_skill` result lands after that prefix, in the turn that read it.
 
 An unknown skill name, or an unknown resource path, is a refusal the model reads and can recover from — it names the mounted skills, or the skill's resource files — and the session continues; `agent.skill.refused` records the reason (`unknown-skill` or `unknown-resource`) and never the name the model typed. Malformed arguments (not a JSON object, no `name`, an unexpected or mistyped field) end the session as a malformed call to any other tool does. Each successful read fires `agent.skill.read` with the operator-authored `skill.name`, the `skill.resource` path (empty for the body), the byte count, and whether it repeated an earlier read. Names and paths are operator-authored; the skill text reaches telemetry only inside the transcript events, which are always recorded ([goal 2](design.md#constitution)). `inspect_agent_config` shows the mounted skills as `skills: [{name, description, resources}]` — names and paths, never the text.
 
@@ -71,7 +71,7 @@ Every text field is trimmed and stripped of control characters other than newlin
 
 Where a suggestion goes depends on who ran the session; in no case is it applied:
 
-- `dekopond` relays nothing to chat; the sender sees only the answer. The record exists in telemetry alone.
+- `dekopon-gatewayd` relays nothing to chat; the sender sees only the answer. The record exists in telemetry alone.
 - An embedder of `dekopon-agent` receives them as `PromptOutcome.suggestions`, already written to telemetry by the time they arrive.
 
 Reading them back is one query against the stream the exporters wrote to. OpenObserve stores the `audit.event` attribute as `audit_event`, folding every character outside letters, digits, and underscores:
@@ -93,7 +93,7 @@ Each of these is a decision, not a gap. Every artifact of the loop is either in 
 
 ## Related documents
 
-- [`dekopond.md`](dekopond.md#sessions) — how a route mounts its agent's catalog skills, and why nothing a suggestion records reaches chat.
+- [`gatewayd.md](gatewayd.md#sessions) — how a route mounts its agent's catalog skills, and why nothing a suggestion records reaches chat.
 - [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) — the `spec.skills` field, the `SKILL.md` front matter, every bound, and what the loader refuses.
 - [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`, all emitted regardless of payload telemetry; only the separate prompt/answer transcript stream remains opt-in.
 - [`inference.md`](inference.md) — the prompt-cache prefix a stable skills listing preserves, and the conversation memory that is not an improvement mechanism.

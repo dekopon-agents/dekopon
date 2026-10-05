@@ -213,7 +213,7 @@ jobs:
 
             # The claim this whole design rests on: the executable in the image is the executable
             # the release published, byte for byte.
-            for binary in dekopon-brokerd dekopond; do
+            for binary in dekopon-brokerd dekopon-gatewayd; do
               in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
               in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
               if [ "$in_image" != "$in_release" ]; then
@@ -244,9 +244,9 @@ jobs:
           done
 
           # The runner is amd64, so that image runs here for real.
-          docker run --rm dekopon-proof:amd64 dekopond --help
+          docker run --rm dekopon-proof:amd64 dekopon-gatewayd --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
-          docker run --rm dekopon-proof:amd64 dekopond --version
+          docker run --rm dekopon-proof:amd64 dekopon-gatewayd --version
           # Tag mode always checks startup. PRs check it too once the latest published
           # broker is from the stdio epoch; only older cross-epoch archives cannot load
           # the checked probes and must defer this proof to the matching release tag.

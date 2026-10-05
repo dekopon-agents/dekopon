@@ -52,7 +52,7 @@ RETIRED = {"x86_64-apple-darwin"}
 # or adding a binary is one edit here rather than a hunt through the prose.
 EXECUTABLES = (
     ("dekopon-brokerd", "the authorization broker daemon (Unix only)"),
-    ("dekopond", "the unprivileged chat gateway daemon (Unix only)"),
+    ("dekopon-gatewayd", "the unprivileged chat gateway daemon (Unix only)"),
 )
 
 # The formula's prose spells its counts. A count with no word here is a hard error rather
@@ -93,18 +93,18 @@ class Dekopon < Formula
 
       Manage model authentication without starting a daemon:
 
-        dekopond auth chatgpt --help
+        dekopon-gatewayd auth chatgpt --help
 
       Check a configuration offline, as startup would, before deploying it:
 
         dekopon-brokerd check broker.d --provider-set providers.yaml --store DIR
-        dekopond check dekopond.d --catalog agents.d
+        dekopon-gatewayd check dekopond.d --catalog agents.d
 
-      dekopon-brokerd and dekopond are daemons. Nothing was started, and neither
+      dekopon-brokerd and dekopon-gatewayd are daemons. Nothing was started, and neither
       runs until you write it an owner-authored configuration file:
 
         dekopon-brokerd --config broker.yaml    #{{doc}}/BROKER.md
-        dekopond --config gateway.yaml          #{{doc}}/GATEWAY.md
+        dekopon-gatewayd --config gateway.yaml          #{{doc}}/GATEWAY.md
 
       The broker holds provider credentials and the only authorization path;
       read BROKER.md before enabling it.
@@ -118,9 +118,9 @@ class Dekopon < Formula
 {smoke}
 
     assert_match "--expose-credential",
-                 shell_output("#{{bin}}/dekopond auth chatgpt export --help")
+                 shell_output("#{{bin}}/dekopon-gatewayd auth chatgpt export --help")
     assert_match '"signedIn": false',
-                 shell_output("#{{bin}}/dekopond auth chatgpt status --auth-file #{{testpath}}/missing-auth.json -o json")
+                 shell_output("#{{bin}}/dekopon-gatewayd auth chatgpt status --auth-file #{{testpath}}/missing-auth.json -o json")
   end
 end
 '''

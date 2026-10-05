@@ -1,10 +1,10 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Parsed `dekopond` invocation.
+/// Parsed `dekopon-gatewayd` invocation.
 #[derive(Debug, Parser)]
 #[command(
-    name = "dekopond",
+    name = "dekopon-gatewayd",
     version,
     subcommand_negates_reqs = true,
     about = "Run the unprivileged Dekopon chat gateway and agent daemon"
@@ -174,7 +174,7 @@ pub enum ChatGptAuthCommand {
     },
 }
 
-/// Forms `dekopond auth chatgpt export` can print a credential in.
+/// Forms `dekopon-gatewayd auth chatgpt export` can print a credential in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum ExportFormat {
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn parses_chatgpt_auth_commands() {
         let cli = Cli::try_parse_from([
-            "dekopond",
+            "dekopon-gatewayd",
             "auth",
             "chatgpt",
             "status",
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn check_takes_a_positional_configuration_without_the_serving_flag() {
         let cli = Cli::try_parse_from([
-            "dekopond",
+            "dekopon-gatewayd",
             "check",
             "dekopond.d",
             "--catalog",
@@ -307,19 +307,21 @@ mod tests {
             Some(std::path::Path::new("agents.d"))
         );
         assert_eq!(check.output, CheckFormat::Json);
-        assert!(Cli::try_parse_from(["dekopond", "check"]).is_err());
-        assert!(Cli::try_parse_from(["dekopond", "check", "x", "--output", "yaml"]).is_err());
+        assert!(Cli::try_parse_from(["dekopon-gatewayd", "check"]).is_err());
+        assert!(
+            Cli::try_parse_from(["dekopon-gatewayd", "check", "x", "--output", "yaml"]).is_err()
+        );
     }
 
     #[test]
     fn export_requires_the_credential_acknowledgement() {
-        let refused = Cli::try_parse_from(["dekopond", "auth", "chatgpt", "export"])
+        let refused = Cli::try_parse_from(["dekopon-gatewayd", "auth", "chatgpt", "export"])
             .expect_err("export without acknowledgement must not parse");
 
         assert!(refused.to_string().contains("--expose-credential"));
 
         let cli = Cli::try_parse_from([
-            "dekopond",
+            "dekopon-gatewayd",
             "auth",
             "chatgpt",
             "export",

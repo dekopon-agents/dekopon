@@ -1,7 +1,7 @@
 # Run Dekopon on a Mac
 
 Dekopon runs natively on macOS as two Unix processes: `dekopon-brokerd` authorizes provider
-calls, and `dekopond` runs the model and chat transports. Kubernetes, Docker, and a Slack workspace
+calls, and `dekopon-gatewayd` runs the model and chat transports. Kubernetes, Docker, and a Slack workspace
 are not needed for a local experiment. For a cluster deployment, use [Kubernetes](kubernetes.md).
 
 The release archives and Homebrew tap support **Apple Silicon (ARM64)** Macs. There is no current
@@ -17,7 +17,7 @@ brew tap dekopon-agents/tap
 brew trust dekopon-agents/tap
 brew install dekopon
 dekopon-brokerd --version
-dekopond --version
+dekopon-gatewayd --version
 ```
 
 Homebrew 6 requires `brew trust` before loading a non-official tap. The
@@ -58,7 +58,7 @@ trusted publishing. Install both daemons at the same available version:
 
 ```console
 cargo install --locked --version 0.32.0 dekopon-brokerd
-cargo install --locked --version 0.32.0 dekopond
+cargo install --locked --version 0.32.0 dekopon-gatewayd
 ```
 
 A crate publication can trail the Git tag or stop partway; use the tap or release archives if the
@@ -74,9 +74,9 @@ also the MSRV (edition 2024):
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
 cargo install --locked --path crates/dekopon-brokerd
-cargo install --locked --path crates/dekopond
+cargo install --locked --path crates/dekopon-gatewayd
 dekopon-brokerd --version
-dekopond --version
+dekopon-gatewayd --version
 ```
 
 That builds `main`. For a release build, check out its tag before the `cargo install` commands.
@@ -209,7 +209,7 @@ when the local endpoint does not require one. If it does, set `apiKeyEnv` to the
 environment variable available only to the gateway; never put the key in the YAML. Relative file
 paths resolve against the configuration file's directory. See the complete
 [broker configuration contract](../crates/dekopon-brokerd/README.md#configuration) and
-[gateway configuration contract](dekopond.md#configuration) for other fields.
+[gateway configuration contract](gatewayd.md#configuration) for other fields.
 
 ### Check, start, and send a message
 
@@ -217,7 +217,7 @@ Before starting either daemon:
 
 ```console
 dekopon-brokerd check "$HOME/.dekopon-demo/broker.yaml"
-dekopond check "$HOME/.dekopon-demo/gateway.yaml"
+dekopon-gatewayd check "$HOME/.dekopon-demo/gateway.yaml"
 ```
 
 These are preflight checks, not a connection test. They do not prove runtime socket permissions,
@@ -231,7 +231,7 @@ In a second terminal, wait for its startup to finish, then probe it and start th
 
 ```console
 dekopon-brokerd probe --socket "$HOME/.dekopon-demo/run/broker.sock"
-dekopond --config "$HOME/.dekopon-demo/gateway.yaml"
+dekopon-gatewayd --config "$HOME/.dekopon-demo/gateway.yaml"
 ```
 
 A successful probe exits silently with status 0. It authenticates and lists capabilities; it
@@ -255,15 +255,15 @@ An unauthorized reply usually means the subject, agent, attestor, capability, or
 not match; inspect both daemons' logs. For a provider failure, also check outbound HTTPS access.
 Stop the gateway with Ctrl-C before stopping the broker. Graceful shutdown drains rather than
 rolling back an effect. See [operations](operations.md) and the
-[local transport contract](dekopond.md#local-development-transport).
+[local transport contract](gatewayd.md#local-development-transport).
 
 ### Use a ChatGPT subscription
 
 Instead of running a local model, authenticate into Dekopon's isolated credential file:
 
 ```console
-dekopond auth chatgpt login
-dekopond auth chatgpt status
+dekopon-gatewayd auth chatgpt login
+dekopon-gatewayd auth chatgpt status
 ```
 
 Replace the gateway's `models` list with:

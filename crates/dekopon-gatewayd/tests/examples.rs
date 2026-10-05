@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use dekopon_config::LocalCatalog;
-use dekopond::{
+use dekopon_gatewayd::{
     DekopondConfig, LivenessConfig, LivenessMode, SlackExperience, SlackLivenessFallback,
 };
 
@@ -23,7 +23,7 @@ fn read(name: &str) -> String {
 
 #[test]
 fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
-    let config = serde_yaml::from_str::<DekopondConfig>(&read("dekopond.yaml"))
+    let config = serde_yaml::from_str::<DekopondConfig>(&read("gatewayd.yaml"))
         .expect("the example gateway configuration decodes under the daemon's strict decoder");
 
     assert_eq!(config.catalog_path, PathBuf::from("dekopon.yaml"));
@@ -45,7 +45,7 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(transport.kind(), "slackSocketMode");
     assert!(matches!(
         transport,
-        dekopond::TransportConfig::SlackSocketMode {
+        dekopon_gatewayd::TransportConfig::SlackSocketMode {
             experience: SlackExperience::Agent,
             liveness: LivenessConfig {
                 mode: LivenessMode::Native,
@@ -61,8 +61,8 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(route.limits.max_capability_calls, 16);
     assert_eq!(
         route.memory,
-        dekopond::MemoryConfig::Persistent {
-            scope: dekopond::MemoryScope::PrivateConversation,
+        dekopon_gatewayd::MemoryConfig::Persistent {
+            scope: dekopon_gatewayd::MemoryScope::PrivateConversation,
             idle_timeout_ms: 900_000,
             max_turns: 12,
             max_bytes: 65_536,
@@ -174,11 +174,11 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
 #[test]
 fn whatsapp_example_uses_the_typed_default_media_collection_window() {
     let config: DekopondConfig =
-        serde_yaml::from_str(include_str!("../../../examples/whatsapp/dekopond.yaml"))
+        serde_yaml::from_str(include_str!("../../../examples/whatsapp/gatewayd.yaml"))
             .expect("WhatsApp example strictly decodes");
     assert!(matches!(
         &config.transports[0],
-        dekopond::TransportConfig::WhatsappCloudApi {
+        dekopon_gatewayd::TransportConfig::WhatsappCloudApi {
             debounce_ms: 5000,
             debounce_max_wait_ms: 15000,
             ..

@@ -1,5 +1,5 @@
 [package]
-name = "dekopond"
+name = "dekopon-gatewayd"
 description = "Unprivileged Dekopon chat gateway daemon: transports, routing, and bounded agent sessions"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/dekopond"
+documentation = "https://docs.rs/dekopon-gatewayd"
 readme = "README.md"
 keywords = ["agents", "daemon", "slack", "llm", "orchestration"]
 categories = ["command-line-utilities", "network-programming"]

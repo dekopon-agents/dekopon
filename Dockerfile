@@ -49,7 +49,7 @@ ARG TARGETARCH
 
 COPY --chmod=0755 \
      dist/${TARGETARCH}/dekopon-brokerd \
-     dist/${TARGETARCH}/dekopond \
+     dist/${TARGETARCH}/dekopon-gatewayd \
      /usr/local/bin/
 
 # Provider components come from the staging context assembled before this network-free build.
@@ -73,9 +73,9 @@ COPY LICENSE-APACHE LICENSE-MIT /usr/share/doc/dekopon/
 USER 65532:65532
 WORKDIR /home/nonroot
 
-# No ENTRYPOINT on purpose. The command selects the binary, so `docker run <image> dekopond
+# No ENTRYPOINT on purpose. The command selects the binary, so `docker run <image> dekopon-gatewayd
 # --config ...` and a Kubernetes `command: ["dekopon-brokerd"]` both work without `--entrypoint`.
-CMD ["dekopond", "--help"]
+CMD ["dekopon-gatewayd", "--help"]
 
 LABEL org.opencontainers.image.title="dekopon" \
       org.opencontainers.image.description="Dekopon capability broker and chat gateway with isolated model auth" \
