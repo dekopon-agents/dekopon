@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.23.0] - 2026-10-05
+
+### Changed
+
+- Rename the chart's gateway config defaults, CLI and example principal for dekopon-gatewayd; release the chart with the reviewed v0.34.0 image index digest pin.
+
+## [0.34.0] - 2026-10-05
+
+### Changed
+
+- Rename the chat gateway daemon to dekopon-gatewayd. This breaks the old binary, crate, config apiVersion, environment variable and deployment-config names; update gateway configuration when upgrading.
+
 ## [dekopon-chart-0.22.0] - 2026-10-04
 
 ### Changed

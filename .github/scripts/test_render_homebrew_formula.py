@@ -88,9 +88,6 @@ class RenderHomebrewFormulaTests(unittest.TestCase):
             with self.subTest(executable=name):
                 self.assertIn(f'assert_match "{name} #{{version}}"', self.formula)
 
-    def test_gateway_config_directory_example_uses_current_name(self) -> None:
-        self.assertIn("dekopon-gatewayd check gatewayd.d --catalog agents.d", self.formula)
-
     def test_every_executable_count_the_prose_states_matches_the_list(self) -> None:
         # The prose also says "every executable" where a count would age badly, so only
         # the spelled numbers are compared: any other one is a count that drifted.

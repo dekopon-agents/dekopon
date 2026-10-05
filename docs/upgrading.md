@@ -8,6 +8,27 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Gateway rename (0.34.0)
+
+Upgrade both daemons together to v0.34.0 before switching the gateway configuration. The
+`dekopond` executable and crate are replaced by `dekopon-gatewayd`; there is no alias. The
+old `dekopond` crate on crates.io remains historical and is not republished. Set the gateway
+resource `apiVersion` to `dekopon.dev/gatewayd/v1alpha1`; do not mix old and new resources.
+Rename `dekopond.yaml` / `dekopond.d` to `gatewayd.yaml` / `gatewayd.d`, and replace all
+`DEKOPOND_*` environment variable names and matching Kubernetes Secret data keys with
+`DEKOPON_GATEWAYD_*`. Update `gateway.config.existingSecretKey` to `gatewayd.yaml` when
+using chart 0.23.0. The gateway's broker principal is now `dekopon-gatewayd` and OTLP
+`serviceName` should be `dekopon-gatewayd`; update the broker's identity mapping and Cedar
+grants accordingly. Keep broker and gateway on separate UIDs.
+
+Move the gateway's journal mount from `/var/lib/dekopond/journal` to
+`/var/lib/dekopon-gatewayd/journal` and point `sessions.journal.path` at the new mount.
+Keep the PVC and `gateway-journal` subPath unchanged so existing journal bytes survive.
+For enabled wakes, update the path to `/var/lib/dekopon-gatewayd/wakes` while retaining the
+`gateway-wakes` subPath. Old gateway configurations are strictly rejected by the new binary;
+update all fragments in one rollout, with the image and chart pin together. No provider
+component or WIT interface changes in this release.
+
 ## Nesting (0.33.0)
 
 Upgrade the gateway and broker together: a v0.32 gateway cannot answer the
