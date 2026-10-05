@@ -138,7 +138,7 @@ Within one session, the second request is the first request plus more items. Bet
 
 `generation`, `reasoning`, `routing` and `cache` are immutable client settings, not arbitrary JSON
 or request-scoped overrides. The strict configuration and every accepted spelling/bound are in
-[`gatewayd.md](gatewayd.md#openrouter-model-settings). Omitted members remain absent on the wire:
+[`gatewayd.md`](gatewayd.md#openrouter-model-settings). Omitted members remain absent on the wire:
 `maxOutputTokens` maps to `max_tokens`, `topP` to `top_p`, reasoning effort to `reasoning.effort`,
 and routing to snake-case members of `provider`. Forwarding a control does not prove that a remote
 provider honored it; telemetry labels these as requested settings.
@@ -178,7 +178,7 @@ counts are a subset of output, not an extra charge added to it.
 A key is a routing hint, not a cache handle: `prompt_cache_key` on Codex and compatible requests,
 `session_id` on OpenRouter. Dekopon cannot use it to read another response,
 enumerate cache contents, or delete provider state, and it is minted from entropy rather than from a
-subject, channel, phone number, or account ID. [`gatewayd.md](gatewayd.md#the-prompt-cache-key) owns
+subject, channel, phone number, or account ID. [`gatewayd.md`](gatewayd.md#the-prompt-cache-key) owns
 its scope, minting, and rotation.
 
 Sharing a one-shot route's key does not share answers: two requests reuse only their identical
@@ -253,7 +253,7 @@ One long-lived optimization is in place: `dekopon-gatewayd` shares one model cli
 
 ## How scoped conversation memory works
 
-A route selects replay behavior with a `memory:` block, and [`gatewayd.md](gatewayd.md#conversations) owns its
+A route selects replay behavior with a `memory:` block, and [`gatewayd.md`](gatewayd.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
@@ -340,7 +340,7 @@ message becomes a second stored turn. Malformed complete records remain `memory-
 Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
 files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage
 root and never in its audit, spans, metrics, public errors, or provider metadata.
-[`gatewayd.md](gatewayd.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
+[`gatewayd.md`](gatewayd.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
 Retrieval is explicit: a durable turn never enters a later prompt on its own, and what comes back is
 untrusted model context.
 
@@ -491,7 +491,7 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 ## Related documents
 
-- [`gatewayd.md](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
+- [`gatewayd.md`](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
 - [`cli.md`](cli.md) — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.

@@ -9,7 +9,7 @@ everything below.
 
 This document is the whole lifecycle for getting a credential from a local login into a cluster and
 keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract,
-[`inference.md`](inference.md) for the inference boundary, [`gatewayd.md](gatewayd.md) for the
+[`inference.md`](inference.md) for the inference boundary, [`gatewayd.md`](gatewayd.md) for the
 `models[].authFile` setting that names the file in a pod, and
 [`secrets.md`](secrets.md#legacy-credentials-the-broker-renews) for the broker credential kind.
 
