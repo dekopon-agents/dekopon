@@ -23,7 +23,7 @@ class SmokeControls(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)
         self.rows = [dict(daemon=daemon, trace_id=str(index) * 32, span_id=str(index) * 16)
-                     for index, daemon in enumerate(("dekopond", "dekopon-brokerd"), 1)]
+                     for index, daemon in enumerate(("dekopon-gatewayd", "dekopon-brokerd"), 1)]
         for row in self.rows:
             self.write(row["daemon"] + ".log", "{}\n" + json.dumps(row) + "\n", raw=True)
         self.write("openobserve-auth-header", "Authorization: Basic fake-ingest-token", raw=True)
@@ -103,7 +103,7 @@ class SmokeControls(unittest.TestCase):
 
     def test_absent_or_invalid_native_ids_fail(self):
         for rows in ([{}], [{"trace_id": "0" * 32, "span_id": "1" * 16}, {}]):
-            self.write("dekopond.log", "\n".join(map(json.dumps, rows)), raw=True)
+            self.write("dekopon-gatewayd.log", "\n".join(map(json.dumps, rows)), raw=True)
             with self.assertRaises(AssertionError):
                 self.ship()
 
@@ -122,7 +122,7 @@ class SmokeControls(unittest.TestCase):
     def test_credentials_are_rejected_before_shipping(self):
         for secret in ("DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
                        "fake-ingest-token", "fake-password"):
-            self.write("dekopond.stderr.log", secret, raw=True)
+            self.write("dekopon-gatewayd.stderr.log", secret, raw=True)
             with self.assertRaisesRegex(AssertionError, "redaction"):
                 self.ship()
 

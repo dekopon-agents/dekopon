@@ -127,7 +127,7 @@ import json, os, pathlib, re, sys, urllib.request
 folder, port, stream = sys.argv[1:]
 folder = pathlib.Path(folder)
 records = []
-for daemon in ("dekopond", "dekopon-brokerd"):
+for daemon in ("dekopon-gatewayd", "dekopon-brokerd"):
     path = folder / (daemon + ".log")
     assert path.stat().st_size <= 4 * 1024 * 1024, "stdout bound"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -279,10 +279,10 @@ shipped = json.loads((folder / "shipped.json").read_text())
 # The broker exports its own log records now, so this stream holds more than the shipper put into
 # it. Every shipped row must still be there.
 assert len(logs) >= len(shipped), "remote log coverage mismatch"
-for daemon in ("dekopond", "dekopon-brokerd"):
+for daemon in ("dekopon-gatewayd", "dekopon-brokerd"):
     pairs = {(row["trace_id"], row["span_id"]) for row in shipped
              if row["daemon"] == daemon and row.get("trace_id")
-             and (daemon != "dekopond" or row["trace_id"] == trace)}
+             and (daemon != "dekopon-gatewayd" or row["trace_id"] == trace)}
     assert pairs, f"no local native IDs for {daemon}"
     assert any(row.get("daemon") == daemon
                and (row.get("trace_id"), row.get("span_id")) in pairs

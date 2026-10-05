@@ -102,9 +102,7 @@ jobs:
             tag="$REQUESTED_TAG"
             push=true
           else
-            # A pull request has no release of its own. Check its staging and image
-            # identity against the latest release. The stdio probes need a broker from
-            # v0.31.0 or later; earlier releases cannot load them.
+            # PR image identity requires archives with the renamed gateway binary; tag jobs use their own release.
             tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             push=false
           fi
@@ -112,21 +110,24 @@ jobs:
             echo "::error::could not resolve a release tag to package"
             exit 1
           fi
-          verify_broker=true
+          stage_image=true
           if [ "$push" = false ]; then
-            # Fail closed on an unknown release label rather than silently waive startup.
+            # Fail closed on an unknown release label rather than silently waive image proof.
             if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
               echo "::error::unexpected published release tag: $tag"
               exit 1
             fi
             major=$((10#${BASH_REMATCH[1]}))
             minor=$((10#${BASH_REMATCH[2]}))
-            if (( major == 0 && minor < 31 )); then verify_broker=false; fi
+            if (( major == 0 && minor < 34 )); then
+              stage_image=false
+              echo "::notice::latest release $tag predates dekopon-gatewayd; image identity is proven by the v0.34.0 tag run"
+            fi
           fi
           {
             echo "tag=$tag"
             echo "push=$push"
-            echo "verify_broker=$verify_broker"
+            echo "stage_image=$stage_image"
             # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
             # cannot push to the wrong package. The published WIT packages are separate GHCR
             # packages under the same owner (dekopon/provider, dekopon/http, dekopon/storage) and
@@ -136,7 +137,7 @@ jobs:
             # release; a pull request checks out itself, which is the point.
             if [ "$push" = "true" ]; then echo "checkout_ref=$tag"; else echo "checkout_ref="; fi
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::packaging $tag (push=$push, verify_broker=$verify_broker)"
+          echo "::notice::packaging $tag (push=$push, stage_image=$stage_image)"
 
       # Keep verification tooling from the workflow revision, not the requested release.
       # The release checkout below still owns every staged image input and its attribution.
@@ -158,6 +159,7 @@ jobs:
         run: shellcheck ci/stage-image-context.sh "$RUNNER_TEMP/verify-image-broker.sh"
 
       - name: Stage the build context
+        if: steps.plan.outputs.stage_image == 'true'
         id: stage
         shell: bash
         env:
@@ -180,9 +182,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
+        if: steps.plan.outputs.stage_image == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build and load both platforms
+        if: steps.plan.outputs.stage_image == 'true'
         shell: bash
         env:
           CONTEXT: ${{ steps.stage.outputs.context }}
@@ -197,6 +201,7 @@ jobs:
           done
 
       - name: Verify the image against the published archives
+        if: steps.plan.outputs.stage_image == 'true'
         shell: bash
         env:
           CONTEXT: ${{ steps.stage.outputs.context }}
@@ -247,14 +252,7 @@ jobs:
           docker run --rm dekopon-proof:amd64 dekopon-gatewayd --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopon-gatewayd --version
-          # Tag mode always checks startup. PRs check it too once the latest published
-          # broker is from the stdio epoch; only older cross-epoch archives cannot load
-          # the checked probes and must defer this proof to the matching release tag.
-          if [ "${{ steps.plan.outputs.verify_broker }}" = "true" ]; then
-            "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
-          else
-            echo "::notice::broker startup deferred: ${{ steps.plan.outputs.tag }} predates the v0.31.0 stdio epoch"
-          fi
+          "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
           human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
           {
@@ -262,7 +260,7 @@ jobs:
             echo "|---|---|"
             echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
-            echo "| binaries executed (amd64) | 2/2; broker component load when released binary supports stdio probes |"
+            echo "| binaries executed (amd64) | 2/2; broker component load verified |"
             echo "| unpacked size | $human |"
           } >> "$GITHUB_STEP_SUMMARY"
 
