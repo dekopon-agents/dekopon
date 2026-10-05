@@ -277,8 +277,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "dekopon-gatewayd") | .version')
+          version="${RELEASE_TAG#v}"
           publish() {
             crate="$1"
             status=$(curl --silent --show-error --retry 3 \

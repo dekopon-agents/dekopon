@@ -27,8 +27,8 @@ no-op and the final reply is unchanged.
 
 | Credential | Prefix | Purpose | Environment variable |
 |---|---|---|---|
-| App-level token | `xapp-…` | Opens the outbound Socket Mode connection | `DEKOPOND_SLACK_APP_TOKEN` |
-| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes liveness/text or attachment replies, and reads attachments | `DEKOPOND_SLACK_BOT_TOKEN` |
+| App-level token | `xapp-…` | Opens the outbound Socket Mode connection | `DEKOPON_GATEWAYD_SLACK_APP_TOKEN` |
+| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes liveness/text or attachment replies, and reads attachments | `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN` |
 
 Neither token belongs in the app manifest or a Dekopon configuration file.
 
@@ -63,7 +63,7 @@ itself routed as a prompt, and ambient channel-history events are discarded insi
       becomes available only after both are present. If Slack shows another empty permission
       selector, leave it empty; a second scope is not required. Select **Generate**.
 3. Slack shows the generated token and its scope. Select **Copy** and save the complete `xapp-…`
-   value as `DEKOPOND_SLACK_APP_TOKEN`. After closing the dialog, the **App-Level Tokens** table
+   value as `DEKOPON_GATEWAYD_SLACK_APP_TOKEN`. After closing the dialog, the **App-Level Tokens** table
    should contain one row named `dekopon` with the `connections:write` scope. Select the token name
    in that table to reopen its **Copy** and **Revoke** controls.
 
@@ -75,7 +75,7 @@ commit. Use **Revoke** in the token details if it is exposed.
 1. Select **Install App** in the Slack app settings sidebar, then select **Install to Workspace**.
 2. Review the requested bot permissions and select **Allow**.
 3. After installation, copy the **Bot User OAuth Token** from **OAuth & Permissions**. Save the
-   complete `xoxb-…` value as `DEKOPOND_SLACK_BOT_TOKEN`.
+   complete `xoxb-…` value as `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN`.
 
 If the app was already installed, open **OAuth & Permissions** directly to find the bot token. If
 bot scopes change later, select **Reinstall to Workspace** so the new scopes take effect.
@@ -171,8 +171,8 @@ session successfully added; a failed cleanup may leave a harmless `:tangerine:` 
 Export the values under the environment-variable names referenced by `gatewayd.yaml`:
 
 ```console
-export DEKOPOND_SLACK_APP_TOKEN=xapp-...
-export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
+export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
+export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
 ```
 
 ## Allow a sender

@@ -474,8 +474,8 @@ mod tests {
     #[test]
     fn an_otlp_layer_never_sees_the_exporters_own_records() {
         for directive in [
-            "dekopond=trace",
-            "dekopond=trace,opentelemetry=off",
+            "dekopon_gatewayd=trace",
+            "dekopon_gatewayd=trace,opentelemetry=off",
             "trace",
         ] {
             let recorded = RecordTargets::default();
@@ -485,12 +485,12 @@ mod tests {
                 tracing::error!(target: "opentelemetry", "api diagnostic");
                 tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
                 tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
-                tracing::info!(target: "dekopond", "gateway event");
+                tracing::info!(target: "dekopon_gatewayd::audit", "gateway event");
             });
 
             assert_eq!(
                 *recorded.0.lock(),
-                vec!["dekopond".to_owned()],
+                vec!["dekopon_gatewayd::audit".to_owned()],
                 "{directive}"
             );
         }

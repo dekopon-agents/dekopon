@@ -18,17 +18,17 @@ broker:
       strict: true
       identities:
         - uid: 65533
-          principal: dekopond-gateway
+          principal: dekopon-gatewayd
           actor:
             type: service
-            principal: dekopond-gateway
+            principal: dekopon-gatewayd
           attestor:
             namespaces: [slack.t0123abcd]
         - uid: 65532
-          principal: dekopond-gateway
+          principal: dekopon-gatewayd
           actor:
             type: service
-            principal: dekopond-gateway
+            principal: dekopon-gatewayd
       principals:
         maintainer:
           subjects: [slack.t0123abcd.u0123abcd]
@@ -89,7 +89,7 @@ broker:
       permit(principal == Dekopon::Principal::"maintainer",
              action == Dekopon::Action::"agent.prompt",
              resource == Dekopon::Agent::"pr-summarizer-linter")
-      when { context has via && context.via == "dekopond-gateway" };
+      when { context has via && context.via == "dekopon-gatewayd" };
 
       @id("pr-summarizer-linter-gh-surface")
       permit(principal == Dekopon::Principal::"maintainer",
@@ -101,7 +101,7 @@ broker:
                         Dekopon::Action::"gh.pull-request.comment"],
              resource == Dekopon::Provider::"gh")
       when { context has agent && context.agent == "pr-summarizer-linter"
-          && context has via && context.via == "dekopond-gateway" };
+          && context has via && context.via == "dekopon-gatewayd" };
 
   # Created out of band, so the token never enters a values file or release:
   #   kubectl create secret generic dekopon-broker-credentials \
@@ -124,7 +124,7 @@ gateway:
   enabled: true
   config:
     inline: |
-      apiVersion: dekopon.dev/dekopond/v1alpha1
+      apiVersion: dekopon.dev/gatewayd/v1alpha1
       catalogPath: /etc/dekopon-catalog/dekopon.yaml
       broker:
         socketPath: /run/dekopon/broker.sock
@@ -132,8 +132,8 @@ gateway:
       transports:
         - name: workspace-slack
           kind: slackSocketMode
-          appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
-          botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+          appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
+          botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
           experience: agent
           liveness:
             mode: native
@@ -188,12 +188,12 @@ gateway:
   env:
     - name: RUST_LOG
       value: info
-    - name: DEKOPOND_SLACK_APP_TOKEN
+    - name: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
       valueFrom:
         secretKeyRef:
           name: dekopon-slack
           key: appToken
-    - name: DEKOPOND_SLACK_BOT_TOKEN
+    - name: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
       valueFrom:
         secretKeyRef:
           name: dekopon-slack

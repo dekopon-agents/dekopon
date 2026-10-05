@@ -18,7 +18,7 @@ use crate::{
 const SECRET_KEY: &str = "chatgpt-auth.json";
 
 const MANIFEST_HEADER: &str = "\
-# Exported by `dekopond auth chatgpt export`. This manifest carries a live ChatGPT access token and
+# Exported by `dekopon-gatewayd auth chatgpt export`. This manifest carries a live ChatGPT access token and
 # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.
 #
 # The refresh token rotates: whichever process refreshes next invalidates this copy. Seed it once

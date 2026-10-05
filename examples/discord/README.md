@@ -49,14 +49,14 @@ commands and interactions are not used.
 ## 2. Configure the transport
 
 ```console
-export DEKOPOND_DISCORD_BOT_TOKEN='...'
+export DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN='...'
 ```
 
 ```yaml
 transports:
   - name: community-discord
     kind: discordGateway
-    botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
+    botTokenEnv: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
     # optional; absent means off, which preserves reply-only behavior
     liveness: { mode: native, progress: message, cancelButton: true }
 
@@ -101,8 +101,8 @@ Use **Copy User ID** in Developer Mode:
 ```yaml
 identities:
   - uid: 65532
-    principal: dekopond-gateway
-    actor: { kind: service, id: dekopond-gateway }
+    principal: dekopon-gatewayd
+    actor: { kind: service, id: dekopon-gatewayd }
     attestor:
       namespaces: [discord]
 

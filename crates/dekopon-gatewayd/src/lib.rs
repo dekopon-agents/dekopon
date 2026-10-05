@@ -47,7 +47,7 @@ use tracing::Instrument as _;
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
-    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, DekopondConfig, HARD_MAX_CONFIG_BYTES, JournalConfig,
+    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, GatewaydConfig, HARD_MAX_CONFIG_BYTES, JournalConfig,
     KeepAliveConfig, LivenessConfig, LivenessMode, LivenessOverride, LivenessSettings,
     MemoryConfig, MemoryPolicy, MemoryScope, MemoryWindow, ProgressSurface, RecallSource,
     ResolvedConfig, ResolvedJournal, ResolvedRoute, ResolvedTelemetry, SlackExperience,
@@ -75,6 +75,8 @@ use crate::{
     },
 };
 
+pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
+
 const INBOUND_BUFFER: usize = 64;
 const ASSET_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -86,18 +88,18 @@ pub fn current_uid() -> u32 {
 pub async fn telemetry_settings(
     config_path: impl AsRef<Path>,
     uid: u32,
-) -> Result<Option<ResolvedTelemetry>, DekopondError> {
+) -> Result<Option<ResolvedTelemetry>, GatewaydError> {
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
-pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), DekopondError>
+pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
     let uid = current_uid();
     let config = config::load(config_path, uid).await?;
 
-    let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
+    let catalog = LocalCatalog::load(&config.catalog_path).map_err(GatewaydError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
     let Prepared {
         transports: built_transports,
@@ -108,11 +110,11 @@ where
         config.broker.server_uid,
         config.broker.frame,
     )
-    .map_err(DekopondError::BrokerProbe)?;
+    .map_err(GatewaydError::BrokerProbe)?;
     let capabilities = broker_client
         .capabilities()
         .await
-        .map_err(DekopondError::BrokerProbe)?;
+        .map_err(GatewaydError::BrokerProbe)?;
     tracing::info!(
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
@@ -141,8 +143,8 @@ where
                 journal::Journal::open(&journal.dir, journal.retention)
             })
             .await
-            .map_err(DekopondError::TransportTask)?
-            .map_err(|error| DekopondError::Journal {
+            .map_err(GatewaydError::TransportTask)?
+            .map_err(|error| GatewaydError::Journal {
                 kind: match error {
                     journal::JournalError::Io { kind } => kind,
                     journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
@@ -155,7 +157,7 @@ where
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
                 .await
-                .map_err(DekopondError::TransportTask)??,
+                .map_err(GatewaydError::TransportTask)??,
         )),
         None => None,
     };
@@ -240,7 +242,7 @@ where
         // instead.
         ServeOutcome::TransportsLost => {
             tracing::error!(event = "gateway_stopped", reason = "transports-lost");
-            Err(DekopondError::TransportsLost)
+            Err(GatewaydError::TransportsLost)
         }
     }
 }
@@ -251,7 +253,7 @@ async fn start_metering_tasks(
     config: &ResolvedConfig,
     configured: &ConfiguredModels,
     metering: &Arc<dekopon_model_token_governor::Metering>,
-) -> Result<JoinSet<()>, DekopondError> {
+) -> Result<JoinSet<()>, GatewaydError> {
     let mut owned_tasks = JoinSet::new();
     if let Some(resolved) = &config.proxy {
         proxy::start(
@@ -262,7 +264,7 @@ async fn start_metering_tasks(
             &mut owned_tasks,
         )
         .await
-        .map_err(DekopondError::Proxy)?;
+        .map_err(GatewaydError::Proxy)?;
     }
     meter_restore::spawn(
         metering,
@@ -278,7 +280,7 @@ async fn start_metering_tasks(
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
-    pub problems: Vec<DekopondError>,
+    pub problems: Vec<GatewaydError>,
     pub warnings: Vec<CheckWarning>,
 }
 
@@ -304,11 +306,11 @@ pub async fn check(config_path: impl AsRef<Path>, catalog_path: Option<&Path>) -
         };
     report
         .problems
-        .extend(refusals.into_iter().map(DekopondError::from));
+        .extend(refusals.into_iter().map(GatewaydError::from));
     let catalog = match LocalCatalog::load(catalog_path.unwrap_or(&config.catalog_path)) {
         Ok(catalog) => catalog,
         Err(error) => {
-            report.problems.push(DekopondError::Catalog(error));
+            report.problems.push(GatewaydError::Catalog(error));
             return report;
         }
     };
@@ -843,7 +845,7 @@ async fn read_transport(
 async fn supervise_transports<F>(
     readers: &mut JoinSet<Result<(), TransportConnectProblem>>,
     shutdown: F,
-) -> Result<(), DekopondError>
+) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -851,9 +853,9 @@ where
         biased;
         () = shutdown => Ok(()),
         result = readers.join_next() => match result {
-            Some(Ok(Err(problem))) => Err(DekopondError::TransportConnect { problems: vec![problem] }),
-            Some(Err(source)) => Err(DekopondError::TransportTask(source)),
-            Some(Ok(Ok(()))) | None => Err(DekopondError::TransportsLost),
+            Some(Ok(Err(problem))) => Err(GatewaydError::TransportConnect { problems: vec![problem] }),
+            Some(Err(source)) => Err(GatewaydError::TransportTask(source)),
+            Some(Ok(Ok(()))) | None => Err(GatewaydError::TransportsLost),
         }
     }
 }
@@ -906,7 +908,7 @@ mod openrouter_startup_tests {
     }
 }
 
-fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, DekopondError> {
+fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, GatewaydError> {
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
@@ -921,7 +923,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, D
     if problems.is_empty() {
         Ok(Prepared { transports })
     } else {
-        Err(DekopondError::Startup { problems })
+        Err(GatewaydError::Startup { problems })
     }
 }
 
@@ -1018,7 +1020,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
 }
 
 #[derive(Debug, Error)]
-pub enum DekopondError {
+pub enum GatewaydError {
     #[error("gateway configuration is invalid")]
     Config(#[from] ConfigError),
     #[error("gateway agent catalog is unavailable or invalid")]

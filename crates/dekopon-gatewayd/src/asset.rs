@@ -1479,15 +1479,32 @@ mod retention_tests {
         use tracing_subscriber::prelude::*;
         let capture = dekopon_test_support::CaptureLayer::workspace();
         let _guard = tracing_subscriber::registry()
-            .with(capture.clone())
+            .with(capture.clone().with_filter(
+                tracing_subscriber::EnvFilter::try_new(crate::OTEL_TRACE_FILTER).unwrap(),
+            ))
             .set_default();
         let span = tracing::info_span!("gateway.session");
+        assert!(
+            span.metadata()
+                .unwrap()
+                .target()
+                .starts_with("dekopon_gatewayd::")
+        );
         span.in_scope(|| {
             assert_eq!(Retention::new(3).check_size(7, 4), Err(BlobError::TooLarge));
+            tracing::info!(target: "legacy_gateway::audit", "wrong audit target");
         });
         assert!(capture.records().iter().any(|record| matches!(record,
-            dekopon_test_support::Record::Event { fields, parent: Some(parent), .. }
-            if fields.contains("gateway.asset.retention_miss") && parent == "gateway.session")));
+            dekopon_test_support::Record::Event { target, fields, parent: Some(parent), .. }
+            if target == "dekopon_gatewayd::audit" && fields.contains("gateway.asset.retention_miss") && parent == "gateway.session")));
+        assert!(capture.records().iter().any(|record| matches!(
+            record,
+            dekopon_test_support::Record::Span {
+                name: "gateway.session",
+                ..
+            }
+        )));
+        assert!(!capture.events_text().contains("wrong audit target"));
         let text = capture.text();
         assert!(text.contains("gateway.asset.retention_miss"), "{text}");
         assert!(

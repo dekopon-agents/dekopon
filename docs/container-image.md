@@ -25,7 +25,7 @@ that one image with two `command`s does not.
 | Path | Contents |
 |---|---|
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
-| `/usr/local/bin/dekopond` | Unprivileged chat gateway |
+| `/usr/local/bin/dekopon-gatewayd` | Unprivileged chat gateway |
 | `/opt/dekopon/providers/*.wasm` | The checked in-tree `cli-probe` and `http-probe` fixtures only |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
@@ -206,7 +206,7 @@ rather than asserted in prose:
           5057  Dockerfile
          10847  LICENSE-APACHE
           1064  LICENSE-MIT
-       4764024  dist/amd64/dekopond
+       4764024  dist/amd64/dekopon-gatewayd
        ...
         ...  providers/http-probe-provider.wasm
 ```
@@ -223,8 +223,8 @@ mode, and content are read from outside it — which is also how the byte-identi
 ```console
 docker export "$(docker create dekopon:local unused)" > rootfs.tar
 tar -tvf rootfs.tar opt/dekopon/providers
-tar -xOf rootfs.tar usr/local/bin/dekopond | sha256sum
-sha256sum "$work/context/dist/arm64/dekopond"
+tar -xOf rootfs.tar usr/local/bin/dekopon-gatewayd | sha256sum
+sha256sum "$work/context/dist/arm64/dekopon-gatewayd"
 ```
 
 The last two must print the same digest. That is the assertion the whole design rests on, and

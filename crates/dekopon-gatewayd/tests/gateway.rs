@@ -31,7 +31,7 @@ const OTHER_MAPPED_SUBJECT: &str = "tel.16035550100";
 const UNMAPPED_SUBJECT: &str = "tel.19999999999";
 const MAPPED_PRINCIPAL: &str = "cpetersen";
 const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
-const GATEWAY_PRINCIPAL: &str = "dekopond-gateway";
+const GATEWAY_PRINCIPAL: &str = "dekopon-gatewayd";
 const AGENT: &str = "chat-agent";
 
 fn provider(name: &str) -> PathBuf {
@@ -523,7 +523,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     broker: tokio::task::JoinHandle<Result<(), dekopon_brokerd::BrokerdError>>,
     stop_broker: oneshot::Sender<()>,
-    gateway: tokio::task::JoinHandle<Result<(), dekopon_gatewayd::DekopondError>>,
+    gateway: tokio::task::JoinHandle<Result<(), dekopon_gatewayd::GatewaydError>>,
     stop_gateway: oneshot::Sender<()>,
     model_requests: Arc<AtomicUsize>,
     model_prompts: Arc<Mutex<Vec<Value>>>,
@@ -726,7 +726,7 @@ async fn boot_with(
     );
     let (endpoint, model_requests, model_prompts) =
         spawn_model(responses, timing.model_delay, timing.model_hold.clone());
-    let gateway_path = directory.path().join("dekopond.json");
+    let gateway_path = directory.path().join("dekopon-gatewayd.json");
     let mut config = gateway_config_with(
         directory.path(),
         uid,
@@ -1625,9 +1625,10 @@ impl Drop for GatewayChild {
 async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_nonzero() {
     let fixture = boot(vec![final_answer("Healthy transport answered.")]).await;
     let directory = fixture.directory.path();
-    let mut config: Value =
-        serde_json::from_slice(&fs::read(directory.join("dekopond.json")).expect("gateway config"))
-            .expect("config JSON");
+    let mut config: Value = serde_json::from_slice(
+        &fs::read(directory.join("dekopon-gatewayd.json")).expect("gateway config"),
+    )
+    .expect("config JSON");
     let healthy = directory.join("second.sock");
     let missing_parent = directory.join("not-yet-created");
     let recovering = missing_parent.join("recovering.sock");

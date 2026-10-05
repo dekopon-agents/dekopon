@@ -73,7 +73,7 @@ fn via(name: &str) -> PolicyContext {
 }
 
 fn session() -> PolicyContext {
-    via("dekopond-gateway")
+    via("dekopon-gatewayd")
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn a_direct_peer_is_refused_every_action_and_an_attested_session_meets_policy() 
         permit(principal == Dekopon::Principal::"cpetersen",
                action == Dekopon::Action::"cli-probe.upper",
                resource == Dekopon::Provider::"cli-probe")
-        when { context.via == "dekopond-gateway" };
+        when { context.via == "dekopon-gatewayd" };
 
         @id("direct-everything")
         permit(principal == Dekopon::Principal::"direct-caller", action, resource);
@@ -193,7 +193,7 @@ fn a_direct_peer_is_refused_every_action_and_an_attested_session_meets_policy() 
     );
 
     let no_agent = PolicyContext {
-        via: Some("dekopond-gateway".to_owned()),
+        via: Some("dekopon-gatewayd".to_owned()),
         ..PolicyContext::default()
     };
     for (context, why) in [
@@ -222,7 +222,7 @@ fn agent_prompt_matches_the_named_agent_only() {
         permit(principal == Dekopon::Principal::"cpetersen",
                action == Dekopon::Action::"agent.prompt",
                resource == Dekopon::Agent::"pr-summarizer-linter")
-        when { context.via == "dekopond-gateway" };
+        when { context.via == "dekopon-gatewayd" };
         "#,
         &world(),
     )
@@ -501,7 +501,7 @@ permit(
   action == Dekopon::Action::"cli-probe.upper",
   resource == Dekopon::Provider::"cli-probe"
 ) when {
-  context.via == "dekopond-gateway"
+  context.via == "dekopon-gatewayd"
   && context has conversation && ["channel", "thread"].contains(context.conversation.kind)
   && context.conversation.id == "1338356895504793623"
 };
@@ -655,7 +655,7 @@ permit(
   action == Dekopon::Action::"cli-probe.upper",
   resource == Dekopon::Provider::"cli-probe"
 ) when {
-  context.via == "dekopond-gateway"
+  context.via == "dekopon-gatewayd"
   && context has channel && context.channel == "1338356895504793623"
 };
 "#;

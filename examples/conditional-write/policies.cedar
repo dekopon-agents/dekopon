@@ -20,7 +20,7 @@
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
        resource == Dekopon::Agent::"xaviers-conditional-writer")
-when { context has via && context.via == "dekopond-gateway" };
+when { context has via && context.via == "dekopon-gatewayd" };
 
 // What that session may then reach. The two statements are independent: driving the agent implies
 // none of these capabilities, and holding these capabilities implies no session.
@@ -38,4 +38,4 @@ permit(principal == Dekopon::Principal::"cpetersen",
                   Dekopon::Action::"http-probe.conditional-write"],
        resource == Dekopon::Provider::"http-probe")
 when { context has agent && context.agent == "xaviers-conditional-writer"
-    && context has via && context.via == "dekopond-gateway" };
+    && context has via && context.via == "dekopon-gatewayd" };

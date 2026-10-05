@@ -291,7 +291,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::config::{ConfigError, ConfigProblem, DekopondConfig};
+    use crate::config::{ConfigError, ConfigProblem, GatewaydConfig};
 
     const JAIL: &str = "spiffe://homelab/ns/vm-runner/sa/vm-runner-jail";
 
@@ -334,7 +334,7 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let server_ca = issuer();
         let jail_ca = issuer();
-        let (cert, key) = leaf(&server_ca, &["dekopond.test"], None);
+        let (cert, key) = leaf(&server_ca, &["dekopon-gatewayd.test"], None);
         std::fs::write(directory.path().join("tls.crt"), cert).unwrap();
         std::fs::write(directory.path().join("tls.key"), key).unwrap();
         std::fs::write(directory.path().join("ca.crt"), jail_ca.pem()).unwrap();
@@ -348,7 +348,7 @@ mod tests {
 
     fn document(directory: &Path, proxy: &str) -> String {
         format!(
-            "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
+            "apiVersion: dekopon.dev/gatewayd/v1alpha1\n\
              catalogPath: dekopon.yaml\n\
              broker: {{ socketPath: /run/dekopon/broker.sock, serverUid: 501 }}\n\
              transports: [{{name: dev, kind: local, socketPath: dev.sock}}]\n\
@@ -368,10 +368,10 @@ mod tests {
     }
 
     fn resolved(document: &str) -> Result<crate::config::ResolvedConfig, ConfigError> {
-        let config = serde_yaml::from_str::<DekopondConfig>(document).expect("the fixture decodes");
+        let config = serde_yaml::from_str::<GatewaydConfig>(document).expect("the fixture decodes");
         crate::config::resolve(
             config,
-            PathBuf::from("/tmp/dekopond.yaml"),
+            PathBuf::from("/tmp/gatewayd.yaml"),
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
         )
@@ -452,12 +452,12 @@ mod tests {
         .unwrap();
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect("dekopond.test".try_into().unwrap(), stream)
+            .connect("dekopon-gatewayd.test".try_into().unwrap(), stream)
             .await
             .unwrap();
         tls.write_all(
             format!(
-                "POST /v1/messages HTTP/1.1\r\nhost: dekopond.test\r\nx-dekopon-vm-subject: {subject}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "POST /v1/messages HTTP/1.1\r\nhost: dekopon-gatewayd.test\r\nx-dekopon-vm-subject: {subject}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),

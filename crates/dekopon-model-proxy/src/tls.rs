@@ -382,7 +382,7 @@ mod tests {
         };
         let server_ca = Authority::new("server ca");
         let jail_ca = Authority::new("homelab ca");
-        let (cert, key) = server_ca.leaf(&["dekopond.test"], None, false);
+        let (cert, key) = server_ca.leaf(&["dekopon-gatewayd.test"], None, false);
         write(&files.cert, &cert);
         write(&files.key, &key);
         write(&files.client_ca, &jail_ca.issuer.pem());
@@ -437,10 +437,12 @@ mod tests {
         };
         let stream = tokio::net::TcpStream::connect(address).await?;
         let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect("dekopond.test".try_into().unwrap(), stream)
+            .connect("dekopon-gatewayd.test".try_into().unwrap(), stream)
             .await?;
-        tls.write_all(b"GET / HTTP/1.1\r\nhost: dekopond.test\r\nconnection: close\r\n\r\n")
-            .await?;
+        tls.write_all(
+            b"GET / HTTP/1.1\r\nhost: dekopon-gatewayd.test\r\nconnection: close\r\n\r\n",
+        )
+        .await?;
         let mut response = String::new();
         tls.read_to_string(&mut response).await?;
         Ok(response)
@@ -493,7 +495,7 @@ mod tests {
         let fixture = fixture();
         let (address, _stop) = serve(&fixture).await;
         let renewed_server_ca = Authority::new("renewed server ca");
-        let (cert, key) = renewed_server_ca.leaf(&["dekopond.test"], None, false);
+        let (cert, key) = renewed_server_ca.leaf(&["dekopon-gatewayd.test"], None, false);
         tokio::time::sleep(Duration::from_millis(20)).await;
         write(&fixture.files.cert, &cert);
         write(&fixture.files.key, &key);

@@ -17,7 +17,7 @@
 {{- $configDirs = append $configDirs (dict "dest" (printf "%s/broker.d" $cfg) "src" "/dekopon-broker-d-source" "volume" "broker-config-directory" "configMap" .Values.broker.configDirectory.configMap "owner" "$uid" "group" "$gid" "globs" "*.yaml *.cedar" "peers" .Values.broker.configDirectory.peers) -}}
 {{- end -}}
 {{- if and .Values.gateway.enabled .Values.gateway.configDirectory.configMap -}}
-{{- $configDirs = append $configDirs (dict "dest" (printf "%s/dekopond.d" $gcfg) "src" "/dekopon-gateway-d-source" "volume" "gateway-config-directory" "configMap" .Values.gateway.configDirectory.configMap "owner" "$gateway_uid" "group" "$gateway_gid" "globs" "*.yaml" "peers" false) -}}
+{{- $configDirs = append $configDirs (dict "dest" (printf "%s/gatewayd.d" $gcfg) "src" "/dekopon-gateway-d-source" "volume" "gateway-config-directory" "configMap" .Values.gateway.configDirectory.configMap "owner" "$gateway_uid" "group" "$gateway_gid" "globs" "*.yaml" "peers" false) -}}
 {{- end -}}
 {{- $sources := concat $files $seed -}}
 apiVersion: apps/v1
@@ -86,7 +86,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
-        # Turn projected-volume entries into files dekopon-brokerd and dekopond will accept.
+        # Turn projected-volume entries into files dekopon-brokerd and dekopon-gatewayd will accept.
         #
         # A Secret or ConfigMap volume is a symlink farm — key -> ..data/key -> ..timestamp/key —
         # and both daemons open configuration with O_NOFOLLOW, so a mounted key fails with ELOOP
@@ -147,7 +147,7 @@ spec:
               # 0600, owner $uid — no symlink for O_NOFOLLOW to reject, no root ownership for the
               # euid comparison to reject, no group bits for `mode & 0o077` to reject.
               {{- range $files }}
-              {{- if eq .file "dekopond.yaml" }}
+              {{- if eq .file "gatewayd.yaml" }}
               install -m 0600 -o "$gateway_uid" -g "$gateway_gid" "{{ $src }}/{{ .file }}" "{{ $gcfg }}/{{ .file }}"
               {{- else }}
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
@@ -163,8 +163,8 @@ spec:
               # it, which is exactly the property being established.
               {{- range $files }}
               {{- $dest := $cfg }}
-              {{- if eq .file "dekopond.yaml" }}{{ $dest = $gcfg }}{{- end }}
-              expected={{ if eq .file "dekopond.yaml" }}"$gateway_uid:$gateway_gid"{{ else }}"$uid:$gid"{{ end }}
+              {{- if eq .file "gatewayd.yaml" }}{{ $dest = $gcfg }}{{- end }}
+              expected={{ if eq .file "gatewayd.yaml" }}"$gateway_uid:$gateway_gid"{{ else }}"$uid:$gid"{{ end }}
               got=$(stat -c '%u:%g:%a:%h:%F' "{{ $dest }}/{{ .file }}")
               if [ "$got" != "$expected:600:1:regular file" ]; then
                 echo "{{ .file }}: got $got, want $expected:600:1:regular file" >&2
@@ -403,12 +403,12 @@ spec:
         - name: gateway
           image: {{ include "dekopon.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["dekopond"]
-          args: ["--config", "{{ $cfg }}/{{ if .Values.gateway.configDirectory.configMap }}dekopond.d{{ else }}dekopond.yaml{{ end }}"]
+          command: ["dekopon-gatewayd"]
+          args: ["--config", "{{ $cfg }}/{{ if .Values.gateway.configDirectory.configMap }}gatewayd.d{{ else }}gatewayd.yaml{{ end }}"]
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65533 "runAsGroup" 65533)) | nindent 12 }}
           env:
-            # Only used when dekopond.yaml omits broker.socketPath; naming it in the file is
+            # Only used when gatewayd.yaml omits broker.socketPath; naming it in the file is
             # clearer. Listed first so an operator entry of the same name wins.
             - name: DEKOPON_BROKER_SOCKET
               value: {{ $run }}/broker.sock
@@ -420,7 +420,7 @@ spec:
             # A chatgptSubscription model with no explicit authFile falls back to
             # $XDG_CONFIG_HOME, then $HOME — which is on the read-only root filesystem, where
             # save_credentials cannot create its temporary sibling. Naming it here means the
-            # fallback can never be reached. Naming authFile in dekopond.yaml is clearer still.
+            # fallback can never be reached. Naming authFile in gatewayd.yaml is clearer still.
             - name: DEKOPON_CHATGPT_AUTH_FILE
               value: {{ $chatgptDir }}/{{ .Values.gateway.chatgpt.fileName }}
 {{- end }}
@@ -432,7 +432,7 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
 {{- if .Values.gateway.service.enabled }}
-          # The chart cannot parse an existing dekopond.yaml. Keep this port equal to the
+          # The chart cannot parse an existing gatewayd.yaml. Keep this port equal to the
           # WhatsApp transport's non-loopback bind port or the readiness probe fails closed.
           ports:
             - name: webhook
@@ -445,7 +445,7 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
 {{- else }}
-          # Without an inbound Service, dekopond has no generic health endpoint. It probes the
+          # Without an inbound Service, dekopon-gatewayd has no generic health endpoint. It probes the
           # broker once at startup and exits non-zero when the broker does not answer.
 {{- end }}
           # No liveness probe: restarting a gateway during model work can lose an acknowledged

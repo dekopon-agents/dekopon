@@ -243,7 +243,7 @@ action performed by this chart.
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 | managed provider set | `/var/lib/dekopon/providers/` | owned `0700` dir, broker-only | the directory by the init container; the lock and the store by the operator's sync step |
-| gateway conversation journal | `gateway.journal.mountPath` (default `/var/lib/dekopond/journal`), `gateway.journal.subdir` on the claim | owned `0700` dir, gateway-only | the directory by the init container when `gateway.journal.enabled`; `0600` files by `dekopon-gatewayd`. Set `sessions.journal.path` in `gatewayd.yaml` to the mount path |
+| gateway conversation journal | `gateway.journal.mountPath` (default `/var/lib/dekopon-gatewayd/journal`), `gateway.journal.subdir` on the claim | owned `0700` dir, gateway-only | the directory by the init container when `gateway.journal.enabled`; `0600` files by `dekopon-gatewayd`. Set `sessions.journal.path` in `gatewayd.yaml` to the mount path |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
 socket never reach the node's disk. `/var/lib/dekopon` is the retained model-credential claim.
@@ -797,13 +797,13 @@ bootstrap files and the ChatGPT seed still land beside `broker.d`, and a fragmen
 path (`credentialsPath: /etc/dekopon/broker-credentials.yaml`).
 
 `broker.configDirectory.peers` (on by default) adds a chart-rendered `peers.yaml` with the pod's
-own identities: `65532` as `dekopon-probe`, `65533` as `dekopond-gateway` with `attestor: {}` when
+own identities: `65532` as `dekopon-probe`, `65533` as `dekopon-gatewayd` with `attestor: {}` when
 the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespaces:
 [<console.subject>]` when the console is enabled with a subject. A ConfigMap key named
 `peers.yaml` fails the init container while this is on.
 
 `gateway.configDirectory.configMap` does the same for dekopon-gatewayd: every `*.yaml` key lands in
-`dekopond.d`, owned by `65533`, and `gateway.config` must be empty.
+`gatewayd.d`, owned by `65533`, and `gateway.config` must be empty.
 
 The chart cannot hash a ConfigMap it did not render, so Reloader is the restart path: annotate the
 ConfigMap `reloader.stakater.com/match: "true"` and put `reloader.stakater.com/search: "true"` in

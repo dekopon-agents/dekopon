@@ -129,7 +129,7 @@ fn document(directory: &Path) -> Value {
 }
 
 fn write_config(directory: &Path, document: &Value) -> PathBuf {
-    let path = directory.join("dekopond.json");
+    let path = directory.join("dekopon-gatewayd.json");
     fs::write(
         &path,
         serde_json::to_vec(document).expect("config serializes"),
@@ -348,7 +348,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
 
 #[test]
 fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
-    let variable = "DEKOPOND_TEST_MODEL_KEY_4F1A62";
+    let variable = "DEKOPON_GATEWAYD_TEST_MODEL_KEY_4F1A62";
     let model = |api_key_env: Option<&str>| ModelConfig::OpenaiCompatible {
         name: "fast".to_owned(),
         endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
@@ -401,8 +401,8 @@ async fn slack_liveness_and_experience_are_explicit_and_strict() {
     document["transports"][0] = json!({
         "name": "workspace-slack",
         "kind": "slackSocketMode",
-        "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-        "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+        "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN",
+        "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
         "experience": "agent",
         "liveness": {"mode": "native", "classicFallback": "reaction"}
     });
@@ -495,9 +495,9 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
     document["transports"][0] = json!({
         "name": "support-whatsapp",
         "kind": "whatsappCloudApi",
-        "appSecretEnv": "DEKOPOND_WHATSAPP_APP_SECRET",
-        "verifyTokenEnv": "DEKOPOND_WHATSAPP_VERIFY_TOKEN",
-        "accessTokenEnv": "DEKOPOND_WHATSAPP_ACCESS_TOKEN",
+        "appSecretEnv": "DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET",
+        "verifyTokenEnv": "DEKOPON_GATEWAYD_WHATSAPP_VERIFY_TOKEN",
+        "accessTokenEnv": "DEKOPON_GATEWAYD_WHATSAPP_ACCESS_TOKEN",
         "bind": "127.0.0.1:9080",
         "callbackPath": "/webhooks/whatsapp",
         "wabaId": "123456",
@@ -576,7 +576,7 @@ async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
     document["transports"][0] = json!({
         "name": "community-discord",
         "kind": "discordGateway",
-        "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN"
+        "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN"
     });
     document["routes"][0]["transport"] = json!("community-discord");
     let resolved = load(directory.path(), &document)
@@ -769,32 +769,32 @@ async fn invalid_configurations_fail_closed_at_startup() {
         ),
         (
             json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
             "liveness": {"mode": "off", "classicFallback": "reaction"}}]}),
             |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
         ),
         (
             json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
             "experience": "classic", "liveness": {"mode": "native", "classicFallback": "none"}}]}),
             |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
         ),
         (
             json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
             "endpoint": "https://slack.evil.test"}]}),
             |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
         ),
         (
             json!({"/transports": [{"name": "dev", "kind": "discordGateway",
-            "botTokenEnv": "DEKOPOND_DISCORD_BOT_TOKEN", "endpoint": "https://discord.evil.test"}]}),
+            "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN", "endpoint": "https://discord.evil.test"}]}),
             |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
         ),
         // URL userinfo can make an authority read as loopback while the socket actually
         // connects elsewhere.
         (
             json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
             "endpoint": "http://127.0.0.1@slack.evil.test"}]}),
             |problem| matches!(problem, ConfigProblem::UnsupportedEndpoint { .. }),
         ),
@@ -975,9 +975,9 @@ async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
 
 #[tokio::test]
 async fn every_missing_transport_credential_is_named_before_anything_connects() {
-    const SLACK_APP_TOKEN: &str = "DEKOPOND_TEST_MISSING_SLACK_APP_4F1B02";
-    const SLACK_BOT_TOKEN: &str = "DEKOPOND_TEST_MISSING_SLACK_BOT_4F1B02";
-    const TELEGRAM_TOKEN: &str = "DEKOPOND_TEST_MISSING_TELEGRAM_BOT_4F1B02";
+    const SLACK_APP_TOKEN: &str = "DEKOPON_GATEWAYD_TEST_MISSING_SLACK_APP_4F1B02";
+    const SLACK_BOT_TOKEN: &str = "DEKOPON_GATEWAYD_TEST_MISSING_SLACK_BOT_4F1B02";
+    const TELEGRAM_TOKEN: &str = "DEKOPON_GATEWAYD_TEST_MISSING_TELEGRAM_BOT_4F1B02";
     for variable in [SLACK_APP_TOKEN, SLACK_BOT_TOKEN, TELEGRAM_TOKEN] {
         assert!(
             std::env::var_os(variable).is_none(),
@@ -1022,7 +1022,7 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
     let error = crate::run(&path, std::future::pending())
         .await
         .expect_err("two unset chat credentials are a startup refusal");
-    let crate::DekopondError::Startup { problems } = &error else {
+    let crate::GatewaydError::Startup { problems } = &error else {
         panic!("one refusal naming both transports, not the first one: {error:?}");
     };
     assert_eq!(problems.len(), 2, "{problems:?}");
@@ -1081,7 +1081,7 @@ async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause
     .await
     .expect("startup is bounded")
     .expect_err("both non-socket paths refuse transport startup");
-    let crate::DekopondError::TransportConnect { problems } = &error else {
+    let crate::GatewaydError::TransportConnect { problems } = &error else {
         panic!("expected a terminal transport refusal: {error:?}");
     };
     assert_eq!(problems.len(), 1);
@@ -1184,7 +1184,7 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
         });
     }
     peer.await.expect("peer completed");
-    let error = crate::DekopondError::TransportConnect { problems };
+    let error = crate::GatewaydError::TransportConnect { problems };
     for rendered in [
         error.to_string(),
         format!("{error:?}"),
@@ -1397,8 +1397,8 @@ async fn a_loopback_endpoint_override_is_accepted_for_tests() {
     document["transports"][0] = json!({
         "name": "dev",
         "kind": "slackSocketMode",
-        "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
-        "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
+        "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN",
+        "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
         "endpoint": "http://127.0.0.1:8080"
     });
 
@@ -1410,7 +1410,7 @@ async fn a_loopback_endpoint_override_is_accepted_for_tests() {
 #[tokio::test]
 async fn an_oversized_configuration_is_refused_before_it_is_parsed() {
     let directory = temporary();
-    let path = directory.path().join("dekopond.json");
+    let path = directory.path().join("dekopon-gatewayd.json");
     let mut document = document(directory.path());
     document["routes"][0]["agent"] = json!("reviewer");
     let padding = "p".repeat(crate::HARD_MAX_CONFIG_BYTES + 16);
@@ -1436,7 +1436,7 @@ async fn a_group_writable_configuration_is_refused() {
     // A group-writable config file lets another user redirect which agents chat messages reach, the
     // same trust violation as rewriting broker policy.
     let directory = temporary();
-    let path = directory.path().join("dekopond.json");
+    let path = directory.path().join("dekopon-gatewayd.json");
     fs::write(
         &path,
         serde_json::to_vec(&document(directory.path())).expect("config serializes"),
@@ -1455,13 +1455,13 @@ async fn a_group_writable_configuration_is_refused() {
 
 #[test]
 fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
-    let mut document = serde_json::from_value::<crate::DekopondConfig>(document(Path::new("/tmp")))
+    let mut document = serde_json::from_value::<crate::GatewaydConfig>(document(Path::new("/tmp")))
         .expect("fixture decodes");
     document.broker.socket_path = None;
 
     let resolved = config::resolve(
         document,
-        PathBuf::from("/tmp/dekopond.json"),
+        PathBuf::from("/tmp/dekopon-gatewayd.json"),
         &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/1000")), None),
         501,
     )
@@ -1799,17 +1799,17 @@ fn a_long_answer_keeps_its_beginning_and_its_conclusion() {
 #[test]
 fn an_exported_but_blank_credential_is_refused_by_name() {
     for blank in ["", " ", "\n\t "] {
-        let error = credential_value("DEKOPOND_WHATSAPP_APP_SECRET", blank.to_owned())
+        let error = credential_value("DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET", blank.to_owned())
             .expect_err("a blank credential is the absence of one");
         assert!(
             matches!(&error, TransportError::EmptyCredential { name }
-                if name == "DEKOPOND_WHATSAPP_APP_SECRET"),
+                if name == "DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET"),
             "{error:?}"
         );
         assert_eq!(error.category(), "empty-credential");
     }
     assert_eq!(
-        credential_value("DEKOPOND_WHATSAPP_APP_SECRET", " token ".to_owned())
+        credential_value("DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET", " token ".to_owned())
             .expect("a credential with surrounding space is still a credential"),
         " token "
     );
@@ -13618,7 +13618,7 @@ async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
     assert_eq!(outcome, crate::ServeOutcome::Shutdown);
     assert!(matches!(
         terminal,
-        Err(crate::DekopondError::TransportConnect { .. })
+        Err(crate::GatewaydError::TransportConnect { .. })
     ));
     assert!(started.elapsed() >= Duration::from_millis(50));
     assert!(
@@ -14083,9 +14083,9 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
 #[tokio::test]
 async fn a_configuration_directory_keeps_each_route_with_its_transport() {
     let root = temporary();
-    let fragments = root.path().join("dekopond.d");
-    fs::create_dir(&fragments).expect("create dekopond.d");
-    fs::set_permissions(&fragments, fs::Permissions::from_mode(0o700)).expect("private dekopond.d");
+    let fragments = root.path().join("gatewayd.d");
+    fs::create_dir(&fragments).expect("create gatewayd.d");
+    fs::set_permissions(&fragments, fs::Permissions::from_mode(0o700)).expect("private gatewayd.d");
     let whole = document(root.path());
     let write = |name: &str, keys: &[&str]| {
         let mut fragment = json!({"apiVersion": config::CONFIG_API_VERSION});
@@ -14119,9 +14119,9 @@ async fn a_configuration_directory_keeps_each_route_with_its_transport() {
 }
 
 fn check_fixture(root: &Path, agent: &str, fragments: &[(&str, Value)]) -> PathBuf {
-    let directory = root.join("dekopond.d");
-    fs::create_dir(&directory).expect("create dekopond.d");
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("private dekopond.d");
+    let directory = root.join("gatewayd.d");
+    fs::create_dir(&directory).expect("create gatewayd.d");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("private gatewayd.d");
     fs::write(
         root.join("dekopon.yaml"),
         catalog_text(true, Some("reasoning")),
@@ -14131,7 +14131,7 @@ fn check_fixture(root: &Path, agent: &str, fragments: &[(&str, Value)]) -> PathB
     let mut chat = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "transports": [
-            { "name": "chat", "kind": "discordGateway", "botTokenEnv": "DEKOPOND_CHECK_NEVER_SET" }
+            { "name": "chat", "kind": "discordGateway", "botTokenEnv": "DEKOPON_GATEWAYD_CHECK_NEVER_SET" }
         ],
         "routes": [
             { "transport": "chat", "conversation": { "kind": ["directMessage"] }, "agent": agent }
@@ -14173,7 +14173,7 @@ async fn check_passes_a_directory_whose_transport_token_variable_is_unset() {
     assert!(report.warnings.iter().any(|warning| matches!(
         warning,
         crate::CheckWarning::TransportCredential { transport, variable }
-            if transport == "chat" && variable == "DEKOPOND_CHECK_NEVER_SET"
+            if transport == "chat" && variable == "DEKOPON_GATEWAYD_CHECK_NEVER_SET"
     )));
 }
 
@@ -14193,13 +14193,13 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
 
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
-        crate::DekopondError::Config(ConfigError::Fragments(
+        crate::GatewaydError::Config(ConfigError::Fragments(
             dekopon_core::fragments::FragmentError::Conflicts { conflicts }
         )) if conflicts.iter().any(|conflict| conflict.key == "catalogPath")
     )));
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
-        crate::DekopondError::Route(RouteError { problems })
+        crate::GatewaydError::Route(RouteError { problems })
             if problems.iter().any(|problem| matches!(
                 problem,
                 RouteProblem::UnknownAgent { agent } if agent == "nobody"

@@ -1,12 +1,12 @@
-# dekopond — the unprivileged half. It hears the question and asks the model; it decides nothing.
+# dekopon-gatewayd — the unprivileged half. It hears the question and asks the model; it decides nothing.
 #
 # It holds a Slack app token, a Slack bot token, and a model endpoint. It holds no provider
 # credential, no policy, and no authorization. Every capability call a session makes is submitted
 # to the broker as an on-behalf-of proposal naming the sender's canonical subject, and the broker
 # alone turns that subject into a principal.
 #
-# chmod 0600 dekopond.yaml. Relative paths resolve against this file's own directory.
-apiVersion: dekopon.dev/dekopond/v1alpha1
+# chmod 0600 gatewayd.yaml. Relative paths resolve against this file's own directory.
+apiVersion: dekopon.dev/gatewayd/v1alpha1
 
 catalogPath: dekopon.yaml
 
@@ -24,8 +24,8 @@ transports:
     # Environment variable NAMES, never values. Pasting a token here is a startup failure, and a
     # missing variable is reported by name. See ../slack/README.md for creating the app and both
     # tokens.
-    appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
-    botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+    appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
+    botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
     # This example uses examples/slack/manifest-agent.yaml. Agent DMs are thread-scoped; if the
     # workspace plan/admin disables Agent status, the fixed tangerine reaction is used instead.
     experience: agent
@@ -102,5 +102,5 @@ metering:
 # telemetry:
 #   endpoint: http://127.0.0.1:5080/api/default
 #   transport: http
-#   serviceName: dekopond
+#   serviceName: dekopon-gatewayd
 #   exportTimeoutMs: 10000

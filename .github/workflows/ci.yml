@@ -547,7 +547,7 @@ jobs:
           helm template dekopon charts/dekopon \
             -f charts/dekopon/ci/values-config-directory.yaml > "$RUNNER_TEMP/config-directory.yaml"
           grep -q -- '"--config", "/etc/dekopon/broker.d"' "$RUNNER_TEMP/config-directory.yaml"
-          grep -q -- '"--config", "/etc/dekopon/dekopond.d"' "$RUNNER_TEMP/config-directory.yaml"
+          grep -q -- '"--config", "/etc/dekopon/gatewayd.d"' "$RUNNER_TEMP/config-directory.yaml"
           grep -q 'namespaces: \["discord.1"\]' "$RUNNER_TEMP/config-directory.yaml"
           if helm template dekopon charts/dekopon -f charts/dekopon/ci/values-config-directory.yaml \
             --set broker.config.inline=x > /dev/null 2> "$RUNNER_TEMP/config-directory.err"; then

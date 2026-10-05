@@ -21,7 +21,7 @@ version: 0.22.0
 appVersion: "0.33.0"
 
 # The broker is a sidecar container (an initContainer with restartPolicy: Always) so it is
-# started and probed before dekopond runs, and torn down after it. Native sidecars are beta and
+# started and probed before dekopon-gatewayd runs, and torn down after it. Native sidecars are beta and
 # enabled by default from 1.29 and stable from 1.33. Below 1.29 the field is silently dropped and
 # the pod deadlocks on an init container that never exits, so refuse to install instead.
 kubeVersion: ">=1.29.0-0"

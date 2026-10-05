@@ -9,7 +9,7 @@ broker:
 gateway:
   enabled: true
   configDirectory:
-    configMap: dekopon-dekopond-d
+    configMap: dekopon-gatewayd-d
   catalog:
     existingConfigMap: dekopon-agents
     existingConfigMapKey: dekopon.yaml

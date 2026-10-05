@@ -26,7 +26,7 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 ## Check a configuration
 
 ```console
-dekopon-gatewayd check dekopond.d --catalog agents.d
+dekopon-gatewayd check gatewayd.d --catalog agents.d
 dekopon-gatewayd check gatewayd.yaml --output json
 ```
 
@@ -43,7 +43,7 @@ constructors run only at boot.
 ## Configuration
 
 ```yaml
-apiVersion: dekopon.dev/dekopond/v1alpha1
+apiVersion: dekopon.dev/gatewayd/v1alpha1
 catalogPath: /path/to/dekopon.yaml            # dekopon-config catalog with the agents routes name
 
 broker:                                       # optional; every field defaults
@@ -55,8 +55,8 @@ broker:                                       # optional; every field defaults
 transports:
   - name: scientist-slack
     kind: slackSocketMode
-    appTokenEnv: DEKOPOND_SLACK_APP_TOKEN     # environment variable NAMES only
-    botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
+    appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN     # environment variable NAMES only
+    botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
     endpoint: https://slack.com               # optional, tests only: the pinned origin or a literal loopback http:// URL
     experience: agent                         # optional: classic (default) | agent
     liveness:                                 # optional; absent means off
@@ -76,19 +76,19 @@ transports:
         failed: "The agent could not complete this request."
   - name: community-discord
     kind: discordGateway
-    botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
+    botTokenEnv: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
     liveness: { mode: native, progress: message, cancelButton: true }
   - name: tg
     kind: telegramLongPoll
-    botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
+    botTokenEnv: DEKOPON_GATEWAYD_TELEGRAM_TOKEN
     liveness: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
     debounceMs: 5000                      # quiet interval; 0 bypasses collection
     debounceMaxWaitMs: 15000               # maximum from first media receipt
-    appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
-    verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
-    accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
+    appSecretEnv: DEKOPON_GATEWAYD_WHATSAPP_APP_SECRET
+    verifyTokenEnv: DEKOPON_GATEWAYD_WHATSAPP_VERIFY_TOKEN
+    accessTokenEnv: DEKOPON_GATEWAYD_WHATSAPP_ACCESS_TOKEN
     bind: 0.0.0.0:9080                     # pod bind; expose only through exact-path TLS ingress
     callbackPath: /webhooks/whatsapp
     wabaId: "123456789"
@@ -97,7 +97,7 @@ transports:
     liveness: { mode: native }             # typing only: WhatsApp cannot edit a message
   - name: dev
     kind: local
-    socketPath: /path/to/dekopond-dev.sock
+    socketPath: /path/to/gatewayd-dev.sock
     liveness: { mode: native, progress: message, stream: true, cancelButton: true }
 
 stopWords: [stop, cancel]                     # optional, default shown; see Stopping a run
@@ -176,9 +176,9 @@ sessions:
   maxConversations: 1024                      # optional, default 1024 tracked
   assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
   journal:                                    # optional; absent, no conversation text is written to disk
-    path: /var/lib/dekopond/journal           # relative paths resolve against this file; files idle past the longest journal-route forgetAfterMs are deleted
+    path: /var/lib/dekopon-gatewayd/journal           # relative paths resolve against this file; files idle past the longest journal-route forgetAfterMs are deleted
   wakes:                                      # optional; absent, no route may schedule a wake
-    path: /var/lib/dekopond/wakes.jsonl       # relative paths resolve against this file
+    path: /var/lib/dekopon-gatewayd/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
     minIntervalMs: 300000                     # optional, default 5 minutes between watch checks; must exceed scriptTimeoutMs
     maxHorizonMs: 2592000000                  # optional, default 30 days
@@ -785,7 +785,7 @@ the project-wide list is [non-goals](design.md#non-goals). See
 An owner-only (`0600`) Unix socket under a private parent directory, with `dekopon-brokerd`'s socket hygiene: the parent must be an owner-owned directory with no group or world access, an existing socket is replaced only if it is already private and single-link, and the guard removes only the exact inode it created. Line-delimited JSON in, line-delimited JSON out on the same connection:
 
 ```console
-$ nc -U /path/to/dekopond-dev.sock
+$ nc -U /path/to/gatewayd-dev.sock
 {"subject": "tel.16034700182", "conversation": {"kind": "channel", "id": "ops"}, "text": "what changed today?"}
 {"reply": "Nothing external. Two read-only capability calls."}
 ```

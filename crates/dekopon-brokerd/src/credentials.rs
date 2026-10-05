@@ -448,7 +448,7 @@ impl ChatGptSubscriptionCredential {
                 path = %self.credential.path().display(),
                 category = category,
                 error = %error_chain(error),
-                "the ChatGPT subscription credential must be renewed with `dekopond auth chatgpt \
+                "the ChatGPT subscription credential must be renewed with `dekopon-gatewayd auth chatgpt \
                  login --auth-file`"
             );
             CredentialRefreshError::ReauthorizationRequired
