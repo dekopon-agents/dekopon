@@ -61,7 +61,7 @@ The gateway also accepts a public HTTPS path after an external Cloudflare Tunnel
 
 The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary): distinct gateway and broker UIDs, private mounts, and only group-reachable IPC.
 
-A model-facing tool call is only a proposal. The daemon-to-broker request carries that proposal, not trusted identity context or an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`, creating and consuming that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopon-gatewayd` never receives or presents serialized authorization state as a bearer grant, and agent code never receives a raw provider credential. Its complete contract is in [`gatewayd.md](gatewayd.md).
+A model-facing tool call is only a proposal. The daemon-to-broker request carries that proposal, not trusted identity context or an `AuthorizedInvocation`. The broker owns the authority transition from `ProposedInvocation` to `AuthorizedInvocation`, creating and consuming that state inside the broker-owned execution boundary while evaluating policy, attaching constraints, invoking a provider, and recording evidence. `dekopon-gatewayd` never receives or presents serialized authorization state as a bearer grant, and agent code never receives a raw provider credential. Its complete contract is in [`gatewayd.md`](gatewayd.md).
 
 ## Shared host helpers and privileged provider authority
 

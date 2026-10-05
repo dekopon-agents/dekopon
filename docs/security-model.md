@@ -185,7 +185,7 @@ The WhatsApp transport adds one public wakeup surface to the unprivileged daemon
 
 Being public also makes the daemon's own telemetry an attacker-reachable resource, which no other transport's is. Refused requests are reported per reason once a minute with the count they stand for rather than once each, so a stranger cannot turn a wrong signature into unbounded volume in a shared log sink, and a genuinely wrong app secret is one obvious line. A refusal never records the body, the headers, the sender, or the message ID it refused.
 
-The [current local process boundary](#current-local-process-boundary) applies to every transport. See [`gatewayd.md](gatewayd.md) for the complete gateway contract.
+The [current local process boundary](#current-local-process-boundary) applies to every transport. See [`gatewayd.md`](gatewayd.md) for the complete gateway contract.
 
 ## Conversation memory as a trust surface
 

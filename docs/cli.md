@@ -3,7 +3,7 @@
 `dekopon-gatewayd auth chatgpt {login,status,logout,export}` manages Dekopon's isolated model credential.
 It dispatches synchronously before gateway configuration discovery, telemetry, runtime creation,
 or transport startup. `--config` is required only for ordinary gateway serving and is ignored by auth.
-Daemon serving is documented in [`gatewayd.md](gatewayd.md).
+Daemon serving is documented in [`gatewayd.md`](gatewayd.md).
 
 ## Commands
 

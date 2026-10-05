@@ -142,7 +142,7 @@ What consumes a loaded skill:
   that route: a second system message after `instructions` lists each skill by name and
   description, and the `read_skill` tool returns a skill's body, or one resource's text, when the
   model asks. Bodies and resources are never in a prompt until read; each read is recorded as
-  `agent.skill.read`. See [`gatewayd.md](gatewayd.md#sessions) and
+  `agent.skill.read`. See [`gatewayd.md`](gatewayd.md#sessions) and
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text.
@@ -171,7 +171,7 @@ It is optional for an unrouted agent or a route with an explicit model. Gateway
 
 Failing at startup rather than per-session is the point: a catalog typo here is one refused boot, not
 an agent that appears configured and answers nobody. See
-[`gatewayd.md](gatewayd.md#configuration) for the model list and route syntax.
+[`gatewayd.md`](gatewayd.md#configuration) for the model list and route syntax.
 
 ## Reserved and inert fields
 
@@ -232,7 +232,7 @@ a catalog that disagrees with it produces no error here and no error there.
 ## Related documents
 
 - [`cli.md`](cli.md) — model-auth formats and exit codes.
-- [`gatewayd.md](gatewayd.md) — routes, model endpoints, sessions, and conversations; the consumer
+- [`gatewayd.md`](gatewayd.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`improvement.md`](improvement.md) — catalog-mounted skills and suggestions.
 - [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries) —
