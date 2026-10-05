@@ -102,7 +102,6 @@ jobs:
             tag="$REQUESTED_TAG"
             push=true
           else
-            # PR image identity requires archives with the renamed gateway binary; tag jobs use their own release.
             tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             push=false
           fi
@@ -111,19 +110,6 @@ jobs:
             exit 1
           fi
           stage_image=true
-          if [ "$push" = false ]; then
-            # Fail closed on an unknown release label rather than silently waive image proof.
-            if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "::error::unexpected published release tag: $tag"
-              exit 1
-            fi
-            major=$((10#${BASH_REMATCH[1]}))
-            minor=$((10#${BASH_REMATCH[2]}))
-            if (( major == 0 && minor < 34 )); then
-              stage_image=false
-              echo "::notice::latest release $tag predates dekopon-gatewayd; image identity is proven by the v0.34.0 tag run"
-            fi
-          fi
           {
             echo "tag=$tag"
             echo "push=$push"
