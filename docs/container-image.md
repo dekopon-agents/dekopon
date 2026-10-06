@@ -174,8 +174,23 @@ The publication job grants `artifact-metadata: write` so the attestation action 
 OCI digest from the organization's **Linked Artifacts** view. This records the already-published
 subject; it does not grant another registry write path.
 
-Only the release tag is published. There is no `latest`: release tags are immutable here, a moving
-pointer would contradict that, and it would let a prerelease become the default pull.
+Each release publishes two tags in the same GHCR repository:
+
+- `<tag>` uses crates.io Wasmtime and retains the normal release behavior
+- `<tag>-wasmtime-optimization` uses the pinned memory-optimized Wasmtime source
+
+Both tags contain `linux/amd64` and `linux/arm64`; neither writes `latest` or changes a deployment.
+Optimized builds and publication run in separate jobs: their failure remains visible in Actions
+but does not block the stock release, stock GHCR image, Homebrew, or crates.io publication.
+The optimized tag uses the separately checksummed and attested
+`dekopon-wasmtime-optimization-<version>-<target>.tar.gz` Linux archives. The stock archives,
+Homebrew formula, macOS build, and crates.io publication keep their existing source selection.
+Image staging selects one archive prefix, and both variants undergo the same byte-identity,
+provider-ownership, broker-load, and provenance checks. Manual image recovery selects the
+`stock` or `wasmtime-optimization` workflow input and requires the corresponding release assets.
+
+To roll back an optimized deployment, select the stock `<tag>` image. See
+[the local opt-in build](development.md#memory-optimized-wasmtime) for source builds.
 
 Pull requests that touch the image inputs — the `Dockerfile`, `.dockerignore`, either provider
 fetch/staging script, the workflow, a licence, or a repository-owned component — run every step
@@ -229,3 +244,9 @@ sha256sum "$work/context/dist/arm64/dekopon-gatewayd"
 
 The last two must print the same digest. That is the assertion the whole design rests on, and
 `$work/binaries.sha256` records all four so the workflow can make it after the build.
+
+To assemble the optimized image from a release that includes its archives:
+
+```console
+ci/stage-image-context.sh v0.34.0 "$work" wasmtime-optimization
+```

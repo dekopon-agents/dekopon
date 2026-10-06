@@ -45,12 +45,22 @@ on:
         description: Published release tag to package (for example v0.4.0)
         required: true
         type: string
+      variant:
+        required: false
+        default: stock
+        type: string
   workflow_dispatch:
     inputs:
       tag:
         description: Existing release tag (for example v0.3.0)
         required: true
         type: string
+      variant:
+        description: Wasmtime source variant
+        required: true
+        default: stock
+        type: choice
+        options: [stock, wasmtime-optimization]
   pull_request:
     paths:
       - ".dockerignore"
@@ -70,7 +80,7 @@ concurrency:
   # and the event is `push`, so a called run never cancels itself. The group is also distinct
   # from `release.yml`'s `release-<tag>`, which matters — a called workflow that queued behind
   # its own caller's concurrency group would wait for a job that is waiting for it.
-  group: container-image-${{ github.ref }}
+  group: container-image-${{ github.ref }}-${{ inputs.variant || 'stock' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -92,6 +102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
+          VARIANT: ${{ inputs.variant || 'stock' }}
         run: |
           set -euo pipefail
           # The presence of the input, not `github.event_name`: under `workflow_call` the github
@@ -109,9 +120,16 @@ jobs:
             echo "::error::could not resolve a release tag to package"
             exit 1
           fi
+          case "$VARIANT" in
+            stock) image_tag="$tag" ;;
+            wasmtime-optimization) image_tag="$tag-wasmtime-optimization" ;;
+            *) echo "::error::unsupported image variant: $VARIANT"; exit 1 ;;
+          esac
           stage_image=true
           {
             echo "tag=$tag"
+            echo "image_tag=$image_tag"
+            echo "variant=$VARIANT"
             echo "push=$push"
             echo "stage_image=$stage_image"
             # ghcr.io/dekopon-agents/dekopon. Derived rather than hardcoded so a fork or a rename
@@ -151,6 +169,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.plan.outputs.tag }}
+          VARIANT: ${{ steps.plan.outputs.variant }}
         run: |
           set -euo pipefail
           # One script, run identically here and by a human building locally: it downloads the
@@ -161,7 +180,11 @@ jobs:
           work="$RUNNER_TEMP/image"
           rm -rf "$work"
           mkdir -p "$work"
-          ci/stage-image-context.sh "$TAG" "$work"
+          if [ "$VARIANT" = stock ]; then
+            ci/stage-image-context.sh "$TAG" "$work"
+          else
+            ci/stage-image-context.sh "$TAG" "$work" "$VARIANT"
+          fi
           {
             echo "work=$work"
             echo "context=$work/context"
@@ -269,15 +292,14 @@ jobs:
           # from the proof builds above, so this pushes what was just verified.
           platforms: linux/amd64,linux/arm64
           push: true
-          # Only the release tag. There is no `latest`: release tags are immutable here, a moving
-          # pointer would contradict that, and it would let a prerelease become the default pull.
-          tags: ${{ steps.plan.outputs.image }}:${{ steps.plan.outputs.tag }}
+          tags: ${{ steps.plan.outputs.image }}:${{ steps.plan.outputs.image_tag }}
           # Nothing has to flatten this index, so buildx can attach its own provenance and SBOM.
           provenance: mode=max
           sbom: true
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.plan.outputs.tag }}
+            org.opencontainers.image.version=${{ steps.plan.outputs.image_tag }}
+            io.dekopon.wasmtime.variant=${{ steps.plan.outputs.variant }}
 
       - name: Verify the published tag
         id: published
@@ -285,7 +307,7 @@ jobs:
         shell: bash
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
-          TAG: ${{ steps.plan.outputs.tag }}
+          TAG: ${{ steps.plan.outputs.image_tag }}
           BUILD_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           set -euo pipefail

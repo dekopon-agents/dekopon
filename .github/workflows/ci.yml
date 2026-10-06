@@ -230,6 +230,36 @@ jobs:
       - name: Test broker-host component boundaries
         run: cargo test -p dekopon-broker-host --test host --all-features --locked
 
+  wasmtime_optimization:
+    name: Wasmtime optimization (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Select the optimized dependency lock
+        run: cp .cargo/wasmtime-optimization.lock Cargo.lock
+      - name: Verify the pinned Wasmtime source
+        shell: bash
+        run: |
+          set -euo pipefail
+          spec=$(python3 -c 'import tomllib; p = tomllib.load(open(".cargo/wasmtime-optimization.toml", "rb"))["patch"]["crates-io"]["wasmtime"]; print("git+" + p["git"] + "?rev=" + p["rev"] + "#wasmtime")')
+          cargo --config .cargo/wasmtime-optimization.toml tree --locked -p "$spec"
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      - name: Test optimized broker and component host
+        run: cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
+      - name: Build optimized release CLIs
+        run: cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+
   # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
   # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
   # undocumented audit event. The audit gate reads crates/**/*.rs, which is why every
@@ -371,9 +401,11 @@ jobs:
         run: python3 .github/scripts/test_verify_release_metadata.py
       - name: Test Homebrew formula rendering
         run: python3 .github/scripts/test_render_homebrew_formula.py
+      - name: Test image variant staging
+        run: python3 .github/scripts/test_stage_image_context.py
       - name: Check package shell scripts
         if: ${{ needs.changes.outputs.run_package != 'false' }}
-        run: shellcheck .github/scripts/prepare-package-cache.sh
+        run: shellcheck .github/scripts/prepare-package-cache.sh ci/stage-image-context.sh
       - name: Install Rust
         run: rustup toolchain install
       # Package verification recompiles unpacked sources under target/package, so its paths do not
