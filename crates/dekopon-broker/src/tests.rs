@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker_host::BrokerHostError;
 use dekopon_broker_host::BrokerHostLimits;
@@ -13,11 +13,76 @@ use dekopon_core::{
 
 use super::{
     AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
-    AuthorityEncoder, CapabilityRoute, ChatMemoryConfig, ConstraintSet, ContextError,
-    InMemoryAuditLog, encode_capability_authority, encode_execution_constraints,
+    AuthorityEncoder, Broker, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ConstraintCatalog,
+    ConstraintSet, ContextError, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    PolicyEngine, PolicyWorld, encode_capability_authority, encode_execution_constraints,
     encode_host_limits, encode_memory_config, encode_storage_limits, provider_exit_status,
     provider_failure_detail, public_host_error,
 };
+
+#[tokio::test]
+async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
+    async fn broker() -> Broker<InMemoryAuditLog> {
+        let registry = dekopon_broker_host::BrokerProviderRegistry::load(
+            [dekopon_test_support::provider_fixture(
+                "cli-probe-provider.wasm",
+            )],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("fixture");
+        let world = PolicyWorld::new(
+            ["peer".parse().expect("principal")],
+            registry
+                .capabilities()
+                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        )
+        .expect("world");
+        Broker::new(
+            registry,
+            "broker".parse().expect("principal"),
+            "smoke-policy".to_owned(),
+            PolicyEngine::new("", &world).expect("policy"),
+            ConstraintCatalog::new([]).expect("constraints"),
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
+            Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+            BrokerLimits::default(),
+        )
+        .expect("broker")
+    }
+    let first = broker().await;
+    let second = broker().await;
+    let via = "peer".parse().expect("via");
+    let subject = "slack.t0123abc.u9xyz".parse().expect("subject");
+    let agent = "reviewer".parse().expect("agent");
+    let digest = first.console_smoke_conversation(&via, &subject, &agent);
+    assert!(digest.starts_with("smoke-") && digest.len() == 70);
+    assert_eq!(
+        digest,
+        first.console_smoke_conversation(&via, &subject, &agent)
+    );
+    assert_ne!(
+        digest,
+        second.console_smoke_conversation(&via, &subject, &agent)
+    );
+    assert_ne!(
+        digest,
+        first.console_smoke_conversation(&"other".parse().expect("via"), &subject, &agent)
+    );
+    assert_ne!(
+        digest,
+        first.console_smoke_conversation(
+            &via,
+            &"slack.t0123abc.uother".parse().expect("subject"),
+            &agent,
+        )
+    );
+    assert_ne!(
+        digest,
+        first.console_smoke_conversation(&via, &subject, &"other".parse().expect("agent"))
+    );
+}
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {

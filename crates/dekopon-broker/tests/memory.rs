@@ -11,7 +11,9 @@ use dekopon_broker::{
 };
 
 use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
+use dekopon_broker_protocol::{
+    ChatScopeClaim, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
+};
 use dekopon_capability::{
     EffectKind, HttpConstraints, InvocationOutcome, StorageAccess, StorageConstraints,
     StorageInterface, StorageScope,
@@ -191,6 +193,298 @@ fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     }
+}
+
+fn local_claim(transport: &str, conversation: &str) -> Attestation {
+    Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "reviewer".parse().expect("agent"),
+        ChatScopeClaim {
+            transport: transport.parse().expect("transport"),
+            kind: ChatTransportKind::Local,
+            conversation: Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: None,
+                id: conversation.to_owned(),
+                thread: None,
+            },
+            trigger: dekopon_broker::Trigger::Message,
+        },
+    )
+}
+
+async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog> {
+    let storage = StorageHost::open(root, StorageLimits::default()).expect("storage");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixture/memory-smoke-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("three-route fixture");
+    let world = PolicyWorld::new(
+        [
+            "gateway".parse().expect("gateway"),
+            "maintainer".parse().expect("maintainer"),
+        ],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    let policy = PolicyEngine::new(
+        r#"@id("prompt") permit(principal == Dekopon::Principal::"maintainer",
+            action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"reviewer")
+            when { context.via == "gateway" };
+            @id("record") permit(principal == Dekopon::Principal::"maintainer",
+            action == Dekopon::Action::"memory.chat.record", resource == Dekopon::Provider::"memory")
+            when { context.via == "gateway" && context.agent == "reviewer" };
+            @id("recent") permit(principal == Dekopon::Principal::"maintainer",
+            action == Dekopon::Action::"memory.chat.recent", resource == Dekopon::Provider::"memory")
+            when { context.via == "gateway" && context.agent == "reviewer" };
+            @id("search") permit(principal == Dekopon::Principal::"maintainer",
+            action == Dekopon::Action::"memory.chat.search", resource == Dekopon::Provider::"memory")
+            when { context.via == "gateway" && context.agent == "reviewer" };"#,
+        &world,
+    ).expect("policy");
+    let constraints = ConstraintCatalog::new(
+        [
+            (
+                "memory.chat.record",
+                CapabilityRoute::ChatMemoryRecord,
+                EffectKind::LocalWrite,
+                RiskLevel::Medium,
+                StorageAccess::ReadWrite,
+            ),
+            (
+                "memory.chat.recent",
+                CapabilityRoute::ChatMemoryRecent,
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                StorageAccess::ReadOnly,
+            ),
+            (
+                "memory.chat.search",
+                CapabilityRoute::ChatMemorySearch,
+                EffectKind::ReadOnly,
+                RiskLevel::High,
+                StorageAccess::ReadOnly,
+            ),
+        ]
+        .map(|(name, route, effect, risk, access)| {
+            (
+                name.parse().expect("capability"),
+                ConstraintSet {
+                    provider: "memory".parse().expect("provider"),
+                    ..memory_constraint(route, effect, risk, access)
+                },
+            )
+        }),
+    )
+    .expect("constraints");
+    Broker::new(
+        registry,
+        "broker".parse().expect("broker"),
+        "smoke-memory-policy".to_owned(),
+        policy,
+        constraints,
+        CredentialStore::empty(),
+        IdentityDirectory::new([(
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        )])
+        .expect("directory"),
+        Arc::new(InMemoryAuditLog::new(64).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_chat_memory(memory_config())
+    .expect("exactly three routes")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one record/read/isolation scenario")]
+async fn smoke_record_rebuilds_local_delivery_and_ordinary_command_reads_only_derived_namespace() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let directory = temp.path().canonicalize().expect("canonical tempdir");
+    let broker = smoke_memory_broker(&directory.join("storage")).await;
+    let peer = gateway();
+    let grant = attestor_grant();
+    let smoke = local_claim("console-smoke", "console-smoke");
+    let real = local_claim("local-dev", "real-session");
+    let delivery = |transport: &str, conversation: &str, sequence| DeliveryIdentity::Local {
+        transport: transport.parse().expect("transport"),
+        conversation: conversation.to_owned(),
+        boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        connection: 1,
+        sequence,
+    };
+    let record = |id: &str, delivery, marker: &str| {
+        let id = id.parse::<InvocationId>().expect("id");
+        DeliveredTurnRequest::new(
+            id,
+            TRACE_PARENT.parse().expect("trace"),
+            delivery,
+            marker.to_owned(),
+            DeliveredAnswer::accepted_by_transport("assistant".to_owned()),
+        )
+    };
+    let recorded = broker
+        .record_delivered_turn(
+            &peer,
+            Some(&grant),
+            &smoke.bound_to("smoke-record".parse().expect("id")),
+            record(
+                "smoke-record",
+                delivery("local-dev", "real-session", 1),
+                "synthetic-marker",
+            ),
+        )
+        .await
+        .expect("record accounted");
+    assert_eq!(
+        recorded.outcome,
+        InvocationOutcome::Succeeded,
+        "{recorded:?}"
+    );
+    let no_grant = broker
+        .record_delivered_turn(
+            &peer,
+            None,
+            &smoke.bound_to("smoke-no-grant".parse().expect("id")),
+            record(
+                "smoke-no-grant",
+                delivery("other", "untrusted", 4),
+                "must-not-record",
+            ),
+        )
+        .await
+        .expect("grant refusal accounted");
+    assert_eq!(no_grant.outcome, InvocationOutcome::Denied);
+    let mut malformed = smoke.clone();
+    malformed.scope.as_mut().expect("scope").conversation.id = "real-session".to_owned();
+    let malformed = broker
+        .record_delivered_turn(
+            &peer,
+            Some(&grant),
+            &malformed.bound_to("smoke-malformed".parse().expect("id")),
+            record(
+                "smoke-malformed",
+                delivery("local-dev", "real-session", 5),
+                "must-not-record",
+            ),
+        )
+        .await
+        .expect("malformed smoke claim accounted");
+    assert_eq!(malformed.outcome, InvocationOutcome::Denied);
+    let nonlocal = broker
+        .record_delivered_turn(
+            &peer,
+            Some(&grant),
+            &smoke.bound_to("smoke-nonlocal".parse().expect("id")),
+            record(
+                "smoke-nonlocal",
+                DeliveryIdentity::Discord {
+                    channel: "123".to_owned(),
+                    message: "456".to_owned(),
+                },
+                "must-not-record",
+            ),
+        )
+        .await
+        .expect("nonlocal delivery accounted");
+    assert_eq!(nonlocal.outcome, InvocationOutcome::Denied);
+    assert_eq!(nonlocal.error.as_deref(), Some("invalid-turn"));
+    let real_recorded = broker
+        .record_delivered_turn(
+            &peer,
+            Some(&grant),
+            &real.bound_to("real-record".parse().expect("id")),
+            record(
+                "real-record",
+                delivery("local-dev", "real-session", 1),
+                "real-marker",
+            ),
+        )
+        .await
+        .expect("real record accounted");
+    assert_eq!(
+        real_recorded.outcome,
+        InvocationOutcome::Succeeded,
+        "{real_recorded:?}"
+    );
+    let mismatch = broker
+        .record_delivered_turn(
+            &peer,
+            Some(&grant),
+            &real.bound_to("real-mismatch".parse().expect("id")),
+            record(
+                "real-mismatch",
+                delivery("other", "real-session", 3),
+                "must-not-record",
+            ),
+        )
+        .await
+        .expect("invalid turn accounted");
+    assert_eq!(mismatch.outcome, InvocationOutcome::Denied);
+    assert_eq!(mismatch.error.as_deref(), Some("invalid-turn"));
+
+    let mut record_ids = Vec::new();
+    for (claim, expected, absent) in [
+        (&smoke, "synthetic-marker", "real-marker"),
+        (&real, "real-marker", "synthetic-marker"),
+    ] {
+        let command = broker
+            .run_command(&peer, Some(&grant), Some(claim), "smokerecent", &[], false)
+            .await
+            .expect("ordinary read command");
+        let dekopon_broker_host::CommandRunOutcome::Proposed {
+            capability, input, ..
+        } = command
+        else {
+            panic!("ordinary command must propose recent");
+        };
+        assert_eq!(capability.as_str(), "memory.chat.recent");
+        let id = format!("read-{expected}")
+            .parse::<InvocationId>()
+            .expect("id");
+        let (streams, stdout) = stdout_assets();
+        let result = broker
+            .invoke(
+                &peer,
+                Some(&grant),
+                Some(&claim.bound_to(id.clone())),
+                InvocationRequest {
+                    id,
+                    capability,
+                    input,
+                    trace_parent: TRACE_PARENT.parse().expect("trace"),
+                    secret_use: None,
+                },
+                streams,
+            )
+            .await
+            .expect("read accounted");
+        assert_eq!(
+            result.result.outcome,
+            InvocationOutcome::Succeeded,
+            "{result:?}"
+        );
+        let bytes = stdout.join().expect("stdout");
+        let row: serde_json::Value = serde_json::from_slice(&bytes).expect("one row");
+        assert_eq!(row["user"], expected);
+        assert_ne!(row["user"], absent);
+        assert_eq!(row["operation"], "record");
+        assert!(row["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(
+            row["commitment"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+        record_ids.push(row["id"].clone());
+    }
+    assert_ne!(record_ids[0], record_ids[1]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
