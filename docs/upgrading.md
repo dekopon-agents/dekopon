@@ -8,6 +8,17 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Console smoke scope (0.35.0)
+
+Upgrade the broker and gateway together. The broker accepts the fixed `console-smoke` local
+claim for a synthetic conversation scoped to its boot, authenticated peer, subject and agent;
+other claims using that transport are refused. A console can record a delivered turn and invoke
+its ordinary authorized provider routes in this separate scope. Existing real chat scopes are
+not migrated or replayed. The provider WIT and SDK/testkit APIs remain unchanged; this release
+does not require provider re-pins. Install chart 0.24.0 only after the published v0.35.0 image
+index is verified and pinned in the chart. Chart 0.24.0 does not address provider-sync cleanup
+issue #471.
+
 ## Gateway rename (0.34.0)
 
 Upgrade both daemons together to v0.34.0 before switching the gateway configuration. The

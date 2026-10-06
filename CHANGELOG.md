@@ -7,6 +7,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.24.0] - 2026-10-06
+
+### Changed
+
+- Prepare chart 0.24.0 for core v0.35.0; the image index digest is pinned separately after publication.
+
+## [0.35.0] - 2026-10-06
+
+### Added
+
+- The broker accepts the reserved `console-smoke` chat claim and replaces its conversation with a broker-derived id per boot, peer, subject and agent, so an operator console can record and read one synthetic chat-memory conversation that cannot address a real one.
+- Opt-in pinned memory-optimized Wasmtime builds and independently published wasmtime-optimization Linux images.
+- Reproducible locked builds for the opt-in optimized Wasmtime variant.
+
+### Changed
+
+- A chat claim on transport `console-smoke` other than its fixed literal is refused with `console-smoke-claim-denied`.
+- A delivered turn whose delivery identity does not match the attested scope is now a denied `invalid-turn` from the broker instead of an `invalid-request` frame error from dekopon-brokerd.
+- Link coding-agent guidance to the memory-optimized Wasmtime build.
+
 ## [dekopon-chart-0.23.0] - 2026-10-05
 
 ### Changed
