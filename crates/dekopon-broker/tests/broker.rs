@@ -2168,12 +2168,22 @@ async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() 
             .capability_surface(&peer, None, Some(&literal))
             .is_none()
     );
-    assert!(
-        broker
-            .run_command(&peer, Some(&grant), Some(&literal), "missing", &[], false)
-            .await
-            .is_err()
-    );
+    let help = broker
+        .run_command(
+            &peer,
+            Some(&grant),
+            Some(&literal),
+            "probe",
+            &["--help".to_owned()],
+            false,
+        )
+        .await
+        .expect("the literal may run the fixture's real help command");
+    assert!(matches!(
+        help,
+        CommandRunOutcome::Rendered { status: 0, stdout, stderr }
+            if stdout.starts_with("Usage: probe <COMMAND>") && stderr.is_empty()
+    ));
 
     let mut deviations = Vec::new();
     let mut wrong = literal.clone();
@@ -2202,12 +2212,20 @@ async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() 
                 .capability_surface(&peer, Some(&grant), Some(claim))
                 .is_none()
         );
-        assert!(
+        assert!(matches!(
             broker
-                .run_command(&peer, Some(&grant), Some(claim), "missing", &[], false)
-                .await
-                .is_err()
-        );
+                .run_command(
+                    &peer,
+                    Some(&grant),
+                    Some(claim),
+                    "probe",
+                    &["--help".to_owned()],
+                    false,
+                )
+                .await,
+            Err(dekopon_broker_host::BrokerHostError::UnknownCommandWord { word })
+                if word == "probe"
+        ));
         let id = format!("smoke-refused-{index}")
             .parse::<InvocationId>()
             .expect("id");
