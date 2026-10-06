@@ -140,7 +140,76 @@ jobs:
       - name: Upload CLI archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dekopon-${{ matrix.target }}
+          name: dekopon-stock-${{ matrix.target }}
+          path: |
+            dekopon-*.tar.gz
+            dekopon-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  optimized-artifacts:
+    name: build optimized ${{ matrix.target }}
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Install target toolchain
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      - name: Restore Linux release dependencies
+        if: runner.os == 'Linux'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: linux-release-v1-${{ matrix.target }}-wasmtime-optimization
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: "false"
+      - name: Build CLIs
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cp .cargo/wasmtime-optimization.lock Cargo.lock
+          spec=$(python3 -c 'import tomllib; p = tomllib.load(open(".cargo/wasmtime-optimization.toml", "rb"))["patch"]["crates-io"]["wasmtime"]; print("git+" + p["git"] + "?rev=" + p["rev"] + "#wasmtime")')
+          cargo --config .cargo/wasmtime-optimization.toml tree --locked -p "$spec"
+          cargo --config .cargo/wasmtime-optimization.toml build --release --locked \
+            -p dekopon-brokerd -p dekopon-gatewayd --target "$TARGET"
+      - name: Create archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="dekopon-wasmtime-optimization-${version}-${{ matrix.target }}"
+          mkdir -p "staging/$archive"
+          cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopon-gatewayd" "staging/$archive/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
+          cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
+          cp crates/dekopon-gatewayd/README.md "staging/$archive/GATEWAY.md"
+          tar -C staging -czf "$archive.tar.gz" "$archive"
+          shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dekopon-wasmtime-optimization-${{ matrix.target }}
           path: |
             dekopon-*.tar.gz
             dekopon-*.tar.gz.sha256
@@ -164,7 +233,7 @@ jobs:
       - name: Download CLI archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: dekopon-*
+          pattern: dekopon-stock-*
           path: dist
           merge-multiple: true
       - name: Attest release binaries
@@ -209,7 +278,65 @@ jobs:
     # workflow always has, and it needs no repository secret.
     uses: ./.github/workflows/container-image.yml
     with:
+      variant: stock
       tag: ${{ needs.github-release.outputs.tag }}
+
+  optimized-release-assets:
+    name: publish optimized release assets
+    if: github.event_name == 'push'
+    needs: [github-release, optimized-artifacts]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download optimized CLI archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: dekopon-wasmtime-optimization-*
+          path: dist
+          merge-multiple: true
+      - name: Attest optimized release binaries
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Attach optimized archives to the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          published=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          existing=$(mktemp -d)
+          trap 'rm -rf "$existing"' EXIT
+          for asset in dist/*; do
+            name=$(basename "$asset")
+            if grep -Fxq -- "$name" <<< "$published"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$existing"
+              if ! cmp --silent "$asset" "$existing/$name"; then
+                echo "::error::published optimized asset differs: $name"
+                exit 1
+              fi
+            else
+              gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+
+  optimized-container-image:
+    name: publish optimized container image
+    needs: [github-release, optimized-release-assets]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: ./.github/workflows/container-image.yml
+    with:
+      tag: ${{ needs.github-release.outputs.tag }}
+      variant: wasmtime-optimization
 
   homebrew-tap:
     name: update Homebrew tap

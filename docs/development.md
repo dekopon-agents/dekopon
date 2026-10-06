@@ -221,6 +221,38 @@ Publishing a release additionally runs `.github/workflows/homebrew-tap.yml`, whi
 
 Neither that workflow nor `.github/workflows/container-image.yml` triggers on `release: published`. `release.yml` publishes with `GITHUB_TOKEN`, and GitHub does not create workflow runs from events raised by that token, so the event is dispatched to nothing: neither workflow produces a run at all, rather than a failed or skipped one. Both are `workflow_call` reusable workflows that `release.yml` invokes as jobs with `needs: github-release`, which is what guarantees they see a release with its assets attached; both keep a `workflow_dispatch` with a `tag` input as the manual recovery path. A reusable workflow reads `github.event_name` and `github.ref` from its caller, so neither may branch on its own event name; each branches on whether its `tag` input is set.
 
+### Memory-optimized Wasmtime
+
+Normal Cargo commands, `--all-features`, packages, and stock release images keep crates.io
+Wasmtime. Cargo features are additive and cannot select a `[patch]` source; the optimized build
+instead explicitly loads `.cargo/wasmtime-optimization.toml` and its separate Cargo lock.
+
+Use an isolated checkout so selecting the optimized lock never changes the stock checkout:
+
+```console
+git worktree add --detach ../dekopon-wasmtime-optimization HEAD
+cd ../dekopon-wasmtime-optimization
+cp .cargo/wasmtime-optimization.lock Cargo.lock
+cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
+```
+
+The overlay pins [C12 at `7cd4d6da`](https://github.com/dekopon-agents/wasmtime/commit/7cd4d6da8f90661629f05f16ea3e7564d322a41b),
+based on Wasmtime 49.0.2. Wasmtime's workspace path dependencies keep its compiler
+and internal crates on that revision. The memory changes compact finalized machine-code buffers
+and release source locations after preserving the address map; they do not include the separate
+experimental unwind/linking changes. Treat this as an opt-in dogfood build, not an upstream fix
+or a claim of production validation.
+
+Return to the untouched checkout for stock builds and publication. If working in a dedicated
+optimized checkout, restore its tracked `Cargo.lock` and omit `--config` to return to stock.
+Changing the pin requires regenerating `.cargo/wasmtime-optimization.lock` with Cargo in an
+isolated checkout and passing both native Linux optimization CI lanes. Those checks report
+separately from the stock required aggregate, so fork availability does not block the normal
+validation path. Never copy the optimized lock into a
+release-publication checkout. The independent existing `tracing-core` patch still applies to
+workspace builds; this option does not remove that exception.
+
 ## Runtime facts that are easy to miss
 
 Shared orchestration and shell behavior is documented in

@@ -69,6 +69,18 @@ class RenderHomebrewFormulaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.formula = render()
 
+    def test_optimized_sidecars_do_not_change_stock_homebrew_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for prefix in (f"dekopon-{VERSION}", f"dekopon-wasmtime-optimization-{VERSION}"):
+                archive = f"{prefix}-x86_64-unknown-linux-gnu.tar.gz"
+                digest = hashlib.sha256(archive.encode()).hexdigest()
+                (path / f"{archive}.sha256").write_text(f"{digest}  {archive}\n")
+            checksums = render_homebrew_formula.read_checksums(path, VERSION)
+            self.assertEqual(list(checksums), ["x86_64-unknown-linux-gnu"])
+            self.assertEqual(checksums["x86_64-unknown-linux-gnu"][0],
+                             f"dekopon-{VERSION}-x86_64-unknown-linux-gnu.tar.gz")
+
     def test_install_stanza_names_every_executable_in_order(self) -> None:
         expected = ", ".join(f'"{name}"' for name, _ in EXECUTABLES)
         self.assertIn(f"bin.install {expected}\n", self.formula)

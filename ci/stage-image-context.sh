@@ -29,14 +29,20 @@
 #                           image is built
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: $0 <release-tag> <work-directory>" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "usage: $0 <release-tag> <work-directory> [stock|wasmtime-optimization]" >&2
   echo "example: $0 v0.3.0 \"\$(mktemp -d)\"" >&2
   exit 2
 fi
 
 tag="$1"
 work="$2"
+variant="${3:-stock}"
+case "$variant" in
+  stock) prefix="dekopon-${tag#v}" ;;
+  wasmtime-optimization) prefix="dekopon-wasmtime-optimization-${tag#v}" ;;
+  *) echo "error: unsupported image variant: $variant" >&2; exit 2 ;;
+esac
 repository="${DEKOPON_REPOSITORY:-dekopon-agents/dekopon}"
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
 archives="$work/archives"
@@ -87,10 +93,10 @@ mkdir -p "$archives" "$context/dist" "$context/providers"
 # dropped upstream changes the release, and this follows it.
 echo "==> downloading $tag from $repository"
 gh release download "$tag" --repo "$repository" --dir "$archives" --clobber \
-  --pattern '*-unknown-linux-gnu.tar.gz' \
-  --pattern '*-unknown-linux-gnu.tar.gz.sha256'
+  --pattern "$prefix-*-unknown-linux-gnu.tar.gz" \
+  --pattern "$prefix-*-unknown-linux-gnu.tar.gz.sha256"
 
-for archive in "$archives"/*-unknown-linux-gnu.tar.gz; do
+for archive in "$archives"/"$prefix"-*-unknown-linux-gnu.tar.gz; do
   name=$(basename "$archive")
   base="${name%.tar.gz}"
   case "$base" in
