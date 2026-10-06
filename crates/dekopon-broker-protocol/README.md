@@ -106,8 +106,10 @@ canonical channel, and canonical conversation. Bounded string deserializers reje
 field while decoding, and `Attestation` renders as `[REDACTED]` whatever shape it holds.
 `RecordDeliveredTurn` carries a tagged service-specific `DeliveryIdentity` whose Slack
 channel/timestamp, Discord channel/snowflake, Telegram chat/topic/message, WhatsApp
-WABA/phone-number/canonical message ID, or local transport/conversation/boot nonce is checked
-against that attested scope. It is a separate typed operation; `invoke` cannot reach hidden
+WABA/phone-number/canonical message ID, or local transport/conversation/boot nonce is checked by
+the broker against the scope it resolves from the claim; a mismatch is a denied `invalid-turn`.
+Under the reserved `console-smoke` claim the broker substitutes its derived local transport and
+conversation before that check ([security model](../../docs/security-model.md#provider-storage-and-durable-on-demand-chat-memory)). It is a separate typed operation; `invoke` cannot reach hidden
 recording under any attestation. `ChatMemorySurface` is present only when the broker freshly
 authorizes the complete surface. `PROTOCOL_VERSION` is `dekopon.dev/broker/v1alpha2`; both envelopes
 are strict-decoded, so a broker and a client from different protocol versions refuse each other's
@@ -133,7 +135,9 @@ audited. `recordDeliveredTurn` requires a chat claim; the other operations accep
 claim, a chat claim, or none.
 
 A chat claim must satisfy the service-specific canonical checks; it then binds Cedar's `transport`
-and `conversation` context. Claim shape itself grants nothing: which transports and conversations an
+and `conversation` context. A claim on transport `console-smoke` is accepted only as the fixed
+literal `{transport: console-smoke, kind: local, conversation: {kind: directMessage, id:
+console-smoke}, trigger: message}`, whose conversation id the broker replaces with its own digest. Claim shape itself grants nothing: which transports and conversations an
 agent may act in is written in policy.
 
 ## Command execution refusals

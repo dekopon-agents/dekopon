@@ -1379,6 +1379,11 @@ impl fmt::Display for RouteConflict {
 pub enum BrokerBuildError {
     #[error("broker limit {field} must be greater than zero")]
     ZeroLimit { field: &'static str },
+    #[error("operating system entropy is unavailable for the broker boot nonce")]
+    BootEntropy {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("policy revision must contain at most 256 bytes")]
     InvalidPolicyRevision,
     #[error("configuration contains {count} constraint sets; broker maximum is {maximum}")]
@@ -1655,6 +1660,7 @@ pub struct Broker<A> {
     gate: AuthorizationGate,
     audit: Arc<A>,
     chat_memory: Option<ChatMemoryConfig>,
+    console_smoke_nonce: [u8; 16],
 }
 
 impl<A> Broker<A>
@@ -1743,6 +1749,12 @@ where
                 }
             }
         }
+        let mut console_smoke_nonce = [0; 16];
+        getrandom::fill(&mut console_smoke_nonce).map_err(|source| {
+            BrokerBuildError::BootEntropy {
+                source: std::io::Error::other(source),
+            }
+        })?;
         Ok((
             Self {
                 registry,
@@ -1757,6 +1769,7 @@ where
                 gate: AuthorizationGate::new(),
                 audit,
                 chat_memory: None,
+                console_smoke_nonce,
             },
             warnings,
         ))
@@ -2233,18 +2246,22 @@ where
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
         attestation: &Attestation,
-        turn: DeliveredTurnRequest,
+        mut turn: DeliveredTurnRequest,
     ) -> Result<InvocationResult, BrokerError> {
         let (context, claim_refusal) = self.resolve_context(peer, grant, attestation);
+        if let Some(scope) = context.chat_scope()
+            && scope.transport.as_str() == CONSOLE_SMOKE_TRANSPORT
+        {
+            turn.delivery = console_smoke_delivery(scope, turn.delivery);
+        }
         let refusal = claim_refusal.map(Refusal::opaque).or_else(|| {
             if !attestation.binds(&turn.id) {
                 Some(unevaluated_refusal(CHAT_REFUSAL))
             } else if self.memory_surface(&context, &attestation.agent).is_none() {
                 Some(unevaluated_refusal("memory-unavailable"))
             } else if !turn.is_bounded()
-                || !attestation
-                    .scope
-                    .as_ref()
+                || !context
+                    .chat_scope()
                     .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
             {
                 Some(unevaluated_refusal("invalid-turn"))
@@ -2304,7 +2321,19 @@ where
         if !grant.permits(&claim.subject) {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         }
-        let derived = match &claim.scope {
+        let scope = match &claim.scope {
+            Some(scope) if scope.transport.as_str() == CONSOLE_SMOKE_TRANSPORT => {
+                if !is_console_smoke_literal(scope) {
+                    return (refused(), Some(unevaluated_refusal(CONSOLE_SMOKE_REFUSAL)));
+                }
+                let mut derived = scope.clone();
+                derived.conversation.id =
+                    self.console_smoke_conversation(peer.principal(), &claim.subject, &claim.agent);
+                Some(derived)
+            }
+            scope => scope.clone(),
+        };
+        let derived = match scope {
             Some(scope) => {
                 if !scope
                     .conversation
@@ -2317,7 +2346,7 @@ where
                     actor,
                     peer.principal().clone(),
                     claim.subject.clone(),
-                    scope.clone(),
+                    scope,
                 )
             }
             None => AuthenticatedContext::attested(
@@ -2336,6 +2365,23 @@ where
         } else {
             (context, Some(decided_refusal(decision, "agent-denied")))
         }
+    }
+
+    fn console_smoke_conversation(
+        &self,
+        via: &PrincipalId,
+        subject: &ExternalSubject,
+        agent: &AgentId,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(CONSOLE_SMOKE_DOMAIN);
+        hasher.update(self.console_smoke_nonce);
+        for part in [via.as_str(), subject.canonical().as_str(), agent.as_str()] {
+            hasher.update(part);
+            hasher.update([0]);
+        }
+        // The hyphen keeps the id outside the Slack, Discord, Telegram and WhatsApp id grammars.
+        format!("smoke-{}", hex_bytes(&hasher.finalize()))
     }
 
     fn route(&self, capability: &CapabilityId) -> CapabilityRoute {
@@ -3742,6 +3788,55 @@ fn encode_storage_limits(
 }
 
 const CHAT_REFUSAL: &str = "chat-attestation-denied";
+
+const CONSOLE_SMOKE_TRANSPORT: &str = "console-smoke";
+const CONSOLE_SMOKE_REFUSAL: &str = "console-smoke-claim-denied";
+const CONSOLE_SMOKE_DOMAIN: &[u8] = b"dekopon-console-smoke-v1\0";
+
+fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
+    let ChatScopeClaim {
+        transport: _,
+        kind,
+        conversation:
+            Conversation {
+                kind: conversation_kind,
+                container,
+                id,
+                thread,
+            },
+        trigger,
+    } = scope;
+    *kind == ChatTransportKind::Local
+        && *conversation_kind == ConversationKind::DirectMessage
+        && container.is_none()
+        && id == CONSOLE_SMOKE_TRANSPORT
+        && thread.is_none()
+        && *trigger == Trigger::Message
+}
+
+fn console_smoke_delivery(
+    scope: &ChatScopeClaim,
+    placeholder: DeliveryIdentity,
+) -> DeliveryIdentity {
+    match placeholder {
+        DeliveryIdentity::Local {
+            boot_nonce,
+            connection,
+            sequence,
+            ..
+        } => DeliveryIdentity::Local {
+            transport: scope.transport.clone(),
+            conversation: scope.conversation.key(),
+            boot_nonce,
+            connection,
+            sequence,
+        },
+        placeholder @ (DeliveryIdentity::Slack { .. }
+        | DeliveryIdentity::Discord { .. }
+        | DeliveryIdentity::Telegram { .. }
+        | DeliveryIdentity::Whatsapp { .. }) => placeholder,
+    }
+}
 
 struct Refusal {
     reason: &'static str,

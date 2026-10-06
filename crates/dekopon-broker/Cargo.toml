@@ -22,6 +22,7 @@ dekopon-capability.workspace = true
 dekopon-core.workspace = true
 dekopon-policy.workspace = true
 dekopon-storage-host.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

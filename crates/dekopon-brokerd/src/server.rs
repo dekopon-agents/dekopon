@@ -523,13 +523,7 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
         BrokerRequest::RecordDeliveredTurn { attestation, turn } => {
-            if !claim_is_valid(Some(&attestation), Some(&turn.id))
-                || !turn.is_bounded()
-                || !attestation
-                    .scope
-                    .as_ref()
-                    .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
-            {
+            if !claim_is_valid(Some(&attestation), Some(&turn.id)) || !turn.is_bounded() {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
             let span = tracing::info_span!(

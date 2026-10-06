@@ -175,7 +175,8 @@ the surface is the owner's declaration — one `route:` per record/recent/search
 `capabilities` — not a reserved name, so renaming the provider drops no reservation and naming an
 ordinary capability `memory.chat.export` gains none. Hidden recording is reachable solely through
 `recordDeliveredTurn` carrying a chat attestation, after complete gateway-attested transport
-acceptance. Recent and literal case-insensitive search are on demand and never automatically seed a
+acceptance, or into the broker-derived `console-smoke` conversation
+([security model](security-model.md#provider-storage-and-durable-on-demand-chat-memory)). Recent and literal case-insensitive search are on demand and never automatically seed a
 prompt. Both
 continuity policies for private conversation storage include provider, agent, canonical sender,
 transport, channel, and conversation: `stable` survives semantic authority changes; the default
