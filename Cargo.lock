@@ -899,6 +899,7 @@ dependencies = [
  "dekopon-policy",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "getrandom 0.4.3",
  "parking_lot",
  "serde",
  "serde_json",

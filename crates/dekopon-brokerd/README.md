@@ -506,8 +506,9 @@ capability at all.
 The gateway names a subject and never a principal; `principals` is the only thing that
 resolves one, and an unmapped subject resolves to nothing. Refusals are audited denials recorded
 against the gateway's own principal, with reason `attestation-denied` (no grant, or a subject
-outside its namespaces), `unmapped-subject` (granted, but no mapping names that subject), or
-`agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
+outside its namespaces), `unmapped-subject` (granted, but no mapping names that subject),
+`console-smoke-claim-denied` (a chat claim on the reserved `console-smoke` transport that is not
+its fixed literal), or `agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
 rejects duplicate mapping subjects and malformed namespaces.
 
 ### IPC directory and distinct peer UIDs

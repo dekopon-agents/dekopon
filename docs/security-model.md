@@ -313,6 +313,35 @@ proves kernel acceptance. Discord partial delivery produces no receipt. The gate
 fresh dedicated request after acceptance, waits once, and never retries after timeout, EOF, denial,
 or outcome-unknown. Its already delivered answer remains answered.
 
+One conversation is the broker's own. A chat claim on transport `console-smoke` is accepted only as
+the exact literal `{transport: console-smoke, kind: local, conversation: {kind: directMessage, id:
+console-smoke}, trigger: message}`; any other claim naming that transport is refused
+(`console-smoke-claim-denied`) before policy. Any peer whose attestor grant covers the claimed
+subject may send it, and the attestor namespace, identity mapping and `agent.prompt` checks run as
+for every claim. The broker then replaces the conversation id with `smoke-` and the hex SHA-256 of
+a random nonce drawn once per broker start, the peer's `via`, the subject and the agent. No peer
+chooses the id; two peers, subjects or agents never share one; a broker restart moves every caller
+to a fresh, empty conversation. It cannot address a real conversation: `console-smoke` is the
+transport in every storage namespace the derived scope reaches, no real claim may carry that
+transport, and the id fits no Slack, Discord, Telegram or WhatsApp id grammar. A
+`recordDeliveredTurn` under the literal claim carries a placeholder local `DeliveryIdentity`; the
+broker keeps its boot nonce, connection and sequence, substitutes the derived transport and
+conversation, and checks canonicality against the derived scope, so the operator console seeds and
+reads one chat-memory conversation through the ordinary record and recent routes and its turn is
+console-attested, not transport acceptance. Under the derived scope the caller also reaches
+storage-constrained generic capabilities, agent-scoped ones included, whose namespace omits the
+conversation; a statement that must not reach them from a smoke session adds
+`unless { context.transport == "console-smoke" }`.
+
+A console profile can author a real scope. The operator console attests with whatever `scope` its
+profile names, and its attestor grant (the chart grants the console UID its configured subject's
+namespace) admits any canonical conversation for that subject. Cedar sees the claimed transport and
+conversation as typed context, and private-conversation storage keys on subject, transport and
+conversation but not `via`, so a console claim of a real conversation addresses that conversation's
+memory, and under `authority-bound` continuity a console read with different effective permissions
+rotates its generation. Memory permits therefore key on `context.transport == "console-smoke"` or
+on the gateway's `via` (`context.via == "dekopon-gatewayd"`), never on the console's `via` alone.
+
 Storage audit records carry every field a non-storage record does — principal, actor/agent,
 via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —
 plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
