@@ -19,10 +19,11 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
-    ClientError, CommandRunOutcome, Conversation, ConversationKind, DescriptorStream,
-    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
-    Trigger, UpcallStdin, UpcallStreams, read_frame, write_frame,
+    ClientError, CommandRunOutcome, Conversation, ConversationKind, DeliveredAnswer,
+    DeliveredTurnRequest, DeliveryIdentity, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
+    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED, FrameLimits,
+    ProtocolVersion, RequestEnvelope, ResponseEnvelope, Trigger, UpcallStdin, UpcallStreams,
+    read_frame, write_frame,
 };
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, capabilities,
@@ -1112,6 +1113,64 @@ async fn attested_capabilities_over_the_socket() {
         .await
         .expect("server task exits")
         .expect("server shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_canonicality() {
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, _) = broker().await;
+    let mut peers = BTreeMap::new();
+    peers.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, peers, limits).expect("server");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client");
+    let attestation = Attestation::for_chat(
+        subject(),
+        agent("chat-agent"),
+        ChatScopeClaim {
+            transport: "console-smoke".parse().expect("transport"),
+            kind: ChatTransportKind::Local,
+            conversation: Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: None,
+                id: "console-smoke".to_owned(),
+                thread: None,
+            },
+            trigger: Trigger::Message,
+        },
+    );
+    let turn = DeliveredTurnRequest::new(
+        "socket-smoke-record".parse().expect("id"),
+        TRACE_PARENT.parse().expect("trace"),
+        DeliveryIdentity::Local {
+            transport: "local-dev".parse().expect("transport"),
+            conversation: "placeholder".to_owned(),
+            boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            connection: 1,
+            sequence: 1,
+        },
+        "synthetic".to_owned(),
+        DeliveredAnswer::accepted_by_transport("answer".to_owned()),
+    );
+    let response = client
+        .record_delivered_turn(attestation, turn)
+        .await
+        .expect("broker result, not socket invalid-request");
+    assert_eq!(response.outcome, InvocationOutcome::Denied);
+    assert_eq!(response.error.as_deref(), Some("memory-unavailable"));
+    stop.send(()).expect("stop");
+    task.await.expect("join").expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread")]

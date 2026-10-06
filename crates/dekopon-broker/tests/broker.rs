@@ -2126,6 +2126,122 @@ async fn attested_success_audits_via_and_subject() {
     assert!(!serialized.contains("TOP-SECRET-PAYLOAD"));
 }
 
+fn smoke_claim() -> Attestation {
+    Attestation::for_chat(
+        subject(SLACK_SUBJECT),
+        agent("some-agent"),
+        dekopon_broker::ChatScopeClaim {
+            transport: "console-smoke".parse().expect("transport"),
+            kind: dekopon_broker::ChatTransportKind::Local,
+            conversation: dekopon_broker::Conversation {
+                kind: dekopon_broker::ConversationKind::DirectMessage,
+                container: None,
+                id: "console-smoke".to_owned(),
+                thread: None,
+            },
+            trigger: dekopon_broker::Trigger::Message,
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() {
+    let audit = Arc::new(InMemoryAuditLog::new(64).expect("audit"));
+    let broker = attested_broker(
+        directory([(SLACK_SUBJECT, "cpetersen")]),
+        Arc::clone(&audit),
+    )
+    .await;
+    let peer = service_context("gateway");
+    let grant = attestor_grant(["slack.t0123abc"]);
+    let literal = smoke_claim();
+    assert_eq!(
+        broker
+            .capability_surface(&peer, Some(&grant), Some(&literal))
+            .expect("granted peer may claim smoke")
+            .0
+            .len(),
+        1
+    );
+    assert!(
+        broker
+            .capability_surface(&peer, None, Some(&literal))
+            .is_none()
+    );
+    assert!(
+        broker
+            .run_command(&peer, Some(&grant), Some(&literal), "missing", &[], false)
+            .await
+            .is_err()
+    );
+
+    let mut deviations = Vec::new();
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").kind = dekopon_broker::ChatTransportKind::Slack;
+    deviations.push(wrong);
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").conversation.kind =
+        dekopon_broker::ConversationKind::Thread;
+    deviations.push(wrong);
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").conversation.container = Some("other".to_owned());
+    deviations.push(wrong);
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").conversation.id = "other".to_owned();
+    deviations.push(wrong);
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").conversation.thread = Some("other".to_owned());
+    deviations.push(wrong);
+    let mut wrong = literal.clone();
+    wrong.scope.as_mut().expect("scope").trigger = dekopon_broker::Trigger::Probe;
+    deviations.push(wrong);
+
+    for (index, claim) in deviations.iter().enumerate() {
+        assert!(
+            broker
+                .capability_surface(&peer, Some(&grant), Some(claim))
+                .is_none()
+        );
+        assert!(
+            broker
+                .run_command(&peer, Some(&grant), Some(claim), "missing", &[], false)
+                .await
+                .is_err()
+        );
+        let id = format!("smoke-refused-{index}")
+            .parse::<InvocationId>()
+            .expect("id");
+        let result = broker
+            .invoke(
+                &peer,
+                Some(&grant),
+                Some(&claim.bound_to(id.clone())),
+                request(
+                    &format!("smoke-refused-{index}"),
+                    "cli-probe.upper",
+                    json!({"text": "untrusted"}),
+                ),
+                Default::default(),
+            )
+            .await
+            .expect("denial accounted");
+        assert_eq!(
+            result.result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        assert_eq!(
+            result.result.error.as_deref(),
+            Some("chat-attestation-denied")
+        );
+    }
+    assert_eq!(
+        audit.records().iter().filter(|event| matches!(event,
+            AuditEvent::Decision { reason: Some(reason), .. } if reason == "console-smoke-claim-denied"
+        )).count(),
+        deviations.len()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_distinguishes_refusal_from_empty() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));

@@ -1,0 +1,6 @@
+package dekopon:memory-smoke-probe@0.1.0;
+
+world provider {
+    include dekopon:provider/provider-cli@0.4.0;
+    import dekopon:storage/jsonl@0.1.1;
+}
