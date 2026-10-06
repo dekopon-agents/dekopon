@@ -245,16 +245,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust
         run: rustup toolchain install
-      - name: Generate the optimized dependency lock
-        run: cargo --config .cargo/wasmtime-optimization.toml update -p wasmtime --precise 49.0.2
-      - name: Save the Cargo-generated optimized lock
-        if: matrix.os == 'ubuntu-24.04'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: wasmtime-optimization-lock
-          path: Cargo.lock
-          if-no-files-found: error
-          retention-days: 1
+      - name: Select the optimized dependency lock
+        run: cp .cargo/wasmtime-optimization.lock Cargo.lock
       - name: Verify the pinned Wasmtime source
         shell: bash
         run: |
