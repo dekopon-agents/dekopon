@@ -408,12 +408,9 @@ where
                         chat_memory,
                     )
                 }
-                None if attestation.as_ref().is_some_and(|claim| {
-                    peer.attestor
-                        .as_ref()
-                        .is_some_and(|grant| grant.permits(&claim.subject))
-                        && broker.console_real_scope_refused(context, claim)
-                }) =>
+                None if attestation
+                    .as_ref()
+                    .is_some_and(|claim| broker.console_real_scope_refused(context, claim)) =>
                 {
                     ResponseEnvelope::error(
                         ERROR_UNAUTHENTICATED,

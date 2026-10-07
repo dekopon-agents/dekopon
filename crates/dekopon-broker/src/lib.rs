@@ -2028,7 +2028,7 @@ where
                 let (context, refusal) = self.resolve_context(peer, grant, claim);
                 if let Some(refusal) = refusal {
                     report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
-                    if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                    if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
                         return Ok(CommandRunOutcome::Rendered {
                             stdout: String::new(),
                             stderr: format!("{CONSOLE_REAL_SCOPE_REFUSAL}\n"),
@@ -2209,7 +2209,7 @@ where
         // own refusals, so every one collapses to the same literal.
         if chat.is_some() {
             refusal = refusal.map(|refusal| {
-                if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
                     refusal
                 } else {
                     refusal.opaque()
@@ -2269,7 +2269,7 @@ where
         }
         let refusal = claim_refusal
             .map(|refusal| {
-                if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
                     refusal
                 } else {
                     refusal.opaque()
@@ -2333,6 +2333,9 @@ where
         let Some(grant) = grant else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
+        if self.console_real_scope_refused(peer, claim) {
+            return (refused(), Some(console_real_scope_refusal()));
+        }
         let Some(principal) = self.identities.resolve(&claim.subject) else {
             return (refused(), Some(unevaluated_refusal("unmapped-subject")));
         };
@@ -2341,12 +2344,6 @@ where
         };
         if !grant.permits(&claim.subject) {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
-        }
-        if self.console_real_scope_refused(peer, claim) {
-            return (
-                refused(),
-                Some(unevaluated_refusal(CONSOLE_REAL_SCOPE_REFUSAL)),
-            );
         }
         let scope = match &claim.scope {
             Some(scope) if scope.transport.as_str() == CONSOLE_SMOKE_TRANSPORT => {
@@ -2405,7 +2402,6 @@ where
                 .scope
                 .as_ref()
                 .is_some_and(|scope| scope.transport.as_str() != CONSOLE_SMOKE_TRANSPORT)
-            && self.identities.resolve(&claim.subject).is_some()
     }
 
     fn console_smoke_conversation(
@@ -3832,6 +3828,7 @@ const CHAT_REFUSAL: &str = "chat-attestation-denied";
 
 const CONSOLE_SMOKE_TRANSPORT: &str = "console-smoke";
 const CONSOLE_SMOKE_REFUSAL: &str = "console-smoke-claim-denied";
+const CONSOLE_REAL_SCOPE_REASON: &str = "console-real-scope-denied";
 pub const CONSOLE_REAL_SCOPE_REFUSAL: &str = "dekopon sandbox: console sessions cannot attest a real conversation; use --smoke-conversation or the authenticated gateway";
 const CONSOLE_SMOKE_DOMAIN: &[u8] = b"dekopon-console-smoke-v1\0";
 
@@ -3890,6 +3887,14 @@ impl Refusal {
     fn opaque(mut self) -> Self {
         self.wire = CHAT_REFUSAL;
         self
+    }
+}
+
+const fn console_real_scope_refusal() -> Refusal {
+    Refusal {
+        reason: CONSOLE_REAL_SCOPE_REASON,
+        wire: CONSOLE_REAL_SCOPE_REFUSAL,
+        policy_ids: Vec::new(),
     }
 }
 
