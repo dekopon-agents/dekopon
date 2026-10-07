@@ -89,7 +89,7 @@ pub(crate) fn read_skill_into(
     let (name, resource) = match skill_arguments(&call.function.name, &call.function.arguments) {
         Ok(arguments) => arguments,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
             return Err(error);
         }
     };

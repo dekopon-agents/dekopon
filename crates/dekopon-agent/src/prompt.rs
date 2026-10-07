@@ -573,6 +573,7 @@ where
     let mut tool_calls = 0_u32;
     let mut transcribed = 0_usize;
     let mut agent_config_shown = false;
+    let mut rejection_fed_back = false;
     let mut skill_reads = SkillReads::default();
     let mut suggestions = Vec::new();
 
@@ -809,7 +810,7 @@ where
         if decline_requested {
             for (index, call) in turn.tool_calls.iter().enumerate() {
                 if call.id.as_str().trim().is_empty() {
-                    reject_tool_call(model_turns, index + 1, "empty-tool-call-id");
+                    reject_tool_call(model_turns, index + 1, "empty-tool-call-id", false);
                     return Err(PromptError::EmptyToolCallId);
                 }
                 if call.function.name == DECLINE_REPLY_TOOL_NAME {
@@ -863,7 +864,7 @@ where
             check_cancelled(cancellation)?;
             let tool_call_index = tool_call_index + 1;
             if call.id.as_str().trim().is_empty() {
-                reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
+                reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id", false);
                 return Err(PromptError::EmptyToolCallId);
             }
             if call.function.name == AGENT_CONFIG_TOOL_NAME
@@ -921,13 +922,36 @@ where
             // The model-selected tool name is excluded from telemetry because it is untrusted model
             // output; an operator reads it from stderr instead.
             if call.function.name != SCRIPT_TOOL_NAME {
-                reject_tool_call(model_turns, tool_call_index, "unknown-tool");
+                let answered = feed_back_rejection(
+                    &mut messages,
+                    &mut rejection_fed_back,
+                    &call,
+                    unknown_tool_feedback(&model_tools),
+                );
+                reject_tool_call(model_turns, tool_call_index, "unknown-tool", answered);
+                if answered {
+                    continue;
+                }
                 return Err(PromptError::UnknownTool(call.function.name));
             }
             let script = match script_argument(&call.function.name, &call.function.arguments) {
                 Ok(script) => script,
                 Err(error) => {
-                    reject_tool_call(model_turns, tool_call_index, error.telemetry_kind());
+                    let answered = feed_back_rejection(
+                        &mut messages,
+                        &mut rejection_fed_back,
+                        &call,
+                        BAD_SCRIPT_ARGUMENTS_FEEDBACK.to_owned(),
+                    );
+                    reject_tool_call(
+                        model_turns,
+                        tool_call_index,
+                        error.telemetry_kind(),
+                        answered,
+                    );
+                    if answered {
+                        continue;
+                    }
                     return Err(error);
                 }
             };
@@ -1081,7 +1105,12 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
     text
 }
 
-pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
+pub(crate) fn reject_tool_call(
+    model_turn: u32,
+    tool_call_index: usize,
+    error_type: &'static str,
+    fed_back: bool,
+) {
     tracing::error!(
         target: "dekopon_agent::audit",
         {
@@ -1089,9 +1118,39 @@ pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_ty
             model.turn = model_turn,
             tool_call.index = tool_call_index,
             error.type = error_type,
+            rejection.fed_back = fed_back,
         },
         "model tool call rejected"
     );
+}
+
+const BAD_SCRIPT_ARGUMENTS_FEEDBACK: &str = "dekopon: bash takes one string argument named \
+    script holding the whole script, for example {\"script\":\"cap --list\"}.";
+
+fn unknown_tool_feedback(tools: &[ModelTool]) -> String {
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "dekopon: no tool by that name is offered. The tools are: {names}. Provider command \
+         words run inside a bash script: call bash with {{\"script\":\"<word> --help\"}}."
+    )
+}
+
+fn feed_back_rejection(
+    messages: &mut Vec<ModelMessage>,
+    fed_back: &mut bool,
+    call: &ModelToolCall,
+    feedback: String,
+) -> bool {
+    if *fed_back {
+        return false;
+    }
+    *fed_back = true;
+    messages.push(ModelMessage::tool(call.id.clone(), feedback));
+    true
 }
 
 fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> ModelTool {
@@ -1181,7 +1240,7 @@ fn inspect_agent_config_into(
     already_shown: &mut bool,
 ) -> Result<(), PromptError> {
     if let Err(error) = agent_config_argument(&call.function.name, &call.function.arguments) {
-        reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+        reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
         return Err(error);
     }
     let result = if *already_shown {
@@ -1286,7 +1345,7 @@ fn fetch_asset_into(
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
             return Err(error);
         }
     };
@@ -1680,13 +1739,13 @@ mod tests {
 
     use super::{
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
-        CancellationProbe, ConversationTurn, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES,
-        DEFAULT_MAX_TURNS, FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
-        MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
-        PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
-        ScriptRuntime, SessionInputs, Steer, SteerSource, agent_config_tool, format_script_outcome,
-        run_prompt, run_prompt_session, run_prompt_with_history,
-        run_prompt_with_history_and_options, script_tool,
+        BAD_SCRIPT_ARGUMENTS_FEEDBACK, CancellationProbe, ConversationTurn,
+        DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, FetchedAsset, History,
+        HistoryLimits, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
+        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION,
+        SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs, Steer, SteerSource,
+        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
     };
 
     struct ScriptedModel {
@@ -4161,51 +4220,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_model_selected_tools_that_were_not_offered() {
-        let model = ScriptedModel::new([AssistantTurn::new(
-            None,
-            vec![ModelToolCall {
-                id: "call-1".into(),
-                kind: "function".to_owned(),
-                function: ModelFunctionCall {
-                    name: "echo_echo".to_owned(),
-                    arguments: "{}".to_owned(),
-                },
-            }],
-            None,
-        )]);
+    fn an_unknown_tool_is_answered_once_and_the_second_ends_the_session() {
+        let model = ScriptedModel::new([
+            tool_call("call-1", "echo_echo", json!({})),
+            tool_call("call-2", "echo_echo", json!({})),
+        ]);
         let runtime = RecordingRuntime::new(0);
 
-        let error = run_prompt(&model, &runtime, "call the old tool", None, limits(1, 32))
-            .expect_err("unknown tools must fail closed");
+        let error = run_prompt(&model, &runtime, "call the old tool", None, limits(3, 32))
+            .expect_err("the second unknown tool fails closed");
 
-        assert!(matches!(error, PromptError::UnknownTool(_)));
+        assert!(matches!(error, PromptError::UnknownTool(name) if name == "echo_echo"));
+        let feedback = model.tool_messages();
+        assert_eq!(feedback.len(), 1, "{feedback:?}");
+        assert!(
+            feedback[0].starts_with(
+                "dekopon: no tool by that name is offered. The tools are: bash, suggest_improvement."
+            ),
+            "{feedback:?}"
+        );
+        assert!(
+            feedback[0].ends_with(r#"call bash with {"script":"<word> --help"}."#),
+            "{feedback:?}"
+        );
+        assert!(!feedback[0].contains("echo_echo"), "{feedback:?}");
         assert!(runtime.scripts.lock().is_empty());
     }
 
     #[test]
-    fn rejects_tool_calls_without_a_string_script_argument() {
+    fn a_rejected_call_beside_a_valid_one_still_runs_the_valid_one() {
+        let call = |id: &str, name: &str, arguments: Value| ModelToolCall {
+            id: id.into(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: name.to_owned(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let model = ScriptedModel::new([
+            AssistantTurn::new(
+                None,
+                vec![
+                    call("call-1", "gh", json!({ "command": "pr view 12" })),
+                    call(
+                        "call-2",
+                        SCRIPT_TOOL_NAME,
+                        json!({ "script": "gh pr view 12" }),
+                    ),
+                ],
+                None,
+            ),
+            answer("done"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+
+        let outcome = run_prompt(&model, &runtime, "go", None, limits(3, 32))
+            .expect("the model recovers from one rejected call");
+
+        assert_eq!(outcome.answer, "done");
+        assert_eq!(outcome.model_turns, 2);
+        assert_eq!(runtime.scripts.lock().as_slice(), ["gh pr view 12"]);
+        let feedback = model.tool_messages();
+        assert_eq!(feedback.len(), 2, "{feedback:?}");
+        assert!(
+            feedback[0].starts_with("dekopon: no tool by that name"),
+            "{feedback:?}"
+        );
+    }
+
+    #[test]
+    fn a_bash_call_without_a_string_script_is_answered_once_then_ends_the_session() {
         for arguments in [r#"{"command":"echo hi"}"#, r#"{"script":42}"#, "{}"] {
-            let model = ScriptedModel::new([AssistantTurn::new(
-                None,
-                vec![ModelToolCall {
-                    id: "call-1".into(),
-                    kind: "function".to_owned(),
-                    function: ModelFunctionCall {
-                        name: SCRIPT_TOOL_NAME.to_owned(),
-                        arguments: arguments.to_owned(),
-                    },
-                }],
-                None,
-            )]);
+            let bad = |id: &str| {
+                AssistantTurn::new(
+                    None,
+                    vec![ModelToolCall {
+                        id: id.into(),
+                        kind: "function".to_owned(),
+                        function: ModelFunctionCall {
+                            name: SCRIPT_TOOL_NAME.to_owned(),
+                            arguments: arguments.to_owned(),
+                        },
+                    }],
+                    None,
+                )
+            };
+            let model = ScriptedModel::new([bad("call-1"), bad("call-2")]);
             let runtime = RecordingRuntime::new(0);
 
-            let error = run_prompt(&model, &runtime, "malformed", None, limits(1, 32))
-                .expect_err("a missing script must fail closed");
+            let error = run_prompt(&model, &runtime, "malformed", None, limits(3, 32))
+                .expect_err("the second malformed call fails closed");
 
             assert!(
                 matches!(error, PromptError::MissingScript { .. }),
                 "{arguments}: {error}"
+            );
+            assert_eq!(
+                model.tool_messages(),
+                [BAD_SCRIPT_ARGUMENTS_FEEDBACK.to_owned()],
+                "{arguments}"
             );
             assert!(runtime.scripts.lock().is_empty());
         }
@@ -4389,25 +4502,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_arguments_that_are_not_a_json_object() {
-        let model = ScriptedModel::new([AssistantTurn::new(
-            None,
-            vec![ModelToolCall {
-                id: "call-1".into(),
-                kind: "function".to_owned(),
-                function: ModelFunctionCall {
-                    name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: Value::String("echo hi".to_owned()).to_string(),
-                },
-            }],
-            None,
-        )]);
+    fn arguments_that_are_not_a_json_object_are_answered_once_then_refused() {
+        let bad = |id: &str| {
+            AssistantTurn::new(
+                None,
+                vec![ModelToolCall {
+                    id: id.into(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: SCRIPT_TOOL_NAME.to_owned(),
+                        arguments: Value::String("echo hi".to_owned()).to_string(),
+                    },
+                }],
+                None,
+            )
+        };
+        let model = ScriptedModel::new([bad("call-1"), bad("call-2")]);
         let runtime = RecordingRuntime::new(0);
 
-        let error = run_prompt(&model, &runtime, "malformed", None, limits(1, 32))
-            .expect_err("non-object arguments must fail closed");
+        let error = run_prompt(&model, &runtime, "malformed", None, limits(3, 32))
+            .expect_err("the second non-object call fails closed");
 
         assert!(matches!(error, PromptError::ArgumentsNotObject { .. }));
+        assert_eq!(
+            model.tool_messages(),
+            [BAD_SCRIPT_ARGUMENTS_FEEDBACK.to_owned()]
+        );
     }
 
     fn mounted_skill() -> (tempfile::TempDir, dekopon_config::Skill) {
@@ -4590,23 +4710,26 @@ mod tests {
 
     #[test]
     fn a_session_without_skills_offers_no_listing_and_no_tool() {
-        let model = ScriptedModel::new([tool_call(
-            "read-1",
-            SKILL_TOOL_NAME,
-            json!({"name": "pull-request-review"}),
-        )]);
+        let read =
+            |id: &str| tool_call(id, SKILL_TOOL_NAME, json!({"name": "pull-request-review"}));
+        let model = ScriptedModel::new([read("read-1"), read("read-2")]);
         let runtime = RecordingRuntime::new(0);
         let mut history = History::default();
 
         let error = run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("review", limits(2, 2)).with_system(Some("Be concise.")),
+            SessionInputs::new("review", limits(3, 2)).with_system(Some("Be concise.")),
             &mut history,
         )
         .expect_err("a tool that was never offered is unknown");
 
         assert!(matches!(error, PromptError::UnknownTool(name) if name == SKILL_TOOL_NAME));
+        assert_eq!(
+            model.tool_messages().len(),
+            1,
+            "answered once, then refused"
+        );
         let roles = model.first_roles();
         assert_eq!(roles.len(), 2, "no listing was added: {roles:?}");
         let tools = model.observed_tools.lock();
