@@ -377,10 +377,15 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let layout = Layout::open(&root)?;
-        let usage = scan_root_usage(&layout, limits.startup_max_entries)?;
+        let (usage, namespace_count) = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
             return Err(StorageHostError::QuotaExceeded);
         }
+        tracing::info!(
+            event = "storage_namespace_capacity",
+            storage.namespace.count = namespace_count,
+            storage.namespace.limit = limits.max_namespaces,
+        );
         let ledger = QuotaLedger::new(limits.clone(), usage);
         #[allow(
             clippy::map_err_ignore,

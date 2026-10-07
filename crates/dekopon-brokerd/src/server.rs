@@ -410,6 +410,18 @@ where
                 }
                 // A refused attestation reveals nothing about the attested context, not even
                 // whether the subject is mapped.
+                None if attestation.as_ref().is_some_and(|claim| {
+                    peer.attestor
+                        .as_ref()
+                        .is_some_and(|grant| grant.permits(&claim.subject))
+                        && broker.console_real_scope_refused(context, claim)
+                }) =>
+                {
+                    ResponseEnvelope::error(
+                        ERROR_UNAUTHENTICATED,
+                        dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL,
+                    )
+                }
                 None => ResponseEnvelope::error(
                     ERROR_UNAUTHENTICATED,
                     "attestation refused: no attestor authority for this subject",

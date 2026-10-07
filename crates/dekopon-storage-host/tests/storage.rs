@@ -495,15 +495,20 @@ fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
     };
     let host = StorageHost::open(&root, limits).expect("host");
     let before = tree_snapshot(&root);
-    assert!(matches!(
+    let (result, events) = captured(|| {
         host.grant(request(
             b"authority",
             ContinuityPolicy::Stable,
             "namespace-housekeeping-denied",
             StorageAccess::ReadOnly,
-        )),
-        Err(StorageHostError::QuotaExceeded)
-    ));
+        ))
+    });
+    assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
+    assert!(
+        !events
+            .events_text()
+            .contains("storage_namespace_slot_refused")
+    );
     assert_eq!(before, tree_snapshot(&root));
     assert_eq!(
         fs::read_dir(root.join("namespaces"))
@@ -608,6 +613,17 @@ fn logical_names_reject_traversal_and_separators_without_creating_data_entries()
         data_entries, 0,
         "invalid names must not create physical data"
     );
+}
+
+#[test]
+fn startup_reports_physical_namespace_count_without_names() {
+    let (_temporary, root) = fixture();
+    let (host, startup) = captured(|| StorageHost::open(&root, StorageLimits::default()));
+    let _host = host.expect("host opens");
+    let logged = startup.events_text();
+    assert!(logged.contains("storage_namespace_capacity"), "{logged}");
+    assert!(logged.contains("storage.namespace.count"), "{logged}");
+    assert!(logged.contains("storage.namespace.limit"), "{logged}");
 }
 
 #[test]
@@ -1045,6 +1061,47 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
         .expect("same namespace succeeds after release");
     same.join().expect("same thread");
     other.join().expect("other thread");
+}
+
+#[test]
+fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
+    let (_temporary, root) = fixture();
+    let limits = StorageLimits {
+        max_namespaces: 1,
+        ..StorageLimits::default()
+    };
+    let seed = StorageHost::open(&root, limits.clone()).expect("seed host");
+    seed.grant(scoped_request(
+        b"authority",
+        ContinuityPolicy::Stable,
+        "seed",
+        StorageAccess::ReadOnly,
+        "slack.t0123abc.uone",
+    ))
+    .expect("one namespace fits");
+    drop(seed);
+    let (host, startup) = captured(|| StorageHost::open(&root, limits));
+    let host = host.expect("reopen");
+    let logged = startup.events_text();
+    assert!(logged.contains("storage_namespace_capacity"), "{logged}");
+    assert!(logged.contains("storage.namespace.count=1"), "{logged}");
+    let (result, refusal) = captured(|| {
+        host.grant(scoped_request(
+            b"authority",
+            ContinuityPolicy::Stable,
+            "second",
+            StorageAccess::ReadOnly,
+            "slack.t0123abc.utwo",
+        ))
+    });
+    assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
+    let logged = refusal.events_text();
+    assert!(
+        logged.contains("storage_namespace_slot_refused"),
+        "{logged}"
+    );
+    assert!(logged.contains("storage.namespace.count=1"), "{logged}");
+    assert!(!logged.contains("slack.t0123abc"), "{logged}");
 }
 
 #[test]

@@ -734,8 +734,9 @@ fn scan_entry(
 pub(crate) fn scan_root_usage(
     layout: &Layout,
     maximum_entries: u64,
-) -> Result<Usage, StorageHostError> {
+) -> Result<(Usage, usize), StorageHostError> {
     let mut usage = Usage::default();
+    let mut namespace_count = 0;
     for name in layout.root.entries_bounded(maximum_entries)? {
         if name != "namespaces" {
             scan_entry(&layout.root, &name, maximum_entries, &mut usage)?;
@@ -744,6 +745,7 @@ pub(crate) fn scan_root_usage(
         usage = usage_with_directory_entry(usage)?;
         let namespaces = layout.namespaces();
         for base in namespaces.entries_bounded(maximum_entries)? {
+            namespace_count += 1;
             let mut charged = usage;
             match scan_entry(namespaces, &base, maximum_entries, &mut charged) {
                 Ok(()) => usage = charged,
@@ -768,7 +770,7 @@ pub(crate) fn scan_root_usage(
             }
         }
     }
-    Ok(usage)
+    Ok((usage, namespace_count))
 }
 
 #[cfg(test)]

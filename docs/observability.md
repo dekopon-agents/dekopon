@@ -940,8 +940,14 @@ scan — a symlink, a hard link, a wrong mode, or an unreadable directory under 
 It carries `storage.namespace`, `storage.path`, `storage.check`, and the rendered `error`. The broker
 starts without charging that base, and the conversation's next grant fails naming the same entry.
 
-Both records name opaque tokens and paths under the storage root. They are for the operator;
-nothing in them reaches a guest or a model.
+`storage_namespace_capacity` at `INFO` reports the count of physically present namespace entries
+from the startup quota scan and `maxNamespaces` as `storage.namespace.count` and
+`storage.namespace.limit`. `storage_namespace_slot_refused` at `WARN` reports the same fields
+under the quota lock, counting both present and pending slots only when a new namespace slot is
+refused; byte and handle quota denials do not emit it. Neither event includes namespace names.
+
+The reset and ignored-entry records name opaque tokens and paths under the storage root. They are
+for the operator; nothing in them reaches a guest or a model.
 
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded

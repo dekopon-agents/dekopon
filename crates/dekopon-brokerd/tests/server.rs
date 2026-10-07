@@ -378,6 +378,63 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, audit) = broker().await;
+    let peers = BTreeMap::from([(
+        uid,
+        MappedPeer {
+            context: context("dekopon-console"),
+            attestor: Some(attestor_grant()),
+        },
+    )]);
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, peers, limits).expect("server");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client");
+    let real = Attestation::for_chat(
+        subject(),
+        agent("chat-agent"),
+        ChatScopeClaim {
+            transport: "scientist-slack".parse().expect("transport"),
+            kind: ChatTransportKind::Slack,
+            conversation: Conversation {
+                kind: ConversationKind::Thread,
+                container: Some("t0123abc".to_owned()),
+                id: "c0123abc".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: Trigger::Message,
+        },
+    );
+    let error = client
+        .session_surface(Some(real.clone()))
+        .await
+        .expect_err("real scope refused");
+    assert!(error.to_string().contains("dekopon sandbox:"), "{error}");
+    let unknown = Attestation::for_chat(
+        "slack.t0123abc.unknown".parse().expect("subject"),
+        agent("chat-agent"),
+        real.scope.expect("scope"),
+    );
+    let error = client
+        .session_surface(Some(unknown))
+        .await
+        .expect_err("unmapped subject refused");
+    assert!(!error.to_string().contains("dekopon sandbox:"), "{error}");
+    assert!(
+        audit.records().is_empty(),
+        "refusal precedes policy and storage"
+    );
+    stop.send(()).expect("stop");
+    task.await.expect("join").expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
     let uid = current_uid();
     let directory = private_directory();
