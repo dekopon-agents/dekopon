@@ -2270,6 +2270,10 @@ async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one peer exercises four refusal routes and mapped/unmapped subjects"
+)]
 async fn authenticated_console_cannot_attest_a_real_scope() {
     let audit = Arc::new(InMemoryAuditLog::new(64).expect("audit"));
     let broker = attested_broker(
@@ -2343,12 +2347,19 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
             .capability_surface(&console, Some(&grant), Some(&unknown))
             .is_none()
     );
-    assert!(matches!(
-        broker
-            .run_command(&console, Some(&grant), Some(&unknown), "probe", &[], false)
-            .await,
-        Err(dekopon_broker_host::BrokerHostError::UnknownCommandWord { .. })
-    ));
+    let CommandRunOutcome::Rendered {
+        stderr: unmapped_stderr,
+        status: unmapped_status,
+        ..
+    } = broker
+        .run_command(&console, Some(&grant), Some(&unknown), "probe", &[], false)
+        .await
+        .expect("the unmapped subject receives the same console rule")
+    else {
+        panic!("console denial is rendered");
+    };
+    assert_eq!(unmapped_status, status);
+    assert_eq!(unmapped_stderr, stderr);
 
     let id = "console-real-invoke".parse::<InvocationId>().expect("id");
     let result = broker
@@ -2367,6 +2378,25 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
         .expect("denial is accounted");
     let refused_invoke = result.result.outcome == dekopon_capability::InvocationOutcome::Denied
         && result.result.error.as_deref() == Some(dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL);
+    let unmapped_invoke = broker
+        .invoke(
+            &console,
+            Some(&grant),
+            Some(
+                &unknown
+                    .clone()
+                    .bound_to("console-unmapped-invoke".parse().expect("id")),
+            ),
+            request(
+                "console-unmapped-invoke",
+                "cli-probe.upper",
+                json!({"text": "no execution"}),
+            ),
+            Default::default(),
+        )
+        .await
+        .expect("unmapped denial is accounted");
+    assert_eq!(unmapped_invoke.result.error, result.result.error);
 
     let turn = dekopon_broker_protocol::DeliveredTurnRequest::new(
         "console-real-record".parse().expect("id"),
@@ -2381,6 +2411,7 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
         "synthetic".to_owned(),
         dekopon_broker_protocol::DeliveredAnswer::accepted_by_transport("answer".to_owned()),
     );
+    let unmapped_turn = turn.clone();
     let result = broker
         .record_delivered_turn(
             &console,
@@ -2392,6 +2423,16 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
         .expect("record refusal accounted");
     let refused_record = result.outcome == dekopon_capability::InvocationOutcome::Denied
         && result.error.as_deref() == Some(dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL);
+    let unmapped_record = broker
+        .record_delivered_turn(
+            &console,
+            Some(&grant),
+            &unknown.bound_to("console-real-record".parse().expect("id")),
+            unmapped_turn,
+        )
+        .await
+        .expect("unmapped record denial is accounted");
+    assert_eq!(unmapped_record.error, result.error);
     assert!(
         refused_capabilities && refused_run_command && refused_invoke && refused_record,
         "console boundary (capabilities, run-command, invoke, record): \
@@ -2399,9 +2440,15 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
     );
     assert_eq!(
         audit.records().len(),
-        2,
+        4,
         "denials audit decisions but never execute"
     );
+    for event in audit.records() {
+        let AuditEvent::Decision { reason, .. } = event else {
+            panic!("denial only audits a decision");
+        };
+        assert_eq!(reason.as_deref(), Some("console-real-scope-denied"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

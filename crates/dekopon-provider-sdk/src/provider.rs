@@ -577,12 +577,16 @@ pub fn command<P: Provider>(argv: &[String], stdin_piped: bool) -> CommandRunOut
             },
         },
         Err(error) => {
+            let append_help =
+                error.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand;
             let use_stderr = error.use_stderr();
             let text = error.render().to_string();
             if use_stderr {
                 let mut stderr = text;
-                let help = matched_help(&grammar, argv);
-                stderr.push_str(&bounded_help(&help, 4096));
+                if append_help {
+                    let help = matched_help(&grammar, argv);
+                    stderr.push_str(&bounded_help(&help, 4096));
+                }
                 CommandRunOutcome::Rendered {
                     stdout: String::new(),
                     stderr,

@@ -126,6 +126,14 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
 }
 
 #[test]
+fn console_scope_refusal_audits_a_token_and_sends_only_the_wire_sentence() {
+    let refusal = super::console_real_scope_refusal();
+    assert_eq!(refusal.reason, "console-real-scope-denied");
+    assert_eq!(refusal.wire, super::CONSOLE_REAL_SCOPE_REFUSAL);
+    assert!(refusal.wire.starts_with("dekopon sandbox:"));
+}
+
+#[test]
 fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
     let authored = serde_json::json!({
         "provider": "memory-chat",

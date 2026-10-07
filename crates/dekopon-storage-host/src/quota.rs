@@ -102,6 +102,7 @@ impl QuotaLedger {
             .union(&state.pending_namespace_slots)
             .count() as u64;
         if count >= self.limits.max_namespaces {
+            drop(state);
             tracing::warn!(
                 event = "storage_namespace_slot_refused",
                 storage.namespace.count = count,
@@ -443,4 +444,49 @@ fn release_locked(state: &mut LedgerState, namespace: &str, reserved: u64, entri
         }
     }
     state.active_invocations = state.active_invocations.saturating_sub(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuotaLedger;
+    use crate::{StorageHostError, StorageLimits, layout::Usage};
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tracing_subscriber::{Layer, prelude::*};
+
+    struct LockProbe {
+        ledger: Arc<QuotaLedger>,
+        unlocked_at_event: Arc<AtomicBool>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for LockProbe {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.unlocked_at_event
+                .store(self.ledger.state.try_lock().is_some(), Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_slot_refusal_releases_the_quota_lock_before_logging() {
+        let limits = StorageLimits {
+            max_namespaces: 1,
+            ..StorageLimits::default()
+        };
+        let ledger = QuotaLedger::new(limits, Usage::default());
+        let unlocked_at_event = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(LockProbe {
+            ledger: Arc::clone(&ledger),
+            unlocked_at_event: Arc::clone(&unlocked_at_event),
+        });
+        let result = tracing::subscriber::with_default(subscriber, || {
+            ledger.reserve_namespace("new".to_owned(), BTreeSet::from(["existing".to_owned()]))
+        });
+        assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
+        assert!(unlocked_at_event.load(Ordering::SeqCst));
+    }
 }

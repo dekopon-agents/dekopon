@@ -23,7 +23,12 @@ const DRN: &str = "drn:com.example:secret:prod:api/token";
 struct Fixture;
 
 #[derive(Parser)]
-#[command(name = "fixture", version = "0.1.0", about = "Transforms text")]
+#[command(
+    name = "fixture",
+    version = "0.1.0",
+    about = "Transforms text",
+    arg_required_else_help = true
+)]
 struct Args {
     #[command(subcommand)]
     verb: Verb,
@@ -801,6 +806,32 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
     assert_eq!(status, 2);
     assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains("Usage: fixture count"), "{stderr:?}");
+}
+
+#[test]
+fn implicit_clap_help_is_rendered_once_without_appended_usage_help() {
+    let error = Args::try_parse_from(["fixture"])
+        .err()
+        .expect("missing subcommand");
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    let original = error.render().to_string();
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = run(&[], false)
+    else {
+        panic!("implicit help must render");
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(
+        stderr, original,
+        "implicit clap help must not be appended twice"
+    );
 }
 
 #[test]

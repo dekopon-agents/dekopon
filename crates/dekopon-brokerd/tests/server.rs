@@ -421,11 +421,11 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
         agent("chat-agent"),
         real.scope.expect("scope"),
     );
-    let error = client
+    let unmapped_error = client
         .session_surface(Some(unknown))
         .await
         .expect_err("unmapped subject refused");
-    assert!(!error.to_string().contains("dekopon sandbox:"), "{error}");
+    assert_eq!(unmapped_error.to_string(), error.to_string());
     assert!(
         audit.records().is_empty(),
         "refusal precedes policy and storage"
