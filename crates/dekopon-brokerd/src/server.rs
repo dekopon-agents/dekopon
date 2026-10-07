@@ -408,8 +408,6 @@ where
                         chat_memory,
                     )
                 }
-                // A refused attestation reveals nothing about the attested context, not even
-                // whether the subject is mapped.
                 None if attestation.as_ref().is_some_and(|claim| {
                     peer.attestor
                         .as_ref()
