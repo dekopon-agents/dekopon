@@ -336,8 +336,7 @@ conversation; a statement that must not reach them from a smoke session adds
 The broker refuses a real conversation scope from the authenticated `dekopon-console` peer
 before subject mapping, canonicalization, Cedar evaluation, or storage preparation. The same
 `dekopon sandbox:` remedy is returned whether or not the claimed subject is mapped, so it cannot
-be used to enumerate subjects. Unmapped peers remain opaque; the authenticated console gets the
-same real-scope refusal at the socket even without a subject grant. Subject mapping and the
+be used to enumerate subjects. Unmapped peers remain opaque. Subject mapping and the
 attestor namespace still apply to unscoped and exact
 `console-smoke` claims; a gateway-authenticated real conversation remains eligible for its own
 policy and storage checks. Memory permits retain both
