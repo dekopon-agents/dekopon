@@ -78,13 +78,28 @@ async fn sigterm_unlinks_admission_and_exits_zero() {
             }
         }
     };
-    drop(stream);
+    use tokio::io::AsyncWriteExt as _;
+    let mut stream = stream;
+    stream.write_all(&[0]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let status = Command::new("kill")
         .args(["-TERM", &child.0.id().to_string()])
         .status()
         .unwrap();
     assert!(status.success(), "signal was delivered");
+    let until = Instant::now() + Duration::from_millis(300);
+    while socket.exists() {
+        assert!(
+            Instant::now() < until,
+            "SIGTERM must unlink before the connection drains"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "connection is still active"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(stream);
     let until = Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
