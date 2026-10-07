@@ -1427,9 +1427,11 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 }
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
-Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
-whenever the task needs data or an action the session's capabilities provide, and write the whole \
-job as one script rather than one tool call per step. Send scripts one after another only when \
+Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
+`{\"script\":\"cap --list\"}`. Put shell commands inside `script`, not `command`; provider command words \
+are not separate model tools. This is the only way to invoke capabilities: use it whenever the task \
+needs data or an action the session's capabilities provide, and write the whole job as one script \
+rather than one tool call per step. Send scripts one after another only when \
 the next step genuinely depends on a result you cannot know yet. Returns the script's combined \
 output followed by an `[exit code: N]` trailer, exactly as a terminal would.
 
@@ -3611,7 +3613,15 @@ mod tests {
         assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
         assert_eq!(tool.parameters["required"], json!(["script"]));
         assert_eq!(tool.parameters["additionalProperties"], json!(false));
-        assert!(tool.description.contains("cap --list"));
+        let example = tool
+            .description
+            .split_once("for example `")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(example, _)| example)
+            .expect("bash tool call example");
+        let arguments: serde_json::Value = serde_json::from_str(example).unwrap();
+        assert_eq!(arguments, json!({ "script": "cap --list" }));
+        assert!(tool.description.contains("inside `script`, not `command`"));
         assert_eq!(
             tool.description.matches("run `<word> --help`").count(),
             1,
