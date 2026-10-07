@@ -577,11 +577,15 @@ pub fn command<P: Provider>(argv: &[String], stdin_piped: bool) -> CommandRunOut
             },
         },
         Err(error) => {
+            let use_stderr = error.use_stderr();
             let text = error.render().to_string();
-            if error.use_stderr() {
+            if use_stderr {
+                let mut stderr = text;
+                let help = matched_help(&grammar, argv);
+                stderr.push_str(&bounded_help(&help, 4096));
                 CommandRunOutcome::Rendered {
                     stdout: String::new(),
-                    stderr: text,
+                    stderr,
                     status: u8::try_from(error.exit_code()).unwrap_or(2),
                 }
             } else {
@@ -593,6 +597,72 @@ pub fn command<P: Provider>(argv: &[String], stdin_piped: bool) -> CommandRunOut
             }
         }
     }
+}
+
+fn matched_help(grammar: &clap::Command, argv: &[String]) -> String {
+    let mut command = grammar;
+    let mut values = 0_usize;
+    let mut options_done = false;
+    for word in argv {
+        if values > 0 {
+            values -= 1;
+            continue;
+        }
+        if word == "--" {
+            options_done = true;
+            continue;
+        }
+        if !options_done && word.starts_with('-') {
+            let (name, inline) = word
+                .split_once('=')
+                .map_or((word.as_str(), false), |(name, _)| (name, true));
+            let argument = if let Some(long) = name.strip_prefix("--") {
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_long() == Some(long))
+            } else if name.len() == 2 {
+                name.chars().nth(1).and_then(|short| {
+                    command
+                        .get_arguments()
+                        .find(|arg| arg.get_short() == Some(short))
+                })
+            } else {
+                None
+            };
+            if let Some(argument) = argument {
+                if !inline {
+                    values = argument
+                        .get_num_args()
+                        .map_or(0, |range| range.min_values());
+                }
+            } else if name != "-h" && name != "--help" && name != "-V" && name != "--version" {
+                break;
+            }
+            continue;
+        }
+        if let Some(next) = command.find_subcommand(word) {
+            command = next;
+        } else {
+            break;
+        }
+    }
+    let mut help = command.clone();
+    help.render_long_help().to_string()
+}
+
+fn bounded_help(help: &str, maximum: usize) -> String {
+    const MARKER: &str = "\n[help truncated]\n";
+    if help.len() < maximum {
+        return format!("\n{help}");
+    }
+    if maximum <= MARKER.len() + 1 {
+        return String::new();
+    }
+    let mut end = maximum - MARKER.len() - 1;
+    while !help.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("\n{}{MARKER}", &help[..end])
 }
 
 fn proposed<P: Provider>(proposal: Proposal<P>) -> CommandRunOutcome {
@@ -612,5 +682,47 @@ fn proposed<P: Provider>(proposal: Proposal<P>) -> CommandRunOutcome {
         capability,
         input,
         secret_use: proposal.secret_use,
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::{bounded_help, matched_help};
+    use clap::{Arg, Command};
+
+    #[test]
+    fn matched_help_ignores_option_values_and_uses_validated_nested_commands() {
+        let grammar = Command::new("fixture")
+            .arg(Arg::new("target").long("target").num_args(1))
+            .subcommand(
+                Command::new("count")
+                    .about("Count items")
+                    .subcommand(Command::new("deep").about("Deep count")),
+            );
+        let help = |words: &[&str]| {
+            matched_help(
+                &grammar,
+                &words
+                    .iter()
+                    .map(|word| (*word).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(
+            help(&["--target", "count", "--bad"]).contains("Usage: fixture"),
+            "{}",
+            help(&["--target", "count", "--bad"])
+        );
+        assert!(help(&["--target=count", "count", "deep", "--bad"]).contains("Deep count"));
+        assert!(help(&["count", "--unknown", "deep"]).contains("Count items"));
+        assert!(help(&["unknown", "count"]).contains("Usage: fixture"));
+    }
+
+    #[test]
+    fn help_truncation_stays_on_utf8_boundaries_within_its_budget() {
+        let help = "é".repeat(5000);
+        let bounded = bounded_help(&help, 4096);
+        assert!(bounded.len() <= 4096);
+        assert!(bounded.ends_with("[help truncated]\n"));
     }
 }

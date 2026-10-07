@@ -333,14 +333,14 @@ storage-constrained generic capabilities, agent-scoped ones included, whose name
 conversation; a statement that must not reach them from a smoke session adds
 `unless { context.transport == "console-smoke" }`.
 
-A console profile can author a real scope. The operator console attests with whatever `scope` its
-profile names, and its attestor grant (the chart grants the console UID its configured subject's
-namespace) admits any canonical conversation for that subject. Cedar sees the claimed transport and
-conversation as typed context, and private-conversation storage keys on subject, transport and
-conversation but not `via`, so a console claim of a real conversation addresses that conversation's
-memory, and under `authority-bound` continuity a console read with different effective permissions
-rotates its generation. Memory permits therefore key on `context.transport == "console-smoke"` or
-on the gateway's `via` (`context.via == "dekopon-gatewayd"`), never on the console's `via` alone.
+The broker refuses a real conversation scope from the authenticated `dekopon-console` peer
+before canonicalization, Cedar evaluation, or storage preparation. Its subject mapping and attestor
+namespace still apply to unscoped and exact `console-smoke` claims; a gateway-authenticated real
+conversation remains eligible for its own policy and storage checks. Console real-scope refusals
+report `dekopon sandbox:` with the synthetic or authenticated-gateway remedy. An unmapped subject
+or a peer without attestor authority still receives an opaque refusal. Memory permits retain both
+the `context.transport == "console-smoke"` restriction and the gateway's `via`
+(`context.via == "dekopon-gatewayd"`), rather than trusting a console-authored transport.
 
 Storage audit records carry every field a non-storage record does — principal, actor/agent,
 via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —

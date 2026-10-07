@@ -102,6 +102,11 @@ impl QuotaLedger {
             .union(&state.pending_namespace_slots)
             .count() as u64;
         if count >= self.limits.max_namespaces {
+            tracing::warn!(
+                event = "storage_namespace_slot_refused",
+                storage.namespace.count = count,
+                storage.namespace.limit = self.limits.max_namespaces,
+            );
             return Err(StorageHostError::QuotaExceeded);
         }
         state.pending_namespace_slots.insert(namespace.clone());

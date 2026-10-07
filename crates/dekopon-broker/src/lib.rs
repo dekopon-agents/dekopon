@@ -2028,6 +2028,13 @@ where
                 let (context, refusal) = self.resolve_context(peer, grant, claim);
                 if let Some(refusal) = refusal {
                     report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+                    if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                        return Ok(CommandRunOutcome::Rendered {
+                            stdout: String::new(),
+                            stderr: format!("{CONSOLE_REAL_SCOPE_REFUSAL}\n"),
+                            status: 2,
+                        });
+                    }
                     return Err(BrokerHostError::UnknownCommandWord {
                         word: word.to_owned(),
                     });
@@ -2201,7 +2208,13 @@ where
         // distinguish denial classes could read the subject directory and agent grants out of its
         // own refusals, so every one collapses to the same literal.
         if chat.is_some() {
-            refusal = refusal.map(Refusal::opaque);
+            refusal = refusal.map(|refusal| {
+                if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                    refusal
+                } else {
+                    refusal.opaque()
+                }
+            });
         }
         if let Some(claim) = chat
             && refusal.is_none()
@@ -2254,21 +2267,29 @@ where
         {
             turn.delivery = console_smoke_delivery(scope, turn.delivery);
         }
-        let refusal = claim_refusal.map(Refusal::opaque).or_else(|| {
-            if !attestation.binds(&turn.id) {
-                Some(unevaluated_refusal(CHAT_REFUSAL))
-            } else if self.memory_surface(&context, &attestation.agent).is_none() {
-                Some(unevaluated_refusal("memory-unavailable"))
-            } else if !turn.is_bounded()
-                || !context
-                    .chat_scope()
-                    .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
-            {
-                Some(unevaluated_refusal("invalid-turn"))
-            } else {
-                None
-            }
-        });
+        let refusal = claim_refusal
+            .map(|refusal| {
+                if refusal.reason == CONSOLE_REAL_SCOPE_REFUSAL {
+                    refusal
+                } else {
+                    refusal.opaque()
+                }
+            })
+            .or_else(|| {
+                if !attestation.binds(&turn.id) {
+                    Some(unevaluated_refusal(CHAT_REFUSAL))
+                } else if self.memory_surface(&context, &attestation.agent).is_none() {
+                    Some(unevaluated_refusal("memory-unavailable"))
+                } else if !turn.is_bounded()
+                    || !context
+                        .chat_scope()
+                        .is_some_and(|scope| turn.delivery.is_canonical_for(scope))
+                {
+                    Some(unevaluated_refusal("invalid-turn"))
+                } else {
+                    None
+                }
+            });
         let capability = self
             .constraints
             .routed(CapabilityRoute::ChatMemoryRecord)
@@ -2321,6 +2342,12 @@ where
         if !grant.permits(&claim.subject) {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         }
+        if self.console_real_scope_refused(peer, claim) {
+            return (
+                refused(),
+                Some(unevaluated_refusal(CONSOLE_REAL_SCOPE_REFUSAL)),
+            );
+        }
         let scope = match &claim.scope {
             Some(scope) if scope.transport.as_str() == CONSOLE_SMOKE_TRANSPORT => {
                 if !is_console_smoke_literal(scope) {
@@ -2365,6 +2392,20 @@ where
         } else {
             (context, Some(decided_refusal(decision, "agent-denied")))
         }
+    }
+
+    #[must_use]
+    pub fn console_real_scope_refused(
+        &self,
+        peer: &AuthenticatedContext,
+        claim: &Attestation,
+    ) -> bool {
+        peer.principal().as_str() == "dekopon-console"
+            && claim
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.transport.as_str() != CONSOLE_SMOKE_TRANSPORT)
+            && self.identities.resolve(&claim.subject).is_some()
     }
 
     fn console_smoke_conversation(
@@ -3791,6 +3832,7 @@ const CHAT_REFUSAL: &str = "chat-attestation-denied";
 
 const CONSOLE_SMOKE_TRANSPORT: &str = "console-smoke";
 const CONSOLE_SMOKE_REFUSAL: &str = "console-smoke-claim-denied";
+pub const CONSOLE_REAL_SCOPE_REFUSAL: &str = "dekopon sandbox: console sessions cannot attest a real conversation; use --smoke-conversation or the authenticated gateway";
 const CONSOLE_SMOKE_DOMAIN: &[u8] = b"dekopon-console-smoke-v1\0";
 
 fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {

@@ -352,12 +352,21 @@ async fn attested_broker(
         "policy-test".to_owned(),
         probe_engine(
             &format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}",
                 attested_policy("cpetersen", "some-agent", "gateway", "cli-probe.upper"),
                 agent_prompt_policy("cpetersen", "some-agent", "gateway"),
                 agent_prompt_policy("oncall", "some-agent", "gateway"),
+                attested_policy(
+                    "cpetersen",
+                    "some-agent",
+                    "dekopon-console",
+                    "cli-probe.upper"
+                )
+                .replace("attested-via", "console-attested-via"),
+                agent_prompt_policy("cpetersen", "some-agent", "dekopon-console")
+                    .replace("-prompts-", "-console-prompts-"),
             ),
-            ["cpetersen", "oncall", "gateway"],
+            ["cpetersen", "oncall", "gateway", "dekopon-console"],
         ),
         catalog([(
             "cli-probe.upper",
@@ -2257,6 +2266,141 @@ async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() 
             AuditEvent::Decision { reason: Some(reason), .. } if reason == "console-smoke-claim-denied"
         )).count(),
         deviations.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_console_cannot_attest_a_real_scope() {
+    let audit = Arc::new(InMemoryAuditLog::new(64).expect("audit"));
+    let broker = attested_broker(
+        directory([(SLACK_SUBJECT, "cpetersen")]),
+        Arc::clone(&audit),
+    )
+    .await;
+    let console = service_context("dekopon-console");
+    let gateway = service_context("gateway");
+    let grant = attestor_grant(["slack.t0123abc"]);
+    let mut real = smoke_claim();
+    let scope = real.scope.as_mut().expect("chat scope");
+    scope.transport = "scientist-slack".parse().expect("transport");
+    scope.kind = dekopon_broker::ChatTransportKind::Slack;
+    scope.conversation.kind = dekopon_broker::ConversationKind::Thread;
+    scope.conversation.container = Some("t0123abc".to_owned());
+    scope.conversation.id = "c0123abc".to_owned();
+    scope.conversation.thread = Some("1712345678.000100".to_owned());
+    let refused_capabilities = broker
+        .capability_surface(&console, Some(&grant), Some(&real))
+        .is_none();
+    assert!(
+        broker
+            .capability_surface(&gateway, Some(&grant), Some(&real))
+            .is_some()
+    );
+    assert!(
+        broker
+            .capability_surface(&console, Some(&grant), Some(&smoke_claim()))
+            .is_some()
+    );
+    assert!(
+        broker
+            .capability_surface(
+                &console,
+                Some(&grant),
+                Some(&Attestation::for_subject(
+                    subject(SLACK_SUBJECT),
+                    agent("some-agent")
+                ))
+            )
+            .is_some()
+    );
+    assert!(
+        audit.records().is_empty(),
+        "inspection must not evaluate a capability"
+    );
+
+    let CommandRunOutcome::Rendered { stderr, status, .. } = broker
+        .run_command(
+            &console,
+            Some(&grant),
+            Some(&real),
+            "probe",
+            &["--help".to_owned()],
+            false,
+        )
+        .await
+        .expect("known console denial is rendered")
+    else {
+        panic!("rendered denial");
+    };
+    let refused_run_command = status == 2 && stderr.starts_with("dekopon sandbox:");
+    let unknown = Attestation::for_chat(
+        subject("slack.t0123abc.unmapped"),
+        agent("some-agent"),
+        real.scope.clone().expect("scope"),
+    );
+    assert!(
+        broker
+            .capability_surface(&console, Some(&grant), Some(&unknown))
+            .is_none()
+    );
+    assert!(matches!(
+        broker
+            .run_command(&console, Some(&grant), Some(&unknown), "probe", &[], false)
+            .await,
+        Err(dekopon_broker_host::BrokerHostError::UnknownCommandWord { .. })
+    ));
+
+    let id = "console-real-invoke".parse::<InvocationId>().expect("id");
+    let result = broker
+        .invoke(
+            &console,
+            Some(&grant),
+            Some(&real.clone().bound_to(id)),
+            request(
+                "console-real-invoke",
+                "cli-probe.upper",
+                json!({"text": "no execution"}),
+            ),
+            Default::default(),
+        )
+        .await
+        .expect("denial is accounted");
+    let refused_invoke = result.result.outcome == dekopon_capability::InvocationOutcome::Denied
+        && result.result.error.as_deref() == Some(dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL);
+
+    let turn = dekopon_broker_protocol::DeliveredTurnRequest::new(
+        "console-real-record".parse().expect("id"),
+        TRACE_PARENT.parse().expect("trace"),
+        dekopon_broker_protocol::DeliveryIdentity::Local {
+            transport: "local-dev".parse().expect("transport"),
+            conversation: "placeholder".to_owned(),
+            boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            connection: 1,
+            sequence: 1,
+        },
+        "synthetic".to_owned(),
+        dekopon_broker_protocol::DeliveredAnswer::accepted_by_transport("answer".to_owned()),
+    );
+    let result = broker
+        .record_delivered_turn(
+            &console,
+            Some(&grant),
+            &real.bound_to("console-real-record".parse().expect("id")),
+            turn,
+        )
+        .await
+        .expect("record refusal accounted");
+    let refused_record = result.outcome == dekopon_capability::InvocationOutcome::Denied
+        && result.error.as_deref() == Some(dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL);
+    assert!(
+        refused_capabilities && refused_run_command && refused_invoke && refused_record,
+        "console boundary (capabilities, run-command, invoke, record): \
+         {refused_capabilities}, {refused_run_command}, {refused_invoke}, {refused_record}"
+    );
+    assert_eq!(
+        audit.records().len(),
+        2,
+        "denials audit decisions but never execute"
     );
 }
 

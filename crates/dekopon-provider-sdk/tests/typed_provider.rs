@@ -804,6 +804,32 @@ fn help_and_usage_render_from_the_args_with_no_escape_byte() {
 }
 
 #[test]
+fn a_bad_flag_keeps_clap_error_and_appends_the_matched_help() {
+    let CommandRunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = run(&["count", "--bearer", DRN, "abc", "--not-an-option"], false)
+    else {
+        panic!("bad flag must render");
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.starts_with("error: unexpected argument '--not-an-option'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Usage: fixture count"), "{stderr}");
+    assert!(
+        stderr.contains("Count the characters of the text"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--bearer <BEARER>"), "{stderr}");
+    assert!(!stderr.contains("Upper-case the text"), "{stderr}");
+    assert!(stderr.contains("--help"), "{stderr}");
+}
+
+#[test]
 fn a_command_proposes_the_capability_with_its_typed_input() {
     assert_eq!(
         run(&["upper", "--text", "hi"], false),
