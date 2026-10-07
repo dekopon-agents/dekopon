@@ -852,7 +852,7 @@ async fn an_unsent_gateway_job_leg_survives_a_broker_restart_and_a_fresh_connect
     let mut new_broker = tokio::spawn(dekopon_brokerd::run(
         path,
         async move {
-            let _ = stopped_new.await;
+            stopped_new.await.expect("replacement shutdown requested");
         },
         dekopon_brokerd::ShutdownDeadline::default(),
     ));
