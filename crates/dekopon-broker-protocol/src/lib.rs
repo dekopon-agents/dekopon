@@ -1488,7 +1488,13 @@ pub struct BrokerClient {
     socket: PathBuf,
     expected_server_uid: u32,
     limits: FrameLimits,
+    connect_window: Duration,
 }
+
+#[cfg(unix)]
+const CONNECT_BACKOFF: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const MAX_CONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 impl BrokerClient {
@@ -1501,7 +1507,16 @@ impl BrokerClient {
             socket: socket.into(),
             expected_server_uid,
             limits: limits.validate().map_err(ClientError::Limits)?,
+            connect_window: Duration::ZERO,
         })
+    }
+
+    /// Keeps retrying a missing or refusing broker socket for up to `window` per request, which
+    /// is safe only because nothing was written: a failure after the request is never retried.
+    #[must_use]
+    pub const fn with_connect_window(mut self, window: Duration) -> Self {
+        self.connect_window = window;
+        self
     }
 
     /// The three refusal causes are deliberately indistinguishable, so a refused caller cannot
@@ -1700,16 +1715,7 @@ impl BrokerClient {
                 phase: ExchangePhase::Request,
                 source,
             })?;
-        validate_socket_path(&self.socket, self.expected_server_uid).await?;
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "tokio's Elapsed says only that io_timeout expired, which \
-                      ClientError::ConnectTimeout already states"
-        )]
-        let stream = timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
-            .await
-            .map_err(|_| ClientError::ConnectTimeout)?
-            .map_err(|source| ClientError::Connect { source })?;
+        let stream = self.connect().await?;
         let credentials = match stream.peer_cred() {
             Ok(credentials) => credentials,
             Err(source) => {
@@ -1728,6 +1734,39 @@ impl BrokerClient {
             return Err(refusal_after_write_failure(&mut stream, source, self.limits).await);
         }
         Ok(stream)
+    }
+}
+
+#[cfg(unix)]
+impl BrokerClient {
+    async fn connect(&self) -> Result<UnixStream, ClientError> {
+        let started = tokio::time::Instant::now();
+        let mut backoff = CONNECT_BACKOFF;
+        loop {
+            let absent = match self.connect_once().await {
+                Err(error) if error.is_absent_broker() => error,
+                result => return result,
+            };
+            let remaining = self.connect_window.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(absent);
+            }
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(MAX_CONNECT_BACKOFF);
+        }
+    }
+
+    async fn connect_once(&self) -> Result<UnixStream, ClientError> {
+        validate_socket_path(&self.socket, self.expected_server_uid).await?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "tokio's Elapsed says only that io_timeout expired, which \
+                      ClientError::ConnectTimeout already states"
+        )]
+        timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
+            .await
+            .map_err(|_| ClientError::ConnectTimeout)?
+            .map_err(|source| ClientError::Connect { source })
     }
 }
 
@@ -1899,6 +1938,22 @@ impl fmt::Display for ExchangePhase {
 
 #[cfg(unix)]
 impl ClientError {
+    #[must_use]
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "only the two pre-connect failures name an absent broker"
+    )]
+    fn is_absent_broker(&self) -> bool {
+        match self {
+            Self::SocketMetadata { source } => source.kind() == io::ErrorKind::NotFound,
+            Self::Connect { source } => matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ),
+            _ => false,
+        }
+    }
+
     #[must_use]
     #[expect(
         clippy::wildcard_enum_match_arm,

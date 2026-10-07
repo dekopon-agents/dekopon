@@ -12,9 +12,9 @@ use std::{
 
 use dekopon_agent::prompt::HistoryLimits;
 use dekopon_broker_protocol::{
-    BrokerSocketDiscovery, ChatTransportKind, ConversationKind, ConversationKindMatch,
-    ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES,
-    FrameLimits, ProtocolError, ResolvedBrokerSocket,
+    BrokerClient, BrokerSocketDiscovery, ChatTransportKind, ClientError, ConversationKind,
+    ConversationKindMatch, ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT,
+    DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
 use dekopon_core::{
     AgentId, ExternalSubject, FileHygieneError, FileTier,
@@ -869,6 +869,16 @@ pub struct ResolvedBroker {
     pub socket_path: PathBuf,
     pub server_uid: u32,
     pub frame: FrameLimits,
+}
+
+impl ResolvedBroker {
+    /// A leg's client waits out a restarting broker for one I/O timeout before failing.
+    pub fn leg_client(&self) -> Result<BrokerClient, ClientError> {
+        Ok(
+            BrokerClient::new(&self.socket_path, self.server_uid, self.frame)?
+                .with_connect_window(self.frame.io_timeout),
+        )
+    }
 }
 
 #[derive(Debug)]

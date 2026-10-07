@@ -18,6 +18,7 @@ pub mod capabilities;
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
 mod config;
 mod credentials;
+mod lock_watch;
 mod provider_manager;
 mod reaper;
 mod secrets;
@@ -29,6 +30,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use config::LoadMode;
@@ -64,7 +66,7 @@ pub use secrets::{
     HARD_MAX_SECRET_BYTES, HARD_MAX_SECRET_MAP_BYTES, HARD_MAX_SECRETS, SECRET_MAP_API_VERSION,
     SecretMapError, SourceError,
 };
-pub use server::{BrokerServer, MappedPeer, ServerError, ServerLimits};
+pub use server::{BrokerServer, MappedPeer, ServerError, ServerLimits, ShutdownDeadline};
 pub use socket::{SocketError, SocketGuard, current_uid};
 
 pub const HARD_MAX_PROVIDERS: usize = 64;
@@ -76,7 +78,23 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
-pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), BrokerdError>
+pub async fn run<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+{
+    serve(config_path, shutdown, deadline, lock_watch::POLL).await
+}
+
+async fn serve<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+    lock_poll: Duration,
+) -> Result<(), BrokerdError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -154,6 +172,7 @@ where
         shutdown_grace: config.server_limits.shutdown_grace(),
     };
     let socket_path = std::mem::take(&mut config.socket_path);
+    let provider_lock = config.provider_lock.take();
     let mut warnings = Vec::new();
     let prepared = prepare(
         config,
@@ -172,10 +191,28 @@ where
     }
     let Ready { broker, identities } = prepared.map_err(BrokerdError::from_problems)?;
     let retention = broker.storage_retention_policies();
-    let server = BrokerServer::new(Arc::new(broker), identities, limits)?;
+    let server = BrokerServer::new(Arc::new(broker), identities, limits)?
+        .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
-    let result = reaper::serve(server.serve(listener, shutdown), storage, retention).await;
+    let mut lock_stop = None;
+    let stop = async {
+        lock_stop = stopped(shutdown, provider_lock.as_ref(), uid, lock_poll).await;
+        // Unlinking at admission close sends a new connect to NotFound, which clients retry,
+        // instead of into a listener that will never accept it.
+        if let Err(error) = socket_guard.cleanup() {
+            tracing::warn!(
+                event = "broker_socket_cleanup_failed",
+                error = %error_chain(&error)
+            );
+        }
+    };
+    let serving = async {
+        let result = server.serve(listener, stop).await;
+        deadline.start(limits.shutdown_grace);
+        result
+    };
+    let result = reaper::serve(serving, storage, retention, deadline.clone()).await;
 
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
@@ -190,7 +227,29 @@ where
     result?;
     tracing::info!(event = "broker_stopped");
     cleanup?;
-    Ok(())
+    match lock_stop {
+        None | Some(lock_watch::LockStop::Changed) => Ok(()),
+        Some(lock_watch::LockStop::Unsettled) => Err(BrokerdError::ProviderLockUnsettled),
+    }
+}
+
+async fn stopped<F>(
+    shutdown: F,
+    lock: Option<&lock_watch::LoadedLock>,
+    uid: u32,
+    poll: Duration,
+) -> Option<lock_watch::LockStop>
+where
+    F: Future<Output = ()>,
+{
+    let Some(lock) = lock else {
+        shutdown.await;
+        return None;
+    };
+    tokio::select! {
+        () = shutdown => None,
+        stop = lock_watch::watch(lock, uid, poll) => Some(stop),
+    }
 }
 
 /// Where `check` resolves a configuration's `providerSet`: the operator's provider set, synced into
@@ -848,6 +907,10 @@ pub enum BrokerdError {
     ProviderSetUnused,
     #[error("the provider set could not be resolved")]
     ProviderSet(#[source] ProviderManagerError),
+    #[error(
+        "the provider lock never read as one stable file; the broker drained so a restart rereads it"
+    )]
+    ProviderLockUnsettled,
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,

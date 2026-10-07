@@ -5,7 +5,7 @@ use std::{
 };
 
 use dekopon_agent::{BrokerLeg, current_trace_parent};
-use dekopon_broker_protocol::{BrokerClient, TraceParent, Trigger};
+use dekopon_broker_protocol::{TraceParent, Trigger};
 use dekopon_core::AgentId;
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{
@@ -587,15 +587,13 @@ impl JobContext {
     }
 
     fn connect(&self, signal: CancelSignal) -> Option<BrokerLeg> {
-        let client = BrokerClient::new(
-            &self.broker.socket_path,
-            self.broker.server_uid,
-            self.broker.frame,
-        )
-        .inspect_err(|error| {
-            tracing::warn!(event = "gateway_job_leg_unavailable", error = %error);
-        })
-        .ok()?;
+        let client = self
+            .broker
+            .leg_client()
+            .inspect_err(|error| {
+                tracing::warn!(event = "gateway_job_leg_unavailable", error = %error);
+            })
+            .ok()?;
         let leg = self
             .runtime
             .block_on(BrokerLeg::connect(

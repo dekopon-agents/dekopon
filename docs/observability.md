@@ -854,6 +854,8 @@ the refresh failure classes remain part of the migration contract.
 | `gateway_child_script_panicked` | warn | `dekopon-agent` | parent invocation ID; the gateway answers with status 70 and releases child stdout |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
+| `broker_provider_lock_changed` | warn | `dekopon-brokerd` | `lock.loaded` and `lock.current`, the `sha256:` digests of the lock the broker booted from and the stable replacement it read; the broker drains and exits for a restart. Never the lock body. |
+| `broker_provider_lock_unsettled` | error | `dekopon-brokerd` | `lock.loaded`, `polls`, `cause` (`unreadable` or `unstable`) and, when unreadable, the read error's chain; the broker drains and exits non-zero |
 | `broker_peer_unmapped` | warn | `dekopon-brokerd` | `peer.uid`, the UID the refused connection authenticated as |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested `runCommand`

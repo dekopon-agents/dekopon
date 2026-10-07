@@ -3,7 +3,7 @@ use std::{future::Future, time::Duration};
 use dekopon_storage_host::{RetentionPolicies, StorageHost, StorageHostError, SweepSummary};
 use tokio::{task::JoinError, time::MissedTickBehavior};
 
-use crate::{BrokerdError, ServerError};
+use crate::{BrokerdError, ServerError, ShutdownDeadline};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -11,6 +11,7 @@ pub(crate) async fn serve<F>(
     server: F,
     storage: Option<StorageHost>,
     policies: RetentionPolicies,
+    deadline: ShutdownDeadline,
 ) -> Result<(), BrokerdError>
 where
     F: Future<Output = Result<(), ServerError>>,
@@ -31,7 +32,7 @@ where
         let mut sweep = tokio::task::spawn_blocking(move || host.sweep(&policies));
         tokio::select! {
             result = &mut server => {
-                return drain_after_server(result, sweep).await;
+                return drain_after_server(result, sweep, &deadline).await;
             }
             result = &mut sweep => finish(result)?,
         }
@@ -41,9 +42,17 @@ where
 async fn drain_after_server(
     server: Result<(), ServerError>,
     sweep: tokio::task::JoinHandle<Result<SweepSummary, StorageHostError>>,
+    deadline: &ShutdownDeadline,
 ) -> Result<(), BrokerdError> {
-    // Native deletion must finish before the broker releases its storage root lease.
-    let cleanup = finish(sweep.await);
+    // Native deletion finishes before the storage root lease is released; past the shutdown
+    // deadline the process exits holding both, and the lease dies with it.
+    let cleanup = match deadline.get() {
+        Some(deadline) => match tokio::time::timeout_at(deadline, sweep).await {
+            Ok(result) => finish(result),
+            Err(_) => Err(BrokerdError::Server(ServerError::ShutdownTimeout)),
+        },
+        None => finish(sweep.await),
+    };
     server?;
     cleanup
 }
@@ -138,6 +147,7 @@ mod tests {
             },
             Some(host),
             policies,
+            ShutdownDeadline::default(),
         ));
         tokio::time::timeout(Duration::from_secs(10), async {
             while resource.exists() {
@@ -155,12 +165,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = root.path().canonicalize().unwrap().join("storage");
         let (host, policies, resource) = expired_resource(&storage);
-        serve(async { Ok(()) }, Some(host), policies).await.unwrap();
+        serve(
+            async { Ok(()) },
+            Some(host),
+            policies,
+            ShutdownDeadline::default(),
+        )
+        .await
+        .unwrap();
         assert!(resource.exists());
     }
 
-    #[tokio::test]
-    async fn shutdown_drains_a_started_native_sweep_even_after_server_failure() {
+    fn parked_sweep() -> (
+        std::sync::mpsc::Sender<()>,
+        oneshot::Receiver<()>,
+        tokio::task::JoinHandle<Result<SweepSummary, StorageHostError>>,
+    ) {
         let (release, released) = std::sync::mpsc::channel();
         let (started, ready) = oneshot::channel();
         let sweep = tokio::task::spawn_blocking(move || {
@@ -168,17 +188,40 @@ mod tests {
             released.recv().unwrap();
             Ok(SweepSummary::default())
         });
+        (release, ready, sweep)
+    }
+
+    #[tokio::test]
+    async fn a_started_native_sweep_drains_inside_the_shutdown_deadline_even_after_server_failure()
+    {
+        let (release, ready, sweep) = parked_sweep();
         ready.await.unwrap();
-        let drain = drain_after_server(Err(ServerError::ShutdownTimeout), sweep);
+        let deadline = ShutdownDeadline::default();
+        deadline.start(Duration::from_secs(60));
+        let drain = drain_after_server(Err(ServerError::ShutdownTimeout), sweep, &deadline);
         tokio::pin!(drain);
         tokio::select! {
             biased;
-            _ = &mut drain => panic!("shutdown abandoned a native sweep"),
+            _ = &mut drain => panic!("shutdown abandoned a native sweep inside its deadline"),
             () = tokio::task::yield_now() => {}
         }
         release.send(()).unwrap();
         assert!(matches!(
             drain.await,
+            Err(BrokerdError::Server(ServerError::ShutdownTimeout))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sweep_still_running_at_the_shutdown_deadline_fails_the_shutdown() {
+        let (release, ready, sweep) = parked_sweep();
+        ready.await.unwrap();
+        let deadline = ShutdownDeadline::default();
+        deadline.start(Duration::from_millis(50));
+        let result = drain_after_server(Ok(()), sweep, &deadline).await;
+        release.send(()).unwrap();
+        assert!(matches!(
+            result,
             Err(BrokerdError::Server(ServerError::ShutdownTimeout))
         ));
     }
@@ -200,6 +243,7 @@ mod tests {
             async { Err(ServerError::ShutdownTimeout) },
             None,
             RetentionPolicies::new(),
+            ShutdownDeadline::default(),
         )
         .await;
         assert!(matches!(

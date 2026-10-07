@@ -29,7 +29,7 @@ daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-broker
 | Question | Read |
 |---|---|
 | What files and directories must exist, and with what ownership and modes? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) |
-| How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
+| How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; a running broker drains and exits on a successful lock change so its supervisor restarts it |
 | Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
 | Why did the gateway refuse to start? | [`gatewayd.md` § Startup fails closed](gatewayd.md#startup-fails-closed) |

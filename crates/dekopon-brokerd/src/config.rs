@@ -26,7 +26,7 @@ use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 
-use crate::capabilities::ProviderCapabilities;
+use crate::{capabilities::ProviderCapabilities, lock_watch::LoadedLock};
 use thiserror::Error;
 
 pub use crate::HARD_MAX_PROVIDERS;
@@ -304,6 +304,7 @@ pub struct ResolvedConfig {
     pub secret_map_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
     pub locked_providers: Option<Vec<LockedProviderSource>>,
+    pub provider_lock: Option<LoadedLock>,
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
@@ -675,13 +676,21 @@ async fn resolve(
             Ok::<_, ConfigError>((lock_path, store_path))
         })
         .transpose()?;
-    let locked_providers = match (&managed_provider_paths, mode) {
-        (None, _) | (Some(_), LoadMode::Check) => None,
-        (Some((lock_path, store_path)), LoadMode::Boot) => Some(
-            provider_manager::load_locked_sources(lock_path, store_path, expected_uid)
-                .await
-                .map_err(|source| ConfigError::ProviderLock { source })?,
-        ),
+    let (locked_providers, provider_lock) = match (&managed_provider_paths, mode) {
+        (None, _) | (Some(_), LoadMode::Check) => (None, None),
+        (Some((lock_path, store_path)), LoadMode::Boot) => {
+            let (sources, digest) =
+                provider_manager::load_locked_digest(lock_path, store_path, expected_uid)
+                    .await
+                    .map_err(|source| ConfigError::ProviderLock { source })?;
+            (
+                Some(sources),
+                Some(LoadedLock {
+                    path: lock_path.clone(),
+                    digest,
+                }),
+            )
+        }
     };
     let mut provider_set = BTreeSet::new();
     let mut providers = locked_providers
@@ -949,6 +958,7 @@ async fn resolve(
         secret_map_path,
         providers,
         locked_providers,
+        provider_lock,
         strict: config.strict,
         identities: config.identities,
         principals: config.principals,
