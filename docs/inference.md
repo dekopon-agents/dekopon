@@ -378,6 +378,14 @@ cargo test -p dekopon-agent --locked --no-run --example compare_models
 cargo test -p dekopon-agent --locked --test compare_models
 ```
 
+[`script_tool_eval.rs`](../crates/dekopon-agent/examples/script_tool_eval.rs) is the prompt-eval
+sibling: `--model <openrouter id> --task <instruction file> --out <transcript.json>` runs one chat
+message through the same loop against a real `dekopon-shell` whose two command words (`gh`, `wiki`)
+answer from canned data, with one ungranted and one denied capability, and writes a JSON transcript:
+each model turn's tool-call names and argument keys, each script with its exit code and output head,
+the final answer or the fatal `PromptError` kind, turns and token usage. Its tests run offline; a run
+makes billed OpenRouter requests and needs the same operator authorization.
+
 The second command is the offline proof: `LoopbackServer::sequence` supplies synthetic tool and
 answer streams for both adapters, and the same prompt loop executes one synthetic runtime call
 and sends its result back with native continuation state. No production endpoint is contacted.

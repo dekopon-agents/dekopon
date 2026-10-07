@@ -50,5 +50,9 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "compare_models"
 test = true
 
+[[example]]
+name = "script_tool_eval"
+test = true
+
 [lints]
 workspace = true
