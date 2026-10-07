@@ -1742,8 +1742,13 @@ impl BrokerClient {
     async fn connect(&self) -> Result<UnixStream, ClientError> {
         let started = tokio::time::Instant::now();
         let mut backoff = CONNECT_BACKOFF;
+        let mut budget = if self.connect_window.is_zero() {
+            self.limits.io_timeout
+        } else {
+            self.connect_window.min(self.limits.io_timeout)
+        };
         loop {
-            let absent = match self.connect_once().await {
+            let absent = match self.connect_once(budget).await {
                 Err(error) if error.is_absent_broker() => error,
                 result => return result,
             };
@@ -1752,21 +1757,31 @@ impl BrokerClient {
                 return Err(absent);
             }
             tokio::time::sleep(backoff.min(remaining)).await;
+            budget = self
+                .connect_window
+                .saturating_sub(started.elapsed())
+                .min(self.limits.io_timeout);
+            if budget.is_zero() {
+                return Err(absent);
+            }
             backoff = backoff.saturating_mul(2).min(MAX_CONNECT_BACKOFF);
         }
     }
 
-    async fn connect_once(&self) -> Result<UnixStream, ClientError> {
-        validate_socket_path(&self.socket, self.expected_server_uid).await?;
+    async fn connect_once(&self, budget: Duration) -> Result<UnixStream, ClientError> {
         #[allow(
             clippy::map_err_ignore,
-            reason = "tokio's Elapsed says only that io_timeout expired, which \
+            reason = "tokio's Elapsed says only that the attempt's budget expired, which \
                       ClientError::ConnectTimeout already states"
         )]
-        timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
-            .await
-            .map_err(|_| ClientError::ConnectTimeout)?
-            .map_err(|source| ClientError::Connect { source })
+        timeout(budget, async {
+            validate_socket_path(&self.socket, self.expected_server_uid).await?;
+            UnixStream::connect(&self.socket)
+                .await
+                .map_err(|source| ClientError::Connect { source })
+        })
+        .await
+        .map_err(|_| ClientError::ConnectTimeout)?
     }
 }
 
