@@ -8,6 +8,16 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker lock-change restart and console scope refusal (0.36.0)
+
+Upgrade the broker and gateway together. The broker closes admission and drains under its existing
+shutdown grace when the provider lock changes; the gateway retries only unsent socket connects
+within its broker I/O timeout. An authenticated console cannot attest real conversation scopes;
+synthetic `console-smoke` sessions remain available. The SDK now includes matching command help
+with clap usage errors when providers are next rebuilt; unchanged deployed provider artifacts do
+not gain that behavior. No provider WIT or public SDK API change or fleet re-pin is required.
+Install chart 0.25.0 only after its default image index is pinned to the verified v0.36.0 image.
+
 ## Console smoke scope (0.35.0)
 
 Upgrade the broker and gateway together. The broker accepts the fixed `console-smoke` local

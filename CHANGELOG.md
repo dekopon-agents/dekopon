@@ -7,6 +7,30 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.25.0] - 2026-10-07
+
+### Changed
+
+- Prepare chart 0.25.0 for core v0.36.0; pin the published image index in a separate reviewed change.
+
+## [0.36.0] - 2026-10-07
+
+### Added
+
+- Report storage namespace capacity at startup and on slot refusal.
+
+### Changed
+
+- Append matched CLI help to SDK clap usage errors without changing provider contracts.
+- Keep implicit clap help singular and log a short console-scope refusal reason.
+- Refuse authenticated console real-conversation claims before policy and storage; preserve synthetic smoke sessions.
+- Refuse console real scopes before subject lookup with the same remedy for mapped and unmapped subjects.
+- Release storage quota lock before reporting namespace-slot exhaustion.
+- Select matched CLI help after short options with attached values in provider usage errors.
+- dekopon-brokerd drains and exits for a restart when its providers.lock.yaml changes, and fails closed when the lock stays unreadable.
+- dekopon-brokerd removes its socket the moment shutdown starts, and one shutdown grace now bounds the connection drain, the storage sweep and the telemetry flush.
+- Gateway turns, jobs and probes retry a missing or refusing broker socket until their broker I/O timeout, never after a request was sent.
+
 ## [dekopon-chart-0.24.0] - 2026-10-06
 
 ### Changed
