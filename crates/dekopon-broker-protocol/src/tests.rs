@@ -2698,6 +2698,64 @@ async fn open_gives_up_on_an_absent_broker_at_its_window() {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_stalled_final_connect_attempt_cannot_outlive_its_absolute_window() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("isolated blocking pool");
+    runtime.block_on(async {
+        use super::{BrokerClient, ClientError};
+
+        let directory = private_socket_directory();
+        let socket = directory.path().join("broker.sock");
+        let window = Duration::from_millis(500);
+        let limits = FrameLimits {
+            io_timeout: Duration::from_secs(10),
+            ..RETRY_LIMITS
+        };
+        let client = BrokerClient::new(&socket, owner(directory.path()), limits)
+            .expect("client limits")
+            .with_connect_window(window);
+        let started = tokio::time::Instant::now();
+        let request = tokio::spawn(async move { client.capabilities().await });
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, occupied) = tokio::sync::oneshot::channel::<()>();
+        let blocker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(230)).await;
+            tokio::task::spawn_blocking(move || {
+                entered.send(()).expect("worker reports occupation");
+                held.recv_timeout(Duration::from_secs(3))
+                    .expect("worker released");
+            })
+            .await
+            .expect("blocking worker joins");
+        });
+        occupied
+            .await
+            .expect("the pool is occupied before the final attempt");
+        let attempt = tokio::time::timeout(Duration::from_secs(2), request).await;
+        let elapsed = started.elapsed();
+        release.send(()).expect("release blocking pool");
+        blocker.await.expect("blocking fixture");
+        let error = attempt
+            .expect("an individual connect may not outlive the window")
+            .expect("client task joins")
+            .expect_err("no broker accepted the request");
+        assert!(elapsed <= window + Duration::from_secs(1));
+        assert!(
+            matches!(
+                error,
+                ClientError::ConnectTimeout | ClientError::SocketMetadata { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.may_have_executed());
+    });
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failure_after_the_connect_is_never_retried() {
     use tokio::net::UnixListener;
