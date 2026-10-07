@@ -1477,7 +1477,7 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
             tool: tool.to_owned(),
         });
     };
-    match arguments.get("script") {
+    match arguments.get("script").or_else(|| arguments.get("command")) {
         Some(Value::String(script)) => Ok(script.clone()),
         _ => Err(PromptError::MissingScript {
             tool: tool.to_owned(),
