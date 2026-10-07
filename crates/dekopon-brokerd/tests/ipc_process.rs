@@ -36,6 +36,67 @@ fn wait(child: &mut Child) {
     }
 }
 
+#[tokio::test]
+async fn sigterm_unlinks_admission_and_exits_zero() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("broker.sock");
+    let config = directory.path().join("broker.json");
+    let provider = dekopon_test_support::provider_fixture("cli-probe-provider.wasm");
+    fs::write(&config, serde_json::to_vec(&json!({
+            "apiVersion": "dekopon.dev/brokerd/v1alpha1",
+            "socketPath": socket,
+            "providers": [provider],
+            "identities": [{"uid": dekopon_brokerd::current_uid(), "principal": "caller", "actor": {"type": "service", "principal": "caller"}}],
+            "serverLimits": {"shutdownGraceMs": 1100, "ioTimeoutMs": 500},
+            "hostLimits": {"maxTimeoutMs": 100}
+        })).unwrap()).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut child = Process(
+        Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"))
+            .args(["--config", config.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    while !socket.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "broker failed to start"
+        );
+        assert!(Instant::now() < until, "broker readiness deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    let stream = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(stream) => break stream,
+            Err(error) => {
+                assert!(Instant::now() < until, "broker did not listen: {error}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let status = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "signal was delivered");
+    let until = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < until, "shutdown deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(status.success(), "SIGTERM completed a clean bounded drain");
+    assert!(!socket.exists(), "admission socket was removed on shutdown");
+}
+
 fn owned(path: &Path, uid: u32, gid: u32, mode: u32, root: bool) {
     if root {
         chown(path, Some(uid), Some(gid)).unwrap();

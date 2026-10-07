@@ -591,6 +591,7 @@ async fn boot_ticking(responses: Vec<Value>, keep_alive: Value, model_delay: Dur
             keep_alive: Some(keep_alive),
             model_delay,
             model_hold: None,
+            ..Timing::default()
         },
     )
     .await
@@ -664,6 +665,7 @@ impl ModelHold {
 
 #[derive(Default)]
 struct Timing {
+    jobs: bool,
     keep_alive: Option<Value>,
     model_delay: Duration,
     model_hold: Option<ModelHold>,
@@ -742,6 +744,9 @@ async fn boot_with(
     if let Some(keep_alive) = &timing.keep_alive {
         config["transports"][0]["liveness"]["keepAlive"] = keep_alive.clone();
     }
+    if timing.jobs {
+        config["routes"][0]["limits"]["jobTimeoutMs"] = json!(20_000);
+    }
     write_owner_only(
         &gateway_path,
         &serde_json::to_vec(&config).expect("gateway config serializes"),
@@ -795,6 +800,108 @@ async fn an_unbounded_jq_allocation_does_not_stop_the_next_gateway_message() {
         .expect("second reply");
     assert_eq!(second, "Still here.");
     let _directory = fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsent_gateway_job_leg_survives_a_broker_restart_and_a_fresh_connection_succeeds() {
+    let audit = Audit::exclusive().await;
+    let hold = ModelHold::new();
+    let fixture = boot_with(
+        temporary(),
+        vec![
+            bash_tool_call("job-1", "probe upper --text restarted & wait"),
+            final_answer("The job finished."),
+            final_answer("Fresh connection succeeded."),
+        ],
+        None,
+        "plain",
+        true,
+        &Timing {
+            model_hold: Some(hold.clone()),
+            jobs: true,
+            ..Timing::default()
+        },
+    )
+    .await;
+    let Fixture {
+        directory,
+        broker,
+        stop_broker,
+        gateway,
+        stop_gateway,
+        model_requests,
+        model_prompts,
+    } = fixture;
+    let socket = directory.path().join("dev.sock");
+    let asking = tokio::task::spawn_blocking({
+        let socket = socket.clone();
+        move || ask(&socket, MAPPED_SUBJECT, "run the job")
+    });
+    hold.wait_until_entered().await;
+    stop_broker.send(()).expect("old broker is serving");
+    broker
+        .await
+        .expect("old broker joins")
+        .expect("old broker drains");
+    assert!(!directory.path().join("broker.sock").exists());
+    hold.release();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!directory.path().join("broker.sock").exists());
+    let (stop_new, stopped_new) = oneshot::channel::<()>();
+    let path = directory.path().join("broker.json");
+    let mut new_broker = tokio::spawn(dekopon_brokerd::run(
+        path,
+        async move {
+            let _ = stopped_new.await;
+        },
+        dekopon_brokerd::ShutdownDeadline::default(),
+    ));
+    wait_for_socket(&directory.path().join("broker.sock"), &mut new_broker).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), asking)
+            .await
+            .expect("job reply deadline")
+            .expect("job reply task"),
+        "The job finished."
+    );
+    let tool = model_prompts.lock()[1]["messages"]
+        .as_array()
+        .expect("second model request")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("job result delivered")["content"]
+        .as_str()
+        .expect("tool text")
+        .to_owned();
+    assert!(tool.contains("[exit code: 0]"), "job completed: {tool}");
+    assert_eq!(model_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        audit
+            .find(
+                "broker.execution",
+                &[
+                    ("capability.id", "cli-probe.upper"),
+                    ("outcome", "Succeeded")
+                ]
+            )
+            .is_some(),
+        "job executed against the replacement broker"
+    );
+    let fresh = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "fresh turn"));
+    assert_eq!(
+        fresh.await.expect("fresh reply"),
+        "Fresh connection succeeded."
+    );
+    stop_gateway.send(()).expect("gateway serving");
+    gateway
+        .await
+        .expect("gateway joins")
+        .expect("gateway drains");
+    stop_new.send(()).expect("replacement broker serving");
+    new_broker
+        .await
+        .expect("replacement joins")
+        .expect("replacement drains");
 }
 
 #[tokio::test(flavor = "multi_thread")]
