@@ -1486,8 +1486,8 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 }
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
-Run one script in Dekopon's sandboxed shell. Call it with JSON arguments, for example \
-`{\"script\":\"cap --list\"}`: the script goes inside `script`, not `command`; provider command \
+Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
+`{\"script\":\"cap --list\"}`: the script goes inside `script`, not `command`, and provider command \
 words are not separate model tools. Returns the script's combined output followed by an \
 `[exit code: N]` trailer.
 
@@ -1496,35 +1496,16 @@ only when the next step needs a result you do not have yet.
 - Provider command words are programs inside the script, like `gh pr view 12`; their `--help` \
 pages are below, or run `<word> --help`. `cap --list` prints the granted capability IDs. A \
 refusal is a fact to report: nothing escalates past the grants.
-- Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist. \
-Everything unsupported fails loudly and by name: `eval`, backticks, subshells, and `<<<` are \
-errors. Otherwise the bash you expect works, including `[[ ]]`, functions, `set -e`, \
-here-documents, and redirection into named in-memory buffers.
-- Values are JSON: `x=$(cmd)` parses `{`/`[` output, `${#NAME}` counts an array's elements, and \
-unquoted expansion splits on newlines. `|` carries bytes. Use `jq` for structure.
-- Patterns are literal. `-E` on `grep`/`sed` is the only regex; `case *)` is the default branch \
-and `*.json)` is an error.
-- Only a pipeline's last stage keeps its assignments; `${PIPESTATUS[@]}` lists each stage's \
-status.
-- `cmd &` starts a detached job that outlives this turn (`$!` is its number; `jobs`, `wait %N`, \
-`kill %N`); its first 16 KiB of output returns as a `[gateway: job ...]` message. Its variables \
-and buffers die with it, it cannot send files or images, it ends at its job deadline, and jobs \
-are lost on gateway restart.
-- Budgets on steps, retained bytes, output, time and capability calls end a script by name. \
-Filter inside the script and print only what the next step needs; long output is truncated in \
-the middle. Nothing survives between scripts except what was printed.
+- Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
+patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
+loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
 - The output is your only evidence: never guess what a command returned, accepts, or whether it \
-exists. Exit 0 is success. Exit 1 is a command that ran and failed, with `<name>: failed: ...` \
-on stderr. Exit 2 is a parse error, a refused construct, a usage error, or an exhausted budget. \
-Exit 124 is the wall-clock deadline. Exit 126 means this session holds the capability but \
-authorization refused this use: report it, do not retry. Exit 127 means the word is not a \
-builtin or a command this session's providers add, or needs an ungranted capability: do not \
-guess more names.
+exists. Exit codes: 0 success; 1 ran and failed; 2 parse, usage, refused construct or exhausted \
+budget; 124 deadline; 126 authorization refused this use, do not retry; 127 not a command here or \
+not granted, do not guess more names. Nothing survives between scripts except what was printed.
 - Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
 `sed`, `cut`, `sort`, `uniq`, `wc`, `head`/`tail`, `base64`, `xargs`, `jobs`, `wait`, `kill`. \
-Every builtin answers `--help`; there is no separate `help` builtin.
-- A public secret DRN in your instructions is a name, not a value. Pass it only to a command \
-whose `--help` accepts one; the broker authorizes each use.";
+Every builtin answers `--help`; there is no separate `help` builtin.";
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -3372,20 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_description_explains_detached_jobs_and_their_delivery_limits() {
-        for phrase in [
-            "`cmd &`",
-            "`$!`",
-            "`jobs`",
-            "`wait %N`",
-            "`kill %N`",
-            "variables and buffers die with it",
-            "cannot send files or images",
-            "job deadline",
-            "lost on gateway restart",
-        ] {
-            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
-        }
+    fn a_detached_job_is_not_among_the_refused_constructs() {
         assert!(!refusal_list().iter().any(|name| name.contains('&')));
     }
 
@@ -3511,25 +3479,25 @@ mod tests {
     #[test]
     fn every_outcome_the_description_explains_is_what_the_shell_produces() {
         for (code, phrase) in [
-            (ExitCode::SUCCESS, "Exit 0 is success"),
-            (ExitCode::FAILURE, "Exit 1 is a command that ran and failed"),
+            (ExitCode::SUCCESS, "0 success"),
+            (ExitCode::FAILURE, "1 ran and failed"),
             (
                 ExitCode::SYNTAX,
-                "Exit 2 is a parse error, a refused construct, a usage error, or an exhausted budget",
+                "2 parse, usage, refused construct or exhausted budget",
             ),
-            (ExitCode::TIMEOUT, "Exit 124 is the wall-clock deadline"),
+            (ExitCode::TIMEOUT, "124 deadline"),
             (
                 ExitCode::DENIED,
-                "Exit 126 means this session holds the capability but authorization refused this use",
+                "126 authorization refused this use, do not retry",
             ),
             (
                 ExitCode::NOT_FOUND,
-                "Exit 127 means the word is not a builtin or a command this session's providers add",
+                "127 not a command here or not granted, do not guess more names",
             ),
         ] {
             assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
             assert!(
-                phrase.contains(&format!("Exit {} ", code.get())),
+                phrase.starts_with(&format!("{} ", code.get())),
                 "{phrase} must name exit code {}",
                 code.get()
             );
