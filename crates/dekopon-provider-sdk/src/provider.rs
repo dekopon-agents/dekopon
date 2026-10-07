@@ -613,19 +613,31 @@ fn matched_help(grammar: &clap::Command, argv: &[String]) -> String {
             continue;
         }
         if !options_done && word.starts_with('-') {
-            let (name, inline) = word
+            let (name, mut inline) = word
                 .split_once('=')
                 .map_or((word.as_str(), false), |(name, _)| (name, true));
             let argument = if let Some(long) = name.strip_prefix("--") {
                 command
                     .get_arguments()
                     .find(|arg| arg.get_long() == Some(long))
-            } else if name.len() == 2 {
-                name.chars().nth(1).and_then(|short| {
+            } else if let Some(shorts) = name.strip_prefix('-') {
+                let mut letters = shorts.chars();
+                let argument = letters.next().and_then(|short| {
                     command
                         .get_arguments()
                         .find(|arg| arg.get_short() == Some(short))
-                })
+                });
+                if !letters.as_str().is_empty() {
+                    if argument.is_some_and(|arg| {
+                        arg.get_num_args()
+                            .is_some_and(|range| range.min_values() > 0)
+                    }) {
+                        inline = true;
+                    } else {
+                        break;
+                    }
+                }
+                argument
             } else {
                 None
             };
@@ -693,7 +705,7 @@ mod help_tests {
     #[test]
     fn matched_help_ignores_option_values_and_uses_validated_nested_commands() {
         let grammar = Command::new("fixture")
-            .arg(Arg::new("target").long("target").num_args(1))
+            .arg(Arg::new("target").short('t').long("target").num_args(1))
             .subcommand(
                 Command::new("count")
                     .about("Count items")
@@ -714,6 +726,7 @@ mod help_tests {
             help(&["--target", "count", "--bad"])
         );
         assert!(help(&["--target=count", "count", "deep", "--bad"]).contains("Deep count"));
+        assert!(help(&["-tcount", "count", "deep", "--bad"]).contains("Deep count"));
         assert!(help(&["count", "--unknown", "deep"]).contains("Count items"));
         assert!(help(&["unknown", "count"]).contains("Usage: fixture"));
     }
