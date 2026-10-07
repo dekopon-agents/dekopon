@@ -178,7 +178,7 @@ pub(crate) fn suggest_improvement_into(
     let raw = match raw_suggestion(&call.function.name, &call.function.arguments) {
         Ok(raw) => raw,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind());
+            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
             return Err(error);
         }
     };

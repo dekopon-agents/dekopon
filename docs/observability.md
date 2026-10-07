@@ -173,7 +173,7 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
+| `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
