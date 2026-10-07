@@ -6,7 +6,9 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
 - `prompt::run_prompt` — the bounded model tool loop that always offers one sandboxed
   scripting tool (`bash`) instead of one tool per capability; embedders may additionally
   supply bounded chat-asset, credential-free agent-configuration, skill-reading, and
-  improvement-suggestion tools.
+  improvement-suggestion tools. A model's first call to a tool that was not offered, or a
+  `bash` call without a string `script`, is answered with the tool shape as a tool result;
+  the second such call in a session ends it.
 - `prompt::run_prompt_with_history` — the same loop run as the continuation of a
   `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
   there is no tokenizer here and token counts only arrive after a call has been billed.
