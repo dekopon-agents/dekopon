@@ -545,7 +545,7 @@ where
     } = extensions;
     let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
-        script.description.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+        script.description.push_str("\n\n`progress \"TEXT\" [--eta S]` sets the person's status line; run it before any step over ~10 s.");
     }
     let mut model_tools = vec![script, improvement::improvement_tool()];
     if agent_config.is_some() {
@@ -1177,7 +1177,7 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "The script to run. Multiple lines are expected and encouraged."
+                    "description": "Shell script text, e.g. `cap --list`. Many lines welcome."
                 }
             },
             "required": ["script"],
@@ -1486,26 +1486,15 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 }
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
-Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
-`{\"script\":\"cap --list\"}`: the script goes inside `script`, not `command`, and provider command \
-words are not separate model tools. Returns the script's combined output followed by an \
-`[exit code: N]` trailer.
-
-- Capabilities are reached only through this tool. Do the whole job in one script; send another \
-only when the next step needs a result you do not have yet.
-- Provider command words are programs inside the script, like `gh pr view 12`; their `--help` \
-pages are below, or run `<word> --help`. `cap --list` prints the granted capability IDs. A \
-refusal is a fact to report: nothing escalates past the grants.
-- Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
-patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
-loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
-- The output is your only evidence: never guess what a command returned, accepts, or whether it \
-exists. Exit codes: 0 success; 1 ran and failed; 2 parse, usage, refused construct or exhausted \
-budget; 124 deadline; 126 authorization refused this use, do not retry; 127 not a command here or \
-not granted, do not guess more names. Nothing survives between scripts except what was printed.
-- Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
-`sed`, `cut`, `sort`, `uniq`, `wc`, `head`/`tail`, `base64`, `xargs`, `jobs`, `wait`, `kill`. \
-Every builtin answers `--help`; there is no separate `help` builtin.";
+Run a script in Dekopon's sandboxed shell. Do the whole job in one script and print only what \
+the next step needs; printed output is all that survives to the next call, and your only \
+evidence.\n\
+It is bash without files, processes, network or environment variables. Data and actions come \
+only from the command words below (each answers `--help`) and the builtins jq, cap, cat, echo, \
+printf, test, true, false, sleep, grep, sed, cut, sort, uniq, wc, head, tail, base64, xargs. \
+`cap --list` prints what this session is granted.\n\
+Values are JSON: `x=$(cmd)` parses JSON output, and unquoted `$(...)` splits on newlines only. \
+Patterns are literal; `grep -E` and `sed -E` take a regular expression.";
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -3207,12 +3196,6 @@ mod tests {
             "{}",
             tool.description
         );
-        assert_eq!(
-            tool.description.matches("run `<word> --help`").count(),
-            1,
-            "{}",
-            tool.description
-        );
         assert_no_doubled_spaces(&tool.description);
     }
 
@@ -3299,7 +3282,7 @@ mod tests {
                 .unwrap();
             let mut expected = script_tool(&runtime.command_words(), &BTreeMap::new()).description;
             if enabled {
-                expected.push_str("\n\n`progress \"what the person is waiting for\" [--eta S]` updates their status line; call it once right before any step that takes more than ~10 s.");
+                expected.push_str("\n\n`progress \"TEXT\" [--eta S]` sets the person's status line; run it before any step over ~10 s.");
             }
             assert_eq!(script.description, expected);
         }
@@ -3332,20 +3315,6 @@ mod tests {
         }
     }
 
-    fn refusal_list() -> Vec<&'static str> {
-        let listed = SCRIPT_TOOL_DESCRIPTION
-            .split_once("fails loudly and by name: ")
-            .expect("the description still names the constructs it refuses")
-            .1
-            .split_once(" are errors")
-            .expect("the refusal list still ends at `are errors`")
-            .0;
-        listed
-            .split(", ")
-            .map(|name| name.strip_prefix("and ").unwrap_or(name))
-            .collect()
-    }
-
     #[test]
     fn the_bash_description_stays_short() {
         let words = SCRIPT_TOOL_DESCRIPTION.split_whitespace().count();
@@ -3353,23 +3322,13 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_job_is_not_among_the_refused_constructs() {
-        assert!(!refusal_list().iter().any(|name| name.contains('&')));
-    }
-
-    #[test]
-    fn every_construct_the_description_calls_an_error_is_refused_by_the_shell() {
+    fn eval_backticks_subshells_and_here_strings_are_refused_by_name() {
         let refused = [
             ("`eval`", "eval 'echo hi'", "eval"),
             ("backticks", "echo `echo hi`", "backtick"),
             ("subshells", "(echo hi)", "subshells"),
             ("`<<<`", "cat <<<\"hi\"", "here-string"),
         ];
-
-        assert_eq!(
-            refusal_list(),
-            refused.iter().map(|(name, ..)| *name).collect::<Vec<_>>()
-        );
 
         for (name, script, expected) in refused {
             let outcome = dekopon_shell::run(script, &NoCapabilities);
@@ -3384,13 +3343,6 @@ mod tests {
 
     #[test]
     fn conditionals_and_errexit_are_supported_rather_than_refused() {
-        let listed = refusal_list();
-        assert!(!listed.iter().any(|name| name.contains("[[")), "{listed:?}");
-        assert!(
-            !listed.iter().any(|name| name.contains("set -e")),
-            "{listed:?}"
-        );
-
         let conditional = dekopon_shell::run(
             "if [[ \"a\" == \"a\" ]]; then echo yes; fi",
             &NoCapabilities,
@@ -3477,32 +3429,7 @@ mod tests {
     }
 
     #[test]
-    fn every_outcome_the_description_explains_is_what_the_shell_produces() {
-        for (code, phrase) in [
-            (ExitCode::SUCCESS, "0 success"),
-            (ExitCode::FAILURE, "1 ran and failed"),
-            (
-                ExitCode::SYNTAX,
-                "2 parse, usage, refused construct or exhausted budget",
-            ),
-            (ExitCode::TIMEOUT, "124 deadline"),
-            (
-                ExitCode::DENIED,
-                "126 authorization refused this use, do not retry",
-            ),
-            (
-                ExitCode::NOT_FOUND,
-                "127 not a command here or not granted, do not guess more names",
-            ),
-        ] {
-            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
-            assert!(
-                phrase.starts_with(&format!("{} ", code.get())),
-                "{phrase} must name exit code {}",
-                code.get()
-            );
-        }
-
+    fn the_shell_produces_the_six_documented_exit_codes() {
         let not_found = dekopon_shell::run("wikipedia_page --title x", &OutcomeCapabilities);
         assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
         assert!(
@@ -3576,20 +3503,10 @@ mod tests {
         assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
         assert_eq!(tool.parameters["required"], json!(["script"]));
         assert_eq!(tool.parameters["additionalProperties"], json!(false));
-        let example = tool
-            .description
-            .split_once("for example `")
-            .and_then(|(_, rest)| rest.split_once('`'))
-            .map(|(example, _)| example)
-            .expect("bash tool call example");
-        let arguments: serde_json::Value = serde_json::from_str(example).unwrap();
-        assert_eq!(arguments, json!({ "script": "cap --list" }));
-        assert!(tool.description.contains("inside `script`, not `command`"));
-        assert_eq!(
-            tool.description.matches("run `<word> --help`").count(),
-            1,
-            "{}",
-            tool.description
+        assert!(
+            tool.parameters["properties"]["script"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("`cap --list`"))
         );
         for retired in [
             "kebab",
@@ -3608,10 +3525,6 @@ mod tests {
             !tool
                 .description
                 .contains("providers add these command words")
-        );
-        assert!(
-            tool.description
-                .contains("there is no separate `help` builtin")
         );
         assert_no_doubled_spaces(&tool.description);
     }
