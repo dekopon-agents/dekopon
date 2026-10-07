@@ -50,7 +50,7 @@ broker:                                       # optional; every field defaults
   socketPath: /path/to/broker.sock            # default: DEKOPON_BROKER_SOCKET, then XDG_RUNTIME_DIR/dekopon/broker.sock, then HOME/.local/run/dekopon/broker.sock; unresolvable is a startup failure
   serverUid: 501                              # default: the daemon's own effective UID
   maxFrameBytes: 2097152                      # default: the protocol's own bound
-  ioTimeoutMs: 30000
+  ioTimeoutMs: 30000                          # also how long a turn, job or probe retries a missing or refusing broker socket before any request is sent
 
 transports:
   - name: scientist-slack

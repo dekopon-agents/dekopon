@@ -274,10 +274,10 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     )
     .await
     .expect("publisher fills managed cache before boot");
-    super::run(&path, async {})
+    super::run(&path, async {}, super::ShutdownDeadline::default())
         .await
         .expect("daemon reads compiled artifacts before binding");
-    super::run(&path, async {})
+    super::run(&path, async {}, super::ShutdownDeadline::default())
         .await
         .expect("warm daemon loads mapped artifacts");
 
@@ -342,7 +342,7 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
     let mut document = attested_document(uid);
     document["socketPath"] = json!("run/broker.sock");
     write_config(&path, &document);
-    let error = super::run(&path, async {})
+    let error = super::run(&path, async {}, super::ShutdownDeadline::default())
         .await
         .expect_err("an owner-only socket cannot admit the gateway or the console peer");
     let super::BrokerdError::UnreachablePeerUids { configured, server } = &error else {
@@ -360,7 +360,7 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
 
     fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o710))
         .expect("IPC socket parent");
-    super::run(&path, async {})
+    super::run(&path, async {}, super::ShutdownDeadline::default())
         .await
         .expect("a group-traversable socket parent admits every configured peer");
 }
@@ -1717,4 +1717,212 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )));
     assert!(!socket.parent().expect("socket parent").exists());
     assert!(!credentials.exists());
+}
+
+struct ManagedBroker {
+    directory: tempfile::TempDir,
+    component_digest: String,
+    component_bytes: usize,
+}
+
+impl ManagedBroker {
+    fn new() -> Self {
+        let uid = current_uid();
+        let directory = tempfile::tempdir().expect("create managed broker fixture");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture directory");
+        write_owner_only(
+            &directory.path().join("policies.cedar"),
+            POLICIES.as_bytes(),
+        );
+        let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+            .expect("checked cli-probe component");
+        let component_digest =
+            Sha256::digest(&component)
+                .iter()
+                .fold(String::new(), |mut text, byte| {
+                    use std::fmt::Write as _;
+                    write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+                    text
+                });
+        let sha = directory.path().join("store/blobs/sha256");
+        fs::create_dir_all(&sha).expect("create store");
+        for private in [
+            directory.path().join("store"),
+            directory.path().join("store/blobs"),
+            sha.clone(),
+        ] {
+            fs::set_permissions(private, fs::Permissions::from_mode(0o700))
+                .expect("private store directory");
+        }
+        write_owner_only(&sha.join(format!("{component_digest}.wasm")), &component);
+        let mut document = attested_document(uid);
+        document["identities"] = json!([document["identities"][0].clone()]);
+        document
+            .as_object_mut()
+            .expect("config object")
+            .remove("providers");
+        document["providerSet"] = json!({
+            "lockPath": "providers.lock.yaml",
+            "storePath": "store"
+        });
+        document["compileOnLoad"] = json!(true);
+        write_config(&directory.path().join("broker.yaml"), &document);
+        Self {
+            directory,
+            component_digest,
+            component_bytes: component.len(),
+        }
+    }
+
+    fn config(&self) -> std::path::PathBuf {
+        self.directory.path().join("broker.yaml")
+    }
+
+    fn lock(&self) -> std::path::PathBuf {
+        self.directory.path().join("providers.lock.yaml")
+    }
+
+    fn socket(&self) -> std::path::PathBuf {
+        self.directory.path().join("broker.sock")
+    }
+
+    fn publish_lock(&self, revision: char) {
+        let staged = self.directory.path().join("providers.lock.yaml.staged");
+        write_owner_only(
+            &staged,
+            format!(
+                "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{}\n    componentBytes: {}\n    providerId: cli-probe\n",
+                revision.to_string().repeat(64),
+                self.component_digest,
+                self.component_bytes
+            )
+            .as_bytes(),
+        );
+        fs::rename(staged, self.lock()).expect("atomic lock replacement");
+    }
+
+    fn serve<F>(&self, shutdown: F) -> tokio::task::JoinHandle<Result<(), super::BrokerdError>>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(super::serve(
+            self.config(),
+            shutdown,
+            super::ShutdownDeadline::default(),
+            LOCK_POLL,
+        ))
+    }
+
+    async fn ready(&self, task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>) {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !self.socket().exists() {
+                assert!(!task.is_finished(), "broker exited before binding");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("broker binds its socket");
+    }
+}
+
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn stopped_within(
+    task: tokio::task::JoinHandle<Result<(), super::BrokerdError>>,
+) -> Result<(), super::BrokerdError> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("the broker stops within the drain")
+        .expect("broker task")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_lock_closes_admission_at_once_and_a_connected_call_still_finishes() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    };
+
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let task = broker.serve(std::future::pending());
+    broker.ready(&task).await;
+    let mut connected = tokio::net::UnixStream::connect(broker.socket())
+        .await
+        .expect("connect before the change");
+
+    broker.publish_lock('2');
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while broker.socket().exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("admission close removes the socket pathname");
+    assert_eq!(
+        tokio::net::UnixStream::connect(broker.socket())
+            .await
+            .expect_err("a closed broker admits nothing new")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(
+        !task.is_finished(),
+        "the connected call holds the drain open"
+    );
+
+    let limits = FrameLimits::default();
+    write_frame(&mut connected, &RequestEnvelope::capabilities(None), limits)
+        .await
+        .expect("send on the connection opened before the change");
+    let response = read_frame::<_, ResponseEnvelope>(&mut connected, limits)
+        .await
+        .expect("the draining broker answers");
+    assert!(matches!(
+        response.response,
+        BrokerResponse::Capabilities { .. }
+    ));
+    drop(connected);
+    stopped_within(task)
+        .await
+        .expect("a clean drain after a lock change exits successfully");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_distinct_lock_change_drains_once_an_identical_rewrite_never_and_a_lost_lock_fails_closed()
+ {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    for next in ['2', '3'] {
+        let task = broker.serve(std::future::pending());
+        broker.ready(&task).await;
+        broker.publish_lock(next);
+        stopped_within(task)
+            .await
+            .expect("each distinct change gives one clean drain and exit");
+        assert!(!broker.socket().exists());
+    }
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = broker.serve(async {
+        drop(stopped.await);
+    });
+    broker.ready(&task).await;
+    broker.publish_lock('3');
+    tokio::time::sleep(LOCK_POLL * 10).await;
+    assert!(
+        !task.is_finished(),
+        "identical bytes never restart the broker"
+    );
+    assert!(broker.socket().exists());
+    stop.send(()).expect("broker still serving");
+    stopped_within(task).await.expect("signal shutdown");
+
+    let task = broker.serve(std::future::pending());
+    broker.ready(&task).await;
+    fs::remove_file(broker.lock()).expect("remove lock");
+    assert!(matches!(
+        stopped_within(task).await,
+        Err(super::BrokerdError::ProviderLockUnsettled)
+    ));
 }

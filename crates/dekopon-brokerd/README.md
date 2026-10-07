@@ -261,11 +261,24 @@ chmod 0600 /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml
 ```
 
-SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown
-grace, log `broker_stopped`, and remove only the Unix socket inode created by this process.
-Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is
-one grace for the whole process: all Unix connections drain under that one deadline rather than
-each taking a fresh grace period.
+SIGINT and SIGTERM stop Unix acceptance and remove only the Unix socket inode created by this
+process at once, so a new connect sees the path missing rather than a listener that will never
+accept it. Connections already open, including ones queued before the close, finish; then the
+broker logs `broker_stopped` and exits. Shutdown grace must cover one configured host deadline plus
+two complete frame deadlines, and it is one deadline for the whole shutdown, fixed when acceptance
+stops: the connection drain, a storage sweep still running and the telemetry flush all share it.
+A clean drain exits 0. Past the deadline remaining connections are aborted and the process exits
+non-zero; telemetry not flushed by then is dropped.
+
+A managed broker (`providerSet`) also watches the lock it booted from. Every 2 s it hashes the file;
+two consecutive reads that agree with each other and differ from the loaded bytes are a change, and
+the broker logs both digests (`broker_provider_lock_changed`, never the lock body) and takes the
+same shutdown path as SIGTERM, exiting 0 after a clean drain so its supervisor starts it on the new
+lock. Rewriting identical bytes never restarts it. A lock that stays unreadable or keeps changing for
+3 polls fails closed: the broker drains and exits non-zero (`broker_provider_lock_unsettled`), and
+the restart reads whatever is there, refusing to boot on a lock it cannot load. Each change is one
+exit, so a supervisor's restart backoff, such as the kubelet's crash-loop backoff, applies to
+repeated changes like any other repeated exit.
 
 ### Provider credentials
 
@@ -727,7 +740,8 @@ components are included in `compiled`. An error exits non-zero without pruning. 
 locks nor publishes compiled artifacts.
 
 `--output json` gives deterministic machine-readable command results. A successful lock change
-applies on the next broker restart; there is no hot reload.
+reaches a running managed broker within seconds: it drains and exits so its supervisor restarts it
+on the new lock ([Configuration](#configuration)); there is no hot reload.
 
 Operator commands never take `--config`; combining them is a usage error. `provider` requires
 `--lock-file` and `--store`; `sync` also requires `--provider-set`. Usage errors exit 2; a failed

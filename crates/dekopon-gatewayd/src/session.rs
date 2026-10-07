@@ -21,7 +21,7 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
+    Attestation, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
     DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
     ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
     InvocationResult,
@@ -1776,11 +1776,7 @@ async fn connect(
     route: &BoundRoute,
     message: &InboundMessage,
 ) -> Result<BrokerLeg, SessionError> {
-    let client = BrokerClient::new(
-        &runner.broker.socket_path,
-        runner.broker.server_uid,
-        runner.broker.frame,
-    )?;
+    let client = runner.broker.leg_client()?;
     BrokerLeg::connect(client, Some(chat_claim(route, message)?))
         .await
         .map_err(SessionError::from)
@@ -1826,12 +1822,10 @@ async fn record_delivered_turn(
     };
     let result: Result<(), MemoryRecordFailure> = async {
         let identifiers = IdSequence::for_session();
-        let client = BrokerClient::new(
-            &runner.broker.socket_path,
-            runner.broker.server_uid,
-            runner.broker.frame,
-        )
-        .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
+        let client = runner
+            .broker
+            .leg_client()
+            .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
         let result = client
             .record_delivered_turn(
                 claim,

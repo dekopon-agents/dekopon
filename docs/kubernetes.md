@@ -549,9 +549,10 @@ root as `0:0` `0700`, creates the subdirectory and hands it to `65532` as `0700`
 own step, because the Job runs before the first pod exists; a `65532` init container copies the ConfigMap key in as a `0600`
 regular file. The fetch runs as `65532` with no ServiceAccount token. `backoffLimit: 2`,
 `activeDeadlineSeconds: 600`, and the Job is removed a day after it finishes. A failed hook fails
-the release and the old pod keeps serving. Every sync re-runs it; with the lock unchanged and the blobs present it fetches nothing. The broker reads the
-lock at startup, so a changed lock takes effect when the pod next rolls; the chart cannot checksum an
-existing ConfigMap to roll it for you.
+the release and the old pod keeps serving. Every sync re-runs it; with the lock unchanged and the blobs present it fetches nothing. The running broker
+sees a changed lock within seconds, drains under its shutdown grace and exits; `restartPolicy: Always`
+restarts only the broker container on the new lock, and the pod and the gateway stay up. An unchanged
+lock restarts nothing.
 
 The hook runs before the release's ordinary objects exist, so the claim and the ConfigMap must
 already be there. The chart-created state claim is not, on a first install, so the default Helm hook

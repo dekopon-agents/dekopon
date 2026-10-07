@@ -138,8 +138,25 @@ const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,deko
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
 #[cfg(unix)]
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(start());
+    // Blocking work still running here outlived the shutdown deadline; it ends with the process.
+    runtime.shutdown_background();
+    code
+}
+
+#[cfg(unix)]
+async fn start() -> ExitCode {
     let cli = Cli::parse();
     if let Err(error) = validate_cli(&cli) {
         if let Err(print_error) = error.print() {
@@ -210,7 +227,7 @@ async fn execute(cli: Cli) -> ExitCode {
                 writer: ConsoleWriter::Stderr,
                 filter: ConsoleFilter::Environment("warn".to_owned()),
             });
-            observed(install, execute_provider(provider)).await
+            observed(install, execute_provider(provider), None).await
         }
         Some(Command::Check(check)) => {
             let install = Install::new(Console {
@@ -222,7 +239,7 @@ async fn execute(cli: Cli) -> ExitCode {
                 writer: ConsoleWriter::Stderr,
                 filter: ConsoleFilter::Environment("error".to_owned()),
             });
-            observed(install, execute_check(check)).await
+            observed(install, execute_check(check), None).await
         }
         None => {
             let config = cli
@@ -252,14 +269,24 @@ async fn execute(cli: Cli) -> ExitCode {
             if let Some(provider) = logger_provider {
                 install = install.with_logs(provider, OTEL_LOG_FILTER);
             }
-            observed(install, execute_server(config)).await
+            let deadline = dekopon_brokerd::ShutdownDeadline::default();
+            observed(
+                install,
+                execute_server(config, deadline.clone()),
+                Some(deadline),
+            )
+            .await
         }
     }
 }
 
 /// Installs one mode's subscriber, runs it to completion, and flushes what it recorded.
 #[cfg(unix)]
-async fn observed(install: Install, work: impl Future<Output = Result<(), AppError>>) -> ExitCode {
+async fn observed(
+    install: Install,
+    work: impl Future<Output = Result<(), AppError>>,
+    deadline: Option<dekopon_brokerd::ShutdownDeadline>,
+) -> ExitCode {
     let telemetry = match install.install() {
         Ok(guard) => guard,
         Err(error) => {
@@ -274,7 +301,29 @@ async fn observed(install: Install, work: impl Future<Output = Result<(), AppErr
             ExitCode::FAILURE
         }
     };
-    if let Err(error) = telemetry.shutdown() {
+    let flushed = match deadline
+        .as_ref()
+        .and_then(dekopon_brokerd::ShutdownDeadline::get)
+    {
+        None => telemetry.shutdown(),
+        Some(deadline) => {
+            let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
+            match tokio::time::timeout_at(deadline, flush).await {
+                Ok(Ok(flushed)) => flushed,
+                Ok(Err(error)) => {
+                    eprintln!("dekopon-brokerd: telemetry flush failed: {error}");
+                    return code;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline"
+                    );
+                    return code;
+                }
+            }
+        }
+    };
+    if let Err(error) = flushed {
         tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
     }
     code
@@ -297,7 +346,10 @@ async fn probe(socket: &std::path::Path) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
-async fn execute_server(config: PathBuf) -> Result<(), AppError> {
+async fn execute_server(
+    config: PathBuf,
+    deadline: dekopon_brokerd::ShutdownDeadline,
+) -> Result<(), AppError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
     let shutdown = async move {
         tokio::select! {
@@ -309,7 +361,7 @@ async fn execute_server(config: PathBuf) -> Result<(), AppError> {
             _ = terminate.recv() => {}
         }
     };
-    dekopon_brokerd::run(config, shutdown)
+    dekopon_brokerd::run(config, shutdown, deadline)
         .await
         .map_err(AppError::Broker)?;
     Ok(())
@@ -344,7 +396,7 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
                 )
             })?;
             if report.restart_required {
-                eprintln!("provider changes apply on the next broker restart");
+                eprintln!("a running broker drains and restarts once it reads the changed lock");
             }
         }
         ProviderCommand::List => {

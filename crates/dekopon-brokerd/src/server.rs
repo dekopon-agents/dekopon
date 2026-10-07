@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, future::Future, io, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_host::{UpcallExit, UpcallRequest};
@@ -17,7 +24,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Semaphore, mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, timeout_at},
 };
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -37,6 +44,26 @@ pub struct ServerLimits {
     pub shutdown_grace: Duration,
 }
 
+const UNBOUNDED_GRACE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+#[derive(Clone, Debug, Default)]
+pub struct ShutdownDeadline(Arc<OnceLock<Instant>>);
+
+impl ShutdownDeadline {
+    pub fn start(&self, grace: Duration) -> Instant {
+        *self
+            .0
+            .get_or_init(|| Instant::now() + grace.min(UNBOUNDED_GRACE))
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Option<Instant> {
+        self.0.get().copied()
+    }
+}
+
+type ConnectionTasks = JoinSet<Result<(), ConnectionError>>;
+
 pub struct BrokerServer<A>
 where
     A: AuditLog,
@@ -44,6 +71,7 @@ where
     broker: Arc<Broker<A>>,
     identities: Arc<BTreeMap<u32, MappedPeer>>,
     limits: ServerLimits,
+    deadline: ShutdownDeadline,
 }
 
 impl<A> BrokerServer<A>
@@ -69,7 +97,14 @@ where
             broker,
             identities: Arc::new(identities),
             limits,
+            deadline: ShutdownDeadline::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_shutdown_deadline(mut self, deadline: ShutdownDeadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     pub async fn serve<F>(self, listener: UnixListener, shutdown: F) -> Result<(), ServerError>
@@ -112,26 +147,12 @@ where
                             continue;
                         }
                     };
-                    let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-                        let refused = refuse_over_capacity(stream, &refusal);
-                        tracing::warn!(
-                            event = "broker_connection_rejected",
-                            reason = "connection_limit",
-                            refusal.written = refused,
-                        );
-                        continue;
-                    };
-                    let broker = Arc::clone(&self.broker);
-                    let identities = Arc::clone(&self.identities);
-                    let frame = self.limits.frame;
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        handle(stream, &broker, &identities, frame).await
-                    });
+                    self.admit(stream, &semaphore, &refusal, &mut tasks);
                 }
             }
         }
-        drop(listener);
+        let deadline = self.deadline.start(self.limits.shutdown_grace);
+        self.admit_backlog(listener, &semaphore, &refusal, &mut tasks);
 
         let drain = async {
             let mut task_failed = false;
@@ -146,12 +167,64 @@ where
                 Ok(())
             }
         };
-        match timeout(self.limits.shutdown_grace, drain).await {
+        match timeout_at(deadline, drain).await {
             Ok(result) => result,
             Err(_) => {
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
                 Err(ServerError::ShutdownTimeout)
+            }
+        }
+    }
+}
+
+impl<A> BrokerServer<A>
+where
+    A: AuditLog + 'static,
+{
+    fn admit(
+        &self,
+        stream: UnixStream,
+        semaphore: &Arc<Semaphore>,
+        refusal: &[u8],
+        tasks: &mut ConnectionTasks,
+    ) {
+        let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
+            let refused = refuse_over_capacity(stream, refusal);
+            tracing::warn!(
+                event = "broker_connection_rejected",
+                reason = "connection_limit",
+                refusal.written = refused,
+            );
+            return;
+        };
+        let broker = Arc::clone(&self.broker);
+        let identities = Arc::clone(&self.identities);
+        let frame = self.limits.frame;
+        tasks.spawn(async move {
+            let _permit = permit;
+            handle(stream, &broker, &identities, frame).await
+        });
+    }
+
+    // A peer whose connect completed before admission closed is already connected and may have
+    // written its request, so it is served rather than reset with the listener.
+    fn admit_backlog(
+        &self,
+        listener: UnixListener,
+        semaphore: &Arc<Semaphore>,
+        refusal: &[u8],
+        tasks: &mut ConnectionTasks,
+    ) {
+        let Ok(listener) = listener.into_std() else {
+            return;
+        };
+        while let Ok((stream, _)) = listener.accept() {
+            if let Ok(stream) = stream
+                .set_nonblocking(true)
+                .and_then(|()| UnixStream::from_std(stream))
+            {
+                self.admit(stream, semaphore, refusal, tasks);
             }
         }
     }

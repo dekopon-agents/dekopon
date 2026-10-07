@@ -2598,3 +2598,136 @@ fn upcall_streams_own_stdout_then_stdin_in_wire_order() {
         Err(ProtocolError::UnexpectedDescriptors)
     ));
 }
+
+#[cfg(unix)]
+fn private_socket(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .expect("make fixture socket private");
+}
+
+#[cfg(unix)]
+fn owner(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::metadata(path).expect("fixture metadata").uid()
+}
+
+#[cfg(unix)]
+const RETRY_LIMITS: FrameLimits = FrameLimits {
+    max_frame_bytes: 4 * 1024,
+    io_timeout: Duration::from_secs(1),
+};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_waits_through_an_absent_then_refusing_broker_until_one_accepts() {
+    use tokio::net::UnixListener;
+
+    use super::BrokerClient;
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    let uid = owner(directory.path());
+    let restarting = {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+            private_socket(&socket);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::remove_file(&socket).expect("remove stale socket");
+            let listener = UnixListener::bind(&socket).expect("bind restarted broker");
+            private_socket(&socket);
+            let (mut stream, _) = listener.accept().await.expect("accept the waiting client");
+            read_frame::<_, RequestEnvelope>(&mut stream, RETRY_LIMITS)
+                .await
+                .expect("the request arrives once");
+            write_frame(
+                &mut stream,
+                &ResponseEnvelope::capabilities(
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                ),
+                RETRY_LIMITS,
+            )
+            .await
+            .expect("answer");
+        })
+    };
+    let client = BrokerClient::new(&socket, uid, RETRY_LIMITS)
+        .expect("valid client limits")
+        .with_connect_window(Duration::from_secs(10));
+    assert!(
+        client
+            .capabilities()
+            .await
+            .expect("the client waits for the restarted broker")
+            .is_empty()
+    );
+    restarting.await.expect("restarted broker fixture");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_gives_up_on_an_absent_broker_at_its_window() {
+    use super::{BrokerClient, ClientError};
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    let window = Duration::from_millis(300);
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS)
+        .expect("valid client limits")
+        .with_connect_window(window);
+    let started = tokio::time::Instant::now();
+    let error = client
+        .capabilities()
+        .await
+        .expect_err("no broker ever appears");
+    assert!(
+        started.elapsed() >= window,
+        "the client retried until its window"
+    );
+    assert!(
+        matches!(&error, ClientError::SocketMetadata { source } if source.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+    assert!(!error.may_have_executed());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failure_after_the_connect_is_never_retried() {
+    use tokio::net::UnixListener;
+
+    use super::BrokerClient;
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    private_socket(&socket);
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS)
+        .expect("valid client limits")
+        .with_connect_window(Duration::from_secs(10));
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept once");
+        read_frame::<_, RequestEnvelope>(&mut stream, RETRY_LIMITS)
+            .await
+            .expect("request");
+        drop(stream);
+        tokio::time::timeout(Duration::from_millis(500), listener.accept())
+            .await
+            .is_err()
+    });
+    let error = client
+        .capabilities()
+        .await
+        .expect_err("a lost response fails");
+    assert!(error.may_have_executed());
+    assert!(
+        server.await.expect("server fixture"),
+        "a sent request is never retried on a fresh connection"
+    );
+}

@@ -8,8 +8,7 @@ use dekopon_agent::{
     wake::{WakeId, WakeRefusal, WakeRegistrar, WakeRequest, WakeSummary},
 };
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, Conversation, TraceParent,
-    Trigger,
+    Attestation, ChatScopeClaim, ChatTransportKind, Conversation, TraceParent, Trigger,
 };
 use dekopon_core::{AgentId, ExternalSubject, TransportId};
 use dekopon_shell::{
@@ -156,7 +155,8 @@ impl Anchor {
         broker: &ResolvedBroker,
         runtime: &tokio::runtime::Handle,
     ) -> Option<BrokerLeg> {
-        let client = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
+        let client = broker
+            .leg_client()
             .inspect_err(|error| {
                 tracing::warn!(event = "gateway_wake_probe_unavailable", error = %error);
             })

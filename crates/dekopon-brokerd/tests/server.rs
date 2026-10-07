@@ -26,8 +26,8 @@ use dekopon_broker_protocol::{
     read_frame, write_frame,
 };
 use dekopon_brokerd::{
-    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, capabilities,
-    current_uid, run,
+    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerError, ServerLimits,
+    ShutdownDeadline, capabilities, current_uid, run,
 };
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
@@ -579,13 +579,17 @@ when { context.capability == "http-probe.fetch"
     let (stop, stopped) = oneshot::channel::<()>();
     let started_config = config_path.clone();
     let mut service = tokio::spawn(async move {
-        run(started_config, async move {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "a dropped sender is normal test shutdown"
-            )]
-            let _ = stopped.await;
-        })
+        run(
+            started_config,
+            async move {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped sender is normal test shutdown"
+                )]
+                let _ = stopped.await;
+            },
+            ShutdownDeadline::default(),
+        )
         .await
     });
     wait_for_socket(&socket_path, &mut service).await;
@@ -1221,7 +1225,7 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
         ),
     ] {
         write_owner_only(&policies_path, policies.as_bytes());
-        let error = run(&config_path, async {})
+        let error = run(&config_path, async {}, ShutdownDeadline::default())
             .await
             .err()
             .unwrap_or_else(|| panic!("{label} must refuse startup"));
@@ -1285,7 +1289,7 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         ),
     ] {
         write_owner_only(&policies_path, policies.as_bytes());
-        run(&config_path, async {})
+        run(&config_path, async {}, ShutdownDeadline::default())
             .await
             .unwrap_or_else(|error| panic!("{label} must start when tolerating: {error:?}"));
     }
@@ -1298,7 +1302,7 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
                   resource == Dekopon::Provider::"cli-probe");"#
             .as_bytes(),
     );
-    let error = run(&config_path, async {})
+    let error = run(&config_path, async {}, ShutdownDeadline::default())
         .await
         .expect_err("an undeclared principal refuses startup even when tolerating");
     assert!(matches!(error, BrokerdError::Policy { .. }), "{error:?}");
@@ -2139,4 +2143,45 @@ async fn a_parent_trap_mid_upcall_still_ends_the_conversation() {
         InvocationOutcome::Failed
     );
     broker.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_outliving_the_shutdown_deadline_fails_the_drain_at_that_deadline() {
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let (broker, _) = broker().await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    );
+    let limits = ServerLimits {
+        frame: FrameLimits {
+            max_frame_bytes: 64 * 1024,
+            io_timeout: Duration::from_secs(30),
+        },
+        max_connections: 4,
+        shutdown_grace: Duration::from_millis(200),
+    };
+    let deadline = ShutdownDeadline::default();
+    let server = BrokerServer::new(broker, identities, limits)
+        .expect("server limits valid")
+        .with_shutdown_deadline(deadline.clone());
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+    let idle = UnixStream::connect(&socket_path).await.expect("connect");
+    stop.send(()).expect("server is running");
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the drain is bounded")
+        .expect("server task");
+    assert!(matches!(result, Err(ServerError::ShutdownTimeout)));
+    let fixed = deadline.get().expect("admission close fixed the deadline");
+    assert!(tokio::time::Instant::now() >= fixed);
+    drop(idle);
 }

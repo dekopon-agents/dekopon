@@ -710,14 +710,18 @@ async fn boot_with(
             .expect("broker config serializes"),
     );
     let (stop_broker, broker_stopped) = oneshot::channel::<()>();
-    let mut broker = tokio::spawn(dekopon_brokerd::run(broker_path, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender means the fixture went away, which is the same instruction \
+    let mut broker = tokio::spawn(dekopon_brokerd::run(
+        broker_path,
+        async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a dropped sender means the fixture went away, which is the same instruction \
                       to shut down as a delivered one"
-        )]
-        let _ = broker_stopped.await;
-    }));
+            )]
+            let _ = broker_stopped.await;
+        },
+        dekopon_brokerd::ShutdownDeadline::default(),
+    ));
     wait_for_socket(&directory.path().join("broker.sock"), &mut broker).await;
 
     write_owner_only(

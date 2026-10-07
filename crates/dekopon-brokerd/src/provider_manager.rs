@@ -369,14 +369,36 @@ pub(crate) async fn load_locked_sources(
     store_path: &Path,
     expected_uid: u32,
 ) -> Result<Vec<LockedProviderSource>, ProviderManagerError> {
-    let lock = load_lock(lock_path, expected_uid).await?;
+    load_locked_digest(lock_path, store_path, expected_uid)
+        .await
+        .map(|(sources, _)| sources)
+}
+
+/// The digest covers the exact bytes the sources were decoded from, so a replacement after this read
+/// still differs.
+pub(crate) async fn load_locked_digest(
+    lock_path: &Path,
+    store_path: &Path,
+    expected_uid: u32,
+) -> Result<(Vec<LockedProviderSource>, String), ProviderManagerError> {
+    let bytes = read_secure_file(lock_path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES).await?;
+    let lock = decode_lock(&bytes)?;
     let store = ProviderStore::open(store_path, expected_uid, false)?;
     let sources = lock.sources(&store)?;
     for source in &sources {
         socket::validate_owned_file(source.path(), expected_uid)
             .map_err(|error| ProviderManagerError::file_security(source.path(), error))?;
     }
-    Ok(sources)
+    Ok((sources, prefixed_sha256(&bytes)))
+}
+
+pub(crate) async fn lock_digest(
+    lock_path: &Path,
+    expected_uid: u32,
+) -> Result<String, ProviderManagerError> {
+    read_secure_file(lock_path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES)
+        .await
+        .map(|bytes| prefixed_sha256(&bytes))
 }
 
 #[derive(Clone)]
