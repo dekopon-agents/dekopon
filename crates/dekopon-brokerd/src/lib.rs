@@ -98,98 +98,21 @@ async fn serve<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let uid = current_uid();
-    let mut config = config::load(config_path, uid).await?;
-    let frame_limits = config.server_limits.frame_limits()?;
-    let socket_parent = socket::validate_socket_parent(&config.socket_path, uid)?;
-    // An owner-only socket under a private parent means other configured UIDs could never connect
-    // — the broker starts healthy while peers loop on EACCES — so every unreachable peer is
-    // checked at startup.
-    if dekopon_broker_protocol::ipc_socket_mode(&socket_parent) == 0o600 {
-        let configured = config
-            .identities
-            .iter()
-            .map(|identity| identity.uid)
-            .filter(|peer| *peer != uid)
-            .collect::<Vec<_>>();
-        if !configured.is_empty() {
-            return Err(BrokerdError::UnreachablePeerUids {
-                configured,
-                server: uid,
-            });
-        }
-    }
-    // A compilation cache holds compiled code the broker will execute. Anyone who can write into
-    // it can choose what the privileged process runs, so it must sit under a private parent.
-    if let Some(cache) = &config.host_options.cwasm_dir {
-        socket::validate_private_parent(cache, uid)?;
-    }
-    let credentials = Credentials::Loaded(match &config.credentials_path {
-        Some(path) => credentials::load(path, uid).await?,
-        None => CredentialStore::empty(),
-    });
-    let secrets = Secrets::Loaded(match &config.secret_map_path {
-        Some(path) => secrets::load(path, uid).await?,
-        None => dekopon_broker::SecretCatalog::empty(),
-    });
-    let storage = config
-        .storage
-        .as_ref()
-        .map(|storage| {
-            dekopon_storage_host::StorageHost::open(&storage.root_path, storage.limits.clone())
-        })
-        .transpose()
-        .map_err(BrokerdError::Storage)?;
-    tracing::info!(
-        max_connections = config.server_limits.max_connections,
-        max_memory_bytes = config.host_limits.max_memory_bytes,
-        aggregate_ceiling_bytes = config.host_options.max_total_memory_bytes,
-        cwasm_cache = config
-            .host_options
-            .cwasm_dir
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        "broker provider guest-memory budget"
-    );
-    if !config.plaintext_hosts.is_empty() {
-        let hosts = config.plaintext_hosts.iter().collect::<Vec<_>>().join(", ");
-        tracing::info!(
-            event = "broker_plaintext_hosts",
-            "http plaintext hosts allowed: [{hosts}]"
-        );
-    }
-    let assets = match &config.assets {
-        Some(config) => Some(
-            assets::initialize(config)
-                .await
-                .map_err(BrokerdError::Assets)?,
-        ),
-        None => None,
-    };
-    let limits = ServerLimits {
-        frame: frame_limits,
-        max_connections: config.server_limits.max_connections,
-        shutdown_grace: config.server_limits.shutdown_grace(),
-    };
-    let socket_path = std::mem::take(&mut config.socket_path);
-    let provider_lock = config.provider_lock.take();
-    let mut warnings = Vec::new();
-    let prepared = prepare(
-        config,
-        frame_limits.max_frame_bytes,
-        Runtime {
-            credentials,
-            secrets,
-            storage: storage.clone(),
-            assets,
-        },
-        &mut warnings,
-    )
-    .await;
-    for warning in &warnings {
+    let (candidate, report) = load_candidate(config_path.as_ref(), Mode::Boot).await;
+    for warning in &report.warnings {
         warning.log();
     }
-    let Ready { broker, identities } = prepared.map_err(BrokerdError::from_problems)?;
+    let Some(Candidate {
+        ready: Ready { broker, identities },
+        socket_path,
+        provider_lock,
+        limits,
+        storage,
+    }) = candidate
+    else {
+        return Err(BrokerdError::from_problems(report.problems));
+    };
+    let uid = current_uid();
     let retention = broker.storage_retention_policies();
     let server = BrokerServer::new(Arc::new(broker), identities, limits)?
         .with_shutdown_deadline(deadline.clone());
@@ -272,78 +195,281 @@ pub async fn check(
     config_path: impl AsRef<Path>,
     providers: Option<CheckProviders>,
 ) -> CheckReport {
+    load_candidate(config_path.as_ref(), Mode::Check(providers))
+        .await
+        .1
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage {
+    Config,
+    ProviderSet,
+    FrameLimits,
+    Runtime,
+    Providers,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Config => "configuration",
+            Self::ProviderSet => "provider set",
+            Self::FrameLimits => "frame limits",
+            Self::Runtime => "runtime files",
+            Self::Providers => "providers, policy and capabilities",
+        })
+    }
+}
+
+enum Mode {
+    Boot,
+    Check(Option<CheckProviders>),
+}
+
+struct Candidate {
+    ready: Ready,
+    socket_path: PathBuf,
+    provider_lock: Option<lock_watch::LoadedLock>,
+    limits: ServerLimits,
+    storage: Option<dekopon_storage_host::StorageHost>,
+}
+
+/// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
+/// did not is reported as skipped.
+async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let uid = current_uid();
-    let (mut config, refusal) = match config::load_in(config_path, uid, LoadMode::Check).await {
-        Ok(loaded) => loaded,
+    let load_mode = match mode {
+        Mode::Boot => LoadMode::Boot,
+        Mode::Check(_) => LoadMode::Check,
+    };
+    let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
+        Ok((config, refusal)) => {
+            report.problems.extend(refusal.map(BrokerdError::from));
+            Some(config)
+        }
         Err(error) => {
             report.problems.push(error.into());
-            return report;
+            None
+        }
+    }) else {
+        for stage in [
+            Stage::ProviderSet,
+            Stage::FrameLimits,
+            Stage::Runtime,
+            Stage::Providers,
+        ] {
+            report.skipped(stage);
+        }
+        return (None, report);
+    };
+    let providers_resolved = match mode {
+        Mode::Boot => true,
+        Mode::Check(providers) => {
+            if config.identities.is_empty() {
+                report.warnings.push(StartupWarning::IdentitiesRequired);
+            }
+            // A Check load leaves a providerSet's providers for this function to resolve.
+            match (config.providers.is_empty(), providers) {
+                (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
+                    Ok(sources) => {
+                        config.providers = sources
+                            .iter()
+                            .map(|source| source.path().to_path_buf())
+                            .collect();
+                        config.locked_providers = Some(sources);
+                        true
+                    }
+                    Err(error) => {
+                        report.problems.push(error);
+                        false
+                    }
+                },
+                (true, None) => {
+                    report.problems.push(BrokerdError::ProviderSetRequired);
+                    false
+                }
+                (false, Some(_)) => {
+                    report.problems.push(BrokerdError::ProviderSetUnused);
+                    true
+                }
+                (false, None) => true,
+            }
         }
     };
-    report.problems.extend(refusal.map(BrokerdError::from));
-    if config.identities.is_empty() {
-        report.warnings.push(StartupWarning::IdentitiesRequired);
-    }
-    // A Check load leaves a providerSet's providers for this function to resolve.
-    match (config.providers.is_empty(), providers) {
-        (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
-            Ok(sources) => {
-                config.providers = sources
-                    .iter()
-                    .map(|source| source.path().to_path_buf())
-                    .collect();
-                config.locked_providers = Some(sources);
+    let frame_limits = keep(
+        &mut report.problems,
+        config
+            .server_limits
+            .frame_limits()
+            .map_err(BrokerdError::from),
+    );
+    let mut scratch = None;
+    let runtime = match load_mode {
+        LoadMode::Boot => boot_runtime(&config, uid, &mut report.problems).await,
+        LoadMode::Check => match config.storage.as_ref().map(scratch_storage).transpose() {
+            Ok(storage) => {
+                let host = storage.as_ref().map(|(_, host)| host.clone());
+                scratch = storage;
+                Some(Runtime {
+                    credentials: match config.credentials_path {
+                        Some(_) => Credentials::Unchecked,
+                        None => Credentials::Loaded(CredentialStore::empty()),
+                    },
+                    secrets: match config.secret_map_path {
+                        Some(_) => Secrets::Unchecked,
+                        None => Secrets::Loaded(dekopon_broker::SecretCatalog::empty()),
+                    },
+                    storage: host,
+                    assets: None,
+                })
             }
             Err(error) => {
                 report.problems.push(error);
-                return report;
+                None
             }
         },
-        (true, None) => {
-            report.problems.push(BrokerdError::ProviderSetRequired);
-            return report;
-        }
-        (false, Some(_)) => report.problems.push(BrokerdError::ProviderSetUnused),
-        (false, None) => {}
-    }
-    let frame_limits = match config.server_limits.frame_limits() {
-        Ok(limits) => limits,
-        Err(error) => {
-            report.problems.push(error.into());
-            return report;
-        }
     };
-    let scratch = match config.storage.as_ref().map(scratch_storage).transpose() {
-        Ok(scratch) => scratch,
-        Err(error) => {
-            report.problems.push(error);
-            return report;
-        }
+    let (Some(frame_limits), Some(runtime), true) = (frame_limits, runtime, providers_resolved)
+    else {
+        report.skipped(Stage::Providers);
+        return (None, report);
     };
-    let runtime = Runtime {
-        credentials: match config.credentials_path {
-            Some(_) => Credentials::Unchecked,
-            None => Credentials::Loaded(CredentialStore::empty()),
-        },
-        secrets: match config.secret_map_path {
-            Some(_) => Secrets::Unchecked,
-            None => Secrets::Loaded(dekopon_broker::SecretCatalog::empty()),
-        },
-        storage: scratch.as_ref().map(|(_, host)| host.clone()),
-        assets: None,
+    let limits = ServerLimits {
+        frame: frame_limits,
+        max_connections: config.server_limits.max_connections,
+        shutdown_grace: config.server_limits.shutdown_grace(),
     };
-    if let Err(problems) = prepare(
+    let socket_path = std::mem::take(&mut config.socket_path);
+    let provider_lock = config.provider_lock.take();
+    let storage = runtime.storage.clone();
+    let prepared = prepare(
         config,
         frame_limits.max_frame_bytes,
         runtime,
         &mut report.warnings,
     )
-    .await
-    {
-        report.problems.extend(problems);
+    .await;
+    drop(scratch);
+    match prepared {
+        Ok(ready) if report.problems.is_empty() => (
+            Some(Candidate {
+                ready,
+                socket_path,
+                provider_lock,
+                limits,
+                storage,
+            }),
+            report,
+        ),
+        Ok(_) => (None, report),
+        Err(problems) => {
+            report.problems.extend(problems);
+            (None, report)
+        }
     }
-    report
+}
+
+impl CheckReport {
+    fn skipped(&mut self, stage: Stage) {
+        self.warnings.push(StartupWarning::Skipped { stage });
+    }
+}
+
+async fn boot_runtime(
+    config: &ResolvedConfig,
+    uid: u32,
+    problems: &mut Vec<BrokerdError>,
+) -> Option<Runtime> {
+    match socket::validate_socket_parent(&config.socket_path, uid) {
+        // An owner-only socket under a private parent means other configured UIDs could never
+        // connect — the broker starts healthy while peers loop on EACCES — so every unreachable
+        // peer is checked at startup.
+        Ok(parent) if dekopon_broker_protocol::ipc_socket_mode(&parent) == 0o600 => {
+            let configured = config
+                .identities
+                .iter()
+                .map(|identity| identity.uid)
+                .filter(|peer| *peer != uid)
+                .collect::<Vec<_>>();
+            if !configured.is_empty() {
+                problems.push(BrokerdError::UnreachablePeerUids {
+                    configured,
+                    server: uid,
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(error) => problems.push(error.into()),
+    }
+    // A compilation cache holds compiled code the broker will execute. Anyone who can write into
+    // it can choose what the privileged process runs, so it must sit under a private parent.
+    if let Some(cache) = &config.host_options.cwasm_dir
+        && let Err(error) = socket::validate_private_parent(cache, uid)
+    {
+        problems.push(error.into());
+    }
+    let credentials = match &config.credentials_path {
+        Some(path) => keep(
+            problems,
+            credentials::load(path, uid)
+                .await
+                .map_err(BrokerdError::from),
+        ),
+        None => Some(CredentialStore::empty()),
+    };
+    let secrets = match &config.secret_map_path {
+        Some(path) => keep(
+            problems,
+            secrets::load(path, uid).await.map_err(BrokerdError::from),
+        ),
+        None => Some(dekopon_broker::SecretCatalog::empty()),
+    };
+    let storage = keep(
+        problems,
+        config
+            .storage
+            .as_ref()
+            .map(|storage| {
+                dekopon_storage_host::StorageHost::open(&storage.root_path, storage.limits.clone())
+            })
+            .transpose()
+            .map_err(BrokerdError::Storage),
+    );
+    tracing::info!(
+        max_connections = config.server_limits.max_connections,
+        max_memory_bytes = config.host_limits.max_memory_bytes,
+        aggregate_ceiling_bytes = config.host_options.max_total_memory_bytes,
+        cwasm_cache = config
+            .host_options
+            .cwasm_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "broker provider guest-memory budget"
+    );
+    if !config.plaintext_hosts.is_empty() {
+        let hosts = config.plaintext_hosts.iter().collect::<Vec<_>>().join(", ");
+        tracing::info!(
+            event = "broker_plaintext_hosts",
+            "http plaintext hosts allowed: [{hosts}]"
+        );
+    }
+    let assets = match &config.assets {
+        Some(config) => keep(
+            problems,
+            assets::initialize(config)
+                .await
+                .map(Some)
+                .map_err(BrokerdError::Assets),
+        ),
+        None => Some(None),
+    };
+    Some(Runtime {
+        credentials: Credentials::Loaded(credentials?),
+        secrets: Secrets::Loaded(secrets?),
+        storage: storage?,
+        assets: assets?,
+    })
 }
 
 async fn resolve_provider_set(
@@ -743,6 +869,8 @@ pub enum StartupWarning {
     SecretRequired { policy: String, secret: String },
     #[error("no identities; boot requires them, from a fragment or the chart's peers.yaml")]
     IdentitiesRequired,
+    #[error("{stage} not checked: a stage it needs failed")]
+    Skipped { stage: Stage },
 }
 
 impl StartupWarning {
@@ -771,6 +899,11 @@ impl StartupWarning {
                     capability.id = %warning.capability(),
                 },
                 "{warning}"
+            ),
+            Self::Skipped { .. } => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                { audit.event = "config.startup.warning", reason = "skipped-stage" },
+                "{self}"
             ),
             Self::CredentialRequired { .. }
             | Self::SecretRequired { .. }

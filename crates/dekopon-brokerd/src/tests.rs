@@ -1684,6 +1684,51 @@ async fn check_reports_a_fragment_collision_an_unknown_group_and_a_missing_field
 }
 
 #[tokio::test]
+async fn check_keeps_going_past_a_collision_and_names_the_stage_it_could_not_run() {
+    use super::{BrokerdError, Stage, StartupWarning};
+    use dekopon_core::fragments::FragmentError;
+
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let directory = root.path().join("broker.d");
+    fs::create_dir(&directory).expect("create broker.d");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("restrict broker.d");
+    write_config(
+        &directory.join("host.yaml"),
+        &json!({
+            "apiVersion": config::CONFIG_API_VERSION,
+            "socketPath": "../run/broker.sock",
+            "providerSet": {"lockPath": "../providers.lock.yaml", "storePath": "../store"}
+        }),
+    );
+    write_config(
+        &directory.join("other.yaml"),
+        &json!({"apiVersion": config::CONFIG_API_VERSION, "socketPath": "/elsewhere.sock"}),
+    );
+
+    let report = super::check(&directory, None).await;
+
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [
+                BrokerdError::Config(config::ConfigError::Fragments(
+                    FragmentError::Conflicts { .. }
+                )),
+                BrokerdError::ProviderSetRequired,
+            ]
+        ),
+        "{:?}",
+        report.problems
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        StartupWarning::Skipped {
+            stage: Stage::Providers
+        }
+    )));
+}
+
+#[tokio::test]
 async fn check_binds_no_socket_and_reads_no_credentials_file() {
     use super::StartupWarning;
 

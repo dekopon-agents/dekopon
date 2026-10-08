@@ -99,14 +99,17 @@ pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), Ga
 where
     F: Future<Output = ()> + Send,
 {
-    let uid = current_uid();
-    let config = config::load(config_path, uid).await?;
-
-    let catalog = LocalCatalog::load(&config.catalog_path).map_err(GatewaydError::Catalog)?;
-    let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
-    let Prepared {
+    let (candidate, report) =
+        load_candidate(config_path.as_ref(), None, config::LoadMode::Boot).await;
+    let Some(Candidate {
+        config,
+        routes,
         transports: built_transports,
-    } = prepare(&config, &routes)?;
+    }) = candidate
+    else {
+        return Err(GatewaydError::from_problems(report.problems));
+    };
+    let routes = Arc::new(routes);
 
     let broker_client = BrokerClient::new(
         &config.broker.socket_path,
@@ -293,62 +296,155 @@ pub enum CheckWarning {
     TransportCredential { transport: String, variable: String },
     #[error("model {model} reads {variable} from the environment at boot")]
     ModelCredential { model: String, variable: String },
+    #[error("{stage} not checked: a stage it needs failed")]
+    Skipped { stage: Stage },
 }
 
-/// Runs the configuration, catalog and route validation `run` runs, then stops: the broker socket
-/// is never probed, no credential variable or model login is read, and no journal is opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage {
+    Config,
+    Catalog,
+    Routes,
+    Credentials,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Config => "configuration",
+            Self::Catalog => "agent catalog",
+            Self::Routes => "routes",
+            Self::Credentials => "credentials",
+        })
+    }
+}
+
+/// Runs the validation `run` runs, then stops: the broker socket is never probed, no credential
+/// variable or model login is read, and no journal is opened.
 pub async fn check(config_path: impl AsRef<Path>, catalog_path: Option<&Path>) -> CheckReport {
+    load_candidate(config_path.as_ref(), catalog_path, config::LoadMode::Check)
+        .await
+        .1
+}
+
+pub(crate) struct Candidate {
+    pub(crate) config: ResolvedConfig,
+    pub(crate) routes: RoutingTable,
+    pub(crate) transports: Vec<Box<dyn ChatTransport>>,
+}
+
+/// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
+/// did not is reported as skipped. `Check` reads no credential and builds no transport.
+pub(crate) async fn load_candidate(
+    config_path: &Path,
+    catalog_path: Option<&Path>,
+    mode: config::LoadMode,
+) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
-    let (config, refusals) =
-        match config::load_in(config_path, current_uid(), config::LoadMode::Check).await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                report.problems.push(error.into());
-                return report;
-            }
-        };
-    report
-        .problems
-        .extend(refusals.into_iter().map(GatewaydError::from));
-    let catalog = match LocalCatalog::load(catalog_path.unwrap_or(&config.catalog_path)) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            report.problems.push(GatewaydError::Catalog(error));
-            return report;
+    let config = match config::load_in(config_path, current_uid(), mode).await {
+        Ok((config, refusals)) => {
+            report
+                .problems
+                .extend(refusals.into_iter().map(GatewaydError::from));
+            Some(config)
         }
-    };
-    let routes = match RoutingTable::bind(&config, &catalog) {
-        Ok(routes) => routes,
         Err(error) => {
             report.problems.push(error.into());
-            return report;
+            None
         }
     };
-    for spec in &config.transports {
-        report.warnings.extend(
-            transport_credential_variables(spec)
-                .into_iter()
-                .map(|variable| CheckWarning::TransportCredential {
-                    transport: spec.name().to_owned(),
-                    variable: variable.to_owned(),
-                }),
-        );
-    }
-    for model in routes.bound_models() {
-        let mut required = None;
-        let missing = session::model_bearer_token_with(model, |variable| {
-            required = Some(variable.to_owned());
+    let catalog = match catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()))
+    {
+        Some(path) => match LocalCatalog::load(path) {
+            Ok(catalog) => Some(catalog),
+            Err(error) => {
+                report.problems.push(GatewaydError::Catalog(error));
+                None
+            }
+        },
+        None => {
+            report.skipped(Stage::Catalog);
             None
-        })
-        .is_err();
-        if let (true, Some(variable)) = (missing, required) {
-            report.warnings.push(CheckWarning::ModelCredential {
-                model: model.name().to_owned(),
-                variable,
-            });
+        }
+    };
+    let routes = match (&config, &catalog) {
+        (Some(config), Some(catalog)) => match RoutingTable::bind(config, catalog) {
+            Ok(routes) => Some(routes),
+            Err(error) => {
+                report.problems.push(error.into());
+                None
+            }
+        },
+        (None, _) | (_, None) => {
+            report.skipped(Stage::Routes);
+            None
+        }
+    };
+    let transports = match (&config, &routes) {
+        (Some(config), Some(routes)) => credentials(config, routes, mode, &mut report),
+        (None, _) | (_, None) => {
+            report.skipped(Stage::Credentials);
+            Vec::new()
+        }
+    };
+    let candidate = match (config, routes) {
+        (Some(config), Some(routes)) if report.problems.is_empty() => Some(Candidate {
+            config,
+            routes,
+            transports,
+        }),
+        _ => None,
+    };
+    (candidate, report)
+}
+
+impl CheckReport {
+    fn skipped(&mut self, stage: Stage) {
+        self.warnings.push(CheckWarning::Skipped { stage });
+    }
+}
+
+fn credentials(
+    config: &ResolvedConfig,
+    routes: &RoutingTable,
+    mode: config::LoadMode,
+    report: &mut CheckReport,
+) -> Vec<Box<dyn ChatTransport>> {
+    match mode {
+        config::LoadMode::Boot => match prepare(config, routes) {
+            Ok(Prepared { transports }) => return transports,
+            Err(error) => report.problems.push(error),
+        },
+        config::LoadMode::Check => {
+            for spec in &config.transports {
+                report
+                    .warnings
+                    .extend(
+                        transport_credential_variables(spec)
+                            .into_iter()
+                            .map(|variable| CheckWarning::TransportCredential {
+                                transport: spec.name().to_owned(),
+                                variable: variable.to_owned(),
+                            }),
+                    );
+            }
+            for model in routes.bound_models() {
+                let mut required = None;
+                let missing = session::model_bearer_token_with(model, |variable| {
+                    required = Some(variable.to_owned());
+                    None
+                })
+                .is_err();
+                if let (true, Some(variable)) = (missing, required) {
+                    report.warnings.push(CheckWarning::ModelCredential {
+                        model: model.name().to_owned(),
+                        variable,
+                    });
+                }
+            }
         }
     }
-    report
+    Vec::new()
 }
 
 fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
@@ -1053,6 +1149,21 @@ pub enum GatewaydError {
     WakeStore(#[from] WakeStoreError),
     #[error("guest model proxy could not start")]
     Proxy(#[source] proxy::ProxyStartError),
+    #[error("{}", render_problems(.problems))]
+    Problems { problems: Vec<GatewaydError> },
+}
+
+impl GatewaydError {
+    fn from_problems(mut problems: Vec<Self>) -> Self {
+        match (problems.pop(), problems.is_empty()) {
+            (Some(only), true) => only,
+            (Some(last), false) => {
+                problems.push(last);
+                Self::Problems { problems }
+            }
+            (None, _) => Self::Problems { problems },
+        }
+    }
 }
 
 #[derive(Debug, Error)]

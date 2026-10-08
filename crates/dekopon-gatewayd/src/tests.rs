@@ -15035,6 +15035,32 @@ async fn check_passes_a_directory_whose_transport_token_variable_is_unset() {
 }
 
 #[tokio::test]
+async fn run_refuses_with_exactly_the_problem_check_reports() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "nobody", &[]);
+
+    let report = crate::check(&directory, None).await;
+    let error = crate::run(&directory, std::future::pending())
+        .await
+        .expect_err("a route naming an absent agent cannot serve");
+
+    let [problem] = report.problems.as_slice() else {
+        panic!("one problem: {:?}", report.problems);
+    };
+    assert!(matches!(error, crate::GatewaydError::Route(_)), "{error:?}");
+    assert_eq!(
+        dekopon_core::error_chain(&error),
+        dekopon_core::error_chain(problem)
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::Skipped {
+            stage: crate::Stage::Credentials
+        }
+    )));
+}
+
+#[tokio::test]
 async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
     let root = temporary();
     let directory = check_fixture(
