@@ -701,10 +701,24 @@ impl Capability for Search {
         out: &mut Stdout,
     ) -> Result<(), Self::Error> {
         let base = settings.into_inner().base_url.unwrap_or(VENDOR_BASE);
-        let uri = base.join(&format!("/search?q={}", input.text)).unwrap();
+        let uri = base
+            .join(&format!("/search?q={}", query_value(&input.text)))
+            .unwrap();
         let response = http.send(Request::new("GET", uri).unwrap()).unwrap();
         emit(out, Ok(json!({"status": response.status})))
     }
+}
+
+fn query_value(text: &str) -> String {
+    text.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -724,7 +738,7 @@ fn a_base_url_setting_overrides_the_vendor_origin_and_keeps_its_prefix() {
         .settings(json!({"baseUrl": "https://fixture.example.test/vendor/"}))
         .http(HttpScript::new("fixture.example.test", "GET", ok));
     assert_eq!(
-        stdout_value(&fixture.call("vendor.search", r#"{"text":"rust"}"#)),
+        stdout_value(&fixture.call("vendor.search", r#"{"text":"rust & wasm=1/é"}"#)),
         json!({"status": 200})
     );
     let uris = |native: &Native<Vendor>| {
@@ -737,7 +751,7 @@ fn a_base_url_setting_overrides_the_vendor_origin_and_keeps_its_prefix() {
     assert_eq!(uris(&vendor), ["https://api.vendor.example/search?q=rust"]);
     assert_eq!(
         uris(&fixture),
-        ["https://fixture.example.test/vendor/search?q=rust"]
+        ["https://fixture.example.test/vendor/search?q=rust%20%26%20wasm%3D1%2F%C3%A9"]
     );
     let invalid = Native::<Vendor>::new()
         .settings(json!({"baseUrl": "https://fixture.example.test/vendor?x=1"}))
