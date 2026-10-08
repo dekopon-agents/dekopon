@@ -392,7 +392,7 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
@@ -442,6 +442,13 @@ never guessed at), `broadcast-channel` (a Telegram broadcast, where nobody can r
 press whose `custom_id` is not this gateway's cancel button). It is declared once,
 where the span is opened, because recording a field a span never declared is silently dropped. The
 word is the transport's own classification and never a fragment of the payload it read.
+On Discord each drop is also a `gateway.message.dropped` log event carrying `drop.reason`, the
+transport name and, once the envelope parsed, the sender's canonical subject and the channel: INFO
+when a person's message went unserved (`content-withheld`, `malformed-envelope`,
+`conversation-unresolved`), DEBUG for `message-type`, `bot-authored` and `self-authored`. A
+`content-withheld` drop records `mention.roles` on both, true when the message mentioned any role:
+a mention of the bot's managed role renders as the bot but is not a user mention, so Discord withholds
+its content.
 
 A WhatsApp group payload is the one drop that does not use the field. One `transport.receive` span
 covers a whole delivery, so a `drop.reason` there would be overwritten by the next message in the
@@ -1016,6 +1023,7 @@ These events join the accounting and refusal ones:
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
 | `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |
+| `gateway.message.dropped` | A Discord receipt the transport declined to route: `drop.reason`, the transport, and where parsed the sender's canonical subject and channel, never the text |
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 | `gateway.wake.scheduled` | The wake id, whether it is a watch, and the canonical subject it will speak as; the note and probe script are in the `agent.model.answer` tool call that asked for it |
 

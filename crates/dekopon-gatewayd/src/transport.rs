@@ -114,6 +114,7 @@ pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
         transport.kind = %kind,
         message.id = tracing::field::Empty,
         drop.reason = tracing::field::Empty,
+        mention.roles = tracing::field::Empty,
         conversation.kind = tracing::field::Empty,
         conversation.container = tracing::field::Empty,
         conversation.id = tracing::field::Empty,
