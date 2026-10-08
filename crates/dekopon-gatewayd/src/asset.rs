@@ -326,7 +326,7 @@ impl AssetStore {
             .unwrap_or_else(Registered::empty)
     }
 
-    // Recalled ids are kept because replayed turns already name them as `Chat Asset #N`.
+    // Recalled ids are kept because replayed turns already name them as `chat-asset:N`.
     pub fn restore(
         &self,
         access: &AssetAccess,
@@ -483,6 +483,19 @@ pub(crate) fn is_image(mime: &str) -> bool {
     READABLE_IMAGE_TYPES.contains(&mime)
 }
 
+pub(crate) fn attached_marker(id: u64, name: &str) -> String {
+    format!("\n[gateway: attached chat-asset:{id} — {name}]")
+}
+
+pub(crate) fn arrival_markers(registered: &Registered) -> String {
+    registered
+        .inventory
+        .iter()
+        .filter(|asset| registered.arrived.contains(&asset.id))
+        .map(|asset| attached_marker(asset.id, &asset.name))
+        .collect()
+}
+
 pub(crate) fn reference_note(registered: &Registered, images_supported: bool) -> Option<String> {
     if registered.inventory.is_empty() {
         return None;
@@ -503,7 +516,7 @@ pub(crate) fn reference_note(registered: &Registered, images_supported: bool) ->
         if asset.is_fetchable(images_supported) {
             any_fetchable = true;
             note.push_str(&format!(
-                "\n  Chat Asset #{} — {name} ({mime}, {size}){arrived}",
+                "\n  chat-asset:{} — {name} ({mime}, {size}){arrived}",
                 asset.id
             ));
         } else {
@@ -789,22 +802,22 @@ impl AssetFailure {
     fn for_model(self, id: u64) -> String {
         match self {
             Self::Storage(error) => format!(
-                "Chat Asset #{id} is unavailable: {error}. No automatic refetch or fallback was performed."
+                "chat-asset:{id} is unavailable: {error}. No automatic refetch or fallback was performed."
             ),
             Self::Unknown => format!(
-                "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
+                "There is no chat-asset:{id} in this conversation. The reference lines in the messages above name the ones there are."
             ),
             Self::Unreadable { reason, .. } => {
-                format!("Chat Asset #{id} cannot be opened: {reason}.")
+                format!("chat-asset:{id} cannot be opened: {reason}.")
             }
             Self::TooLarge { size } => format!(
-                "Chat Asset #{id} is {} which is over the {} the gateway will read.",
+                "chat-asset:{id} is {} which is over the {} the gateway will read.",
                 kibibytes(size),
                 kibibytes(MAX_ASSET_BYTES)
             ),
-            Self::Unavailable => format!("Chat Asset #{id} cannot be opened."),
+            Self::Unavailable => format!("chat-asset:{id} cannot be opened."),
             Self::Transport { category } => {
-                format!("Chat Asset #{id} could not be read ({category}).")
+                format!("chat-asset:{id} could not be read ({category}).")
             }
         }
     }

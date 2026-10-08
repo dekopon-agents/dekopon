@@ -252,7 +252,7 @@ impl BlobReference {
     #[must_use]
     pub fn release_notice(&self) -> String {
         format!(
-            "[gateway: Chat Asset #{} was released from disk retention and is no longer available. Ask the user to resend it or choose another asset; do not silently reuse an original image.]",
+            "[gateway: chat-asset:{} was released from disk retention and is no longer available. Ask the user to resend it or choose another asset; do not silently reuse an original image.]",
             self.id
         )
     }

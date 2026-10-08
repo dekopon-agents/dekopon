@@ -877,10 +877,7 @@ fn platform_window(
     {
         let mut text = message.text;
         for asset in message.assets {
-            text.push_str(&format!(
-                "\n[gateway: attached Chat Asset #{next_asset_id} — {}]",
-                asset.name
-            ));
+            text.push_str(&asset::attached_marker(next_asset_id, &asset.name));
             assets.push(RecalledAsset {
                 id: next_asset_id,
                 asset,
@@ -1195,7 +1192,7 @@ impl SteerSource for SessionSteers {
                     .received_at
                     .saturating_duration_since(self.received_at)
                     .as_secs();
-                let mut text = bound_inbound(&format!(
+                let text = bound_inbound(&format!(
                     "[gateway: sent while you were working, +{seconds}s]\n{}",
                     steer.text
                 ));
@@ -1206,14 +1203,18 @@ impl SteerSource for SessionSteers {
                     Instant::now(),
                 );
                 self.assets.arrived(registered.fetchable);
-                if let Some(note) = asset::reference_note(&registered, self.images_supported) {
-                    text = bound_inbound(&format!("{text}\n\n{note}"));
-                }
+                let mut recorded =
+                    bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
+                let mut prompt = match asset::reference_note(&registered, self.images_supported) {
+                    Some(note) => bound_inbound(&format!("{text}\n\n{note}")),
+                    None => text,
+                };
                 if self.scope == Some(MemoryScope::SharedConversation) {
-                    text = attributed_prompt(&steer.subject, &text);
+                    prompt = attributed_prompt(&steer.subject, &prompt);
+                    recorded = attributed_prompt(&steer.subject, &recorded);
                 }
                 self.raw_texts.lock().push(steer.text);
-                Steer::Person(text)
+                Steer::Person { prompt, recorded }
             })
             .collect()
     }
@@ -1393,15 +1394,27 @@ async fn session(
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
     };
+    let recorded = bound_inbound(&format!(
+        "{}{}",
+        message.text,
+        asset::arrival_markers(&registered)
+    ));
     let journal_access = asset_access.clone();
-    let text = match runner.assets.take_delivery_notice(&asset_access) {
-        Some(note) => bound_inbound(&format!("{note}\n{text}")),
-        None => text,
+    let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
+    let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
+    let frame = |text: String| {
+        let text = match &delivery_notice {
+            Some(note) => bound_inbound(&format!("{note}\n{text}")),
+            None => text,
+        };
+        if shared {
+            attributed_prompt(&message.subject, &text)
+        } else {
+            text
+        }
     };
-    let text = match window.map(|window| window.scope) {
-        Some(MemoryScope::SharedConversation) => attributed_prompt(&message.subject, &text),
-        Some(MemoryScope::PrivateConversation) | None => text,
-    };
+    let text = frame(text);
+    let recorded = frame(recorded);
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access.clone(),
@@ -1546,6 +1559,7 @@ async fn session(
             };
             let mut history = seeded;
             let mut inputs = SessionInputs::new(&text, limits)
+                .with_recorded_prompt(&recorded)
                 .with_system(Some(&instructions))
                 .with_skills(&skills)
                 .with_agent(&agent)

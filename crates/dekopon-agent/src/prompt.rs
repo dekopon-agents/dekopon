@@ -114,7 +114,8 @@ pub trait CancellationProbe: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Steer {
-    Person(String),
+    /// `recorded` is what history keeps; `prompt` may add gateway notes that only this turn needs.
+    Person { prompt: String, recorded: String },
     /// Reaches the model but never the recorded turn: it is not the person's words.
     Notice(String),
 }
@@ -213,6 +214,7 @@ where
 
 pub struct SessionInputs<'a> {
     prompt: &'a str,
+    recorded: Option<&'a str>,
     system: Option<&'a str>,
     limits: PromptLimits,
     options: Option<&'a CompletionOptions>,
@@ -235,6 +237,7 @@ impl<'a> SessionInputs<'a> {
     pub const fn new(prompt: &'a str, limits: PromptLimits) -> Self {
         Self {
             prompt,
+            recorded: None,
             system: None,
             limits,
             options: None,
@@ -251,6 +254,12 @@ impl<'a> SessionInputs<'a> {
             progress_notes: false,
             wakes: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_recorded_prompt(mut self, recorded: &'a str) -> Self {
+        self.recorded = Some(recorded);
+        self
     }
 
     #[must_use]
@@ -370,6 +379,7 @@ where
 {
     let SessionInputs {
         prompt,
+        recorded,
         system,
         limits,
         options,
@@ -431,7 +441,7 @@ where
             wakes,
         },
     );
-    let mut user = prompt.to_owned();
+    let mut user = recorded.unwrap_or(prompt).to_owned();
     for steer in steers {
         user.push_str("\n\n");
         user.push_str(&steer);
@@ -500,9 +510,9 @@ fn drain_steers(
     let any = !steers.is_empty();
     for steer in steers {
         match steer {
-            Steer::Person(text) => {
-                messages.push(ModelMessage::user(&text));
-                consumed.push(text);
+            Steer::Person { prompt, recorded } => {
+                messages.push(ModelMessage::user(&prompt));
+                consumed.push(recorded);
             }
             Steer::Notice(text) => messages.push(ModelMessage::user(&text)),
         }
@@ -1317,16 +1327,15 @@ fn is_textual(mime: &str) -> bool {
 fn asset_tool() -> ModelTool {
     ModelTool {
         name: ASSET_TOOL_NAME.to_owned(),
-        description: "Look at an inbound or generated file in this conversation. The conversation \
-                      names each one as `Chat Asset #N`; pass that number. Call this when \
-                      answering depends on what the file actually contains."
+        description: "Show the contents of chat-asset:N from this conversation. Look before you \
+                      describe a file."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "id": {
                     "type": "integer",
-                    "description": "The number from the `Chat Asset #N` reference in the conversation."
+                    "description": "N from chat-asset:N."
                 }
             },
             "required": ["id"],
@@ -1406,7 +1415,7 @@ fn fetch_asset_into(
     }
     messages.push(ModelMessage::tool(
         call.id.clone(),
-        format!("Chat Asset #{id} follows in the next message."),
+        format!("chat-asset:{id} follows in the next message."),
     ));
     let part = if asset.mime.starts_with("image/") {
         ContentPart::Image {
@@ -1421,7 +1430,7 @@ fn fetch_asset_into(
         }
     };
     messages.push(ModelMessage::user_with_parts(vec![
-        ContentPart::Text(format!("Chat Asset #{id}:")),
+        ContentPart::Text(format!("chat-asset:{id}:")),
         part,
     ]));
     Ok(())
@@ -1459,7 +1468,10 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     };
     let id = arguments.get("id").and_then(|id| match id {
         Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.trim().parse().ok(),
+        Value::String(text) => {
+            let text = text.trim();
+            dekopon_core::chat_asset_marker(text).or_else(|| text.parse().ok())
+        }
         _ => None,
     });
     id.ok_or_else(|| PromptError::MissingAssetId {
@@ -1679,7 +1691,7 @@ mod tests {
         FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES,
         MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition,
         SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs,
-        Steer, SteerSource, agent_config_tool, format_script_outcome, run_prompt,
+        Steer, SteerSource, agent_config_tool, asset_argument, format_script_outcome, run_prompt,
         run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
         script_tool,
     };
@@ -2049,7 +2061,14 @@ mod tests {
 
     impl SteerSource for QueuedSteers {
         fn drain(&self) -> Vec<Steer> {
-            self.0.lock().drain(..).map(Steer::Person).collect()
+            self.0
+                .lock()
+                .drain(..)
+                .map(|text| Steer::Person {
+                    recorded: text.clone(),
+                    prompt: text,
+                })
+                .collect()
         }
     }
 
@@ -2139,6 +2158,40 @@ mod tests {
                 "finished Answered turns=1 calls=0"
             ]
         );
+        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+    }
+
+    #[test]
+    fn history_keeps_the_recorded_text_while_the_model_reads_the_noted_prompt() {
+        struct OneSteer(Mutex<Option<Steer>>);
+        impl SteerSource for OneSteer {
+            fn drain(&self) -> Vec<Steer> {
+                self.0.lock().take().into_iter().collect()
+            }
+        }
+        let steer = OneSteer(Mutex::new(Some(Steer::Person {
+            prompt: "msg2\n\n[note 2]".to_owned(),
+            recorded: "msg2".to_owned(),
+        })));
+        let model = ScriptedModel::new([answer("done")]);
+        let mut history = History::default();
+
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1\n\n[note 1]", limits(1, 4))
+                .with_recorded_prompt("msg1")
+                .with_steering(&steer),
+            &mut history,
+        )
+        .expect("session answers");
+
+        let users = model.observed_messages.lock()[0]
+            .iter()
+            .filter(|message| message.role() == "user")
+            .map(|message| message.content().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(users, ["msg1\n\n[note 1]", "msg2\n\n[note 2]"]);
         assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
     }
 
@@ -2262,7 +2315,10 @@ mod tests {
         )
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
-        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
+        assert_eq!(model.steers.drain(), [Steer::Person {
+                prompt: "msg2".to_owned(),
+                recorded: "msg2".to_owned()
+            }]);
         assert!(!sink.events.lock().iter().any(|event| matches!(
             event,
             ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
@@ -2281,7 +2337,10 @@ mod tests {
         )
         .expect("the final step answers");
         assert_eq!(outcome.answer, "done");
-        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
+        assert_eq!(model.steers.drain(), [Steer::Person {
+                prompt: "msg2".to_owned(),
+                recorded: "msg2".to_owned()
+            }]);
         assert_eq!(history.turns()[0].user(), "msg1");
     }
 
@@ -2355,7 +2414,10 @@ mod tests {
         )
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
-        assert_eq!(model.steers.drain(), [Steer::Person("msg2".to_owned())]);
+        assert_eq!(model.steers.drain(), [Steer::Person {
+                prompt: "msg2".to_owned(),
+                recorded: "msg2".to_owned()
+            }]);
     }
 
     #[test]
@@ -3852,7 +3914,7 @@ mod tests {
                 .filter(|index| *index >= 1)
                 .and_then(|index| self.0.get(index - 1))
                 .cloned()
-                .ok_or_else(|| format!("Chat Asset #{id} is not part of this conversation."))
+                .ok_or_else(|| format!("chat-asset:{id} is not part of this conversation."))
         }
 
         fn is_empty(&self) -> bool {
@@ -3904,6 +3966,22 @@ mod tests {
             model.tool_messages(),
             vec!["2026-08-20 request failed\n".to_owned()]
         );
+    }
+
+    #[test]
+    fn an_asset_id_is_read_as_a_number_or_the_chat_asset_label() {
+        for arguments in [r#"{"id":3}"#, r#"{"id":"3"}"#, r#"{"id":" chat-asset:3 "}"#] {
+            assert_eq!(
+                asset_argument(ASSET_TOOL_NAME, arguments).expect(arguments),
+                3
+            );
+        }
+        for arguments in [r#"{"id":"chat-asset:"}"#, r#"{"id":"asset 3"}"#] {
+            assert!(matches!(
+                asset_argument(ASSET_TOOL_NAME, arguments),
+                Err(PromptError::MissingAssetId { .. })
+            ));
+        }
     }
 
     #[test]

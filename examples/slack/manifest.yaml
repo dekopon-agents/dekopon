@@ -49,7 +49,7 @@
 # reported to the model as something it cannot open.
 #
 # The gateway does not read a file just because one arrived. Each is named in the
-# prompt as `Chat Asset #N`, and the bytes are fetched only if the model calls
+# prompt as `chat-asset:N`, and the bytes are fetched only if the model calls
 # `fetch_chat_asset` with that number. Nothing else in Dekopon gains authority from
 # this scope: no policy and no provider credential. `files:write` below is the separate,
 # explicit presentation permission used only for generated reply images.

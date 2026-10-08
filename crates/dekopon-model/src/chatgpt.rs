@@ -2667,7 +2667,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            wire.contains("gateway: Chat Asset #7 was released"),
+            wire.contains("gateway: chat-asset:7 was released"),
             "{wire}"
         );
         assert!(!wire.contains("image_url"));
