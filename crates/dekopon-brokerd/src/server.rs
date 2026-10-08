@@ -168,7 +168,8 @@ where
             }
         };
         match timeout_at(deadline, drain).await {
-            Ok(result) => result,
+            Ok(result) if Instant::now() < deadline => result,
+            Ok(_) => Err(ServerError::ShutdownTimeout),
             Err(_) => {
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
