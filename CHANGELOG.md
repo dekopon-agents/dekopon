@@ -7,6 +7,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.30.0] - 2026-10-08
+
+### Changed
+
+- Prepare chart 0.30.0 for core v0.41.0; pin the published image index in a separate reviewed change.
+
+## [0.41.0] - 2026-10-08
+
+### Added
+
+- An HTTP constraint set's `requestTemplates` pins a capability's requests to the attested conversation: slots `conversation.id`, `conversation.thread`, `conversation.apiChannel` and `transport` are filled by the broker in the request path or query, and a request matching no rule, naming a pinned query key itself or using a key outside `allowed` is denied.
+- A templated capability invoked without a chat scope is denied `chat-scope-required`, one whose slot the scope lacks is denied `request-template-slot-absent`, and neither is listed to a session that would be denied.
+
+### Changed
+
+- `BrokerProviderRegistry::invoke_with_storage` takes the invocation's `ChatSlotValues` before its assets.
+
+### Fixed
+
+- dekopon-brokerd exits non-zero when its shutdown drain finishes after the shutdown deadline, instead of depending on task scheduling order.
+
 ## [dekopon-chart-0.29.0] - 2026-10-08
 
 ### Changed
