@@ -1966,7 +1966,7 @@ fn script_call(script: &str) -> AssistantTurn {
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "bash".to_owned(),
-                arguments: json!({"script": script}).to_string(),
+                arguments: json!({ "command": script}).to_string(),
             },
         }],
         None,
@@ -4083,7 +4083,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "bash".to_owned(),
-                arguments: json!({"script": "probe upper --text late"}).to_string(),
+                arguments: json!({ "command": "probe upper --text late"}).to_string(),
             },
         }],
         None,

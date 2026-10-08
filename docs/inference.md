@@ -423,8 +423,8 @@ async fn two_turns(
         name: "bash".into(),
         description: "Return a synthetic result; no script executes.".into(),
         parameters: serde_json::json!({
-            "type":"object", "properties":{"script":{"type":"string"}},
-            "required":["script"], "additionalProperties":false
+            "type":"object", "properties":{"command":{"type":"string"}},
+            "required":["command"], "additionalProperties":false
         }),
     }];
     let options = CompletionOptions::default();

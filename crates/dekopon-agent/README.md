@@ -173,9 +173,9 @@ model's capability seam.
 
 ## Prompt and host bounds
 
-The `bash` tool requires an object carrying a string `script`; malformed arguments end the
-session rather than being guessed at. Its shared tool description includes a concrete
-`{"script":"cap --list"}` call and distinguishes shell command words from model tools; no
+The `bash` tool requires an object carrying a string `command`. The first malformed call in a session is
+answered with the expected shape; a second ends the session rather than being guessed at. Its
+shared tool description includes a concrete `{"command":"cap --list"}` call and distinguishes shell command words from model tools; no
 per-agent system-prompt prefix supplies that example. Its result is combined script output
 followed by an `[exit code: N]` trailer. `cap --list` shows the capability identifiers the session was granted,
 and each provider command word documents itself through `<word> --help`; argument parsing and

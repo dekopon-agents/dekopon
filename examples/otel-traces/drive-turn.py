@@ -49,7 +49,7 @@ def main():
                     message = {"role": "assistant", "content": None, "tool_calls": [{
                         "id": "probe-call", "type": "function", "function": {
                             "name": "bash", "arguments": json.dumps({
-                                "script": f'probe upper --text "{PAYLOAD}" | jq -r .text'})}}]}
+                                "command": f'probe upper --text "{PAYLOAD}" | jq -r .text'})}}]}
                 else:
                     assert len(calls) == 2, "extra model call"
                     assert any(m.get("role") == "tool" and PAYLOAD in m.get("content", "")
