@@ -39,6 +39,9 @@ All notable changes to Dekopon are documented here. The format is based on
 - The `bash` tool's argument is `command` (was `script`); the rejection error type is `missing-command`.
 - The bash tool description is a short rules list (about 255 words, from about 1,400); the shell's own errors teach what was prose.
 - A model's first unknown-tool or malformed bash call is answered with the tool shape instead of ending the session; the second still ends it.
+
+### Fixed
+
 - Show models the bash tool argument shape in its shared description.
 
 ## [dekopon-chart-0.25.0] - 2026-10-07
