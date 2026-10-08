@@ -58,7 +58,8 @@ pub use dekopon_broker_protocol::{
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
     HttpConstraintsError, InvocationOutcome, InvocationResult, ProposedInvocation, SecretUseGrant,
-    StorageAccess, StorageInterface, StorageRetention, StorageScope, broker::AuthorizationGate,
+    StorageAccess, StorageConstraints, StorageInterface, StorageRetention, StorageScope,
+    broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
@@ -620,6 +621,7 @@ impl ConstraintCatalog {
             });
         }
         self.validate_routes()?;
+        self.validate_storage_namespaces()?;
         self.retention_policies()?;
         for (capability_id, set) in &self.sets {
             validate_set_constraints(set)?;
@@ -654,17 +656,70 @@ impl ConstraintCatalog {
             {
                 return Err(BrokerBuildError::InvalidStorageRetention);
             }
-            let key = (set.provider.clone(), storage.scope);
+            let namespace = storage.namespace.as_ref().unwrap_or(&set.provider).clone();
+            let key = (namespace, storage.scope);
             if let Some(previous) = policies.insert(key.clone(), storage.retention)
                 && previous != storage.retention
             {
                 return Err(BrokerBuildError::ConflictingStorageRetention {
-                    provider: key.0,
+                    namespace: key.0,
                     scope: key.1,
                 });
             }
         }
         Ok(policies)
+    }
+
+    fn validate_storage_namespaces(&self) -> Result<(), BrokerBuildError> {
+        let mut conflicts = Vec::new();
+        let mut members = BTreeMap::<&ProviderId, Vec<(&CapabilityId, &StorageConstraints)>>::new();
+        for (capability, set) in &self.sets {
+            let Some(storage) = &set.constraints.storage else {
+                continue;
+            };
+            if let Some(namespace) = &storage.namespace
+                && storage.scope != StorageScope::Agent
+            {
+                conflicts.push(NamespaceConflict::NotAgentScope {
+                    capability: capability.clone(),
+                    namespace: namespace.clone(),
+                    scope: storage.scope,
+                });
+            }
+            members
+                .entry(storage.namespace.as_ref().unwrap_or(&set.provider))
+                .or_default()
+                .push((capability, storage));
+        }
+        for (namespace, sets) in members {
+            if sets.iter().all(|(_, storage)| storage.namespace.is_none()) {
+                continue;
+            }
+            let interfaces = sets
+                .iter()
+                .map(|(_, storage)| storage.interface)
+                .collect::<BTreeSet<_>>();
+            let scopes = sets
+                .iter()
+                .map(|(_, storage)| storage.scope)
+                .collect::<BTreeSet<_>>();
+            if interfaces.len() > 1 || scopes.len() > 1 {
+                conflicts.push(NamespaceConflict::Mismatch {
+                    namespace: namespace.clone(),
+                    capabilities: sets
+                        .iter()
+                        .map(|(capability, storage)| {
+                            ((*capability).clone(), storage.interface, storage.scope)
+                        })
+                        .collect(),
+                });
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(BrokerBuildError::ConflictingStorageNamespaces { conflicts })
+        }
     }
 
     fn validate_routes(&self) -> Result<(), BrokerBuildError> {
@@ -1334,6 +1389,48 @@ pub enum RouteConflict {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceConflict {
+    NotAgentScope {
+        capability: CapabilityId,
+        namespace: ProviderId,
+        scope: StorageScope,
+    },
+    Mismatch {
+        namespace: ProviderId,
+        capabilities: Vec<(CapabilityId, StorageInterface, StorageScope)>,
+    },
+}
+
+impl fmt::Display for NamespaceConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAgentScope {
+                capability,
+                namespace,
+                scope,
+            } => write!(
+                formatter,
+                "capability {capability} names storage namespace {namespace} at scope {scope:?}; \
+                 only agent scope may name a namespace"
+            ),
+            Self::Mismatch {
+                namespace,
+                capabilities,
+            } => {
+                write!(formatter, "storage namespace {namespace} is shared by")?;
+                for (capability, interface, scope) in capabilities {
+                    write!(formatter, " {capability} ({interface:?}, {scope:?})")?;
+                }
+                write!(
+                    formatter,
+                    "; every capability in one namespace declares one interface and scope"
+                )
+            }
+        }
+    }
+}
+
 impl fmt::Display for RouteConflict {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1406,9 +1503,9 @@ pub enum BrokerBuildError {
     InvalidPolicyConstraints,
     #[error("storage idle TTL must be a positive whole number of milliseconds fitting in u64")]
     InvalidStorageRetention,
-    #[error("storage retention conflicts for provider {provider} and scope {scope:?}")]
+    #[error("storage retention conflicts for namespace {namespace} and scope {scope:?}")]
     ConflictingStorageRetention {
-        provider: ProviderId,
+        namespace: ProviderId,
         scope: StorageScope,
     },
     #[error("http execution constraints are invalid")]
@@ -1480,6 +1577,9 @@ pub enum BrokerBuildError {
     #[error("constraint sets declare {} conflicting capability route(s): {}", conflicts.len(),
         conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
     ConflictingRoutes { conflicts: Vec<RouteConflict> },
+    #[error("constraint sets declare {} conflicting storage namespace(s): {}", conflicts.len(),
+        conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    ConflictingStorageNamespaces { conflicts: Vec<NamespaceConflict> },
     #[error("identity mapping duplicates subject {subject:?}")]
     DuplicateSubjectMapping { subject: String },
 }
@@ -2678,7 +2778,8 @@ where
                 ContinuityPolicy::Stable
             },
             authority,
-        );
+        )
+        .with_shared_namespace(storage.namespace.clone());
         host.prepare_grant(grant_request)
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
@@ -3699,6 +3800,9 @@ fn encode_execution_constraints(
                 StorageScope::Agent => 2,
             },
         );
+        if let Some(namespace) = &storage.namespace {
+            encoded.text("execution.storage.sharedNamespace", namespace.as_str());
+        }
     } else {
         encoded.byte("execution.storage.present", 0);
     }

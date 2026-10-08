@@ -1650,6 +1650,82 @@ async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_grant_outside_the_configured_shared_namespace_never_runs() {
+    let directory = tempfile::tempdir().expect("storage directory");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("canonical storage directory")
+        .join("root");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
+    let registry = BrokerProviderRegistry::load_with_storage(
+        [provider_fixture("storage-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+        Some(storage.clone()),
+    )
+    .await
+    .expect("probe loads");
+    let capability = "storage-probe.run"
+        .parse::<CapabilityId>()
+        .expect("capability");
+    for (configured, granted) in [
+        (Some("turso"), None),
+        (None, Some("turso")),
+        (Some("turso"), Some("sqlite")),
+    ] {
+        let constraints = ExecutionConstraints {
+            timeout_ms: 10_000,
+            storage: Some(StorageConstraints {
+                interface: StorageInterface::DurableFiles,
+                access: StorageAccess::ReadWrite,
+                scope: StorageScope::Agent,
+                retention: Default::default(),
+                namespace: configured.map(|name| name.parse().expect("namespace")),
+            }),
+            ..ExecutionConstraints::default()
+        };
+        let grant = storage
+            .grant(
+                StorageGrantRequest::new(
+                    "invoke-test".parse().expect("invocation"),
+                    capability.clone(),
+                    "storage-probe".parse().expect("provider"),
+                    StorageInterface::DurableFiles,
+                    StorageAccess::ReadWrite,
+                    StorageScope::Agent,
+                    "provider-test".parse().expect("agent"),
+                    "slack.t0123abc.u9xyz".parse().expect("subject"),
+                    "slack",
+                    "probe-transport",
+                    "c0123abc",
+                    "c0123abc:1712345678.000100",
+                    ContinuityPolicy::Stable,
+                    b"probe-authority".to_vec(),
+                )
+                .with_shared_namespace(granted.map(|name| name.parse().expect("namespace"))),
+            )
+            .expect("grant");
+        let failure = registry
+            .invoke_with_storage(
+                authorized_for("storage-probe", capability.clone(), json!({}), constraints),
+                None,
+                Some(grant),
+                Default::default(),
+            )
+            .await
+            .expect_err("a grant for another namespace is refused");
+        assert!(
+            matches!(
+                failure.error.as_ref(),
+                BrokerHostError::StorageGrantMismatch
+            ),
+            "{configured:?}/{granted:?} returned {:?}",
+            failure.error
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
     for (_index, mode, interface, access, max_calls, reason) in [
         (
@@ -1726,6 +1802,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 access,
                 scope: StorageScope::PrivateConversation,
                 retention: Default::default(),
+                namespace: None,
             }),
             secret_use: None,
         };

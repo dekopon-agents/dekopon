@@ -89,6 +89,7 @@ when { context.via == "gateway" && context.agent == "reviewer" };
                         access: StorageAccess::ReadWrite,
                         scope: StorageScope::Agent,
                         retention: StorageRetention::IdleTtl(Duration::from_secs(30)),
+                        namespace: None,
                     }),
                     ..Default::default()
                 },

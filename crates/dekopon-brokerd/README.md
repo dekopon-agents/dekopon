@@ -898,11 +898,33 @@ chatMemory:
   compactionThresholdBytes: 12582912
 ```
 
-Storage constraints require `scope: private-conversation|shared-conversation|agent`. The
-`namespace: chat` key is not accepted. Optional `retention: {mode: keep}` defaults to Keep;
-`retention: {mode: idle-ttl, idleTtlMs: 86400000}` opts the addressed storage family into an
-idle TTL, and zero, overflow, unknown fields and conflicting retention settings for the same
-provider and scope refuse startup. No existing chat-memory data gains a TTL by default.
+Storage constraints require `scope: private-conversation|shared-conversation|agent`. Optional
+`retention: {mode: keep}` defaults to Keep; `retention: {mode: idle-ttl, idleTtlMs: 86400000}`
+opts the addressed storage family into an idle TTL, and zero, overflow, unknown fields and
+conflicting retention settings for the same namespace and scope refuse startup. No existing
+chat-memory data gains a TTL by default.
+
+Under `scope: agent`, optional `namespace: <provider id>` opens another provider's agent storage
+instead of the invoking provider's own, so a table one provider builds the other reads back:
+
+```yaml
+python:
+  constraints:
+    timeoutMs: 60000
+    storage:
+      interface: durable-files
+      access: read-write
+      scope: agent
+      namespace: turso
+  capabilities:
+    python.eval: {}
+```
+
+Absent, the namespace is the invoking provider, so existing configuration keeps its directory.
+Only owner configuration names it; Cedar still authorizes each capability on its own. Startup
+refuses `namespace` under any other scope, and refuses sets that share a namespace (the providers
+naming it plus that provider's own sets) with a different `interface` or `scope`; `access` may
+differ. Every such conflict is listed in one startup error.
 
 The broker runs a bounded storage sweep at startup and every 12 hours; missed ticks do not cause
 catch-up bursts. One sweep runs at a time on a joined blocking task while requests continue to be

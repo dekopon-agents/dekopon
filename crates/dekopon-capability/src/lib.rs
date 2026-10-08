@@ -491,6 +491,8 @@ pub struct StorageConstraints {
     pub scope: StorageScope,
     #[serde(default)]
     pub retention: StorageRetention,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ProviderId>,
 }
 
 #[cfg(test)]
@@ -523,12 +525,21 @@ mod storage_retention_tests {
                 "{invalid}"
             );
         }
-        assert!(
-            serde_json::from_str::<StorageConstraints>(
-                r#"{"interface":"jsonl","access":"read-only","namespace":"chat"}"#
-            )
-            .is_err()
-        );
+        for invalid in [
+            r#"{"interface":"jsonl","access":"read-only","namespace":"chat"}"#,
+            r#"{"interface":"durable-files","access":"read-only","scope":"agent","namespace":"-turso"}"#,
+            r#"{"interface":"durable-files","access":"read-only","scope":"agent","path":"turso"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<StorageConstraints>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(parsed.namespace, None);
+        let shared = r#"{"interface":"durable-files","access":"read-write","scope":"agent","retention":{"mode":"keep"},"namespace":"turso"}"#;
+        let parsed: StorageConstraints = serde_json::from_str(shared).expect("shared namespace");
+        assert_eq!(parsed.namespace, Some("turso".parse().expect("provider")));
+        assert_eq!(serde_json::to_string(&parsed).expect("encode"), shared);
     }
 }
 

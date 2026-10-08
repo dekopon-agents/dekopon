@@ -122,6 +122,182 @@ fn request(
     )
 }
 
+fn agent_request(
+    invocation: &str,
+    provider: &str,
+    agent: &str,
+    access: StorageAccess,
+    namespace: Option<&str>,
+) -> StorageGrantRequest {
+    StorageGrantRequest::new(
+        invocation.parse().expect("invocation"),
+        format!("{provider}.exec").parse().expect("capability"),
+        provider.parse().expect("provider"),
+        StorageInterface::DurableFiles,
+        access,
+        StorageScope::Agent,
+        agent.parse().expect("agent"),
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "slack",
+        "scientist-slack",
+        "c0123abc",
+        "c0123abc:1712345678.000100",
+        ContinuityPolicy::Stable,
+        format!("{provider}-authority").into_bytes(),
+    )
+    .with_shared_namespace(namespace.map(|name| name.parse().expect("namespace")))
+}
+
+fn read_shared(host: &StorageHost, request: StorageGrantRequest) -> Option<Vec<u8>> {
+    let mut reader = host
+        .begin(host.grant(request).expect("reader grant"))
+        .expect("reader transaction");
+    let read = OpenOptions {
+        read: true,
+        ..OpenOptions::default()
+    };
+    let contents = match reader.vfs_open("shared.db", read) {
+        Ok(handle) => {
+            let bytes = reader.vfs_read_at(handle, 0, 64).expect("read");
+            reader.vfs_close(handle).expect("close");
+            Some(bytes)
+        }
+        Err(StorageHostError::NotFound) => None,
+        Err(error) => panic!("unexpected open failure: {error:?}"),
+    };
+    reader.finish_read().expect("finish read");
+    contents
+}
+
+#[test]
+fn an_agent_namespace_without_a_shared_name_keeps_its_directory() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let today = "a4ef29b4cf1b6c037c8569d780da3239a010f7668c2067233823442b0fb3a720";
+    for namespace in [None, Some("turso")] {
+        let preparation = host
+            .prepare_grant(agent_request(
+                "default-directory",
+                "turso",
+                "reviewer",
+                StorageAccess::ReadOnly,
+                namespace,
+            ))
+            .expect("preparation");
+        assert_eq!(preparation.namespace(), today, "{namespace:?}");
+    }
+}
+
+#[test]
+fn two_providers_share_one_named_agent_namespace_and_no_other_agent_reaches_it() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let mut writer = host
+        .begin(
+            host.grant(agent_request(
+                "turso-writes",
+                "turso",
+                "reviewer",
+                StorageAccess::ReadWrite,
+                None,
+            ))
+            .expect("writer grant"),
+        )
+        .expect("writer transaction");
+    let handle = writer
+        .vfs_open(
+            "shared.db",
+            OpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open");
+    writer
+        .vfs_write_at(handle, 0, b"from turso")
+        .expect("write");
+    writer.vfs_close(handle).expect("close");
+    writer.commit().expect("commit");
+
+    let mut python = host
+        .begin(
+            host.grant(agent_request(
+                "python-writes",
+                "python",
+                "reviewer",
+                StorageAccess::ReadWrite,
+                Some("turso"),
+            ))
+            .expect("python grant"),
+        )
+        .expect("python transaction");
+    assert_eq!(
+        python
+            .vfs_stat("shared.db")
+            .expect("stat")
+            .expect("shared")
+            .size,
+        10
+    );
+    let handle = python
+        .vfs_open(
+            "shared.db",
+            OpenOptions {
+                read: true,
+                write: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open shared");
+    python.vfs_write_at(handle, 5, b"python").expect("write");
+    python.vfs_close(handle).expect("close");
+    python.commit().expect("commit");
+
+    assert_eq!(
+        read_shared(
+            &host,
+            agent_request(
+                "turso-reads",
+                "turso",
+                "reviewer",
+                StorageAccess::ReadOnly,
+                None
+            )
+        )
+        .as_deref(),
+        Some(b"from python".as_slice())
+    );
+    for (invocation, provider, agent, namespace) in [
+        ("other-agent", "python", "assistant", Some("turso")),
+        ("other-agent-own", "turso", "assistant", None),
+        ("python-own", "python", "reviewer", None),
+        ("third-name", "python", "reviewer", Some("sqlite")),
+    ] {
+        assert_eq!(
+            read_shared(
+                &host,
+                agent_request(
+                    invocation,
+                    provider,
+                    agent,
+                    StorageAccess::ReadOnly,
+                    namespace
+                )
+            ),
+            None,
+            "{invocation}"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(root.join("namespaces"))
+            .expect("namespaces")
+            .count(),
+        4
+    );
+}
+
 #[test]
 fn authority_bound_never_reopens_an_epoch_after_continuity_changes() {
     for (surface, continuity, limits) in [
