@@ -190,7 +190,7 @@ fn bash_tool_call(id: &str, script: &str) -> Value {
                     "type": "function",
                     "function": {
                         "name": "bash",
-                        "arguments": json!({ "script": script }).to_string()
+                        "arguments": json!({ "command": script }).to_string()
                     }
                 }]
             }

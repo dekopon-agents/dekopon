@@ -173,7 +173,7 @@ impl FailureClass {
             | PromptError::ArgumentsNotObject { .. }
             | PromptError::AgentConfigArgumentsNotEmpty { .. }
             | PromptError::DeclineReplyArgumentsNotEmpty { .. }
-            | PromptError::MissingScript { .. }
+            | PromptError::MissingCommand { .. }
             | PromptError::MissingAssetId { .. }
             | PromptError::MissingSkillName { .. }
             | PromptError::UnexpectedSkillArguments { .. }

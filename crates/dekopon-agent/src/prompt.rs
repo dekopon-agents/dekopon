@@ -1125,7 +1125,7 @@ pub(crate) fn reject_tool_call(
 }
 
 const BAD_SCRIPT_ARGUMENTS_FEEDBACK: &str = "dekopon: bash takes one string argument named \
-    script holding the whole script, for example {\"script\":\"cap --list\"}.";
+    command holding the whole script, for example {\"command\":\"cap --list\"}.";
 
 fn unknown_tool_feedback(tools: &[ModelTool]) -> String {
     let names = tools
@@ -1135,7 +1135,7 @@ fn unknown_tool_feedback(tools: &[ModelTool]) -> String {
         .join(", ");
     format!(
         "dekopon: no tool by that name is offered. The tools are: {names}. Provider command \
-         words run inside a bash script: call bash with {{\"script\":\"<word> --help\"}}."
+         words run inside a bash script: call bash with {{\"command\":\"<word> --help\"}}."
     )
 }
 
@@ -1175,12 +1175,12 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
         parameters: json!({
             "type": "object",
             "properties": {
-                "script": {
+                "command": {
                     "type": "string",
                     "description": "The script to run. Multiple lines are expected and encouraged."
                 }
             },
-            "required": ["script"],
+            "required": ["command"],
             "additionalProperties": false
         }),
     }
@@ -1477,9 +1477,9 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
             tool: tool.to_owned(),
         });
     };
-    match arguments.get("script") {
+    match arguments.get("command") {
         Some(Value::String(script)) => Ok(script.clone()),
-        _ => Err(PromptError::MissingScript {
+        _ => Err(PromptError::MissingCommand {
             tool: tool.to_owned(),
         }),
     }
@@ -1487,8 +1487,8 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
-`{\"script\":\"cap --list\"}`: the script goes inside `script`, not `command`, and provider command \
-words are not separate model tools. Returns the script's combined output followed by an \
+`{\"command\":\"cap --list\"}`; provider command words are not separate model \
+tools. Returns the script's combined output followed by an \
 `[exit code: N]` trailer.
 
 - Capabilities are reached only through this tool. Do the whole job in one script; send another \
@@ -1533,8 +1533,8 @@ pub enum PromptError {
     AgentConfigArgumentsNotEmpty { tool: String },
     #[error("model arguments for tool {tool:?} must be an empty object")]
     DeclineReplyArgumentsNotEmpty { tool: String },
-    #[error("model arguments for tool {tool:?} must include a string \"script\" field")]
-    MissingScript { tool: String },
+    #[error("model arguments for tool {tool:?} must include a string \"command\" field")]
+    MissingCommand { tool: String },
     #[error("model arguments for tool {tool:?} must include an integer \"id\" field")]
     MissingAssetId { tool: String },
     #[error("model arguments for tool {tool:?} must include a non-empty string \"name\" field")]
@@ -1575,7 +1575,7 @@ impl PromptError {
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
             Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
             Self::DeclineReplyArgumentsNotEmpty { .. } => "decline-reply-arguments-not-empty",
-            Self::MissingScript { .. } => "missing-script",
+            Self::MissingCommand { .. } => "missing-command",
             Self::MissingAssetId { .. } => "missing-asset-id",
             Self::MissingSkillName { .. } => "missing-skill-name",
             Self::UnexpectedSkillArguments { .. } => "unexpected-skill-arguments",
@@ -1781,7 +1781,7 @@ mod tests {
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": script }).to_string(),
+                    arguments: json!({ "command": script }).to_string(),
                 },
             }],
             None,
@@ -3573,8 +3573,8 @@ mod tests {
         let tool = script_tool(&[], &BTreeMap::new());
 
         assert_eq!(tool.name, "bash");
-        assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
-        assert_eq!(tool.parameters["required"], json!(["script"]));
+        assert_eq!(tool.parameters["properties"]["command"]["type"], "string");
+        assert_eq!(tool.parameters["required"], json!(["command"]));
         assert_eq!(tool.parameters["additionalProperties"], json!(false));
         let example = tool
             .description
@@ -3583,8 +3583,8 @@ mod tests {
             .map(|(example, _)| example)
             .expect("bash tool call example");
         let arguments: serde_json::Value = serde_json::from_str(example).unwrap();
-        assert_eq!(arguments, json!({ "script": "cap --list" }));
-        assert!(tool.description.contains("inside `script`, not `command`"));
+        assert_eq!(arguments, json!({ "command": "cap --list" }));
+        assert!(!tool.description.contains("`script`"));
         assert_eq!(
             tool.description.matches("run `<word> --help`").count(),
             1,
@@ -3940,7 +3940,7 @@ mod tests {
                     kind: "function".to_owned(),
                     function: ModelFunctionCall {
                         name: SCRIPT_TOOL_NAME.to_owned(),
-                        arguments: json!({"script": "echo should-not-run"}).to_string(),
+                        arguments: json!({ "command": "echo should-not-run"}).to_string(),
                     },
                 },
             ],
@@ -4144,7 +4144,7 @@ mod tests {
             "{feedback:?}"
         );
         assert!(
-            feedback[0].ends_with(r#"call bash with {"script":"<word> --help"}."#),
+            feedback[0].ends_with(r#"call bash with {"command":"<word> --help"}."#),
             "{feedback:?}"
         );
         assert!(!feedback[0].contains("echo_echo"), "{feedback:?}");
@@ -4169,7 +4169,7 @@ mod tests {
                     call(
                         "call-2",
                         SCRIPT_TOOL_NAME,
-                        json!({ "script": "gh pr view 12" }),
+                        json!({ "command": "gh pr view 12" }),
                     ),
                 ],
                 None,
@@ -4193,8 +4193,8 @@ mod tests {
     }
 
     #[test]
-    fn a_bash_call_without_a_string_script_is_answered_once_then_ends_the_session() {
-        for arguments in [r#"{"command":"echo hi"}"#, r#"{"script":42}"#, "{}"] {
+    fn a_bash_call_without_a_string_command_is_answered_once_then_ends_the_session() {
+        for arguments in [r#"{"script":"echo hi"}"#, r#"{"command":42}"#, "{}"] {
             let bad = |id: &str| {
                 AssistantTurn::new(
                     None,
@@ -4216,7 +4216,7 @@ mod tests {
                 .expect_err("the second malformed call fails closed");
 
             assert!(
-                matches!(error, PromptError::MissingScript { .. }),
+                matches!(error, PromptError::MissingCommand { .. }),
                 "{arguments}: {error}"
             );
             assert_eq!(
@@ -4237,7 +4237,7 @@ mod tests {
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": "echo hi" }).to_string(),
+                    arguments: json!({ "command": "echo hi" }).to_string(),
                 },
             })
             .collect();
@@ -4263,7 +4263,7 @@ mod tests {
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": "echo hi" }).to_string(),
+                    arguments: json!({ "command": "echo hi" }).to_string(),
                 },
             })
             .collect();
@@ -4392,7 +4392,7 @@ mod tests {
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": "echo hi" }).to_string(),
+                    arguments: json!({ "command": "echo hi" }).to_string(),
                 },
             }],
             None,
