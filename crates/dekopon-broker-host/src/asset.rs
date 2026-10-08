@@ -1140,9 +1140,11 @@ mod tests {
                 max_response_bytes: 1024,
                 allow_plaintext_loopback: true,
                 propagate_trace: false,
+                request_templates: Vec::new(),
             }),
             None,
             None,
+            Default::default(),
             Default::default(),
             Duration::from_secs(30),
         )

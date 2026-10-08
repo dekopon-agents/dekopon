@@ -58,7 +58,9 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-use std::{fmt, num::NonZeroU8};
+mod template;
+
+use std::{collections::BTreeSet, fmt, num::NonZeroU8};
 
 use dekopon_core::{
     Actor, CapabilityId, InvocationId, PrincipalId, ProviderFailureDetail, ProviderId, SecretDrn,
@@ -67,6 +69,11 @@ use dekopon_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+pub use template::{
+    ChatSlot, ChatSlotValues, MAX_TEMPLATE_PATH_BYTES, MAX_TEMPLATE_QUERY_KEY_BYTES, PathSegment,
+    PathTemplate, PathTemplateError, QueryTemplate, RequestTemplate,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -147,6 +154,8 @@ pub struct HttpConstraints {
     pub allow_plaintext_loopback: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub propagate_trace: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_templates: Vec<RequestTemplate>,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -194,6 +203,60 @@ impl HttpConstraints {
         }
         if self.max_requests == 0 || self.max_request_bytes == 0 || self.max_response_bytes == 0 {
             return Err(HttpConstraintsError::ZeroLimit);
+        }
+        self.validate_request_templates()
+    }
+
+    #[must_use]
+    pub fn template_slots(&self) -> BTreeSet<ChatSlot> {
+        self.request_templates
+            .iter()
+            .flat_map(RequestTemplate::slots)
+            .collect()
+    }
+
+    fn validate_request_templates(&self) -> Result<(), HttpConstraintsError> {
+        if self.request_templates.len() > MAX_HTTP_SCOPE_ENTRIES {
+            return Err(HttpConstraintsError::TooManyEntries {
+                maximum: MAX_HTTP_SCOPE_ENTRIES,
+            });
+        }
+        let mut routes = BTreeSet::new();
+        for template in &self.request_templates {
+            let rule = template.to_string();
+            if !self.allowed_methods.contains(&template.method) {
+                return Err(HttpConstraintsError::TemplateMethodNotAllowed { rule });
+            }
+            if !routes.insert((&template.method, &template.path)) {
+                return Err(HttpConstraintsError::DuplicateTemplate { rule });
+            }
+            let query = &template.query;
+            if query.pinned.len() + query.allowed.len() > MAX_HTTP_SCOPE_ENTRIES {
+                return Err(HttpConstraintsError::TooManyEntries {
+                    maximum: MAX_HTTP_SCOPE_ENTRIES,
+                });
+            }
+            if let Some(key) = query
+                .pinned
+                .keys()
+                .chain(&query.allowed)
+                .find(|key| !template::is_query_key(key))
+            {
+                return Err(HttpConstraintsError::InvalidTemplateQueryKey {
+                    rule,
+                    key: key.clone(),
+                });
+            }
+            if let Some(key) = query
+                .allowed
+                .iter()
+                .find(|key| query.pinned.contains_key(*key))
+            {
+                return Err(HttpConstraintsError::TemplateKeyPinnedAndAllowed {
+                    rule,
+                    key: key.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -247,6 +310,14 @@ pub enum HttpConstraintsError {
     InvalidMethod { value: String },
     #[error("HTTP authorization limits must be greater than zero")]
     ZeroLimit,
+    #[error("HTTP request template {rule:?} names a method allowedMethods does not grant")]
+    TemplateMethodNotAllowed { rule: String },
+    #[error("HTTP request template {rule:?} appears more than once")]
+    DuplicateTemplate { rule: String },
+    #[error("HTTP request template {rule:?} has an invalid query key {key:?}")]
+    InvalidTemplateQueryKey { rule: String, key: String },
+    #[error("HTTP request template {rule:?} both pins and allows query key {key:?}")]
+    TemplateKeyPinnedAndAllowed { rule: String, key: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -874,6 +945,7 @@ mod tests {
             max_response_bytes: 1024,
             allow_plaintext_loopback: false,
             propagate_trace: false,
+            request_templates: Vec::new(),
         };
         let cases = [
             (
@@ -974,6 +1046,42 @@ mod tests {
     }
 
     #[test]
+    fn request_templates_must_be_reachable_unique_and_unambiguous() {
+        let with = |templates: serde_json::Value| HttpConstraints {
+            allowed_hosts: vec!["slack.com".to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 1,
+            max_request_bytes: 1,
+            max_response_bytes: 1,
+            allow_plaintext_loopback: false,
+            propagate_trace: false,
+            request_templates: serde_json::from_value(templates).expect("template fixtures"),
+        };
+        let replies = json!({"method": "GET", "path": "/api/conversations.replies",
+            "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}});
+        assert_eq!(with(json!([replies])).validate(), Ok(()));
+        assert!(matches!(
+            with(json!([{"method": "POST", "path": "/api/chat.postMessage"}])).validate(),
+            Err(HttpConstraintsError::TemplateMethodNotAllowed { .. })
+        ));
+        assert!(matches!(
+            with(json!([replies, {"method": "GET", "path": "/api/conversations.replies"}]))
+                .validate(),
+            Err(HttpConstraintsError::DuplicateTemplate { .. })
+        ));
+        assert!(matches!(
+            with(json!([{"method": "GET", "path": "/api",
+                "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["channel"]}}]))
+            .validate(),
+            Err(HttpConstraintsError::TemplateKeyPinnedAndAllowed { .. })
+        ));
+        assert!(matches!(
+            with(json!([{"method": "GET", "path": "/api", "query": {"allowed": [""]}}])).validate(),
+            Err(HttpConstraintsError::InvalidTemplateQueryKey { .. })
+        ));
+    }
+
+    #[test]
     fn broker_gate_accepts_exact_http_authority() {
         let http = HttpConstraints {
             allowed_hosts: vec!["api.example.test".to_owned(), "127.0.0.1:8080".to_owned()],
@@ -988,6 +1096,7 @@ mod tests {
             max_response_bytes: 1_048_576,
             allow_plaintext_loopback: true,
             propagate_trace: false,
+            request_templates: Vec::new(),
         };
 
         http.validate().expect("an exact grant is enforceable");
@@ -1004,6 +1113,7 @@ mod tests {
                 max_response_bytes: 1_048_576,
                 allow_plaintext_loopback: false,
                 propagate_trace: false,
+                request_templates: Vec::new(),
             }),
             ..ExecutionConstraints::default()
         };

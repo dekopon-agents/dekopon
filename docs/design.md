@@ -334,7 +334,10 @@ provider JSON, so no capability statement can say "this agent may comment on iss
 `dekopon-agents/*` only". The public-DRN path is narrower: a private secret-use binding
 may constrain HTTP authority, method, canonical path and query presence at the native sink, but that
 constrains where one secret is presented rather than interpreting repository/object identity in
-provider input or request bodies. Upstream credential scope remains the boundary for those semantics.
+provider input or request bodies. One identity the broker can pin: an HTTP constraint set's
+`requestTemplates` substitute the attested conversation into the request path or query in the
+native host, so a chat-history read reaches only the chat it was called from. Upstream credential
+scope remains the boundary for every other request identity.
 
 ## Operator interface
 

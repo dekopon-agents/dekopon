@@ -56,10 +56,10 @@ pub use dekopon_broker_protocol::{
     InvocationRequest, Trigger,
 };
 use dekopon_capability::{
-    AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
-    HttpConstraintsError, InvocationOutcome, InvocationResult, ProposedInvocation, SecretUseGrant,
-    StorageAccess, StorageConstraints, StorageInterface, StorageRetention, StorageScope,
-    broker::AuthorizationGate,
+    AuthorizationError, ChatSlot, ChatSlotValues, DecisionReference, EffectKind, Evidence,
+    ExecutionConstraints, HttpConstraints, HttpConstraintsError, InvocationOutcome,
+    InvocationResult, ProposedInvocation, SecretUseGrant, StorageAccess, StorageConstraints,
+    StorageInterface, StorageRetention, StorageScope, broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
@@ -2026,6 +2026,8 @@ where
             .filter(|(capability, set)| {
                 set.route.is_generic()
                     && (set.constraints.storage.is_none() || context.chat_scope().is_some())
+                    && render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
+                        .is_ok()
                     && probe_permits(context, set.effect)
                     && self.authorize_capability(context, capability, set).allowed
             })
@@ -2907,6 +2909,17 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
+            let slots = match render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
+            {
+                Ok(slots) => slots,
+                Err(reason) => {
+                    authorize.record("outcome", reason);
+                    return self
+                        .deny(context, &request, unevaluated_refusal(reason))
+                        .await
+                        .map(ControlFlow::Break);
+                }
+            };
             let decision = self.authorize_capability(context, &request.capability, &set);
             // A policy error denies exactly like a non-match; this is recorded as a flag rather
             // than the error text so denial explanations can't become a per-request channel leaking
@@ -2991,11 +3004,11 @@ where
                 set.constraints.secret_use = None;
             }
             authorize.record("outcome", "allowed");
-            Ok(ControlFlow::Continue((set, policy_ids)))
+            Ok(ControlFlow::Continue((set, policy_ids, slots)))
         }
         .instrument(authorize.clone())
         .await?;
-        let (set, policy_ids) = match authorized {
+        let (set, policy_ids, slots) = match authorized {
             ControlFlow::Break(denied) => return Ok(denied),
             ControlFlow::Continue(allowed) => allowed,
         };
@@ -3019,7 +3032,7 @@ where
         } else if let Some(credential) = self.constraints.credential_for(&set, context.actor()) {
             execute.record("credential", credential);
         }
-        self.execute(context, request, set, policy_ids, assets, outputs)
+        self.execute(context, request, set, policy_ids, slots, assets, outputs)
             .instrument(execute)
             .await
     }
@@ -3185,6 +3198,7 @@ where
         mut request: InvocationRequest,
         set: ConstraintSet,
         policy_ids: Vec<String>,
+        slots: ChatSlotValues,
         assets: dekopon_broker_host::asset::AssetInputs,
         outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
@@ -3487,7 +3501,7 @@ where
         let started = Instant::now();
         let execution = self
             .registry
-            .invoke_with_storage(authorized, credential, storage_grant, assets)
+            .invoke_with_storage(authorized, credential, storage_grant, slots, assets)
             .await;
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
@@ -3768,6 +3782,35 @@ fn encode_execution_constraints(
         if http.propagate_trace {
             encoded.boolean("execution.http.propagateTrace", true);
         }
+        if !http.request_templates.is_empty() {
+            let templates = http.request_templates.iter().collect::<BTreeSet<_>>();
+            encoded.number(
+                "execution.http.requestTemplateCount",
+                templates.len() as u128,
+            );
+            for template in templates {
+                encoded.text("execution.http.requestTemplate.method", &template.method);
+                encoded.text(
+                    "execution.http.requestTemplate.path",
+                    &template.path.to_string(),
+                );
+                encoded.number(
+                    "execution.http.requestTemplate.pinnedCount",
+                    template.query.pinned.len() as u128,
+                );
+                for (key, slot) in &template.query.pinned {
+                    encoded.text("execution.http.requestTemplate.pinnedKey", key);
+                    encoded.text("execution.http.requestTemplate.pinnedSlot", slot.as_str());
+                }
+                encoded.number(
+                    "execution.http.requestTemplate.allowedCount",
+                    template.query.allowed.len() as u128,
+                );
+                for key in &template.query.allowed {
+                    encoded.text("execution.http.requestTemplate.allowedKey", key);
+                }
+            }
+        }
     } else {
         encoded.byte("execution.http.present", 0);
     }
@@ -3939,6 +3982,42 @@ const CONSOLE_SMOKE_REFUSAL: &str = "console-smoke-claim-denied";
 const CONSOLE_REAL_SCOPE_REASON: &str = "console-real-scope-denied";
 pub const CONSOLE_REAL_SCOPE_REFUSAL: &str = "dekopon sandbox: console sessions cannot attest a real conversation; use --smoke-conversation or the authenticated gateway";
 const CONSOLE_SMOKE_DOMAIN: &[u8] = b"dekopon-console-smoke-v1\0";
+
+/// Slack ids render upper-cased because the attestation carries them lower-cased and the Web API
+/// takes them as Slack issued them.
+fn render_chat_slots(
+    http: Option<&HttpConstraints>,
+    scope: Option<&ChatScopeClaim>,
+) -> Result<ChatSlotValues, &'static str> {
+    let mut values = ChatSlotValues::default();
+    let Some(http) = http.filter(|http| !http.request_templates.is_empty()) else {
+        return Ok(values);
+    };
+    let scope = scope.ok_or("chat-scope-required")?;
+    let api_form = |id: &str| match scope.kind {
+        ChatTransportKind::Slack => id.to_ascii_uppercase(),
+        ChatTransportKind::Discord
+        | ChatTransportKind::Telegram
+        | ChatTransportKind::Whatsapp
+        | ChatTransportKind::Local => id.to_owned(),
+    };
+    for slot in http.template_slots() {
+        let value = match slot {
+            ChatSlot::ConversationId => api_form(&scope.conversation.id),
+            ChatSlot::ConversationThread => scope
+                .conversation
+                .thread
+                .clone()
+                .ok_or("request-template-slot-absent")?,
+            ChatSlot::ConversationApiChannel => {
+                api_form(scope.conversation.api_channel(scope.kind))
+            }
+            ChatSlot::Transport => scope.transport.as_str().to_owned(),
+        };
+        values.insert(slot, value);
+    }
+    Ok(values)
+}
 
 fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
     let ChatScopeClaim {

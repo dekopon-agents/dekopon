@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use dekopon_broker::{CapabilityRoute, ConstraintSet};
 use dekopon_capability::{
-    AssetConstraints, EffectKind, ExecutionConstraints, HttpConstraints, SecretUseGrant,
-    StorageConstraints,
+    AssetConstraints, EffectKind, ExecutionConstraints, HttpConstraints, RequestTemplate,
+    SecretUseGrant, StorageConstraints,
 };
 use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 use serde::Deserialize;
@@ -50,6 +50,7 @@ pub struct HttpPatch {
     pub max_response_bytes: Option<u64>,
     pub allow_plaintext_loopback: Option<bool>,
     pub propagate_trace: Option<bool>,
+    pub request_templates: Option<Vec<RequestTemplate>>,
 }
 
 impl ConstraintsPatch {
@@ -97,6 +98,7 @@ impl ConstraintsPatch {
                             .ok_or_else(|| missing("http.maxResponseBytes"))?,
                         allow_plaintext_loopback: http.allow_plaintext_loopback.unwrap_or(false),
                         propagate_trace: http.propagate_trace.unwrap_or(false),
+                        request_templates: http.request_templates.unwrap_or_default(),
                     })
                 })
                 .transpose()?,
@@ -125,6 +127,10 @@ impl HttpPatch {
                 .allow_plaintext_loopback
                 .or(base.allow_plaintext_loopback),
             propagate_trace: self.propagate_trace.or(base.propagate_trace),
+            request_templates: self
+                .request_templates
+                .clone()
+                .or_else(|| base.request_templates.clone()),
         }
     }
 }
@@ -288,6 +294,50 @@ gh:
         assert_eq!(http.allowed_methods, ["GET", "POST"]);
         assert_eq!(http.allowed_hosts, ["api.github.com"]);
         assert_eq!(http.max_requests, 2);
+    }
+
+    #[test]
+    fn request_templates_parse_per_capability_and_refuse_unknown_slots() {
+        let capability = |template: &str| {
+            format!(
+                "{DEFAULTS}  capabilities:\n    gh.repo.read:\n      constraints:\n        http:\n          requestTemplates:\n{template}"
+            )
+        };
+        let (sets, problems) = resolve(&capability(
+            "            - method: GET\n              path: /channels/{conversation.apiChannel}/messages\n              query: { pinned: { ts: conversation.thread }, allowed: [limit] }\n",
+        ));
+        assert!(problems.is_empty());
+        let http = sets[&id("gh.repo.read")]
+            .constraints
+            .http
+            .as_ref()
+            .expect("http");
+        assert_eq!(http.allowed_hosts, ["api.github.com"]);
+        let [template] = http.request_templates.as_slice() else {
+            panic!("one template: {:?}", http.request_templates);
+        };
+        assert_eq!(
+            template.to_string(),
+            "GET /channels/{conversation.apiChannel}/messages"
+        );
+        assert_eq!(
+            template.query.pinned.get("ts"),
+            Some(&dekopon_capability::ChatSlot::ConversationThread)
+        );
+
+        for invalid in [
+            "            - { method: GET, path: \"/channels/{conversation.guild}\" }\n",
+            "            - { method: GET, path: /api, query: { pinnned: {} } }\n",
+            "            - { method: GET, path: /api, query: { pinned: { c: conversation.container } } }\n",
+        ] {
+            assert!(
+                serde_yaml::from_str::<BTreeMap<ProviderId, ProviderCapabilities>>(&capability(
+                    invalid
+                ))
+                .is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

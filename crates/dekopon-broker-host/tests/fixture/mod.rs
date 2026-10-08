@@ -367,7 +367,7 @@ impl FixtureHost {
         let (assets, stdout) = piped_stdout();
         let output = self
             .registry
-            .invoke_with_storage(authorized, None, grant, assets)
+            .invoke_with_storage(authorized, None, grant, Default::default(), assets)
             .await
             .map_err(|failure| FixtureHostError::Invocation(Box::new(failure)))?;
         Ok((output, stdout.json()))
