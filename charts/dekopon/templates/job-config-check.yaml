@@ -1,0 +1,271 @@
+{{- if .Values.configCheck.enabled }}
+{{- $check := .Values.configCheck -}}
+{{- if not (or $check.broker.configMap $check.gateway.configMap) }}
+{{- fail "configCheck.enabled requires configCheck.broker.configMap, configCheck.gateway.configMap or both" }}
+{{- end }}
+{{- if and $check.gateway.configMap (not $check.gateway.catalogConfigMap) }}
+{{- fail "configCheck.gateway.configMap requires configCheck.gateway.catalogConfigMap; check binds every route against the candidate catalog" }}
+{{- end }}
+{{- $store := and $check.broker.configMap $check.broker.providerSetConfigMap -}}
+{{- if and $store (not $check.annotations) (not .Values.state.existingClaim) }}
+{{- fail "configCheck.broker.providerSetConfigMap with Helm's default pre-install hook requires state.existingClaim; the chart-created claim does not exist yet when the hook runs" }}
+{{- end }}
+{{- $skills := and $check.gateway.configMap $check.gateway.skillsConfigMap -}}
+{{- $uid := .Values.podSecurityContext.runAsUser | int -}}
+{{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
+{{- $storeDir := printf "%s/config-check" .Values.paths.stateDir -}}
+{{- $brokerSecurityContext := mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" $uid "runAsGroup" $gid) -}}
+{{- $gatewaySecurityContext := mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65533 "runAsGroup" 65533) -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dekopon.fullname" . }}-config-check
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config-check
+  annotations:
+    {{- with $check.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- else }}
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- end }}
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      # Not the Deployment's selector labels: a running check pod would otherwise join the gateway
+      # Service's endpoints.
+      labels:
+        app.kubernetes.io/name: {{ include "dekopon.name" . }}
+        app.kubernetes.io/component: config-check
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # check refuses symlinks and files it does not own, and a ConfigMap mount is a root-owned
+        # symlink farm, so every candidate file is copied into a 0700 directory its daemon owns.
+        - name: prepare-candidate
+          image: {{ include "dekopon.initImage" . }}
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.initSecurityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              umask 077
+              copy() {
+                owner=$1 source=$2 dest=$3
+                shift 3
+                mkdir -m 0700 "$dest"
+                found=0
+                for f in "$@"; do
+                  [ -f "$f" ] || continue
+                  install -m 0600 -o "$owner" -g "$owner" "$f" "$dest/${f##*/}"
+                  found=1
+                done
+                if [ "$found" -eq 0 ]; then
+                  echo "$source: nothing to copy into $dest" >&2
+                  exit 1
+                fi
+                chown "$owner:$owner" "$dest"
+              }
+              chmod 0755 /check
+{{- if $check.broker.configMap }}
+              copy {{ $uid }} {{ $check.broker.configMap }} /check/broker.d /source/broker.d/*.yaml /source/broker.d/*.cedar
+{{- end }}
+{{- if $store }}
+              install -m 0600 -o {{ $uid }} -g {{ $gid }} /source/provider-set/providers.yaml /check/providers.yaml
+              chown 0:0 "{{ .Values.paths.stateDir }}"
+              chmod 0700 "{{ .Values.paths.stateDir }}"
+              [ -d "{{ $storeDir }}" ] || mkdir -p "{{ $storeDir }}"
+              chown {{ $uid }}:{{ $gid }} "{{ $storeDir }}"
+              chmod 0700 "{{ $storeDir }}"
+{{- end }}
+{{- if $check.gateway.configMap }}
+              copy 65533 {{ $check.gateway.configMap }} /check/gatewayd.d /source/gatewayd.d/*.yaml
+              copy 65533 {{ $check.gateway.catalogConfigMap }} /check/agents.d /source/agents.d/*
+{{- if $check.gateway.againstConfigMap }}
+              copy 65533 {{ $check.gateway.againstConfigMap }} /check/live.d /source/live.d/*.yaml
+{{- end }}
+{{- end }}
+{{- if $skills }}
+              for entry in /source/skills/*; do
+                [ -e "$entry" ] || continue
+                cp -RL "$entry" {{ .Values.paths.skillsDir }}/
+              done
+              find {{ .Values.paths.skillsDir }} -type d -exec chmod 0755 {} +
+              find {{ .Values.paths.skillsDir }} -type f -exec chmod 0644 {} +
+{{- end }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: check
+              mountPath: /check
+{{- if $check.broker.configMap }}
+            - name: broker-source
+              mountPath: /source/broker.d
+              readOnly: true
+{{- end }}
+{{- if $store }}
+            - name: provider-set-source
+              mountPath: /source/provider-set
+              readOnly: true
+            - name: state
+              mountPath: {{ .Values.paths.stateDir }}
+{{- end }}
+{{- if $check.gateway.configMap }}
+            - name: gateway-source
+              mountPath: /source/gatewayd.d
+              readOnly: true
+            - name: catalog-source
+              mountPath: /source/agents.d
+              readOnly: true
+{{- if $check.gateway.againstConfigMap }}
+            - name: against-source
+              mountPath: /source/live.d
+              readOnly: true
+{{- end }}
+{{- end }}
+{{- if $skills }}
+            - name: skills-source
+              mountPath: /source/skills
+              readOnly: true
+            - name: skills
+              mountPath: {{ .Values.paths.skillsDir }}
+{{- end }}
+      containers:
+{{- if $check.broker.configMap }}
+        - name: check-broker
+          image: {{ include "dekopon.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["dekopon-brokerd"]
+          args:
+            - check
+            - /check/broker.d
+{{- if $store }}
+            - --provider-set=/check/providers.yaml
+            - --store={{ $storeDir }}
+{{- end }}
+            - --output=json
+          securityContext:
+            {{- toYaml $brokerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.broker.resources | nindent 12 }}
+          volumeMounts:
+            - name: check
+              mountPath: /check
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+{{- if $store }}
+            - name: state
+              mountPath: {{ $storeDir }}
+              subPath: config-check
+{{- end }}
+{{- end }}
+{{- if $check.gateway.configMap }}
+        - name: check-gateway
+          image: {{ include "dekopon.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["dekopon-gatewayd"]
+          args:
+            - check
+            - /check/gatewayd.d
+            - --catalog=/check/agents.d
+            - --probe
+{{- if $check.gateway.againstConfigMap }}
+            - --against=/check/live.d
+{{- end }}
+            - --output=json
+          {{- with $check.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $gatewaySecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: check
+              mountPath: /check
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+{{- if $skills }}
+            - name: skills
+              mountPath: {{ .Values.paths.skillsDir }}
+              readOnly: true
+{{- end }}
+{{- end }}
+      volumes:
+        - name: check
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.config }}
+        - name: tmp
+          emptyDir: {}
+{{- if $check.broker.configMap }}
+        - name: broker-source
+          configMap:
+            name: {{ $check.broker.configMap }}
+{{- end }}
+{{- if $store }}
+        - name: provider-set-source
+          configMap:
+            name: {{ $check.broker.providerSetConfigMap }}
+            items:
+              - key: providers.yaml
+                path: providers.yaml
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ include "dekopon.stateClaimName" . }}
+{{- end }}
+{{- if $check.gateway.configMap }}
+        - name: gateway-source
+          configMap:
+            name: {{ $check.gateway.configMap }}
+        - name: catalog-source
+          configMap:
+            name: {{ $check.gateway.catalogConfigMap }}
+{{- if $check.gateway.againstConfigMap }}
+        - name: against-source
+          configMap:
+            name: {{ $check.gateway.againstConfigMap }}
+{{- end }}
+{{- end }}
+{{- if $skills }}
+        - name: skills-source
+          configMap:
+            name: {{ $check.gateway.skillsConfigMap }}
+            defaultMode: 0400
+            items:
+              {{- toYaml .Values.gateway.skills.items | nindent 14 }}
+        - name: skills
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.config }}
+{{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

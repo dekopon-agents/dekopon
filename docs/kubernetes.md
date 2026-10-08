@@ -575,6 +575,51 @@ broker:
 with the ConfigMap in an earlier wave and the claim in the same wave, so a `WaitForFirstConsumer`
 claim binds to the hook's pod.
 
+## Checking configuration before a sync
+
+`configCheck.enabled` renders a hook Job that runs `dekopon-brokerd check` and
+`dekopon-gatewayd check --probe` on the configuration a release is about to apply, with the
+Deployment's image. A problem fails the hook, the release stops before anything changes and the
+old pod keeps serving. Each check is the function its daemon runs at boot; see
+[`gatewayd.md`](gatewayd.md#check-a-configuration) and the brokerd README.
+
+```yaml
+configCheck:
+  enabled: true
+  broker:
+    configMap: dekopon-check-broker-d
+    providerSetConfigMap: dekopon-check-config
+  gateway:
+    configMap: dekopon-check-gatewayd-d
+    catalogConfigMap: dekopon-check-agents-d
+    skillsConfigMap: dekopon-check-skills
+    againstConfigMap: dekopon-gatewayd-d
+  env:
+    - name: OPENROUTER_API_KEY
+      valueFrom:
+        secretKeyRef: {name: dekopon-openrouter, key: OPENROUTER_API_KEY}
+```
+
+The ConfigMaps it reads must hold the **candidate** files when the hook runs. The live ones do not:
+a hook runs before the sync applies them, and once they are applied, Reloader rolls the pod
+whatever the hook later says. Render a second set from the same files (a kustomize generator per
+directory, `dekopon-check-*`), annotated as hooks of the same phase with a lower sync wave than the
+Job, so they exist before it starts. `againstConfigMap` names the live gateway ConfigMap: only a
+model absent from it or changed in it is probed, so an unchanged model costs no vendor call.
+
+A root init container copies each ConfigMap into a `0700` directory owned by the daemon that reads
+it, as `0600` regular files, because `check` refuses the symlinks a ConfigMap mount is made of. The
+broker check runs as `65532`, resolving `providerSetConfigMap`'s `providers.yaml` into
+`<paths.stateDir>/config-check` on the state claim, so blobs persist between runs; that path needs
+`state.existingClaim` under the default Helm hook. The gateway check runs as `65533` with `env`,
+which should name each probed model's `apiKeyEnv` and nothing else; no ChatGPT login is mounted,
+since `check` never probes a subscription model. `backoffLimit: 1`, `activeDeadlineSeconds: 600`.
+
+`configCheck.annotations` replaces the hook annotations entirely. Empty means
+`helm.sh/hook: pre-install,pre-upgrade` with `before-hook-creation`, which Argo CD runs as
+`PreSync`. **Argo CD's selective sync runs no hooks**: a selective sync is unchecked unless you run
+both checks by hand on the rendered candidate first.
+
 ## Operator console
 
 `console.enabled` adds a third container that runs `dekopon-console --idle` as UID 65535 from
@@ -932,6 +977,8 @@ keeps the Service endpoint unavailable when the configuration and chart port dis
   in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume and
   a `65532`-owned `0700` claim root, mounted by `subPath` as the Job mounts it: the sync fetched every
   provider, and a second run fetched nothing.
+- The config-check hook Job has not run in a cluster. Both checks have run on the deployment's
+  real configuration outside one, and `--probe` against OpenRouter itself.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 
