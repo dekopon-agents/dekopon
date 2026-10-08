@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer};
 /// default, or the owner's `providerSettings.<id>.baseUrl`. The broker's grant, not this type,
 /// decides which destinations a call may reach.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// const BAD: dekopon_provider_sdk::provider::endpoint::Base =
 ///     dekopon_provider_sdk::provider::endpoint::Base::from_static("ftp://example.com");
 /// ```
@@ -81,7 +81,7 @@ const fn checked(url: &str) -> Result<&str, InvalidBase> {
         }
         index += 1;
     }
-    if index == 0 {
+    if index == 0 || authority[0] == b':' {
         return Err(InvalidBase::Host);
     }
     Ok(match url.as_bytes() {
@@ -187,6 +187,8 @@ mod tests {
             ("example.com", InvalidBase::Scheme),
             ("https://", InvalidBase::Host),
             ("https:///path", InvalidBase::Host),
+            ("https://:8080", InvalidBase::Host),
+            ("http://:8080/prefix", InvalidBase::Host),
             ("https://user:secret@example.com", InvalidBase::Userinfo),
             ("https://example.com/?q=1", InvalidBase::Query),
             ("https://example.com/#top", InvalidBase::Fragment),
