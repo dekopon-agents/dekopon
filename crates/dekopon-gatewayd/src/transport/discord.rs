@@ -1,6 +1,6 @@
-//! Requesting only the GUILD_MESSAGES and DIRECT_MESSAGES intents avoids needing Discord's
-//! privileged Message Content intent, since addressing is still decided by the authenticated
-//! mentions array, never message text.
+//! Addressing is decided by the authenticated `mentions` and `mention_roles` arrays, never by
+//! message text, so the privileged Message Content intent is requested only when `messageContent`
+//! opts in and a mention of the bot's managed role can then carry its text.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -39,8 +39,10 @@ use crate::{
 
 const API_VERSION: u8 = 10;
 const INTENTS: u64 = (1 << 9) | (1 << 12);
+const MESSAGE_CONTENT_INTENT: u64 = 1 << 15;
 const CHANNEL_SHAPE_CAPACITY: usize = 512;
-const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const GUILD_ROLE_CAPACITY: usize = 128;
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ATTACHMENTS: usize = 10;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const MAX_MESSAGE_CHARS: usize = 2_000;
@@ -62,7 +64,8 @@ const MAX_HISTORY_MESSAGES: usize = 100;
 const DISCORD_EPOCH_MILLIS: u64 = 1_420_070_400_000;
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
-const FATAL_GATEWAY_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
+const FATAL_GATEWAY_CLOSE_CODES: [u16; 5] = [4004, 4010, 4011, 4012, 4013];
+const DISALLOWED_INTENTS_CLOSE_CODE: u16 = 4014;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -83,9 +86,26 @@ pub(crate) struct DiscordTransport {
     next_heartbeat: Option<Instant>,
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
-    channels: ChannelShapes,
+    message_content: MessageContent,
+    channels: Lookups<ChannelShape>,
+    bot_roles: Lookups<BotRole>,
     pending: VecDeque<TransportEvent>,
     native: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MessageContent {
+    Withheld,
+    Requested,
+}
+
+impl MessageContent {
+    const fn intents(self) -> u64 {
+        match self {
+            Self::Withheld => INTENTS,
+            Self::Requested => INTENTS | MESSAGE_CONTENT_INTENT,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +126,7 @@ impl DiscordTransport {
         name: String,
         endpoint: String,
         token: String,
+        message_content: MessageContent,
         liveness: LivenessSettings,
     ) -> Result<Self, TransportError> {
         let http = client()?;
@@ -136,7 +157,9 @@ impl DiscordTransport {
             next_heartbeat: None,
             heartbeat_acked: true,
             last_identify: None,
-            channels: ChannelShapes::new(CHANNEL_SHAPE_CAPACITY),
+            message_content,
+            channels: Lookups::new(CHANNEL_SHAPE_CAPACITY),
+            bot_roles: Lookups::new(GUILD_ROLE_CAPACITY),
             pending: VecDeque::new(),
             native: liveness.mode == LivenessMode::Native,
         })
@@ -228,7 +251,7 @@ impl DiscordTransport {
                 "op": 2,
                 "d": {
                     "token": self.token.expose(),
-                    "intents": INTENTS,
+                    "intents": self.message_content.intents(),
                     "properties": {
                         "os": std::env::consts::OS,
                         "browser": "dekopon-gatewayd",
@@ -349,6 +372,9 @@ impl DiscordTransport {
                         let code = u16::from(frame.code);
                         if matches!(code, 4007 | 4009) {
                             self.clear_session();
+                        }
+                        if code == DISALLOWED_INTENTS_CLOSE_CODE {
+                            return Err(TransportError::DisallowedIntents);
                         }
                         if FATAL_GATEWAY_CLOSE_CODES.contains(&code) {
                             return Err(TransportError::Service {
@@ -567,20 +593,23 @@ impl DiscordTransport {
             self.dropped(received, DropReason::SelfAuthored, origin);
             return Ok(None);
         }
-        let text = bound_inbound(message["content"].as_str().unwrap_or_default());
+        let content = message["content"].as_str().unwrap_or_default();
         let assets = pending_assets(
             &message["attachments"],
             &self.driver,
             channel_id,
             message_id,
         );
-        if text.trim().is_empty() && assets.is_empty() {
-            let mention_roles = message["mention_roles"]
-                .as_array()
-                .is_some_and(|roles| !roles.is_empty());
+        let mention_roles = message["mention_roles"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if content.trim().is_empty() && assets.is_empty() {
             self.dropped(
                 received,
-                DropReason::ContentWithheld { mention_roles },
+                DropReason::ContentWithheld {
+                    mention_roles: !mention_roles.is_empty(),
+                },
                 origin,
             );
             return Ok(None);
@@ -588,7 +617,17 @@ impl DiscordTransport {
 
         let guild = message["guild_id"].as_str().filter(|id| is_snowflake(id));
         let direct = message["guild_id"].is_null();
+        let role_mention = self.role_mention(guild, mention_roles).await;
+        // A managed-role mention is rewritten to the bot's user mention so stop words and the
+        // prompt treat both "@Dekopon" pills alike.
+        let text = match (&role_mention, self.identity.user_id.as_deref()) {
+            (Some(role), Some(bot)) => {
+                bound_inbound(&content.replace(&format!("<@&{role}>"), &format!("<@{bot}>")))
+            }
+            (None, _) | (Some(_), None) => bound_inbound(content),
+        };
         let addressed = direct
+            || role_mention.is_some()
             || message["mentions"].as_array().is_some_and(|mentions| {
                 mentions
                     .iter()
@@ -663,25 +702,15 @@ impl DiscordTransport {
 
     /// This never takes the driver's rest_lock, because that lock serializes replies and a 429 here
     /// must not stall the reader that also sends heartbeats.
-    async fn channel_shape(&mut self, channel_id: &str) -> Option<ChannelShape> {
-        if let Some(shape) = self.channels.get(channel_id) {
-            return Some(shape);
-        }
+    async fn lookup(&self, path: &str, event: &'static str) -> Option<Value> {
         if self.driver.rest_cooldown().is_some() {
-            tracing::debug!(
-                event = "gateway_conversation_unresolved",
-                transport = %self.name,
-                cause = "rest-cooldown"
-            );
+            tracing::debug!(event = event, transport = %self.name, cause = "rest-cooldown");
             return None;
         }
         let response = timeout(
-            CHANNEL_LOOKUP_TIMEOUT,
+            LOOKUP_TIMEOUT,
             self.http
-                .get(format!(
-                    "{}/api/v{API_VERSION}/channels/{channel_id}",
-                    self.endpoint
-                ))
+                .get(format!("{}/api/v{API_VERSION}/{path}", self.endpoint))
                 .header(
                     reqwest::header::AUTHORIZATION,
                     format!("Bot {}", self.token.expose()),
@@ -693,7 +722,7 @@ impl DiscordTransport {
             Ok(Ok(response)) if response.status().is_success() => response.bytes().await,
             Ok(Ok(response)) => {
                 tracing::debug!(
-                    event = "gateway_conversation_unresolved",
+                    event = event,
                     transport = %self.name,
                     cause = "status",
                     status = response.status().as_u16()
@@ -702,7 +731,7 @@ impl DiscordTransport {
             }
             Ok(Err(source)) => {
                 tracing::debug!(
-                    event = "gateway_conversation_unresolved",
+                    event = event,
                     transport = %self.name,
                     cause = "request",
                     cause_type = %source
@@ -710,11 +739,7 @@ impl DiscordTransport {
                 return None;
             }
             Err(_elapsed) => {
-                tracing::debug!(
-                    event = "gateway_conversation_unresolved",
-                    transport = %self.name,
-                    cause = "timeout"
-                );
+                tracing::debug!(event = event, transport = %self.name, cause = "timeout");
                 return None;
             }
         };
@@ -722,7 +747,7 @@ impl DiscordTransport {
             Ok(bytes) => bytes,
             Err(source) => {
                 tracing::debug!(
-                    event = "gateway_conversation_unresolved",
+                    event = event,
                     transport = %self.name,
                     cause = "body",
                     cause_type = %source
@@ -730,18 +755,30 @@ impl DiscordTransport {
                 return None;
             }
         };
-        let body = match serde_json::from_slice::<Value>(&bytes) {
-            Ok(body) => body,
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body) => Some(body),
             Err(source) => {
                 tracing::debug!(
-                    event = "gateway_conversation_unresolved",
+                    event = event,
                     transport = %self.name,
                     cause = "body",
                     cause_type = %source
                 );
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    async fn channel_shape(&mut self, channel_id: &str) -> Option<ChannelShape> {
+        if let Some(shape) = self.channels.get(channel_id) {
+            return Some(shape);
+        }
+        let body = self
+            .lookup(
+                &format!("channels/{channel_id}"),
+                "gateway_conversation_unresolved",
+            )
+            .await?;
         let Some(shape) = ChannelShape::of(&body) else {
             tracing::debug!(
                 event = "gateway_conversation_unresolved",
@@ -752,6 +789,40 @@ impl DiscordTransport {
         };
         self.channels.insert(channel_id.to_owned(), shape.clone());
         Some(shape)
+    }
+
+    async fn role_mention(&mut self, guild: Option<&str>, mentioned: &[Value]) -> Option<String> {
+        let guild = guild.filter(|_| !mentioned.is_empty())?;
+        match self.bot_role(guild).await? {
+            BotRole::Managed { id } => mentioned
+                .iter()
+                .any(|role| role.as_str() == Some(id.as_str()))
+                .then_some(id),
+            BotRole::Absent => None,
+        }
+    }
+
+    async fn bot_role(&mut self, guild_id: &str) -> Option<BotRole> {
+        if let Some(role) = self.bot_roles.get(guild_id) {
+            return Some(role);
+        }
+        let bot = self.identity.user_id.as_deref()?;
+        let body = self
+            .lookup(
+                &format!("guilds/{guild_id}/roles"),
+                "gateway_role_unresolved",
+            )
+            .await?;
+        let Some(role) = BotRole::of(&body, bot) else {
+            tracing::debug!(
+                event = "gateway_role_unresolved",
+                transport = %self.name,
+                cause = "role-shape"
+            );
+            return None;
+        };
+        self.bot_roles.insert(guild_id.to_owned(), role.clone());
+        Some(role)
     }
 
     fn cancel_press(
@@ -940,32 +1011,54 @@ impl ChannelShape {
     }
 }
 
-struct ChannelShapes {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BotRole {
+    Managed { id: String },
+    Absent,
+}
+
+impl BotRole {
+    fn of(roles: &Value, bot_user: &str) -> Option<Self> {
+        let Some(role) = roles
+            .as_array()?
+            .iter()
+            .find(|role| role["tags"]["bot_id"].as_str() == Some(bot_user))
+        else {
+            return Some(Self::Absent);
+        };
+        role["id"]
+            .as_str()
+            .filter(|id| is_snowflake(id))
+            .map(|id| Self::Managed { id: id.to_owned() })
+    }
+}
+
+struct Lookups<V> {
     order: VecDeque<String>,
-    shapes: HashMap<String, ChannelShape>,
+    values: HashMap<String, V>,
     capacity: usize,
 }
 
-impl ChannelShapes {
+impl<V: Clone> Lookups<V> {
     fn new(capacity: usize) -> Self {
         Self {
             order: VecDeque::with_capacity(capacity),
-            shapes: HashMap::with_capacity(capacity),
+            values: HashMap::with_capacity(capacity),
             capacity,
         }
     }
 
-    fn get(&self, channel_id: &str) -> Option<ChannelShape> {
-        self.shapes.get(channel_id).cloned()
+    fn get(&self, key: &str) -> Option<V> {
+        self.values.get(key).cloned()
     }
 
-    fn insert(&mut self, channel_id: String, shape: ChannelShape) {
-        if self.shapes.insert(channel_id.clone(), shape).is_none() {
-            self.order.push_back(channel_id);
+    fn insert(&mut self, key: String, value: V) {
+        if self.values.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
             if self.order.len() > self.capacity
                 && let Some(evicted) = self.order.pop_front()
             {
-                self.shapes.remove(&evicted);
+                self.values.remove(&evicted);
             }
         }
     }
@@ -1991,17 +2084,18 @@ fn is_snowflake(value: &str) -> bool {
 }
 
 fn is_fatal(error: &TransportError) -> bool {
-    matches!(
-        error,
-        TransportError::Service { code }
-            if code == "session-start-limit-exhausted"
-                || code == "http-401"
-                || code == "http-403"
-                || code
-                    .strip_prefix("gateway-close-")
-                    .and_then(|code| code.parse::<u16>().ok())
-                    .is_some_and(|code| FATAL_GATEWAY_CLOSE_CODES.contains(&code))
-    )
+    matches!(error, TransportError::DisallowedIntents)
+        || matches!(
+            error,
+            TransportError::Service { code }
+                if code == "session-start-limit-exhausted"
+                    || code == "http-401"
+                    || code == "http-403"
+                    || code
+                        .strip_prefix("gateway-close-")
+                        .and_then(|code| code.parse::<u16>().ok())
+                        .is_some_and(|code| FATAL_GATEWAY_CLOSE_CODES.contains(&code))
+        )
 }
 
 fn gateway_url(raw: &str, production: bool) -> Result<String, TransportError> {
@@ -2109,9 +2203,9 @@ mod unit_tests {
 
     use super::{
         CANCEL_CUSTOM_ID_PREFIX, ChannelShape, Conversation, ConversationKind, DiscordDriver,
-        DiscordTransport, MAX_HISTORY_MESSAGES, MAX_MESSAGE_CHARS, SessionStarts, TextUnit,
-        allowed_asset_url, cancel_components, client, gateway_url, is_fatal, is_interaction_token,
-        percent_encoded, split_message,
+        DiscordTransport, MAX_HISTORY_MESSAGES, MAX_MESSAGE_CHARS, MessageContent, SessionStarts,
+        TextUnit, allowed_asset_url, cancel_components, client, gateway_url, is_fatal,
+        is_interaction_token, percent_encoded, split_message,
     };
     use crate::{
         config::{LivenessMode, LivenessSettings},
@@ -2208,6 +2302,7 @@ mod unit_tests {
             name.to_owned(),
             UNREACHABLE.to_owned(),
             "test-token".to_owned(),
+            MessageContent::Withheld,
             LivenessSettings {
                 mode: LivenessMode::Native,
                 ..LivenessSettings::default()
@@ -2286,11 +2381,12 @@ mod unit_tests {
 
     #[test]
     fn fatal_gateway_close_codes_stop_instead_of_reconnecting_forever() {
-        for code in [4004, 4010, 4011, 4012, 4013, 4014] {
+        for code in [4004, 4010, 4011, 4012, 4013] {
             assert!(is_fatal(&TransportError::Service {
                 code: format!("gateway-close-{code}"),
             }));
         }
+        assert!(is_fatal(&TransportError::DisallowedIntents));
         assert!(!is_fatal(&TransportError::Service {
             code: "gateway-close-4009".to_owned(),
         }));
@@ -2994,6 +3090,7 @@ mod unit_tests {
             "elote".to_owned(),
             UNREACHABLE.to_owned(),
             "test-token".to_owned(),
+            MessageContent::Withheld,
             LivenessSettings::default(),
         )
         .expect("transport builds");

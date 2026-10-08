@@ -37,10 +37,13 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
    Open that URL, choose the intended server, and authorize the app. The installing account needs
    permission to manage that server. This does not require a redirect URI, client secret,
    `applications.commands` scope, or OAuth2 code grant.
-7. The transport identifies with the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents.
-   Leave Presence, Server Members, and Message Content under **Privileged Gateway Intents** disabled.
-   Discord exposes content and attachments in DMs and in guild messages that explicitly mention the
-   bot, which is the exact wakeup surface the gateway accepts.
+7. By default the transport identifies with the non-privileged `GUILD_MESSAGES` and
+   `DIRECT_MESSAGES` intents, and Presence, Server Members, and Message Content under **Privileged
+   Gateway Intents** stay disabled. Discord then exposes content and attachments only in DMs and in
+   guild messages that mention the bot user. A mention of the bot's managed role, which renders as
+   the same "@" pill, arrives without its text unless **Message Content Intent** is on and the
+   transport sets `messageContent: true`; see
+   [How @mentions reach the bot on Discord](../../docs/gatewayd.md#how-mentions-reach-the-bot-on-discord).
 
 The transport implements heartbeat ACK detection, Resume after reconnect, Invalid Session handling,
 fatal close-code handling, identify/session-start limits, and jittered reconnect backoff. Slash
@@ -78,7 +81,8 @@ Discord threads are channels in the Gateway API, so a thread has its own channel
 channel route covers it automatically; a route naming only the parent channel does not also claim
 its transient thread IDs.
 
-In guild channels, Discord's structured `mentions` array decides whether the bot was addressed.
+In guild channels, Discord's structured `mentions` array, or the bot's managed role in
+`mention_roles`, decides whether the bot was addressed.
 Ambient messages never start a model session. Direct messages are addressed by definition. Bot,
 webhook, self-authored, and system messages are dropped.
 

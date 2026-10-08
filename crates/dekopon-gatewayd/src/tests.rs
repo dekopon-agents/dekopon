@@ -73,7 +73,7 @@ use crate::{
         MessageId, MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage,
         ReplyTarget, Status, SteerAck, StreamLimits, StreamedText, TextStream, ThreadClaim,
         ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, bound_outbound, credential_value,
+        TypingLease, bound_inbound, bound_outbound, credential_value, discord::MessageContent,
     },
 };
 
@@ -586,8 +586,11 @@ async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
         .expect("the default remains reply-only");
     assert!(matches!(
         &resolved.transports[0],
-        config::TransportConfig::DiscordGateway { endpoint: Some(endpoint), .. }
-            if endpoint == config::DISCORD_ENDPOINT
+        config::TransportConfig::DiscordGateway {
+            endpoint: Some(endpoint),
+            message_content: false,
+            ..
+        } if endpoint == config::DISCORD_ENDPOINT
     ));
     assert!(matches!(
         resolved.transports.first(),
@@ -9791,6 +9794,7 @@ fn discord(endpoint: &str) -> crate::transport::discord::DiscordTransport {
         "community-discord".to_owned(),
         endpoint.to_owned(),
         "discord-test-bot-token".to_owned(),
+        MessageContent::Withheld,
         LivenessSettings::default(),
     )
     .expect("Discord transport builds")
@@ -9912,6 +9916,112 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn message_content_adds_the_privileged_intent_to_identify() {
+    let mut socket = spawn_discord_socket_mock(Vec::new(), None);
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = crate::transport::discord::DiscordTransport::new(
+        "community-discord".to_owned(),
+        http.base.clone(),
+        "discord-test-bot-token".to_owned(),
+        MessageContent::Requested,
+        LivenessSettings::default(),
+    )
+    .expect("Discord transport builds");
+    transport.connect().await.expect("Discord connects");
+
+    let identify = tokio::time::timeout(Duration::from_secs(5), socket.sent.recv())
+        .await
+        .expect("Identify arrives")
+        .expect("Gateway recorded Identify");
+    assert_eq!(identify["op"], 2);
+    assert_eq!(identify["d"]["intents"], 4_608 | (1 << 15));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_bots_own_managed_role_addresses_it() {
+    const MANAGED_ROLE: &str = "555555555555555555";
+    const BOTS_ROLE: &str = "666666666666666666";
+    let managed = {
+        let mut event = discord_message(
+            DISCORD_MESSAGE,
+            DISCORD_CHANNEL,
+            Some(DISCORD_GUILD),
+            DISCORD_USER,
+            false,
+            &format!("<@&{MANAGED_ROLE}> stop"),
+        );
+        event["mention_roles"] = json!([MANAGED_ROLE]);
+        event
+    };
+    let bots = {
+        let mut event = discord_message(
+            "333333333333333334",
+            DISCORD_CHANNEL,
+            Some(DISCORD_GUILD),
+            DISCORD_USER,
+            false,
+            &format!("<@&{BOTS_ROLE}> hello"),
+        );
+        event["mention_roles"] = json!([BOTS_ROLE]);
+        event
+    };
+    let socket = spawn_discord_socket_mock(
+        vec![
+            discord_dispatch(2, "MESSAGE_CREATE", managed),
+            discord_dispatch(3, "MESSAGE_CREATE", bots),
+        ],
+        None,
+    );
+    let gateway = socket.url.clone();
+    let channels = discord_handler(gateway);
+    let http = spawn_http_mock(move |path, body| {
+        if path == format!("/api/v10/guilds/{DISCORD_GUILD}/roles") {
+            json!([
+                { "id": DISCORD_GUILD, "name": "@everyone" },
+                { "id": BOTS_ROLE, "name": "bots", "managed": false },
+                {
+                    "id": "888888888888888888",
+                    "name": "Other Bot",
+                    "managed": true,
+                    "tags": { "bot_id": "121212121212121212" }
+                },
+                {
+                    "id": MANAGED_ROLE,
+                    "name": "Dekopon",
+                    "managed": true,
+                    "tags": { "bot_id": DISCORD_BOT }
+                }
+            ])
+        } else {
+            channels(path, body)
+        }
+    });
+    let mut transport = crate::transport::discord::DiscordTransport::new(
+        "community-discord".to_owned(),
+        http.base.clone(),
+        "discord-test-bot-token".to_owned(),
+        MessageContent::Requested,
+        LivenessSettings::default(),
+    )
+    .expect("Discord transport builds");
+    transport.connect().await.expect("Discord connects");
+
+    let managed = next_message(&mut transport).await;
+    assert_eq!(managed.addressed, Some(true));
+    assert_eq!(managed.text, format!("<@{DISCORD_BOT}> stop"));
+
+    let bots = next_message(&mut transport).await;
+    assert_eq!(bots.addressed, Some(false));
+
+    let lookups = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path.ends_with("/roles"))
+        .count();
+    assert_eq!(lookups, 1, "the guild's roles are read once and cached");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&attempts);
@@ -10009,6 +10119,7 @@ async fn discord_native_liveness_triggers_typing_on_the_authenticated_channel() 
         "community-discord".to_owned(),
         http.base.clone(),
         "discord-test-bot-token".to_owned(),
+        MessageContent::Withheld,
         liveness_settings(LivenessMode::Native),
     )
     .expect("Discord transport builds");
@@ -13532,6 +13643,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
             "discord".into(),
             http.base.clone(),
             "test-token".into(),
+            MessageContent::Withheld,
             liveness_settings(LivenessMode::Off),
         )
         .unwrap();

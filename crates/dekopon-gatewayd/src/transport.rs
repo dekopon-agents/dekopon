@@ -623,6 +623,11 @@ pub enum TransportError {
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
     Service { code: String },
+    #[error(
+        "Discord refused the requested gateway intents (close 4014): messageContent: true needs \
+         Developer Portal > Bot > Privileged Gateway Intents > Message Content Intent turned on"
+    )]
+    DisallowedIntents,
     #[error("chat service response was not the expected shape")]
     Response,
     #[error("chat service response was not valid JSON")]
@@ -660,6 +665,7 @@ impl TransportError {
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
+            Self::DisallowedIntents => "disallowed-intents",
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",
             Self::PartialDelivery => "partial-delivery",
