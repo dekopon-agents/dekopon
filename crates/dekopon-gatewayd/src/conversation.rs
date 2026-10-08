@@ -89,6 +89,42 @@ struct Conversation {
     /// that key may reveal who is asking.
     cache_key: String,
     touched: Instant,
+    watermark: Option<Watermark>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Watermark {
+    pub after: String,
+    pub taken: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct TakenIn {
+    pub newest: Option<String>,
+    pub steers: Vec<String>,
+}
+
+impl TakenIn {
+    fn advance(self, watermark: Option<Watermark>) -> Option<Watermark> {
+        match (self.newest, watermark) {
+            (Some(after), _) => Some(Watermark {
+                after,
+                taken: self.steers,
+            }),
+            (None, Some(mut watermark)) => {
+                watermark.taken.extend(self.steers);
+                Some(watermark)
+            }
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Residency {
+    Cold,
+    Resident,
+    Since(Watermark),
 }
 
 struct Slot {
@@ -129,6 +165,7 @@ impl ConversationLease<'_> {
         mut self,
         window: MemoryWindow,
         turn: ConversationTurn,
+        taken: TakenIn,
         declared_cache_key: &str,
         now: Instant,
     ) -> bool {
@@ -147,6 +184,7 @@ impl ConversationLease<'_> {
                 Some(existing) => {
                     existing.history.record(turn);
                     existing.touched = now;
+                    existing.watermark = taken.advance(existing.watermark.take());
                 }
                 None => {
                     let mut history = History::new(window.limits);
@@ -155,6 +193,7 @@ impl ConversationLease<'_> {
                         history,
                         cache_key: declared_cache_key.to_owned(),
                         touched: now,
+                        watermark: taken.advance(None),
                     });
                 }
             }
@@ -235,15 +274,21 @@ impl ConversationStore {
         granted: &[String],
         window: MemoryWindow,
         now: Instant,
-    ) -> bool {
+    ) -> Residency {
         let state = self.state.lock();
-        state.slots.get(key).is_some_and(|slot| {
-            slot.granted == granted
-                && slot
-                    .live
-                    .as_ref()
-                    .is_some_and(|conversation| !expired(conversation, window.idle_timeout, now))
-        })
+        let live = state
+            .slots
+            .get(key)
+            .filter(|slot| slot.granted == granted)
+            .and_then(|slot| slot.live.as_ref())
+            .filter(|conversation| !expired(conversation, window.idle_timeout, now));
+        match live {
+            None => Residency::Cold,
+            Some(conversation) => conversation
+                .watermark
+                .clone()
+                .map_or(Residency::Resident, Residency::Since),
+        }
     }
 
     pub fn begin(
@@ -288,6 +333,7 @@ impl ConversationStore {
                 history,
                 cache_key: cache_key.clone(),
                 touched: now,
+                watermark: None,
             });
             let history = live.as_ref().map_or_else(
                 || History::new(window.limits),
@@ -337,6 +383,7 @@ impl ConversationStore {
                 history,
                 cache_key: cache_key::for_conversation(),
                 touched: now,
+                watermark: None,
             });
         }
         let (history, cache_key) = slot.live.as_ref().map_or_else(

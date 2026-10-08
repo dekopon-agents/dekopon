@@ -993,21 +993,65 @@ impl ChatHistory for DiscordDriver {
     async fn recent(
         &self,
         conversation: &Conversation,
+        after: Option<&str>,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PastMessage>, TransportError> {
         let bot = self.bot_user.get().ok_or(TransportError::Closed)?;
         let channel_id = conversation.api_channel(ChatTransportKind::Discord);
-        if !is_snowflake(channel_id) || before.is_some_and(|before| !is_snowflake(before)) {
+        let snowflake = |id: &str| id.parse::<u64>().ok().filter(|_| is_snowflake(id));
+        let floor = after
+            .map(|after| snowflake(after).ok_or(TransportError::Response))
+            .transpose()?;
+        let ceiling = before
+            .map(|before| snowflake(before).ok_or(TransportError::Response))
+            .transpose()?;
+        if !is_snowflake(channel_id) {
             return Err(TransportError::Response);
         }
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = limit.min(MAX_HISTORY_MESSAGES).to_string();
-        let mut query = before
-            .map(|before| vec![("before", before)])
-            .unwrap_or_default();
+        let limit = limit.min(MAX_HISTORY_MESSAGES);
+        let in_range = |id: u64| {
+            floor.is_none_or(|floor| id > floor) && ceiling.is_none_or(|ceiling| id < ceiling)
+        };
+        if let Some(after) = after {
+            let page = self
+                .history_page(channel_id, Some(("after", after)), MAX_HISTORY_MESSAGES)
+                .await?;
+            let reached =
+                page.len() < MAX_HISTORY_MESSAGES || page.iter().any(|(id, _)| !in_range(*id));
+            if reached {
+                let mut kept = page
+                    .iter()
+                    .filter(|(id, _)| in_range(*id))
+                    .filter_map(|(_, message)| self.past_message(message, bot))
+                    .collect::<Vec<_>>();
+                kept.drain(..kept.len().saturating_sub(limit));
+                return Ok(kept);
+            }
+        }
+        let page = self
+            .history_page(channel_id, before.map(|before| ("before", before)), limit)
+            .await?;
+        Ok(page
+            .iter()
+            .filter(|(id, _)| in_range(*id))
+            .filter_map(|(_, message)| self.past_message(message, bot))
+            .collect())
+    }
+}
+
+impl DiscordDriver {
+    async fn history_page(
+        &self,
+        channel_id: &str,
+        anchor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Value)>, TransportError> {
+        let limit = limit.to_string();
+        let mut query = anchor.into_iter().collect::<Vec<_>>();
         query.push(("limit", limit.as_str()));
         let response = self
             .send_rest(
@@ -1034,17 +1078,24 @@ impl ChatHistory for DiscordDriver {
                 code: "http-429".to_owned(),
             });
         }
-        let body = decode(response).await?;
-        let messages = body.as_array().ok_or(TransportError::Response)?;
-        Ok(messages
-            .iter()
-            .rev()
-            .filter_map(|message| self.past_message(message, bot))
-            .collect())
+        let Value::Array(messages) = decode(response).await? else {
+            return Err(TransportError::Response);
+        };
+        let mut page = messages
+            .into_iter()
+            .filter_map(|message| {
+                let id = message["id"]
+                    .as_str()
+                    .filter(|id| is_snowflake(id))?
+                    .parse()
+                    .ok()?;
+                Some((id, message))
+            })
+            .collect::<Vec<_>>();
+        page.sort_unstable_by_key(|(id, _)| *id);
+        Ok(page)
     }
-}
 
-impl DiscordDriver {
     fn past_message(&self, message: &Value, bot: &str) -> Option<PastMessage> {
         if !matches!(message["type"].as_u64().unwrap_or_default(), 0 | 19) {
             return None;
@@ -1062,8 +1113,10 @@ impl DiscordDriver {
             return None;
         }
         Some(PastMessage {
+            id: message_id.to_owned(),
             from_bot: author == bot,
             author: author.to_owned(),
+            subject: ExternalSubject::discord(author).ok()?,
             text,
             assets,
             at: snowflake_instant(message_id)?,
@@ -2896,6 +2949,90 @@ mod unit_tests {
     }
 
     #[tokio::test]
+    async fn a_delta_read_pages_after_the_watermark_and_cuts_at_the_trigger() {
+        let newest_first = json!([
+            posted("1100000016777216001", "42", "after the trigger"),
+            posted("1100000016777216000", "42", "the trigger"),
+            posted("1100000012582912000", BOT_USER, "a reply"),
+            posted("1100000008388608000", "43", "posted unaddressed"),
+        ]);
+        let (endpoint, server) = loopback(vec![(200, newest_first.to_string())]);
+
+        let recalled = driver(&endpoint)
+            .recent(
+                &thread_conversation(),
+                Some("1100000004194304000"),
+                Some("1100000016777216000"),
+                10,
+            )
+            .await
+            .expect("the history reads");
+
+        let recorded = server.await.expect("the stand-in joins");
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            [format!(
+                "/api/v10/channels/300/messages?after=1100000004194304000&limit={MAX_HISTORY_MESSAGES}"
+            )]
+        );
+        let seen = recalled
+            .iter()
+            .map(|message| (message.id.as_str(), message.subject.canonical()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                ("1100000008388608000", "discord.43".to_owned()),
+                ("1100000012582912000", format!("discord.{BOT_USER}")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delta_longer_than_one_page_keeps_the_newest_messages_before_the_trigger() {
+        let watermark = 1_100_000_000_000_000_000_u64;
+        let full_page = (1..=MAX_HISTORY_MESSAGES as u64)
+            .rev()
+            .map(|offset| posted(&(watermark + offset).to_string(), "42", "older"))
+            .collect::<Vec<_>>();
+        let newest = json!([
+            posted("1100000016777215999", "42", "newest"),
+            posted("1100000016777215998", "42", "second newest"),
+            posted(&watermark.to_string(), "42", "already seen"),
+        ]);
+        let (endpoint, server) = loopback(vec![
+            (200, Value::Array(full_page).to_string()),
+            (200, newest.to_string()),
+        ]);
+
+        let recalled = driver(&endpoint)
+            .recent(
+                &thread_conversation(),
+                Some(&watermark.to_string()),
+                Some("1100000016777216000"),
+                3,
+            )
+            .await
+            .expect("the history reads");
+
+        let recorded = server.await.expect("the stand-in joins");
+        assert_eq!(
+            recorded[1].path,
+            "/api/v10/channels/300/messages?before=1100000016777216000&limit=3"
+        );
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["second newest", "newest"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_thread_is_recalled_oldest_first_from_the_messages_before_the_trigger() {
         let mut shared = posted("1100000004194304000", "42", "");
         shared["attachments"] = photo();
@@ -2912,7 +3049,7 @@ mod unit_tests {
         let recalled = driver(&endpoint)
             .history()
             .expect("Discord reads its own history")
-            .recent(&thread_conversation(), Some("1100000016777216000"), 4)
+            .recent(&thread_conversation(), None, Some("1100000016777216000"), 4)
             .await
             .expect("the history reads");
 
@@ -2966,7 +3103,7 @@ mod unit_tests {
             .expect("the message routes");
 
         let recalled = driver(&endpoint)
-            .recent(&direct_conversation(), Some("200"), 10)
+            .recent(&direct_conversation(), None, Some("200"), 10)
             .await
             .expect("the history reads");
         server.await.expect("the stand-in joins");
@@ -2983,7 +3120,7 @@ mod unit_tests {
 
         for limit in [MAX_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES + 1] {
             driver
-                .recent(&direct_conversation(), Some("200"), limit)
+                .recent(&direct_conversation(), None, Some("200"), limit)
                 .await
                 .expect("the history reads");
         }
@@ -3003,7 +3140,9 @@ mod unit_tests {
         )]);
         let driver = driver(&endpoint);
 
-        let throttled = driver.recent(&direct_conversation(), Some("200"), 10).await;
+        let throttled = driver
+            .recent(&direct_conversation(), None, Some("200"), 10)
+            .await;
         server.await.expect("the stand-in joins");
 
         assert!(
@@ -3024,7 +3163,7 @@ mod unit_tests {
         )]);
 
         let refused = driver(&endpoint)
-            .recent(&direct_conversation(), Some("200"), 10)
+            .recent(&direct_conversation(), None, Some("200"), 10)
             .await;
         server.await.expect("the stand-in joins");
 
@@ -3039,7 +3178,9 @@ mod unit_tests {
         let mut driver = driver(UNREACHABLE);
         driver.bot_user = std::sync::OnceLock::new();
 
-        let early = driver.recent(&direct_conversation(), Some("200"), 10).await;
+        let early = driver
+            .recent(&direct_conversation(), None, Some("200"), 10)
+            .await;
 
         assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
     }

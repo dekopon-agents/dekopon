@@ -57,7 +57,9 @@ use crate::{
         MemoryScope, MemoryWindow, ModelConfig, ProgressSurface, RecallSource, ResolvedBroker,
         ResolvedLiveness, SlackExperience, SlackLivenessFallback,
     },
-    conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    conversation::{
+        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
+    },
     progress::{KeepAlive, ProgressDetail, ProgressText},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
@@ -4804,7 +4806,7 @@ fn commit(
     let ConversationSeed {
         cache_key, lease, ..
     } = store.begin(key, granted, window, None, now);
-    lease.commit(window, turn, &cache_key, now);
+    lease.commit(window, turn, TakenIn::default(), &cache_key, now);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5703,12 +5705,14 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     first_lease.commit(
         window(),
         ConversationTurn::completed("what broke?", "two things"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
     second_lease.commit(
         window(),
         ConversationTurn::completed("still there?", "yes"),
+        TakenIn::default(),
         &second_cache_key,
         now,
     );
@@ -5833,12 +5837,14 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
     fresh.lease.commit(
         window(),
         ConversationTurn::completed("fresh question", "fresh answer"),
+        TakenIn::default(),
         &fresh_cache_key,
         now + Duration::from_secs(3),
     );
     stale.lease.commit(
         window(),
         ConversationTurn::completed("stale question", "stale privileged answer"),
+        TakenIn::default(),
         &stale.cache_key,
         now + Duration::from_secs(4),
     );
@@ -5870,6 +5876,7 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
     stale.lease.commit(
         window(),
         ConversationTurn::completed("late question", "late answer"),
+        TakenIn::default(),
         &stale_cache_key,
         now + Duration::from_secs(2),
     );
@@ -5915,6 +5922,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
     stale.lease.commit(
         window(),
         ConversationTurn::completed("late first", "late answer"),
+        TakenIn::default(),
         &stale_cache_key,
         now + Duration::from_secs(3),
     );
@@ -5981,12 +5989,14 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
     fresh.lease.commit(
         window(),
         ConversationTurn::completed("new", "new answer"),
+        TakenIn::default(),
         &fresh_cache_key,
         now + Duration::from_secs(900),
     );
     stale.lease.commit(
         window(),
         ConversationTurn::completed("late old", "late old answer"),
+        TakenIn::default(),
         &stale.cache_key,
         now + Duration::from_secs(901),
     );
@@ -6102,6 +6112,7 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
     first.lease.commit(
         window(),
         ConversationTurn::completed("what broke?", "two things"),
+        TakenIn::default(),
         &first_cache_key,
         start,
     );
@@ -8714,6 +8725,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     first.lease.commit(
         window(),
         ConversationTurn::completed("old", "old answer"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
@@ -8816,6 +8828,7 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     first.lease.commit(
         window(),
         ConversationTurn::completed("old", "old answer"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
@@ -8864,6 +8877,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     first.lease.commit(
         window(),
         ConversationTurn::completed("first", "first answer"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
@@ -8945,6 +8959,7 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     first.lease.commit(
         window(),
         ConversationTurn::completed("first", "first answer"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
@@ -9022,6 +9037,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     first.lease.commit(
         window(),
         ConversationTurn::completed("old", "old answer"),
+        TakenIn::default(),
         &first_cache_key,
         now,
     );
@@ -9123,6 +9139,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     seed.lease.commit(
         window(),
         ConversationTurn::completed("old", "old answer"),
+        TakenIn::default(),
         &cache_key,
         now,
     );
@@ -14096,10 +14113,28 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
     assert!(prompt[1].1.starts_with("four photos"));
 }
 
+type Asked = (Option<String>, Option<String>, usize);
+
 struct HistoryDriver {
     inner: RecordingDriver,
-    past: Result<Vec<crate::transport::PastMessage>, ()>,
-    asked: Mutex<Vec<(String, usize)>>,
+    past: Mutex<Result<Vec<crate::transport::PastMessage>, ()>>,
+    asked: Mutex<Vec<Asked>>,
+}
+
+impl HistoryDriver {
+    fn new(past: Result<Vec<crate::transport::PastMessage>, ()>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RecordingDriver::default(),
+            past: Mutex::new(past),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn post(&self, message: crate::transport::PastMessage) {
+        if let Ok(past) = self.past.lock().as_mut() {
+            past.push(message);
+        }
+    }
 }
 
 #[async_trait]
@@ -14122,43 +14157,123 @@ impl crate::transport::ChatHistory for HistoryDriver {
     async fn recent(
         &self,
         _conversation: &Conversation,
+        after: Option<&str>,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<crate::transport::PastMessage>, TransportError> {
         self.asked
             .lock()
-            .push((before.unwrap_or_default().to_owned(), limit));
-        self.past.clone().map_err(|()| TransportError::Response)
+            .push((after.map(str::to_owned), before.map(str::to_owned), limit));
+        let past = self
+            .past
+            .lock()
+            .clone()
+            .map_err(|()| TransportError::Response)?;
+        let mut inside = past
+            .into_iter()
+            .filter(|message| {
+                after.is_none_or(|after| message.id.as_str() > after)
+                    && before.is_none_or(|before| message.id.as_str() < before)
+            })
+            .collect::<Vec<_>>();
+        inside.drain(..inside.len().saturating_sub(limit));
+        Ok(inside)
     }
 }
 
-fn past(from_bot: bool, author: &str, text: &str) -> crate::transport::PastMessage {
+fn past(id: &str, author: &str, subject: &str, text: &str) -> crate::transport::PastMessage {
     crate::transport::PastMessage {
-        from_bot,
+        id: id.to_owned(),
+        from_bot: false,
         author: author.to_owned(),
+        subject: subject.parse().expect("canonical subject fixture"),
         text: text.to_owned(),
         assets: Vec::new(),
         at: std::time::SystemTime::now(),
     }
 }
 
+fn bot_past(id: &str, text: &str) -> crate::transport::PastMessage {
+    crate::transport::PastMessage {
+        from_bot: true,
+        ..past(id, "B1", "tel.16035550000", text)
+    }
+}
+
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "fixture observer and socket are test-owned; absent observations fail the calling test"
+)]
+async fn naming_broker(
+    directory: &Path,
+    names: &[(&str, &str)],
+) -> (ResolvedBroker, Arc<Mutex<Vec<String>>>) {
+    let socket = directory.join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind stub broker");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("secure stub socket");
+    let names = names
+        .iter()
+        .map(|(subject, principal)| ((*subject).to_owned(), (*principal).to_owned()))
+        .collect::<HashMap<_, _>>();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&asked);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut stream = DescriptorStream::new(stream);
+            let Ok((request, _)) = stream
+                .read_frame::<RequestEnvelope>(FrameLimits::default())
+                .await
+            else {
+                continue;
+            };
+            let BrokerRequest::Capabilities {
+                attestation: Some(claim),
+            } = request.request
+            else {
+                continue;
+            };
+            let subject = claim.subject.canonical();
+            observed.lock().push(subject.clone());
+            let response = match names.get(&subject) {
+                Some(principal) => ResponseEnvelope::chat_capabilities(
+                    vec![capability("cli-probe.upper")],
+                    Vec::new(),
+                    BTreeMap::new(),
+                    None,
+                    Some(principal.parse().expect("valid principal fixture")),
+                ),
+                None => ResponseEnvelope::error(
+                    dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
+                    "attestation refused",
+                ),
+            };
+            let _ = stream
+                .write_frame(&response, &[], FrameLimits::default())
+                .await;
+        }
+    });
+    (
+        ResolvedBroker {
+            socket_path: socket,
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        asked,
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     let directory = temporary();
-    let (broker, _observed) =
-        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
     let models = ModelScript::new([answer("It is about the outage.")]);
-    let mut screenshot = past(false, "U2", "look at this");
+    let mut screenshot = past("0000000003", "U2", "tel.16035550102", "look at this");
     screenshot.assets = vec![pending("graph.png", "image/png", 12)];
-    let driver = Arc::new(HistoryDriver {
-        inner: RecordingDriver::default(),
-        past: Ok(vec![
-            past(false, "U1", "the site is down"),
-            past(true, "B1", "Checking."),
-            screenshot,
-        ]),
-        asked: Mutex::new(Vec::new()),
-    });
+    let driver = HistoryDriver::new(Ok(vec![
+        past("0000000001", "U1", "tel.16035550101", "the site is down"),
+        bot_past("0000000002", "Checking."),
+        screenshot,
+    ]));
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
     let inbound = message("read this thread");
@@ -14172,7 +14287,7 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     )
     .await;
 
-    assert_eq!(driver.asked.lock().as_slice(), [(trigger, 24)]);
+    assert_eq!(driver.asked.lock().as_slice(), [(None, Some(trigger), 24)]);
     let prompt = models.prompt(0);
     assert_eq!(
         prompt[1..3],
@@ -14201,11 +14316,7 @@ async fn a_failed_history_read_still_answers_from_an_empty_window() {
     let (broker, _observed) =
         stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Which thread?")]);
-    let driver = Arc::new(HistoryDriver {
-        inner: RecordingDriver::default(),
-        past: Err(()),
-        asked: Mutex::new(Vec::new()),
-    });
+    let driver = HistoryDriver::new(Err(()));
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
 
@@ -14227,6 +14338,201 @@ async fn a_failed_history_read_still_answers_from_an_empty_window() {
     );
 }
 
+fn mention(id: &str, text: &str) -> InboundMessage {
+    InboundMessage {
+        message_id: MessageId::Native(id.to_owned()),
+        addressed: Some(true),
+        ..message(text)
+    }
+}
+
+fn recalled_events(capture: &dekopon_test_support::CaptureLayer) -> Vec<String> {
+    capture
+        .events()
+        .into_iter()
+        .map(|(fields, _)| fields)
+        .filter(|fields| fields.contains("gateway_recalled"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([
+        answer("first answer"),
+        answer("a cat"),
+        answer("nothing new"),
+    ]);
+    let driver = HistoryDriver::new(Ok(Vec::new()));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    let (capture, _subscriber) = capture_spans();
+    let run = |inbound| {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+    };
+
+    run(mention("t1", "first question")).await;
+    driver.post(bot_past("t2", "first answer"));
+    let mut photo = past("t3", "U2", "tel.16035550102", "a photo");
+    photo.assets = vec![pending("cat.png", "image/png", 12)];
+    driver.post(photo);
+    run(mention("t4", "what did they post?")).await;
+    driver.post(bot_past("t5", "a cat"));
+    run(mention("t6", "anything new?")).await;
+
+    let some = |id: &str| Some(id.to_owned());
+    assert_eq!(
+        driver.asked.lock().as_slice(),
+        [
+            (None, some("t1"), 24),
+            (some("t1"), some("t4"), 24),
+            (some("t4"), some("t6"), 24),
+        ]
+    );
+    let block =
+        "[gateway: chat history, from U2]\na photo\n[gateway: attached chat-asset:1 — cat.png]";
+    let delivered = models.prompt(1);
+    let (_, latest) = delivered.last().expect("the mention");
+    assert!(
+        latest.starts_with(&format!("{block}\n\nwhat did they post?")),
+        "{latest}"
+    );
+    let following = models.prompt(2);
+    let (_, latest) = following.last().expect("the next mention");
+    assert!(latest.starts_with("anything new?"), "{latest}");
+    let replayed = following
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<String>();
+    assert_eq!(replayed.matches("a photo").count(), 1, "{following:?}");
+    assert_eq!(replayed.matches("first answer").count(), 1, "{following:?}");
+    let events = recalled_events(&capture);
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert!(
+        events[0].contains("messages=0") && events[0].contains("delta=0"),
+        "{events:?}"
+    );
+    assert!(
+        events[1].contains("messages=1") && events[1].contains("delta=1"),
+        "{events:?}"
+    );
+    assert!(
+        events[2].contains("messages=0") && events[2].contains("delta=0"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([answer("ok")]);
+    let driver = HistoryDriver::new(Ok(vec![
+        past("t2", "U1", SUBJECT, "steered in"),
+        past("t3", "U2", "tel.16035550102", "unaddressed"),
+    ]));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let window = recall_window(RecallSource::Platform);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let seed = runner
+        .conversations
+        .begin(&key, &granted(&["cli-probe.upper"]), window, None, now);
+    seed.lease.commit(
+        window,
+        ConversationTurn::completed("asked", "answered"),
+        TakenIn {
+            newest: Some("t1".to_owned()),
+            steers: vec!["t2".to_owned()],
+        },
+        &seed.cache_key,
+        now,
+    );
+
+    run_session(
+        Arc::clone(&runner),
+        persistent_route(model_config(), window),
+        mention("t4", "next"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let prompt = models.prompt(0);
+    let (_, latest) = prompt.last().expect("the mention");
+    assert_eq!(
+        latest,
+        "[gateway: chat history, from U2]\nunaddressed\n\nnext"
+    );
+}
+
+async fn recalled_labels(scope: MemoryScope) -> (String, Vec<String>) {
+    let directory = temporary();
+    let (broker, asked) = naming_broker(
+        directory.path(),
+        &[(SUBJECT, "xavier"), ("tel.16035550100", "simon")],
+    )
+    .await;
+    let models = ModelScript::new([answer("ok")]);
+    let driver = HistoryDriver::new(Ok(vec![
+        past("t1", "U7", "tel.16035550100", "hi"),
+        past("t2", "U9", "tel.16035550199", "yo"),
+        past("t3", "U7", "tel.16035550100", "again"),
+        past("t4", "U1", SUBJECT, "mine"),
+    ]));
+    let route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope,
+            ..recall_window(RecallSource::Platform)
+        },
+    );
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route,
+        mention("t5", "who said what?"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let mut asked = asked.lock().clone();
+    asked.sort();
+    (models.prompt(0)[1].1.clone(), asked)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recalled_history_names_mapped_authors_and_keeps_unmapped_ids_on_a_private_route() {
+    let (recalled, asked) = recalled_labels(MemoryScope::PrivateConversation).await;
+
+    assert_eq!(
+        recalled,
+        "[gateway: chat history, from simon]\nhi\n[gateway: chat history, from U9]\nyo\n\
+         [gateway: chat history, from simon]\nagain\n[gateway: chat history, from xavier]\nmine"
+    );
+    assert_eq!(
+        asked,
+        [SUBJECT, "tel.16035550100", "tel.16035550199"],
+        "one exchange for the sender and one per distinct other author"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recalled_history_on_a_shared_route_names_no_unmapped_author_by_id() {
+    let (recalled, _) = recalled_labels(MemoryScope::SharedConversation).await;
+
+    assert_eq!(
+        recalled,
+        "[gateway: chat history, from simon]\nhi\n[gateway: chat history, from unmapped participant]\nyo\n\
+         [gateway: chat history, from simon]\nagain\n[gateway: chat history, from xavier]\nmine"
+    );
+}
+
 #[test]
 fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
     let store = ConversationStore::new(4);
@@ -14240,15 +14546,64 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
         ))
     };
 
-    assert!(!store.resident(&key, &allowed, window(), now));
+    assert_eq!(
+        store.resident(&key, &allowed, window(), now),
+        Residency::Cold
+    );
     let first = store.begin(&key, &allowed, window(), recalled("from disk"), now);
     assert!(first.created);
     assert_eq!(first.history.turns()[0].user(), "from disk");
-    assert!(store.resident(&key, &allowed, window(), now));
+    assert_eq!(
+        store.resident(&key, &allowed, window(), now),
+        Residency::Resident
+    );
     let second = store.begin(&key, &allowed, window(), recalled("ignored"), now);
     assert!(!second.created);
     assert_eq!(second.history.turns()[0].user(), "from disk");
-    assert!(!store.resident(&key, &allowed, window(), now + window().idle_timeout));
+    assert_eq!(
+        store.resident(&key, &allowed, window(), now + window().idle_timeout),
+        Residency::Cold
+    );
+}
+
+#[test]
+fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it() {
+    let store = ConversationStore::new(4);
+    let allowed = granted(&["cli-probe.upper"]);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let turn = |text: &str| ConversationTurn::completed(text, "ok");
+
+    let first = store.begin(&key, &allowed, window(), None, now);
+    first.lease.commit(
+        window(),
+        turn("asked"),
+        TakenIn {
+            newest: Some("t1".to_owned()),
+            steers: vec!["t2".to_owned()],
+        },
+        &first.cache_key,
+        now,
+    );
+    let woken = store.begin(&key, &allowed, window(), None, now);
+    woken.lease.commit(
+        window(),
+        turn("a wake"),
+        TakenIn {
+            newest: None,
+            steers: vec!["t3".to_owned()],
+        },
+        &woken.cache_key,
+        now,
+    );
+
+    assert_eq!(
+        store.resident(&key, &allowed, window(), now),
+        Residency::Since(crate::conversation::Watermark {
+            after: "t1".to_owned(),
+            taken: vec!["t2".to_owned(), "t3".to_owned()],
+        })
+    );
 }
 
 #[tokio::test]
