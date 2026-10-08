@@ -16,6 +16,10 @@ directory byte for byte. To let a second provider open an agent-scope store, add
 ([`dekopon-brokerd`](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory)).
 Providers that construct `StorageConstraints` in Rust add `namespace: None` when they re-pin.
 
+Co-tenants of one namespace take turns: the base lease is held through guest execution, so a
+pipeline or upcall between the two providers on one agent waits up to `storage.lockTimeoutMs` and
+fails with a storage `Timeout` if the holder runs longer.
+
 ## Late-mention catch-up and named recall authors (0.39.0)
 
 Upgrade broker and gateway together as usual. No configuration key, broker protocol, provider WIT

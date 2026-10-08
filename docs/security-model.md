@@ -267,8 +267,8 @@ shared-conversation scope retains transport and conversation without subject; ag
 provider and agent. An agent-scope storage constraint may name `namespace: <provider id>` in owner
 configuration, which then stands in for the provider, so providers naming one namespace share one
 resource per agent; no provider or input can name it, the grant still binds the invoking provider,
-and broker startup refuses the key under any other scope and refuses sets that share a namespace
-with a different interface or scope. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
+and broker startup refuses the key under any other scope and refuses agent-scope sets that share a
+namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
 use stable storage continuity so different callers' effective permissions cannot rotate a shared
 resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
 resolution receive a disabled sticky context.
