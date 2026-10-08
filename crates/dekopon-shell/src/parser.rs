@@ -20,10 +20,7 @@ const MAX_NESTING_DEPTH: u32 = 64;
 const MAX_ARITHMETIC_TOKENS: usize = 4_096;
 
 pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
-    (
-        "eval",
-        "`eval` is excluded: running text the script assembled at runtime is self-modifying code and defeats the point of parsing the script up front",
-    ),
+    ("eval", "`eval` is not supported; write the command out"),
     (
         "exec",
         "`exec` is excluded: this shell never replaces a process image and has no processes to replace",
@@ -568,10 +565,10 @@ impl<'a> Parser<'a> {
 
         let word = convert_word(&raw, line, depth)?;
         if word_is_constant(&raw) {
-            if let Some((character, meaning)) = literal_pattern_metacharacter(&raw) {
+            if let Some(character) = literal_pattern_metacharacter(&raw) {
                 return Err(ParseError::syntax(
                     line,
-                    unsupported_case_pattern(character, meaning),
+                    unsupported_case_pattern(character),
                 ));
             }
             return Ok(CasePattern::Literal(word));
@@ -773,15 +770,15 @@ impl<'a> Parser<'a> {
             if operator == "=~" {
                 return Err(ParseError::syntax(
                     line,
-                    "`=~` regex matching is not supported: every pattern in this shell is literal                      text; compare with `==`, or match structurally with `jq`",
+                    "`=~` regex matching is not supported: every pattern in this shell is literal text; compare with `==`, or match structurally with `jq`",
                 ));
             }
             if matches!(operator.as_str(), "=" | "==" | "!=") {
                 if word_is_constant(right) {
-                    if let Some((character, meaning)) = literal_pattern_metacharacter(right) {
+                    if let Some(character) = literal_pattern_metacharacter(right) {
                         return Err(ParseError::syntax(
                             line,
-                            unsupported_conditional_pattern(character, meaning),
+                            unsupported_conditional_pattern(character),
                         ));
                     }
                 } else {
@@ -1040,54 +1037,32 @@ impl<'a> Parser<'a> {
 
 /// `]` is deliberately absent from this table: only `[` opens a character class, so `[ab]` is still
 /// caught by its bracket while a lone `a]` is left alone.
-const CASE_METACHARACTERS: &[(char, &str)] = &[
-    ('*', "any run of characters"),
-    ('?', "any single character"),
-    ('[', "a character class"),
-];
+const CASE_METACHARACTERS: &[char] = &['*', '?', '['];
 
-pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> {
-    text.chars().find_map(|character| {
-        CASE_METACHARACTERS
-            .iter()
-            .find(|(candidate, _)| *candidate == character)
-            .map(|(candidate, meaning)| (*candidate, *meaning))
-    })
+pub(crate) fn pattern_metacharacter(text: &str) -> Option<char> {
+    text.chars()
+        .find(|character| CASE_METACHARACTERS.contains(character))
 }
 
-pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String {
+pub(crate) fn unsupported_case_pattern(character: char) -> String {
     format!(
-        "a `case` pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the value out, add another `PATTERN|PATTERN` alternative, quote it as `'{character}'` to match the character itself, or use `*)` for the default branch"
+        "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"
     )
 }
 
-pub(crate) fn unsupported_parameter_pattern(character: char, meaning: &str) -> String {
+pub(crate) fn unsupported_parameter_pattern(character: char) -> String {
+    format!("`${{NAME}}` patterns are literal: `{character}` is not supported; slice with `jq`")
+}
+
+pub(crate) fn unsupported_conditional_pattern(character: char) -> String {
     format!(
-        "a `${{NAME}}` expansion pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the text out, or slice the value with `jq` instead"
+        "`[[ == ]]` patterns are literal: `{character}` is not supported; quote it as `'{character}'` or use `jq`"
     )
 }
 
-pub(crate) fn unsupported_conditional_pattern(character: char, meaning: &str) -> String {
+pub(crate) fn expanded_pattern(character: char) -> String {
     format!(
-        "the right operand of `==` inside `[[ ... ]]` is a glob in bash, and every pattern here is literal text, so `{character}` — which would match {meaning} — is not supported; quote it as `'{character}'` to compare the character itself, or match structurally with `jq`"
-    )
-}
-
-pub(crate) fn expanded_conditional_pattern(character: char, meaning: &str) -> String {
-    format!(
-        "this `[[ ... ]]` comparison expanded to text containing `{character}`, which bash would match as {meaning}; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — compare without `{character}`, or match structurally with `jq`"
-    )
-}
-
-pub(crate) fn expanded_parameter_pattern(character: char, meaning: &str) -> String {
-    format!(
-        "this `${{NAME}}` expansion pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or slice the value with `jq` instead"
-    )
-}
-
-pub(crate) fn expanded_case_pattern(character: char, meaning: &str) -> String {
-    format!(
-        "this `case` pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or branch with `if` and `jq` instead"
+        "this pattern expanded to text containing `{character}`, and patterns are literal; build it without `{character}` or use `jq`"
     )
 }
 
@@ -1108,7 +1083,7 @@ fn word_is_constant(word: &RawWord) -> bool {
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn literal_pattern_metacharacter(word: &RawWord) -> Option<(char, &'static str)> {
+fn literal_pattern_metacharacter(word: &RawWord) -> Option<char> {
     word.parts.iter().find_map(|part| match part {
         RawPart::Literal(text) => pattern_metacharacter(text),
         _ => None,
@@ -1202,10 +1177,10 @@ fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Para
 fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, ParseError> {
     let word = convert_word(raw, line, depth)?;
     if word_is_constant(raw) {
-        if let Some((character, meaning)) = literal_pattern_metacharacter(raw) {
+        if let Some(character) = literal_pattern_metacharacter(raw) {
             return Err(ParseError::syntax(
                 line,
-                unsupported_parameter_pattern(character, meaning),
+                unsupported_parameter_pattern(character),
             ));
         }
         return Ok(Pattern::Literal(word));
@@ -1837,13 +1812,16 @@ mod tests {
     #[test]
     fn case_patterns_that_would_glob_are_rejected_by_name() {
         for (source, expected) in [
-            ("case $f in *.json) echo j ;; esac", "any run of characters"),
-            ("case $f in a?c) echo q ;; esac", "any single character"),
-            ("case $f in [ab]) echo c ;; esac", "a character class"),
+            ("case $f in *.json) echo j ;; esac", "`*`"),
+            ("case $f in a?c) echo q ;; esac", "`?`"),
+            ("case $f in [ab]) echo c ;; esac", "`[`"),
         ] {
             let message = syntax_error(source);
             assert!(message.contains(expected), "{source}: {message}");
-            assert!(message.contains("literal text"), "{source}: {message}");
+            assert!(
+                message.contains("patterns are literal"),
+                "{source}: {message}"
+            );
         }
 
         assert!(parse("case $f in '*') echo star ;; esac").is_ok());

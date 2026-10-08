@@ -14,7 +14,7 @@ Ordered by the goals it serves. Credentials stay inside the broker:
 
 - Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters (including broker-private Kubernetes TokenRequest minting), canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and a credential echo check. Providers never see values; a provider command may propose a reference. See [`docs/secrets.md`](docs/secrets.md).
 - One capability presents a different credential per acting agent through `credential`/`agents.<id>.credentials`. *Committed direction:* these bindings will be replaced by public DRNs ([migration requirements](docs/design.md#legacy-credential-bindings)).
-- Credential-free self-inspection: an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
+- Credential-free self-inspection: on a route that opts in, an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 
 Correlated tracing from receipt to execution:
 

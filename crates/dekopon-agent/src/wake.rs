@@ -121,17 +121,12 @@ enum WakeCall {
 pub(crate) fn wake_tool() -> ModelTool {
     ModelTool {
         name: WAKE_TOOL_NAME.to_owned(),
-        description: "Come back to this conversation later, as the person who asked, in this \
-                      same chat. This is the only way to schedule, see or cancel a wake. \
-                      `schedule` wakes you once after `afterSeconds` with your `note`. `watch` \
-                      runs `script` in the same shell as `bash` every `everySeconds` for up to \
-                      `forSeconds`, with no model in the loop: exit 0 wakes you with its output, \
-                      exit 1 keeps waiting, and any other exit wakes you with the failure. The \
-                      previous run's output is in `$PREV`; it is unset on the first run, which \
-                      happens now and never wakes you. A watch script may only read: every \
-                      capability that writes is refused to it. The note is what you will see \
-                      when you wake, so say what to do then. `list` shows this person's pending \
-                      wakes and `cancel` removes one by id."
+        description: "Come back to this chat later. `schedule` wakes you once after \
+                      `afterSeconds` with your `note`. `watch` runs a read-only `script` every \
+                      `everySeconds` for up to `forSeconds`, with no model: exit 0 wakes you \
+                      with its output, exit 1 keeps waiting, any other exit wakes you with the \
+                      failure. `$PREV` holds the previous run's output; the first run is now and \
+                      only sets it. `list` shows pending wakes; `cancel` takes an `id`."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -139,10 +134,10 @@ pub(crate) fn wake_tool() -> ModelTool {
                 "action": { "type": "string", "enum": ["schedule", "watch", "list", "cancel"] },
                 "note": { "type": "string", "description": "What to do when you wake." },
                 "afterSeconds": { "type": "integer", "minimum": 1 },
-                "script": { "type": "string", "description": "The watch probe." },
+                "script": { "type": "string" },
                 "everySeconds": { "type": "integer", "minimum": 1 },
                 "forSeconds": { "type": "integer", "minimum": 1 },
-                "id": { "type": "integer", "description": "The wake to cancel." }
+                "id": { "type": "integer" }
             },
             "required": ["action"],
             "additionalProperties": false

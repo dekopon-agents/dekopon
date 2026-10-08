@@ -977,6 +977,36 @@ fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> Conversatio
     }
 }
 
+pub(crate) const RESTRICTED_REPLY_ASSETS_NOTE: &str = "[gateway: this chat shows only image/png and \
+image/jpeg; convert other images before `asset send`.]";
+
+fn limits_line(
+    limits: dekopon_agent::prompt::PromptLimits,
+    max_duration: Option<Duration>,
+) -> String {
+    let steps = counted(limits.max_steps.into(), "step", "steps");
+    let calls = counted(
+        limits.max_capability_calls.into(),
+        "capability call",
+        "capability calls",
+    );
+    match max_duration {
+        Some(duration) if duration.as_secs() % 60 == 0 => format!(
+            "[gateway: {steps}, {calls} and {} per message.]",
+            counted(duration.as_secs() / 60, "minute", "minutes")
+        ),
+        Some(duration) => format!(
+            "[gateway: {steps}, {calls} and {} per message.]",
+            counted(duration.as_secs(), "second", "seconds")
+        ),
+        None => format!("[gateway: {steps} and {calls} per message.]"),
+    }
+}
+
+fn counted(count: u64, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 /// Only the canonical subject line is attribution the gateway vouches for; the rest is untrusted
 /// user text that can contain lookalike labels or prompt injection, even under the local-dev
 /// transport.
@@ -1334,23 +1364,23 @@ async fn session(
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
     let limits = route.limits;
-    let instructions = match (route.instructions.as_deref(), memory_surface.as_ref()) {
-        (Some(instructions), Some(memory)) => {
-            Some(format!("{instructions}\n\n{}", memory.prompt_note))
-        }
-        (None, Some(memory)) => Some(memory.prompt_note.clone()),
-        (Some(instructions), None) => Some(instructions.to_owned()),
-        (None, None) => None,
-    };
-    let accepted_types = match &message.reply {
+    let assets_note = match &message.reply {
         crate::transport::ReplyTarget::Telegram { .. }
-        | crate::transport::ReplyTarget::WhatsApp { .. } => "image/png and image/jpeg",
-        _ => "any concrete syntactically valid media type (no wildcards)",
+        | crate::transport::ReplyTarget::WhatsApp { .. } => Some(RESTRICTED_REPLY_ASSETS_NOTE),
+        _ => None,
     };
-    let instructions = Some(format!(
-        "{}\n\n[Gateway assets: this reply adapter accepts {accepted_types}. Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]",
-        instructions.as_deref().unwrap_or_default()
-    ));
+    let instructions = [
+        route.instructions.as_deref(),
+        memory_surface
+            .as_ref()
+            .map(|memory| memory.prompt_note.as_str()),
+        assets_note,
+        Some(limits_line(limits, route.max_duration).as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
     let images_supported = route.model.accepts_images();
     let registered = runner.assets.assets_for_access(
         &asset_access,
@@ -1516,7 +1546,7 @@ async fn session(
             };
             let mut history = seeded;
             let mut inputs = SessionInputs::new(&text, limits)
-                .with_system(instructions.as_deref())
+                .with_system(Some(&instructions))
                 .with_skills(&skills)
                 .with_agent(&agent)
                 .with_options(&options)

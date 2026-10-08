@@ -54,15 +54,11 @@ const MAX_IGNORED_ARGUMENT_NAMES_BYTES: usize = 256;
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
-const OPTIONAL_REPLY_INSTRUCTION: &str = "This message is an unaddressed continuation inside a \
-chat thread the agent already owns. Reply when doing so would materially help. If no response is \
-needed—for example, the people are talking to each other, acknowledged the result, or already \
-resolved the point—call `decline_chat_reply` instead. That call posts nothing to chat. Do not reply \
-merely to have the last word.";
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This thread message was not addressed to you. Reply only \
+if it helps; for thanks or side talk, call `decline_chat_reply`.";
 
-const DECLINE_AFTER_WORK_RESULT: &str = "A chat reply is required because this session already \
-invoked a capability. No tool calls from this turn were run. Provide a concise reply describing \
-what happened instead.";
+const DECLINE_AFTER_WORK_RESULT: &str = "Not declined: a capability already ran, so reply with what \
+happened. None of this turn's tool calls ran.";
 
 /// Returns no Result because a script failure is an outcome the model recovers from, like a nonzero
 /// exit code, not a reason to end the session.
@@ -1164,14 +1160,26 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
         let mut words = command_words.to_vec();
         words.sort();
         words.dedup();
-        description.push_str(&format!(
-            "\n\nThis session's providers add these command words: {}.",
-            words.join(", ")
-        ));
+        description.push_str(&format!("\n\nCommand words: {}.", words.join(", ")));
+        // One broker render per provider maps to each of its words, so byte-identical pages are
+        // one provider's page and are sent once.
+        let mut pages: Vec<(&str, Vec<&str>)> = Vec::new();
         for word in &words {
-            if let Some(page) = help.get(word) {
-                description.push_str(&format!("\n\n`{word} --help`:\n{page}"));
+            let Some(page) = help.get(word) else {
+                continue;
+            };
+            match pages.iter_mut().find(|(text, _)| *text == page.as_str()) {
+                Some((_, named)) => named.push(word),
+                None => pages.push((page, vec![word])),
             }
+        }
+        for (page, named) in pages {
+            let named = named
+                .iter()
+                .map(|word| format!("`{word}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            description.push_str(&format!("\n\n--help for {named}:\n{page}"));
         }
     }
     ModelTool {
@@ -1194,11 +1202,7 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
 fn decline_reply_tool() -> ModelTool {
     ModelTool {
         name: DECLINE_REPLY_TOOL_NAME.to_owned(),
-        description: "Post nothing to chat and end this optional continuation. Call this instead \
-                      of writing text when a reply would not materially help or would merely take \
-                      the last word. Call it before running capabilities; once capability work has \
-                      happened, a concise report is required."
-            .to_owned(),
+        description: "Post nothing to chat and end this turn.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {},
@@ -1211,16 +1215,9 @@ fn decline_reply_tool() -> ModelTool {
 fn agent_config_tool() -> ModelTool {
     ModelTool {
         name: AGENT_CONFIG_TOOL_NAME.to_owned(),
-        description: "Inspect this session's credential-free agent configuration. Call this when \
-                      asked about the agent's prompt, configuration, Cedar policy, permissions, \
-                      tools, limits, or memory. The result contains the exact standing \
-                      instructions, route/session bounds, and only the capabilities Cedar \
-                      currently grants this sender through this agent. Present it as concise \
-                      Markdown tables unless raw JSON was requested. Raw Cedar source, policy \
-                      identifiers, principals, subjects, endpoints, paths, legacy credential \
-                      names, private secret-map inventory, and all credential values are \
-                      intentionally omitted. A public DRN may appear only when the operator put \
-                      that inert name in the standing instructions."
+        description: "Show this agent's instructions, limits and granted capabilities, without \
+                      credentials. Use it when asked about your configuration or permissions, and \
+                      present it as short tables."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -1678,12 +1675,13 @@ mod tests {
     use super::{
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
         BAD_SCRIPT_ARGUMENTS_FEEDBACK, CancellationProbe, ConversationTurn,
-        DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, FetchedAsset, History,
-        HistoryLimits, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN,
-        ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION,
-        SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs, Steer, SteerSource,
-        agent_config_tool, format_script_outcome, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_tool,
+        DECLINE_AFTER_WORK_RESULT, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS,
+        FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES,
+        MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition,
+        SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs,
+        Steer, SteerSource, agent_config_tool, format_script_outcome, run_prompt,
+        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
+        script_tool,
     };
 
     struct ScriptedModel {
@@ -3275,7 +3273,7 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(
-            tool.description.contains("command words: fly, gh."),
+            tool.description.contains("Command words: fly, gh."),
             "{}",
             tool.description
         );
@@ -3294,15 +3292,50 @@ mod tests {
         help.insert("gh".to_owned(), "Usage: gh <command>".to_owned());
         let tool = script_tool(&["gh".to_owned(), "fly".to_owned()], &help);
 
+        let (listing, pages) = tool
+            .description
+            .split_once("Command words: fly, gh.")
+            .expect("word listing");
+        assert!(!listing.contains("Usage: gh"), "{}", tool.description);
+        assert_eq!(pages.matches("Usage: gh <command>").count(), 1);
+        assert!(pages.contains("`gh`"), "{}", tool.description);
         assert!(
+            !pages.contains("`fly`"),
+            "a word missing from help gets no page: {}",
             tool.description
-                .contains("command words: fly, gh.\n\n`gh --help`:\nUsage: gh <command>"),
+        );
+    }
+
+    #[test]
+    fn words_sharing_one_providers_page_get_it_once_with_every_word_named() {
+        let page = "Usage: openobserve <COMMAND>".to_owned();
+        let help = BTreeMap::from([
+            ("agent".to_owned(), page.clone()),
+            ("broker".to_owned(), page.clone()),
+            ("gh".to_owned(), "Usage: gh <command>".to_owned()),
+            ("openobserve".to_owned(), page),
+        ]);
+        let words = ["openobserve", "gh", "broker", "agent"].map(str::to_owned);
+        let tool = script_tool(&words, &help);
+
+        assert_eq!(
+            tool.description
+                .matches("Usage: openobserve <COMMAND>")
+                .count(),
+            1,
             "{}",
             tool.description
         );
         assert!(
-            !tool.description.contains("`fly --help`:"),
-            "a word missing from help gets no page: {}",
+            tool.description
+                .contains("--help for `agent`, `broker`, `openobserve`:\nUsage: openobserve"),
+            "{}",
+            tool.description
+        );
+        assert!(
+            tool.description
+                .contains("--help for `gh`:\nUsage: gh <command>"),
+            "{}",
             tool.description
         );
     }
@@ -3346,9 +3379,7 @@ mod tests {
             .find(|tool| tool.name == SCRIPT_TOOL_NAME)
             .expect("bash tool offered");
         assert!(
-            script
-                .description
-                .contains("`gh --help`:\nUsage: gh <command>"),
+            script.description.matches("Usage: gh <command>").count() == 1,
             "{}",
             script.description
         );
@@ -3676,11 +3707,7 @@ mod tests {
                 tool.description
             );
         }
-        assert!(
-            !tool
-                .description
-                .contains("providers add these command words")
-        );
+        assert!(!tool.description.contains("Command words:"));
         assert!(
             tool.description
                 .contains("there is no separate `help` builtin")
@@ -3696,12 +3723,6 @@ mod tests {
         assert_eq!(tool.parameters["properties"], json!({}));
         assert_eq!(tool.parameters["required"], json!([]));
         assert_eq!(tool.parameters["additionalProperties"], false);
-        assert!(tool.description.contains("Markdown tables"));
-        assert!(tool.description.contains("currently grants this sender"));
-        assert!(
-            tool.description
-                .contains("credential values are intentionally omitted")
-        );
     }
 
     #[test]
@@ -3967,7 +3988,8 @@ mod tests {
             model
                 .first_roles()
                 .iter()
-                .any(|(role, content)| role == &"system" && content.contains("last word")),
+                .any(|(role, content)| role == &"system"
+                    && content.contains(DECLINE_REPLY_TOOL_NAME)),
             "the model is explicitly told that silence is available"
         );
     }
@@ -4065,7 +4087,7 @@ mod tests {
             model
                 .tool_messages()
                 .iter()
-                .any(|message| message.contains("a concise reply describing what happened"))
+                .any(|message| message == DECLINE_AFTER_WORK_RESULT)
         );
     }
 

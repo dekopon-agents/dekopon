@@ -1315,13 +1315,8 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
     Ok(())
 }
 
-fn memory_prompt_note(max_lookback_turns: u32) -> String {
-    format!(
-        "Durable chat memory is available on demand. Use `memory recent --last N` or `memory \
-         search --query TEXT`. Searches inspect at most {max_lookback_turns} prior turns. Do not \
-         claim recall without retrieving it."
-    )
-}
+const MEMORY_PROMPT_NOTE: &str = "`memory recent` and `memory search` retrieve older turns of \
+this chat. Do not claim to remember anything you have not retrieved.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteConflict {
@@ -2143,7 +2138,7 @@ where
         let config = self.chat_memory.as_ref()?;
         Some(ChatMemorySurface {
             max_lookback_turns: config.max_lookback_turns,
-            prompt_note: memory_prompt_note(config.max_lookback_turns),
+            prompt_note: MEMORY_PROMPT_NOTE.to_owned(),
         })
     }
 
@@ -2460,7 +2455,7 @@ where
         }
         Some(ChatMemorySurface {
             max_lookback_turns: config.max_lookback_turns,
-            prompt_note: memory_prompt_note(config.max_lookback_turns),
+            prompt_note: MEMORY_PROMPT_NOTE.to_owned(),
         })
     }
 

@@ -8,6 +8,12 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Opt-in self-inspection and participant names (0.37.0)
+
+`inspect_agent_config` is now offered only on a route that writes `inspectAgentConfig: true`;
+add that line to every route that should keep it before upgrading, and delete any
+`inspectAgentConfig: false`, which is now the default.
+
 ## Broker lock-change restart and console scope refusal (0.36.0)
 
 Upgrade the broker and gateway together. The broker closes admission and drains under its existing

@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{ExitCode, TreeContext, ast::Statement, interp::JobScope};
 
-pub const JOBS_OFF: &str = "jobs are off in this chat: its route sets no limits.jobTimeoutMs";
+pub const JOBS_OFF: &str = "jobs are off in this chat";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct JobId(u64);
