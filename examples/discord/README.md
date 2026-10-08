@@ -2,7 +2,7 @@
 
 `dekopon-gatewayd` connects to Discord Gateway v10 over an outbound WebSocket, so it needs no inbound HTTP
 endpoint. It answers direct messages and explicit bot mentions in guild channels, including Discord
-thread channels. Photos and files use the same lazy `Chat Asset #N` flow as Slack and Telegram: the
+thread channels. Photos and files use the same lazy `chat-asset:N` flow as Slack and Telegram: the
 model sees bounded metadata first and downloads bytes only if it calls `fetch_chat_asset`.
 
 ## 1. Create and install the bot

@@ -200,7 +200,7 @@ async fn a_photo_steer_is_acknowledged_and_offers_fetch_in_the_retried_turn() {
         models
             .prompt(1)
             .iter()
-            .any(|(role, text)| role == "user" && text.contains("Chat Asset #1"))
+            .any(|(role, text)| role == "user" && text.contains("chat-asset:1"))
     );
     assert!(
         !models

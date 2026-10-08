@@ -5227,6 +5227,48 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_carries_the_inventory()
+ {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("A screenshot."), answer("Still one file.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+    let mut first = message("what is this?");
+    first.assets = vec![pending("shot.png", "image/png", 10)];
+
+    for inbound in [first, message("and now?")] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    let first_prompt = models.prompt(0);
+    assert!(
+        first_prompt[1].1.contains("files in this conversation"),
+        "{first_prompt:?}"
+    );
+    let second = models.prompt(1);
+    assert_eq!(
+        second[1],
+        (
+            "user".to_owned(),
+            "what is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
+        ),
+        "the recorded turn keeps the arrival and drops the inventory note"
+    );
+    assert_eq!(second[2], ("assistant".to_owned(), "A screenshot.".to_owned()));
+    assert!(second[3].1.starts_with("and now?\n\n[gateway: files in this conversation"));
+    assert!(second[3].1.contains("shot.png"), "{second:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_message() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
@@ -9017,7 +9059,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
         .await
         .expect("blocking fetch completes")
         .expect_err("retired bytes never reach the model");
-    assert!(refusal.contains("no Chat Asset #1"), "{refusal}");
+    assert!(refusal.contains("no chat-asset:1"), "{refusal}");
 }
 
 #[test]
@@ -9064,11 +9106,11 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
     let note = asset::reference_note(&registered, true).expect("a note for three files");
 
     assert!(
-        note.contains("Chat Asset #1 — shot.png (image/png, 2 KB)"),
+        note.contains("chat-asset:1 — shot.png (image/png, 2 KB)"),
         "{note}"
     );
     assert!(note.contains("clip.mov"), "{note}");
-    assert!(!note.contains("Chat Asset #2"), "{note}");
+    assert!(!note.contains("chat-asset:2"), "{note}");
     assert!(
         note.contains("the gateway cannot see this file at all"),
         "{note}"
@@ -9089,7 +9131,7 @@ fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
     let note = asset::reference_note(&registered, false).expect("a note");
 
     assert!(!registered.fetchable);
-    assert!(!note.contains("Chat Asset #"), "{note}");
+    assert!(!note.contains("chat-asset:"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
@@ -9172,8 +9214,8 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
     );
     let note = asset::reference_note(&registered, true).expect("a note");
 
-    assert!(note.contains("Chat Asset #1 — recipe.pdf"), "{note}");
-    assert!(note.contains("Chat Asset #2 — shot.png"), "{note}");
+    assert!(note.contains("chat-asset:1 — recipe.pdf"), "{note}");
+    assert!(note.contains("chat-asset:2 — shot.png"), "{note}");
     assert!(
         note.contains("shot.png (image/png, 2 KB) — attached to this message"),
         "{note}"
@@ -9205,7 +9247,7 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
     let refusal = tokio::task::spawn_blocking(move || assets.fetch(99).expect_err("no such asset"))
         .await
         .expect("the blocking task completes");
-    assert!(refusal.contains("no Chat Asset #99"), "{refusal}");
+    assert!(refusal.contains("no chat-asset:99"), "{refusal}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -10469,8 +10511,8 @@ fn a_document_does_not_need_the_image_modality() {
     let note = asset::reference_note(&registered, false).expect("a note");
 
     assert!(registered.fetchable, "the document is still fetchable");
-    assert!(note.contains("Chat Asset #1 — spec.pdf"), "{note}");
-    assert!(!note.contains("Chat Asset #2"), "{note}");
+    assert!(note.contains("chat-asset:1 — spec.pdf"), "{note}");
+    assert!(!note.contains("chat-asset:2"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
 }
 
@@ -10487,7 +10529,7 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
 
     assert!(!registered.fetchable);
     assert!(note.contains("clip.mov"), "{note}");
-    assert!(!note.contains("Chat Asset #"), "{note}");
+    assert!(!note.contains("chat-asset:"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
 
@@ -12735,7 +12777,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         assert_eq!(models.requests(), 12);
         let first = models.prompt(0);
         assert!(
-            first.iter().any(|(_, text)| text.contains("Chat Asset #1")),
+            first.iter().any(|(_, text)| text.contains("chat-asset:1")),
             "{first:?}"
         );
         let tool = tool_message(&models, 2);
@@ -12757,7 +12799,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 models
                     .prompt(edit * 4)
                     .iter()
-                    .any(|(_, text)| text.contains(&format!("Chat Asset #{}", edit + 1))),
+                    .any(|(_, text)| text.contains(&format!("chat-asset:{}", edit + 1))),
                 "generated IDs must be visible in later-turn inventory"
             );
             if edit > 0 {
@@ -13054,9 +13096,9 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
         .collect::<Vec<_>>()
         .join("\n");
     for needle in [
-        "Chat Asset #1",
-        "Chat Asset #2",
-        "Chat Asset #3",
+        "chat-asset:1",
+        "chat-asset:2",
+        "chat-asset:3",
         "edit these three together",
         "first reference",
         "third reference",
@@ -13182,7 +13224,7 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
         .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(prompt.contains("Chat Asset #3"));
+    assert!(prompt.contains("chat-asset:3"));
     assert!(prompt.contains("please edit all three"));
 }
 
@@ -14054,7 +14096,7 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     );
     assert_eq!(
         prompt[3].1,
-        "[gateway: chat history, from U2]\nlook at this\n[gateway: attached Chat Asset #1 — graph.png]"
+        "[gateway: chat history, from U2]\nlook at this\n[gateway: attached chat-asset:1 — graph.png]"
     );
     assert!(
         prompt[4].1.contains("graph.png (image/png"),
