@@ -10,7 +10,7 @@ image:
   # Empty means "v" + .Chart.AppVersion, which names the application release this chart deploys.
   # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
   # image for v0.3.0 or earlier — the image workflow landed after that release.
-  tag: "v0.33.0"
+  tag: ""
   digest: "sha256:7c44f92e1bc40fe231ff1341feb59c5b5e17a27086346852390a35f56548ef9f"
   pullPolicy: IfNotPresent
   # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
@@ -312,12 +312,9 @@ broker:
       cpu: 100m
       memory: 256Mi
     limits:
-      # The provider sync Job and the precompile init container compile with these too, and exit
-      # before the broker starts, releasing their compiler memory. The limit covers the largest
-      # provider's cold-compile peak (a 49 MB python component peaks near 1.7 GB) as well as the
-      # broker's warm startup; the broker retains its mapped components until it exits.
+      # Covers python's ~1.7 GB cold compile in the sync Job and precompile init container.
       cpu: "2"
-      memory: 1Gi
+      memory: 2Gi
 
   # Plain env entries. Chat-service and model tokens are NOT here — they belong to the gateway. What the
   # broker wants is RUST_LOG and, if broker.yaml has a telemetry section, OTEL_EXPORTER_OTLP_HEADERS
