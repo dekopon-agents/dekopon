@@ -141,8 +141,9 @@ impl Default for BrokerHostLimits {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct TestImports {
+    pub assets: Option<dekopon_http_host::asset::AssetDirectory>,
     pub clock: Option<std::time::SystemTime>,
     pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
     pub settings: Option<String>,
@@ -1876,7 +1877,10 @@ impl BrokerProviderRegistry {
                 slots,
                 storage_transaction,
                 assets,
-                self.assets.clone(),
+                test_imports
+                    .and_then(|imports| imports.assets.as_ref())
+                    .or(self.assets.as_ref())
+                    .cloned(),
             )
             .instrument(span)
             .await
