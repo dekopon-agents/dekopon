@@ -1214,13 +1214,17 @@ dependencies = [
 name = "dekopon-provider-sdk-testkit"
 version = "0.41.0"
 dependencies = [
+ "axum",
  "clap",
  "dekopon-broker-host",
+ "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
  "dekopon-test-support",
+ "hyper",
+ "hyper-util",
  "parking_lot",
  "rcgen",
  "rustls",
