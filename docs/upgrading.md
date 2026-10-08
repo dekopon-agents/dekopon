@@ -8,7 +8,11 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Shared agent storage namespaces (unreleased)
+## Shared agent storage namespaces (0.40.0)
+
+Upgrade broker and gateway together as usual. No broker protocol, provider WIT or SDK changed;
+broker configuration gains one optional key. Console 0.12.0 keeps working without a re-pin, and
+deployed provider components run unchanged without a re-pin.
 
 No action needed: a storage constraint without the new optional `namespace` key keeps its
 directory byte for byte. To let a second provider open an agent-scope store, add
@@ -19,6 +23,11 @@ Providers that construct `StorageConstraints` in Rust add `namespace: None` when
 Co-tenants of one namespace take turns: the base lease is held through guest execution, so a
 pipeline or upcall between the two providers on one agent waits up to `storage.lockTimeoutMs` and
 fails with a storage `Timeout` if the holder runs longer.
+
+A broker older than 0.40.0 refuses a storage constraint that names `namespace` as an unknown field,
+so upgrade the broker before adding the key.
+
+Install chart 0.29.0 only after its default image index is pinned to the verified v0.40.0 image.
 
 ## Late-mention catch-up and named recall authors (0.39.0)
 

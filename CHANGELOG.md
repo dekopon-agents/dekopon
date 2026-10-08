@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.29.0] - 2026-10-08
+
+### Changed
+
+- Prepare chart 0.29.0 for core v0.40.0; pin the published image index in a separate reviewed change.
+
+## [0.40.0] - 2026-10-08
+
+### Added
+
+- An agent-scope storage constraint accepts optional `namespace: <provider id>` in broker configuration, so two providers share one agent store; absent keeps each provider's own directory.
+
 ## [dekopon-chart-0.28.0] - 2026-10-08
 
 ### Changed
