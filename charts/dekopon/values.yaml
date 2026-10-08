@@ -478,6 +478,42 @@ gateway:
     annotations: {}
 
 # ---------------------------------------------------------------------------------------------
+# Configuration check
+# ---------------------------------------------------------------------------------------------
+# A hook Job that runs `dekopon-brokerd check` and `dekopon-gatewayd check --probe` on candidate
+# configuration with the Deployment's own image, before the release changes anything; a problem
+# fails the hook and the old pod keeps serving. The candidate ConfigMaps must already hold the
+# files about to be applied when the hook runs: under Argo CD that means a second set of
+# ConfigMaps synced ahead of the Job, since the live ones change only after it. `check` with
+# `--probe` sends one short completion to the vendor of every API-key model that is absent from or
+# different in `gateway.againstConfigMap`, reading its apiKeyEnv from `env`; subscription and
+# proxy-only models are reported as not probed. Off by default.
+configCheck:
+  enabled: false
+  broker:
+    # Candidate broker.d: every *.yaml and *.cedar key.
+    configMap: ""
+    # ConfigMap whose providers.yaml key is the candidate provider set, required when broker.d names
+    # a providerSet. The resolved store is kept under <paths.stateDir>/config-check between runs, so
+    # the default Helm hook then requires state.existingClaim.
+    providerSetConfigMap: ""
+  gateway:
+    # Candidate gatewayd.d: every *.yaml key.
+    configMap: ""
+    # Candidate agent catalog, every key a file of the directory passed as --catalog. Required with
+    # gateway.configMap.
+    catalogConfigMap: ""
+    # Candidate skills, projected with gateway.skills.items into paths.skillsDir.
+    skillsConfigMap: ""
+    # Live gatewayd.d passed as --against. Empty probes every API-key model.
+    againstConfigMap: ""
+  # Environment for the gateway check: the apiKeyEnv variable of each model it probes.
+  env: []
+  # Empty means Helm's pre-install,pre-upgrade hook with before-hook-creation, which Argo CD runs
+  # as PreSync. Any entry replaces that set entirely.
+  annotations: {}
+
+# ---------------------------------------------------------------------------------------------
 # Console
 # ---------------------------------------------------------------------------------------------
 # An idle dekopon-console container for `kubectl exec -it deploy/<release> -c console --

@@ -8,6 +8,25 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## One validator and vendor probes (0.44.0)
+
+Upgrade broker and gateway together as usual. No configuration key, broker protocol, provider WIT
+or SDK changed.
+
+`dekopon-gatewayd check` and `dekopon-brokerd check` now run the function each daemon runs at boot,
+keep going past a failed stage and report every problem together; a stage that could not run is a
+warning, `<stage> not checked: a stage it needs failed`. A script that counted on one problem per
+run sees all of them.
+
+`dekopon-gatewayd check --probe [--against <live config>]` sends one capped completion to the vendor
+of each changed `openrouter` model and reads that model's `apiKeyEnv` to do it; plain `check` still
+reads no credential. Subscription, `anthropic` and `openaiCompatible` models are reported as not
+probed.
+
+Chart: `configCheck` (off by default) renders a pre-install/pre-upgrade hook Job running both
+checks on candidate ConfigMaps; see [`kubernetes.md`](kubernetes.md#checking-configuration-before-a-sync).
+Enabling it needs a second, candidate set of ConfigMaps synced ahead of the Job.
+
 ## Discord role mentions (0.43.0)
 
 Upgrade the gateway first; nothing changes until a Discord transport sets `messageContent: true`.
