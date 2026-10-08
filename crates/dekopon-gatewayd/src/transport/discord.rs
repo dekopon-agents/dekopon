@@ -490,6 +490,51 @@ impl DiscordTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))
     }
 
+    fn dropped(&self, received: &Span, reason: DropReason, origin: Option<(&str, &str)>) {
+        let mention_roles = match reason {
+            DropReason::ContentWithheld { mention_roles } => Some(mention_roles),
+            DropReason::MessageType
+            | DropReason::BotAuthored
+            | DropReason::MalformedEnvelope
+            | DropReason::SelfAuthored
+            | DropReason::ConversationUnresolved => None,
+        };
+        let why = reason.as_str();
+        received.record("drop.reason", why);
+        received.record("mention.roles", mention_roles);
+        let sender = origin.and_then(|(user, _)| ExternalSubject::discord(user).ok());
+        let subject = sender.as_ref().map(tracing::field::display);
+        let channel = origin.map(|(_, channel)| channel);
+        let transport = self.name.as_str();
+        match reason {
+            DropReason::MessageType | DropReason::BotAuthored | DropReason::SelfAuthored => {
+                tracing::debug!(
+                    target: "dekopon_gatewayd::audit",
+                    { audit.event = "gateway.message.dropped",
+                    drop.reason = why,
+                    transport,
+                    subject,
+                    channel, },
+                    "gateway message dropped"
+                );
+            }
+            DropReason::MalformedEnvelope
+            | DropReason::ContentWithheld { .. }
+            | DropReason::ConversationUnresolved => {
+                tracing::info!(
+                    target: "dekopon_gatewayd::audit",
+                    { audit.event = "gateway.message.dropped",
+                    drop.reason = why,
+                    transport,
+                    subject,
+                    channel,
+                    mention.roles = mention_roles, },
+                    "gateway message dropped"
+                );
+            }
+        }
+    }
+
     async fn routable(
         &mut self,
         message: &Value,
@@ -497,12 +542,12 @@ impl DiscordTransport {
     ) -> Result<Option<InboundMessage>, TransportError> {
         let message_type = message["type"].as_u64().unwrap_or_default();
         if !matches!(message_type, 0 | 19) {
-            received.record("drop.reason", "message-type");
+            self.dropped(received, DropReason::MessageType, None);
             return Ok(None);
         }
         let author = &message["author"];
         if author["bot"].as_bool() == Some(true) || !message["webhook_id"].is_null() {
-            received.record("drop.reason", "bot-authored");
+            self.dropped(received, DropReason::BotAuthored, None);
             return Ok(None);
         }
         let (Some(user_id), Some(channel_id), Some(message_id)) = (
@@ -510,15 +555,16 @@ impl DiscordTransport {
             message["channel_id"].as_str(),
             message["id"].as_str(),
         ) else {
-            received.record("drop.reason", "malformed-envelope");
+            self.dropped(received, DropReason::MalformedEnvelope, None);
             return Ok(None);
         };
         if !is_snowflake(user_id) || !is_snowflake(channel_id) || !is_snowflake(message_id) {
-            received.record("drop.reason", "malformed-envelope");
+            self.dropped(received, DropReason::MalformedEnvelope, None);
             return Ok(None);
         }
+        let origin = Some((user_id, channel_id));
         if self.identity.user_id.as_deref() == Some(user_id) {
-            received.record("drop.reason", "self-authored");
+            self.dropped(received, DropReason::SelfAuthored, origin);
             return Ok(None);
         }
         let text = bound_inbound(message["content"].as_str().unwrap_or_default());
@@ -529,7 +575,14 @@ impl DiscordTransport {
             message_id,
         );
         if text.trim().is_empty() && assets.is_empty() {
-            received.record("drop.reason", "content-withheld");
+            let mention_roles = message["mention_roles"]
+                .as_array()
+                .is_some_and(|roles| !roles.is_empty());
+            self.dropped(
+                received,
+                DropReason::ContentWithheld { mention_roles },
+                origin,
+            );
             return Ok(None);
         }
 
@@ -550,7 +603,7 @@ impl DiscordTransport {
             },
             (false, Some(guild)) => {
                 let Some(shape) = self.channel_shape(channel_id).await else {
-                    received.record("drop.reason", "conversation-unresolved");
+                    self.dropped(received, DropReason::ConversationUnresolved, origin);
                     return Ok(None);
                 };
                 match shape {
@@ -569,7 +622,7 @@ impl DiscordTransport {
                 }
             }
             (false, None) => {
-                received.record("drop.reason", "conversation-unresolved");
+                self.dropped(received, DropReason::ConversationUnresolved, origin);
                 return Ok(None);
             }
         };
@@ -840,6 +893,29 @@ impl ChatTransport for DiscordTransport {
 
     fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
         Some(Arc::clone(&self.driver) as Arc<dyn AssetFetcher>)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DropReason {
+    MessageType,
+    BotAuthored,
+    MalformedEnvelope,
+    SelfAuthored,
+    ContentWithheld { mention_roles: bool },
+    ConversationUnresolved,
+}
+
+impl DropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageType => "message-type",
+            Self::BotAuthored => "bot-authored",
+            Self::MalformedEnvelope => "malformed-envelope",
+            Self::SelfAuthored => "self-authored",
+            Self::ContentWithheld { .. } => "content-withheld",
+            Self::ConversationUnresolved => "conversation-unresolved",
+        }
     }
 }
 
@@ -2754,18 +2830,28 @@ mod unit_tests {
             .with(capture.clone())
             .set_default();
 
-        for (dropped, reason) in [
-            (message(json!({ "type": 6 })), "message-type"),
+        for (dropped, reason, level) in [
+            (message(json!({ "type": 6 })), "message-type", "DEBUG"),
             (
                 message(json!({ "author": { "id": "7", "bot": true } })),
                 "bot-authored",
+                "DEBUG",
             ),
-            (message(json!({ "channel_id": null })), "malformed-envelope"),
+            (
+                message(json!({ "channel_id": null })),
+                "malformed-envelope",
+                "INFO",
+            ),
             (
                 message(json!({ "author": { "id": "999" } })),
                 "self-authored",
+                "DEBUG",
             ),
-            (message(json!({ "content": "  " })), "content-withheld"),
+            (
+                message(json!({ "content": "  " })),
+                "content-withheld",
+                "INFO",
+            ),
         ] {
             capture.clear();
             let span = receive_span(ChatTransportKind::Discord);
@@ -2777,7 +2863,34 @@ mod unit_tests {
             assert!(routed.is_none(), "{dropped} routed");
             drop(span);
             assert_reason(&capture, reason);
+            let events = capture.events_text();
+            assert!(
+                events.contains(&format!("{level} dekopon_gatewayd::audit"))
+                    && events.contains("audit.event=\"gateway.message.dropped\"")
+                    && events.contains(&format!("drop.reason=\"{reason}\"")),
+                "expected a {level} gateway.message.dropped for {reason} in {events}"
+            );
         }
+
+        capture.clear();
+        let span = receive_span(ChatTransportKind::Discord);
+        let routed = transport
+            .routable(
+                &message(json!({ "content": "", "mention_roles": ["300"] })),
+                &span,
+            )
+            .instrument(span.clone())
+            .await
+            .expect("a drop is not a transport failure");
+        assert!(routed.is_none(), "a withheld role mention routed");
+        drop(span);
+        assert!(capture.spans_text().contains("mention.roles=true"));
+        let events = capture.events_text();
+        assert!(
+            events.contains("mention.roles=true") && events.contains("subject="),
+            "{events}"
+        );
+
         let span = receive_span(ChatTransportKind::Discord);
         assert!(
             transport
