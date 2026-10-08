@@ -14,6 +14,13 @@ do not understand rather than guessing.
 add that line to every route that should keep it before upgrading, and delete any
 `inspectAgentConfig: false`, which is now the default.
 
+Upgrade the broker and gateway together, and re-pin `dekopon-console` to this release. A broker
+`capabilities` answer now carries `principal`, the broker principal the attested subject maps to,
+and `BrokerResponse` refuses unknown fields, so an older client fails to decode it. On
+`sharedConversation` routes the participant label reads
+`[gateway: authenticated participant: <principal>]` instead of the canonical subject, or
+`[gateway: unmapped participant]`; rewrite instructions that quote the old label.
+
 ## Broker lock-change restart and console scope refusal (0.36.0)
 
 Upgrade the broker and gateway together. The broker closes admission and drains under its existing

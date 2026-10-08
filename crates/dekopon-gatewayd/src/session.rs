@@ -26,6 +26,7 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
     InvocationResult,
 };
+use dekopon_core::PrincipalId;
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     blocking::BlockingModel,
@@ -1004,14 +1005,14 @@ fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Only the canonical subject line is attribution the gateway vouches for; the rest is untrusted
-/// user text that can contain lookalike labels or prompt injection, even under the local-dev
-/// transport.
-fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> String {
-    bound_inbound(&format!(
-        "[gateway: authenticated participant: {}]\n{text}",
-        subject.canonical()
-    ))
+/// Only this first line is attribution the gateway vouches for, naming the broker principal the
+/// attested sender maps to; the rest is untrusted user text that can contain lookalike labels or
+/// prompt injection, even under the local-dev transport.
+fn attributed_prompt(principal: Option<&PrincipalId>, text: &str) -> String {
+    bound_inbound(&match principal {
+        Some(principal) => format!("[gateway: authenticated participant: {principal}]\n{text}"),
+        None => format!("[gateway: unmapped participant]\n{text}"),
+    })
 }
 
 fn message_span(
@@ -1173,6 +1174,7 @@ struct SessionSteers {
     access: AssetAccess,
     images_supported: bool,
     scope: Option<MemoryScope>,
+    principal: Option<PrincipalId>,
     assets: Arc<SessionAssets>,
     received_at: tokio::time::Instant,
     raw_texts: Mutex<Vec<String>>,
@@ -1210,8 +1212,8 @@ impl SteerSource for SessionSteers {
                     None => text,
                 };
                 if self.scope == Some(MemoryScope::SharedConversation) {
-                    prompt = attributed_prompt(&steer.subject, &prompt);
-                    recorded = attributed_prompt(&steer.subject, &recorded);
+                    prompt = attributed_prompt(self.principal.as_ref(), &prompt);
+                    recorded = attributed_prompt(self.principal.as_ref(), &recorded);
                 }
                 self.raw_texts.lock().push(steer.text);
                 Steer::Person { prompt, recorded }
@@ -1361,6 +1363,7 @@ async fn session(
     );
 
     let memory_surface = leg.chat_memory_surface().cloned();
+    let principal = leg.principal().cloned();
     let chat_claim = chat_claim(route, message).ok();
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
@@ -1408,7 +1411,7 @@ async fn session(
             None => text,
         };
         if shared {
-            attributed_prompt(&message.subject, &text)
+            attributed_prompt(principal.as_ref(), &text)
         } else {
             text
         }
@@ -1430,6 +1433,7 @@ async fn session(
         access: asset_access,
         images_supported,
         scope: window.map(|window| window.scope),
+        principal: principal.clone(),
         assets: Arc::clone(&assets),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),

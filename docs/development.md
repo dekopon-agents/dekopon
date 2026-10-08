@@ -64,7 +64,7 @@ Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names
 
 Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exits documented. Add parser tests and black-box tests. Machine-readable JSON/YAML shapes and exit codes need compatibility consideration even when table output can evolve.
 
-`dekopon-gatewayd auth` does not load the catalog. Broker protocol clients remain identity-free proposal clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
+`dekopon-gatewayd auth` does not load the catalog. Broker protocol clients remain identity-free proposal clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments. The one principal on the wire is the display name a `capabilities` answer carries back, which no client decides anything from.
 
 ### Model clients or prompt tools
 

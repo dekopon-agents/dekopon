@@ -807,6 +807,7 @@ fn validate_capability_responses<A: AuditLog>(
         command_words,
         command_word_help,
         broker.chat_memory_ceiling(),
+        broker.principal_ceiling(),
     );
     let length = encoded_capability_response(&response)?;
     if length > maximum {

@@ -40,8 +40,8 @@ use conversation::{
     canonical_signed_decimal, canonical_slack_timestamp, canonical_unsigned_decimal,
 };
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
-    TraceIdError, TransportId,
+    AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
+    SecretUseProposal, TraceId, TraceIdError, TransportId,
 };
 use dekopon_provider_sdk::ProviderCapability;
 pub use dekopon_provider_sdk::{CommandRunOutcome, ComponentFailure};
@@ -226,7 +226,7 @@ pub enum TraceParentError {
 }
 
 /// Actor and principal are deliberately absent here; the server derives them from transport
-/// identity, not client input.
+/// identity, not client input. The principal a `Capabilities` answer names is display-only.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationRequest {
@@ -731,6 +731,15 @@ pub struct ChatMemorySurface {
     pub prompt_note: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSurface {
+    pub capabilities: Vec<AvailableCapability>,
+    pub command_words: Vec<String>,
+    pub command_word_help: BTreeMap<String, String>,
+    pub chat_memory: Option<ChatMemorySurface>,
+    pub principal: Option<PrincipalId>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AvailableCapability {
@@ -1085,6 +1094,7 @@ impl ResponseEnvelope {
                 command_words,
                 command_word_help,
                 chat_memory: None,
+                principal: None,
             },
         }
     }
@@ -1095,6 +1105,7 @@ impl ResponseEnvelope {
         command_words: Vec<String>,
         command_word_help: BTreeMap<String, String>,
         chat_memory: Option<ChatMemorySurface>,
+        principal: Option<PrincipalId>,
     ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
@@ -1103,6 +1114,7 @@ impl ResponseEnvelope {
                 command_words,
                 command_word_help,
                 chat_memory,
+                principal,
             },
         }
     }
@@ -1156,6 +1168,8 @@ pub enum BrokerResponse {
         command_word_help: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_memory: Option<ChatMemorySurface>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<PrincipalId>,
     },
     Invocation {
         result: InvocationResult,
@@ -1524,15 +1538,7 @@ impl BrokerClient {
     pub async fn session_surface(
         &self,
         attestation: Option<Attestation>,
-    ) -> Result<
-        (
-            Vec<AvailableCapability>,
-            Vec<String>,
-            BTreeMap<String, String>,
-            Option<ChatMemorySurface>,
-        ),
-        ClientError,
-    > {
+    ) -> Result<SessionSurface, ClientError> {
         match self
             .exchange(RequestEnvelope::capabilities(attestation))
             .await?
@@ -1542,7 +1548,14 @@ impl BrokerClient {
                 command_words,
                 command_word_help,
                 chat_memory,
-            } => Ok((capabilities, command_words, command_word_help, chat_memory)),
+                principal,
+            } => Ok(SessionSurface {
+                capabilities,
+                command_words,
+                command_word_help,
+                chat_memory,
+                principal,
+            }),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. }
@@ -1551,7 +1564,7 @@ impl BrokerClient {
     }
 
     pub async fn capabilities(&self) -> Result<Vec<AvailableCapability>, ClientError> {
-        Ok(self.session_surface(None).await?.0)
+        Ok(self.session_surface(None).await?.capabilities)
     }
 
     /// A refused attestation must answer exactly as an unknown word would, since naming the word

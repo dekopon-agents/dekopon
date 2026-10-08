@@ -1322,6 +1322,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         words,
         command_word_help,
         broker.chat_memory_ceiling(),
+        broker.principal_ceiling(),
     ))
     .expect("ceiling response encodes")
     .len();

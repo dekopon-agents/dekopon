@@ -479,6 +479,9 @@ where
                         command_words,
                         command_word_help,
                         chat_memory,
+                        attestation
+                            .as_ref()
+                            .and_then(|claim| broker.display_principal(&claim.subject)),
                     )
                 }
                 None if attestation

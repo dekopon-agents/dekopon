@@ -1044,9 +1044,9 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
     assert_eq!(second, "The second one was the database.");
 
     let first_prompt =
-        format!("[gateway: authenticated participant: {MAPPED_SUBJECT}]\nwhat broke?");
+        format!("[gateway: authenticated participant: {MAPPED_PRINCIPAL}]\nwhat broke?");
     let second_prompt = format!(
-        "[gateway: authenticated participant: {OTHER_MAPPED_SUBJECT}]\nand the second one?"
+        "[gateway: authenticated participant: {OTHER_MAPPED_PRINCIPAL}]\nand the second one?"
     );
     assert_eq!(
         fixture.prompt(1),
@@ -1064,6 +1064,14 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
             ("user".to_owned(), second_prompt),
         ],
         "the second authenticated principal receives one shared, provenance-labelled transcript"
+    );
+    assert!(
+        fixture
+            .prompt(1)
+            .iter()
+            .all(|(_, content)| !content.contains(MAPPED_SUBJECT)
+                && !content.contains(OTHER_MAPPED_SUBJECT)),
+        "the label names the broker principal, never the platform id"
     );
     let tool_output = fixture
         .prompt(2)

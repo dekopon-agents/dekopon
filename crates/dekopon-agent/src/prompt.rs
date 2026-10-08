@@ -2315,10 +2315,13 @@ mod tests {
         )
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
-        assert_eq!(model.steers.drain(), [Steer::Person {
+        assert_eq!(
+            model.steers.drain(),
+            [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()
-            }]);
+            }]
+        );
         assert!(!sink.events.lock().iter().any(|event| matches!(
             event,
             ProgressEvent::Steered { .. } | ProgressEvent::Finished { .. }
@@ -2337,10 +2340,13 @@ mod tests {
         )
         .expect("the final step answers");
         assert_eq!(outcome.answer, "done");
-        assert_eq!(model.steers.drain(), [Steer::Person {
+        assert_eq!(
+            model.steers.drain(),
+            [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()
-            }]);
+            }]
+        );
         assert_eq!(history.turns()[0].user(), "msg1");
     }
 
@@ -2414,10 +2420,13 @@ mod tests {
         )
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
-        assert_eq!(model.steers.drain(), [Steer::Person {
+        assert_eq!(
+            model.steers.drain(),
+            [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()
-            }]);
+            }]
+        );
     }
 
     #[test]

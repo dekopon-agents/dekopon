@@ -294,11 +294,11 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let (_, words, _, _) = client
+    let surface = client
         .session_surface(Some(session()))
         .await
         .expect("inspect the surface");
-    assert_eq!(words, ["probe"]);
+    assert_eq!(surface.command_words, ["probe"]);
 
     match client
         .run_command(
@@ -469,11 +469,12 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
             .expect("inspect capabilities")
             .is_empty()
     );
-    let (capabilities, words, _, _) = client
+    let surface = client
         .session_surface(None)
         .await
         .expect("inspect the surface");
-    assert!(capabilities.is_empty() && words.is_empty());
+    assert!(surface.capabilities.is_empty() && surface.command_words.is_empty());
+    assert_eq!(surface.principal, None);
     let result = client
         .invoke(
             None,
@@ -487,11 +488,11 @@ async fn a_direct_unix_peer_holds_no_capability_even_when_policy_names_it() {
     assert_eq!(result.result.error.as_deref(), Some("policy-error"));
     assert_eq!(audit.records().len(), 1);
 
-    let (capabilities, _, _, _) = client
+    let surface = client
         .session_surface(Some(session()))
         .await
         .expect("the same peer may still attest a session");
-    assert_eq!(capabilities.len(), 1);
+    assert_eq!(surface.capabilities.len(), 1);
 
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -1129,12 +1130,20 @@ async fn attested_capabilities_over_the_socket() {
     let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let (capabilities, _, _, _) = client
+    let surface = client
         .session_surface(Some(session()))
         .await
         .expect("an attestor peer may inspect the attested context");
-    assert_eq!(capabilities.len(), 1);
-    assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
+    assert_eq!(surface.capabilities.len(), 1);
+    assert_eq!(
+        surface.capabilities[0].capability.id.as_str(),
+        "cli-probe.upper"
+    );
+    assert_eq!(
+        surface.principal.as_ref().map(PrincipalId::as_str),
+        Some("cpetersen"),
+        "the attested subject's one principal is named for display"
+    );
 
     granted_stop.send(()).expect("signal clean shutdown");
     granted_task
