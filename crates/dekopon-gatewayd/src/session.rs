@@ -3,7 +3,7 @@
 
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -26,7 +26,7 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
     InvocationResult,
 };
-use dekopon_core::PrincipalId;
+use dekopon_core::{ExternalSubject, PrincipalId};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     blocking::BlockingModel,
@@ -37,6 +37,7 @@ use dekopon_model::{
 };
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CallBudget, CapabilityInvoker as _, Limits as ShellLimits};
+use futures_util::StreamExt as _;
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
@@ -48,7 +49,10 @@ use crate::{
         MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, RecallSource, ResolvedBroker,
         ResolvedLiveness, Steering,
     },
-    conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    conversation::{
+        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
+        Watermark,
+    },
     jobs::JobContext,
     journal::{self, Journal},
     metering::ChatProviderGovernor,
@@ -70,6 +74,7 @@ pub(crate) const STOPPED_REPLY: &str = "Stopped.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
+const PRINCIPAL_LOOKUPS_IN_FLIGHT: usize = 4;
 // A history read that outlasts this is abandoned; the message is answered from an empty window.
 const PLATFORM_RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -776,106 +781,239 @@ struct RecalledWindow {
     history: History,
     assets: Vec<RecalledAsset>,
     next_asset_id: u64,
+    newest: Option<String>,
 }
 
-async fn recall_window(
-    runner: &SessionRunner,
-    driver: &dyn ChatDriver,
-    message: &InboundMessage,
-    key: &ConversationKey,
-    granted: &[String],
-    window: MemoryWindow,
-) -> Option<RecalledWindow> {
-    let span = tracing::Span::current();
-    match window.recall {
-        RecallSource::None => None,
-        RecallSource::Journal => {
-            let journal = Arc::clone(runner.journal.as_ref()?);
-            let stem = key.journal_stem();
-            let grant = journal::grant_digest(granted);
-            let recalled = tokio::task::spawn_blocking(move || {
-                journal.recall(&stem, &grant, window, SystemTime::now())
-            })
-            .await;
-            match recalled {
-                Ok(Ok(recalled)) => {
-                    span.record("conversation.recall_source", "journal");
-                    Some(RecalledWindow {
-                        history: recalled.history,
-                        assets: recalled.assets,
-                        next_asset_id: recalled.next_asset_id,
-                    })
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        event = "gateway_recall_failed",
-                        source = "journal",
-                        reason = error.label()
-                    );
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        event = "gateway_recall_failed",
-                        source = "journal",
-                        reason = "task"
-                    );
-                    None
-                }
+struct Delta {
+    messages: Vec<PastMessage>,
+    names: Names,
+}
+
+struct Names {
+    principals: HashMap<ExternalSubject, PrincipalId>,
+    scope: MemoryScope,
+}
+
+impl Names {
+    // Authors come from the chat service, not the broker, so the label does not claim authentication.
+    fn label(&self, message: &PastMessage) -> String {
+        match (self.principals.get(&message.subject), self.scope) {
+            (Some(principal), _) => format!("[gateway: chat history, from {principal}]"),
+            (None, MemoryScope::SharedConversation) => {
+                "[gateway: chat history, from unmapped participant]".to_owned()
             }
-        }
-        RecallSource::Platform => {
-            let history = driver.history()?;
-            let limit = window
-                .limits
-                .max_turns
-                .saturating_mul(2)
-                .min(PLATFORM_RECALL_MAX_MESSAGES);
-            let read = tokio::time::timeout(
-                PLATFORM_RECALL_TIMEOUT,
-                history.recent(
-                    &message.conversation,
-                    match &message.message_id {
-                        MessageId::Native(id) => Some(id),
-                        MessageId::Wake { .. } | MessageId::Job { .. } => None,
-                    },
-                    limit,
-                ),
-            )
-            .await;
-            let reason = match read {
-                Ok(Ok(messages)) => {
-                    span.record("conversation.recall_source", "platform");
-                    return Some(platform_window(messages, window, SystemTime::now()));
-                }
-                Ok(Err(error)) => error.category(),
-                Err(_) => "timeout",
-            };
-            tracing::warn!(event = "gateway_recall_failed", source = "platform", reason);
-            None
+            (None, MemoryScope::PrivateConversation) => {
+                format!("[gateway: chat history, from {}]", message.author)
+            }
         }
     }
 }
 
-// Authors come from the chat service, not the broker, so the label does not claim authentication.
+struct Recall<'a> {
+    runner: &'a SessionRunner,
+    route: &'a BoundRoute,
+    message: &'a InboundMessage,
+    driver: &'a dyn ChatDriver,
+    sender: Option<&'a PrincipalId>,
+}
+
+impl Recall<'_> {
+    async fn window(
+        &self,
+        key: &ConversationKey,
+        granted: &[String],
+        window: MemoryWindow,
+    ) -> Option<RecalledWindow> {
+        let span = tracing::Span::current();
+        match window.recall {
+            RecallSource::None => None,
+            RecallSource::Journal => {
+                let journal = Arc::clone(self.runner.journal.as_ref()?);
+                let stem = key.journal_stem();
+                let grant = journal::grant_digest(granted);
+                let recalled = tokio::task::spawn_blocking(move || {
+                    journal.recall(&stem, &grant, window, SystemTime::now())
+                })
+                .await;
+                match recalled {
+                    Ok(Ok(recalled)) => {
+                        span.record("conversation.recall_source", "journal");
+                        tracing::info!(
+                            event = "gateway_recalled",
+                            source = "journal",
+                            messages = recalled.history.len(),
+                            delta = 0
+                        );
+                        Some(RecalledWindow {
+                            history: recalled.history,
+                            assets: recalled.assets,
+                            next_asset_id: recalled.next_asset_id,
+                            newest: None,
+                        })
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            event = "gateway_recall_failed",
+                            source = "journal",
+                            reason = error.label()
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            event = "gateway_recall_failed",
+                            source = "journal",
+                            reason = "task"
+                        );
+                        None
+                    }
+                }
+            }
+            RecallSource::Platform => {
+                let horizon = SystemTime::now()
+                    .checked_sub(window.forget_after)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                // Without Discord's Message Content intent other people's messages arrive with no content.
+                let (messages, names) = self
+                    .platform(window, None, |message| {
+                        message.at >= horizon
+                            && (!message.text.trim().is_empty() || !message.assets.is_empty())
+                    })
+                    .await?;
+                span.record("conversation.recall_source", "platform");
+                tracing::info!(
+                    event = "gateway_recalled",
+                    source = "platform",
+                    messages = messages.len(),
+                    delta = 0
+                );
+                Some(platform_window(messages, &names, window))
+            }
+        }
+    }
+
+    async fn delta(&self, window: MemoryWindow, watermark: &Watermark) -> Option<Delta> {
+        if window.recall != RecallSource::Platform || self.message.addressed == Some(false) {
+            return None;
+        }
+        let MessageId::Native(_) = &self.message.message_id else {
+            return None;
+        };
+        let (mut messages, names) = self
+            .platform(window, Some(&watermark.after), |message| {
+                !message.from_bot && !watermark.taken.contains(&message.id)
+            })
+            .await?;
+        let mut spent = 0_usize;
+        let keep = messages
+            .iter()
+            .rev()
+            .take_while(|message| {
+                spent += names.label(message).len() + message.text.len() + 1;
+                spent <= window.limits.max_bytes
+            })
+            .count();
+        messages.drain(..messages.len() - keep);
+        tracing::Span::current().record("conversation.recall_source", "platform");
+        tracing::info!(
+            event = "gateway_recalled",
+            source = "platform",
+            messages = messages.len(),
+            delta = messages.len()
+        );
+        Some(Delta { messages, names })
+    }
+
+    async fn platform(
+        &self,
+        window: MemoryWindow,
+        after: Option<&str>,
+        seeds: impl Fn(&PastMessage) -> bool,
+    ) -> Option<(Vec<PastMessage>, Names)> {
+        let history = self.driver.history()?;
+        let deadline = tokio::time::Instant::now() + PLATFORM_RECALL_TIMEOUT;
+        let limit = window
+            .limits
+            .max_turns
+            .saturating_mul(2)
+            .min(PLATFORM_RECALL_MAX_MESSAGES);
+        let before = match &self.message.message_id {
+            MessageId::Native(id) => Some(id.as_str()),
+            MessageId::Wake { .. } | MessageId::Job { .. } => None,
+        };
+        let read = tokio::time::timeout_at(
+            deadline,
+            history.recent(&self.message.conversation, after, before, limit),
+        )
+        .await;
+        let reason = match read {
+            Ok(Ok(mut messages)) => {
+                messages.retain(seeds);
+                let names = self.names(&messages, window.scope, deadline).await;
+                return Some((messages, names));
+            }
+            Ok(Err(error)) => error.category(),
+            Err(_) => "timeout",
+        };
+        tracing::warn!(event = "gateway_recall_failed", source = "platform", reason);
+        None
+    }
+
+    async fn names(
+        &self,
+        messages: &[PastMessage],
+        scope: MemoryScope,
+        deadline: tokio::time::Instant,
+    ) -> Names {
+        let mut principals = HashMap::new();
+        if let Some(sender) = self.sender {
+            principals.insert(self.message.subject.clone(), sender.clone());
+        }
+        let claims = messages
+            .iter()
+            .filter(|message| !message.from_bot && message.subject != self.message.subject)
+            .map(|message| &message.subject)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|subject| chat_claim_for(self.route, self.message, subject.clone()).ok())
+            .collect::<Vec<_>>();
+        if !claims.is_empty()
+            && let Ok(client) = self.runner.broker.leg_client()
+        {
+            let client = &client;
+            let lookups = futures_util::stream::iter(claims)
+                .map(|claim| async move {
+                    let subject = claim.subject.clone();
+                    let surface = client.session_surface(Some(claim)).await.ok()?;
+                    Some((subject, surface.principal?))
+                })
+                .buffer_unordered(PRINCIPAL_LOOKUPS_IN_FLIGHT)
+                .for_each(|named| {
+                    if let Some((subject, principal)) = named {
+                        principals.insert(subject, principal);
+                    }
+                    std::future::ready(())
+                });
+            tokio::time::timeout_at(deadline, lookups)
+                .await
+                .unwrap_or_default();
+        }
+        Names { principals, scope }
+    }
+}
+
 fn platform_window(
     messages: Vec<PastMessage>,
+    names: &Names,
     window: MemoryWindow,
-    now: SystemTime,
 ) -> RecalledWindow {
-    let horizon = now
-        .checked_sub(window.forget_after)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let newest = messages.last().map(|message| message.id.clone());
     let mut turns = Vec::new();
     let mut assets = Vec::new();
     let mut pending_user = String::new();
     let mut next_asset_id = 1;
-    // Without Discord's Message Content intent other people's messages arrive with no content.
-    for message in messages
-        .into_iter()
-        .filter(|message| message.at >= horizon)
-        .filter(|message| !message.text.trim().is_empty() || !message.assets.is_empty())
-    {
+    for message in messages {
+        let label = names.label(&message);
         let mut text = message.text;
         for asset in message.assets {
             text.push_str(&asset::attached_marker(next_asset_id, &asset.name));
@@ -897,10 +1035,7 @@ fn platform_window(
             if !pending_user.is_empty() {
                 pending_user.push('\n');
             }
-            pending_user.push_str(&format!(
-                "[gateway: chat history, from {}]\n{text}",
-                message.author
-            ));
+            pending_user.push_str(&format!("{label}\n{text}"));
         }
     }
     if !pending_user.is_empty() {
@@ -914,6 +1049,39 @@ fn platform_window(
         history: History::from_turns(window.limits, turns),
         assets,
         next_asset_id,
+        newest,
+    }
+}
+
+impl Delta {
+    fn block(
+        self,
+        store: &AssetStore,
+        access: &AssetAccess,
+        images_supported: bool,
+    ) -> Option<String> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        let arriving = self
+            .messages
+            .iter()
+            .flat_map(|message| message.assets.iter().cloned())
+            .collect();
+        let registered =
+            store.assets_for_access(access, arriving, images_supported, Instant::now());
+        let mut ids = registered.arrived.into_iter();
+        let mut block = String::new();
+        for message in &self.messages {
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(&format!("{}\n{}", self.names.label(message), message.text));
+            for (asset, id) in message.assets.iter().zip(ids.by_ref()) {
+                block.push_str(&asset::attached_marker(id, &asset.name));
+            }
+        }
+        Some(block)
     }
 }
 
@@ -1178,6 +1346,7 @@ struct SessionSteers {
     assets: Arc<SessionAssets>,
     received_at: tokio::time::Instant,
     raw_texts: Mutex<Vec<String>>,
+    taken: Mutex<Vec<String>>,
 }
 
 impl SteerSource for SessionSteers {
@@ -1186,9 +1355,10 @@ impl SteerSource for SessionSteers {
             .take_steers(&self.key)
             .into_iter()
             .map(|steer| {
-                match steer.message_id {
+                match &steer.message_id {
                     MessageId::Job { .. } => return Steer::Notice(steer.text),
-                    MessageId::Native(_) | MessageId::Wake { .. } => {}
+                    MessageId::Native(id) => self.taken.lock().push(id.clone()),
+                    MessageId::Wake { .. } => {}
                 }
                 let seconds = steer
                     .received_at
@@ -1301,22 +1471,38 @@ async fn session(
     );
 
     let window = route.memory.window();
-    let (seeded, cache_key, conversation_lease, asset_access) = match window {
+    let principal = leg.principal().cloned();
+    let recall = Recall {
+        runner,
+        route,
+        message,
+        driver: driver.as_ref(),
+        sender: principal.as_ref(),
+    };
+    let mut newest_seen = match &message.message_id {
+        MessageId::Native(id) => Some(id.clone()),
+        MessageId::Wake { .. } | MessageId::Job { .. } => None,
+    };
+    let (seeded, cache_key, conversation_lease, asset_access, delta) = match window {
         Some(window) => {
-            let recalled = if runner
-                .conversations
-                .resident(&key, &granted, window, Instant::now())
-            {
-                None
-            } else {
-                recall_window(runner, driver.as_ref(), message, &key, &granted, window).await
-            };
+            let (recalled, delta) =
+                match runner
+                    .conversations
+                    .resident(&key, &granted, window, Instant::now())
+                {
+                    Residency::Cold => (recall.window(&key, &granted, window).await, None),
+                    Residency::Since(watermark) => (None, recall.delta(window, &watermark).await),
+                    Residency::Resident => (None, None),
+                };
             let (recalled_history, recalled_assets, next_asset_id) = match recalled {
-                Some(recalled) => (
-                    Some(recalled.history),
-                    recalled.assets,
-                    recalled.next_asset_id,
-                ),
+                Some(recalled) => {
+                    newest_seen = newest_seen.or(recalled.newest);
+                    (
+                        Some(recalled.history),
+                        recalled.assets,
+                        recalled.next_asset_id,
+                    )
+                }
                 None => (None, Vec::new(), 1),
             };
             let ConversationSeed {
@@ -1340,13 +1526,14 @@ async fn session(
                     .assets
                     .restore(&assets, recalled_assets, next_asset_id, Instant::now());
             }
-            (history, cache_key, Some(lease), assets)
+            (history, cache_key, Some(lease), assets, delta)
         }
         None => (
             History::default(),
             route.cache_key.clone(),
             None,
             AssetAccess::one_shot(key.clone()),
+            None,
         ),
     };
     let span = tracing::Span::current();
@@ -1363,7 +1550,6 @@ async fn session(
     );
 
     let memory_surface = leg.chat_memory_surface().cloned();
-    let principal = leg.principal().cloned();
     let chat_claim = chat_claim(route, message).ok();
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
@@ -1386,6 +1572,8 @@ async fn session(
     .collect::<Vec<_>>()
     .join("\n\n");
     let images_supported = route.model.accepts_images();
+    let delta =
+        delta.and_then(|delta| delta.block(&runner.assets, &asset_access, images_supported));
     let registered = runner.assets.assets_for_access(
         &asset_access,
         message.assets.clone(),
@@ -1402,6 +1590,13 @@ async fn session(
         message.text,
         asset::arrival_markers(&registered)
     ));
+    let (text, recorded) = match &delta {
+        Some(block) => (
+            format!("{block}\n\n{text}"),
+            format!("{block}\n\n{recorded}"),
+        ),
+        None => (text, recorded),
+    };
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
     let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
@@ -1437,6 +1632,7 @@ async fn session(
         assets: Arc::clone(&assets),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),
+        taken: Mutex::new(Vec::new()),
     });
     let session_steers = Arc::clone(&steers);
     let shell = ShellLimits {
@@ -1635,7 +1831,11 @@ async fn session(
         && let Some(lease) = conversation_lease
     {
         let journaled = (window.recall == RecallSource::Journal).then(|| turn.clone());
-        if lease.commit(window, turn, &cache_key, Instant::now())
+        let taken = TakenIn {
+            newest: newest_seen,
+            steers: std::mem::take(&mut *steers.taken.lock()),
+        };
+        if lease.commit(window, turn, taken, &cache_key, Instant::now())
             && let Some(turn) = journaled
             && let Some(journal) = runner.journal.as_ref()
         {
@@ -1834,12 +2034,20 @@ async fn connect(
 /// the grant, claim check, and policy engine all compare against, so re-normalizing would create a
 /// second definition of the same fact.
 fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestation, SessionError> {
+    chat_claim_for(route, message, message.subject.clone())
+}
+
+fn chat_claim_for(
+    route: &BoundRoute,
+    message: &InboundMessage,
+    subject: ExternalSubject,
+) -> Result<Attestation, SessionError> {
     let transport = message
         .transport
         .parse()
         .map_err(SessionError::TransportId)?;
     Ok(Attestation::for_chat(
-        message.subject.clone(),
+        subject,
         route.agent.clone(),
         ChatScopeClaim {
             transport,

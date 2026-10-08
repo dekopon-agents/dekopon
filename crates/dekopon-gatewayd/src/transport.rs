@@ -529,12 +529,14 @@ pub(crate) trait ChatDriver: Send + Sync {
     }
 }
 
-/// Messages the chat service shows in a conversation, oldest first, strictly before `before`.
+/// Messages the chat service shows in a conversation, oldest first, strictly between `after` and
+/// `before`; when more than `limit` fall in that range, the newest `limit` of them.
 #[async_trait]
 pub(crate) trait ChatHistory: Send + Sync {
     async fn recent(
         &self,
         conversation: &Conversation,
+        after: Option<&str>,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PastMessage>, TransportError>;
@@ -542,8 +544,10 @@ pub(crate) trait ChatHistory: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PastMessage {
+    pub id: String,
     pub from_bot: bool,
     pub author: String,
+    pub subject: ExternalSubject,
     pub text: String,
     pub assets: Vec<PendingAsset>,
     pub at: std::time::SystemTime,
