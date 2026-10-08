@@ -1090,6 +1090,7 @@ dependencies = [
  "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
