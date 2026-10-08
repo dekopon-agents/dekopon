@@ -613,9 +613,10 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 occupied; on `sharedConversation` the byte count includes each retained gateway-authored
 participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
-Every successful recall logs `gateway_recalled` at info with `source` (`journal` or `platform`),
-`messages` (chat messages seeded, or journal exchanges) and `delta` (messages a resident window's
-watermark read added; 0 on a cold recall). A failed one logs `gateway_recall_failed` at warn with
+Every successful recall that seeds a window logs `gateway_recalled` at info with `source`
+(`journal` or `platform`), `messages` (chat messages seeded, or journal exchanges) and `delta`
+(messages a resident window's watermark read added; 0 on a cold recall). A watermark read that
+finds nothing new logs nothing. A failed one logs `gateway_recall_failed` at warn with
 `source` and `reason`; the message runs without what it would have added.
 `gateway_conversation_unresolved` is the debug-level record of why a conversation could not be
 placed, and the cause behind `drop.reason = conversation-unresolved`. On Discord, where the

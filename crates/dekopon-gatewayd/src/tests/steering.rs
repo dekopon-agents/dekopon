@@ -236,3 +236,26 @@ fn leftover_steers_never_become_another_subjects_input() {
     assert!(followup.message.text.contains("leftover"));
     assert!(admission.next_or_release().is_none());
 }
+
+#[test]
+fn folded_leftover_steers_carry_every_grouped_message_id() {
+    let gate = SessionGate::new(1);
+    let route = route(model_config());
+    let admission = held(&gate, &route);
+    for id in ["n2", "n3", "n4"] {
+        let steer = InboundMessage {
+            message_id: MessageId::Native(id.to_owned()),
+            ..message(id)
+        };
+        assert!(matches!(admit(&gate, &route, steer), Admit::Steered(_)));
+    }
+
+    let (admission, followup) = admission.next_or_release().expect("the leftover steers");
+
+    assert_eq!(
+        followup.message.message_id,
+        MessageId::Native("n2".to_owned())
+    );
+    assert_eq!(followup.message.folded, ["n3", "n4"]);
+    assert!(admission.next_or_release().is_none());
+}

@@ -70,6 +70,7 @@ pub(crate) struct InboundMessage {
     pub received_at: tokio::time::Instant,
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
+    pub folded: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

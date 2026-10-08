@@ -562,6 +562,10 @@ impl SessionAdmission {
                         std::iter::once(&message).chain(grouped.iter()),
                     ));
                     for next in grouped {
+                        if let MessageId::Native(id) = next.message_id {
+                            message.folded.push(id);
+                        }
+                        message.folded.extend(next.folded);
                         message.assets.extend(next.assets);
                         message.constituents.extend(next.constituents);
                         message.receive_span = next.receive_span;
@@ -870,9 +874,7 @@ impl Recall<'_> {
                 }
             }
             RecallSource::Platform => {
-                let horizon = SystemTime::now()
-                    .checked_sub(window.forget_after)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let horizon = horizon(window);
                 // Without Discord's Message Content intent other people's messages arrive with no content.
                 let (messages, names) = self
                     .platform(window, None, |message| {
@@ -893,15 +895,16 @@ impl Recall<'_> {
     }
 
     async fn delta(&self, window: MemoryWindow, watermark: &Watermark) -> Option<Delta> {
-        if window.recall != RecallSource::Platform || self.message.addressed == Some(false) {
+        if window.recall != RecallSource::Platform {
             return None;
         }
         let MessageId::Native(_) = &self.message.message_id else {
             return None;
         };
+        let horizon = horizon(window);
         let (mut messages, names) = self
             .platform(window, Some(&watermark.after), |message| {
-                !message.from_bot && !watermark.taken.contains(&message.id)
+                message.at >= horizon && !message.from_bot && !watermark.taken.contains(&message.id)
             })
             .await?;
         let mut spent = 0_usize;
@@ -914,6 +917,9 @@ impl Recall<'_> {
             })
             .count();
         messages.drain(..messages.len() - keep);
+        if messages.is_empty() {
+            return None;
+        }
         tracing::Span::current().record("conversation.recall_source", "platform");
         tracing::info!(
             event = "gateway_recalled",
@@ -1000,6 +1006,12 @@ impl Recall<'_> {
         }
         Names { principals, scope }
     }
+}
+
+fn horizon(window: MemoryWindow) -> SystemTime {
+    SystemTime::now()
+        .checked_sub(window.forget_after)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn platform_window(
@@ -1483,7 +1495,7 @@ async fn session(
         MessageId::Native(id) => Some(id.clone()),
         MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
-    let (seeded, cache_key, conversation_lease, asset_access, delta) = match window {
+    let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
         Some(window) => {
             let (recalled, delta) =
                 match runner
@@ -1572,8 +1584,12 @@ async fn session(
     .collect::<Vec<_>>()
     .join("\n\n");
     let images_supported = route.model.accepts_images();
-    let delta =
-        delta.and_then(|delta| delta.block(&runner.assets, &asset_access, images_supported));
+    let delta = delta
+        .and_then(|delta| delta.block(&runner.assets, &asset_access, images_supported))
+        .map(ConversationTurn::unanswered);
+    if let Some(delta) = &delta {
+        seeded.record(delta.clone());
+    }
     let registered = runner.assets.assets_for_access(
         &asset_access,
         message.assets.clone(),
@@ -1590,13 +1606,6 @@ async fn session(
         message.text,
         asset::arrival_markers(&registered)
     ));
-    let (text, recorded) = match &delta {
-        Some(block) => (
-            format!("{block}\n\n{text}"),
-            format!("{block}\n\n{recorded}"),
-        ),
-        None => (text, recorded),
-    };
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
     let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
@@ -1632,7 +1641,7 @@ async fn session(
         assets: Arc::clone(&assets),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),
-        taken: Mutex::new(Vec::new()),
+        taken: Mutex::new(message.folded.clone()),
     });
     let session_steers = Arc::clone(&steers);
     let shell = ShellLimits {
@@ -1834,6 +1843,7 @@ async fn session(
         let taken = TakenIn {
             newest: newest_seen,
             steers: std::mem::take(&mut *steers.taken.lock()),
+            recalled: delta,
         };
         if lease.commit(window, turn, taken, &cache_key, Instant::now())
             && let Some(turn) = journaled
