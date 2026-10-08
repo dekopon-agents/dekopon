@@ -205,8 +205,9 @@ remain independent; this flag grants no network access.
 `requestTemplates` belongs to an HTTP constraint set and pins a request to the conversation the
 gateway attested, so a provider reading chat history can reach only the chat it was called from.
 Each rule names one method, one path and the query keys it accepts; a set with any rule accepts a
-request only if it matches one, beside every other constraint. A later write capability carries its
-own `POST` rule in its own constraint set, so a read grant never implies a send.
+request only if it matches one, beside every other constraint. A rule's method is `GET` or `HEAD`;
+the broker refuses to start on any other, listing every offending rule. Send templates come with the
+send capability's body grammar, in its own constraint set, so a read grant never implies a send.
 
 ```yaml
 capabilities:
@@ -252,8 +253,7 @@ compared after one percent-decode and rebuilt from the rule, so a slot position 
 own placeholder and a literal id, another slot or an extra segment is refused. Pinned query keys
 are host-filled: a provider that supplies one is refused, never overwritten, and a key outside
 `allowed` is refused. Denials name the rule, never the attested ids. A templated `GET` or `HEAD`
-takes no body, so the body can never carry a second channel; a send rule's body grammar comes with
-the send capability.
+takes no body, so the body can never carry a second channel.
 
 The pin is per capability, not per credential: a sibling capability without `requestTemplates`
 (or with `requestTemplates: []`) on the same credential and host is unpinned, and reaches any
