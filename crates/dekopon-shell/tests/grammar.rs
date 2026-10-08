@@ -1382,7 +1382,7 @@ fn eval_is_rejected_as_a_sandbox_escape() {
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(outcome.output.contains("eval"), "{}", outcome.output);
     assert!(
-        outcome.output.contains("self-modifying code"),
+        outcome.output.contains("not supported"),
         "{}",
         outcome.output
     );
@@ -1835,14 +1835,17 @@ fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
 fn comparison_operands_inside_double_brackets_stay_literal() {
     let outcome = run("f=report.json\n[[ $f == *.json ]] && echo matched");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(outcome.output.contains("glob in bash"), "{outcome:?}");
+    assert!(
+        outcome.output.contains("patterns are literal"),
+        "{outcome:?}"
+    );
     assert!(!outcome.output.contains("matched"), "{outcome:?}");
 
     assert_eq!(output("f='*'\n[[ $f == '*' ]] && echo literal"), "literal");
     let outcome = run("p='*.json'\nf=report.json\n[[ $f == $p ]] && echo matched");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
-        outcome.output.contains("quoting cannot exempt"),
+        outcome.output.contains("expanded to text containing `*`"),
         "{outcome:?}"
     );
 
@@ -2013,12 +2016,12 @@ fn a_metacharacter_in_an_expansion_pattern_is_rejected_rather_than_matched_liter
     for script in ["p=a/b\necho ${p##*/}", "p=a.json\necho ${p%.*}"] {
         let outcome = run(script);
         assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
-        assert!(outcome.output.contains("literal text"), "{script}");
+        assert!(outcome.output.contains("patterns are literal"), "{script}");
     }
     let outcome = run("star='*'\np=a.json\necho ${p%$star}");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
-        outcome.output.contains("quoting cannot exempt"),
+        outcome.output.contains("expanded to text containing `*`"),
         "{outcome:?}"
     );
     assert_eq!(output("p='*.json'\necho ${p#'*'}"), ".json");

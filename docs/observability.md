@@ -1032,7 +1032,7 @@ drained provider or buffered-builtin input when recorded, its rendered result, i
 `shell.script` span's counters.
 
 A mounted skill takes the same route as that meta result. The listing the model sees — names and
-one-line descriptions, beginning `Skills mounted for this agent` — is a system message of its own,
+one-line descriptions under one sentence that says to call `read_skill` — is a system message of its own,
 placed after the standing instructions, so it rides the first turn's `full` `agent.model.prompt`.
 The skill's text does not: a `read_skill` result is appended to the conversation like any other tool
 message and reaches the log stream only inside the following turn's `agent.model.prompt` delta.

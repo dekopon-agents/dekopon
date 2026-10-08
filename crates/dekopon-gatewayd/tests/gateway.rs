@@ -1002,9 +1002,7 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                 "system",
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
-                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
-                    "References use chat-asset:<N>, never data URLs.]"
+                    "[gateway: 4 steps and 4 capability calls per message.]"
                 )
             ),
             ("user", "what broke?"),
@@ -1057,9 +1055,7 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                 "system".to_owned(),
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
-                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
-                    "References use chat-asset:<N>, never data URLs.]"
+                    "[gateway: 4 steps and 4 capability calls per message.]"
                 )
                 .to_owned(),
             ),

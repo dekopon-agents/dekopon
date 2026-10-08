@@ -28,7 +28,7 @@ Where a skill lives decides who mounts it. An agent's `spec.skills` names direct
 
 The model meets a skill in three steps, each paid for only when the model decides it needs it:
 
-1. **The listing.** When at least one skill is mounted, a second system message follows the standing instructions. It begins `Skills mounted for this agent`, lists each skill as `- name: description`, and tells the model to call `read_skill` before doing work a skill covers. Nothing else of the skill is in the prompt.
+1. **The listing.** When at least one skill is mounted, a second system message follows the standing instructions. One sentence tells the model to call `read_skill` before doing work a skill covers, then each skill follows as `- name: description`. Nothing else of the skill is in the prompt.
 2. **The instructions.** `read_skill` with `name` returns the skill's body, framed with its name and description and followed by the list of its resource files.
 3. **A resource.** `read_skill` with `name` and `resource` returns one supporting file's text.
 
@@ -56,7 +56,7 @@ An agent that hit a limit, reached for a capability it was never granted, or fou
 
 **It is offered on every session.** The record carries model-authored text — a suggestion nobody can read is not a suggestion — but that text goes to telemetry like every other model-authored record ([goal 2](design.md#constitution)): there is no separate opt-in to gate it behind. The record carries no chat text the gateway holds and no subject, only what the model chose to write into six bounded fields.
 
-The tool's own description tells the model when to call it: after the task is done or when it is genuinely blocked, at most three times per session, never instead of answering, and that the note goes to the operator's telemetry rather than to the person it is talking with. A call is a JSON object of six strings:
+The tool's own description invites a note after the model has answered, states the cap of three per session, and says the person never sees it. The rest is taught by the results: every answer, a refusal included, tells the model to continue with the task, and a fourth call is refused by name. A call is a JSON object of six strings:
 
 | Field | Bound | Meaning |
 |---|---|---|

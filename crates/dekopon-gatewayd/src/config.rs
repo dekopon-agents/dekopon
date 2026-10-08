@@ -686,7 +686,7 @@ pub struct RouteConfig {
     /// Turning inspect_agent_config off only removes the structured config dump; the instructions
     /// stay in the system prompt regardless, so this is never a real secrecy gate against a
     /// determined user.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub inspect_agent_config: bool,
     #[serde(default)]
     pub limits: RouteLimits,
@@ -700,10 +700,6 @@ pub struct RouteConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub wakes: bool,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2940,6 +2936,28 @@ routes:
             named.limits.script_timeout(),
             Duration::from_millis(240_000)
         );
+    }
+
+    #[test]
+    fn agent_config_inspection_is_offered_only_where_a_route_writes_true() {
+        let config = resolved(
+            "transports:\n\
+             \x20 - name: dev\n\
+             \x20   kind: local\n\
+             \x20   socketPath: dev.sock\n\
+             routes:\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [channel, thread] }\n\
+             \x20   agent: reviewer\n\
+             \x20   inspectAgentConfig: true\n",
+        )
+        .expect("a well-formed configuration resolves");
+
+        assert!(!config.routes[0].inspect_agent_config);
+        assert!(config.routes[1].inspect_agent_config);
     }
 
     #[test]

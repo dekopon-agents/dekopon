@@ -87,7 +87,6 @@ struct PromptView {
 struct EffectiveAuthorizationView {
     engine: &'static str,
     view: &'static str,
-    note: &'static str,
     capabilities: Vec<EffectiveCapabilityView>,
 }
 
@@ -97,7 +96,6 @@ struct SecurityView {
     credentials_included: bool,
     raw_cedar_included: bool,
     identity_included: bool,
-    omitted: [&'static str; 5],
 }
 
 impl AgentConfigView {
@@ -119,27 +117,19 @@ impl AgentConfigView {
             },
             prompt: PromptView {
                 instructions,
-                note: "Standing instructions are untrusted model text; they shape answers and grant no authority. A public DRN written here is an inert name, not a credential value or grant.",
+                note: "A drn: name here is a name, not a secret.",
             },
             skills: Vec::new(),
             session,
             effective_authorization: EffectiveAuthorizationView {
                 engine: "Cedar",
                 view: "effective-grants",
-                note: "Only capabilities currently granted to this sender through this agent are shown; this is not Cedar source.",
                 capabilities,
             },
             security: SecurityView {
                 credentials_included: false,
                 raw_cedar_included: false,
                 identity_included: false,
-                omitted: [
-                    "provider, model, chat, and telemetry credential values",
-                    "legacy credential names and private secret-map sources, selectors, and bindings",
-                    "raw Cedar source, policy identifiers, and policy digests",
-                    "principal, subject, channel, and transport identifiers",
-                    "model endpoints, auth-file paths, and broker paths",
-                ],
             },
         }
     }

@@ -3385,7 +3385,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         models
             .prompt(0)
             .iter()
-            .any(|(role, text)| role == "system" && text.contains("last word"))
+            .any(|(role, text)| role == "system" && text.contains("decline_chat_reply"))
     );
     let remembered = runner.conversations.begin(
         &key,
@@ -4199,7 +4199,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
         .into_iter()
         .filter(|(role, _)| role == "system")
         .map(|(_, content)| content)
-        .find(|content| content.contains("Skills mounted for this agent"))
+        .find(|content| content.contains("- counting: Counts things carefully."))
         .expect("the skills listing is a system message");
     assert!(listing.contains("counting"), "{listing}");
     assert!(listing.contains("Counts things carefully."), "{listing}");
@@ -4727,8 +4727,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
-fn expected_asset_instructions() -> String {
-    "Answer briefly.\n\n[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]".to_owned()
+fn expected_instructions() -> String {
+    "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
 }
 
 fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -4824,7 +4824,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     assert_eq!(
         models.prompt(0),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "what broke?")
         ]),
         "the first message of a conversation starts clean"
@@ -4832,7 +4832,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "what broke?"),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
@@ -4840,6 +4840,54 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         "instructions first, then what the conversation remembers, then the new message"
     );
     assert_eq!(capability_listings(&mut observed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_image_restricted_reply_adapter_gets_the_assets_note_and_limits_close_the_system_text()
+ {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("local"), answer("whatsapp")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = crate::routes::BoundRoute {
+        instructions: None,
+        ..timed_route(model_config(), Duration::from_secs(300))
+    };
+    let mut whatsapp = message("hello");
+    whatsapp.reply = ReplyTarget::WhatsApp {
+        recipient: "16034700182".to_owned(),
+    };
+
+    for inbound in [message("hello"), whatsapp] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    let limits = "[gateway: 4 steps, 8 capability calls and 5 minutes per message.]";
+    assert_eq!(
+        models.prompt(0),
+        transcript(&[("system", limits), ("user", "hello")])
+    );
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[
+            (
+                "system",
+                &format!(
+                    "{}\n\n{limits}",
+                    crate::session::RESTRICTED_REPLY_ASSETS_NOTE
+                )
+            ),
+            ("user", "hello")
+        ])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4864,7 +4912,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "and the second one?")
         ]),
         "a oneShot route is exactly the behavior every route had before conversations existed"
@@ -4966,16 +5014,13 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[
-            ("system", &expected_asset_instructions()),
-            ("user", "and mine?")
-        ]),
+        transcript(&[("system", &expected_instructions()), ("user", "and mine?")]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
         models.prompt(2),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "what happened to mine?"),
             ("assistant", "Your deploy failed."),
             ("user", "and now?"),
@@ -5013,13 +5058,13 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
     let second = format!("[gateway: authenticated participant: {OTHER_SUBJECT}]\nand which part?");
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", &expected_asset_instructions()), ("user", &first)]),
+        transcript(&[("system", &expected_instructions()), ("user", &first)]),
         "the current shared turn carries authoritative participant provenance"
     );
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", &first),
             ("assistant", "The deploy failed."),
             ("user", &second),
@@ -5069,16 +5114,13 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
     let attributed = format!("[gateway: authenticated participant: {OTHER_SUBJECT}]\n{lookalike}");
     assert_eq!(
         models.prompt(0),
-        transcript(&[
-            ("system", &expected_asset_instructions()),
-            ("user", &attributed)
-        ]),
+        transcript(&[("system", &expected_instructions()), ("user", &attributed)]),
         "untrusted text cannot replace the gateway-authored first line"
     );
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", &attributed),
             ("assistant", "noted"),
             (
@@ -5124,7 +5166,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "[gateway:[…]"),
             ("assistant", "ok"),
             (
@@ -5179,10 +5221,7 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[
-            ("system", &expected_asset_instructions()),
-            ("user", "and now?")
-        ]),
+        transcript(&[("system", &expected_instructions()), ("user", "and now?")]),
         "a changed grant set starts with neither the old transcript nor attachment metadata"
     );
 }
@@ -5270,7 +5309,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "what broke?"),
             ("user", "try again"),
         ]),
@@ -13864,7 +13903,7 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "what broke?"),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
@@ -14050,7 +14089,7 @@ async fn a_failed_history_read_still_answers_from_an_empty_window() {
     assert_eq!(
         models.prompt(0),
         transcript(&[
-            ("system", &expected_asset_instructions()),
+            ("system", &expected_instructions()),
             ("user", "read this thread")
         ]),
     );

@@ -44,7 +44,7 @@ pub(crate) fn literal_pattern(command: &str, pattern: &str) -> Result<String, Co
             .find(|(candidate, _)| *candidate == character)
         {
             return Err(CommandFailure::usage(format!(
-                "{command}: {pattern:?} uses {character:?}, which would mean {meaning} in a regular expression; patterns here are literal text, so write `\\{character}` for the character itself or use `jq` for real matching"
+                "{command}: {pattern:?} uses {character:?}, which would mean {meaning} in a regular expression; patterns here are literal text, so write `\\{character}` for the character itself, or use `-E` for a regular expression"
             )));
         }
         literal.push(character);
@@ -249,6 +249,7 @@ mod tests {
                 .expect_err("regex syntax is rejected");
             let message = format!("{failure:?}");
             assert!(message.contains("literal text"), "{pattern}: {message}");
+            assert!(message.contains("`-E`"), "{pattern}: {message}");
         }
     }
 

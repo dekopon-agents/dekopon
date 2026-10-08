@@ -104,62 +104,41 @@ pub(crate) fn improvement_tool() -> ModelTool {
     ModelTool {
         name: IMPROVEMENT_TOOL_NAME.to_owned(),
         description: format!(
-            "Tap the glass: record one structured note telling the operator how this agent could \
-             be improved. Use it when you noticed something the operator could fix: standing \
-             instructions that were wrong, missing, or contradictory; a skill that would have \
-             helped or that misled you; a capability you needed but were not granted; a limit \
-             you ran into; a tool that behaved differently from how it was described; or, even on \
-             a task that succeeded, an awkward path the operator can't see from the answer alone: \
-             a workaround you built, a retry loop, a multi-step dance one capability or command \
-             word would have collapsed, output you reshaped by hand every time, or a provider \
-             whose `--help` you had to guess at. Succeeding the long way is still worth a note. \
-             Before recording one, ask whether a future session of this agent would plausibly act \
-             better because of it: skip one-off facts, live values a script should query again, \
-             and anything your instructions already say. Ground every field in something you \
-             observed in this session's tool results — an exit code, a refusal message, a missing \
-             fact, or, for an efficiency note, the session's own scripts and their exit codes — \
-             rather than in speculation. Call it \
-             after the task is done or when it is genuinely blocked, at most {MAX_SUGGESTIONS_PER_SESSION} \
-             times per session, never instead of answering, and without asking the person for \
-             permission. Recording a note changes nothing in this session; it goes to the \
-             operator's telemetry, not to the person you are talking with, so be specific: name \
-             the thing in `target`, quote the evidence briefly, and propose one concrete change. \
-             Returns a confirmation with the note's number out of {MAX_SUGGESTIONS_PER_SESSION}; \
-             a note that breaks a bound is refused with the reason, so fix it and resend, or \
-             continue without it."
+            "After you have answered, you may send the operator a note \
+             ({MAX_SUGGESTIONS_PER_SESSION} per session) on what would make this agent work \
+             better: an instruction that was wrong or missing, a capability or skill you needed, a \
+             limit you hit. Quote what you saw in this session. The person never sees it."
         ),
         parameters: json!({
             "type": "object",
             "properties": {
                 "category": {
                     "type": "string",
-                    "enum": ["instructions", "skill", "capability", "tool", "limits", "efficiency", "other"],
-                    "description": "What kind of thing the operator would change."
+                    "enum": ["instructions", "skill", "capability", "tool", "limits", "efficiency", "other"]
                 },
                 "target": {
                     "type": "string",
                     "maxLength": MAX_SUGGESTION_TARGET_BYTES,
-                    "description": "The specific thing: a skill name, a capability identifier, `instructions`, a limit name, a builtin."
+                    "description": "What to change: a skill, capability id, `instructions`, limit or builtin."
                 },
                 "summary": {
                     "type": "string",
                     "maxLength": MAX_SUGGESTION_SUMMARY_BYTES,
-                    "description": "One sentence: what was wrong or could be better."
+                    "description": "One sentence."
                 },
                 "evidence": {
                     "type": "string",
                     "maxLength": MAX_SUGGESTION_DETAIL_BYTES,
-                    "description": "What you observed in this session that supports it: an exit code, a refusal, a missing fact."
+                    "description": "What you saw: an exit code, a refusal, a missing fact."
                 },
                 "proposal": {
                     "type": "string",
                     "maxLength": MAX_SUGGESTION_DETAIL_BYTES,
-                    "description": "The concrete change: the instruction to add, the skill to write, the capability to grant, the limit to raise."
+                    "description": "The change to make."
                 },
                 "confidence": {
                     "type": "string",
-                    "enum": ["low", "medium", "high"],
-                    "description": "How sure you are that the change would help."
+                    "enum": ["low", "medium", "high"]
                 }
             },
             "required": ["category", "target", "summary", "evidence", "proposal", "confidence"],

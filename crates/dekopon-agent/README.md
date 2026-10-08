@@ -103,9 +103,9 @@ names and resource paths, never the text, which `read_skill` already discloses o
 `skills` mounts operator-authored reference material and discloses it progressively. The text is a
 `dekopon_config::Skill`, loaded and bounded by `dekopon-config` at catalog or embedder load
 time, so nothing in this crate opens a file. When at least one skill is mounted, a second system
-message follows the standing instructions: it begins `Skills mounted for this agent` and lists each
-skill as `- name: description` with the instruction to call `read_skill` before starting work a
-description covers. Bodies stay out of the prompt, and the block is deterministic for one mounted
+message follows the standing instructions: one sentence tells the model to call
+`read_skill` before starting work a skill covers, then each skill follows as
+`- name: description`. Bodies stay out of the prompt, and the block is deterministic for one mounted
 set, so a route's cached prompt prefix holds across sessions. The `read_skill` tool
 (`prompt::SKILL_TOOL_NAME`) takes `name` and an optional `resource` path and returns the skill's
 name, description, complete instructions, and the paths of its resource files, or one resource's
@@ -125,9 +125,9 @@ are: it shapes an answer and grants nothing, so nothing secret belongs in one.
 `category` (`instructions`, `skill`, `capability`, `tool`, `limits`, `efficiency`, `other`), `target` (at most
 `MAX_SUGGESTION_TARGET_BYTES`, 128), `summary` (`MAX_SUGGESTION_SUMMARY_BYTES`, 512), `evidence`
 and `proposal` (`MAX_SUGGESTION_DETAIL_BYTES`, 2048 each), and `confidence` (`low`, `medium`,
-`high`), at most `MAX_SUGGESTIONS_PER_SESSION` (3) times per session. Its description tells the
-model to call it after the task is done or when genuinely blocked, never instead of answering,
-and that the note goes to the operator's telemetry rather than to the person it is talking with.
+`high`), at most `MAX_SUGGESTIONS_PER_SESSION` (3) times per session. Its description invites a
+note after the model has answered and says the person never sees it; every result tells the
+model to continue with the task.
 The four text fields are trimmed and stripped of control characters other than newline and tab
 before their bounds are checked; a well-formed object that fails a bound or names an unknown
 token is answered with the reason so the model can fix it or move on, a fourth note is refused

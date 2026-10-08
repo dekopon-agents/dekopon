@@ -31,10 +31,7 @@ use crate::{
     dispatch::{self, Resolution},
     job::ScriptJobs,
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
-    parser::{
-        expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
-        pattern_metacharacter,
-    },
+    parser::{expanded_pattern, parse, pattern_metacharacter},
     pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome},
     value::{self, display},
 };
@@ -927,10 +924,10 @@ impl<'a> Evaluator<'a> {
                                 return Ok(Flow::Normal);
                             }
                         };
-                        if let Some((character, meaning)) = pattern_metacharacter(&expanded) {
+                        if let Some(character) = pattern_metacharacter(&expanded) {
                             self.write_line(&format!(
                                 "dekopon-shell: {}",
-                                expanded_case_pattern(character, meaning)
+                                expanded_pattern(character)
                             ));
                             self.last_status = ExitCode::SYNTAX;
                             return Ok(Flow::Normal);
@@ -3568,10 +3565,8 @@ impl<'a> Evaluator<'a> {
             Pattern::Literal(word) => self.expand_quoted(&word.parts),
             Pattern::Expanded(word) => {
                 let text = self.expand_quoted(&word.parts)?;
-                if let Some((character, meaning)) = pattern_metacharacter(&text) {
-                    return Err(CommandFailure::usage(expanded_parameter_pattern(
-                        character, meaning,
-                    )));
+                if let Some(character) = pattern_metacharacter(&text) {
+                    return Err(CommandFailure::usage(expanded_pattern(character)));
                 }
                 Ok(text)
             }
@@ -3613,11 +3608,9 @@ impl<'a> Evaluator<'a> {
         }
         if test.check_right_pattern
             && let [_, _, right] = operands.as_slice()
-            && let Some((character, meaning)) = pattern_metacharacter(right)
+            && let Some(character) = pattern_metacharacter(right)
         {
-            return Err(CommandFailure::usage(expanded_conditional_pattern(
-                character, meaning,
-            )));
+            return Err(CommandFailure::usage(expanded_pattern(character)));
         }
         Ok(builtins::misc::evaluate_test("[[", &operands)?.status)
     }

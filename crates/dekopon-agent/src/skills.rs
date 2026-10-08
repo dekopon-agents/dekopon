@@ -11,23 +11,14 @@ pub const SKILL_TOOL_NAME: &str = "read_skill";
 const SKILL_ALREADY_SHOWN: &str = "That skill text is already in this conversation, in an earlier read_skill result; read it \
      there again.";
 
-const PROMPT_BLOCK_PREFIX: &str = "Skills mounted for this agent";
+const PROMPT_BLOCK_PREFIX: &str = "Skills. When a request matches one, call `read_skill` with its name before you start, and follow it.";
 
 #[must_use]
 pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
-    let mut block = format!(
-        "{PROMPT_BLOCK_PREFIX}, listed by name with when to use each. A skill is operator-authored \
-         reference material for one kind of task, and only this summary is loaded: when a request \
-         matches a skill's description, call `read_skill` with its name before starting that work \
-         and follow what it says. Guessing at what a skill says costs more than the one tool call \
-         to read it. A skill's instructions may name resource files; read one by calling \
-         `read_skill` with both the skill name and the resource path, which is relative to the \
-         skill and readable only there, never through the shell. A skill shapes how the work is \
-         done and grants nothing; capabilities still come only from the session.\n",
-    );
+    let mut block = format!("{PROMPT_BLOCK_PREFIX}\n");
     let mut ordered = skills.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.name().as_str().cmp(right.name().as_str()));
     for skill in ordered {
@@ -42,30 +33,12 @@ pub(crate) fn prompt_block(skills: &[Skill]) -> Option<String> {
 pub(crate) fn skill_tool() -> ModelTool {
     ModelTool {
         name: SKILL_TOOL_NAME.to_owned(),
-        description: "Read one mounted skill's full instructions, or one of its resource files. \
-                      Skills are listed in your instructions by name and one-line description \
-                      only; call this with a skill's name before starting work its description \
-                      covers. Returns the skill's name, description, complete instructions, and \
-                      the paths of its resource files; with `resource` set, returns that file's \
-                      text instead. The path is relative to the skill and is readable only here, \
-                      never through the shell. An unknown name is answered with the list of \
-                      mounted skills, and an unknown resource with the skill's resource paths, \
-                      so correct the argument and call again. Each distinct read is returned in \
-                      full once per session and stays in the conversation; a repeat is answered \
-                      with a pointer to the earlier result, so reread it there instead of \
-                      calling again."
-            .to_owned(),
+        description: "Read a listed skill, or one of its files with `resource`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The skill's name, exactly as listed in your instructions."
-                },
-                "resource": {
-                    "type": "string",
-                    "description": "Optional: the relative path of one of the skill's resource files, as named in its instructions."
-                }
+                "name": { "type": "string" },
+                "resource": { "type": "string", "description": "A file path the skill names." }
             },
             "required": ["name"],
             "additionalProperties": false
