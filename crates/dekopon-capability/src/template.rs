@@ -49,8 +49,17 @@ impl fmt::Display for ChatSlot {
 
 /// Rendered per invocation from the attested chat scope; never serialized, so the values stay out
 /// of evidence and the authority commitment.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct ChatSlotValues(BTreeMap<ChatSlot, String>);
+
+impl fmt::Debug for ChatSlotValues {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.0.keys().map(|slot| (slot.as_str(), "[REDACTED]")))
+            .finish()
+    }
+}
 
 impl ChatSlotValues {
     pub fn insert(&mut self, slot: ChatSlot, value: String) {
@@ -258,7 +267,21 @@ pub(crate) fn is_query_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatSlot, PathSegment, PathTemplate, PathTemplateError, RequestTemplate};
+    use super::{
+        ChatSlot, ChatSlotValues, PathSegment, PathTemplate, PathTemplateError, RequestTemplate,
+    };
+
+    #[test]
+    fn chat_slot_values_debug_names_the_slots_and_redacts_the_ids() {
+        let mut slots = ChatSlotValues::default();
+        slots.insert(ChatSlot::ConversationId, "C0123ABC".to_owned());
+        slots.insert(ChatSlot::ConversationThread, "1700000000.000100".to_owned());
+        let rendered = format!("{slots:?}");
+        assert!(rendered.contains("conversation.id"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("C0123ABC"), "{rendered}");
+        assert!(!rendered.contains("1700000000"), "{rendered}");
+    }
 
     #[test]
     fn path_templates_parse_slots_and_round_trip() {

@@ -911,6 +911,7 @@ impl BufferedHttpClient {
             ));
         }
         let mut prepared = self.prepare(request, &grant, streamed).await?;
+        tracing::Span::current().record("url.full", prepared.url.as_str());
         // Credential injection happens strictly after every guest-facing check, and its binding is
         // narrower than the grant and fails closed: an allowed-but-unbound destination is refused
         // rather than sent unauthenticated.
@@ -1129,6 +1130,15 @@ impl BufferedHttpClient {
             }
         }
         apply_request_templates(grant, &self.slots, &method, &mut url)?;
+        if !grant.request_templates.is_empty()
+            && (method == Method::GET || method == Method::HEAD)
+            && (bounded_body_bytes > 0 || streamed.is_some())
+        {
+            return Err(http_error(
+                ErrorCode::Denied,
+                "a request template's GET or HEAD rule takes no body",
+            ));
+        }
 
         if request.headers.len() > self.ceilings.max_headers {
             return Err(http_error(
@@ -1441,7 +1451,10 @@ fn apply_request_templates(
     let decoded = percent_encoding::percent_decode_str(url.path())
         .decode_utf8()
         .map_err(|_error| {
-            http_error(ErrorCode::Denied, "request path is not UTF-8 once decoded")
+            http_error(
+                ErrorCode::Denied,
+                "request path is not UTF-8 once decoded, so no request template matches",
+            )
         })?;
     let segments = if decoded == "/" {
         Vec::new()
@@ -2759,6 +2772,17 @@ mod tests {
         method: &str,
         path: &str,
     ) -> super::HttpError {
+        template_denial_with_body(grant, slots, method, path, Vec::new(), Vec::new()).await
+    }
+
+    async fn template_denial_with_body(
+        grant: HttpConstraints,
+        slots: ChatSlotValues,
+        method: &str,
+        path: &str,
+        headers: Vec<Header>,
+        body: Vec<u8>,
+    ) -> super::HttpError {
         let mut client = BufferedHttpClient::authorized(
             grant,
             HttpHostCeilings::default(),
@@ -2766,15 +2790,22 @@ mod tests {
         )
         .expect("valid fixture authorization")
         .with_chat_slots(slots);
-        client
+        let error = client
             .send(Request {
                 method: method.to_owned(),
                 uri: format!("http://127.0.0.1:9{path}"),
-                headers: Vec::new(),
-                body: Vec::new(),
+                headers,
+                body,
             })
             .await
-            .expect_err("the request template refuses this request")
+            .expect_err("the request template refuses this request");
+        assert_eq!(error.code, ErrorCode::Denied, "{method} {path}");
+        assert!(
+            error.message.contains("request template"),
+            "{method} {path}: {}",
+            error.message
+        );
+        error
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2855,6 +2886,26 @@ mod tests {
             assert_eq!(error.code, ErrorCode::Denied, "{method} {path}");
             assert!(!error.message.contains("1122334455"), "{}", error.message);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_templated_get_with_a_body_is_denied_so_the_body_carries_no_second_channel() {
+        let error = template_denial_with_body(
+            slack_replies("127.0.0.1:9"),
+            slots(&[
+                (ChatSlot::ConversationId, "C0123ABC"),
+                (ChatSlot::ConversationThread, "1700000000.000100"),
+            ]),
+            "GET",
+            "/api/conversations.replies?limit=5",
+            vec![Header {
+                name: "content-type".to_owned(),
+                value: b"application/x-www-form-urlencoded".to_vec(),
+            }],
+            b"channel=C0999ZZZ&ts=1.2".to_vec(),
+        )
+        .await;
+        assert!(error.message.contains("takes no body"), "{}", error.message);
     }
 
     #[tokio::test(flavor = "multi_thread")]

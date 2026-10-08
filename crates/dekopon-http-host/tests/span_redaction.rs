@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use dekopon_capability::HttpConstraints;
+use dekopon_capability::{ChatSlot, ChatSlotValues, HttpConstraints, RequestTemplate};
 use dekopon_http_host::{BufferedHttpClient, ErrorCode, Header, HttpHostCeilings, Request};
 use dekopon_test_support::{CaptureLayer, LoopbackServer};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -66,6 +66,60 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
     }
 
     refusals_carry_their_failure_class_and_are_still_accounted(&captured).await;
+    templated_requests_trace_the_rebuilt_url(&captured).await;
+}
+
+async fn templated_requests_trace_the_rebuilt_url(captured: &CaptureLayer) {
+    captured.clear();
+
+    let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+    let authority = server.authority().to_owned();
+    let mut slots = ChatSlotValues::default();
+    slots.insert(ChatSlot::ConversationApiChannel, "1122334455".to_owned());
+    let mut client = BufferedHttpClient::authorized(
+        HttpConstraints {
+            allowed_hosts: vec![authority.clone()],
+            propagate_trace: false,
+            allowed_methods: vec!["GET".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+            allow_plaintext_loopback: true,
+            request_templates: vec![
+                serde_json::from_value::<RequestTemplate>(serde_json::json!({
+                    "method": "GET",
+                    "path": "/channels/{conversation.apiChannel}/messages",
+                    "query": {"allowed": ["limit"]}
+                }))
+                .expect("template fixture"),
+            ],
+        },
+        HttpHostCeilings::default(),
+        Duration::from_secs(5),
+    )
+    .expect("authorized fixture client")
+    .with_chat_slots(slots);
+
+    client
+        .send(Request {
+            method: "GET".to_owned(),
+            uri: format!(
+                "http://{authority}/channels/{{conversation.apiChannel}}/messages?limit=5"
+            ),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .expect("templated loopback request succeeds");
+    server.join();
+
+    let recorded = captured.spans_text();
+    assert!(
+        recorded.contains(&format!(
+            "url.full=\"http://{authority}/channels/1122334455/messages?limit=5\""
+        )),
+        "{recorded}"
+    );
 }
 
 async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &CaptureLayer) {

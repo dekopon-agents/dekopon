@@ -251,7 +251,18 @@ value; the broker renders it from the attested scope and the native HTTP host fi
 compared after one percent-decode and rebuilt from the rule, so a slot position matches only its
 own placeholder and a literal id, another slot or an extra segment is refused. Pinned query keys
 are host-filled: a provider that supplies one is refused, never overwritten, and a key outside
-`allowed` is refused. Denials name the rule, never the attested ids.
+`allowed` is refused. Denials name the rule, never the attested ids. A templated `GET` or `HEAD`
+takes no body, so the body can never carry a second channel; a send rule's body grammar comes with
+the send capability.
+
+The pin is per capability, not per credential: a sibling capability without `requestTemplates`
+(or with `requestTemplates: []`) on the same credential and host is unpinned, and reaches any
+conversation the credential can. Keep every capability that holds a chat credential templated.
+
+A capability has one slot set, the union over all its rules, and is listed and invoked only where
+the attested scope fills every slot in it. Mixing a history rule (`channel` only) with a replies
+rule (`channel` and `ts`) therefore hides the capability outside a thread; give each slot set its
+own capability.
 
 A templated capability invoked without a chat scope is denied `chat-scope-required`; one whose
 slot the scope lacks, such as `conversation.thread` outside a thread, is denied
