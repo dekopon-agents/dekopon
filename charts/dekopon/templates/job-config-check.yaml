@@ -31,7 +31,7 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation
     {{- end }}
 spec:
-  backoffLimit: 1
+  backoffLimit: 0
   activeDeadlineSeconds: 600
   ttlSecondsAfterFinished: 86400
   template:
@@ -80,7 +80,7 @@ spec:
               copy {{ $uid }} {{ $check.broker.configMap }} /check/broker.d /source/broker.d/*.yaml /source/broker.d/*.cedar
 {{- end }}
 {{- if $store }}
-              install -m 0600 -o {{ $uid }} -g {{ $gid }} /source/provider-set/providers.yaml /check/providers.yaml
+              copy {{ $uid }} {{ $check.broker.providerSetConfigMap }} /check/provider-set /source/provider-set/providers.yaml
               chown 0:0 "{{ .Values.paths.stateDir }}"
               chmod 0700 "{{ .Values.paths.stateDir }}"
               [ -d "{{ $storeDir }}" ] || mkdir -p "{{ $storeDir }}"
@@ -154,7 +154,7 @@ spec:
             - check
             - /check/broker.d
 {{- if $store }}
-            - --provider-set=/check/providers.yaml
+            - --provider-set=/check/provider-set/providers.yaml
             - --store={{ $storeDir }}
 {{- end }}
             - --output=json

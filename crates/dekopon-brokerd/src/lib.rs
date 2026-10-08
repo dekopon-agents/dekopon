@@ -202,7 +202,6 @@ pub async fn check(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
-    Config,
     ProviderSet,
     FrameLimits,
     Runtime,
@@ -212,7 +211,6 @@ pub enum Stage {
 impl std::fmt::Display for Stage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Config => "configuration",
             Self::ProviderSet => "provider set",
             Self::FrameLimits => "frame limits",
             Self::Runtime => "runtime files",

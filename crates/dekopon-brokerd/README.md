@@ -53,9 +53,9 @@ warning naming what boot will require, and credential destination coverage and t
 not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
 provider paths loads them directly. `check` publishes validated managed components into its own
-`--store` cwasm cache through sync; provider paths have no cache. The peer-UID socket-parent check
-is runtime-only and skipped, and a configuration with no `identities` (the chart renders them into
-`peers.yaml`) is a warning rather than a problem.
+`--store` cwasm cache through sync but loads without it, so each run compiles every provider. The
+peer-UID socket-parent check is runtime-only and skipped, and a configuration with no `identities`
+(the chart renders them into `peers.yaml`) is a warning rather than a problem.
 
 ## Configuration
 
