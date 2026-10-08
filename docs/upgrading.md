@@ -8,6 +8,28 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider endpoint base and optional settings (0.38.0)
+
+Upgrade broker and gateway together as usual. No daemon behaviour, broker protocol, provider WIT,
+or configuration schema changed. Console 0.12.0 keeps working without a re-pin, and deployed
+provider components run unchanged without a re-pin. SDK changes reach a provider only when it is
+rebuilt against 0.38.0.
+
+`provider::endpoint::Base` is the origin a provider sends to: declare a vendor default with
+`Base::from_static`, and let the owner override it with `providerSettings.<id>.baseUrl`.
+`Base::parse` accepts `http://` or `https://`, refuses userinfo, query, fragment, whitespace and
+an empty host, and trims one trailing `/`. `join` appends a path beginning with `/`. An invalid
+explicit `baseUrl` fails `invalid-settings` before any request. The rule: a provider talks to one origin; a second vendor is a second provider or a `vendor` setting.
+
+`Settings<T>` parses `{}` when there is no `providerSettings.<id>` entry, so all-optional
+settings run without one; a required field still fails `invalid-settings`.
+
+The test kit's `Native::settings` and `Run::settings` supply a test call's settings JSON in place
+of `providerSettings.<id>`. `dekopon_broker_host::TestImports` gains a public `settings` field;
+struct literals must add it or end with `..Default::default()`.
+
+Install chart 0.27.0 only after its default image index is pinned to the verified v0.38.0 image.
+
 ## Opt-in self-inspection and participant names (0.37.0)
 
 `inspect_agent_config` is now offered only on a route that writes `inspectAgentConfig: true`;

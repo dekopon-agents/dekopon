@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.27.0] - 2026-10-08
+
+### Changed
+
+- Prepare chart 0.27.0 for core v0.38.0; pin the published image index in a separate reviewed change.
+
+## [0.38.0] - 2026-10-08
+
+### Added
+
+- `provider::endpoint::Base` in `dekopon-provider-sdk`, a validated base URL for a provider's vendor default and the owner's `providerSettings.<id>.baseUrl` override.
+- `Native::settings` and `Run::settings` in `dekopon-provider-sdk-testkit` supply a provider's settings JSON to a test call.
+
+### Changed
+
+- `Settings<T>` parses `{}` when a provider has no `providerSettings` entry, so all-optional settings no longer fail with `invalid-settings`; a required field still does.
+
 ## [dekopon-chart-0.26.0] - 2026-10-08
 
 ### Fixed
