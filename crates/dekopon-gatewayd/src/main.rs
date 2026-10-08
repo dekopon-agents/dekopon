@@ -120,7 +120,12 @@ struct CheckOutput {
 
 #[cfg(unix)]
 async fn run_check(check: &cli::CheckArgs) -> ExitCode {
-    let report = dekopon_gatewayd::check(&check.config, check.catalog.as_deref()).await;
+    let scope = check.probe.then(|| match &check.against {
+        Some(against) => dekopon_gatewayd::ProbeScope::ChangedFrom(against.clone()),
+        None => dekopon_gatewayd::ProbeScope::Every,
+    });
+    let report =
+        dekopon_gatewayd::check(&check.config, check.catalog.as_deref(), scope.as_ref()).await;
     let output = CheckOutput {
         ok: report.problems.is_empty(),
         problems: report
@@ -128,7 +133,11 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
             .iter()
             .map(|problem| error_chain(problem))
             .collect(),
-        warnings: report.warnings.iter().map(ToString::to_string).collect(),
+        warnings: report
+            .warnings
+            .iter()
+            .map(|warning| error_chain(warning))
+            .collect(),
     };
     match check.output {
         cli::CheckFormat::Table => {

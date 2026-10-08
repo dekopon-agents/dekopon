@@ -39,8 +39,10 @@ dekopon-brokerd check broker.yaml --output json
 
 `check` runs the startup validation the daemon runs — strict decoding, fragment merging, provider
 loading, Cedar policy against the declared world, capability blocks, constraint sets against the
-loaded manifests, frame and memory ceilings — and stops before binding anything. It prints every
-problem and warning at once, one per line or as `{ "ok", "problems", "warnings" }`, and exits 0
+loaded manifests, frame and memory ceilings — through the function boot uses, and stops before
+binding anything. Every stage whose inputs loaded runs, and one that could not (providers when the
+provider set failed to resolve, say) is a warning naming it. It prints every problem and warning
+at once, one per line or as `{ "ok", "problems", "warnings" }`, and exits 0
 with no problems, 1 with problems and 2 on a usage error. Configuration files may be the invoking
 user's own 0644 files, as in a Git checkout; symlinks and group/world-writable files are still
 refused. Runtime paths are not required to exist and are never touched: the socket and its parent,

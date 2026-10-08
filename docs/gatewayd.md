@@ -28,17 +28,33 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 ```console
 dekopon-gatewayd check gatewayd.d --catalog agents.d
 dekopon-gatewayd check gatewayd.yaml --output json
+dekopon-gatewayd check candidate.d --catalog agents.d --probe --against live.d
 ```
 
-`check` runs the configuration, catalog and route validation startup runs and stops before the
-broker probe. It prints every problem and warning at once, one per line or as
-`{ "ok", "problems", "warnings" }`, and exits 0 with no problems, 1 with problems and 2 on a usage
+`check` runs the validation startup runs, through the same function, and stops before the broker
+is contacted. Every stage whose inputs loaded runs, so it prints every configuration, catalog and
+route problem at once, and a stage that could not run (routes when the catalog failed, say) is a
+warning naming it. Output is one line per problem or warning, or
+`{ "ok", "problems", "warnings" }`; it exits 0 with no problems, 1 with problems and 2 on a usage
 error. `--catalog` replaces `catalogPath`, which usually names a deployment path. Files may be the
-invoking user's own 0644 files; symlinks and group/world-writable files are still refused. Nothing
-runtime is touched: the broker socket is never contacted, no transport or model credential
-variable is read (each one boot will read is listed as a warning), no ChatGPT login is opened and
-no journal directory is created. Transport clients are not built, so checks that live in their
-constructors run only at boot.
+invoking user's own 0644 files; symlinks and group/world-writable files are still refused. Plain
+`check` touches nothing runtime: the broker socket is never contacted, no transport or model
+credential variable is read (each one boot will read is listed as a warning), no ChatGPT login is
+opened and no journal directory is created. Transport clients are not built, so checks that live
+in their constructors run only at boot.
+
+`--probe` adds the one online stage, and with it the one credential read: for each changed
+`openrouter` model it reads the model's `apiKeyEnv` and sends a single completion capped at 16
+output tokens, through the same client and routing settings the gateway uses, with a 30-second
+bound (or the model's `timeoutMs`, if shorter). A refusal is a problem naming the model, its
+vendor model id, the file that defines it, the routes it serves and the vendor's status and body;
+the key never appears, because the client redacts it from the body. A model is changed when its
+name is absent from the `--against` configuration or its parsed settings differ there (defaults
+filled in, so formatting alone is no change); without `--against` every model is probed, and an
+`--against` that does not load is a warning and probes every model. `chatgptSubscription` models
+are never probed, since reading the login can refresh and rotate it under the running gateway;
+each changed one is a `not probed: subscription auth` warning, as is each changed `anthropic`
+(`proxy-only model`) and `openaiCompatible` model.
 
 ## Configuration
 

@@ -140,6 +140,14 @@ impl RoutingTable {
             .collect()
     }
 
+    pub(crate) fn serving(&self, model: &str) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|route| route.model.name() == model)
+            .map(|route| format!("{}:{}", route.transport, route.agent))
+            .collect()
+    }
+
     /// Declaration order is the only precedence rule, with no specificity ranking, so an operator
     /// reads top to bottom to see which route wins; a catch-all still needs dispatch's own
     /// addressing check.

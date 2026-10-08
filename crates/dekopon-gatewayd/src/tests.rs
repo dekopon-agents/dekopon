@@ -15024,7 +15024,7 @@ async fn check_passes_a_directory_whose_transport_token_variable_is_unset() {
     let root = temporary();
     let directory = check_fixture(root.path(), "reviewer", &[]);
 
-    let report = crate::check(&directory, None).await;
+    let report = crate::check(&directory, None, None).await;
 
     assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert!(report.warnings.iter().any(|warning| matches!(
@@ -15039,7 +15039,7 @@ async fn run_refuses_with_exactly_the_problem_check_reports() {
     let root = temporary();
     let directory = check_fixture(root.path(), "nobody", &[]);
 
-    let report = crate::check(&directory, None).await;
+    let report = crate::check(&directory, None, None).await;
     let error = crate::run(&directory, std::future::pending())
         .await
         .expect_err("a route naming an absent agent cannot serve");
@@ -15072,7 +15072,7 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
         )],
     );
 
-    let report = crate::check(&directory, None).await;
+    let report = crate::check(&directory, None, None).await;
 
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -15088,6 +15088,246 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
                 RouteProblem::UnknownAgent { agent } if agent == "nobody"
             ))
     )));
+}
+
+const PROBE_KEY_VARIABLE: &str = "DEKOPON_GATEWAYD_PROBE_TEST_KEY";
+const PROBE_KEY: &str = "sk-or-probe-test-4F1B02";
+
+fn probe_environment(variable: &str) -> Option<OsString> {
+    (variable == PROBE_KEY_VARIABLE).then(|| PROBE_KEY.into())
+}
+
+fn openrouter_model(name: &str, model: &str, timeout_ms: u64) -> Value {
+    json!({
+        "kind": "openrouter",
+        "name": name,
+        "model": model,
+        "apiKeyEnv": PROBE_KEY_VARIABLE,
+        "timeoutMs": timeout_ms,
+        "routing": { "requireParameters": true }
+    })
+}
+
+fn models_fragment(models: Value) -> Value {
+    json!({ "apiVersion": config::CONFIG_API_VERSION, "models": models })
+}
+
+struct FakeVendor {
+    endpoint: String,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "a vendor that cannot finish writing leaves the probe without an answer, which the \
+              calling test asserts on"
+)]
+fn spawn_fake_vendor() -> FakeVendor {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fake vendor binds");
+    let address = listener.local_addr().expect("fake vendor address");
+    listener
+        .set_nonblocking(true)
+        .expect("fake vendor is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("fake vendor adopts");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&asked);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let Some((_, headers, body)) = read_http_request_parts(&mut stream).await else {
+                    return;
+                };
+                let model =
+                    serde_json::from_str::<Value>(&body).expect("probe body is JSON")["model"]
+                        .as_str()
+                        .expect("probe names its model")
+                        .to_owned();
+                recorded.lock().push(model.clone());
+                let (status, content_type, response) = if model == "vendor/refused" {
+                    let authorization = headers
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("authorization"))
+                        .unwrap_or_default()
+                        .to_owned();
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        json!({ "error": { "message": format!("no endpoints for this model; you sent {authorization}") } })
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                use tokio::io::AsyncWriteExt as _;
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    FakeVendor {
+        endpoint: format!("http://{address}/api/v1/chat/completions"),
+        asked,
+    }
+}
+
+async fn probed(
+    directory: &Path,
+    scope: &crate::ProbeScope,
+    vendor: &FakeVendor,
+) -> crate::CheckReport {
+    let vendor = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    crate::load_candidate(
+        directory,
+        None,
+        config::LoadMode::Check,
+        Some((scope, &vendor)),
+    )
+    .await
+    .1
+}
+
+#[tokio::test]
+async fn check_reports_a_collision_an_unknown_agent_and_a_refused_model_together() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "nobody",
+        &[
+            (
+                "twice.yaml",
+                json!({"apiVersion": config::CONFIG_API_VERSION, "catalogPath": "/elsewhere.yaml"}),
+            ),
+            (
+                "vendor.yaml",
+                models_fragment(json!([openrouter_model("router", "vendor/refused", 5_000)])),
+            ),
+        ],
+    );
+
+    let report = probed(&directory, &crate::ProbeScope::Every, &vendor).await;
+
+    assert_eq!(report.problems.len(), 3, "{:?}", report.problems);
+    assert!(matches!(
+        &report.problems[0],
+        crate::GatewaydError::Config(ConfigError::Fragments(
+            dekopon_core::fragments::FragmentError::Conflicts { .. }
+        ))
+    ));
+    assert!(matches!(
+        &report.problems[1],
+        crate::GatewaydError::Route(RouteError { problems })
+            if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { agent }] if agent == "nobody")
+    ));
+    let crate::GatewaydError::Probe(problem) = &report.problems[2] else {
+        panic!("the third problem is the probe: {:?}", report.problems[2]);
+    };
+    assert_eq!(problem.model, "router");
+    assert_eq!(problem.vendor_model, "vendor/refused");
+    assert_eq!(problem.file, directory.join("vendor.yaml"));
+    let crate::ProbeError::Vendor(InferenceError::Provider(failure)) = &problem.source else {
+        panic!("the vendor's refusal: {:?}", problem.source);
+    };
+    assert_eq!(failure.status, Some(400));
+    assert!(
+        failure
+            .diagnostic
+            .contains("no endpoints for this model; you sent authorization: Bearer [REDACTED]"),
+        "{}",
+        failure.diagnostic
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::NotProbed { model, reason: crate::NotProbed::OpenaiCompatible }
+            if model == "local-qwen"
+    )));
+    for line in report
+        .problems
+        .iter()
+        .map(|problem| dekopon_core::error_chain(problem))
+        .chain(
+            report
+                .warnings
+                .iter()
+                .map(|warning| dekopon_core::error_chain(warning)),
+        )
+    {
+        assert!(!line.contains(PROBE_KEY), "{line}");
+    }
+}
+
+#[tokio::test]
+async fn only_a_model_absent_from_or_different_in_the_live_config_is_probed() {
+    let vendor = spawn_fake_vendor();
+    let live_root = temporary();
+    let live = check_fixture(
+        live_root.path(),
+        "reviewer",
+        &[(
+            "vendor.yaml",
+            models_fragment(json!([
+                openrouter_model("kept", "vendor/kept", 5_000),
+                openrouter_model("retuned", "vendor/retuned", 5_000),
+                { "kind": "chatgptSubscription", "name": "astra", "model": "gpt-astra", "timeoutMs": 5_000 },
+            ])),
+        )],
+    );
+    let candidate_root = temporary();
+    let candidate = check_fixture(
+        candidate_root.path(),
+        "reviewer",
+        &[(
+            "vendor.yaml",
+            models_fragment(json!([
+                openrouter_model("kept", "vendor/kept", 5_000),
+                openrouter_model("retuned", "vendor/retuned", 6_000),
+                openrouter_model("added", "vendor/added", 5_000),
+                { "kind": "chatgptSubscription", "name": "astra", "model": "gpt-astra", "timeoutMs": 5_000 },
+                { "kind": "chatgptSubscription", "name": "terra", "model": "gpt-terra", "timeoutMs": 5_000 },
+            ])),
+        )],
+    );
+
+    let report = probed(&candidate, &crate::ProbeScope::ChangedFrom(live), &vendor).await;
+
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    let mut asked = vendor.asked.lock().clone();
+    asked.sort();
+    assert_eq!(asked, ["vendor/added", "vendor/retuned"]);
+    let not_probed = report
+        .warnings
+        .iter()
+        .filter_map(|warning| {
+            if let crate::CheckWarning::NotProbed { model, reason } = warning {
+                Some((model.as_str(), *reason))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            not_probed.as_slice(),
+            [("terra", crate::NotProbed::SubscriptionAuth)]
+        ),
+        "{not_probed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

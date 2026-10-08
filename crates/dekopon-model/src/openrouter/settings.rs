@@ -10,7 +10,7 @@ pub struct Settings {
     pub cache: Option<Cache>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Generation {
     pub max_output_tokens: Option<NonZeroU32>,
@@ -18,13 +18,13 @@ pub struct Generation {
     pub top_p: Option<f64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Reasoning {
     pub effort: Effort,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     None,
@@ -36,7 +36,7 @@ pub enum Effort {
     Max,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Routing {
     pub allow_fallbacks: Option<bool>,
@@ -44,7 +44,7 @@ pub struct Routing {
     pub only: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
     pub style: CacheStyle,
@@ -58,7 +58,7 @@ pub enum CacheStyle {
     ExplicitPrefix,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Ttl {
     #[serde(rename = "5m")]
     FiveMinutes,
