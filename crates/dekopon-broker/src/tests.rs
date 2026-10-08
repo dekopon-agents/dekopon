@@ -1203,31 +1203,32 @@ fn a_shared_namespace_keys_retention_and_conflicting_retention_fails() {
 }
 
 #[test]
-fn a_named_namespace_outside_agent_scope_and_every_mismatch_are_refused_together() {
+fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refused_together() {
     use super::{BrokerBuildError, ConstraintCatalog, NamespaceConflict};
     let keep = dekopon_capability::StorageRetention::Keep;
+    let set = |provider, interface, scope, namespace| {
+        storage_set(
+            provider,
+            interface,
+            StorageAccess::ReadOnly,
+            scope,
+            keep,
+            namespace,
+        )
+    };
     let unchanged = ConstraintCatalog::new([
         (
             "turso.exec".parse().unwrap(),
-            storage_set(
+            set(
                 "turso",
                 StorageInterface::DurableFiles,
-                StorageAccess::ReadWrite,
                 StorageScope::Agent,
-                keep,
                 None,
             ),
         ),
         (
             "turso.log".parse().unwrap(),
-            storage_set(
-                "turso",
-                StorageInterface::Jsonl,
-                StorageAccess::ReadWrite,
-                StorageScope::Agent,
-                keep,
-                None,
-            ),
+            set("turso", StorageInterface::Jsonl, StorageScope::Agent, None),
         ),
     ])
     .unwrap();
@@ -1239,47 +1240,34 @@ fn a_named_namespace_outside_agent_scope_and_every_mismatch_are_refused_together
     let conflicting = ConstraintCatalog::new([
         (
             "turso.exec".parse().unwrap(),
-            storage_set(
+            set(
                 "turso",
                 StorageInterface::DurableFiles,
-                StorageAccess::ReadWrite,
                 StorageScope::Agent,
-                keep,
                 None,
             ),
         ),
         (
             "python.eval".parse().unwrap(),
-            storage_set(
+            set(
                 "python",
                 StorageInterface::Jsonl,
-                StorageAccess::ReadOnly,
                 StorageScope::Agent,
-                keep,
                 Some("turso"),
             ),
         ),
         (
             "memory.recent".parse().unwrap(),
-            storage_set(
+            set(
                 "memory",
                 StorageInterface::Jsonl,
-                StorageAccess::ReadOnly,
                 StorageScope::PrivateConversation,
-                keep,
                 Some("chat"),
             ),
         ),
         (
             "chat.read".parse().unwrap(),
-            storage_set(
-                "chat",
-                StorageInterface::Jsonl,
-                StorageAccess::ReadOnly,
-                StorageScope::SharedConversation,
-                keep,
-                None,
-            ),
+            set("chat", StorageInterface::Jsonl, StorageScope::Agent, None),
         ),
     ])
     .unwrap();
@@ -1297,35 +1285,58 @@ fn a_named_namespace_outside_agent_scope_and_every_mismatch_are_refused_together
                 scope: StorageScope::PrivateConversation,
             },
             NamespaceConflict::Mismatch {
-                namespace: "chat".parse().unwrap(),
-                capabilities: vec![
-                    (
-                        "chat.read".parse().unwrap(),
-                        StorageInterface::Jsonl,
-                        StorageScope::SharedConversation,
-                    ),
-                    (
-                        "memory.recent".parse().unwrap(),
-                        StorageInterface::Jsonl,
-                        StorageScope::PrivateConversation,
-                    ),
-                ],
-            },
-            NamespaceConflict::Mismatch {
                 namespace: "turso".parse().unwrap(),
                 capabilities: vec![
-                    (
-                        "python.eval".parse().unwrap(),
-                        StorageInterface::Jsonl,
-                        StorageScope::Agent,
-                    ),
+                    ("python.eval".parse().unwrap(), StorageInterface::Jsonl),
                     (
                         "turso.exec".parse().unwrap(),
-                        StorageInterface::DurableFiles,
-                        StorageScope::Agent,
+                        StorageInterface::DurableFiles
                     ),
                 ],
             },
         ]
     );
+}
+
+#[test]
+fn naming_a_namespace_leaves_its_owners_conversation_scoped_sets_alone() {
+    use super::ConstraintCatalog;
+    let keep = dekopon_capability::StorageRetention::Keep;
+    let catalog = ConstraintCatalog::new([
+        (
+            "turso.exec".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadWrite,
+                StorageScope::Agent,
+                keep,
+                None,
+            ),
+        ),
+        (
+            "turso.notes".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::Jsonl,
+                StorageAccess::ReadWrite,
+                StorageScope::PrivateConversation,
+                keep,
+                None,
+            ),
+        ),
+        (
+            "python.eval".parse().unwrap(),
+            storage_set(
+                "python",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadOnly,
+                StorageScope::Agent,
+                keep,
+                Some("turso"),
+            ),
+        ),
+    ])
+    .unwrap();
+    assert!(catalog.validate_storage_namespaces().is_ok());
 }

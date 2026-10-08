@@ -922,9 +922,10 @@ python:
 
 Absent, the namespace is the invoking provider, so existing configuration keeps its directory.
 Only owner configuration names it; Cedar still authorizes each capability on its own. Startup
-refuses `namespace` under any other scope, and refuses sets that share a namespace (the providers
-naming it plus that provider's own sets) with a different `interface` or `scope`; `access` may
-differ. Every such conflict is listed in one startup error.
+refuses `namespace` under any other scope, and refuses agent-scope sets that share a named
+namespace (the providers naming it plus that provider's own agent-scope sets) with a different
+`interface`; `access` may differ, and the provider's conversation-scope sets are untouched. Every
+such conflict is listed in one startup error.
 
 The broker runs a bounded storage sweep at startup and every 12 hours; missed ticks do not cause
 catch-up bursts. One sweep runs at a time on a joined blocking task while requests continue to be

@@ -677,14 +677,15 @@ impl ConstraintCatalog {
             let Some(storage) = &set.constraints.storage else {
                 continue;
             };
-            if let Some(namespace) = &storage.namespace
-                && storage.scope != StorageScope::Agent
-            {
-                conflicts.push(NamespaceConflict::NotAgentScope {
-                    capability: capability.clone(),
-                    namespace: namespace.clone(),
-                    scope: storage.scope,
-                });
+            if storage.scope != StorageScope::Agent {
+                if let Some(namespace) = &storage.namespace {
+                    conflicts.push(NamespaceConflict::NotAgentScope {
+                        capability: capability.clone(),
+                        namespace: namespace.clone(),
+                        scope: storage.scope,
+                    });
+                }
+                continue;
             }
             members
                 .entry(storage.namespace.as_ref().unwrap_or(&set.provider))
@@ -699,18 +700,12 @@ impl ConstraintCatalog {
                 .iter()
                 .map(|(_, storage)| storage.interface)
                 .collect::<BTreeSet<_>>();
-            let scopes = sets
-                .iter()
-                .map(|(_, storage)| storage.scope)
-                .collect::<BTreeSet<_>>();
-            if interfaces.len() > 1 || scopes.len() > 1 {
+            if interfaces.len() > 1 {
                 conflicts.push(NamespaceConflict::Mismatch {
                     namespace: namespace.clone(),
                     capabilities: sets
                         .iter()
-                        .map(|(capability, storage)| {
-                            ((*capability).clone(), storage.interface, storage.scope)
-                        })
+                        .map(|(capability, storage)| ((*capability).clone(), storage.interface))
                         .collect(),
                 });
             }
@@ -1398,7 +1393,7 @@ pub enum NamespaceConflict {
     },
     Mismatch {
         namespace: ProviderId,
-        capabilities: Vec<(CapabilityId, StorageInterface, StorageScope)>,
+        capabilities: Vec<(CapabilityId, StorageInterface)>,
     },
 }
 
@@ -1419,12 +1414,12 @@ impl fmt::Display for NamespaceConflict {
                 capabilities,
             } => {
                 write!(formatter, "storage namespace {namespace} is shared by")?;
-                for (capability, interface, scope) in capabilities {
-                    write!(formatter, " {capability} ({interface:?}, {scope:?})")?;
+                for (capability, interface) in capabilities {
+                    write!(formatter, " {capability} ({interface:?})")?;
                 }
                 write!(
                     formatter,
-                    "; every capability in one namespace declares one interface and scope"
+                    "; every agent-scope capability in one namespace declares one interface"
                 )
             }
         }
