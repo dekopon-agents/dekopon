@@ -312,7 +312,6 @@ pub enum CheckWarning {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
-    Config,
     Catalog,
     Routes,
     Credentials,
@@ -322,7 +321,6 @@ pub enum Stage {
 impl std::fmt::Display for Stage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Config => "configuration",
             Self::Catalog => "agent catalog",
             Self::Routes => "routes",
             Self::Credentials => "credentials",

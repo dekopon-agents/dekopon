@@ -855,6 +855,86 @@ if helm template shadow-set "$chart_dir" -f "$values" \
 fi
 echo "PASS the provider-set mount cannot shadow another of the broker's mounts"
 
+echo
+echo "==> (q) the config-check hook hands dekopon-brokerd check a provider set it accepts, as UID 65532"
+for suffix in check check-broker-src check-set-src; do
+  v="${resource}-${suffix}"
+  if docker volume inspect "$v" >/dev/null 2>&1; then
+    echo "refusing preexisting test volume: $v" >&2
+    exit 1
+  fi
+  echo "$v" >> "$work/volumes"
+  docker volume create "$v" >/dev/null
+done
+docker run --rm --platform "$platform" -v "${resource}-check-broker-src:/b" -v "${resource}-check-set-src:/p" \
+  "$busybox" sh -c '
+  set -eu
+  for d in /b /p; do mkdir "$d/..fixture"; ln -s ..fixture "$d/..data"; done
+  printf "apiVersion: dekopon.dev/brokerd/v1alpha1\n" > /b/..fixture/broker.yaml
+  printf "providers: []\n" > /p/..fixture/providers.yaml
+  chmod 0400 /b/..fixture/broker.yaml /p/..fixture/providers.yaml
+  ln -s ..data/broker.yaml /b/broker.yaml
+  ln -s ..data/providers.yaml /p/providers.yaml'
+render "$work/config-check-render.yaml" \
+  --set configCheck.enabled=true \
+  --set configCheck.broker.configMap=dekopon-check-broker-d \
+  --set configCheck.broker.providerSetConfigMap=dekopon-check-config \
+  --set state.existingClaim=dekopon-state
+cat > "$work/config-check-extract.py" <<'CHECKEXTRACT'
+import yaml, sys
+job = next(d for d in yaml.safe_load_all(sys.stdin) if d and d["kind"] == "Job" and d["metadata"]["name"].endswith("-config-check"))
+pod = job["spec"]["template"]["spec"]
+init = pod["initContainers"][0]
+assert init["name"] == "prepare-candidate", init["name"]
+assert init["command"] == ["/bin/sh", "-c"]
+assert {m["name"]: m["mountPath"] for m in init["volumeMounts"]} == {
+    "check": "/check", "broker-source": "/source/broker.d",
+    "provider-set-source": "/source/provider-set", "state": "/var/lib/dekopon"}
+broker = next(c for c in pod["containers"] if c["name"] == "check-broker")
+assert broker["securityContext"]["runAsUser"] == broker["securityContext"]["runAsGroup"] == 65532
+flag = next(a for a in broker["args"] if a.startswith("--provider-set="))
+sys.stdout.write(flag.split("=", 1)[1] + "\n" + init["args"][0])
+CHECKEXTRACT
+python_yaml "$(cat "$work/config-check-extract.py")" "$work/config-check-render.yaml" > "$work/config-check-out"
+provider_set=$(head -n 1 "$work/config-check-out")
+tail -n +2 "$work/config-check-out" > "$work/config-check-init.sh"
+docker run --rm --platform "$platform" \
+  --user 0:0 --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER \
+  --security-opt=no-new-privileges --read-only \
+  -v "${resource}-check":/check \
+  -v "${resource}-check-broker-src":/source/broker.d:ro \
+  -v "${resource}-check-set-src":/source/provider-set:ro \
+  -v "${resource}-state":/var/lib/dekopon \
+  "$busybox" /bin/sh -c "$(cat "$work/config-check-init.sh")"
+# provider_manager::read_secure_file: validate_file_parent, then the file itself, O_NOFOLLOW.
+cat > "$work/config-check-set.py" <<'CHECKSET'
+import os, stat, sys
+path = os.environ["PROVIDER_SET"]
+euid = os.geteuid()
+parent = os.path.realpath(os.path.dirname(path))
+pst = os.lstat(parent)
+assert stat.S_ISDIR(pst.st_mode) and pst.st_uid == euid and (pst.st_mode & 0o022) == 0, \
+    f"provider directory is not protected and owned by this UID: {parent} uid={pst.st_uid} mode={oct(pst.st_mode & 0o7777)}"
+ancestor = os.path.dirname(parent)
+while True:
+    ast = os.lstat(ancestor)
+    assert stat.S_ISDIR(ast.st_mode) and ((ast.st_mode & 0o022) == 0 or (ast.st_mode & 0o1000) != 0), \
+        f"ancestor {ancestor} mode={oct(ast.st_mode & 0o7777)}"
+    if ancestor == "/":
+        break
+    ancestor = os.path.dirname(ancestor)
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+fst = os.fstat(fd)
+os.close(fd)
+assert stat.S_ISREG(fst.st_mode) and fst.st_uid == euid and (fst.st_mode & 0o002) == 0, \
+    f"{path} uid={fst.st_uid} mode={oct(fst.st_mode & 0o7777)}"
+print(f"PASS {path} and {parent} are owned by {euid} and not writable by others")
+CHECKSET
+docker run --rm -i --platform "$platform" --user 65532:65532 --cap-drop=ALL \
+  --security-opt=no-new-privileges -e PROVIDER_SET="$provider_set" \
+  -v "${resource}-check":/check:ro \
+  "$python_image" python3 - < "$work/config-check-set.py"
+
 echo "==> materializing nested skills from a projected ConfigMap"
 for suffix in skills-src skills; do
   v="${resource}-${suffix}"

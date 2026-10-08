@@ -613,7 +613,14 @@ broker check runs as `65532`, resolving `providerSetConfigMap`'s `providers.yaml
 `<paths.stateDir>/config-check` on the state claim, so blobs persist between runs; that path needs
 `state.existingClaim` under the default Helm hook. The gateway check runs as `65533` with `env`,
 which should name each probed model's `apiKeyEnv` and nothing else; no ChatGPT login is mounted,
-since `check` never probes a subscription model. `backoffLimit: 1`, `activeDeadlineSeconds: 600`.
+since `check` never probes a subscription model. `backoffLimit: 0`, since a refusal is
+deterministic and a retry pays for every probe twice; `activeDeadlineSeconds: 600`.
+
+Two costs. The broker check loads providers without the cwasm cache, so every run compiles every
+provider in the set; on the RPi that run time is not yet measured. And the hook sees only the
+candidate ConfigMaps: the `peers.yaml` the chart renders into the pod's `broker.d`
+(`broker.configDirectory.peers`) is not among them, so a problem there surfaces at boot, not in the
+hook.
 
 `configCheck.annotations` replaces the hook annotations entirely. Empty means
 `helm.sh/hook: pre-install,pre-upgrade` with `before-hook-creation`, which Argo CD runs as

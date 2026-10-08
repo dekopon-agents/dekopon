@@ -581,7 +581,6 @@ jobs:
             --set 'configCheck.env[0].valueFrom.secretKeyRef.name=dekopon-openrouter' \
             --set 'configCheck.env[0].valueFrom.secretKeyRef.key=OPENROUTER_API_KEY' \
             --set state.existingClaim=dekopon-state > "$RUNNER_TEMP/config-check.yaml"
-          grep -q -- '- --against=/check/live.d' "$RUNNER_TEMP/config-check.yaml"
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"

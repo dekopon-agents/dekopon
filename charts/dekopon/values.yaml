@@ -503,7 +503,8 @@ configCheck:
     # Candidate agent catalog, every key a file of the directory passed as --catalog. Required with
     # gateway.configMap.
     catalogConfigMap: ""
-    # Candidate skills, projected with gateway.skills.items into paths.skillsDir.
+    # Candidate skills, projected with gateway.skills.items into paths.skillsDir. Required when an
+    # agent in the catalog mounts skills: the catalog check reads them.
     skillsConfigMap: ""
     # Live gatewayd.d passed as --against. Empty probes every API-key model.
     againstConfigMap: ""
