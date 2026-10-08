@@ -264,7 +264,11 @@ ambient I/O: an exact JSONL or durable-files import is linked to a single-use gr
 instance, invocation, capability, provider, interface, access, configured storage scope, scope
 commitment, and limits. Private conversation scope retains the authenticated subject;
 shared-conversation scope retains transport and conversation without subject; agent scope retains
-provider and agent. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
+provider and agent. An agent-scope storage constraint may name `namespace: <provider id>` in owner
+configuration, which then stands in for the provider, so providers naming one namespace share one
+resource per agent; no provider or input can name it, the grant still binds the invoking provider,
+and broker startup refuses the key under any other scope and refuses sets that share a namespace
+with a different interface or scope. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
 use stable storage continuity so different callers' effective permissions cannot rotate a shared
 resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
 resolution receive a disabled sticky context.
@@ -347,8 +351,9 @@ Storage audit records carry every field a non-storage record does — principal,
 via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —
 plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
 content commitment, evidence, authority, and generations are separate unkeyed SHA-256 domains, so
-no two are equal. Nothing in them is secret: isolation is the broker granting only the caller's own scope
-and the host binding each handle to that scope's directory, and a name the operator can recompute is
+no two are equal. Nothing in them is secret: isolation is the broker granting only the caller's
+own scope, in the namespace the owner configured for that capability, and the host binding each
+handle to that scope's directory, and a name the operator can recompute is
 a name the operator could already list.
 Storage spans likewise carry identity, capability, provider, input, and the namespace token, and
 storage evidence carries exact read and write byte counts. The telemetry store is inside the
@@ -369,7 +374,8 @@ its deadline, while leases/reservations stay held until an already-started block
 drains, so this is not a hard wall-clock guarantee. Durable-files has no lock operation, no SHM
 operation and no multiprocess-database claim. A single-instance WAL engine needs none of them and
 runs on these primitives unchanged; the out-of-tree `turso-sql` provider ships one and opens
-exactly two files.
+exactly two files. Providers configured into one shared namespace take turns under the base lease,
+so each engine still runs alone over those files, and they must agree on the file format.
 Writes apply per host call. A trap can leave partial database/log changes; neither sync nor
 invocation success promises cross-file atomicity or crash recovery ([`design.md`](design.md#non-goals)).
 

@@ -513,6 +513,45 @@ fn capability_authority_commits_exactly_these_fields() {
         ],
         "the storage authority surface gained or lost a field"
     );
+
+    let mut shared = set.clone();
+    shared.constraints.storage = Some(StorageConstraints {
+        interface: StorageInterface::DurableFiles,
+        access: StorageAccess::ReadOnly,
+        scope: StorageScope::Agent,
+        retention: Default::default(),
+        namespace: Some("turso".parse().expect("namespace")),
+    });
+    let mut encoded = AuthorityEncoder::new();
+    encode_capability_authority(
+        &mut encoded,
+        &"cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("valid fixture"),
+        &shared,
+        None,
+        "sha256:artifact",
+    );
+    assert_eq!(
+        labels(&encoded.finish()),
+        vec![
+            "capability",
+            "provider",
+            "effect",
+            "risk",
+            "credential.present",
+            "execution.timeoutMs",
+            "execution.http.present",
+            "execution.storage.present",
+            "execution.storage.interface",
+            "execution.storage.access",
+            "execution.storage.namespace",
+            "execution.storage.sharedNamespace",
+            "execution.asset.present",
+            "providerArtifactSha256",
+        ],
+        "the storage authority surface gained or lost a field"
+    );
 }
 
 #[test]
@@ -615,6 +654,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
             access: StorageAccess::ReadOnly,
             scope: StorageScope::PrivateConversation,
             retention: Default::default(),
+            namespace: None,
         }),
         ..ExecutionConstraints::default()
     };
@@ -635,6 +675,26 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
     let mut writable = storage.clone();
     writable.storage.as_mut().expect("storage").access = StorageAccess::ReadWrite;
     assert_ne!(bytes(&storage), bytes(&writable));
+
+    let mut legacy = AuthorityEncoder::new();
+    legacy.number("execution.timeoutMs", 30_000);
+    legacy.byte("execution.http.present", 0);
+    legacy.byte("execution.storage.present", 1);
+    legacy.byte("execution.storage.interface", 0);
+    legacy.byte("execution.storage.access", 0);
+    legacy.byte("execution.storage.namespace", 0);
+    legacy.byte("execution.asset.present", 0);
+    assert_eq!(
+        bytes(&storage),
+        legacy.finish(),
+        "an absent shared namespace encodes as before the field existed"
+    );
+    let mut named = storage.clone();
+    named.storage.as_mut().expect("storage").namespace = Some("turso".parse().expect("name"));
+    let mut renamed = storage.clone();
+    renamed.storage.as_mut().expect("storage").namespace = Some("sqlite".parse().expect("name"));
+    assert_ne!(bytes(&storage), bytes(&named));
+    assert_ne!(bytes(&named), bytes(&renamed));
 }
 
 #[test]
@@ -987,6 +1047,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         access: StorageAccess::ReadWrite,
         scope: StorageScope::PrivateConversation,
         retention: Default::default(),
+        namespace: None,
     });
     assert!(super::validate_set_constraints(&set).is_ok());
     set.constraints.http = Some(dekopon_capability::HttpConstraints {
@@ -1034,6 +1095,7 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
                 access: StorageAccess::ReadOnly,
                 scope: StorageScope::Agent,
                 retention,
+                namespace: None,
             }),
             ..Default::default()
         },
@@ -1060,4 +1122,210 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
         zero.retention_policies(),
         Err(BrokerBuildError::InvalidStorageRetention)
     ));
+}
+
+fn storage_set(
+    provider: &str,
+    interface: StorageInterface,
+    access: StorageAccess,
+    scope: StorageScope,
+    retention: dekopon_capability::StorageRetention,
+    namespace: Option<&str>,
+) -> ConstraintSet {
+    ConstraintSet {
+        route: CapabilityRoute::Generic,
+        provider: provider.parse().unwrap(),
+        effect: match access {
+            StorageAccess::ReadOnly => dekopon_capability::EffectKind::ReadOnly,
+            StorageAccess::ReadWrite => dekopon_capability::EffectKind::LocalWrite,
+        },
+        risk: dekopon_core::RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints {
+            storage: Some(StorageConstraints {
+                interface,
+                access,
+                scope,
+                retention,
+                namespace: namespace.map(|name| name.parse().unwrap()),
+            }),
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn a_shared_namespace_keys_retention_and_conflicting_retention_fails() {
+    use super::{BrokerBuildError, ConstraintCatalog};
+    use dekopon_capability::StorageRetention;
+    let ttl = StorageRetention::IdleTtl(std::time::Duration::from_secs(20));
+    let catalog = |python_retention| {
+        ConstraintCatalog::new([
+            (
+                "turso.exec".parse().unwrap(),
+                storage_set(
+                    "turso",
+                    StorageInterface::DurableFiles,
+                    StorageAccess::ReadWrite,
+                    StorageScope::Agent,
+                    StorageRetention::Keep,
+                    None,
+                ),
+            ),
+            (
+                "python.eval".parse().unwrap(),
+                storage_set(
+                    "python",
+                    StorageInterface::DurableFiles,
+                    StorageAccess::ReadOnly,
+                    StorageScope::Agent,
+                    python_retention,
+                    Some("turso"),
+                ),
+            ),
+        ])
+        .unwrap()
+    };
+    let shared = catalog(StorageRetention::Keep);
+    assert!(shared.validate_storage_namespaces().is_ok());
+    assert_eq!(
+        shared.retention_policies().unwrap(),
+        dekopon_storage_host::RetentionPolicies::from([(
+            ("turso".parse().unwrap(), StorageScope::Agent),
+            StorageRetention::Keep
+        )])
+    );
+    assert!(matches!(
+        catalog(ttl).retention_policies(),
+        Err(BrokerBuildError::ConflictingStorageRetention { namespace, scope: StorageScope::Agent })
+            if namespace.as_str() == "turso"
+    ));
+}
+
+#[test]
+fn a_named_namespace_outside_agent_scope_and_every_mismatch_are_refused_together() {
+    use super::{BrokerBuildError, ConstraintCatalog, NamespaceConflict};
+    let keep = dekopon_capability::StorageRetention::Keep;
+    let unchanged = ConstraintCatalog::new([
+        (
+            "turso.exec".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadWrite,
+                StorageScope::Agent,
+                keep,
+                None,
+            ),
+        ),
+        (
+            "turso.log".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::Jsonl,
+                StorageAccess::ReadWrite,
+                StorageScope::Agent,
+                keep,
+                None,
+            ),
+        ),
+    ])
+    .unwrap();
+    assert!(
+        unchanged.validate_storage_namespaces().is_ok(),
+        "configs that name no namespace keep today's checks"
+    );
+
+    let conflicting = ConstraintCatalog::new([
+        (
+            "turso.exec".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadWrite,
+                StorageScope::Agent,
+                keep,
+                None,
+            ),
+        ),
+        (
+            "python.eval".parse().unwrap(),
+            storage_set(
+                "python",
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageScope::Agent,
+                keep,
+                Some("turso"),
+            ),
+        ),
+        (
+            "memory.recent".parse().unwrap(),
+            storage_set(
+                "memory",
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageScope::PrivateConversation,
+                keep,
+                Some("chat"),
+            ),
+        ),
+        (
+            "chat.read".parse().unwrap(),
+            storage_set(
+                "chat",
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageScope::SharedConversation,
+                keep,
+                None,
+            ),
+        ),
+    ])
+    .unwrap();
+    let Err(BrokerBuildError::ConflictingStorageNamespaces { conflicts }) =
+        conflicting.validate_storage_namespaces()
+    else {
+        panic!("expected every namespace conflict");
+    };
+    assert_eq!(
+        conflicts,
+        vec![
+            NamespaceConflict::NotAgentScope {
+                capability: "memory.recent".parse().unwrap(),
+                namespace: "chat".parse().unwrap(),
+                scope: StorageScope::PrivateConversation,
+            },
+            NamespaceConflict::Mismatch {
+                namespace: "chat".parse().unwrap(),
+                capabilities: vec![
+                    (
+                        "chat.read".parse().unwrap(),
+                        StorageInterface::Jsonl,
+                        StorageScope::SharedConversation,
+                    ),
+                    (
+                        "memory.recent".parse().unwrap(),
+                        StorageInterface::Jsonl,
+                        StorageScope::PrivateConversation,
+                    ),
+                ],
+            },
+            NamespaceConflict::Mismatch {
+                namespace: "turso".parse().unwrap(),
+                capabilities: vec![
+                    (
+                        "python.eval".parse().unwrap(),
+                        StorageInterface::Jsonl,
+                        StorageScope::Agent,
+                    ),
+                    (
+                        "turso.exec".parse().unwrap(),
+                        StorageInterface::DurableFiles,
+                        StorageScope::Agent,
+                    ),
+                ],
+            },
+        ]
+    );
 }

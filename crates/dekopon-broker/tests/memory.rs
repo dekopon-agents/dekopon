@@ -113,6 +113,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                     access: StorageAccess::ReadWrite,
                     scope: StorageScope::PrivateConversation,
                     retention: Default::default(),
+                    namespace: None,
                 }),
                 secret_use: None,
             },
@@ -552,6 +553,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
                     access: StorageAccess::ReadWrite,
                     scope: StorageScope::PrivateConversation,
                     retention: Default::default(),
+                    namespace: None,
                 }),
                 ..Default::default()
             },
@@ -1040,6 +1042,7 @@ fn memory_constraint(
                 access,
                 scope: StorageScope::PrivateConversation,
                 retention: Default::default(),
+                namespace: None,
             }),
             secret_use: None,
         },
@@ -1091,6 +1094,7 @@ async fn chat_memory_without_routes_names_every_missing_role() {
                     access: StorageAccess::ReadWrite,
                     scope: StorageScope::PrivateConversation,
                     retention: Default::default(),
+                    namespace: None,
                 }),
                 ..Default::default()
             },
@@ -1174,6 +1178,7 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         access: StorageAccess::ReadOnly,
         scope: StorageScope::PrivateConversation,
         retention: Default::default(),
+        namespace: None,
     });
     let constraints = ConstraintCatalog::new([
         (

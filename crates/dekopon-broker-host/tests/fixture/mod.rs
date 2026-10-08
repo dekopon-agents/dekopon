@@ -406,6 +406,7 @@ impl FixtureHost {
                     access,
                     scope: StorageScope::PrivateConversation,
                     retention: Default::default(),
+                    namespace: None,
                 }),
             secret_use: None,
         }

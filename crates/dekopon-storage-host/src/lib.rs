@@ -137,6 +137,7 @@ pub struct StorageGrantRequest {
     conversation: String,
     continuity_policy: ContinuityPolicy,
     authority_surface: Vec<u8>,
+    shared_namespace: Option<ProviderId>,
 }
 
 impl fmt::Debug for StorageGrantRequest {
@@ -181,11 +182,22 @@ impl StorageGrantRequest {
             conversation: conversation.into(),
             continuity_policy,
             authority_surface,
+            shared_namespace: None,
         }
     }
 
+    #[must_use]
+    pub fn with_shared_namespace(mut self, namespace: Option<ProviderId>) -> Self {
+        self.shared_namespace = namespace;
+        self
+    }
+
     pub(crate) fn scope_values(&self) -> Vec<String> {
-        let provider = self.provider.to_string();
+        let provider = self
+            .shared_namespace
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .to_string();
         let agent = self.agent.to_string();
         match self.scope {
             StorageScope::PrivateConversation => vec![
@@ -272,6 +284,7 @@ pub struct StorageGrant {
     invocation: InvocationId,
     capability: CapabilityId,
     provider: ProviderId,
+    shared_namespace: Option<ProviderId>,
     interface: StorageInterface,
     access: StorageAccess,
     scope_kind: StorageScope,
@@ -297,6 +310,10 @@ impl StorageGrant {
     #[must_use]
     pub fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+    #[must_use]
+    pub fn shared_namespace(&self) -> Option<&ProviderId> {
+        self.shared_namespace.as_ref()
     }
     #[must_use]
     pub const fn interface(&self) -> StorageInterface {
@@ -562,6 +579,7 @@ impl StorageHost {
             invocation: request.invocation,
             capability: request.capability,
             provider: request.provider,
+            shared_namespace: request.shared_namespace,
             interface: request.interface,
             access: request.access,
             scope_kind: request.scope,

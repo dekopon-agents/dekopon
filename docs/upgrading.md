@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Shared agent storage namespaces (unreleased)
+
+No action needed: a storage constraint without the new optional `namespace` key keeps its
+directory byte for byte. To let a second provider open an agent-scope store, add
+`namespace: <owning provider id>` beside `scope: agent` in its storage constraint
+([`dekopon-brokerd`](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory)).
+Providers that construct `StorageConstraints` in Rust add `namespace: None` when they re-pin.
+
 ## Late-mention catch-up and named recall authors (0.39.0)
 
 Upgrade broker and gateway together as usual. No configuration key, broker protocol, provider WIT
