@@ -1089,7 +1089,10 @@ a public telemetry contract. Broker component spans and their bounds are describ
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so
 `prompt.script` is the span for a whole unit of model-requested work rather than for a single
-capability invocation. Inside it, the interpreter opens one `shell.script` span per run, and inside
+capability invocation. It carries `model.turn`, `tool_call.index`, `script.max_capability_calls`,
+`script.bytes`, and `tool_call.ignored_arguments`: the comma-separated names, never the values, of
+arguments the `bash` call sent beside `command` (bounded to 256 bytes, absent when there were none).
+The call still runs; the field shows which shapes a model brings from other bash tools. Inside it, the interpreter opens one `shell.script` span per run, and inside
 *that*, `shell.command` is one span per command word the script actually ran; pipeline stages run concurrently, so their spans need not close in source order — a
 builtin, a provider command word, a shell function, a compound pipeline stage, a word this shell refuses, or a word that
 resolved to nothing. A trace therefore reads as the commands a script executed, with pipeline ids and stage indices preserving source order, and the reading

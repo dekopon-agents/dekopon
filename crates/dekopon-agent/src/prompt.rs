@@ -15,6 +15,7 @@ use dekopon_model::model::{
 use dekopon_model::{ModelText, TurnEvent};
 use dekopon_model_token_governor::ModelUsage;
 use dekopon_shell::ScriptOutcome;
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -48,6 +49,7 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
+const MAX_IGNORED_ARGUMENT_NAMES_BYTES: usize = 256;
 
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
@@ -934,8 +936,8 @@ where
                 }
                 return Err(PromptError::UnknownTool(call.function.name));
             }
-            let script = match script_argument(&call.function.name, &call.function.arguments) {
-                Ok(script) => script,
+            let arguments = match script_argument(&call.function.name, &call.function.arguments) {
+                Ok(arguments) => arguments,
                 Err(error) => {
                     let answered = feed_back_rejection(
                         &mut messages,
@@ -959,10 +961,13 @@ where
             let remaining = limits
                 .max_capability_calls
                 .saturating_sub(runtime.capability_calls_used());
+            let ignored_arguments = arguments.ignored_names();
+            let script = arguments.command;
             let span = tracing::info_span!(
                 "prompt.script",
                 model.turn = model_turns,
                 tool_call.index = tool_call_index,
+                tool_call.ignored_arguments = ignored_arguments,
                 script.max_capability_calls = remaining,
                 script.bytes = script.len()
             );
@@ -1465,7 +1470,30 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     })
 }
 
-fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
+#[derive(Debug, Deserialize)]
+struct BashArguments {
+    command: String,
+    #[serde(flatten)]
+    ignored: BTreeMap<String, IgnoredAny>,
+}
+
+impl BashArguments {
+    fn ignored_names(&self) -> Option<String> {
+        if self.ignored.is_empty() {
+            return None;
+        }
+        let mut names = self
+            .ignored
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        names.truncate(names.floor_char_boundary(MAX_IGNORED_ARGUMENT_NAMES_BYTES));
+        Some(names)
+    }
+}
+
+fn script_argument(tool: &str, arguments: &str) -> Result<BashArguments, PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
             tool: tool.to_owned(),
@@ -1477,12 +1505,11 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
             tool: tool.to_owned(),
         });
     };
-    match arguments.get("command") {
-        Some(Value::String(script)) => Ok(script.clone()),
-        _ => Err(PromptError::MissingCommand {
+    BashArguments::deserialize(Value::Object(arguments)).map_err(|_missing| {
+        PromptError::MissingCommand {
             tool: tool.to_owned(),
-        }),
-    }
+        }
+    })
 }
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
@@ -3194,6 +3221,51 @@ mod tests {
             "no agent supplied should mean no field: {}",
             capture.events_text()
         );
+    }
+
+    #[test]
+    fn a_bash_call_runs_its_command_and_names_the_arguments_it_ignored_on_the_span() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::workspace();
+        let model = ScriptedModel::new([
+            tool_call(
+                "call-1",
+                SCRIPT_TOOL_NAME,
+                json!({ "command": "echo hi", "timeout": 30, "cwd": "/" }),
+            ),
+            script_call("call-2", "echo again"),
+            answer("done"),
+        ]);
+        let runtime = RecordingRuntime::new(0);
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                run_prompt_session(
+                    &model,
+                    &runtime,
+                    SessionInputs::new("go", limits(3, 4)),
+                    &mut History::default(),
+                )
+            },
+        )
+        .expect("extra arguments do not end the session");
+
+        assert_eq!(*runtime.scripts.lock(), ["echo hi", "echo again"]);
+        let scripts = capture
+            .spans()
+            .into_iter()
+            .filter(|(name, _)| *name == "prompt.script")
+            .map(|(_, fields)| fields)
+            .collect::<Vec<_>>();
+        assert_eq!(scripts.len(), 2, "{}", capture.spans_text());
+        assert!(
+            scripts[0].contains(r#"tool_call.ignored_arguments="cwd,timeout""#),
+            "{}",
+            scripts[0]
+        );
+        assert!(!scripts[1].contains("ignored_arguments"), "{}", scripts[1]);
     }
 
     #[test]
