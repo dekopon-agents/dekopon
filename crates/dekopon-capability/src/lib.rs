@@ -221,6 +221,17 @@ impl HttpConstraints {
                 maximum: MAX_HTTP_SCOPE_ENTRIES,
             });
         }
+        let unsafe_rules = self
+            .request_templates
+            .iter()
+            .filter(|template| !matches!(template.method.as_str(), "GET" | "HEAD"))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !unsafe_rules.is_empty() {
+            return Err(HttpConstraintsError::TemplateMethodNotReadOnly {
+                rules: unsafe_rules,
+            });
+        }
         let mut routes = BTreeSet::new();
         for template in &self.request_templates {
             let rule = template.to_string();
@@ -310,6 +321,11 @@ pub enum HttpConstraintsError {
     InvalidMethod { value: String },
     #[error("HTTP authorization limits must be greater than zero")]
     ZeroLimit,
+    #[error(
+        "HTTP request templates {rules:?} name a method other than GET or HEAD; send templates \
+         come with the send capability's body grammar"
+    )]
+    TemplateMethodNotReadOnly { rules: Vec<String> },
     #[error("HTTP request template {rule:?} names a method allowedMethods does not grant")]
     TemplateMethodNotAllowed { rule: String },
     #[error("HTTP request template {rule:?} appears more than once")]
@@ -1061,9 +1077,27 @@ mod tests {
             "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}});
         assert_eq!(with(json!([replies])).validate(), Ok(()));
         assert!(matches!(
-            with(json!([{"method": "POST", "path": "/api/chat.postMessage"}])).validate(),
+            with(json!([{"method": "HEAD", "path": "/api/conversations.replies"}])).validate(),
             Err(HttpConstraintsError::TemplateMethodNotAllowed { .. })
         ));
+        let send = HttpConstraints {
+            allowed_methods: vec!["GET".to_owned(), "POST".to_owned(), "PUT".to_owned()],
+            ..with(json!([
+                replies,
+                {"method": "POST", "path": "/api/chat.postMessage",
+                    "query": {"pinned": {"channel": "conversation.id"}}},
+                {"method": "PUT", "path": "/api/chat.update"}
+            ]))
+        };
+        assert_eq!(
+            send.validate(),
+            Err(HttpConstraintsError::TemplateMethodNotReadOnly {
+                rules: vec![
+                    "POST /api/chat.postMessage".to_owned(),
+                    "PUT /api/chat.update".to_owned()
+                ]
+            })
+        );
         assert!(matches!(
             with(json!([replies, {"method": "GET", "path": "/api/conversations.replies"}]))
                 .validate(),
