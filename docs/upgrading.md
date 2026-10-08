@@ -8,6 +8,35 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Late-mention catch-up and named recall authors (0.39.0)
+
+Upgrade broker and gateway together as usual. No configuration key, broker protocol, provider WIT
+or SDK changed. Console 0.12.0 keeps working without a re-pin, and deployed provider components
+run unchanged without a re-pin.
+
+On a `recall: platform` route, a window already in memory catches up when a mention or Slack Agent
+thread continuation finds it resident. Before the triggering message, the gateway reads chat
+messages posted strictly after the newest message the window took in and before this one, under
+the same `min(2 × maxTurns, 100)`, 5 s and `forgetAfterMs` bounds. It drops the bot's own messages
+and messages already taken in, and keeps the newest that fit in `maxBytes`. They reach the model as
+one turn of their own ahead of the triggering message, so an unaddressed message or photo between
+mentions reaches the next turn once. Each such message costs one extra chat-history read (Slack
+`conversations.replies`/`conversations.history`, Discord `GET /channels/{id}/messages`). A failed
+read logs `gateway_recall_failed` and the turn runs without it.
+
+Recalled authors are labelled with their broker principal, such as `[gateway: chat history, from
+simon]`. An author no principal names keeps `from <service user id>` on a private route and becomes
+`from unmapped participant` on a `sharedConversation` route. Each distinct author other than the
+sender costs one broker `capabilities` exchange per seeded window; an unmapped author logs
+`broker_capabilities_refused` with `reason: unmapped-subject` in the broker. This is expected, not
+an attack. Rewrite agent instructions that quote the old service-id label.
+
+Every successful recall that seeds a window logs `gateway_recalled` at info with `source` (`journal`
+or `platform`), `messages` and `delta` (0 on a cold recall). A catch-up read that finds nothing
+logs nothing.
+
+Install chart 0.28.0 only after its default image index is pinned to the verified v0.39.0 image.
+
 ## Provider endpoint base and optional settings (0.38.0)
 
 Upgrade broker and gateway together as usual. No daemon behaviour, broker protocol, provider WIT,
