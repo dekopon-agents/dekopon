@@ -55,8 +55,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Conversations** — `persistent` is the route default, with per-subject history under
   `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
   window. `memory: { mode: oneShot }` starts each session without prior history.
-  Shared turns carry gateway-authored canonical participant labels, and those identifiers reach
-  the model provider. History is compacted and bounded;
+  Shared turns carry gateway-authored participant labels naming each sender's broker principal,
+  and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
   one generation that is retired on idle/LRU/grant change or empty-grant removal. It caches no
   authorization.

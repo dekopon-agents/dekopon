@@ -611,7 +611,7 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 **The history size gets its own fields.** `gateway.session` carries `conversation.turns` and
 `conversation.bytes` — how many prior exchanges this message replayed and how many bytes they
 occupied; on `sharedConversation` the byte count includes each retained gateway-authored
-canonical-participant label. Both are zero on a `oneShot` route and on the first message of any
+participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
 `gateway_conversation_unresolved` is the debug-level record of why a conversation could not be
 placed, and the cause behind `drop.reason = conversation-unresolved`. On Discord, where the
@@ -630,7 +630,7 @@ put either into the eviction record.
 
 The history itself is not a new signal. It is chat text and model output, and it goes where those
 already go: the session's first `agent.model.prompt` carries its opening message list, which on a
-seeded session includes the replayed window. Shared scope adds canonical participant identifiers to
+seeded session includes the replayed window. Shared scope adds participant principal names to
 those prompt events, and not to spans, eviction events, or cache key events. Those labels are part
 of every shared prompt sent to the selected model provider independently of telemetry.
 

@@ -24,10 +24,11 @@ use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatMemorySurface, ClientError, CommandRunOutcome,
-    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest, Upcall, UpcallExit, UpcallStreams,
+    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest, SessionSurface, Upcall,
+    UpcallExit, UpcallStreams,
 };
 #[cfg(unix)]
-use dekopon_core::{CapabilityId, InvocationId, TraceId};
+use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
 use dekopon_process::ProcessOutcome;
 #[cfg(unix)]
 use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
@@ -341,6 +342,7 @@ pub struct BrokerLeg {
     identifiers: IdSequence,
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
+    principal: Option<PrincipalId>,
     cancel: CancelSignal,
     script_cancel: parking_lot::Mutex<Option<ScriptCancellation>>,
     attachments: Option<Arc<ReplyAttachments>>,
@@ -358,26 +360,22 @@ impl BrokerLeg {
         client: BrokerClient,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
-        let (capabilities, command_words, command_word_help, chat_memory) =
-            client.session_surface(attestation.clone()).await?;
-        Self::build(
-            client,
-            capabilities,
-            command_words,
-            command_word_help,
-            attestation,
-            chat_memory,
-        )
+        let surface = client.session_surface(attestation.clone()).await?;
+        Self::build(client, surface, attestation)
     }
 
     fn build(
         client: BrokerClient,
-        available: Vec<dekopon_broker_protocol::AvailableCapability>,
-        command_words: Vec<String>,
-        command_word_help: BTreeMap<String, String>,
+        surface: SessionSurface,
         attestation: Option<Attestation>,
-        chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
+        let SessionSurface {
+            capabilities: available,
+            command_words,
+            command_word_help,
+            chat_memory,
+            principal,
+        } = surface;
         let (capabilities, effective_capabilities) = snapshot(available)?;
         Ok(Self {
             client,
@@ -389,6 +387,7 @@ impl BrokerLeg {
             identifiers: IdSequence::for_session(),
             attestation,
             chat_memory,
+            principal,
             cancel: CancelSignal::never(),
             script_cancel: parking_lot::Mutex::new(None),
             attachments: None,
@@ -452,6 +451,11 @@ impl BrokerLeg {
     #[must_use]
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
+    }
+
+    #[must_use]
+    pub fn principal(&self) -> Option<&PrincipalId> {
+        self.principal.as_ref()
     }
 
     #[must_use]
@@ -1875,6 +1879,7 @@ mod tests {
                 identifiers: IdSequence::for_session(),
                 attestation,
                 chat_memory: None,
+                principal: None,
                 cancel: CancelSignal::never(),
                 script_cancel: parking_lot::Mutex::new(None),
                 attachments: None,

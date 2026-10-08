@@ -11,7 +11,9 @@ one.
 
 The authority-bearing half of the wire carries only capability inspection requests and untrusted
 `InvocationRequest` values. It has no principal, actor, policy, constraint, credential **value**, or
-`AuthorizedInvocation` field. An optional `secretUse` is an inert canonical public DRN plus native
+`AuthorizedInvocation` field. The answer to an attested `capabilities` request may carry
+`principal`, the broker principal the subject maps to, as a display name only: no client decides
+anything from it. An optional `secretUse` is an inert canonical public DRN plus native
 sink intent; possession grants nothing, and providers never receive it. A broker server must derive
 `AuthenticatedContext` from operating-system peer credentials and trusted workload mapping, then
 separately authorize and bind any DRN use.

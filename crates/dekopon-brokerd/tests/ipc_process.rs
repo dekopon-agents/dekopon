@@ -253,7 +253,7 @@ async fn ipc_process_boundary() {
                 "chat-agent".parse().unwrap(),
             )))
             .await
-            .map(|(capabilities, _, _, _)| capabilities);
+            .map(|surface| surface.capabilities);
         match role.as_str() {
             "mapped" | "owner" => assert_eq!(result.expect("mapped OS peer accepted").len(), 1),
             "wrong-pin" | "wrong-group" => {

@@ -2133,6 +2133,20 @@ where
         (capabilities, words, help)
     }
 
+    /// Display only: the gateway labels a shared-scope turn with it and decides nothing from it.
+    #[must_use]
+    pub fn display_principal(&self, subject: &ExternalSubject) -> Option<PrincipalId> {
+        self.identities.resolve(subject).cloned()
+    }
+
+    #[must_use]
+    pub fn principal_ceiling(&self) -> Option<PrincipalId> {
+        self.identities
+            .principals()
+            .max_by_key(|principal| principal.as_str().len())
+            .cloned()
+    }
+
     #[must_use]
     pub fn chat_memory_ceiling(&self) -> Option<ChatMemorySurface> {
         let config = self.chat_memory.as_ref()?;
