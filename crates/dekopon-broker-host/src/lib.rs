@@ -145,6 +145,7 @@ impl Default for BrokerHostLimits {
 pub struct TestImports {
     pub clock: Option<std::time::SystemTime>,
     pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
+    pub settings: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1139,10 +1140,14 @@ impl BrokerWasmProvider {
                     .or(self.runtime.test_clock),
             ),
             SettingsState::invoke(
-                self.runtime
-                    .provider_settings
-                    .get(&self.manifest.id)
-                    .cloned(),
+                test_imports
+                    .and_then(|imports| imports.settings.clone())
+                    .or_else(|| {
+                        self.runtime
+                            .provider_settings
+                            .get(&self.manifest.id)
+                            .cloned()
+                    }),
             ),
         )?;
         let cancel = assets.cancel.take();

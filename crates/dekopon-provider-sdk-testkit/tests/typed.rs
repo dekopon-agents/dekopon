@@ -16,7 +16,7 @@ use dekopon_provider_sdk::{
     clap::{Parser, Subcommand},
     provider::{
         Capability, Clock, Code, DurableFiles, Failure, Header, Http, Monotonic, Proposal,
-        Provider, Random, Request, Response, Stdout, Storage, Usage,
+        Provider, Random, Request, Response, Settings, Stdout, Storage, Usage, endpoint::Base,
     },
 };
 use dekopon_provider_sdk_testkit::{
@@ -664,4 +664,94 @@ fn native_fake_records_http_and_fixes_guest_clock() {
         native.requests()[0].uri,
         "https://fixture.example.test/path"
     );
+}
+
+struct Vendor;
+struct Search;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Endpoint {
+    base_url: Option<Base>,
+}
+const VENDOR_BASE: Base = Base::from_static("https://api.vendor.example");
+impl Provider for Vendor {
+    const ID: &'static str = "vendor";
+    const COMMAND_WORDS: &'static [&'static str] = &["vendor"];
+    const DESCRIPTION: &'static str = "a provider with an owner-overridable origin";
+    type Args = NoArgs;
+    type Capabilities = (Search,);
+    fn propose(_: NoArgs, _: bool) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<Search>(Text {
+            text: "rust".to_owned(),
+        }))
+    }
+}
+impl Capability for Search {
+    type Provider = Vendor;
+    const NAME: &'static str = "search";
+    const DESCRIPTION: &'static str = "Search the vendor";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Low;
+    type Input = Text;
+    type Needs = (Settings<Endpoint>, Http);
+    type Error = Gone;
+    fn run(
+        input: Text,
+        (settings, http): (Settings<Endpoint>, Http),
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let base = settings.into_inner().base_url.unwrap_or(VENDOR_BASE);
+        let uri = base.join(&format!("/search?q={}", input.text)).unwrap();
+        let response = http.send(Request::new("GET", uri).unwrap()).unwrap();
+        emit(out, Ok(json!({"status": response.status})))
+    }
+}
+
+#[test]
+fn a_base_url_setting_overrides_the_vendor_origin_and_keeps_its_prefix() {
+    let ok = Response {
+        status: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let vendor =
+        Native::<Vendor>::new().http(HttpScript::new("api.vendor.example", "GET", ok.clone()));
+    assert_eq!(
+        stdout_value(&vendor.call("vendor.search", r#"{"text":"rust"}"#)),
+        json!({"status": 200})
+    );
+    let fixture = Native::<Vendor>::new()
+        .settings(json!({"baseUrl": "https://fixture.example.test/vendor/"}))
+        .http(HttpScript::new("fixture.example.test", "GET", ok));
+    assert_eq!(
+        stdout_value(&fixture.call("vendor.search", r#"{"text":"rust"}"#)),
+        json!({"status": 200})
+    );
+    let uris = |native: &Native<Vendor>| {
+        native
+            .requests()
+            .into_iter()
+            .map(|request| request.uri)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(uris(&vendor), ["https://api.vendor.example/search?q=rust"]);
+    assert_eq!(
+        uris(&fixture),
+        ["https://fixture.example.test/vendor/search?q=rust"]
+    );
+    let invalid = Native::<Vendor>::new()
+        .settings(json!({"baseUrl": "https://fixture.example.test/vendor?x=1"}))
+        .http(HttpScript::new(
+            "api.vendor.example",
+            "GET",
+            Response {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ));
+    let refused = invalid.call("vendor.search", r#"{"text":"rust"}"#);
+    assert_eq!(refused.status, 1);
+    assert!(refused.stderr.contains("settings"), "{}", refused.stderr);
+    assert!(invalid.requests().is_empty());
 }
