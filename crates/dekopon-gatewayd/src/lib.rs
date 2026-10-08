@@ -22,6 +22,7 @@ mod jobs;
 mod journal;
 mod meter_restore;
 mod metering;
+mod probe;
 mod progress;
 mod proxy;
 mod routes;
@@ -53,6 +54,7 @@ pub use config::{
     ResolvedConfig, ResolvedJournal, ResolvedRoute, ResolvedTelemetry, SlackExperience,
     SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
 };
+pub use probe::{NotProbed, ProbeError, ProbeProblem, ProbeScope};
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
 pub use transport::TransportError;
@@ -100,7 +102,7 @@ where
     F: Future<Output = ()> + Send,
 {
     let (candidate, report) =
-        load_candidate(config_path.as_ref(), None, config::LoadMode::Boot).await;
+        load_candidate(config_path.as_ref(), None, config::LoadMode::Boot, None).await;
     let Some(Candidate {
         config,
         routes,
@@ -298,6 +300,14 @@ pub enum CheckWarning {
     ModelCredential { model: String, variable: String },
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
+    #[error("model {model} not probed: {reason}")]
+    NotProbed { model: String, reason: NotProbed },
+    #[error("{} did not load, so every model is probed", .path.display())]
+    Baseline {
+        path: std::path::PathBuf,
+        #[source]
+        source: ConfigError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +316,7 @@ pub enum Stage {
     Catalog,
     Routes,
     Credentials,
+    Probe,
 }
 
 impl std::fmt::Display for Stage {
@@ -315,16 +326,26 @@ impl std::fmt::Display for Stage {
             Self::Catalog => "agent catalog",
             Self::Routes => "routes",
             Self::Credentials => "credentials",
+            Self::Probe => "vendor probe",
         })
     }
 }
 
-/// Runs the validation `run` runs, then stops: the broker socket is never probed, no credential
-/// variable or model login is read, and no journal is opened.
-pub async fn check(config_path: impl AsRef<Path>, catalog_path: Option<&Path>) -> CheckReport {
-    load_candidate(config_path.as_ref(), catalog_path, config::LoadMode::Check)
-        .await
-        .1
+/// Runs the validation `run` runs, then stops: the broker socket is never contacted, no model login
+/// or journal is read, and a credential variable is read only to probe a model's vendor.
+pub async fn check(
+    config_path: impl AsRef<Path>,
+    catalog_path: Option<&Path>,
+    probe: Option<&ProbeScope>,
+) -> CheckReport {
+    load_candidate(
+        config_path.as_ref(),
+        catalog_path,
+        config::LoadMode::Check,
+        probe.map(|scope| (scope, &probe::Vendor::LIVE)),
+    )
+    .await
+    .1
 }
 
 pub(crate) struct Candidate {
@@ -339,6 +360,7 @@ pub(crate) async fn load_candidate(
     config_path: &Path,
     catalog_path: Option<&Path>,
     mode: config::LoadMode,
+    probe: Option<(&ProbeScope, &probe::Vendor)>,
 ) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let config = match config::load_in(config_path, current_uid(), mode).await {
@@ -387,6 +409,13 @@ pub(crate) async fn load_candidate(
             Vec::new()
         }
     };
+    match (probe, &config) {
+        (Some((scope, vendor)), Some(config)) => {
+            probe::probe(config, routes.as_ref(), scope, vendor, &mut report).await;
+        }
+        (Some(_), None) => report.skipped(Stage::Probe),
+        (None, _) => {}
+    }
     let candidate = match (config, routes) {
         (Some(config), Some(routes)) if report.problems.is_empty() => Some(Candidate {
             config,
@@ -1149,6 +1178,8 @@ pub enum GatewaydError {
     WakeStore(#[from] WakeStoreError),
     #[error("guest model proxy could not start")]
     Proxy(#[source] proxy::ProxyStartError),
+    #[error(transparent)]
+    Probe(Box<ProbeProblem>),
     #[error("{}", render_problems(.problems))]
     Problems { problems: Vec<GatewaydError> },
 }

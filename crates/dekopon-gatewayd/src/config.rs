@@ -419,7 +419,7 @@ impl TransportConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(
     tag = "kind",
     deny_unknown_fields,
@@ -491,6 +491,15 @@ impl ModelConfig {
             | Self::ChatgptSubscription { name, .. }
             | Self::Openrouter { name, .. }
             | Self::Anthropic { name, .. } => name,
+        }
+    }
+
+    pub(crate) fn vendor_model(&self) -> &str {
+        match self {
+            Self::OpenaiCompatible { model, .. }
+            | Self::ChatgptSubscription { model, .. }
+            | Self::Openrouter { model, .. }
+            | Self::Anthropic { model, .. } => model,
         }
     }
 
@@ -886,6 +895,7 @@ pub struct ResolvedConfig {
     pub broker: ResolvedBroker,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    pub(crate) model_files: BTreeMap<String, PathBuf>,
     pub routes: Vec<ResolvedRoute>,
     pub(crate) liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub(crate) stop_words: Vec<String>,
@@ -956,6 +966,7 @@ async fn load_directory(
     let mut parsed = Vec::with_capacity(paths.len());
     let mut defined = BTreeMap::<String, PathBuf>::new();
     let mut referenced = Vec::<(PathBuf, String)>::new();
+    let mut model_files = BTreeMap::<String, PathBuf>::new();
     for path in paths {
         let bytes = read_config_file(path.clone(), expected_uid).await?;
         let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
@@ -969,6 +980,9 @@ async fn load_directory(
         }
         for transport in names_under(&mapping, "routes", "transport") {
             referenced.push((path.clone(), transport));
+        }
+        for model in names_under(&mapping, "models", "name") {
+            model_files.insert(model, path.clone());
         }
         parsed.push((path, mapping));
     }
@@ -1006,7 +1020,10 @@ async fn load_directory(
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
     ) {
-        Ok(resolved) => Ok((resolved, refusals)),
+        Ok(mut resolved) => {
+            resolved.model_files.extend(model_files);
+            Ok((resolved, refusals))
+        }
         Err(error) => Err(later(error, refusals)),
     }
 }
@@ -1671,6 +1688,11 @@ pub(crate) fn resolve(
     match (frame, socket_path, telemetry) {
         (Some(frame), Some(socket_path), Some(telemetry)) if problems.is_empty() => {
             Ok(ResolvedConfig {
+                model_files: config
+                    .models
+                    .iter()
+                    .map(|model| (model.name().to_owned(), source.clone()))
+                    .collect(),
                 source,
                 catalog_path: resolve_path(config.catalog_path),
                 broker: ResolvedBroker {

@@ -23,8 +23,8 @@ pub struct Cli {
 pub enum Command {
     /// Manage model-account authentication without starting the gateway.
     Auth(AuthOptions),
-    /// Run startup validation on a configuration without serving: the broker is never contacted
-    /// and no credential variable, model login or journal is read.
+    /// Run startup validation on a configuration without serving: the broker is never contacted,
+    /// no model login or journal is read, and no credential variable is read without --probe.
     Check(CheckArgs),
 }
 
@@ -37,6 +37,14 @@ pub struct CheckArgs {
     /// Agent catalog file or directory to check instead of the configured catalogPath.
     #[arg(long, value_name = "PATH")]
     pub catalog: Option<PathBuf>,
+    /// Send one short completion to the vendor of each changed API-key model, reading its
+    /// credential variable; subscription and proxy-only models are reported as not probed.
+    #[arg(long)]
+    pub probe: bool,
+    /// Live configuration file or directory; a model is changed when its name is absent there or
+    /// its parsed settings differ. Without it, every model is probed.
+    #[arg(long, value_name = "CONFIG", requires = "probe")]
+    pub against: Option<PathBuf>,
     /// Render problems and warnings as a table or JSON.
     #[arg(long, value_enum, default_value_t = CheckFormat::Table, value_name = "FORMAT")]
     pub output: CheckFormat,
