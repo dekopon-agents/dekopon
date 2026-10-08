@@ -314,6 +314,8 @@ pub enum TransportConfig {
         name: String,
         bot_token_env: String,
         #[serde(default)]
+        message_content: bool,
+        #[serde(default)]
         liveness: LivenessConfig,
         #[serde(default)]
         endpoint: Option<String>,
@@ -1147,6 +1149,7 @@ pub(crate) fn resolve(
             TransportConfig::DiscordGateway {
                 name,
                 bot_token_env,
+                message_content,
                 liveness,
                 endpoint,
             } => {
@@ -1155,6 +1158,7 @@ pub(crate) fn resolve(
                 TransportConfig::DiscordGateway {
                     name,
                     bot_token_env,
+                    message_content,
                     liveness,
                     endpoint: Some(endpoint),
                 }

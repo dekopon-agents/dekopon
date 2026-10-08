@@ -69,8 +69,11 @@ use crate::{
     },
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, MessageId,
-        ThreadOwnership, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        ThreadOwnership, TransportEvent, TransportIdentity,
+        discord::{DiscordTransport, MessageContent},
+        local::LocalTransport,
+        slack::SlackTransport,
+        telegram::TelegramTransport,
         whatsapp::WhatsappTransport,
     },
 };
@@ -954,15 +957,20 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
         TransportConfig::DiscordGateway {
             name,
             bot_token_env,
+            message_content,
             liveness,
             endpoint,
-            ..
         } => Box::new(DiscordTransport::new(
             name.clone(),
             endpoint
                 .clone()
                 .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
             transport::read_credential(bot_token_env)?,
+            if *message_content {
+                MessageContent::Requested
+            } else {
+                MessageContent::Withheld
+            },
             liveness.settings(),
         )?),
         TransportConfig::WhatsappCloudApi {

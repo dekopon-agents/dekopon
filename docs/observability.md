@@ -448,7 +448,8 @@ when a person's message went unserved (`content-withheld`, `malformed-envelope`,
 `conversation-unresolved`), DEBUG for `message-type`, `bot-authored` and `self-authored`. A
 `content-withheld` drop records `mention.roles` on both, true when the message mentioned any role:
 a mention of the bot's managed role renders as the bot but is not a user mention, so Discord withholds
-its content.
+its content unless the transport sets `messageContent: true`
+([How @mentions reach the bot on Discord](gatewayd.md#how-mentions-reach-the-bot-on-discord)).
 
 A WhatsApp group payload is the one drop that does not use the field. One `transport.receive` span
 covers a whole delivery, so a `drop.reason` there would be overwritten by the next message in the
@@ -633,6 +634,9 @@ or `channel-type`; on Slack, where it is an `app_mention` carrying no `channel_t
 the cause, and `cause_type` rendering the underlying error where there is one — Slack's own stable
 error word, or the HTTP client's failure — with Discord's `status` arm carrying the response
 `status` instead. Never a token and never a byte of the payload.
+`gateway_role_unresolved` is the Discord debug record of a guild-roles lookup that did not answer,
+so a mention of the bot's managed role in that message did not address it; `cause` is
+`rest-cooldown`, `request`, `status`, `timeout`, `body`, or `role-shape`, with the same fields.
 
 `gateway_conversation_evicted` carries a reason of `idle`, `capacity`, or `grant-changed` and
 nothing else, so a `maxConversations` ceiling set too low reads as eviction churn instead of as a
