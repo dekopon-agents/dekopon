@@ -190,15 +190,16 @@ impl<T: DeserializeOwned> Needs for Settings<T> {
 }
 
 fn parse_settings<T: DeserializeOwned>(json: Option<String>) -> Result<T, SdkFailure> {
-    json.ok_or(SdkFailure::InvalidSettings).and_then(|json| {
-        serde_json::from_str(&json).map_err(|_invalid_json| SdkFailure::InvalidSettings)
-    })
+    serde_json::from_str(json.as_deref().unwrap_or("{}"))
+        .map_err(|_invalid_json| SdkFailure::InvalidSettings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Clock, Http, ImportSet, Jsonl, Needs, Settings, Storage, parse_settings};
     use crate::provider::SdkFailure;
+    use crate::provider::endpoint::Base;
+    use serde::Deserialize;
 
     #[test]
     fn needs_union_deduplicates_interfaces_and_pure_needs_import_nothing() {
@@ -223,6 +224,39 @@ mod tests {
             Err(SdkFailure::InvalidSettings)
         );
         assert_eq!(parse_settings::<u64>(Some("42".into())), Ok(42));
+    }
+
+    #[test]
+    fn absent_settings_parse_as_an_empty_object() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Endpoint {
+            base_url: Option<Base>,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Required {
+            #[expect(dead_code, reason = "only its presence is parsed")]
+            base_url: Base,
+        }
+        assert_eq!(
+            parse_settings::<Endpoint>(None),
+            Ok(Endpoint { base_url: None })
+        );
+        assert!(matches!(
+            parse_settings::<Required>(None),
+            Err(SdkFailure::InvalidSettings)
+        ));
+        assert_eq!(
+            parse_settings::<Endpoint>(Some(r#"{"baseUrl":"http://127.0.0.1:8787/x/"}"#.into())),
+            Ok(Endpoint {
+                base_url: Base::parse("http://127.0.0.1:8787/x").ok()
+            })
+        );
+        assert!(matches!(
+            parse_settings::<Endpoint>(Some(r#"{"baseUrl":"https://api.example.com?x"}"#.into())),
+            Err(SdkFailure::InvalidSettings)
+        ));
     }
 }
 

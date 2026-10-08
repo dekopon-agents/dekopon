@@ -16,7 +16,10 @@ dekopon_provider_sdk::export!(MyProvider);
 The SDK owns guest bindings for buffered HTTP, asset-backed request bodies,
 wall and monotonic clocks, OS entropy, settings, storage, and child scripts. `provider::Http`, `Clock`,
 `Monotonic`, `Random`, `Settings<T>`, `Storage<K>`, `Assets`, and `Spawn` are private-construction handles; the broker alone
-grants their imports. `Clock` remains wall-only; `Random::fill` splits a buffer into 4096-byte host reads. `Bounded<N>` validates input by UTF-8 byte length, and
+grants their imports. `Settings<T>` parses the owner's `providerSettings.<id>`, or `{}` when
+there is none. `provider::endpoint::Base` is the origin a provider sends to: a vendor default from
+`Base::from_static`, overridden by the owner key `providerSettings.<id>.baseUrl`; `join` appends a
+path beginning with `/`. The rule: a provider talks to one origin; a second vendor is a second provider or a `vendor` setting. `Clock` remains wall-only; `Random::fill` splits a buffer into 4096-byte host reads. `Bounded<N>` validates input by UTF-8 byte length, and
 `Truncated<N>` cuts output on a character boundary. `manifest::<P>()`,
 `call::<P>()` and `command::<P>()` use the same typed dispatch as the component
 export. `Spawn::run(script, ChildStdin)` exposes a child stdout reader and a status
