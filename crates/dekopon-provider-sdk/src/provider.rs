@@ -1,4 +1,5 @@
 mod bounded;
+pub mod endpoint;
 mod handles;
 #[cfg(not(target_arch = "wasm32"))]
 mod port;
