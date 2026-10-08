@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dekopon_capability::{HttpConstraints, SecretUseGrant};
+use dekopon_capability::{ChatSlotValues, HttpConstraints, SecretUseGrant};
 use dekopon_http_host::{
     BufferedHttpClient, ConfigurationError, ErrorCode as NativeErrorCode, Header as NativeHeader,
     HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest,
@@ -32,6 +32,7 @@ impl HttpState {
         grant: Option<HttpConstraints>,
         secret_grant: Option<SecretUseGrant>,
         credential: Option<BoundCredential>,
+        slots: ChatSlotValues,
         ceilings: HttpCeilings,
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
@@ -51,7 +52,9 @@ impl HttpState {
                 });
             }
         };
-        Ok(Self { client })
+        Ok(Self {
+            client: client.with_chat_slots(slots),
+        })
     }
 
     pub(crate) fn attempted(&self) -> bool {

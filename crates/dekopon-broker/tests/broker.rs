@@ -282,6 +282,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
@@ -619,6 +620,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
@@ -686,6 +688,121 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     ] {
         assert!(!serialized.contains(secret), "audit leaked {secret}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scope() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let mut constraints = loopback_constraints(&authority);
+    constraints.http.as_mut().expect("HTTP").request_templates = vec![
+        serde_json::from_value(json!({
+            "method": "GET",
+            "path": "/api/conversations.replies",
+            "query": {
+                "pinned": {"channel": "conversation.id", "ts": "conversation.thread"},
+                "allowed": ["limit"]
+            }
+        }))
+        .expect("template fixture"),
+    ];
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
+        catalog([("http-probe.fetch", set("http-probe", constraints))]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("a templated HTTP constraint set is coherent");
+    let fetch = |id: &str| {
+        request(
+            id,
+            "http-probe.fetch",
+            json!({"uri": format!("http://{authority}/api/conversations.replies?limit=5")}),
+        )
+    };
+
+    let unscoped = invoke_as(&broker, "caller", "provider-test", fetch("invoke-unscoped"))
+        .await
+        .expect("a denial is a result");
+    assert_eq!(
+        unscoped.result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(
+        unscoped.result.error.as_deref(),
+        Some("chat-scope-required")
+    );
+
+    let request = fetch("invoke-scoped");
+    let attestation = Attestation::for_chat(
+        caller_subject("caller"),
+        agent("provider-test"),
+        dekopon_broker::ChatScopeClaim {
+            transport: "family-slack".parse().expect("transport"),
+            kind: dekopon_broker::ChatTransportKind::Slack,
+            conversation: dekopon_broker::Conversation {
+                kind: dekopon_broker::ConversationKind::Thread,
+                container: Some("t0123abc".to_owned()),
+                id: "c0123abc".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: dekopon_broker::Trigger::Message,
+        },
+    )
+    .bound_to(request.id.clone());
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("test stdout pipe");
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).expect("stdout capture");
+        bytes
+    });
+    let scoped = broker
+        .invoke(
+            &service_context(GATEWAY),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&attestation),
+            request,
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the scoped invocation runs");
+    capture.join().expect("stdout capture thread");
+    assert_eq!(
+        scoped.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded,
+        "{:?}",
+        scoped.result.error
+    );
+    let wire = String::from_utf8(server.request()).expect("fixture request is UTF-8");
+    server.join();
+    assert_eq!(
+        wire.lines().next(),
+        Some(
+            "GET /api/conversations.replies?limit=5&channel=C0123ABC&ts=1712345678.000100 HTTP/1.1"
+        )
+    );
+    let records = serde_json::to_string(&audit.records()).expect("audit serializes");
+    assert!(!records.contains("C0123ABC"), "{records}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1667,6 +1784,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: false,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,

@@ -253,6 +253,7 @@ impl<P: Provider> Run<P> {
                 max_response_bytes: 64 * 1024,
                 allow_plaintext_loopback: false,
                 propagate_trace: false,
+                request_templates: Vec::new(),
             });
             server = Some(started);
         }

@@ -28,7 +28,9 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dekopon_capability::{HttpConstraints, HttpConstraintsError, SecretUseGrant};
+use dekopon_capability::{
+    ChatSlotValues, HttpConstraints, HttpConstraintsError, PathSegment, SecretUseGrant,
+};
 use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
 use futures_util::StreamExt as _;
 use reqwest::{
@@ -658,6 +660,7 @@ pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
     secret_grant: Option<SecretUseGrant>,
     credential: Option<BoundCredential>,
+    slots: ChatSlotValues,
     ceilings: HttpHostCeilings,
     timeout: Duration,
     deadline: Instant,
@@ -753,6 +756,7 @@ impl BufferedHttpClient {
             grant,
             secret_grant,
             credential,
+            slots: ChatSlotValues::default(),
             ceilings,
             timeout,
             deadline,
@@ -765,6 +769,12 @@ impl BufferedHttpClient {
             resolved: HashMap::new(),
             pinned_client: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_chat_slots(mut self, slots: ChatSlotValues) -> Self {
+        self.slots = slots;
+        self
     }
 
     pub fn asset_over_budget(&self) -> bool {
@@ -1065,7 +1075,7 @@ impl BufferedHttpClient {
             ));
         }
 
-        let url = Url::parse(&request.uri).map_err(|error| {
+        let mut url = Url::parse(&request.uri).map_err(|error| {
             http_error(
                 ErrorCode::InvalidUri,
                 format!("URI is not a valid absolute URL: {error}"),
@@ -1118,6 +1128,7 @@ impl BufferedHttpClient {
                 ));
             }
         }
+        apply_request_templates(grant, &self.slots, &method, &mut url)?;
 
         if request.headers.len() > self.ceilings.max_headers {
             return Err(http_error(
@@ -1414,6 +1425,91 @@ impl BufferedHttpClient {
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| http_error(ErrorCode::Timeout, "invocation deadline expired"))
     }
+}
+
+/// The outgoing path is rebuilt from the template rather than edited in place, so how the provider
+/// percent-encoded its placeholders can never change what the upstream receives.
+fn apply_request_templates(
+    grant: &HttpConstraints,
+    slots: &ChatSlotValues,
+    method: &Method,
+    url: &mut Url,
+) -> Result<(), HttpError> {
+    if grant.request_templates.is_empty() {
+        return Ok(());
+    }
+    let decoded = percent_encoding::percent_decode_str(url.path())
+        .decode_utf8()
+        .map_err(|_error| {
+            http_error(ErrorCode::Denied, "request path is not UTF-8 once decoded")
+        })?;
+    let segments = if decoded == "/" {
+        Vec::new()
+    } else {
+        decoded.split('/').skip(1).collect::<Vec<_>>()
+    };
+    let Some(template) = grant
+        .request_templates
+        .iter()
+        .find(|template| template.method == method.as_str() && template.path.matches(&segments))
+    else {
+        return Err(http_error(
+            ErrorCode::Denied,
+            "request matches no request template of this capability",
+        ));
+    };
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    for (key, _) in &pairs {
+        if template.query.pinned.contains_key(key) {
+            return Err(http_error(
+                ErrorCode::Denied,
+                format!("query key {key:?} is host-filled by request template {template}"),
+            ));
+        }
+        if !template.query.allowed.contains(key) {
+            return Err(http_error(
+                ErrorCode::Denied,
+                format!("request template {template} does not allow one of the query keys"),
+            ));
+        }
+    }
+    let slot_value = |slot| {
+        slots.get(slot).ok_or_else(|| {
+            http_error(
+                ErrorCode::Denied,
+                format!(
+                    "request template {template} needs {{{slot}}}, which this invocation lacks"
+                ),
+            )
+        })
+    };
+    let mut path = Vec::with_capacity(template.path.segments().len());
+    for segment in template.path.segments() {
+        path.push(match segment {
+            PathSegment::Literal(literal) => literal.as_str(),
+            PathSegment::Slot(slot) => slot_value(*slot)?,
+        });
+    }
+    let mut pinned = Vec::with_capacity(template.query.pinned.len());
+    for (key, slot) in &template.query.pinned {
+        pinned.push((key.as_str(), slot_value(*slot)?));
+    }
+    url.path_segments_mut()
+        .map_err(|()| http_error(ErrorCode::InvalidUri, "URI cannot carry a path"))?
+        .clear()
+        .extend(path);
+    if pairs.is_empty() && pinned.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(&pairs)
+            .extend_pairs(pinned);
+    }
+    Ok(())
 }
 
 fn validate_configuration(
@@ -1732,7 +1828,10 @@ mod tests {
 
     use dekopon_test_support::LoopbackServer;
 
-    use dekopon_capability::{HttpConstraints, HttpConstraintsError, HttpPathRule, SecretUseGrant};
+    use dekopon_capability::{
+        ChatSlot, ChatSlotValues, HttpConstraints, HttpConstraintsError, HttpPathRule,
+        RequestTemplate, SecretUseGrant,
+    };
     use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
 
     use super::{
@@ -1751,6 +1850,7 @@ mod tests {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }
     }
 
@@ -2575,6 +2675,198 @@ mod tests {
                 .expect_err("scope confusion is denied");
             assert_eq!(error.code, ErrorCode::Denied, "{uri}");
         }
+    }
+
+    fn templated(authority: &str, template: serde_json::Value) -> HttpConstraints {
+        HttpConstraints {
+            allowed_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            request_templates: vec![
+                serde_json::from_value::<RequestTemplate>(template).expect("template fixture"),
+            ],
+            ..grant(authority.to_owned(), "GET")
+        }
+    }
+
+    fn slack_replies(authority: &str) -> HttpConstraints {
+        templated(
+            authority,
+            serde_json::json!({
+                "method": "GET",
+                "path": "/api/conversations.replies",
+                "query": {
+                    "pinned": {"channel": "conversation.id", "ts": "conversation.thread"},
+                    "allowed": ["limit", "cursor"]
+                }
+            }),
+        )
+    }
+
+    fn discord_messages(authority: &str) -> HttpConstraints {
+        templated(
+            authority,
+            serde_json::json!({
+                "method": "GET",
+                "path": "/channels/{conversation.apiChannel}/messages",
+                "query": {"allowed": ["limit", "before"]}
+            }),
+        )
+    }
+
+    fn slots(values: &[(ChatSlot, &str)]) -> ChatSlotValues {
+        let mut slots = ChatSlotValues::default();
+        for (slot, value) in values {
+            slots.insert(*slot, (*value).to_owned());
+        }
+        slots
+    }
+
+    async fn sent_request_line(
+        grant: HttpConstraints,
+        slots: ChatSlotValues,
+        path: &str,
+    ) -> String {
+        let server = LoopbackServer::once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let authority = server.authority().to_owned();
+        let mut client = BufferedHttpClient::authorized(
+            HttpConstraints {
+                allowed_hosts: vec![authority.clone()],
+                ..grant
+            },
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization")
+        .with_chat_slots(slots);
+        client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}{path}"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect("templated request succeeds");
+        let request = String::from_utf8(server.request()).expect("fixture request is UTF-8");
+        server.join();
+        request.lines().next().expect("request line").to_owned()
+    }
+
+    async fn template_denial(
+        grant: HttpConstraints,
+        slots: ChatSlotValues,
+        method: &str,
+        path: &str,
+    ) -> super::HttpError {
+        let mut client = BufferedHttpClient::authorized(
+            grant,
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization")
+        .with_chat_slots(slots);
+        client
+            .send(Request {
+                method: method.to_owned(),
+                uri: format!("http://127.0.0.1:9{path}"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("the request template refuses this request")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slack_replies_template_pins_the_attested_channel_and_thread() {
+        let line = sent_request_line(
+            slack_replies("127.0.0.1:9"),
+            slots(&[
+                (ChatSlot::ConversationId, "C0123ABC"),
+                (ChatSlot::ConversationThread, "1700000000.000100"),
+            ]),
+            "/api/conversations.replies?limit=5",
+        )
+        .await;
+        assert_eq!(
+            line,
+            "GET /api/conversations.replies?limit=5&channel=C0123ABC&ts=1700000000.000100 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slack_replies_template_denies_another_channel_and_unlisted_keys() {
+        let attested = slots(&[
+            (ChatSlot::ConversationId, "C0123ABC"),
+            (ChatSlot::ConversationThread, "1700000000.000100"),
+        ]);
+        for query in [
+            "?channel=C0999ZZZ&limit=5",
+            "?ts=1.2",
+            "?limit=5&user=U1",
+            "?a;channel=C0999ZZZ",
+        ] {
+            let error = template_denial(
+                slack_replies("127.0.0.1:9"),
+                attested.clone(),
+                "GET",
+                &format!("/api/conversations.replies{query}"),
+            )
+            .await;
+            assert_eq!(error.code, ErrorCode::Denied, "{query}");
+            assert!(!error.message.contains("C0123ABC"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_discord_template_fills_the_api_channel_into_the_path() {
+        let attested = slots(&[(ChatSlot::ConversationApiChannel, "1122334455")]);
+        for path in [
+            "/channels/{conversation.apiChannel}/messages?limit=10",
+            "/channels/%7Bconversation.apiChannel%7D/messages?limit=10",
+        ] {
+            assert_eq!(
+                sent_request_line(discord_messages("127.0.0.1:9"), attested.clone(), path).await,
+                "GET /channels/1122334455/messages?limit=10 HTTP/1.1"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_discord_template_denies_another_channel_in_the_path_and_other_methods() {
+        let attested = slots(&[(ChatSlot::ConversationApiChannel, "1122334455")]);
+        for (method, path) in [
+            ("GET", "/channels/9988776655/messages"),
+            ("GET", "/channels/{conversation.id}/messages"),
+            ("GET", "/channels/{conversation.apiChannel}/messages/1"),
+            (
+                "GET",
+                "/channels/{conversation.apiChannel}/../9988776655/messages",
+            ),
+            ("POST", "/channels/{conversation.apiChannel}/messages"),
+        ] {
+            let error = template_denial(
+                discord_messages("127.0.0.1:9"),
+                attested.clone(),
+                method,
+                path,
+            )
+            .await;
+            assert_eq!(error.code, ErrorCode::Denied, "{method} {path}");
+            assert!(!error.message.contains("1122334455"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_template_slot_the_invocation_lacks_is_denied_before_connection() {
+        let error = template_denial(
+            slack_replies("127.0.0.1:9"),
+            slots(&[(ChatSlot::ConversationId, "C0123ABC")]),
+            "GET",
+            "/api/conversations.replies",
+        )
+        .await;
+        assert_eq!(error.code, ErrorCode::Denied);
     }
 
     #[test]

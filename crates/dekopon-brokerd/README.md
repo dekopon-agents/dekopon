@@ -200,6 +200,64 @@ request limits. `tracestate` is never sent. A provider that sets either header i
 with `InvalidHeader`, even when propagation is off. Destination, method and transport restrictions
 remain independent; this flag grants no network access.
 
+### Request templates
+
+`requestTemplates` belongs to an HTTP constraint set and pins a request to the conversation the
+gateway attested, so a provider reading chat history can reach only the chat it was called from.
+Each rule names one method, one path and the query keys it accepts; a set with any rule accepts a
+request only if it matches one, beside every other constraint. A later write capability carries its
+own `POST` rule in its own constraint set, so a read grant never implies a send.
+
+```yaml
+capabilities:
+  slack-history:
+    capabilities:
+      slack-history.replies:
+        constraints:
+          http:
+            allowedHosts: [slack.com]
+            allowedMethods: [GET]
+            requestTemplates:
+              - method: GET
+                path: /api/conversations.replies
+                query:
+                  pinned: { channel: conversation.id, ts: conversation.thread }
+                  allowed: [limit, cursor, oldest, latest]
+  discord-history:
+    capabilities:
+      discord-history.messages:
+        constraints:
+          http:
+            allowedHosts: [discord.com]
+            allowedMethods: [GET]
+            requestTemplates:
+              - method: GET
+                path: /api/v10/channels/{conversation.apiChannel}/messages
+                query: { allowed: [limit, before, after] }
+```
+
+A slot is one of the attested values:
+
+| Slot | Value |
+|---|---|
+| `conversation.id` | the conversation id: the Slack channel, the Discord channel |
+| `conversation.thread` | the thread coordinate: the Slack thread `ts`, the Discord thread channel |
+| `conversation.apiChannel` | the id the transport's API addresses: the Discord thread channel inside a thread, otherwise `conversation.id` |
+| `transport` | the attesting transport's configured id |
+
+Slack ids render upper-cased, as Slack's Web API takes them. The provider writes the slot name
+where the path takes one (`/channels/{conversation.apiChannel}/messages`) and never learns the
+value; the broker renders it from the attested scope and the native HTTP host fills it. The path is
+compared after one percent-decode and rebuilt from the rule, so a slot position matches only its
+own placeholder and a literal id, another slot or an extra segment is refused. Pinned query keys
+are host-filled: a provider that supplies one is refused, never overwritten, and a key outside
+`allowed` is refused. Denials name the rule, never the attested ids.
+
+A templated capability invoked without a chat scope is denied `chat-scope-required`; one whose
+slot the scope lacks, such as `conversation.thread` outside a thread, is denied
+`request-template-slot-absent`. Neither is listed to a session that would be denied. The rules join
+the capability's committed authority; the rendered ids are per invocation and stay out of it.
+
 ### Additional CA trust and non-public HTTPS egress
 
 These are **independent** broker-owned settings. `extraCABundles` adds PEM roots to

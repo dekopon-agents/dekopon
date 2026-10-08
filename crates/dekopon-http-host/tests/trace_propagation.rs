@@ -36,6 +36,7 @@ fn grant(authority: &str) -> HttpConstraints {
         max_response_bytes: 1024,
         allow_plaintext_loopback: true,
         propagate_trace: false,
+        request_templates: Vec::new(),
     }
 }
 

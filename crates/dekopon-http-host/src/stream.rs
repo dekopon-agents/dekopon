@@ -530,6 +530,7 @@ mod tests {
                 max_response_bytes: maximum,
                 allow_plaintext_loopback: true,
                 propagate_trace: false,
+                request_templates: Vec::new(),
             },
             credential,
             HttpHostCeilings::default(),

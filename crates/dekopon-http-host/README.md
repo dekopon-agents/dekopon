@@ -28,6 +28,10 @@ grant opts in with `propagateTrace`, buffered and streaming requests inject the 
 `http.request` span's W3C `traceparent` outside guest byte accounting. No header is sent without
 an OTel context, and `tracestate` is never sent. Operators opt in only first-party destinations
 inside their trust boundary, using a separate constraint set from third-party destinations.
+A grant with `requestTemplates` accepts a request only if its method, once-decoded path and
+query keys match one rule; the client fills the rule's slots from the `ChatSlotValues` the broker
+passes with `with_chat_slots`, rebuilds the path from the rule, appends pinned query keys and
+refuses a provider-supplied pinned key or one outside `allowed`.
 
 Destination-bound credentials are injected only after guest-header validation; a guest
 `authorization` header is rejected, not overwritten. Binding refusal never falls back to an

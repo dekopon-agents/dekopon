@@ -154,6 +154,7 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
@@ -1403,6 +1404,7 @@ fn conditional_write_constraints(
             max_response_bytes: 256 * 1024,
             allow_plaintext_loopback: true,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
@@ -1711,6 +1713,7 @@ async fn a_grant_outside_the_configured_shared_namespace_never_runs() {
                 None,
                 Some(grant),
                 Default::default(),
+                Default::default(),
             )
             .await
             .expect_err("a grant for another namespace is refused");
@@ -1835,6 +1838,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 ),
                 None,
                 Some(grant),
+                Default::default(),
                 Default::default(),
             )
             .await

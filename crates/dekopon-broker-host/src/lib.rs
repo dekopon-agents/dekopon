@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints};
+use dekopon_capability::{AuthorizedInvocation, ChatSlotValues, ExecutionConstraints};
 use dekopon_core::{CapabilityId, ProviderId};
 pub use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability, ProviderManifest,
@@ -1077,6 +1077,7 @@ impl BrokerWasmProvider {
         input: &Value,
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
+        slots: ChatSlotValues,
         storage_transaction: Option<dekopon_storage_host::StorageHandle>,
         mut assets: asset::AssetInputs,
         directory: Option<dekopon_http_host::asset::AssetDirectory>,
@@ -1120,6 +1121,7 @@ impl BrokerWasmProvider {
             constraints.http.clone(),
             constraints.secret_use.clone(),
             credential,
+            slots,
             ceilings,
             operation_timeout,
         ) {
@@ -1723,8 +1725,14 @@ impl BrokerProviderRegistry {
         credential: Option<BoundCredential>,
         assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_with_storage(authorized, credential, None, assets)
-            .await
+        self.invoke_with_storage(
+            authorized,
+            credential,
+            None,
+            ChatSlotValues::default(),
+            assets,
+        )
+        .await
     }
 
     pub async fn invoke_with_storage(
@@ -1732,9 +1740,10 @@ impl BrokerProviderRegistry {
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
         storage_grant: Option<StorageGrant>,
+        slots: ChatSlotValues,
         assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_with_test_imports(authorized, credential, storage_grant, assets, None)
+        self.invoke_authorized(authorized, credential, storage_grant, slots, assets, None)
             .await
     }
 
@@ -1743,6 +1752,31 @@ impl BrokerProviderRegistry {
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
         storage_grant: Option<StorageGrant>,
+        assets: asset::AssetInputs,
+        test_imports: Option<&TestImports>,
+    ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
+        self.invoke_authorized(
+            authorized,
+            credential,
+            storage_grant,
+            ChatSlotValues::default(),
+            assets,
+            test_imports,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the authorization, credential, storage grant and chat slots are separate grants \
+                  the broker hands over once each"
+    )]
+    async fn invoke_authorized(
+        &self,
+        authorized: AuthorizedInvocation,
+        credential: Option<BoundCredential>,
+        storage_grant: Option<StorageGrant>,
+        slots: ChatSlotValues,
         assets: asset::AssetInputs,
         test_imports: Option<&TestImports>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
@@ -1839,6 +1873,7 @@ impl BrokerProviderRegistry {
                 &proposal.input,
                 authorized.constraints(),
                 credential,
+                slots,
                 storage_transaction,
                 assets,
                 self.assets.clone(),

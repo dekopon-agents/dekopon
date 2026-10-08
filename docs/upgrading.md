@@ -8,6 +8,17 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Request templates (0.41.0)
+
+Upgrade the broker; nothing changes until a constraint set uses the new key. An HTTP constraint
+set may now carry `requestTemplates`, which pins a capability's requests to the attested
+conversation ([brokerd README](../crates/dekopon-brokerd/README.md#request-templates)). An older
+broker refuses a configuration that uses the key, so upgrade the broker before writing it. No
+broker protocol, provider WIT or SDK changed, and console needs no re-pin. Deployed provider
+components run unchanged; a provider whose Rust tests build `HttpConstraints` by struct literal
+adds `request_templates: Vec::new()` at its next re-pin, and one that calls
+`BrokerProviderRegistry::invoke_with_storage` passes `ChatSlotValues::default()` before the assets.
+
 ## Shared agent storage namespaces (0.40.0)
 
 Upgrade broker and gateway together as usual. No broker protocol, provider WIT or SDK changed;

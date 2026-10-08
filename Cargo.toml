@@ -58,6 +58,7 @@ jaq-json = { version = "2.0.1", features = ["serde"] }
 jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
 parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
 # `internal-logs` is the SDK's only runtime failure channel since the global error handler was
 # removed: without it every export failure — expired token, missing header, receiver down — is
 # discarded in silence. Each exporting binary filters the `opentelemetry` target off its own OTLP

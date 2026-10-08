@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use dekopon_broker_host::BrokerHostError;
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
-    ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
-    StorageScope,
+    ChatSlot, ExecutionConstraints, HttpConstraints, RequestTemplate, StorageAccess,
+    StorageConstraints, StorageInterface, StorageScope,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, MAX_FAILURE_MESSAGE_BYTES, PrincipalId,
@@ -17,7 +17,7 @@ use super::{
     ConstraintSet, ContextError, CredentialStore, IdentityDirectory, InMemoryAuditLog,
     PolicyEngine, PolicyWorld, encode_capability_authority, encode_execution_constraints,
     encode_host_limits, encode_memory_config, encode_storage_limits, provider_exit_status,
-    provider_failure_detail, public_host_error,
+    provider_failure_detail, public_host_error, render_chat_slots,
 };
 
 #[tokio::test]
@@ -566,6 +566,7 @@ fn a_flag_false_http_constraint_set_encodes_as_before_the_field_existed() {
             max_response_bytes: 4,
             allow_plaintext_loopback: false,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }),
         ..ExecutionConstraints::default()
     };
@@ -606,6 +607,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
             max_response_bytes: 4,
             allow_plaintext_loopback: false,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
@@ -646,6 +648,48 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         .expect("HTTP")
         .allowed_methods
         .push("PATCH".to_owned()));
+    let template = |value: serde_json::Value| {
+        serde_json::from_value::<RequestTemplate>(value).expect("template fixture")
+    };
+    let replies = template(serde_json::json!({
+        "method": "GET",
+        "path": "/api/conversations.replies",
+        "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}
+    }));
+    let history = template(serde_json::json!({
+        "method": "GET",
+        "path": "/channels/{conversation.apiChannel}/messages"
+    }));
+    let mut templated = baseline.clone();
+    templated.http.as_mut().expect("HTTP").request_templates =
+        vec![replies.clone(), history.clone()];
+    assert_ne!(bytes(&baseline), bytes(&templated));
+    let mut reordered_templates = templated.clone();
+    reordered_templates
+        .http
+        .as_mut()
+        .expect("HTTP")
+        .request_templates
+        .reverse();
+    assert_eq!(bytes(&templated), bytes(&reordered_templates));
+    for changed in [
+        serde_json::json!({"method": "GET", "path": "/api/conversations.history",
+            "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}}),
+        serde_json::json!({"method": "POST", "path": "/api/conversations.replies",
+            "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}}),
+        serde_json::json!({"method": "GET", "path": "/api/conversations.replies",
+            "query": {"pinned": {"channel": "conversation.apiChannel"}, "allowed": ["limit"]}}),
+        serde_json::json!({"method": "GET", "path": "/api/conversations.replies",
+            "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["cursor"]}}),
+        serde_json::json!({"method": "GET", "path": "/api/conversations.replies",
+            "query": {"pinned": {"channel": "conversation.id", "ts": "conversation.thread"},
+                      "allowed": ["limit"]}}),
+    ] {
+        let mut mutated = templated.clone();
+        mutated.http.as_mut().expect("HTTP").request_templates =
+            vec![template(changed.clone()), history.clone()];
+        assert_ne!(bytes(&templated), bytes(&mutated), "{changed}");
+    }
 
     let storage = ExecutionConstraints {
         http: None,
@@ -839,6 +883,7 @@ fn policy_http_scope_values_are_bounded() {
         max_response_bytes: 1,
         allow_plaintext_loopback: false,
         propagate_trace: false,
+        request_templates: Vec::new(),
     };
     assert!(super::validate_set_constraints(&constrain(valid.clone())).is_ok());
 
@@ -1058,6 +1103,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         max_response_bytes: 1,
         allow_plaintext_loopback: false,
         propagate_trace: false,
+        request_templates: Vec::new(),
     });
     assert!(matches!(
         super::validate_set_constraints(&set),
@@ -1122,6 +1168,100 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
         zero.retention_policies(),
         Err(BrokerBuildError::InvalidStorageRetention)
     ));
+}
+
+#[test]
+fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
+    use dekopon_broker_protocol::{
+        ChatScopeClaim, ChatTransportKind, Conversation, ConversationKind, Trigger,
+    };
+
+    let scope =
+        |kind, conversation_kind, container: Option<&str>, id: &str, thread: Option<&str>| {
+            ChatScopeClaim {
+                transport: "family-chat".parse().expect("transport"),
+                kind,
+                conversation: Conversation {
+                    kind: conversation_kind,
+                    container: container.map(str::to_owned),
+                    id: id.to_owned(),
+                    thread: thread.map(str::to_owned),
+                },
+                trigger: Trigger::Message,
+            }
+        };
+    let every_slot = HttpConstraints {
+        allowed_hosts: vec!["chat.example:443".to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        max_requests: 1,
+        max_request_bytes: 1024,
+        max_response_bytes: 1024,
+        allow_plaintext_loopback: false,
+        propagate_trace: false,
+        request_templates: vec![
+            serde_json::from_value::<RequestTemplate>(serde_json::json!({
+                "method": "GET",
+                "path": "/{transport}/{conversation.apiChannel}",
+                "query": {"pinned": {"c": "conversation.id", "t": "conversation.thread"}}
+            }))
+            .expect("template fixture"),
+        ],
+    };
+
+    let discord_thread = scope(
+        ChatTransportKind::Discord,
+        ConversationKind::Thread,
+        Some("111"),
+        "222",
+        Some("333"),
+    );
+    let values = render_chat_slots(Some(&every_slot), Some(&discord_thread)).expect("renders");
+    assert_eq!(values.get(ChatSlot::ConversationApiChannel), Some("333"));
+    assert_eq!(values.get(ChatSlot::ConversationId), Some("222"));
+    assert_eq!(values.get(ChatSlot::ConversationThread), Some("333"));
+    assert_eq!(values.get(ChatSlot::Transport), Some("family-chat"));
+
+    let slack_thread = scope(
+        ChatTransportKind::Slack,
+        ConversationKind::Thread,
+        Some("t0123abc"),
+        "c0123abc",
+        Some("1712345678.000100"),
+    );
+    let values = render_chat_slots(Some(&every_slot), Some(&slack_thread)).expect("renders");
+    assert_eq!(
+        values.get(ChatSlot::ConversationApiChannel),
+        Some("C0123ABC")
+    );
+    assert_eq!(values.get(ChatSlot::ConversationId), Some("C0123ABC"));
+    assert_eq!(
+        values.get(ChatSlot::ConversationThread),
+        Some("1712345678.000100")
+    );
+
+    let discord_channel = scope(
+        ChatTransportKind::Discord,
+        ConversationKind::Channel,
+        Some("111"),
+        "222",
+        None,
+    );
+    assert_eq!(
+        render_chat_slots(Some(&every_slot), Some(&discord_channel)),
+        Err("request-template-slot-absent")
+    );
+    assert_eq!(
+        render_chat_slots(Some(&every_slot), None),
+        Err("chat-scope-required")
+    );
+    let untemplated = HttpConstraints {
+        request_templates: Vec::new(),
+        ..every_slot
+    };
+    assert_eq!(
+        render_chat_slots(Some(&untemplated), None),
+        Ok(dekopon_capability::ChatSlotValues::default())
+    );
 }
 
 fn storage_set(

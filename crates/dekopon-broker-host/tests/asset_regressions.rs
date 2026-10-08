@@ -79,6 +79,7 @@ fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
             propagate_trace: false,
+            request_templates: Vec::new(),
         }),
         storage: None,
         secret_use: None,
