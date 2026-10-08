@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.28.0] - 2026-10-08
+
+### Changed
+
+- Prepare chart 0.28.0 for core v0.39.0; pin the published image index in a separate reviewed change.
+
+## [0.39.0] - 2026-10-08
+
+### Added
+
+- On a `recall: platform` route, a mention that finds the conversation's window in memory first reads the messages posted since the window last looked, so an unaddressed message or photo between mentions reaches the next turn once.
+- `gateway_recalled` (info) records each successful recall with `source`, `messages` and `delta`.
+
+### Changed
+
+- Platform-recalled messages are labelled with the author's broker principal (`[gateway: chat history, from simon]`); an unmapped author keeps the service id on private routes and is `unmapped participant` on `sharedConversation` routes.
+
 ## [dekopon-chart-0.27.0] - 2026-10-08
 
 ### Changed
