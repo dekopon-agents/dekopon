@@ -1487,114 +1487,25 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
-`{\"script\":\"cap --list\"}`. Put shell commands inside `script`, not `command`; provider command words \
-are not separate model tools. This is the only way to invoke capabilities: use it whenever the task \
-needs data or an action the session's capabilities provide, and write the whole job as one script \
-rather than one tool call per step. Send scripts one after another only when \
-the next step genuinely depends on a result you cannot know yet. Returns the script's combined \
-output followed by an `[exit code: N]` trailer, exactly as a terminal would.
+`{\"script\":\"cap --list\"}`: the script goes inside `script`, not `command`, and provider command \
+words are not separate model tools. Returns the script's combined output followed by an \
+`[exit code: N]` trailer.
 
-The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
-leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
-groups — the compound ones all usable as pipeline stages, so `cmd | while ...; do ...; done` \
-works — `break`/`continue`, \
-functions with `$1`/`$@`/`$#`/`shift`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
-`${NAME[@]}`, `${#NAME}`, `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( \
-)`, `$(( ))`, `$?`, `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, `exit`, \
-both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and redirection of \
-either stream (`>`, `>>`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `> /dev/null`) into named in-memory \
-buffers all behave the way you expect. Everything outside that curated set fails loudly and by \
-name: `eval`, backticks, subshells, and `<<<` are errors, never silent no-ops. If a script ran, it \
-did what it said.
-
-`cmd &` starts a detached job that outlives this script and turn when the route sets a job deadline. \
-It prints `[N]` on stderr and sets `$!` to N. Use `jobs` to list, `wait %N` to wait, and \
-`kill %N` to stop it; there is no `fg` or `bg`. Completion arrives as a `[gateway: job ...]` \
-message. A job's variables and buffers die with it; only what it prints reaches that notice \
-(the first 16 KiB). A job cannot send files or images. It ends at its job deadline, and \
-jobs are lost on gateway restart.\n
-Five things genuinely differ from a real shell:
-
-1. There are no processes, no filesystem, no environment variables, and no network reachable \
-except through a capability. The capabilities you may invoke are exactly those this session was \
-granted: no flag, retry, or rewording escalates past that set, and a refusal is a fact to report, \
-not an obstacle to work around.
-2. Provider command words are programs. A provider adds words of its own, and each behaves like a \
-command-line tool with subcommands and flags. Its top-level `--help` page for this session, when \
-present, is baked in below the word listing at the end of this description; run `<word> --help` \
-yourself for that page when it is not, or for a deeper subcommand's own page. Its subcommands call \
-capabilities on your behalf, so a word can do only what this session was granted, and `cap --list` \
-shows those capability IDs.
-3. Variables can hold JSON values, but `|` carries bytes, not values. `echo` writes a newline; \
-`printf` and `echo -n` do not. `read`, `cat`, and other stdin-reading builtins consume their \
-input once; a silent or failed stage supplies end of input, not JSON null. A provider command \
-receives only its own pipe or here-document as a live byte stream. Provider stdout feeds the \
-next stage while it runs; a closed consumer ends the provider stage with status 141. Invalid \
-UTF-8 captured into a variable or expanded into an argument fails that stage. `$(cmd)` strips trailing newlines; a whole assignment like \
-`pr=$(cmd)` parses object/array JSON, while scalar text stays text. Unquoted substitution \
-splits on newlines, not spaces. `x=$(cmd 2>&1)` captures diagnostics; `> buf` and `>> buf` \
-store exact bytes, including binary bytes for `cat` or `base64` to copy.
-4. Each pipeline stage runs concurrently. Earlier stages, including compounds, functions, \
-and `xargs`, have isolated scope snapshots: assignments and buffer redirects there do not \
-change the parent; only the last stage keeps assignments. A non-final `exit`, `return`, or \
-`break` ends that stage, not the parent. Inside a compound, stdin-reading builtins share its \
-one-shot stream; provider commands do not inherit it. Under `set -o pipefail` the rightmost \
-failure determines status; `${PIPESTATUS[@]}` lists each stage. A closed consumer stops its \
-provider producer with status 141; `${PIPESTATUS[@]}` reports that exit status.
-5. The session is bounded. Steps, retained bytes (including substitutions, sort, tail, \
-slurped jq input, and stage stacks), output, wall-clock time, and capability calls have \
-ceilings; tripping one ends the script with a message naming it. Streaming bytes do not \
-accumulate against the retained-value ceiling. Filter with `jq`, loop in the shell, and print \
-only what you need next.
-
-Builtins: `jq` (`-r` raw strings, `-c` compact, `-n` null input, `-s` slurp; one JSON \
-document per output line, strings quoted unless `-r`), `cap`, `cat`, `echo`, `printf`, \
-`test`/`[`, `true`, `false`, `sleep`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, \
-`head`/`tail` (default 10 lines, `-n N` or `-N`; `tail -n +N` starts at N; no file \
-operands), `base64`, `xargs`, `jobs`, `wait`, `kill`. Any provider command words this session has \
-are listed at the end of this description.
-
-A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \
-a provider command whose `--help` says it accepts one: the command proposes using that secret, the \
-broker independently authorizes every use, and neither you nor the provider ever reads the secret \
-itself.
-
-Patterns are literal text, never globs, and regular expressions only where you ask for one with \
-`-E`: a `grep`/`sed` pattern, a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand \
-of `==` inside `[[ ]]`, and a `case` pattern too, where `*)` remains the default branch but \
-`*.json)` is an error rather than a silent mismatch. `grep -E '[0-9]'` and `sed -E 's/^ *//'` are \
-how you get a real regular expression, and the only way: unflagged, both are a usage error naming \
-the metacharacter rather than a search that quietly finds nothing. Under `-E`, anchors and `.` \
-mean what they mean in any regex, but the replacement half of `sed` is still literal text, so \
-groups select and do not substitute. `${#NAME}` counts characters of a string but elements of an \
-array and keys of an object, because values here are real JSON. Use `jq` when the thing you want \
-is structure rather than lines: it parses each piped JSON document (including scalars), \
-refuses invalid JSON at status 2, and emits each result before waiting for more input. `jq -s` \
-collects documents against the retained-byte budget; `jq -n` ignores stdin.
-
-Reading the result. The tool result is your only evidence: what a script printed is what you \
-know, and what it did not print you do not know, so never guess what a capability returned, what \
-it accepts, or whether it exists. Exit 0 is success. Exit 1 is a command that ran and failed; \
-its error arrives on stderr as `<name>: failed: ...`, naming the command or the capability it \
-called, so read it before retrying. Exit 127 means the word is not a builtin or a command this \
-session's providers add (`command not found`), or that a command needs a capability this session \
-was not granted, and the message says which; guessing at more names will not change either. Exit \
-126 means this session holds the capability \
-but authorization refused this use; different arguments will not change that, so report it. Exit \
-2 is a parse error, a refused construct, a usage error, or an exhausted budget, and the message \
-names which. Exit 124 is the wall-clock deadline. Output past the ceiling is truncated in the \
-middle, keeping the head and the tail with a marker giving the total line count, so filter inside \
-the script rather than printing everything and reading it here. Each script starts empty: nothing \
-an earlier script assigned survives, but everything it printed is already in this conversation.
-
-Not for: skills, chat attachments, and this agent's own configuration are not files here, and \
-when the session offers a tool for one of them it is listed beside this one. There are no files \
-at all: `ls` and `cd` do not exist, and `cat` only passes along what is piped or here-documented \
-into it.
-
-Every builtin answers its own `--help` on stdout at exit 0, naming the flags it accepts; there is \
-no separate `help` builtin. Prefer a single script that does the whole job over many small ones — \
-that is the entire point of this tool.";
+- Capabilities are reached only through this tool. Do the whole job in one script; send another \
+only when the next step needs a result you do not have yet.
+- Provider command words are programs inside the script, like `gh pr view 12`; their `--help` \
+pages are below, or run `<word> --help`. `cap --list` prints the granted capability IDs. A \
+refusal is a fact to report: nothing escalates past the grants.
+- Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
+patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
+loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
+- The output is your only evidence: never guess what a command returned, accepts, or whether it \
+exists. Exit codes: 0 success; 1 ran and failed; 2 parse, usage, refused construct or exhausted \
+budget; 124 deadline; 126 authorization refused this use, do not retry; 127 not a command here or \
+not granted, do not guess more names. Nothing survives between scripts except what was printed.
+- Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
+`sed`, `cut`, `sort`, `uniq`, `wc`, `head`/`tail`, `base64`, `xargs`, `jobs`, `wait`, `kill`. \
+Every builtin answers `--help`; there is no separate `help` builtin.";
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -3436,20 +3347,13 @@ mod tests {
     }
 
     #[test]
-    fn bash_description_explains_detached_jobs_and_their_delivery_limits() {
-        for phrase in [
-            "`cmd &`",
-            "`$!`",
-            "`jobs`",
-            "`wait %N`",
-            "`kill %N`",
-            "variables and buffers die with it",
-            "cannot send files or images",
-            "job deadline",
-            "lost on gateway restart",
-        ] {
-            assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
-        }
+    fn the_bash_description_stays_short() {
+        let words = SCRIPT_TOOL_DESCRIPTION.split_whitespace().count();
+        assert!(words <= 500, "{words} words: cut before appending");
+    }
+
+    #[test]
+    fn a_detached_job_is_not_among_the_refused_constructs() {
         assert!(!refusal_list().iter().any(|name| name.contains('&')));
     }
 
@@ -3575,25 +3479,25 @@ mod tests {
     #[test]
     fn every_outcome_the_description_explains_is_what_the_shell_produces() {
         for (code, phrase) in [
-            (ExitCode::SUCCESS, "Exit 0 is success"),
-            (ExitCode::FAILURE, "Exit 1 is a command that ran and failed"),
+            (ExitCode::SUCCESS, "0 success"),
+            (ExitCode::FAILURE, "1 ran and failed"),
             (
                 ExitCode::SYNTAX,
-                "Exit 2 is a parse error, a refused construct, a usage error, or an exhausted budget",
+                "2 parse, usage, refused construct or exhausted budget",
             ),
-            (ExitCode::TIMEOUT, "Exit 124 is the wall-clock deadline"),
+            (ExitCode::TIMEOUT, "124 deadline"),
             (
                 ExitCode::DENIED,
-                "Exit 126 means this session holds the capability but authorization refused this use",
+                "126 authorization refused this use, do not retry",
             ),
             (
                 ExitCode::NOT_FOUND,
-                "Exit 127 means the word is not a builtin or a command this session's providers add",
+                "127 not a command here or not granted, do not guess more names",
             ),
         ] {
             assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
             assert!(
-                phrase.contains(&format!("Exit {} ", code.get())),
+                phrase.starts_with(&format!("{} ", code.get())),
                 "{phrase} must name exit code {}",
                 code.get()
             );
