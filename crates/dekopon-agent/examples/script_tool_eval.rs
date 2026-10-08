@@ -1,5 +1,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+#[path = "support/scientist.rs"]
+mod scientist;
+
 use dekopon_agent::{
     ShellRuntime,
     prompt::{History, PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session},
@@ -43,18 +46,28 @@ struct Arguments {
     task: PathBuf,
     out: PathBuf,
     label: String,
+    system: Option<PathBuf>,
+    world: World,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum World {
+    Basic,
+    Scientist,
 }
 
 #[derive(Debug, Error)]
 enum EvalError {
     #[error(
-        "usage: --model <openrouter id> --task <instruction file> --out <transcript.json> [--label <experiment>]"
+        "usage: --model <openrouter id> --task <instruction file> --out <transcript.json> [--label <experiment>] [--system <instructions file>] [--world basic|scientist]"
     )]
     Arguments,
     #[error("OPENROUTER_API_KEY must contain a nonblank credential")]
     Credential,
     #[error("could not read the task instruction")]
     Task(#[source] std::io::Error),
+    #[error("could not read the operator instructions")]
+    System(#[source] std::io::Error),
     #[error("could not write the transcript")]
     Transcript(#[source] std::io::Error),
     #[error("the current executable path is unknown")]
@@ -76,6 +89,7 @@ impl Arguments {
 
     fn parse_from(mut arguments: impl Iterator<Item = String>) -> Result<Self, EvalError> {
         let (mut model, mut task, mut out, mut label) = (None, None, None, None);
+        let (mut system, mut world) = (None, None);
         while let Some(flag) = arguments.next() {
             let value = arguments.next().ok_or(EvalError::Arguments)?;
             match flag.as_str() {
@@ -83,6 +97,14 @@ impl Arguments {
                 "--task" if task.is_none() => task = Some(PathBuf::from(value)),
                 "--out" if out.is_none() => out = Some(PathBuf::from(value)),
                 "--label" if label.is_none() => label = Some(value),
+                "--system" if system.is_none() => system = Some(PathBuf::from(value)),
+                "--world" if world.is_none() => {
+                    world = Some(match value.as_str() {
+                        "basic" => World::Basic,
+                        "scientist" => World::Scientist,
+                        _ => return Err(EvalError::Arguments),
+                    });
+                }
                 _ => return Err(EvalError::Arguments),
             }
         }
@@ -91,6 +113,8 @@ impl Arguments {
             task: task.ok_or(EvalError::Arguments)?,
             out: out.ok_or(EvalError::Arguments)?,
             label: label.unwrap_or_else(|| "script-tool-eval".into()),
+            system,
+            world: world.unwrap_or(World::Basic),
         })
     }
 }
@@ -336,7 +360,7 @@ struct ScriptRecord {
 }
 
 struct Recording {
-    shell: ShellRuntime<EvalInvoker>,
+    shell: ShellRuntime<Arc<dyn CapabilityInvoker>>,
     scripts: Mutex<Vec<ScriptRecord>>,
 }
 
@@ -408,6 +432,19 @@ fn run() -> Result<(), EvalError> {
     dekopon_shell::set_jq_worker_executable(executable)
         .map_err(|_already_set| EvalError::JqWorker)?;
     let instruction = std::fs::read_to_string(&arguments.task).map_err(EvalError::Task)?;
+    let system = match &arguments.system {
+        Some(path) => format!(
+            "{}\n\n{}",
+            std::fs::read_to_string(path).map_err(EvalError::System)?,
+            scientist::GATEWAY_ASSETS_NOTE
+        ),
+        None => SYSTEM.to_owned(),
+    };
+    let (invoker, max_steps, max_capability_calls): (Arc<dyn CapabilityInvoker>, u32, u32) =
+        match arguments.world {
+            World::Basic => (Arc::new(EvalInvoker), MAX_STEPS, MAX_CAPABILITY_CALLS),
+            World::Scientist => (Arc::new(scientist::Scientist::new()), 20, 100),
+        };
     let token =
         std::env::var("OPENROUTER_API_KEY").map_err(|_credential_error| EvalError::Credential)?;
     if token.trim().is_empty() {
@@ -436,9 +473,9 @@ fn run() -> Result<(), EvalError> {
     };
     let shell = Recording {
         shell: ShellRuntime {
-            invoker: EvalInvoker,
+            invoker,
             limits: Limits::default(),
-            calls: CallBudget::new(MAX_CAPABILITY_CALLS),
+            calls: CallBudget::new(max_capability_calls),
         },
         scripts: Mutex::new(Vec::new()),
     };
@@ -450,11 +487,11 @@ fn run() -> Result<(), EvalError> {
         let inputs = SessionInputs::new(
             &instruction,
             PromptLimits {
-                max_steps: MAX_STEPS,
-                max_capability_calls: MAX_CAPABILITY_CALLS,
+                max_steps,
+                max_capability_calls,
             },
         )
-        .with_system(Some(SYSTEM));
+        .with_system(Some(&system));
         let result = run_prompt_session(&model, &shell, inputs, &mut History::default());
         (result, model, shell)
     }))?;
