@@ -19,6 +19,8 @@ components run unchanged; a provider whose Rust tests build `HttpConstraints` by
 adds `request_templates: Vec::new()` at its next re-pin, and one that calls
 `BrokerProviderRegistry::invoke_with_storage` passes `ChatSlotValues::default()` before the assets.
 
+Install chart 0.30.0 only after its default image index is pinned to the verified v0.41.0 image.
+
 ## Shared agent storage namespaces (0.40.0)
 
 Upgrade broker and gateway together as usual. No broker protocol, provider WIT or SDK changed;
