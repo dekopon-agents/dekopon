@@ -7,7 +7,7 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   scripting tool (`bash`) instead of one tool per capability; embedders may additionally
   supply bounded chat-asset, credential-free agent-configuration, skill-reading, and
   improvement-suggestion tools. A model's first call to a tool that was not offered, or a
-  `bash` call without a string `script`, is answered with the tool shape as a tool result;
+  `bash` call without a string `command`, is answered with the tool shape as a tool result;
   the second such call in a session ends it.
 - `prompt::run_prompt_with_history` — the same loop run as the continuation of a
   `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
