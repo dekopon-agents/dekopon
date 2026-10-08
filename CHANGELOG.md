@@ -7,6 +7,40 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.26.0] - 2026-10-08
+
+### Fixed
+
+- The chart's default broker memory limit is 2Gi, covering python's ~1.7 GB cold compile in the sync Job and precompile init container, and the default image.tag is empty so it follows appVersion instead of naming v0.33.0.
+
+### Changed
+
+- Prepare chart 0.26.0 for core v0.37.0; pin the published image index in a separate reviewed change.
+
+## [0.37.0] - 2026-10-08
+
+### Added
+
+- The broker's `capabilities` answer carries `principal`, the attested subject's broker principal, for display only; broker, gateway and console upgrade together.
+- `prompt.script` records `tool_call.ignored_arguments`, the names of arguments a `bash` call sent beside `command`.
+- A `script_tool_eval` example runs one prompt through the loop against a real shell with canned command words and writes a JSON transcript for prompt evals.
+
+### Changed
+
+- A `sharedConversation` turn is labelled `[gateway: authenticated participant: <principal>]` with the sender's broker principal name, or `[gateway: unmapped participant]`, instead of the platform subject id.
+- Chat files are named `chat-asset:N` everywhere the model reads them, and `fetch_chat_asset` accepts `"chat-asset:N"` as its id.
+- Conversation history records a turn without the attachment inventory note, keeping one `[gateway: attached chat-asset:N — name]` line per file that arrived with it and the shared-scope participant label.
+- `inspect_agent_config` is offered only on a route that writes `inspectAgentConfig: true`; the default is now false.
+- A provider's `--help` page shared by several command words is sent once in the bash tool description, naming every word.
+- The gateway closes the system text with the route's limits, `[gateway: N steps, M capability calls and W minutes per message.]`, and sends the image-type note only on WhatsApp and Telegram.
+- Shorter descriptions for `suggest_improvement`, `read_skill`, `wake`, `decline_chat_reply` and `inspect_agent_config`, the skills listing, the chat-memory note and the shell's pattern refusals.
+- docs/security-model.md and docs/architecture.md link the broker host's import list in docs/design.md instead of repeating a partial copy.
+- docs/design.md records that host imports exist only for what a sandbox cannot have by construction and lists the broker host's real imports.
+- The `bash` tool's argument is `command` (was `script`); the rejection error type is `missing-command`.
+- The bash tool description is a short rules list (about 255 words, from about 1,400); the shell's own errors teach what was prose.
+- A model's first unknown-tool or malformed bash call is answered with the tool shape instead of ending the session; the second still ends it.
+- Show models the bash tool argument shape in its shared description.
+
 ## [dekopon-chart-0.25.0] - 2026-10-07
 
 ### Changed
