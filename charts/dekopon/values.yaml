@@ -11,7 +11,7 @@ image:
   # The published tag is the Git tag, so it carries the v. There is no `latest`, and there is no
   # image for v0.3.0 or earlier — the image workflow landed after that release.
   tag: ""
-  digest: "sha256:0ce8aef44f46fdd27f70e6d18c21b377c5cf31324b9556f909105507af8efde9"
+  digest: "sha256:84546616b432d744d1b1a2b87f8cef1c78dabdd33dcc4430f5ea186f25d756eb"
   pullPolicy: IfNotPresent
   # No pull secret hook on purpose. Both GHCR packages this chart touches — the image and the
   # chart itself — are public, so every pull on this path is anonymous. A dangling
