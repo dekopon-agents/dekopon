@@ -14,12 +14,21 @@ do not understand rather than guessing.
 add that line to every route that should keep it before upgrading, and delete any
 `inspectAgentConfig: false`, which is now the default.
 
-Upgrade the broker and gateway together, and re-pin `dekopon-console` to this release. A broker
-`capabilities` answer now carries `principal`, the broker principal the attested subject maps to,
-and `BrokerResponse` refuses unknown fields, so an older client fails to decode it. On
-`sharedConversation` routes the participant label reads
-`[gateway: authenticated participant: <principal>]` instead of the canonical subject, or
-`[gateway: unmapped participant]`; rewrite instructions that quote the old label.
+Re-pin the console first, then upgrade the broker and gateway together. The new `principal`
+field on the broker's `capabilities` answer is optional for a new console against an old broker,
+but a 0.36 console cannot decode a 0.37 broker's `Capabilities` (`deny_unknown_fields`). The
+field is the broker principal the attested subject maps to. On `sharedConversation` routes the
+participant label reads `[gateway: authenticated participant: <principal>]` instead of the
+canonical subject, or `[gateway: unmapped participant]`; rewrite instructions that quote the old
+label.
+
+Embedders that send `{"script": …}` to the `bash` tool must send `{"command": …}` instead. A
+model's first `script` call is answered once with the tool shape; a second ends the session. The
+bash description no longer explains `cmd &` / `$!` / `wait` / `kill`; this matters only on routes
+with `jobTimeoutMs`.
+
+Chart 0.26.0 defaults the broker memory limit to 2Gi, and `image.tag` follows appVersion. Install
+chart 0.26.0 only after its default image index is pinned to the verified v0.37.0 image.
 
 ## Broker lock-change restart and console scope refusal (0.36.0)
 
