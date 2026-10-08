@@ -147,6 +147,7 @@ impl Anchor {
             received_at: tokio::time::Instant::now(),
             native_group: None,
             constituents: Vec::new(),
+            folded: Vec::new(),
         }
     }
 

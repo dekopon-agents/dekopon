@@ -102,22 +102,35 @@ pub(crate) struct Watermark {
 pub(crate) struct TakenIn {
     pub newest: Option<String>,
     pub steers: Vec<String>,
+    pub recalled: Option<ConversationTurn>,
 }
 
 impl TakenIn {
     fn advance(self, watermark: Option<Watermark>) -> Option<Watermark> {
-        match (self.newest, watermark) {
-            (Some(after), _) => Some(Watermark {
-                after,
-                taken: self.steers,
-            }),
-            (None, Some(mut watermark)) => {
-                watermark.taken.extend(self.steers);
-                Some(watermark)
+        let mut watermark = match (self.newest, watermark) {
+            (Some(after), Some(mut watermark)) => {
+                if later(&after, &watermark.after) {
+                    watermark.after = after;
+                }
+                watermark
             }
-            (None, None) => None,
-        }
+            (Some(after), None) => Watermark {
+                after,
+                taken: Vec::new(),
+            },
+            (None, Some(watermark)) => watermark,
+            (None, None) => return None,
+        };
+        watermark.taken.extend(self.steers);
+        let Watermark { after, taken } = &mut watermark;
+        taken.retain(|id| later(id, after));
+        Some(watermark)
     }
+}
+
+// Slack timestamps and Discord snowflakes are both fixed-alphabet numerals, so a longer id is newer.
+fn later(id: &str, than: &str) -> bool {
+    (id.len(), id) > (than.len(), than)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -165,7 +178,7 @@ impl ConversationLease<'_> {
         mut self,
         window: MemoryWindow,
         turn: ConversationTurn,
-        taken: TakenIn,
+        mut taken: TakenIn,
         declared_cache_key: &str,
         now: Instant,
     ) -> bool {
@@ -180,14 +193,21 @@ impl ConversationLease<'_> {
                 .get_mut(&self.key)
                 .expect("the matching conversation slot exists");
             decrement_pending(slot);
+            let recalled = taken.recalled.take();
             match slot.live.as_mut() {
                 Some(existing) => {
+                    if let Some(recalled) = recalled {
+                        existing.history.record(recalled);
+                    }
                     existing.history.record(turn);
                     existing.touched = now;
                     existing.watermark = taken.advance(existing.watermark.take());
                 }
                 None => {
                     let mut history = History::new(window.limits);
+                    if let Some(recalled) = recalled {
+                        history.record(recalled);
+                    }
                     history.record(turn);
                     slot.live = Some(Conversation {
                         history,

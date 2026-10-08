@@ -2639,6 +2639,7 @@ fn message(text: &str) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
+        folded: Vec::new(),
         asset_overflow: false,
     }
 }
@@ -2721,6 +2722,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
+        folded: Vec::new(),
         asset_overflow: false,
     }
 }
@@ -14398,10 +14400,11 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
     let block =
         "[gateway: chat history, from U2]\na photo\n[gateway: attached chat-asset:1 — cat.png]";
     let delivered = models.prompt(1);
-    let (_, latest) = delivered.last().expect("the mention");
+    let caught_up = &delivered[delivered.len() - 2..];
+    assert_eq!(caught_up[0], ("user".to_owned(), block.to_owned()));
     assert!(
-        latest.starts_with(&format!("{block}\n\nwhat did they post?")),
-        "{latest}"
+        caught_up[1].1.starts_with("what did they post?"),
+        "{caught_up:?}"
     );
     let following = models.prompt(2);
     let (_, latest) = following.last().expect("the next mention");
@@ -14413,17 +14416,13 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
     assert_eq!(replayed.matches("a photo").count(), 1, "{following:?}");
     assert_eq!(replayed.matches("first answer").count(), 1, "{following:?}");
     let events = recalled_events(&capture);
-    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events.len(), 2, "one event per seeded window: {events:?}");
     assert!(
         events[0].contains("messages=0") && events[0].contains("delta=0"),
         "{events:?}"
     );
     assert!(
         events[1].contains("messages=1") && events[1].contains("delta=1"),
-        "{events:?}"
-    );
-    assert!(
-        events[2].contains("messages=0") && events[2].contains("delta=0"),
         "{events:?}"
     );
 }
@@ -14450,6 +14449,7 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
         TakenIn {
             newest: Some("t1".to_owned()),
             steers: vec!["t2".to_owned()],
+            recalled: None,
         },
         &seed.cache_key,
         now,
@@ -14464,10 +14464,12 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
     .await;
 
     let prompt = models.prompt(0);
-    let (_, latest) = prompt.last().expect("the mention");
     assert_eq!(
-        latest,
-        "[gateway: chat history, from U2]\nunaddressed\n\nnext"
+        prompt[prompt.len() - 2..],
+        transcript(&[
+            ("user", "[gateway: chat history, from U2]\nunaddressed"),
+            ("user", "next"),
+        ])
     );
 }
 
@@ -14581,6 +14583,7 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
         TakenIn {
             newest: Some("t1".to_owned()),
             steers: vec!["t2".to_owned()],
+            recalled: None,
         },
         &first.cache_key,
         now,
@@ -14592,6 +14595,7 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
         TakenIn {
             newest: None,
             steers: vec!["t3".to_owned()],
+            recalled: None,
         },
         &woken.cache_key,
         now,
@@ -14603,6 +14607,221 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
             after: "t1".to_owned(),
             taken: vec!["t2".to_owned(), "t3".to_owned()],
         })
+    );
+}
+
+#[test]
+fn a_follow_up_commit_keeps_earlier_steers_and_never_moves_the_watermark_back() {
+    let store = ConversationStore::new(4);
+    let allowed = granted(&["cli-probe.upper"]);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let commit = |newest: &str, steers: &[&str]| {
+        let seed = store.begin(&key, &allowed, window(), None, now);
+        seed.lease.commit(
+            window(),
+            ConversationTurn::completed(newest, "ok"),
+            TakenIn {
+                newest: Some(newest.to_owned()),
+                steers: steers.iter().map(|id| (*id).to_owned()).collect(),
+                recalled: None,
+            },
+            &seed.cache_key,
+            now,
+        );
+        store.resident(&key, &allowed, window(), now)
+    };
+    let since = |after: &str, taken: &[&str]| {
+        Residency::Since(crate::conversation::Watermark {
+            after: after.to_owned(),
+            taken: taken.iter().map(|id| (*id).to_owned()).collect(),
+        })
+    };
+
+    assert_eq!(commit("t1", &["t3"]), since("t1", &["t3"]));
+    assert_eq!(commit("t2", &[]), since("t2", &["t3"]));
+    assert_eq!(commit("t1", &[]), since("t2", &["t3"]));
+    assert_eq!(commit("t4", &[]), since("t4", &[]));
+}
+
+fn resident_since(runner: &SessionRunner, after: &str) {
+    let window = recall_window(RecallSource::Platform);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let seed = runner
+        .conversations
+        .begin(&key, &granted(&["cli-probe.upper"]), window, None, now);
+    seed.lease.commit(
+        window,
+        ConversationTurn::completed("asked", "answered"),
+        TakenIn {
+            newest: Some(after.to_owned()),
+            ..TakenIn::default()
+        },
+        &seed.cache_key,
+        now,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unaddressed_continuation_catches_up_on_what_others_posted() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([answer("first answer"), answer("seen it")]);
+    let driver = HistoryDriver::new(Ok(Vec::new()));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    let run = |inbound| {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+    };
+
+    run(mention("t1", "first question")).await;
+    driver.post(past("t2", "U2", "tel.16035550102", "posted meanwhile"));
+    run(InboundMessage {
+        addressed: Some(false),
+        ..mention("t3", "and another thing")
+    })
+    .await;
+
+    let continued = models.prompt(1);
+    assert_eq!(
+        continued[continued.len() - 2..],
+        transcript(&[
+            ("user", "[gateway: chat history, from U2]\nposted meanwhile"),
+            ("user", "and another thing"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folded_steer_is_not_replayed_by_the_next_mention() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([answer("ok"), answer("ok")]);
+    let driver = HistoryDriver::new(Ok(vec![
+        past("t2", "U1", SUBJECT, "lead"),
+        past("t3", "U1", SUBJECT, "folded in"),
+        past("t4", "U2", "tel.16035550102", "unaddressed"),
+    ]));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    resident_since(&runner, "t1");
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    let run = |inbound| {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+    };
+
+    run(InboundMessage {
+        folded: vec!["t3".to_owned()],
+        ..mention("t2", "lead\n\nfolded in")
+    })
+    .await;
+    run(mention("t5", "next")).await;
+
+    let prompt = models.prompt(1);
+    assert_eq!(
+        prompt[prompt.len() - 2..],
+        transcript(&[
+            ("user", "[gateway: chat history, from U2]\nunaddressed"),
+            ("user", "next"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_mention_on_a_shared_route_keeps_others_history_out_of_the_senders_turn() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(
+        directory.path(),
+        &[(SUBJECT, "xavier"), ("tel.16035550102", "simon")],
+    )
+    .await;
+    let models = ModelScript::new([
+        answer("first answer"),
+        answer("simon said hi"),
+        answer("ok"),
+    ]);
+    let driver = HistoryDriver::new(Ok(Vec::new()));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..recall_window(RecallSource::Platform)
+        },
+    );
+    let run = |inbound| {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+    };
+
+    run(mention("t1", "first question")).await;
+    driver.post(past("t2", "U2", "tel.16035550102", "hi all"));
+    run(mention("t3", "what did simon say?")).await;
+    run(mention("t4", "thanks")).await;
+
+    let block = "[gateway: chat history, from simon]\nhi all";
+    let asked = "[gateway: authenticated participant: xavier]\nwhat did simon say?";
+    let delivered = models.prompt(1);
+    assert_eq!(
+        delivered[delivered.len() - 2..],
+        transcript(&[("user", block), ("user", asked)])
+    );
+    let replayed = models.prompt(2);
+    assert_eq!(
+        replayed[replayed.len() - 4..replayed.len() - 1],
+        transcript(&[
+            ("user", block),
+            ("user", asked),
+            ("assistant", "simon said hi"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_mention_reads_nothing_older_than_forget_after() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([answer("ok")]);
+    let mut stale = past("t2", "U2", "tel.16035550102", "long ago");
+    stale.at = std::time::SystemTime::now()
+        .checked_sub(DEFAULT_FORGET_AFTER + Duration::from_secs(60))
+        .expect("a time before the horizon");
+    let driver = HistoryDriver::new(Ok(vec![
+        stale,
+        past("t3", "U2", "tel.16035550102", "just now"),
+    ]));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    resident_since(&runner, "t1");
+
+    run_session(
+        Arc::clone(&runner),
+        persistent_route(model_config(), recall_window(RecallSource::Platform)),
+        mention("t4", "catch me up"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let prompt = models.prompt(0);
+    assert_eq!(
+        prompt[prompt.len() - 2..],
+        transcript(&[
+            ("user", "[gateway: chat history, from U2]\njust now"),
+            ("user", "catch me up"),
+        ])
     );
 }
 

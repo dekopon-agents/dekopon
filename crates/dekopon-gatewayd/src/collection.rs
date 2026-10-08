@@ -340,6 +340,7 @@ mod tests {
             received_at: Instant::now(),
             native_group: None,
             constituents: Vec::new(),
+            folded: Vec::new(),
         }
     }
     fn collector(millis: u64, capacity: usize) -> Collector {
