@@ -111,6 +111,7 @@ pub struct Run<P: Provider> {
     component: PathBuf,
     limits: BrokerHostLimits,
     clock: Option<SystemTime>,
+    settings: Option<Value>,
     http: Option<Result<ScriptServer, HarnessError>>,
     stdin: Option<Vec<u8>>,
     close_stdout_after: Option<usize>,
@@ -129,6 +130,7 @@ impl<P: Provider> Harness<P> {
             component: component.as_ref().to_path_buf(),
             limits: BrokerHostLimits::default(),
             clock: None,
+            settings: None,
             http: None,
             stdin: None,
             close_stdout_after: None,
@@ -176,6 +178,13 @@ impl<P: Provider> Run<P> {
     #[must_use]
     pub fn clock(mut self, instant: SystemTime) -> Self {
         self.clock = Some(instant);
+        self
+    }
+
+    /// Supplies this call's provider settings in place of `providerSettings.<id>`.
+    #[must_use]
+    pub fn settings(mut self, settings: Value) -> Self {
+        self.settings = Some(settings);
         self
     }
 
@@ -228,6 +237,7 @@ impl<P: Provider> Run<P> {
         let registry = cached_registry::<P>(component, self.limits.clone())?;
         let mut imports = TestImports {
             clock: self.clock,
+            settings: self.settings.as_ref().map(Value::to_string),
             ..TestImports::default()
         };
         let mut http = None;
@@ -554,6 +564,7 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
 /// Native typed dispatch with fake clock and buffered HTTP imports, recording every request.
 pub struct Native<P: Provider> {
     clock: Option<SystemTime>,
+    settings: Option<Value>,
     monotonic: u64,
     entropy: Option<Vec<u8>>,
     http: Option<HttpScript>,
@@ -568,6 +579,7 @@ impl<P: Provider> Default for Native<P> {
     fn default() -> Self {
         Self {
             clock: None,
+            settings: None,
             monotonic: 0,
             entropy: None,
             http: None,
@@ -588,6 +600,12 @@ impl<P: Provider> Native<P> {
     #[must_use]
     pub fn clock(mut self, instant: SystemTime) -> Self {
         self.clock = Some(instant);
+        self
+    }
+    /// Supplies the provider settings every call reads.
+    #[must_use]
+    pub fn settings(mut self, settings: Value) -> Self {
+        self.settings = Some(settings);
         self
     }
     #[must_use]
@@ -632,6 +650,7 @@ impl<P: Provider> Native<P> {
         let scripts = Arc::new(Mutex::new(self.scripts.clone()));
         let port = FakePort {
             clock: self.clock,
+            settings: self.settings.as_ref().map(Value::to_string),
             monotonic: self.monotonic,
             entropy: self.entropy.clone(),
             entropy_cursor: 0,
@@ -685,6 +704,7 @@ impl std::io::Write for Captured {
 
 struct FakePort {
     clock: Option<SystemTime>,
+    settings: Option<String>,
     monotonic: u64,
     entropy: Option<Vec<u8>>,
     entropy_cursor: usize,
@@ -755,7 +775,7 @@ impl Port for FakePort {
         self.entropy_cursor = end;
     }
     fn settings(&mut self) -> Option<String> {
-        None
+        self.settings.clone()
     }
     fn send(&mut self, request: Request) -> Result<Response, HttpError> {
         self.requests.lock().push(request.clone());
