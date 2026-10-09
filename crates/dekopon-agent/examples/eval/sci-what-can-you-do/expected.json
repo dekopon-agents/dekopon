@@ -1,0 +1,1 @@
+{"all_of": ["wikipedia"], "any_of": [["image", "picture"], ["github", "gh "]], "script_all_of": ["cap --list"]}
