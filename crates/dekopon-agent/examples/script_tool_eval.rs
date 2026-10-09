@@ -1410,7 +1410,7 @@ mod tests {
         let client = Arc::new(ModelClient::Codex(
             codex_client("gpt-test", &auth_file, timeout)
                 .unwrap()
-                .with_loopback_endpoint(&server.url())
+                .with_loopback_endpoint(&format!("{}/backend-api/codex/responses", server.url()))
                 .unwrap(),
         ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1440,15 +1440,32 @@ mod tests {
         assert_eq!(row.scripts[0].script, "printf safe");
         assert_eq!(row.usage.input_tokens, Some(43));
         assert_eq!(row.usage.output_tokens, Some(8));
-        for _ in 0..2 {
-            let request = server.request_text().to_ascii_lowercase();
-            assert!(request.starts_with("post "), "{request}");
-            assert!(
-                request.contains("authorization: bearer fake-access"),
-                "{request}"
+        let requests = server.recorded();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let request = String::from_utf8(request).unwrap();
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let mut lines = head.split("\r\n");
+            assert_eq!(
+                lines.next(),
+                Some("POST /backend-api/codex/responses HTTP/1.1")
             );
+            let mut authorization = Vec::new();
+            for line in lines {
+                let (name, value) = line.split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("authorization") {
+                    authorization.push(value.trim());
+                } else {
+                    for token in ["fake-access", "fake-refresh"] {
+                        assert!(!line.contains(token), "{line}");
+                    }
+                }
+            }
+            assert_eq!(authorization, ["Bearer fake-access"]);
+            for token in ["fake-access", "fake-refresh"] {
+                assert!(!body.contains(token), "{body}");
+            }
         }
-        assert_eq!(server.recorded(), Vec::<Vec<u8>>::new());
     }
 
     #[test]
