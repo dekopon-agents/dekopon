@@ -14,6 +14,9 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - Select other contracts from the [area index](docs/README.md#change-a-specific-area);
   do not read every document by default or copy its inventory here.
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md#change-guidelines) for implementation and review conventions.
+- This file and the documents it links are the whole contract. A cloud agent in a bare checkout has
+  no owner memories, machine instructions or sibling repositories, and needs none: fetch what a
+  gate needs (`ci/fetch-external-provider-components.sh`), and name every gate you could not run.
 
 ## Boundaries that must survive
 
@@ -85,6 +88,8 @@ Audits and plans default to over-building, and the owner reels them back. Before
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
 - Follow the change map for companion tests, documentation and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).
+- A change to a CI gate edits the sentence that describes it. An example config the change touches
+  still starts, or is deleted.
 - Add no comments or doc comments unless they meet [Comments](#comments); delete the ones your
   change makes stale instead of rewording them.
 - Keep [WIT mirrors](docs/development.md#provider-contract-or-host) byte-identical;
@@ -230,6 +235,8 @@ The name states the invariant and the primitives are real; one test per behaviou
 
 - Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
 - No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`, exactly-the-ceiling beside one-over twins, a 1 ns-over timeout cap, `assert!(elapsed < Duration::from_millis(50))`, production bytes canonicalized so a golden fixture is stable (compare parsed `Value`s instead).
+- A test named for the real component loads the built artifact and reads its path with `expect`: no fallback file, early return or skip. A native-only test carries a native name.
+- A real-component test asserts the request it caused: the full URI with any configured prefix, exactly one call, no guest-sent credential. Before claiming coverage, name what each harness observes and the payload sizes it ran at.
 - An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
 - A fake that receives `Invoke` reads its frames with `DescriptorStream`, never plain `read(2)`: on macOS a passed `SCM_RIGHTS` descriptor stays open in the receiver (Linux closes it), so the pipe never sees EOF and the test hangs only on the Mac.
 
