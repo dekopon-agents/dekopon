@@ -4465,6 +4465,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_codex_turn_is_an_empty_answer() {
+        let model = ScriptedModel::new([AssistantTurn::new(None, vec![], None)]);
+        let runtime = RecordingRuntime::new(0);
+
+        let error = run_prompt(&model, &runtime, "hello", None, limits(1, 32))
+            .expect_err("an empty turn is not an answer");
+
+        assert!(matches!(error, PromptError::EmptyAnswer));
+    }
+
+    #[test]
     fn formats_an_empty_script_outcome_without_a_leading_blank_line() {
         let outcome = ScriptOutcome {
             output: String::new(),
