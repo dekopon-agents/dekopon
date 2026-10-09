@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-10-09
+
+### Added
+
+- Discord transports accept `messageContent: true`, which requests the Message Content intent so a mention of the bot's managed role wakes the bot like a mention of the bot user. A transport Discord refuses the intent to (close 4014) stops at startup with a fatal `disallowed-intents` error.
+
 ## [0.42.0] - 2026-10-09
 
 ### Added
