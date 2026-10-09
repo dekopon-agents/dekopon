@@ -49,7 +49,7 @@ pub trait Provider: Sized + 'static {
     const DESCRIPTION: &'static str;
     /// The argv grammar; help, version and usage errors are rendered from it.
     type Args: clap::Parser;
-    /// The exported capabilities, as a tuple of up to 19.
+    /// The exported capabilities, as a tuple of up to 32.
     type Capabilities: Capabilities<Self>;
 
     /// Maps parsed arguments to one capability proposal or a usage error; it runs before
@@ -335,7 +335,7 @@ impl<P: Provider> Proposal<P> {
     }
 }
 
-/// The capabilities a provider lists: a tuple of up to 19 [`Capability`] types.
+/// The capabilities a provider lists: a tuple of up to 32 [`Capability`] types.
 pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {
     /// The union of imports declared by the capabilities in this tuple.
     const IMPORTS: ImportSet;
@@ -398,7 +398,8 @@ mod sealed {
     }
 
     tuples!(
-        C19, C18, C17, C16, C15, C14, C13, C12, C11, C10, C9, C8, C7, C6, C5, C4, C3, C2, C1
+        C32, C31, C30, C29, C28, C27, C26, C25, C24, C23, C22, C21, C20, C19, C18, C17, C16, C15,
+        C14, C13, C12, C11, C10, C9, C8, C7, C6, C5, C4, C3, C2, C1
     );
 }
 

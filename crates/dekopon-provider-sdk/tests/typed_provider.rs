@@ -1065,3 +1065,97 @@ fn spawn_signatures_compile_and_declare_the_spawn_import() {
         imports
     );
 }
+
+struct WideFixture;
+
+impl Provider for WideFixture {
+    const ID: &'static str = "wide";
+    const COMMAND_WORDS: &'static [&'static str] = &["wide"];
+    const DESCRIPTION: &'static str = "Twenty capabilities";
+    type Args = ClockArgs;
+    type Capabilities = (
+        W1,
+        W2,
+        W3,
+        W4,
+        W5,
+        W6,
+        W7,
+        W8,
+        W9,
+        W10,
+        W11,
+        W12,
+        W13,
+        W14,
+        W15,
+        W16,
+        W17,
+        W18,
+        W19,
+        W20,
+    );
+    fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
+        Ok(Proposal::to::<W1>(ClockInput {}))
+    }
+}
+
+macro_rules! wide {
+    ($($capability:ident = $name:literal),+) => {$(
+        struct $capability;
+        impl Capability for $capability {
+            type Provider = WideFixture;
+            const NAME: &'static str = $name;
+            const DESCRIPTION: &'static str = "Writes its own name";
+            const EFFECT: EffectKind = EffectKind::ReadOnly;
+            const RISK: RiskLevel = RiskLevel::Low;
+            type Input = ClockInput;
+            type Needs = ();
+            type Error = Gone;
+            fn run(_: ClockInput, (): (), out: &mut Stdout) -> Result<(), Gone> {
+                writeln!(out, "{}", Self::NAME)?;
+                Ok(())
+            }
+        }
+    )+};
+}
+
+wide!(
+    W1 = "w1",
+    W2 = "w2",
+    W3 = "w3",
+    W4 = "w4",
+    W5 = "w5",
+    W6 = "w6",
+    W7 = "w7",
+    W8 = "w8",
+    W9 = "w9",
+    W10 = "w10",
+    W11 = "w11",
+    W12 = "w12",
+    W13 = "w13",
+    W14 = "w14",
+    W15 = "w15",
+    W16 = "w16",
+    W17 = "w17",
+    W18 = "w18",
+    W19 = "w19",
+    W20 = "w20"
+);
+
+#[test]
+fn a_provider_with_twenty_capabilities_lists_them_in_order_and_dispatches_the_last() {
+    let manifest = manifest::<WideFixture>().expect("the wide identifiers are valid");
+    let ids: Vec<&str> = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect();
+    let expected: Vec<String> = (1..=20).map(|index| format!("wide.w{index}")).collect();
+    assert_eq!(ids, expected);
+    let exit = call::<WideFixture>("wide.w20", "{}");
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (0, "w20\n", "")
+    );
+}
