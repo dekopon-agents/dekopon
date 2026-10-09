@@ -1065,3 +1065,256 @@ fn spawn_signatures_compile_and_declare_the_spawn_import() {
         imports
     );
 }
+
+mod unbounded_lists {
+    use super::*;
+    use dekopon_provider_sdk::provider::{Capabilities, Clock, Http, ImportSet, Needs};
+    use dekopon_provider_sdk::type_list;
+
+    struct Many;
+    struct Numbered<const INDEX: usize>;
+    struct Final;
+    struct Unlisted;
+
+    const NAMES: [&str; 23] = [
+        "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09", "c10", "c11", "c12", "c13",
+        "c14", "c15", "c16", "c17", "c18", "c19", "c20", "c21", "c22", "c23",
+    ];
+
+    #[derive(Parser)]
+    #[command(name = "many", about = "Dispatch a long capability list")]
+    struct ManyArgs {
+        #[arg(long)]
+        unlisted: bool,
+        text: String,
+    }
+
+    #[derive(Deserialize, Serialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct Text {
+        text: String,
+    }
+
+    impl Provider for Many {
+        const ID: &'static str = "many";
+        const COMMAND_WORDS: &'static [&'static str] = &["many"];
+        const DESCRIPTION: &'static str = "Long capability list";
+        type Args = ManyArgs;
+        type Capabilities = type_list![
+            Numbered<0>,
+            Numbered<1>,
+            Numbered<2>,
+            Numbered<3>,
+            Numbered<4>,
+            Numbered<5>,
+            Numbered<6>,
+            Numbered<7>,
+            Numbered<8>,
+            Numbered<9>,
+            Numbered<10>,
+            Numbered<11>,
+            Numbered<12>,
+            Numbered<13>,
+            Numbered<14>,
+            Numbered<15>,
+            Numbered<16>,
+            Numbered<17>,
+            Numbered<18>,
+            Numbered<19>,
+            Numbered<20>,
+            Numbered<21>,
+            Numbered<22>,
+            Final,
+        ];
+
+        fn propose(args: ManyArgs, _: bool) -> Result<Proposal<Self>, Usage> {
+            let input = Text { text: args.text };
+            Ok(if args.unlisted {
+                Proposal::to::<Unlisted>(input)
+            } else {
+                Proposal::to::<Final>(input)
+            })
+        }
+    }
+
+    impl<const INDEX: usize> Capability for Numbered<INDEX> {
+        type Provider = Many;
+        const NAME: &'static str = NAMES[INDEX];
+        const DESCRIPTION: &'static str = "Numbered capability";
+        const EFFECT: EffectKind = EffectKind::ReadOnly;
+        const RISK: RiskLevel = RiskLevel::Low;
+        type Input = Text;
+        type Needs = Clock;
+        type Error = Gone;
+
+        fn run(input: Text, _: Clock, out: &mut Stdout) -> Result<(), Gone> {
+            writeln!(out, "{}:{}", Self::NAME, input.text)?;
+            Ok(())
+        }
+    }
+
+    impl Capability for Final {
+        type Provider = Many;
+        const NAME: &'static str = "final";
+        const DESCRIPTION: &'static str = "Final registered capability";
+        const EFFECT: EffectKind = EffectKind::ExternalWrite;
+        const RISK: RiskLevel = RiskLevel::High;
+        type Input = Text;
+        type Needs = type_list![
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            Http,
+        ];
+        type Error = Gone;
+
+        fn run(input: Text, needs: Self::Needs, out: &mut Stdout) -> Result<(), Gone> {
+            let _: Http = needs.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.0;
+            writeln!(out, "final:{}", input.text)?;
+            Ok(())
+        }
+    }
+
+    impl Capability for Unlisted {
+        type Provider = Many;
+        const NAME: &'static str = "unlisted";
+        const DESCRIPTION: &'static str = "Unregistered capability";
+        const EFFECT: EffectKind = EffectKind::ReadOnly;
+        const RISK: RiskLevel = RiskLevel::Low;
+        type Input = Text;
+        type Needs = ();
+        type Error = Infallible;
+
+        fn run(_: Text, (): (), _: &mut Stdout) -> Result<(), Infallible> {
+            panic!("an unregistered capability must not run")
+        }
+    }
+
+    #[test]
+    fn long_lists_preserve_manifest_order_schema_effects_and_imports() {
+        let manifest = manifest::<Many>().expect("valid manifest");
+        let expected: Vec<_> = NAMES
+            .iter()
+            .chain([&"final"])
+            .map(|name| format!("many.{name}"))
+            .collect();
+        let ids: Vec<_> = manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(manifest.command_words, ["many"]);
+        for capability in &manifest.capabilities {
+            assert_eq!(
+                capability.input_schema,
+                json!({
+                    "type": "object", "properties": {"text": {"type": "string"}},
+                    "required": ["text"], "additionalProperties": false
+                })
+            );
+        }
+        let final_capability = manifest.capabilities.last().expect("final entry");
+        assert_eq!(final_capability.description, Final::DESCRIPTION);
+        assert_eq!(final_capability.effect, EffectKind::ExternalWrite);
+        assert_eq!(final_capability.risk, RiskLevel::High);
+        assert_eq!(
+            <Final as Capability>::Needs::IMPORTS,
+            ImportSet::HTTP.union(ImportSet::ASSETS)
+        );
+        assert_eq!(
+            <Many as Provider>::Capabilities::IMPORTS,
+            ImportSet::CLOCK
+                .union(ImportSet::HTTP)
+                .union(ImportSet::ASSETS)
+        );
+    }
+
+    #[test]
+    fn the_final_registered_capability_is_proposed_and_dispatched_with_typed_input() {
+        let outcome = command::<Many>(&["payload".into()], false);
+        let CommandRunOutcome::Proposed {
+            capability, input, ..
+        } = outcome
+        else {
+            panic!("expected final capability proposal");
+        };
+        assert_eq!(capability.as_str(), "many.final");
+        assert_eq!(input, json!({"text": "payload"}));
+        let exit = call::<Many>(capability.as_str(), &input.to_string());
+        assert_eq!(exit.status, 0);
+        assert_eq!(exit.stdout, "final:payload\n");
+        assert!(exit.stderr.is_empty());
+        assert_eq!(
+            call::<Many>("many.c20", r#"{"text":"middle"}"#).stdout,
+            "c20:middle\n"
+        );
+        assert_eq!(
+            call::<Many>("many.final", r#"{"text":"bad","extra":true}"#).status,
+            2
+        );
+        assert_eq!(call::<Many>("many.unlisted", r#"{"text":"bad"}"#).status, 1);
+        assert_eq!(call::<Many>("other.final", r#"{"text":"bad"}"#).status, 1);
+        assert!(
+            matches!(command::<Many>(&["--unlisted".into(), "text".into()], false),
+            CommandRunOutcome::Failed { error } if error.code == Code::UNKNOWN_CAPABILITY.as_str())
+        );
+        assert!(matches!(command::<Many>(&["--help".into()], false),
+            CommandRunOutcome::Rendered { status: 0, stdout, .. } if stdout.contains("Dispatch a long capability list")));
+    }
+
+    refused_native_import!(
+        LongNeeds,
+        LongNeedsCall,
+        type_list![
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            dekopon_provider_sdk::provider::Assets,
+        ]
+    );
+
+    #[test]
+    fn a_long_need_list_still_refuses_an_unsupported_native_import() {
+        let exit = call::<LongNeeds>("native-import.read", "{}");
+        assert_eq!(exit.status, 1);
+        assert_eq!(
+            exit.stderr,
+            format!("{}\n", SdkFailure::ComponentHarnessRequired)
+        );
+    }
+}
