@@ -291,7 +291,7 @@ impl AssetState {
     }
 }
 
-pub(crate) fn references(input: &serde_json::Value) -> Vec<u64> {
+pub fn references(input: &serde_json::Value) -> Vec<u64> {
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"

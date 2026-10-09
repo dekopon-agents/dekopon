@@ -769,3 +769,322 @@ fn a_base_url_setting_overrides_the_vendor_origin_and_keeps_its_prefix() {
     assert!(refused.stderr.contains("settings"), "{}", refused.stderr);
     assert!(invalid.requests().is_empty());
 }
+
+fn streamed_http_run(body: &[u8]) -> dekopon_provider_sdk_testkit::Run<RawHttp> {
+    Harness::<RawHttp>::get(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/providers/http-probe-provider.wasm"),
+    )
+    .http(HttpScript::new(
+        "fixture.example.test",
+        "POST",
+        Response {
+            status: 201,
+            headers: Vec::new(),
+            body: body.to_vec(),
+        },
+    ))
+}
+
+#[test]
+fn real_streamed_http_returns_readable_isolated_assets() {
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    use dekopon_provider_sdk_testkit::AssetConstraints;
+
+    let run = || {
+        let run = streamed_http_run(b"streamed asset bytes").assets(AssetConstraints {
+            attach: true,
+            ..Default::default()
+        });
+        let uri = format!("{}/images/generations", run.origin().unwrap());
+        run.call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":[], "uri":uri}),
+        )
+        .unwrap()
+    };
+    let first = run();
+    let second = run();
+    for result in [&first, &second] {
+        assert_eq!(result.status, 0, "{}", result.stderr);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stdout).unwrap(),
+            json!({"status":201})
+        );
+        assert_eq!(result.http_calls.len(), 1);
+        assert_eq!(result.assets.attached.len(), 1);
+        assert_eq!(result.assets.files.len(), 1);
+        let asset = &result.assets.attached[0];
+        assert_eq!(asset.content_type, "text/plain");
+        assert_eq!(asset.bytes, 20);
+        let file = result.assets.files[asset.descriptor as usize].file();
+        let mut bytes = [0; 20];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"streamed asset bytes");
+        assert_eq!(file.metadata().unwrap().nlink(), 0);
+    }
+    assert_ne!(
+        first.assets.files[0].file().metadata().unwrap().ino(),
+        second.assets.files[0].file().metadata().unwrap().ino()
+    );
+}
+
+#[test]
+fn streamed_http_without_assets_still_refuses_before_dispatch() {
+    let run = streamed_http_run(b"streamed asset bytes");
+    let uri = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":[], "uri":uri}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(failure.http_calls.is_empty());
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::HostCallRejected {
+            reason: "asset-call-rejected",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn asset_storage_does_not_grant_attachment() {
+    let run = streamed_http_run(b"streamed asset bytes").assets(Default::default());
+    let uri = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":[], "uri":uri}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(failure.http_calls.len(), 1);
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::HostCallRejected {
+            reason: "asset-call-rejected",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn asset_storage_does_not_widen_http_methods() {
+    let run = streamed_http_run(b"streamed asset bytes")
+        .assets(dekopon_provider_sdk_testkit::AssetConstraints {
+            attach: true,
+            ..Default::default()
+        })
+        .http(HttpScript::new(
+            "fixture.example.test",
+            "GET",
+            Response {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ));
+    let uri = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":[], "uri":uri}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::HostCallRejected {
+            reason: "denied",
+            ..
+        }
+    ));
+}
+
+const RED_PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+const BLUE_PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==";
+
+#[test]
+fn real_edit_requests_stream_fixture_images_and_return_output_assets() {
+    use dekopon_core::base64::{Engine as _, STANDARD};
+    use std::os::unix::fs::FileExt as _;
+
+    let red = STANDARD.decode(RED_PIXEL).unwrap();
+    let blue = STANDARD.decode(BLUE_PIXEL).unwrap();
+    let run = streamed_http_run(&blue)
+        .assets(dekopon_provider_sdk_testkit::AssetConstraints {
+            attach: true,
+            ..Default::default()
+        })
+        .asset(3, "image/png", blue.clone())
+        .asset(7, "image/png", red);
+    let uri = format!("{}/images/edits", run.origin().unwrap());
+    let output = run.call(
+        "http-probe.fetch",
+        json!({"assetMode":"stream", "references":["chat-asset:7", "chat-asset:3", "chat-asset:7"], "uri":uri}),
+    ).unwrap();
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    let request = output.http_request.unwrap();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.uri, uri);
+    assert_eq!(
+        request.body,
+        format!("{RED_PIXEL}{BLUE_PIXEL}{RED_PIXEL}").as_bytes()
+    );
+    assert_eq!(output.assets.attached.len(), 1);
+    let asset = &output.assets.attached[0];
+    assert_eq!(asset.bytes, blue.len() as u64);
+    let mut bytes = vec![0; blue.len()];
+    output.assets.files[asset.descriptor as usize]
+        .file()
+        .read_exact_at(&mut bytes, 0)
+        .unwrap();
+    assert_eq!(bytes, blue);
+}
+
+#[test]
+fn input_asset_bytes_and_references_do_not_leak_between_calls() {
+    use dekopon_core::base64::{Engine as _, STANDARD};
+
+    for pixel in [RED_PIXEL, BLUE_PIXEL] {
+        let run = streamed_http_run(b"edited")
+            .assets(dekopon_provider_sdk_testkit::AssetConstraints {
+                attach: true,
+                ..Default::default()
+            })
+            .asset(7, "image/png", STANDARD.decode(pixel).unwrap());
+        let uri = run.origin().unwrap().to_owned();
+        let output = run
+            .call(
+                "http-probe.fetch",
+                json!({"assetMode":"stream", "references":["chat-asset:7"], "uri":uri}),
+            )
+            .unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.http_request.unwrap().body, pixel.as_bytes());
+    }
+    let run = streamed_http_run(b"edited").assets(dekopon_provider_sdk_testkit::AssetConstraints {
+        attach: true,
+        ..Default::default()
+    });
+    let uri = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":["chat-asset:7"], "uri":uri}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(failure.http_calls.is_empty());
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::AssetInput {
+            source: dekopon_broker_host::asset::AssetAdmissionError::DescriptorCount
+        }
+    ));
+}
+
+#[test]
+fn an_input_fixture_can_be_read_without_an_attachment_grant() {
+    use dekopon_core::base64::{Engine as _, STANDARD};
+
+    let bytes = STANDARD.decode(RED_PIXEL).unwrap();
+    let output = streamed_http_run(b"unused")
+        .asset(1, "image/png", bytes.clone())
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"read", "reference":"chat-asset:1"}),
+        )
+        .unwrap();
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"read":bytes.len()})
+    );
+    assert!(output.http_calls.is_empty());
+    assert!(output.http_request.is_none());
+    assert!(output.assets.attached.is_empty());
+}
+
+#[test]
+fn duplicate_input_asset_ids_are_refused_by_broker_admission() {
+    let error = streamed_http_run(b"unused")
+        .asset(1, "image/png", vec![1])
+        .asset(1, "image/png", vec![2])
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"read", "reference":"chat-asset:1"}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(failure.http_calls.is_empty());
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::AssetInput {
+            source: dekopon_broker_host::asset::AssetAdmissionError::DuplicateRow
+        }
+    ));
+}
+
+#[test]
+fn input_images_do_not_grant_output_attachment() {
+    use dekopon_core::base64::{Engine as _, STANDARD};
+
+    let run =
+        streamed_http_run(b"edited").asset(7, "image/png", STANDARD.decode(RED_PIXEL).unwrap());
+    let uri = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":["chat-asset:7"], "uri":uri}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(failure.http_calls.len(), 1);
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::HostCallRejected {
+            reason: "asset-call-rejected",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scripted_https_captures_the_complete_streamed_request_body() {
+    use dekopon_core::base64::{Engine as _, STANDARD};
+
+    let bytes = vec![0xa5; 8192];
+    let expected = STANDARD.encode(&bytes);
+    let run = streamed_http_run(b"done")
+        .assets(dekopon_provider_sdk_testkit::AssetConstraints {
+            attach: true,
+            ..Default::default()
+        })
+        .asset(1, "application/octet-stream", bytes);
+    let uri = run.origin().unwrap().to_owned();
+    let output = run
+        .call(
+            "http-probe.fetch",
+            json!({"assetMode":"stream", "references":["chat-asset:1"], "uri":uri}),
+        )
+        .unwrap();
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    assert_eq!(output.http_request.unwrap().body, expected.as_bytes());
+}

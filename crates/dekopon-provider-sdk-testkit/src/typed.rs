@@ -14,7 +14,8 @@ use dekopon_broker_host::{
     BrokerHostLimits, BrokerProviderRegistry, TestImports, UpcallExit, UpcallRequest, UpcallStdin,
 };
 use dekopon_capability::{
-    ExecutionConstraints, HttpConstraints, ProposedInvocation, broker::AuthorizationGate,
+    AssetConstraints, ExecutionConstraints, HttpConstraints, ProposedInvocation,
+    broker::AuthorizationGate,
 };
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
 use dekopon_http_host::LoopbackHttpsPin;
@@ -25,6 +26,8 @@ use dekopon_provider_sdk::provider::{
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::assets::{Fixtures, InputAsset};
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 type CacheKey = (TypeId, PathBuf);
@@ -79,6 +82,7 @@ impl HttpScript {
 
 const UNEXPECTED_CHILD: &str = "unexpected child script";
 const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
+const HTTP_BYTES: usize = 64 * 1024;
 
 /// One scripted child: the script the provider must run next, and how that child behaves.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -113,6 +117,8 @@ pub struct Run<P: Provider> {
     clock: Option<SystemTime>,
     settings: Option<Value>,
     http: Option<Result<ScriptServer, HarnessError>>,
+    assets: Option<AssetConstraints>,
+    input_assets: Vec<InputAsset>,
     stdin: Option<Vec<u8>>,
     close_stdout_after: Option<usize>,
     children: VecDeque<ChildScript>,
@@ -132,6 +138,8 @@ impl<P: Provider> Harness<P> {
             clock: None,
             settings: None,
             http: None,
+            assets: None,
+            input_assets: Vec::new(),
             stdin: None,
             close_stdout_after: None,
             children: VecDeque::new(),
@@ -164,11 +172,34 @@ pub enum HarnessError {
     Authorization(#[from] dekopon_capability::AuthorizationError),
     #[error("invalid identifier: {0}")]
     Identifier(#[from] dekopon_core::IdentifierError),
+    #[error("asset fixture: {0}")]
+    Asset(#[from] dekopon_http_host::asset::AssetIoError),
     #[error("fixture I/O: {0}")]
     Io(#[from] std::io::Error),
 }
 
 impl<P: Provider> Run<P> {
+    #[must_use]
+    pub fn asset(
+        mut self,
+        id: u64,
+        content_type: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.input_assets.push(InputAsset {
+            id,
+            content_type: content_type.into(),
+            bytes: bytes.into(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn assets(mut self, grant: AssetConstraints) -> Self {
+        self.assets = Some(grant);
+        self
+    }
+
     #[must_use]
     pub fn host_limits(mut self, limits: BrokerHostLimits) -> Self {
         self.limits = limits;
@@ -235,33 +266,29 @@ impl<P: Provider> Run<P> {
     pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
         let component = self.component.canonicalize()?;
         let registry = cached_registry::<P>(component, self.limits.clone())?;
+        let fixtures = Fixtures::new(self.assets.as_ref(), self.input_assets)?;
+        let mut assets = fixtures
+            .as_ref()
+            .map(|fixtures| fixtures.inputs(&input))
+            .transpose()?
+            .unwrap_or_default();
         let mut imports = TestImports {
+            assets: fixtures.as_ref().map(|fixtures| fixtures.directory.clone()),
             clock: self.clock,
             settings: self.settings.as_ref().map(Value::to_string),
-            ..TestImports::default()
+            loopback_https_pin: None,
         };
         let mut http = None;
         let mut server = None;
         if let Some(script) = self.http {
             let started = script?;
             imports.loopback_https_pin = Some(started.pin.clone());
-            http = Some(HttpConstraints {
-                allowed_hosts: vec![started.authority.clone()],
-                allowed_methods: vec![started.method.clone()],
-                max_requests: 1,
-                max_request_bytes: 64 * 1024,
-                max_response_bytes: 64 * 1024,
-                allow_plaintext_loopback: false,
-                propagate_trace: false,
-                request_templates: Vec::new(),
-            });
+            http = Some(started.constraints());
             server = Some(started);
         }
-        let capability = capability.parse()?;
-        let provider = P::ID.parse()?;
         let proposal = ProposedInvocation::new(
             "typed-testkit-call".parse::<InvocationId>()?,
-            capability,
+            capability.parse()?,
             Actor::Agent {
                 agent: "typed-testkit".parse::<AgentId>()?,
             },
@@ -271,12 +298,12 @@ impl<P: Provider> Run<P> {
         );
         let authorized = AuthorizationGate::new().authorize(
             proposal,
-            provider,
+            P::ID.parse()?,
             "testkit-decision".to_owned(),
             "testkit-broker".parse::<PrincipalId>()?,
             "testkit-policy".to_owned(),
             ExecutionConstraints {
-                asset: None,
+                asset: self.assets,
                 timeout_ms: self
                     .limits
                     .max_timeout
@@ -304,14 +331,11 @@ impl<P: Provider> Run<P> {
             None => (None, None),
         };
         let (upcalls, answers) = tokio::sync::mpsc::channel(1);
-        let assets = dekopon_broker_host::asset::AssetInputs {
-            streams: Some(dekopon_broker_host::Streams {
-                stdin: stdin_end,
-                stdout: host_end.into(),
-            }),
-            upcalls: Some(upcalls),
-            ..Default::default()
-        };
+        assets.streams = Some(dekopon_broker_host::Streams {
+            stdin: stdin_end,
+            stdout: host_end.into(),
+        });
+        assets.upcalls = Some(upcalls);
         let children = self.children;
         let (result, captured, fed, children) = runtime().block_on(async {
             let close_after = self.close_stdout_after;
@@ -349,6 +373,11 @@ impl<P: Provider> Run<P> {
             };
             Ok::<_, HarnessError>((result, captured, fed, children))
         })?;
+        let http_request = server
+            .as_mut()
+            .map(|server| server.finish(self.limits.max_timeout))
+            .transpose()
+            .map(Option::flatten);
         drop(server);
         if fed.is_some_and(|result| result.is_err()) {
             return Err(HarnessError::Fixture("stdin feeder"));
@@ -358,12 +387,12 @@ impl<P: Provider> Run<P> {
         if stdout.len() > 16 * 1024 * 1024 {
             return Err(HarnessError::Fixture("stdout exceeds capture limit"));
         }
-        let (status, stderr, http_calls) = match result {
-            Ok(output) => (0, output.stderr, output.http_calls),
+        let (status, stderr, http_calls, assets) = match result {
+            Ok(output) => (0, output.stderr, output.http_calls, output.assets),
             Err(failure) => match *failure.error {
                 dekopon_broker_host::BrokerHostError::ProviderFailure {
                     status, stderr, ..
-                } => (status, stderr, failure.http_calls),
+                } => (status, stderr, failure.http_calls, Default::default()),
                 error => {
                     return Err(HarnessError::Invocation(Box::new(
                         dekopon_broker_host::BrokerInvocationFailure {
@@ -380,6 +409,8 @@ impl<P: Provider> Run<P> {
             stdout,
             stderr,
             http_calls,
+            http_request: http_request?,
+            assets,
             children,
         })
     }
@@ -449,6 +480,8 @@ pub struct ComponentOutput {
     pub stdout: Vec<u8>,
     pub stderr: String,
     pub http_calls: Vec<dekopon_http_host::HttpCallEvidence>,
+    pub http_request: Option<Request>,
+    pub assets: dekopon_broker_host::asset::AssetOutputs,
     pub children: Vec<ChildRun>,
 }
 
@@ -457,7 +490,36 @@ struct ScriptServer {
     origin: String,
     method: String,
     pin: LoopbackHttpsPin,
-    task: tokio::task::JoinHandle<()>,
+    request: Arc<Mutex<Option<Request>>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl ScriptServer {
+    fn finish(&mut self, timeout: Duration) -> Result<Option<Request>, HarnessError> {
+        let request = self.request.lock().take();
+        if request.is_some() || self.task.is_finished() {
+            runtime().block_on(async {
+                tokio::time::timeout(timeout, &mut self.task)
+                    .await
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?
+                    .map_err(std::io::Error::other)?
+            })?;
+        }
+        Ok(request)
+    }
+
+    fn constraints(&self) -> HttpConstraints {
+        HttpConstraints {
+            allowed_hosts: vec![self.authority.clone()],
+            allowed_methods: vec![self.method.clone()],
+            max_requests: 1,
+            max_request_bytes: HTTP_BYTES as u64,
+            max_response_bytes: HTTP_BYTES as u64,
+            allow_plaintext_loopback: false,
+            propagate_trace: false,
+            request_templates: Vec::new(),
+        }
+    }
 }
 
 impl Drop for ScriptServer {
@@ -466,8 +528,9 @@ impl Drop for ScriptServer {
     }
 }
 
-fn response_head(response: &Response) -> Result<Vec<u8>, HarnessError> {
-    let mut bytes = format!("HTTP/1.1 {} OK\r\n", response.status).into_bytes();
+fn validate_response(response: &Response) -> Result<(), HarnessError> {
+    hyper::StatusCode::from_u16(response.status)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let expected_length = response.body.len().to_string();
     let mut has_length = false;
     for header in &response.headers {
@@ -495,20 +558,12 @@ fn response_head(response: &Response) -> Result<Vec<u8>, HarnessError> {
             }
             has_length = true;
         }
-        bytes.extend_from_slice(header.name.as_bytes());
-        bytes.extend_from_slice(b": ");
-        bytes.extend_from_slice(&header.value);
-        bytes.extend_from_slice(b"\r\n");
     }
-    if !has_length {
-        bytes.extend_from_slice(format!("Content-Length: {expected_length}\r\n").as_bytes());
-    }
-    bytes.extend_from_slice(b"Connection: close\r\n\r\n");
-    Ok(bytes)
+    Ok(())
 }
 
 fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
-    let response_head = response_head(&script.response)?;
+    validate_response(&script.response)?;
     if script.hostname.is_empty()
         || !script
             .hostname
@@ -537,27 +592,59 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
         .map_err(HarnessError::Fixture)?;
     let origin = format!("https://{authority}");
     let method = script.method.clone();
+    let request = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&request);
+    let request_origin = origin.clone();
     let task = runtime().spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-            if let Ok(mut tls) = acceptor.accept(stream).await {
-                let mut request = [0; 4096];
-                if tls.read(&mut request).await.is_ok() {
-                    let body = &script.response.body;
-                    if tls.write_all(&response_head).await.is_ok()
-                        && tls.write_all(body).await.is_ok()
-                    {
-                        drop(tls.shutdown().await);
+        let (stream, _) = listener.accept().await?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let tls = acceptor.accept(stream).await?;
+        let service =
+            hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                let captured = Arc::clone(&captured);
+                let origin = request_origin.clone();
+                let response = script.response.clone();
+                async move {
+                    let (head, body) = request.into_parts();
+                    let body = axum::body::to_bytes(axum::body::Body::new(body), HTTP_BYTES)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    *captured.lock() = Some(Request {
+                        method: head.method.to_string(),
+                        uri: format!("{origin}{}", head.uri),
+                        headers: head
+                            .headers
+                            .iter()
+                            .map(|(name, value)| Header {
+                                name: name.to_string(),
+                                value: value.as_bytes().to_vec(),
+                            })
+                            .collect(),
+                        body: body.to_vec(),
+                    });
+                    let mut reply = hyper::Response::builder().status(response.status);
+                    for header in response.headers {
+                        reply = reply.header(header.name, header.value);
                     }
+                    reply
+                        .header("connection", "close")
+                        .body(axum::body::Body::from(response.body))
+                        .map_err(std::io::Error::other)
                 }
-            }
-        }
+            });
+        hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .auto_date_header(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+            .await
+            .map_err(std::io::Error::other)
     });
     Ok(ScriptServer {
         authority,
         origin,
         method,
         pin,
+        request,
         task,
     })
 }
