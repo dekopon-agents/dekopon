@@ -2111,6 +2111,82 @@ async fn the_wall_clock_budget_cancels_the_session_from_started() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_answer_one_millisecond_before_the_deadline_writes_no_stop() {
+    const ANSWER: &str = "Answered in time.";
+
+    let mut harness = start_with(
+        Offers::default(),
+        ProgressDetail::Plain,
+        liveness(false),
+        Duration::from_secs(3),
+        Some(Duration::from_secs(30)),
+    );
+    harness.sink.emit(started());
+    settle().await;
+
+    advance(Duration::from_millis(29_999)).await;
+    let delivered = harness
+        .policy
+        .terminal(Terminal::Answered(OutboundReply::text(ANSWER.to_owned())))
+        .await;
+    assert!(
+        delivered,
+        "the answer beat the deadline and reached the person"
+    );
+
+    advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        harness.cancellation.source(),
+        None,
+        "a deadline passing after the answer cancels nothing"
+    );
+    assert_eq!(
+        harness
+            .recorder
+            .writes()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Finalize(_) | Call::Reply(_)))
+            .collect::<Vec<_>>(),
+        vec![Call::Reply(ANSWER.to_owned())],
+        "the answer is the only terminal write: {:?}",
+        harness.recorder.calls()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_started_rearms_the_wall_clock_deadline() {
+    let harness = start_with(
+        Offers::default(),
+        ProgressDetail::Plain,
+        liveness(false),
+        Duration::from_secs(3),
+        Some(Duration::from_secs(30)),
+    );
+    harness.sink.emit(started());
+    settle().await;
+
+    advance(Duration::from_secs(20)).await;
+    harness.sink.emit(started());
+    settle().await;
+
+    advance(Duration::from_secs(11)).await;
+    assert_eq!(
+        harness.cancellation.source(),
+        None,
+        "the first deadline no longer fires once a second Started arrives"
+    );
+
+    advance(Duration::from_secs(20)).await;
+    assert_eq!(
+        harness.cancellation.source(),
+        Some(CancelSource::Budget {
+            limit: BudgetLimit::WallClock
+        }),
+        "the second Started's deadline fires a full budget after it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_failed_session_removes_the_surface_and_replies_the_fixed_line() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
     harness.sink.emit(started());

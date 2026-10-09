@@ -12585,6 +12585,160 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
     }
 }
 
+async fn wall_clock_stops_after(
+    capture: &dekopon_test_support::CaptureLayer,
+    elapsed: Duration,
+) -> usize {
+    tokio::time::advance(elapsed).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    capture
+        .events()
+        .into_iter()
+        .filter(|(fields, _)| {
+            fields.contains(" kind=\"terminal_cancelled\"")
+                && fields.contains(" by=\"budget:wall-clock\"")
+        })
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_keeps_the_original_wall_clock_deadline() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
+        answer("too late"),
+        Duration::from_secs(30),
+    ));
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let budget = Duration::from_secs(30);
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        timed_route(model_config(), budget),
+        message("take your time"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_asked().await;
+
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_secs(10)).await,
+        0
+    );
+    run_session(
+        Arc::clone(&runner),
+        timed_route(model_config(), budget),
+        InboundMessage {
+            message_id: MessageId::Native("0123456789abcdef0123456789abcdef-1-2".to_owned()),
+            ..message("and one more thing")
+        },
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    model.release_next();
+    model.wait_until_asked().await;
+    assert!(
+        capture.events().into_iter().any(|(fields, _)| {
+            fields.contains(" audit.event=\"agent.model.prompt\"")
+                && fields.contains(" model.turn=2")
+                && fields.contains("and one more thing")
+        }),
+        "the steer is taken into the running session before its deadline: {}",
+        capture.events_text()
+    );
+
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_millis(19_999)).await,
+        0,
+        "the session runs until its original deadline"
+    );
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_millis(1)).await,
+        1,
+        "the steer moved nothing: the stop lands at the original deadline"
+    );
+    model.release_next();
+    session.await.expect("the stopped session unwinds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follow_up_after_a_wall_clock_stop_gets_its_full_budget() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let listing = || {
+        ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+    };
+    let (broker, _observed) = stub_broker(directory.path(), vec![listing(), listing()]).await;
+    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
+        answer("too late"),
+        Duration::from_secs(30),
+    ));
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let budget = Duration::from_secs(30);
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        timed_route(model_config(), budget),
+        message("take your time"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_asked().await;
+
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_secs(10)).await,
+        0
+    );
+    run_session(
+        Arc::clone(&runner),
+        timed_route(model_config(), budget),
+        message_from("tel.16035550100", "my turn next"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_secs(20)).await,
+        1,
+        "the first session stops at its own deadline with the follow-up queued"
+    );
+
+    model.release_next();
+    model.wait_until_asked().await;
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_millis(29_999)).await,
+        1,
+        "the follow-up's budget runs from its own start, not from the first session or its receipt"
+    );
+    assert_eq!(
+        wall_clock_stops_after(&capture, Duration::from_millis(1)).await,
+        2,
+        "the follow-up stops at its own deadline"
+    );
+    model.release_next();
+    session.await.expect("both sessions unwind");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
     for origin in CancelOrigin::EVERY {
