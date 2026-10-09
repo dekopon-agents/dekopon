@@ -725,9 +725,6 @@ impl CodexReducer<'_> {
             });
         }
         let content = (!self.text.trim().is_empty()).then_some(self.text);
-        if content.is_none() && calls.is_empty() {
-            return Err(invalid_event("response contained neither text nor calls"));
-        }
         Ok(
             AssistantTurn::new(content, calls, self.usage).with_codex_continuation(
                 self.native_items,
@@ -1387,6 +1384,18 @@ mod tests {
             ),
             Err(InferenceError::InvalidRequest(RequestError::EmptyModel))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_completed_response_is_an_empty_turn() {
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":5}}}\n\n";
+        let (_directory, _server, client) = fixture(vec![MockResponse::sse(body)]);
+        let turn = generate(&client, &control()).await.unwrap();
+        assert_eq!(turn.content, None);
+        assert!(turn.tool_calls.is_empty());
+        let usage = turn.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(5));
     }
 
     #[tokio::test]
