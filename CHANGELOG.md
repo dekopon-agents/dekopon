@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-10-09
+
+### Added
+
+- The provider testkit Harness supports isolated input asset fixtures, scoped asset grants, streamed HTTPS request capture and broker-owned output asset readback.
+- Discord inbound drops log a `gateway.message.dropped` event (INFO for content-withheld, malformed-envelope and conversation-unresolved; DEBUG for message-type, bot-authored and self-authored), and a `content-withheld` drop records `mention.roles` on the event and the `transport.receive` span.
+
 ## [dekopon-chart-0.30.0] - 2026-10-08
 
 ### Changed

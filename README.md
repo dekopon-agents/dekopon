@@ -23,7 +23,7 @@ Correlated tracing from receipt to execution:
 
 Extensibility through Wasm providers:
 
-- A Rust provider SDK, a bounded Wasmtime component host with a fresh store per call, and a typed native/real-component testkit (`dekopon-provider-sdk-testkit`); broker-host fixture tests run external and storage components against exact grants. Inside an authorized invoke, providers read the wall clock, a monotonic clock (`dekopon:clock@1.1.0`) and bounded OS entropy (`dekopon:random@0.1.0`) with no extra grant.
+- A Rust provider SDK, a bounded Wasmtime component host with a fresh store per call, and a typed native/real-component testkit (`dekopon-provider-sdk-testkit`) with isolated input assets, scoped grants, streamed HTTPS request capture and output asset readback; broker-host fixture tests run external and storage components against exact grants. Inside an authorized invoke, providers read the wall clock, a monotonic clock (`dekopon:clock@1.1.0`) and bounded OS entropy (`dekopon:random@0.1.0`) with no extra grant.
 - A published streaming `dekopon:http@1.1.0` contract, a guest Rust facade, a bounded native HTTP engine, an asynchronous broker component host, a deny-by-default authorization core, and a bounded identity-free Unix protocol.
 - Provider child scripts through `dekopon:spawn/run@0.1.0`: the broker authorizes the parent invocation and passes the child to the gateway to run on the same session tree, budget, and trace.
 - Broker-owned JSONL and durable-file provider storage, plus optional on-demand durable chat memory: model-queryable only under an effective all-three grant, recorded once after gateway-attested transport acceptance, never automatically replayed into a prompt.

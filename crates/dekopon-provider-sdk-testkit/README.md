@@ -1,5 +1,8 @@
 # dekopon-provider-sdk-testkit
 
+Version 0.42.0 includes component asset fixtures and readback. Keep exact core crate
+pins at 0.42.0 together; this testkit requires the matching broker-host APIs.
+
 The typed test kit runs a provider against the same SDK dispatch in two modes:
 `Native<P>` with injected ports and `Harness::<P>::get(path)` against a checked
 WebAssembly component loaded by the real broker host. `conformance::<P>(path)`

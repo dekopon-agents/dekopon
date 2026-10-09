@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider testkit assets (0.42.0)
+
+Update exact core crate pins together to 0.42.0 when adopting the testkit's input asset
+fixtures, scoped grants, HTTPS request capture or output asset readback. The testkit
+requires the matching broker-host APIs; publish broker-host before testkit in the
+shared core release. See the [testkit README](../crates/dekopon-provider-sdk-testkit/README.md)
+for fixture setup and ownership. No provider WIT or configuration migration is required;
+existing deployed provider components remain unchanged.
+
 ## Request templates (0.41.0)
 
 Upgrade the broker; nothing changes until a constraint set uses the new key. An HTTP constraint
