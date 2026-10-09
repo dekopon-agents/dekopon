@@ -49,6 +49,7 @@ pub trait Provider: Sized + 'static {
     const DESCRIPTION: &'static str;
     /// The argv grammar; help, version and usage errors are rendered from it.
     type Args: clap::Parser;
+    /// The exported capabilities, as a tuple of up to 32.
     type Capabilities: Capabilities<Self>;
 
     /// Maps parsed arguments to one capability proposal or a usage error; it runs before
@@ -133,26 +134,6 @@ impl ImportSet {
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
-}
-
-pub struct Cons<Head, Tail>(pub Head, pub Tail);
-
-#[macro_export]
-macro_rules! type_list {
-    () => { () };
-    ($head:ty $(, $tail:ty)* $(,)?) => {
-        $crate::provider::Cons<$head, $crate::type_list!($($tail),*)>
-    };
-}
-
-impl<Head: Needs, Tail: Needs> sealed::Needs for Cons<Head, Tail> {
-    fn grant() -> Result<Self, SdkFailure> {
-        Ok(Self(Head::grant()?, Tail::grant()?))
-    }
-}
-
-impl<Head: Needs, Tail: Needs> Needs for Cons<Head, Tail> {
-    const IMPORTS: ImportSet = Head::IMPORTS.union(Tail::IMPORTS);
 }
 
 macro_rules! need_tuple {
@@ -354,7 +335,9 @@ impl<P: Provider> Proposal<P> {
     }
 }
 
+/// The capabilities a provider lists: a tuple of up to 32 [`Capability`] types.
 pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {
+    /// The union of imports declared by the capabilities in this tuple.
     const IMPORTS: ImportSet;
 }
 
@@ -372,67 +355,9 @@ mod sealed {
     }
 
     pub trait Capabilities<P: Provider> {
-        fn describe(
-            provider: &str,
-            capabilities: &mut Vec<ProviderCapability>,
-        ) -> Result<(), ManifestError>;
+        fn describe(provider: &str) -> Result<Vec<ProviderCapability>, ManifestError>;
         fn lists(name: &str) -> bool;
         fn run(name: &str, input: &str, out: &mut Stdout) -> Option<Result<(), Exit>>;
-    }
-
-    impl<P: Provider> Capabilities<P> for () {
-        fn describe(_: &str, _: &mut Vec<ProviderCapability>) -> Result<(), ManifestError> {
-            Ok(())
-        }
-
-        fn lists(_: &str) -> bool {
-            false
-        }
-
-        fn run(_: &str, _: &str, _: &mut Stdout) -> Option<Result<(), Exit>> {
-            None
-        }
-    }
-
-    impl<P: Provider> super::Capabilities<P> for () {
-        const IMPORTS: super::ImportSet = super::ImportSet::EMPTY;
-    }
-
-    impl<P, Head, Tail> Capabilities<P> for super::Cons<Head, Tail>
-    where
-        P: Provider,
-        Head: Capability<Provider = P>,
-        Tail: super::Capabilities<P>,
-    {
-        fn describe(
-            provider: &str,
-            capabilities: &mut Vec<ProviderCapability>,
-        ) -> Result<(), ManifestError> {
-            capabilities.push(super::describe::<Head>(provider)?);
-            Tail::describe(provider, capabilities)
-        }
-
-        fn lists(name: &str) -> bool {
-            name == Head::NAME || Tail::lists(name)
-        }
-
-        fn run(name: &str, input: &str, out: &mut Stdout) -> Option<Result<(), Exit>> {
-            if name == Head::NAME {
-                Some(super::run::<Head>(input, out))
-            } else {
-                Tail::run(name, input, out)
-            }
-        }
-    }
-
-    impl<P, Head, Tail> super::Capabilities<P> for super::Cons<Head, Tail>
-    where
-        P: Provider,
-        Head: Capability<Provider = P>,
-        Tail: super::Capabilities<P>,
-    {
-        const IMPORTS: super::ImportSet =
-            <Head::Needs as super::Needs>::IMPORTS.union(Tail::IMPORTS);
     }
 
     macro_rules! tuple {
@@ -440,9 +365,8 @@ mod sealed {
             impl<P: Provider, $($capability: Capability<Provider = P>),+> Capabilities<P>
                 for ($($capability,)+)
             {
-                fn describe(provider: &str, capabilities: &mut Vec<ProviderCapability>) -> Result<(), ManifestError> {
-                    $(capabilities.push(super::describe::<$capability>(provider)?);)+
-                    Ok(())
+                fn describe(provider: &str) -> Result<Vec<ProviderCapability>, ManifestError> {
+                    Ok(vec![$(super::describe::<$capability>(provider)?),+])
                 }
 
                 fn lists(name: &str) -> bool {
@@ -474,7 +398,8 @@ mod sealed {
     }
 
     tuples!(
-        C19, C18, C17, C16, C15, C14, C13, C12, C11, C10, C9, C8, C7, C6, C5, C4, C3, C2, C1
+        C32, C31, C30, C29, C28, C27, C26, C25, C24, C23, C22, C21, C20, C19, C18, C17, C16, C15,
+        C14, C13, C12, C11, C10, C9, C8, C7, C6, C5, C4, C3, C2, C1
     );
 }
 
@@ -597,16 +522,13 @@ impl std::error::Error for ManifestError {}
 
 /// The manifest derived from `P`'s declarations, or why it cannot be derived.
 pub fn manifest<P: Provider>() -> Result<ProviderManifest, ManifestError> {
-    let id = P::ID
-        .parse::<ProviderId>()
-        .map_err(ManifestError::Identifier)?;
-    let mut capabilities = Vec::new();
-    <P::Capabilities as sealed::Capabilities<P>>::describe(P::ID, &mut capabilities)?;
     Ok(ProviderManifest {
         api_version: ProviderApiVersion::V1Alpha1,
-        id,
+        id: P::ID
+            .parse::<ProviderId>()
+            .map_err(ManifestError::Identifier)?,
         description: P::DESCRIPTION.to_owned(),
-        capabilities,
+        capabilities: <P::Capabilities as sealed::Capabilities<P>>::describe(P::ID)?,
         command_words: P::COMMAND_WORDS
             .iter()
             .map(|&word| word.to_owned())

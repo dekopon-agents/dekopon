@@ -1,9 +1,9 @@
 # dekopon-provider-sdk
 
 Rust guest SDK for Dekopon component providers. Declare a `Provider` with an
-identity, command words, clap `Args`, and a list of typed `Capability` types.
-Each capability declares a closed, serializable input, a `Needs` list of
-broker-granted handles, streamed output, and a typed failure code. The
+identity, command words, clap `Args`, and a tuple of typed `Capability` types.
+Each capability declares a closed, serializable input, a `Needs` tuple of
+broker-granted handles, a serializable output, and a typed failure code. The
 SDK derives the manifest and command dispatch; `export!(P)` exports the current
 `dekopon:provider/provider-cli@0.4.0` WIT world. `propose` and `describe` must
 not use host imports: only an authorized `invoke` receives handles.
@@ -44,19 +44,3 @@ components, and `dekopon-provider-sdk-testkit` for native/component parity and
 conformance checks. Previously published guest binding crates continue to serve
 external providers until those providers migrate separately; they are not part
 of this workspace.
-
-Register capabilities with `type Capabilities = dekopon_provider_sdk::type_list![Read,
-Write, Inspect];`. The macro builds an SDK-owned `provider::Cons<Head, Tail>` list
-ending in `()`. There is no SDK-imposed capability or need count limit; ordinary
-Rust compiler recursion and resource limits still apply. Manifest entries keep
-declaration order, and the same list drives proposals, typed dispatch, schemas,
-and the union of required imports. Clap `Args` continues to define help.
-
-Existing capability and need tuples remain supported without migration. To grow a
-flat tuple past its supported arity, replace the tuple declaration with
-`type_list![...]`. Capability implementations and `propose` stay the same.
-For needs, use `type Needs = dekopon_provider_sdk::type_list![Clock, Random];`
-and destructure the granted value as `Cons(clock, Cons(random, ()))` in `run`.
-The list cannot construct import handles or grant authority: its sealed `Needs`
-implementation obtains each handle through the same SDK grant path as tuples.
-See `clock-probe` for a complete component using both lists.

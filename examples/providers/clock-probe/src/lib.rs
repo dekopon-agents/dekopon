@@ -1,6 +1,6 @@
 use dekopon_provider_sdk::clap::Parser;
 use dekopon_provider_sdk::provider::{
-    Capability, Clock, Code, Cons, Failure, Monotonic, Proposal, Provider, Random, Stdout, Usage,
+    Capability, Clock, Code, Failure, Monotonic, Proposal, Provider, Random, Stdout, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
@@ -60,7 +60,7 @@ impl Provider for ClockProbe {
     const DESCRIPTION: &'static str =
         "Clock provider fixture: the date word and the host wall clock";
     type Args = Date;
-    type Capabilities = dekopon_provider_sdk::type_list![Now];
+    type Capabilities = (Now,);
     fn propose(args: Date, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<Now>(Empty {
             services: args.services,
@@ -75,11 +75,11 @@ impl Capability for Now {
     const EFFECT: EffectKind = EffectKind::ReadOnly;
     const RISK: RiskLevel = RiskLevel::Low;
     type Input = Empty;
-    type Needs = dekopon_provider_sdk::type_list![Clock, Monotonic, Random];
+    type Needs = (Clock, Monotonic, Random);
     type Error = ClockError;
     fn run(
         input: Empty,
-        Cons(clock, Cons(monotonic, Cons(random, ()))): Self::Needs,
+        (clock, monotonic, random): (Clock, Monotonic, Random),
         out: &mut Stdout,
     ) -> Result<(), ClockError> {
         let mut value = reading(clock.now_unix_millis())?;
