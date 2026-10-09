@@ -116,6 +116,10 @@ library uses `tracing` only and installs no subscriber.
 | `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.reasoning_output_tokens` | reported subsets/work, without adding them again to total |
 | `tool_call.count`, `response.bytes` | completed call count on success, bytes consumed by the response reader |
 | `finish.reason`, `output.partial` | reported chat finish reason; partial visible output on failure or successful `length` text |
+| `stream.events` | SSE events observed by the adapter, including `[DONE]`, recorded once when the exchange ends |
+| `reasoning.items` | merged reasoning item count when an OpenRouter turn is finalized; never reasoning text |
+| `tool_call.skipped` | OpenRouter tool items dropped during finalization because their type is unknown |
+| `delta.unrecognized` | first eight distinct ignored OpenRouter delta keys in sorted order, sanitized and comma-joined; absent when none, never their values |
 | `outcome`, `error`, `error.kind` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
 | `error.phase` | `before-send`, `awaiting-headers` or `reading-body`, when known |
 | `http.status`, `provider.code`, `provider.request_id` | safe known response metadata; status/request ID survive later protocol/cancellation failures |

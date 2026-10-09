@@ -874,3 +874,125 @@ async fn a_public_router_override_rejects_remote_hosts_and_invalidates_native_re
     assert_eq!(server.requests().len(), 1);
     requests_have_only_the_authored_headers(&server);
 }
+
+#[tokio::test]
+async fn a_reasoning_only_stream_completes_empty_and_counts_reasoning() {
+    let chunks = [
+        json!({"choices":[{"delta":{"reasoning_details":[
+            {"index":0,"type":"reasoning.text","text":"private reasoning"},
+            {"index":1,"type":"reasoning.text","text":"another thought"}
+        ]}}]}),
+        json!({"choices":[{"delta":{"reasoning_details":[
+            {"index":0,"text":" continued"}
+        ]},"finish_reason":"stop"}]}),
+    ];
+    let body: String = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let trace = crate::trace_capture::TraceCapture::default();
+    let turn = generate(&client(&server, Settings::default()), &[])
+        .with_subscriber(trace.subscriber())
+        .await
+        .unwrap();
+    assert!(turn.content.is_none());
+    assert!(turn.tool_calls.is_empty());
+    assert_eq!(trace.field("reasoning.items").as_deref(), Some("2"));
+    assert_eq!(trace.field("finish.reason").as_deref(), Some("\"stop\""));
+    assert_eq!(trace.field("delta.unrecognized"), None);
+    assert!(!trace.text().contains("private reasoning"));
+    assert!(!trace.text().contains("another thought"));
+    trace.assert_exchange("openrouter", "chat-completions");
+}
+
+#[tokio::test]
+async fn done_without_a_finish_reason_completes_with_no_recorded_reason() {
+    let chunks = [
+        json!({"choices":[{"delta":{"content":null}}]}),
+        json!({"choices":[{"delta":{"content":""}}]}),
+    ];
+    let mut body: String = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    body.push_str("data: [DONE]\n\n");
+    let server = MockServer::start(vec![MockResponse::sse(&body).split(1)]);
+    let trace = crate::trace_capture::TraceCapture::default();
+    let turn = generate(&client(&server, Settings::default()), &[])
+        .with_subscriber(trace.subscriber())
+        .await
+        .unwrap();
+    assert!(turn.content.is_none());
+    assert!(turn.tool_calls.is_empty());
+    assert_eq!(trace.field("finish.reason"), None);
+    assert_eq!(
+        trace.field("stream.events"),
+        Some((chunks.len() + 1).to_string())
+    );
+    assert_eq!(trace.text().matches("stream.events=").count(), 1);
+    assert_eq!(trace.field("reasoning.items").as_deref(), Some("0"));
+    assert_eq!(trace.field("tool_call.skipped").as_deref(), Some("0"));
+    trace.assert_exchange("openrouter", "chat-completions");
+}
+
+#[tokio::test]
+async fn a_turn_of_only_unknown_tool_items_completes_empty_and_counts_the_skip() {
+    let chunks = [
+        json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"unknown-0","type":"computer"},
+            {"index":1,"id":"unknown-1","type":"future"}
+        ]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"type":"computer"}
+        ]},"finish_reason":"tool_calls"}]}),
+    ];
+    let body: String = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let trace = crate::trace_capture::TraceCapture::default();
+    let turn = generate(&client(&server, Settings::default()), &[])
+        .with_subscriber(trace.subscriber())
+        .await
+        .unwrap();
+    assert!(turn.content.is_none());
+    assert!(turn.tool_calls.is_empty());
+    assert!(turn.openrouter_replay().unwrap().calls.is_empty());
+    assert_eq!(trace.field("tool_call.skipped").as_deref(), Some("2"));
+    trace.assert_exchange("openrouter", "chat-completions");
+}
+
+#[tokio::test]
+async fn unrecognized_delta_keys_are_named_on_the_span_never_valued() {
+    let chunks = [
+        json!({"choices":[{"delta":{
+            "reasoning":"secret words", "z-last":"secret words",
+            "x":null, "w":[], "v":{}, "u":true, "t":1, "s":"secret words"
+        }}]}),
+        json!({"choices":[{"delta":{
+            "b":"secret words", "a-synthetic-key":"secret words", "reasoning":"secret words"
+        },"finish_reason":"stop"}]}),
+    ];
+    let body: String = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let trace = crate::trace_capture::TraceCapture::default();
+    let turn = generate(&client(&server, Settings::default()), &[])
+        .with_subscriber(trace.subscriber())
+        .await
+        .unwrap();
+    assert!(turn.content.is_none());
+    assert!(turn.tool_calls.is_empty());
+    assert_eq!(
+        trace.field("delta.unrecognized").as_deref(),
+        Some("\"a-[REDACTED],b,reasoning,s,t,u,v,w\"")
+    );
+    assert_eq!(trace.text().matches("delta.unrecognized=").count(), 1);
+    assert!(!trace.text().contains("secret words"));
+    assert!(!trace.text().contains("synthetic-key"));
+    trace.assert_exchange("openrouter", "chat-completions");
+}

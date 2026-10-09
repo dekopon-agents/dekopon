@@ -19,7 +19,12 @@ use dekopon_core::Redacted;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use settings::{CacheStyle, Settings};
-use std::{collections::HashMap, num::NonZeroU32, ops::ControlFlow, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroU32,
+    ops::ControlFlow,
+    time::Duration,
+};
 
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -374,6 +379,8 @@ struct Delta {
     reasoning_details: Option<Vec<Value>>,
     #[serde(default)]
     tool_calls: Option<Vec<Value>>,
+    #[serde(flatten)]
+    other: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 struct RouterStream {
@@ -387,6 +394,7 @@ struct RouterStream {
     reason: Option<FinishReason>,
     terminal: bool,
     choices_seen: bool,
+    unrecognized: BTreeSet<String>,
 }
 
 fn protocol(message: &str, secrets: DiagnosticSecrets<'_>) -> InferenceError {
@@ -409,6 +417,7 @@ impl RouterStream {
             reason: None,
             terminal: false,
             choices_seen: false,
+            unrecognized: BTreeSet::new(),
         }
     }
 
@@ -443,6 +452,12 @@ impl RouterStream {
                 self.terminal = true;
             }
             let delta = choice.delta.unwrap_or_default();
+            for key in delta.other.into_keys() {
+                self.unrecognized.insert(key);
+                if self.unrecognized.len() > 8 {
+                    self.unrecognized.pop_last();
+                }
+            }
             if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
                 self.content.push_str(&text);
                 if observe(TurnEvent::TextDelta(ModelText::from_model(text))).is_break() {
@@ -482,6 +497,14 @@ impl RouterStream {
         identity: &ClientIdentity,
         secrets: DiagnosticSecrets<'_>,
     ) -> Result<AssistantTurn, InferenceError> {
+        let span = tracing::Span::current();
+        span.record("reasoning.items", self.replay.reasoning.len());
+        if !self.unrecognized.is_empty() {
+            span.record(
+                "delta.unrecognized",
+                secrets.sanitize(&self.unrecognized.into_iter().collect::<Vec<_>>().join(",")),
+            );
+        }
         if !self.terminal {
             return Err(ProtocolFailure::MissingTerminal.into());
         }
@@ -490,6 +513,7 @@ impl RouterStream {
         }
         let mut calls = Vec::with_capacity(self.replay.calls.len());
         let mut kept = Vec::with_capacity(self.replay.calls.len());
+        let mut skipped = 0_u64;
         for mut value in std::mem::take(&mut self.replay.calls) {
             let object = value
                 .as_object_mut()
@@ -501,8 +525,11 @@ impl RouterStream {
             {
                 calls.push(call);
                 kept.push(value);
+            } else {
+                skipped += 1;
             }
         }
+        span.record("tool_call.skipped", skipped);
         self.replay.calls = kept;
         Ok(complete_turn(
             (!self.content.is_empty()).then_some(self.content),
