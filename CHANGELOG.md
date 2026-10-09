@@ -7,6 +7,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.31.0] - 2026-10-09
+
+### Added
+
+- chart `configCheck` renders a hook Job that runs `dekopon-brokerd check` and `dekopon-gatewayd check --probe` on candidate ConfigMaps before a sync; a problem fails the hook before anything changes.
+
+### Changed
+
+- Prepare chart 0.31.0 for core v0.44.0; pin the published image index in a separate reviewed change.
+
+## [0.44.0] - 2026-10-09
+
+### Added
+
+- `dekopon-gatewayd check --probe [--against <config>]` sends one capped completion to the vendor of each changed OpenRouter model and reports a refusal with the model, its file, its routes and the vendor's status and body; subscription, anthropic and openaiCompatible models are reported as not probed.
+
+### Changed
+
+- `dekopon-gatewayd check` and `dekopon-brokerd check` keep going past a catalog, route, provider-set or frame-limit failure and report every problem together, naming each stage they could not run.
+
 ## [0.43.0] - 2026-10-09
 
 ### Added

@@ -27,6 +27,8 @@ Chart: `configCheck` (off by default) renders a pre-install/pre-upgrade hook Job
 checks on candidate ConfigMaps; see [`kubernetes.md`](kubernetes.md#checking-configuration-before-a-sync).
 Enabling it needs a second, candidate set of ConfigMaps synced ahead of the Job.
 
+Install chart 0.31.0 only after its default image index is pinned to the verified v0.44.0 image.
+
 ## Discord role mentions (0.43.0)
 
 Upgrade the gateway first; nothing changes until a Discord transport sets `messageContent: true`.
