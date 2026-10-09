@@ -33,6 +33,7 @@ hmac.workspace = true
 http-auth.workspace = true
 libc.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rustix.workspace = true
 semver.workspace = true
 serde.workspace = true

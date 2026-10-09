@@ -985,6 +985,7 @@ dependencies = [
  "parking_lot",
  "rcgen",
  "reqwest",
+ "ring",
  "rustix",
  "rustls",
  "semver",
