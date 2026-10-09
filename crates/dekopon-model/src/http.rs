@@ -128,6 +128,10 @@ impl InferenceHttp {
             provider.code = tracing::field::Empty,
             provider.request_id = tracing::field::Empty,
             finish.reason = tracing::field::Empty,
+            stream.events = tracing::field::Empty,
+            reasoning.items = tracing::field::Empty,
+            tool_call.skipped = tracing::field::Empty,
+            delta.unrecognized = tracing::field::Empty,
             output.partial = false,
         );
         let started = Instant::now();
@@ -436,6 +440,12 @@ impl Progress {
         observer(event)
     }
 }
+impl Drop for Progress {
+    fn drop(&mut self) {
+        tracing::Span::current().record("stream.events", self.events);
+    }
+}
+
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
