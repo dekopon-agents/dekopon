@@ -725,9 +725,6 @@ impl CodexReducer<'_> {
             });
         }
         let content = (!self.text.trim().is_empty()).then_some(self.text);
-        if content.is_none() && calls.is_empty() {
-            return Err(invalid_event("response contained neither text nor calls"));
-        }
         Ok(
             AssistantTurn::new(content, calls, self.usage).with_codex_continuation(
                 self.native_items,
@@ -1025,6 +1022,32 @@ mod tests {
         )
         .unwrap();
         (directory, server, client)
+    }
+
+    #[tokio::test]
+    async fn an_empty_completed_response_is_an_empty_turn() {
+        let body = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],",
+            "\"usage\":{\"input_tokens\":23,\"input_tokens_details\":{\"cached_tokens\":5},",
+            "\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":3},\"total_tokens\":26}}}\n\n"
+        );
+        let (_directory, _server, client) = fixture(vec![MockResponse::sse(body)]);
+        let turn = generate(&client, &control()).await.unwrap();
+
+        assert_eq!(turn.content, None);
+        assert!(turn.tool_calls.is_empty());
+        assert_eq!(
+            turn.usage,
+            Some(ModelUsage {
+                input_tokens: Some(23),
+                cached_input_tokens: Some(5),
+                output_tokens: Some(3),
+                reasoning_output_tokens: Some(3),
+                total_tokens: Some(26),
+                ..ModelUsage::default()
+            })
+        );
+        assert!(turn.codex_items().unwrap().is_empty());
     }
 
     #[test]

@@ -1860,6 +1860,23 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_codex_turn_is_an_empty_answer() {
+        let model = ScriptedModel::new([AssistantTurn::new(None, Vec::new(), None)]);
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("answer", limits(1, 2)),
+            &mut history,
+        )
+        .expect_err("an empty final turn has no answer");
+
+        assert!(matches!(error, PromptError::EmptyAnswer));
+    }
+
+    #[test]
     fn a_pre_cancelled_session_never_reaches_the_model_or_history() {
         let model = ScriptedModel::new([answer("too late")]);
         let runtime = RecordingRuntime::new(0);
