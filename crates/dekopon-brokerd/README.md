@@ -400,7 +400,7 @@ credentials:
 ```
 
 Every entry takes `name`, `kind` and `destinations`. The rest is per kind, and the file is validated
-as a whole: every missing field, every field that belongs to the other kind, every malformed name, and
+as a whole: every missing field, every field that belongs to another kind, every malformed name, and
 every duplicate name is reported in one refusal, so fixing one does not reveal the next on the
 following start.
 
@@ -408,6 +408,7 @@ following start.
 |---|---|---|---|
 | `bearerToken` | `scheme`, `secret` | `authFile` | `authorization: <scheme> <secret>` |
 | `chatgptSubscription` | `authFile` (absolute) | `scheme`, `secret` | `authorization: Bearer <access>` plus `chatgpt-account-id: <accountId>` |
+| `githubApp` | `appId`, `installationId`, `privateKey` (absolute) | `scheme`, `secret`, `authFile` | `authorization: Bearer <installation token>` |
 
 A `bearerToken` `secret` must be at least 16 bytes of printable ASCII with no whitespace or control
 bytes. The value is also what the native HTTP host searches an authorized response for before

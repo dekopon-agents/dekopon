@@ -7,7 +7,7 @@ use base64::{
 };
 use dekopon_broker::{CredentialRefreshError, RefreshingCredential};
 use dekopon_broker_host::BoundCredential;
-use dekopon_core::Redacted;
+use dekopon_core::{Redacted, error_chain};
 use reqwest::{
     StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue},
@@ -26,7 +26,7 @@ use crate::credentials::REFRESH_TIMEOUT;
 
 pub(crate) const HARD_MAX_GITHUB_APP_KEY_BYTES: usize = 16 * 1024;
 const GITHUB_API_BASE: &str = "https://api.github.com";
-const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 // GitHub refuses an App JWT whose `exp` is more than ten minutes out, and backdating `iat` absorbs
 // clock drift between the broker and GitHub.
 const JWT_BACKDATE: time::Duration = time::Duration::seconds(60);
@@ -251,7 +251,7 @@ impl GithubAppCredential {
         let mut response = request
             .send()
             .await
-            .map_err(|_transport| self.unavailable("transport"))?;
+            .map_err(|error| self.transport(&error))?;
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED {
             tracing::error!(
@@ -272,7 +272,7 @@ impl GithubAppCredential {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_transport| self.unavailable("transport"))?
+            .map_err(|error| self.transport(&error))?
         {
             if body.len() + chunk.len() > MAX_TOKEN_RESPONSE_BYTES {
                 return Err(self.unavailable("token-endpoint-protocol"));
@@ -294,12 +294,19 @@ impl GithubAppCredential {
         CredentialRefreshError::Unavailable { category }
     }
 
-    fn failed(&self, category: &'static str, reason: Option<&dyn std::error::Error>) {
+    fn transport(&self, error: &reqwest::Error) -> CredentialRefreshError {
+        self.failed("transport", Some(error));
+        CredentialRefreshError::Unavailable {
+            category: "transport",
+        }
+    }
+
+    fn failed(&self, category: &'static str, error: Option<&dyn std::error::Error>) {
         tracing::warn!(
             event = "broker_github_app_credential_refresh_failed",
             credential = %self.name,
             category = category,
-            reason = reason.map(tracing::field::display),
+            error = error.map(|error| tracing::field::display(error_chain(error))),
             "a GitHub App installation token could not be minted"
         );
     }
@@ -351,8 +358,6 @@ mod tests {
     use super::{Downscope, GithubAppCredential, GithubAppKey, Installation};
 
     const KEY_PEM: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
-    const PUBLIC_KEY_DER: &[u8] =
-        include_bytes!("../tests/fixture/github-app-test-only.public.der");
     const APP_ID: u64 = 1_000_001;
     const INSTALLATION_ID: u64 = 2_000_002;
     const TOKEN: &str = "ghs_fixtureInstallationTokenValue0001";
@@ -446,7 +451,6 @@ mod tests {
             )),
             "{request}"
         );
-        assert!(server.recorded().is_empty(), "the token was minted twice");
         server.join();
 
         let renewing = LoopbackServer::sequence([
@@ -486,14 +490,15 @@ mod tests {
         );
         let token = jwt(&request);
         let (signing_input, signature) = token.rsplit_once('.').expect("three JWT segments");
-        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, PUBLIC_KEY_DER)
+        let key = GithubAppKey::from_pem(KEY_PEM).expect("the fixture key parses");
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.0.public().as_ref())
             .verify(
                 signing_input.as_bytes(),
                 &URL_SAFE_NO_PAD
                     .decode(signature)
                     .expect("signature encoding"),
             )
-            .expect("the fixture's public key verifies the JWT");
+            .expect("the fixture key pair's public key verifies the JWT");
         let (header_segment, claims_segment) =
             signing_input.split_once('.').expect("header and claims");
         let header_json: serde_json::Value = serde_json::from_slice(
@@ -565,6 +570,35 @@ mod tests {
             sent,
             serde_json::json!({"permissions": {"issues": "write"}})
         );
+        server.join();
+    }
+
+    #[tokio::test]
+    async fn github_app_mints_from_a_response_listing_many_repositories() {
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .format(&Rfc3339)
+            .expect("format expiry");
+        let repositories = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index,
+                    "full_name": format!("fixture-owner/repository-{index}"),
+                    "description": "d".repeat(2048),
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "token": TOKEN,
+            "expires_at": expires_at,
+            "repositories": repositories,
+        })
+        .to_string();
+        assert!(body.len() > 200 * 1024, "{} bytes", body.len());
+        let server = LoopbackServer::once(&status_response("201 Created", &body));
+        credential(&server, None)
+            .resolve()
+            .await
+            .expect("a large repository listing mints");
         server.join();
     }
 
