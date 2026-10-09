@@ -849,7 +849,6 @@ fn run_trial<'a>(
             scripts: &views,
         },
     );
-    drop(views);
     Ok(Row {
         label: trial.label,
         client: trial.client.name(),
