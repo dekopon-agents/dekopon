@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Discord role mentions (0.43.0)
+
+Upgrade the gateway first; nothing changes until a Discord transport sets `messageContent: true`.
+A 0.42.0 or older gateway refuses the key at startup. Turn on Message Content Intent in the
+Developer Portal (app → Bot → Privileged Gateway Intents) before setting it, or the transport stops
+at startup with close 4014. See [How @mentions reach the bot on Discord](gatewayd.md#how-mentions-reach-the-bot-on-discord).
+
 ## Provider testkit assets (0.42.0)
 
 Update exact core crate pins together to 0.42.0 when adopting the testkit's input asset
