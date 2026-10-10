@@ -6,7 +6,10 @@ use futures_util::{Stream, StreamExt as _};
 use serde_json::Value;
 use tokio::time::Instant;
 
-use crate::dialect::{Dialect, Observation};
+use crate::{
+    CallSpan,
+    dialect::{Dialect, Observation},
+};
 
 /// A single SSE line longer than this is forwarded but not parsed for usage.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -31,6 +34,7 @@ struct Tee<S> {
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
+    span: CallSpan,
     observed: Observation,
     line: Vec<u8>,
     overlong: bool,
@@ -41,15 +45,13 @@ struct Tee<S> {
     done: bool,
 }
 
-/// Forwards the upstream body unbuffered, feeds each event's usage and text into the admission,
-/// and settles it when the upstream ends; a dropped body (the client went away) drops the
-/// admission, which settles as cancelled.
 pub(crate) fn tee<S>(
     upstream: S,
     dialect: Dialect,
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
+    span: CallSpan,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
@@ -61,6 +63,7 @@ where
         shape,
         timing,
         admission,
+        span,
         observed: Observation::default(),
         line: Vec::new(),
         overlong: false,
@@ -74,6 +77,43 @@ where
         let item = state.next().await?;
         Some((item, state))
     })
+}
+
+impl<S> Tee<S> {
+    fn settle(&mut self, outcome: Outcome) {
+        self.done = true;
+        self.flush();
+        let admission = self.admission.take();
+        self.span.inner.in_scope(|| {
+            if let Some(admission) = admission {
+                admission.settle(outcome);
+            }
+        });
+        self.span.settle(outcome);
+    }
+
+    fn flush(&mut self) {
+        if let Some(usage) = self.observed.usage.take() {
+            self.span.observe(usage);
+            if let Some(admission) = self.admission.as_ref() {
+                admission.observe_usage(usage);
+            }
+        }
+        if self.observed.text_bytes > 0 {
+            let bytes = std::mem::take(&mut self.observed.text_bytes);
+            if let Some(admission) = self.admission.as_ref() {
+                admission.observe_text(bytes);
+            }
+        }
+    }
+}
+
+impl<S> Drop for Tee<S> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.settle(Outcome::Cancelled);
+        }
+    }
 }
 
 impl<S> Tee<S>
@@ -127,28 +167,6 @@ where
                     self.last_written = now;
                 }
             }
-        }
-    }
-
-    fn settle(&mut self, outcome: Outcome) {
-        self.done = true;
-        self.flush();
-        if let Some(admission) = self.admission.take() {
-            admission.settle(outcome);
-        }
-    }
-
-    /// Hands what was observed to the admission as it arrives, so a client that disconnects
-    /// mid-stream is still charged for it when the admission drops.
-    fn flush(&mut self) {
-        let Some(admission) = self.admission.as_ref() else {
-            return;
-        };
-        if let Some(usage) = self.observed.usage.take() {
-            admission.observe_usage(usage);
-        }
-        if self.observed.text_bytes > 0 {
-            admission.observe_text(std::mem::take(&mut self.observed.text_bytes));
         }
     }
 
