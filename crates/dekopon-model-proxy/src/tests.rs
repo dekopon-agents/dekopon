@@ -177,6 +177,7 @@ fn models(
 }
 
 struct Running {
+    proxy: Arc<ModelProxy>,
     url: String,
     metering: Arc<Metering>,
     client: reqwest::Client,
@@ -205,9 +206,11 @@ async fn proxy_with(
         .with_timing(ping, Duration::from_secs(30));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = Arc::new(proxy).router();
+    let proxy = Arc::new(proxy);
+    let router = Arc::clone(&proxy).router();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     Running {
+        proxy,
         url,
         metering,
         client: reqwest::Client::new(),
@@ -229,12 +232,17 @@ impl Running {
 }
 
 #[derive(Clone, Default)]
-struct MeterRecords(Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<CallSpan>>>);
+struct MeterRecords(
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<CallSpan>>>,
+    Arc<Mutex<Vec<Option<tracing::span::Id>>>>,
+);
 
 #[derive(Debug)]
 struct CallSpan {
     id: tracing::span::Id,
     fields: HashMap<String, String>,
+    closed: bool,
 }
 
 struct SpanFields<'a>(&'a mut HashMap<String, String>);
@@ -245,7 +253,10 @@ impl tracing::field::Visit for SpanFields<'_> {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
+impl<S> tracing_subscriber::Layer<S> for MeterRecords
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
     fn on_new_span(
         &self,
         attributes: &tracing::span::Attributes<'_>,
@@ -258,6 +269,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
             self.1.lock().push(CallSpan {
                 id: id.clone(),
                 fields,
+                closed: false,
             });
         }
     }
@@ -273,7 +285,17 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
         }
     }
 
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = self.1.lock().iter_mut().rev().find(|span| span.id == id) {
+            span.closed = true;
+        }
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         struct Fields(String);
         impl tracing::field::Visit for Fields {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -283,6 +305,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
         if event.metadata().target() == "meter" {
             let mut fields = Fields(String::new());
             event.record(&mut fields);
+            self.2
+                .lock()
+                .push(context.event_span(event).map(|span| span.id()));
             self.0.lock().push(fields.0);
         }
     }
@@ -899,6 +924,78 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
         used(&running.metering),
         input + Tokens::from_bytes("Echoed hello.".len()).0
     );
+}
+
+async fn wait_for_call_close(records: &MeterRecords) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !records.1.lock().iter().any(|span| span.closed) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_before_the_upstream_answers_records_cancelled() {
+    let (records, _guard) = capture();
+    let upstream = FakeUpstream::start(vec![Step::Wait(Duration::from_secs(60))]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let request = running.post("/v1/chat/completions", r#"{"model":"glm-flash"}"#);
+    let client = tokio::spawn(async move { request.send().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while upstream.requests.lock().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+    wait_for_call_close(&records).await;
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["outcome"], "\"cancelled\"");
+}
+
+#[tokio::test]
+async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() {
+    let (records, _guard) = capture();
+    let first = OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+        .split_inclusive("\n\n")
+        .next()
+        .unwrap();
+    let upstream = FakeUpstream::start(vec![
+        sse_head(),
+        chunk(first.as_bytes()),
+        Step::Wait(Duration::from_secs(60)),
+    ])
+    .await;
+    let running = proxy(&upstream.url, 100_000).await;
+    use futures_util::StreamExt as _;
+    let body = r#"{"model":"glm-flash","stream":true}"#;
+    let request = running.post("/v1/chat/completions", body).build().unwrap();
+    let response = crate::handle(
+        axum::extract::State(Arc::clone(&running.proxy)),
+        crate::Dialect::Chat,
+        request.headers().clone(),
+        axum::body::Body::from(body),
+    )
+    .await;
+    let mut response = response.into_body().into_data_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(2).any(|bytes| bytes == b"\n\n") {
+        seen.extend_from_slice(&response.next().await.unwrap().unwrap());
+    }
+    drop(response);
+    wait_for_call_close(&records).await;
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["outcome"], "\"cancelled\"");
+    assert_eq!(*records.2.lock(), vec![Some(spans[0].id.clone())]);
+    let events = records.0.lock();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("outcome=\"cancelled\""), "{events:?}");
 }
 
 async fn json_body(response: reqwest::Response) -> serde_json::Value {

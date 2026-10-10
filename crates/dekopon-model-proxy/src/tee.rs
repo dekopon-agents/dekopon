@@ -7,7 +7,10 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tracing::Instrument as _;
 
-use crate::dialect::{Dialect, Observation};
+use crate::{
+    CallSpan,
+    dialect::{Dialect, Observation},
+};
 
 /// A single SSE line longer than this is forwarded but not parsed for usage.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -32,7 +35,7 @@ struct Tee<S> {
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
-    span: tracing::Span,
+    call_span: CallSpan,
     observed: Observation,
     line: Vec<u8>,
     overlong: bool,
@@ -52,7 +55,7 @@ pub(crate) fn tee<S>(
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
-    span: tracing::Span,
+    call_span: CallSpan,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
@@ -64,7 +67,7 @@ where
         shape,
         timing,
         admission,
-        span,
+        call_span,
         observed: Observation::default(),
         line: Vec::new(),
         overlong: false,
@@ -75,7 +78,7 @@ where
         done: false,
     };
     futures_util::stream::unfold(state, |mut state| {
-        let span = state.span.clone();
+        let span = state.call_span.span.clone();
         async move {
             let item = state.next().await?;
             Some((item, state))
@@ -140,7 +143,7 @@ where
 
     fn settle(&mut self, outcome: Outcome) {
         self.done = true;
-        self.span.record("outcome", outcome.as_str());
+        self.call_span.settle(outcome.as_str());
         self.flush();
         if let Some(admission) = self.admission.take() {
             admission.settle(outcome);
@@ -155,10 +158,10 @@ where
         };
         if let Some(usage) = self.observed.usage.take() {
             if let Some(input) = usage.input_tokens {
-                self.span.record("usage.input_tokens", input);
+                self.call_span.span.record("usage.input_tokens", input);
             }
             if let Some(output) = usage.output_tokens {
-                self.span.record("usage.output_tokens", output);
+                self.call_span.span.record("usage.output_tokens", output);
             }
             admission.observe_usage(usage);
         }
@@ -246,8 +249,12 @@ where
 
 impl<S> Drop for Tee<S> {
     fn drop(&mut self) {
-        if !self.done {
-            self.span.record("outcome", Outcome::Cancelled.as_str());
+        if !self.done
+            && let Some(admission) = self.admission.take()
+        {
+            self.call_span
+                .span
+                .in_scope(|| admission.settle(Outcome::Cancelled));
         }
     }
 }
