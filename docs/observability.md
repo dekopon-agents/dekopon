@@ -68,6 +68,10 @@ and is the one that fills. The trace filter does not include `meter`.
 | `meter.estimate.input_tokens` | i64 | the admission estimate, kept to measure the estimator |
 | `outcome` | string | `succeeded`, `failed`, `cancelled`, or `refused` |
 
+| Span | Fields | Meaning |
+|---|---|---|
+| `model.proxy.call` | `vm.subject`, `vm.session`, `agent`, `model.name`, `usage.input_tokens`, `usage.output_tokens`, `outcome` | One guest model call through completion or disconnect, excluding `count_tokens`; usage counts are observed upstream counts, initially zero, and outcome uses the meter vocabulary. Pre-admission request rejections are `failed`; budget refusals are `refused`. Unknown agent/model fields are empty. The optional session label is trimmed and accepted only as at most 128 bytes of printable ASCII, otherwise empty; it never affects identity, admission, or metering. |
+
 The record holds raw usage and no budget name, so a changed budget re-applies to history rather than
 invalidating it. A `refused` record carries zeros, and a call that was never sent is `failed` with
 zeros; restore skips both. Every number is recorded as an integer, so neither OpenObserve nor

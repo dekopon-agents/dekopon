@@ -122,7 +122,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed | Self::NotSent => "failed",

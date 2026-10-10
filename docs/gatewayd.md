@@ -1408,6 +1408,7 @@ proxy:
 - **Identity.** The client certificate must chain to `clientCaFile` and carry `jailIdentity` as a
   URI SAN, or the TLS handshake fails. The jail names the VM in `x-dekopon-vm-subject`; an
   unlisted subject gets a 403. See [the security model](security-model.md#the-guest-model-proxy-trusts-the-jail-to-name-its-vm).
+  The jail sets the optional `x-dekopon-vm-session` header; the proxy records it only on the `model.proxy.call` span.
 - **Models.** A guest names a configured model (`astra`, `claude-opus`), never an upstream id.
   A model outside the guest's list, or one the path's dialect cannot reach, gets a 403. The proxy
   rewrites `model` to the configured upstream id and injects the upstream credential. It drops

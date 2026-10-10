@@ -5,6 +5,7 @@ use dekopon_model_token_governor::{Admission, Outcome};
 use futures_util::{Stream, StreamExt as _};
 use serde_json::Value;
 use tokio::time::Instant;
+use tracing::Instrument as _;
 
 use crate::dialect::{Dialect, Observation};
 
@@ -31,6 +32,7 @@ struct Tee<S> {
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
+    span: tracing::Span,
     observed: Observation,
     line: Vec<u8>,
     overlong: bool,
@@ -50,6 +52,7 @@ pub(crate) fn tee<S>(
     shape: Shape,
     timing: Timing,
     admission: Option<Admission>,
+    span: tracing::Span,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
@@ -61,6 +64,7 @@ where
         shape,
         timing,
         admission,
+        span,
         observed: Observation::default(),
         line: Vec::new(),
         overlong: false,
@@ -70,9 +74,13 @@ where
         last_written: now,
         done: false,
     };
-    futures_util::stream::unfold(state, |mut state| async move {
-        let item = state.next().await?;
-        Some((item, state))
+    futures_util::stream::unfold(state, |mut state| {
+        let span = state.span.clone();
+        async move {
+            let item = state.next().await?;
+            Some((item, state))
+        }
+        .instrument(span)
     })
 }
 
@@ -132,6 +140,7 @@ where
 
     fn settle(&mut self, outcome: Outcome) {
         self.done = true;
+        self.span.record("outcome", outcome.as_str());
         self.flush();
         if let Some(admission) = self.admission.take() {
             admission.settle(outcome);
@@ -145,6 +154,12 @@ where
             return;
         };
         if let Some(usage) = self.observed.usage.take() {
+            if let Some(input) = usage.input_tokens {
+                self.span.record("usage.input_tokens", input);
+            }
+            if let Some(output) = usage.output_tokens {
+                self.span.record("usage.output_tokens", output);
+            }
             admission.observe_usage(usage);
         }
         if self.observed.text_bytes > 0 {
@@ -225,6 +240,14 @@ where
                     tracing::debug!(target: "model", error = %error, "proxied answer was not JSON");
                 }
             }
+        }
+    }
+}
+
+impl<S> Drop for Tee<S> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.span.record("outcome", Outcome::Cancelled.as_str());
         }
     }
 }

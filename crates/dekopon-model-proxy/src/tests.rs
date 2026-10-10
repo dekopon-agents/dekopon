@@ -13,7 +13,9 @@ use tokio::{
     net::TcpListener,
 };
 
-use crate::{Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SUBJECT_HEADER, Upstream};
+use crate::{
+    Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER, Upstream,
+};
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
 
@@ -227,9 +229,50 @@ impl Running {
 }
 
 #[derive(Clone, Default)]
-struct MeterRecords(Arc<Mutex<Vec<String>>>);
+struct MeterRecords(Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<CallSpan>>>);
+
+#[derive(Debug)]
+struct CallSpan {
+    id: tracing::span::Id,
+    fields: HashMap<String, String>,
+}
+
+struct SpanFields<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for SpanFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attributes.metadata().name() == "model.proxy.call" {
+            let mut fields = HashMap::new();
+            attributes.record(&mut SpanFields(&mut fields));
+            self.1.lock().push(CallSpan {
+                id: id.clone(),
+                fields,
+            });
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = self.1.lock().iter_mut().rev().find(|span| span.id == *id) {
+            values.record(&mut SpanFields(&mut span.fields));
+        }
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         struct Fields(String);
         impl tracing::field::Visit for Fields {
@@ -251,6 +294,115 @@ fn capture() -> (MeterRecords, tracing::subscriber::DefaultGuard) {
     let guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(records.clone()));
     (records, guard)
+}
+
+#[tokio::test]
+async fn a_proxied_call_records_subject_session_model_and_outcome() {
+    let (records, _guard) = capture();
+    let upstream = FakeUpstream::start(vec![json(
+        "200 OK",
+        r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+    )])
+    .await;
+    let running = proxy(&upstream.url, 100_000).await;
+    running
+        .post("/v1/chat/completions", r#"{"model":"glm-flash"}"#)
+        .header(SESSION_HEADER, "  session-7  ")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(
+        spans[0].fields,
+        HashMap::from([
+            ("vm.subject".to_owned(), format!("{SUBJECT:?}")),
+            ("vm.session".to_owned(), "\"session-7\"".to_owned()),
+            ("agent".to_owned(), "\"gylmar\"".to_owned()),
+            ("model.name".to_owned(), "\"glm-flash\"".to_owned()),
+            ("usage.input_tokens".to_owned(), "5".to_owned()),
+            ("usage.output_tokens".to_owned(), "2".to_owned()),
+            ("outcome".to_owned(), "\"succeeded\"".to_owned()),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_call_without_a_session_header_still_records_its_subject() {
+    let (records, _guard) = capture();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    running
+        .post("/v1/chat/completions", r#"{"model":"glm-flash"}"#)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["vm.subject"], format!("{SUBJECT:?}"));
+    assert_eq!(spans[0].fields["vm.session"], "\"\"");
+}
+
+#[tokio::test]
+async fn an_oversized_session_header_is_recorded_empty() {
+    let (records, _guard) = capture();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    running
+        .post("/v1/chat/completions", r#"{"model":"glm-flash"}"#)
+        .header(SESSION_HEADER, "s".repeat(256))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["vm.session"], "\"\"");
+}
+
+#[tokio::test]
+async fn a_nonprintable_session_header_is_recorded_empty() {
+    let (records, _guard) = capture();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    for session in ["session\tlabel", "séance"] {
+        running
+            .post("/v1/chat/completions", r#"{"model":"glm-flash"}"#)
+            .header(SESSION_HEADER, session)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+    }
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    for span in spans.iter() {
+        assert_eq!(span.fields["vm.session"], "\"\"");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_call_records_its_outcome_on_the_span() {
+    let (records, _guard) = capture();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    running
+        .post("/v1/messages", r#"{"model":"ungranted-model"}"#)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["outcome"], "\"failed\"");
 }
 
 #[tokio::test]
@@ -363,6 +515,7 @@ fn refusal_shape<'a>(dialect_path: &str, body: &'a serde_json::Value) -> Option<
 
 #[tokio::test]
 async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
+    let (records, _guard) = capture();
     let running = proxy("http://127.0.0.1:9", 2_000).await;
     let spent = running
         .metering
@@ -420,6 +573,11 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
     assert!(message.starts_with("dekopon sandbox: "), "{message}");
     assert!(!message.contains("prompt is too long"), "{message}");
     assert!(message.contains("can't run as is"), "{message}");
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 3, "{spans:?}");
+    for span in spans.iter() {
+        assert_eq!(span.fields["outcome"], "\"refused\"");
+    }
 }
 
 /// Asserts the dialect's error shape, the status and the sandbox prefix, and returns the message.
@@ -601,6 +759,13 @@ async fn an_upstream_error_status_is_charged_nothing() {
     assert_eq!(response.headers()["retry-after"], "7");
     assert_eq!(response.text().await.unwrap(), overloaded);
     assert_eq!(used(&running.metering), 0);
+    {
+        let spans = records.1.lock();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].fields["outcome"], "\"failed\"");
+        assert_eq!(spans[0].fields["usage.input_tokens"], "0");
+        assert_eq!(spans[0].fields["usage.output_tokens"], "0");
+    }
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
     for field in [
@@ -640,10 +805,12 @@ async fn count_tokens_is_forwarded_and_never_charged() {
     );
     assert_eq!(used(&running.metering), 0);
     assert!(records.0.lock().is_empty());
+    assert!(records.1.lock().is_empty());
 }
 
 #[tokio::test]
 async fn a_silent_upstream_stream_carries_pings() {
+    let (records, _guard) = capture();
     let upstream = FakeUpstream::start(vec![
         sse_head(),
         chunk(
@@ -681,6 +848,11 @@ async fn a_silent_upstream_stream_carries_pings() {
         text.replace(": ping\n\n", ""),
         OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
     );
+    let spans = records.1.lock();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].fields["usage.input_tokens"], "120");
+    assert_eq!(spans[0].fields["usage.output_tokens"], "30");
+    assert_eq!(spans[0].fields["outcome"], "\"succeeded\"");
 }
 
 #[tokio::test]
@@ -713,6 +885,11 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let spans = records.1.lock();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].fields["outcome"], "\"cancelled\"");
+    }
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
     assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");

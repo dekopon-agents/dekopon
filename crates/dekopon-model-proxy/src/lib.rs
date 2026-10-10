@@ -36,6 +36,7 @@ use dekopon_model::{
     wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
+use tracing::Instrument as _;
 
 use dialect::Problem;
 pub use dialect::{Dialect, SANDBOX};
@@ -43,6 +44,7 @@ use tee::{Shape, Timing};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
+pub const SESSION_HEADER: &str = "x-dekopon-vm-session";
 /// Under the jail's 90 s idle timer, so a reasoning model's silence never drops the stream.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -221,104 +223,140 @@ async fn handle(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(grant) = headers
-        .get(SUBJECT_HEADER)
-        .and_then(|subject| subject.to_str().ok())
-        .and_then(|subject| proxy.guests.get(subject))
-    else {
-        return dialect.sandbox(
-            Problem::Forbidden,
-            "this VM is granted no model. Ask the operator to grant its agent one.",
-        );
-    };
-    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::debug!(target: "model", error = %error, "proxy request body refused");
-            return dialect.sandbox(
-                Problem::TooLarge,
-                "a request body may be at most 8 MiB. Send a smaller request.",
-            );
-        }
-    };
-    let peek = match RequestPeek::of(&body) {
-        Ok(peek) => peek,
-        Err(error) => return dialect.sandbox(Problem::Invalid, &peek_rule(&error, grant)),
-    };
-    let Some(model) = proxy
-        .models
-        .get(&peek.model)
-        .filter(|model| grant.models.contains(&model.name) && model.upstream.serves(dialect))
-    else {
-        return dialect.sandbox(Problem::Forbidden, &proxy.model_rule(grant, dialect));
-    };
-    let wire_model = serde_json::Value::from(model.wire_model.as_str()).to_string();
-    let rewritten = match &model.upstream {
-        Upstream::Codex { .. } if peek.stream != Some(true) => {
-            return dialect.sandbox(
-                Problem::Invalid,
-                "this model is served only as a stream. Set `stream` to true.",
-            );
-        }
-        Upstream::Codex { .. } => peek.rewrite(
-            &body,
-            &[(Field::Model, &wire_model), (Field::Store, "false")],
-        ),
-        Upstream::OpenRouter { .. } if peek.has(Field::Models) || peek.has(Field::Route) => {
-            return dialect.sandbox(
-                Problem::Invalid,
-                "OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field.",
-            );
-        }
-        Upstream::Anthropic { .. } | Upstream::OpenRouter { .. } => {
-            peek.rewrite(&body, &[(Field::Model, &wire_model)])
-        }
-    };
-    drop(body);
-    let admission = if dialect == Dialect::CountTokens {
-        None
+    let session = headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            value.len() <= 128 && value.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+        })
+        .unwrap_or_default();
+    let span = if dialect == Dialect::CountTokens {
+        tracing::Span::none()
     } else {
-        let call = Call {
-            agent: grant.agent.clone(),
-            model: model.name.clone(),
-            backend: model.backend,
-            via: Via::Proxy,
+        tracing::info_span!(
+            "model.proxy.call",
+            vm.subject = headers
+                .get(SUBJECT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            vm.session = session,
+            agent = "",
+            model.name = "",
+            usage.input_tokens = 0_u64,
+            usage.output_tokens = 0_u64,
+            outcome = Outcome::Failed.as_str(),
+        )
+    };
+    let context = span.clone();
+    async move {
+        let Some(grant) = headers
+            .get(SUBJECT_HEADER)
+            .and_then(|subject| subject.to_str().ok())
+            .and_then(|subject| proxy.guests.get(subject))
+        else {
+            return dialect.sandbox(
+                Problem::Forbidden,
+                "this VM is granted no model. Ask the operator to grant its agent one.",
+            );
         };
-        let estimate = Estimate::from_sizes(
-            Sizes {
-                bytes: rewritten.len(),
-                images: peek.images,
-            },
-            None,
-            model.reserve,
-        );
-        match proxy.metering.admit(call, estimate) {
-            Ok(admission) => Some(admission),
-            Err(refusal) => return dialect.refusal(&refusal),
-        }
-    };
-    let upstream = match send(
-        &proxy.http,
-        model,
-        dialect,
-        &headers,
-        Bytes::from(rewritten),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error);
-            if let Some(admission) = admission {
-                admission.settle(match error {
-                    SendError::Credential(_) | SendError::CredentialTask(_) => Outcome::NotSent,
-                    SendError::Request(_) => Outcome::Failed,
-                });
+        span.record("agent", grant.agent.as_str());
+        let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(target: "model", error = %error, "proxy request body refused");
+                return dialect.sandbox(
+                    Problem::TooLarge,
+                    "a request body may be at most 8 MiB. Send a smaller request.",
+                );
             }
-            return dialect.error(Problem::Upstream, "the model upstream could not be reached");
+        };
+        let peek = match RequestPeek::of(&body) {
+            Ok(peek) => peek,
+            Err(error) => return dialect.sandbox(Problem::Invalid, &peek_rule(&error, grant)),
+        };
+        if let Some(model) = proxy.models.get(&peek.model) {
+            span.record("model.name", model.name.as_str());
         }
-    };
-    respond(&proxy, dialect, upstream, admission).await
+        let Some(model) = proxy
+            .models
+            .get(&peek.model)
+            .filter(|model| grant.models.contains(&model.name) && model.upstream.serves(dialect))
+        else {
+            return dialect.sandbox(Problem::Forbidden, &proxy.model_rule(grant, dialect));
+        };
+        let wire_model = serde_json::Value::from(model.wire_model.as_str()).to_string();
+        let rewritten = match &model.upstream {
+            Upstream::Codex { .. } if peek.stream != Some(true) => {
+                return dialect.sandbox(
+                    Problem::Invalid,
+                    "this model is served only as a stream. Set `stream` to true.",
+                );
+            }
+            Upstream::Codex { .. } => peek.rewrite(
+                &body,
+                &[(Field::Model, &wire_model), (Field::Store, "false")],
+            ),
+            Upstream::OpenRouter { .. } if peek.has(Field::Models) || peek.has(Field::Route) => {
+                return dialect.sandbox(
+                    Problem::Invalid,
+                    "OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field.",
+                );
+            }
+            Upstream::Anthropic { .. } | Upstream::OpenRouter { .. } => {
+                peek.rewrite(&body, &[(Field::Model, &wire_model)])
+            }
+        };
+        drop(body);
+        let admission = if dialect == Dialect::CountTokens {
+            None
+        } else {
+            let call = Call {
+                agent: grant.agent.clone(),
+                model: model.name.clone(),
+                backend: model.backend,
+                via: Via::Proxy,
+            };
+            let estimate = Estimate::from_sizes(
+                Sizes {
+                    bytes: rewritten.len(),
+                    images: peek.images,
+                },
+                None,
+                model.reserve,
+            );
+            match proxy.metering.admit(call, estimate) {
+                Ok(admission) => Some(admission),
+                Err(refusal) => {
+                    span.record("outcome", "refused");
+                    return dialect.refusal(&refusal);
+                }
+            }
+        };
+        let upstream = match send(
+            &proxy.http,
+            model,
+            dialect,
+            &headers,
+            Bytes::from(rewritten),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                span.record("outcome", Outcome::Failed.as_str());
+                tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error);
+                if let Some(admission) = admission {
+                    admission.settle(match error {
+                        SendError::Credential(_) | SendError::CredentialTask(_) => Outcome::NotSent,
+                        SendError::Request(_) => Outcome::Failed,
+                    });
+                }
+                return dialect.error(Problem::Upstream, "the model upstream could not be reached");
+            }
+        };
+        respond(&proxy, dialect, upstream, admission, span).await
+    }.instrument(context).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -417,6 +455,7 @@ async fn respond(
     dialect: Dialect,
     upstream: reqwest::Response,
     admission: Option<dekopon_model_token_governor::Admission>,
+    span: tracing::Span,
 ) -> Response {
     let status = upstream.status();
     let mut headers = HeaderMap::new();
@@ -426,6 +465,7 @@ async fn respond(
         }
     }
     if !status.is_success() {
+        span.record("outcome", Outcome::NotSent.as_str());
         if let Some(admission) = admission {
             admission.settle(Outcome::NotSent);
         }
@@ -446,6 +486,7 @@ async fn respond(
         shape,
         proxy.timing,
         admission,
+        span,
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
