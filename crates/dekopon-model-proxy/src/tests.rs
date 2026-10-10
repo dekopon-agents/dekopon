@@ -13,7 +13,9 @@ use tokio::{
     net::TcpListener,
 };
 
-use crate::{Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SUBJECT_HEADER, Upstream};
+use crate::{
+    Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER, Upstream,
+};
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
 
@@ -251,6 +253,145 @@ fn capture() -> (MeterRecords, tracing::subscriber::DefaultGuard) {
     let guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(records.clone()));
     (records, guard)
+}
+
+type Fields = std::collections::BTreeMap<String, String>;
+
+#[derive(Clone, Default)]
+struct CallSpans(Arc<Mutex<HashMap<tracing::span::Id, Fields>>>);
+
+struct SpanFields<'a>(&'a mut Fields);
+
+impl tracing::field::Visit for SpanFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallSpans {
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attributes.metadata().name() == "model.proxy.call" {
+            let mut fields = Fields::new();
+            attributes.record(&mut SpanFields(&mut fields));
+            self.0.lock().insert(id.clone(), fields);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(fields) = self.0.lock().get_mut(id) {
+            values.record(&mut SpanFields(fields));
+        }
+    }
+}
+
+impl CallSpans {
+    fn only(&self) -> Fields {
+        let spans = self.0.lock();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        spans.values().next().unwrap().clone()
+    }
+}
+
+fn capture_spans() -> (CallSpans, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let spans = CallSpans::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+    (spans, guard)
+}
+
+const USAGE_ANSWER: &str = r#"{"id":"x","usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+const CHAT_CALL: &str = r#"{"model":"glm-flash","messages":[],"stream":false}"#;
+
+#[tokio::test]
+async fn a_proxied_call_records_subject_session_model_and_outcome() {
+    let (spans, _guard) = capture_spans();
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post("/v1/chat/completions", CHAT_CALL)
+        .header(SESSION_HEADER, " vm-session-7 ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    assert!(!upstream.request().contains("vm-session-7"));
+    let expected = [
+        ("vm.subject", SUBJECT),
+        ("vm.session", "vm-session-7"),
+        ("agent", "gylmar"),
+        ("model.name", "glm-flash"),
+        ("usage.input_tokens", "5"),
+        ("usage.output_tokens", "2"),
+        ("outcome", "succeeded"),
+    ]
+    .map(|(name, value)| (name.to_owned(), value.to_owned()));
+    assert_eq!(spans.only(), Fields::from(expected));
+}
+
+#[tokio::test]
+async fn a_call_without_a_session_header_still_records_its_subject() {
+    let (spans, _guard) = capture_spans();
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running.post("/v1/chat/completions", CHAT_CALL).send().await;
+    assert_eq!(response.unwrap().text().await.unwrap(), USAGE_ANSWER);
+    let span = spans.only();
+    assert_eq!(span["vm.subject"], SUBJECT);
+    assert_eq!(span["vm.session"], "");
+}
+
+#[tokio::test]
+async fn an_oversized_session_header_is_recorded_empty() {
+    let (spans, _guard) = capture_spans();
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post("/v1/chat/completions", CHAT_CALL)
+        .header(SESSION_HEADER, "s".repeat(129))
+        .send()
+        .await;
+    assert_eq!(response.unwrap().status(), 200);
+    let span = spans.only();
+    assert_eq!(span["vm.session"], "");
+    assert_eq!(span["outcome"], "succeeded");
+}
+
+#[tokio::test]
+async fn a_refused_call_records_its_outcome_on_the_span() {
+    let (spans, _guard) = capture_spans();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    let response = running
+        .post("/v1/chat/completions", r#"{"model":"claude-opus"}"#)
+        .header(SESSION_HEADER, "vm-session-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let expected = [
+        ("vm.subject", SUBJECT),
+        ("vm.session", "vm-session-7"),
+        ("agent", "gylmar"),
+        ("usage.input_tokens", "0"),
+        ("usage.output_tokens", "0"),
+        ("outcome", "refused"),
+    ]
+    .map(|(name, value)| (name.to_owned(), value.to_owned()));
+    assert_eq!(spans.only(), Fields::from(expected));
 }
 
 #[tokio::test]

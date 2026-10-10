@@ -75,6 +75,21 @@ Quickwit sees it as a string. The boot restore that reads these records logs one
 record on the same target: at info with the row count when it applies, at warn with `error.kind`
 when it keeps the live meters ([best effort](gatewayd.md#restoring-token-windows-at-boot-is-best-effort)).
 
+A proxied call also opens one `model.proxy.call` span on the `model` target, from its headers to
+the end of its response body; the proxy's `meter` record is emitted inside it. Its fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `vm.subject` | string | the jail's `x-dekopon-vm-subject` |
+| `vm.session` | string | the jail's `x-dekopon-vm-session`, trimmed; empty when absent, over 128 bytes, or not printable ASCII |
+| `agent` | string | the subject's agent; unset when the subject is unknown |
+| `model.name` | string | the configured model name; unset when the request names no granted model |
+| `usage.input_tokens`, `usage.output_tokens` | i64 | as the upstream reported them, `0` when unreported; the charge is the `meter` record's |
+| `outcome` | string | `succeeded`, `failed`, `cancelled`, or `refused` |
+
+`vm.subject` and `vm.session` are bounded the same way and are labels: neither changes admission,
+the subject check or metering.
+
 Whatever the model provider reports for usage lands as `usage.input_tokens`,
 `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.output_tokens`, `usage.reasoning_output_tokens`, and
 `usage.total_tokens` — normalized across the chat-completions and Codex Responses wire shapes — on
