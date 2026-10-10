@@ -45,9 +45,6 @@ struct Tee<S> {
     done: bool,
 }
 
-/// Forwards the upstream body unbuffered, feeds each event's usage and text into the admission,
-/// and settles it when the upstream ends; a dropped body (the client went away) settles as
-/// cancelled.
 pub(crate) fn tee<S>(
     upstream: S,
     dialect: Dialect,

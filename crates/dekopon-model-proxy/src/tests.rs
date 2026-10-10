@@ -188,6 +188,7 @@ fn models(
 
 struct Running {
     url: String,
+    proxy: Arc<ModelProxy>,
     metering: Arc<Metering>,
     client: reqwest::Client,
 }
@@ -210,15 +211,18 @@ async fn proxy_with(
             ]),
         },
     )]);
-    let proxy = ModelProxy::new(models(endpoint, codex), guests, Arc::clone(&metering))
-        .unwrap()
-        .with_timing(ping, Duration::from_secs(30));
+    let proxy = Arc::new(
+        ModelProxy::new(models(endpoint, codex), guests, Arc::clone(&metering))
+            .unwrap()
+            .with_timing(ping, Duration::from_secs(30)),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = Arc::new(proxy).router();
+    let router = Arc::clone(&proxy).router();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     Running {
         url,
+        proxy,
         metering,
         client: reqwest::Client::new(),
     }
@@ -246,17 +250,17 @@ where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        struct Fields(String);
-        impl tracing::field::Visit for Fields {
+        struct EventFields(String);
+        impl tracing::field::Visit for EventFields {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
         if event.metadata().target() == "meter" {
-            let mut fields = Fields(String::new());
+            let mut fields = EventFields(String::new());
             event.record(&mut fields);
             if let Some(parent) = ctx.event_span(event) {
-                fields.0.push_str(&format!("parent={:?} ", parent.name()));
+                fields.0.push_str(&format!("parent={:?} ", parent.id()));
             }
             self.0.lock().push(fields.0);
         }
@@ -308,9 +312,22 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallSpans {
 
 impl CallSpans {
     fn only(&self) -> Fields {
+        self.only_with_id().1
+    }
+
+    fn only_with_id(&self) -> (tracing::span::Id, Fields) {
         let spans = self.0.lock();
         assert_eq!(spans.len(), 1, "{spans:?}");
-        spans.values().next().unwrap().clone()
+        let (id, fields) = spans.iter().next().unwrap();
+        (id.clone(), fields.clone())
+    }
+
+    fn outcomes(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .values()
+            .map(|span| span["outcome"].clone())
+            .collect()
     }
 }
 
@@ -381,6 +398,25 @@ async fn an_oversized_session_header_is_recorded_empty() {
     let span = spans.only();
     assert_eq!(span["vm.session"], "");
     assert_eq!(span["outcome"], "succeeded");
+}
+
+#[tokio::test]
+async fn a_nonprintable_session_header_is_recorded_empty() {
+    let (_, spans, _guard) = capture();
+    let running = proxy("http://127.0.0.1:9", 100_000).await;
+    for session in ["session\tlabel", "séance"] {
+        let response = running
+            .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
+            .header(SESSION_HEADER, session)
+            .send()
+            .await;
+        assert_eq!(response.unwrap().status(), 403);
+    }
+    let spans = spans.0.lock();
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    for span in spans.values() {
+        assert_eq!(span["vm.session"], "");
+    }
 }
 
 #[tokio::test]
@@ -543,6 +579,7 @@ fn refusal_shape<'a>(dialect_path: &str, body: &'a serde_json::Value) -> Option<
 
 #[tokio::test]
 async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
+    let (_, spans, _guard) = capture();
     let running = proxy("http://127.0.0.1:9", 2_000).await;
     let spent = running
         .metering
@@ -600,6 +637,7 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
     assert!(message.starts_with("dekopon sandbox: "), "{message}");
     assert!(!message.contains("prompt is too long"), "{message}");
     assert!(message.contains("can't run as is"), "{message}");
+    assert_eq!(spans.outcomes(), ["refused"; 3]);
 }
 
 /// Asserts the dialect's error shape, the status and the sandbox prefix, and returns the message.
@@ -757,7 +795,7 @@ fn a_cap_sized_body_of_deeply_nested_arrays_is_peeked() {
 
 #[tokio::test]
 async fn an_upstream_error_status_is_charged_nothing() {
-    let (records, _, _guard) = capture();
+    let (records, spans, _guard) = capture();
     let overloaded =
         r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
     let upstream = FakeUpstream::start(vec![Step::Write(
@@ -781,6 +819,10 @@ async fn an_upstream_error_status_is_charged_nothing() {
     assert_eq!(response.headers()["retry-after"], "7");
     assert_eq!(response.text().await.unwrap(), overloaded);
     assert_eq!(used(&running.metering), 0);
+    let span = spans.only();
+    assert_eq!(span["outcome"], "failed");
+    assert_eq!(span["usage.input_tokens"], "0");
+    assert_eq!(span["usage.output_tokens"], "0");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
     for field in [
@@ -824,6 +866,7 @@ async fn count_tokens_is_forwarded_and_never_charged() {
 
 #[tokio::test]
 async fn a_silent_upstream_stream_carries_pings() {
+    let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![
         sse_head(),
         chunk(
@@ -861,6 +904,10 @@ async fn a_silent_upstream_stream_carries_pings() {
         text.replace(": ping\n\n", ""),
         OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
     );
+    let span = spans.only();
+    assert_eq!(span["usage.input_tokens"], "120");
+    assert_eq!(span["usage.output_tokens"], "30");
+    assert_eq!(span["outcome"], "succeeded");
 }
 
 #[tokio::test]
@@ -906,6 +953,7 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
 
 #[tokio::test]
 async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() {
+    use futures_util::StreamExt as _;
     let (records, spans, _guard) = capture();
     let first = OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
         .split_inclusive("\n\n")
@@ -914,41 +962,34 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
     let upstream = FakeUpstream::start(vec![
         sse_head(),
         chunk(first.as_bytes()),
-        Step::Wait(Duration::from_secs(10)),
+        Step::Wait(Duration::from_secs(60)),
     ])
     .await;
     let running = proxy(&upstream.url, 100_000).await;
-    let mut response = running
-        .post(
-            "/v1/chat/completions",
-            r#"{"model":"glm-flash","stream":true,"messages":[]}"#,
-        )
-        .send()
-        .await
-        .unwrap();
-    response.chunk().await.unwrap().unwrap();
-    drop(response);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while records.0.lock().is_empty() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let body = r#"{"model":"glm-flash","stream":true,"messages":[]}"#;
+    let request = running.post("/v1/chat/completions", body).build().unwrap();
+    let response = crate::handle(
+        axum::extract::State(Arc::clone(&running.proxy)),
+        crate::Dialect::Chat,
+        request.headers().clone(),
+        axum::body::Body::from(body),
+    )
+    .await;
+    let mut stream = response.into_body().into_data_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(2).any(|bytes| bytes == b"\n\n") {
+        seen.extend_from_slice(&stream.next().await.unwrap().unwrap());
     }
+    drop(stream);
+    let (id, span) = spans.only_with_id();
+    assert_eq!(span["outcome"], "cancelled");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
     assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
     assert!(
-        records[0].contains("parent=\"model.proxy.call\""),
-        "{records:?}"
+        records[0].contains(&format!("parent={id:?} ")),
+        "{id:?}: {records:?}"
     );
-    while !spans
-        .0
-        .lock()
-        .values()
-        .any(|span| span.contains_key("outcome"))
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(spans.only()["outcome"], "cancelled");
 }
 
 async fn json_body(response: reqwest::Response) -> serde_json::Value {

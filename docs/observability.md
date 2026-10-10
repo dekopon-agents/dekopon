@@ -85,7 +85,7 @@ the end of its response body; the proxy's `meter` record is emitted inside it. I
 | `agent` | string | the subject's agent; unset when the subject is unknown |
 | `model.name` | string | the configured model name; unset when the request names no granted model |
 | `usage.input_tokens`, `usage.output_tokens` | i64 | as the upstream reported them, `0` when unreported; the charge is the `meter` record's |
-| `outcome` | string | `succeeded`, `failed`, `cancelled`, or `refused` |
+| `outcome` | string | the `meter` record's `outcome` vocabulary above |
 
 `vm.subject` and `vm.session` are bounded the same way and are labels: neither changes admission,
 the subject check or metering.

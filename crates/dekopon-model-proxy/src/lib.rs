@@ -276,7 +276,7 @@ impl Drop for CallSpan {
     }
 }
 
-/// A guest-influenced header bounded before it reaches telemetry; anything else records empty.
+/// The guest controls these bytes, so only a short printable-ASCII label reaches telemetry.
 fn label<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)
