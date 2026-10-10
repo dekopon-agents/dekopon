@@ -95,8 +95,6 @@ impl<S> Tee<S> {
         self.span.settle(outcome);
     }
 
-    /// Hands what was observed to the admission as it arrives, so a client that disconnects
-    /// mid-stream is still charged for it when the admission drops.
     fn flush(&mut self) {
         if let Some(usage) = self.observed.usage.take() {
             self.span.observe(usage);

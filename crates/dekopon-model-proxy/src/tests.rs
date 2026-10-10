@@ -939,6 +939,15 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
         records[0].contains("parent=\"model.proxy.call\""),
         "{records:?}"
     );
+    while !spans
+        .0
+        .lock()
+        .values()
+        .any(|span| span.contains_key("outcome"))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(spans.only()["outcome"], "cancelled");
 }
 
