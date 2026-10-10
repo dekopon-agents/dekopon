@@ -241,8 +241,11 @@ impl Running {
 #[derive(Clone, Default)]
 struct MeterRecords(Arc<Mutex<Vec<String>>>);
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+impl<S> tracing_subscriber::Layer<S> for MeterRecords
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         struct Fields(String);
         impl tracing::field::Visit for Fields {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -252,17 +255,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MeterRecords {
         if event.metadata().target() == "meter" {
             let mut fields = Fields(String::new());
             event.record(&mut fields);
+            if let Some(parent) = ctx.event_span(event) {
+                fields.0.push_str(&format!("parent={:?} ", parent.name()));
+            }
             self.0.lock().push(fields.0);
         }
     }
-}
-
-fn capture() -> (MeterRecords, tracing::subscriber::DefaultGuard) {
-    use tracing_subscriber::layer::SubscriberExt as _;
-    let records = MeterRecords::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(records.clone()));
-    (records, guard)
 }
 
 type Fields = std::collections::BTreeMap<String, String>;
@@ -316,12 +314,16 @@ impl CallSpans {
     }
 }
 
-fn capture_spans() -> (CallSpans, tracing::subscriber::DefaultGuard) {
+fn capture() -> (MeterRecords, CallSpans, tracing::subscriber::DefaultGuard) {
     use tracing_subscriber::layer::SubscriberExt as _;
+    let records = MeterRecords::default();
     let spans = CallSpans::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
-    (spans, guard)
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(records.clone())
+            .with(spans.clone()),
+    );
+    (records, spans, guard)
 }
 
 const USAGE_ANSWER: &str = r#"{"id":"x","usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
@@ -329,7 +331,7 @@ const CHAT_CALL: &str = r#"{"model":"glm-flash","messages":[],"stream":false}"#;
 
 #[tokio::test]
 async fn a_proxied_call_records_subject_session_model_and_outcome() {
-    let (spans, _guard) = capture_spans();
+    let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
@@ -355,7 +357,7 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
 
 #[tokio::test]
 async fn a_call_without_a_session_header_still_records_its_subject() {
-    let (spans, _guard) = capture_spans();
+    let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running.post("/v1/chat/completions", CHAT_CALL).send().await;
@@ -367,7 +369,7 @@ async fn a_call_without_a_session_header_still_records_its_subject() {
 
 #[tokio::test]
 async fn an_oversized_session_header_is_recorded_empty() {
-    let (spans, _guard) = capture_spans();
+    let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
@@ -383,7 +385,7 @@ async fn an_oversized_session_header_is_recorded_empty() {
 
 #[tokio::test]
 async fn a_refused_call_records_its_outcome_on_the_span() {
-    let (spans, _guard) = capture_spans();
+    let (_, spans, _guard) = capture();
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
         .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
@@ -406,7 +408,7 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
 
 #[tokio::test]
 async fn a_client_that_disconnects_before_the_upstream_answers_records_cancelled() {
-    let (spans, _guard) = capture_spans();
+    let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![Step::Wait(Duration::from_secs(10))]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let client = tokio::spawn(running.post("/v1/chat/completions", CHAT_CALL).send());
@@ -755,7 +757,7 @@ fn a_cap_sized_body_of_deeply_nested_arrays_is_peeked() {
 
 #[tokio::test]
 async fn an_upstream_error_status_is_charged_nothing() {
-    let (records, _guard) = capture();
+    let (records, _, _guard) = capture();
     let overloaded =
         r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
     let upstream = FakeUpstream::start(vec![Step::Write(
@@ -792,7 +794,7 @@ async fn an_upstream_error_status_is_charged_nothing() {
 
 #[tokio::test]
 async fn count_tokens_is_forwarded_and_never_charged() {
-    let (records, _guard) = capture();
+    let (records, _, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", r#"{"input_tokens":2095}"#)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
@@ -863,7 +865,7 @@ async fn a_silent_upstream_stream_carries_pings() {
 
 #[tokio::test]
 async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
-    let (records, _guard) = capture();
+    let (records, _, _guard) = capture();
     let first = OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
         .split_inclusive("\n\n")
         .take(3)
@@ -900,6 +902,44 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
         used(&running.metering),
         input + Tokens::from_bytes("Echoed hello.".len()).0
     );
+}
+
+#[tokio::test]
+async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() {
+    let (records, spans, _guard) = capture();
+    let first = OPENAI_CHAT_COMPLETIONS_TWO_DELTAS
+        .split_inclusive("\n\n")
+        .next()
+        .unwrap();
+    let upstream = FakeUpstream::start(vec![
+        sse_head(),
+        chunk(first.as_bytes()),
+        Step::Wait(Duration::from_secs(10)),
+    ])
+    .await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let mut response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","stream":true,"messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    response.chunk().await.unwrap().unwrap();
+    drop(response);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while records.0.lock().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let records = records.0.lock().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
+    assert!(
+        records[0].contains("parent=\"model.proxy.call\""),
+        "{records:?}"
+    );
+    assert_eq!(spans.only()["outcome"], "cancelled");
 }
 
 async fn json_body(response: reqwest::Response) -> serde_json::Value {

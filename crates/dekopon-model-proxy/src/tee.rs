@@ -113,6 +113,14 @@ impl<S> Tee<S> {
     }
 }
 
+impl<S> Drop for Tee<S> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.settle(Outcome::Cancelled);
+        }
+    }
+}
+
 impl<S> Tee<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
