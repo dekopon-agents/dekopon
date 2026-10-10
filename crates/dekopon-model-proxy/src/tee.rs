@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use dekopon_model_token_governor::{Admission, ModelUsage, Outcome};
+use dekopon_model_token_governor::{Admission, Outcome};
 use futures_util::{Stream, StreamExt as _};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -36,7 +36,6 @@ struct Tee<S> {
     admission: Option<Admission>,
     span: CallSpan,
     observed: Observation,
-    usage: ModelUsage,
     line: Vec<u8>,
     overlong: bool,
     at_boundary: bool,
@@ -69,7 +68,6 @@ where
         admission,
         span,
         observed: Observation::default(),
-        usage: ModelUsage::default(),
         line: Vec::new(),
         overlong: false,
         at_boundary: true,
@@ -89,19 +87,19 @@ impl<S> Tee<S> {
         self.done = true;
         self.flush();
         let admission = self.admission.take();
-        self.span.0.in_scope(|| {
+        self.span.inner.in_scope(|| {
             if let Some(admission) = admission {
                 admission.settle(outcome);
             }
         });
-        self.span.settle(outcome, self.usage);
+        self.span.settle(outcome);
     }
 
     /// Hands what was observed to the admission as it arrives, so a client that disconnects
     /// mid-stream is still charged for it when the admission drops.
     fn flush(&mut self) {
         if let Some(usage) = self.observed.usage.take() {
-            self.usage = self.usage.merged(usage);
+            self.span.observe(usage);
             if let Some(admission) = self.admission.as_ref() {
                 admission.observe_usage(usage);
             }
@@ -111,14 +109,6 @@ impl<S> Tee<S> {
             if let Some(admission) = self.admission.as_ref() {
                 admission.observe_text(bytes);
             }
-        }
-    }
-}
-
-impl<S> Drop for Tee<S> {
-    fn drop(&mut self) {
-        if !self.done {
-            self.settle(Outcome::Cancelled);
         }
     }
 }

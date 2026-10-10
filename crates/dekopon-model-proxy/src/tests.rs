@@ -160,6 +160,16 @@ fn models(
                 api_key: Redacted::new("sk-or-proxy".to_owned()),
             },
         },
+        ProxyModel {
+            name: "glm-ungranted".to_owned(),
+            wire_model: "z-ai/glm-4.6".to_owned(),
+            backend: "openrouter",
+            reserve: Tokens(10),
+            upstream: Upstream::OpenRouter {
+                endpoint: endpoint.to_owned(),
+                api_key: Redacted::new("sk-or-proxy".to_owned()),
+            },
+        },
     ];
     if let Some(credential) = codex {
         models.push(ProxyModel {
@@ -376,7 +386,7 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
     let (spans, _guard) = capture_spans();
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
-        .post("/v1/chat/completions", r#"{"model":"claude-opus"}"#)
+        .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
         .header(SESSION_HEADER, "vm-session-7")
         .send()
         .await
@@ -392,6 +402,33 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
     ]
     .map(|(name, value)| (name.to_owned(), value.to_owned()));
     assert_eq!(spans.only(), Fields::from(expected));
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_before_the_upstream_answers_records_cancelled() {
+    let (spans, _guard) = capture_spans();
+    let upstream = FakeUpstream::start(vec![Step::Wait(Duration::from_secs(10))]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let client = tokio::spawn(running.post("/v1/chat/completions", CHAT_CALL).send());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while upstream.requests.lock().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(upstream.requests.lock().len(), 1);
+    client.abort();
+    let settled = |spans: &CallSpans| {
+        spans
+            .0
+            .lock()
+            .values()
+            .any(|span| span.contains_key("outcome"))
+    };
+    while !settled(&spans) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let span = spans.only();
+    assert_eq!(span["model.name"], "glm-flash");
+    assert_eq!(span["outcome"], "cancelled");
 }
 
 #[tokio::test]

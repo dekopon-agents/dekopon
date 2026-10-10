@@ -220,45 +220,59 @@ impl ModelProxy {
     }
 }
 
-struct CallSpan(Span);
+struct CallSpan {
+    inner: Span,
+    usage: ModelUsage,
+    settled: bool,
+}
 
 impl CallSpan {
     fn open(headers: &HeaderMap) -> Self {
-        Self(tracing::info_span!(
-            target: "model",
-            "model.proxy.call",
-            vm.subject = label(headers, SUBJECT_HEADER),
-            vm.session = label(headers, SESSION_HEADER),
-            agent = Empty,
-            model.name = Empty,
-            usage.input_tokens = Empty,
-            usage.output_tokens = Empty,
-            outcome = Empty,
-        ))
+        Self {
+            inner: tracing::info_span!(
+                target: "model",
+                "model.proxy.call",
+                vm.subject = label(headers, SUBJECT_HEADER),
+                vm.session = label(headers, SESSION_HEADER),
+                agent = Empty,
+                model.name = Empty,
+                usage.input_tokens = Empty,
+                usage.output_tokens = Empty,
+                outcome = Empty,
+            ),
+            usage: ModelUsage::default(),
+            settled: false,
+        }
     }
 
-    fn refused(&self, response: Response) -> Response {
-        self.end("refused", ModelUsage::default());
+    fn observe(&mut self, usage: ModelUsage) {
+        self.usage = self.usage.merged(usage);
+    }
+
+    fn refused(mut self, response: Response) -> Response {
+        self.end("refused");
         response
     }
 
-    fn settle(&self, outcome: Outcome, usage: ModelUsage) {
-        self.end(
-            match outcome {
-                Outcome::Succeeded => "succeeded",
-                Outcome::Failed | Outcome::NotSent => "failed",
-                Outcome::Cancelled => "cancelled",
-            },
-            usage,
-        );
+    fn settle(&mut self, outcome: Outcome) {
+        self.end(outcome.as_str());
     }
 
-    fn end(&self, outcome: &'static str, usage: ModelUsage) {
+    fn end(&mut self, outcome: &'static str) {
+        self.settled = true;
         let tokens = |count: Option<u64>| i64::try_from(count.unwrap_or(0)).unwrap_or(i64::MAX);
-        self.0
-            .record("usage.input_tokens", tokens(usage.input_tokens))
-            .record("usage.output_tokens", tokens(usage.output_tokens))
+        self.inner
+            .record("usage.input_tokens", tokens(self.usage.input_tokens))
+            .record("usage.output_tokens", tokens(self.usage.output_tokens))
             .record("outcome", outcome);
+    }
+}
+
+impl Drop for CallSpan {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.end(Outcome::Cancelled.as_str());
+        }
     }
 }
 
@@ -281,7 +295,7 @@ async fn handle(
     body: Body,
 ) -> Response {
     let span = CallSpan::open(&headers);
-    let current = span.0.clone();
+    let current = span.inner.clone();
     call(&proxy, dialect, &headers, body, span)
         .instrument(current)
         .await
@@ -292,7 +306,7 @@ async fn call(
     dialect: Dialect,
     headers: &HeaderMap,
     body: Body,
-    span: CallSpan,
+    mut span: CallSpan,
 ) -> Response {
     let Some(grant) = headers
         .get(SUBJECT_HEADER)
@@ -304,7 +318,7 @@ async fn call(
             "this VM is granted no model. Ask the operator to grant its agent one.",
         ));
     };
-    span.0.record("agent", grant.agent.as_str());
+    span.inner.record("agent", grant.agent.as_str());
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
@@ -329,7 +343,7 @@ async fn call(
         return span
             .refused(dialect.sandbox(Problem::Forbidden, &proxy.model_rule(grant, dialect)));
     };
-    span.0.record("model.name", model.name.as_str());
+    span.inner.record("model.name", model.name.as_str());
     let wire_model = serde_json::Value::from(model.wire_model.as_str()).to_string();
     let rewritten = match &model.upstream {
         Upstream::Codex { .. } if peek.stream != Some(true) => {
@@ -386,7 +400,7 @@ async fn call(
             if let Some(admission) = admission {
                 admission.settle(outcome);
             }
-            span.settle(outcome, ModelUsage::default());
+            span.settle(outcome);
             return dialect.error(Problem::Upstream, "the model upstream could not be reached");
         }
     };
@@ -489,7 +503,7 @@ async fn respond(
     dialect: Dialect,
     upstream: reqwest::Response,
     admission: Option<dekopon_model_token_governor::Admission>,
-    span: CallSpan,
+    mut span: CallSpan,
 ) -> Response {
     let status = upstream.status();
     let mut headers = HeaderMap::new();
@@ -502,7 +516,7 @@ async fn respond(
         if let Some(admission) = admission {
             admission.settle(Outcome::NotSent);
         }
-        span.settle(Outcome::NotSent, ModelUsage::default());
+        span.settle(Outcome::NotSent);
         let body = bounded(upstream, MAX_ERROR_BYTES).await;
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
