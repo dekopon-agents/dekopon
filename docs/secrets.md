@@ -673,7 +673,7 @@ the installation's full grant. An empty list or map refuses startup instead of s
 
 **Failure classification.** A 401 from the mint means GitHub no longer accepts the App's JWT (a
 revoked or rotated key, a deleted App, or the broker's clock is more than a minute ahead of GitHub's): the invocation fails as `credential-unavailable` and logs
-`broker_github_app_credential_reauth_required`, and an operator must install a new key. Everything
+`broker_github_app_credential_reauth_required`; an operator must correct clock skew, restore a deleted App, or replace a revoked or wrong key. Everything
 else — transport, a 5xx, another refusal such as a removed installation, a malformed response —
 fails as `credential-refresh-failed` and logs `broker_github_app_credential_refresh_failed`; the
 next invocation tries again.
