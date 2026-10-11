@@ -160,25 +160,26 @@ impl InferenceHttp {
                 }
             }
             Err(error) => {
-                let (kind, context) = match error {
-                    InferenceError::Authentication(AuthError::Provider(context)) => {
-                        ("authentication", Some(context))
+                let kind = error.kind().as_str();
+                let context = match error {
+                    InferenceError::Authentication(AuthError::Provider(context))
+                    | InferenceError::RateLimited(RateLimitError(context))
+                    | InferenceError::Provider(context)
+                    | InferenceError::Transport(TransportFailure::Http { context, .. }) => {
+                        Some(context)
                     }
-                    InferenceError::Authentication(_) => ("authentication", None),
-                    InferenceError::RateLimited(RateLimitError(context)) => {
-                        ("rate-limited", Some(context))
-                    }
-                    InferenceError::Provider(context) => ("provider", Some(context)),
-                    InferenceError::Transport(TransportFailure::Http { context, .. }) => {
-                        ("transport", Some(context))
-                    }
-                    InferenceError::Transport(_) => ("transport", None),
-                    InferenceError::Protocol(_) => ("protocol", None),
-                    InferenceError::Attachment(_) => ("attachment", None),
-                    InferenceError::InvalidRequest(_) => ("invalid-request", None),
-                    InferenceError::Cancelled => ("cancelled", None),
-                    InferenceError::DeadlineExceeded => ("deadline-exceeded", None),
-                    InferenceError::OverBudget(_) => ("over-budget", None),
+                    InferenceError::Authentication(AuthError::Credential(_))
+                    | InferenceError::Transport(
+                        TransportFailure::Blocking(_)
+                        | TransportFailure::Encoding(_)
+                        | TransportFailure::Credential(_),
+                    )
+                    | InferenceError::Protocol(_)
+                    | InferenceError::Attachment(_)
+                    | InferenceError::InvalidRequest(_)
+                    | InferenceError::Cancelled
+                    | InferenceError::DeadlineExceeded
+                    | InferenceError::OverBudget(_) => None,
                 };
                 span.record("outcome", "failed");
                 // Upstream messages and parser sources may echo sensitive request data.

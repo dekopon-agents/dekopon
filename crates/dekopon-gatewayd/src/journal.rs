@@ -15,9 +15,11 @@ use thiserror::Error;
 use crate::{
     asset::{AssetRef, AssetSourceRef, PendingAsset, RecalledAsset},
     config::MemoryWindow,
+    conversation::SealedConversation,
 };
 
 const EXTENSION: &str = "jsonl";
+const SEAL_EXTENSION: &str = "sealed";
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
 
@@ -70,6 +72,12 @@ struct LineAsset {
     source: AssetSourceRef,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Seal {
+    at_ms: u64,
+}
+
 pub(crate) struct Recalled {
     pub history: History,
     pub assets: Vec<RecalledAsset>,
@@ -104,6 +112,50 @@ impl Journal {
         Ok(journal)
     }
 
+    pub fn seal(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.seal_path(stem))?;
+        serde_json::to_writer(&mut file, &Seal { at_ms: millis(at) }).map_err(io::Error::from)?;
+        Ok(())
+    }
+
+    pub fn sealed(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
+        let _lock = self.lock.lock();
+        self.expire(SystemTime::now())?;
+        self.read_seal(stem)
+    }
+
+    fn seal_path(&self, stem: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.{SEAL_EXTENSION}"))
+    }
+
+    fn read_seal(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
+        let path = self.seal_path(stem);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_reader::<_, Seal>(BufReader::new(file)) {
+            Ok(seal) => match UNIX_EPOCH.checked_add(Duration::from_millis(seal.at_ms)) {
+                Some(at) => Ok(Some(SealedConversation { at })),
+                None => {
+                    remove(&path);
+                    Err(JournalError::Corrupt)
+                }
+            },
+            Err(_) => {
+                remove(&path);
+                Err(JournalError::Corrupt)
+            }
+        }
+    }
+
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
@@ -129,6 +181,9 @@ impl Journal {
             Err(error) => return Err(error),
         };
 
+        if let Some(seal) = self.read_seal(stem)? {
+            lines.retain(|line| line.at_ms > millis(seal.at));
+        }
         let now_ms = millis(now);
         let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
         let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
@@ -245,7 +300,7 @@ impl Journal {
             let path = entry.path();
             if path
                 .extension()
-                .is_some_and(|extension| extension == EXTENSION)
+                .is_some_and(|extension| extension == EXTENSION || extension == SEAL_EXTENSION)
                 && entry.metadata()?.modified()? < cutoff
             {
                 remove(&path);
@@ -701,5 +756,79 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&journal.path(&stem)), 0o600);
         assert!(stem.chars().all(|character| character.is_ascii_hexdigit()));
+    }
+    #[test]
+    fn a_seal_has_private_sibling_storage_and_leaves_the_transcript_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "old turn");
+        let before = fs::read(journal.path(&stem)).unwrap();
+        journal.seal(&stem, now).unwrap();
+        assert_eq!(fs::read(journal.path(&stem)).unwrap(), before);
+        let path = dir.path().join(format!("{stem}.sealed"));
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"atMs": millis(now)}));
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn a_seal_filters_journal_lines_at_and_before_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(
+            &journal,
+            &stem,
+            now - Duration::from_secs(1),
+            GRANT,
+            "before",
+        );
+        append(&journal, &stem, now, GRANT, "at");
+        append(
+            &journal,
+            &stem,
+            now + Duration::from_secs(1),
+            GRANT,
+            "after",
+        );
+        journal.seal(&stem, now).unwrap();
+        let recalled = journal
+            .recall(&stem, GRANT, window(), now + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(users(&recalled), ["after"]);
+    }
+
+    #[test]
+    fn a_corrupt_seal_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let path = journal.seal_path(&stem);
+        fs::write(&path, b"not a marker").unwrap();
+        assert!(matches!(journal.sealed(&stem), Err(JournalError::Corrupt)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_seal_expires_with_the_journal_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        journal.seal(&stem, now).unwrap();
+        let path = journal.seal_path(&stem);
+        File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(now - RETENTION - Duration::from_secs(1)))
+            .unwrap();
+        assert!(journal.sealed(&stem).unwrap().is_none());
+        assert!(!path.exists());
     }
 }

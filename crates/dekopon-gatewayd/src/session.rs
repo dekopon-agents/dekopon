@@ -12,7 +12,8 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
+    BrokerLeg, BrokerLegError, BudgetLimit, CancelSource, IdSequence, ProgressEvent, ProgressSink,
+    ShellRuntime,
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
@@ -21,10 +22,10 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
-    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
-    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
-    InvocationResult,
+    Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
+    DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
+    ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
+    InvocationOutcome, InvocationResult,
 };
 use dekopon_core::{ExternalSubject, PrincipalId};
 use dekopon_model::error::InferenceError;
@@ -50,13 +51,13 @@ use crate::{
         ResolvedLiveness, Steering,
     },
     conversation::{
-        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
-        Watermark,
+        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
+        SealedConversation, TakenIn, Watermark,
     },
     jobs::JobContext,
     journal::{self, Journal},
     metering::ChatProviderGovernor,
-    progress::{ProgressInputs, ProgressPolicy, Terminal},
+    progress::{ProgressInputs, ProgressPolicy, StopCause, Terminal},
     routes::BoundRoute,
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
@@ -71,6 +72,17 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
 pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
+pub(crate) const WALL_CLOCK_REPLY: &str =
+    "Stopped: this session reached its time limit. Capability calls already made were not undone.";
+pub(crate) const MODEL_DEADLINE_REPLY: &str =
+    "Stopped: the model did not answer in time. Capability calls already made were not undone.";
+pub(crate) const EMPTY_ANSWER_REPLY: &str =
+    "Stopped: the model returned an empty answer. Capability calls already made were not undone.";
+pub(crate) const MAX_STEPS_REPLY: &str =
+    "Stopped: this session reached its step limit. Capability calls already made were not undone.";
+pub(crate) const SESSION_TASK_REPLY: &str =
+    "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
+pub(crate) const SEALED_THREAD_REPLY: &str = "Sorry, this agent took too long and we've canceled the chat. Please feel free to start a new one with a smaller scope.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
@@ -765,12 +777,16 @@ impl CancelOutcome {
     }
 }
 
+pub(crate) struct PendingNotice(StopCause);
+
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
     pub models: Arc<ModelCache>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     pub conversations: ConversationStore,
+    pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
+    pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -819,6 +835,7 @@ struct Recall<'a> {
     message: &'a InboundMessage,
     driver: &'a dyn ChatDriver,
     sender: Option<&'a PrincipalId>,
+    sealed_at: Option<SystemTime>,
 }
 
 impl Recall<'_> {
@@ -874,7 +891,9 @@ impl Recall<'_> {
                 }
             }
             RecallSource::Platform => {
-                let horizon = horizon(window);
+                let horizon = self
+                    .sealed_at
+                    .map_or(horizon(window), |at| horizon(window).max(at));
                 // Without Discord's Message Content intent other people's messages arrive with no content.
                 let (messages, names) = self
                     .platform(window, None, |message| {
@@ -901,7 +920,9 @@ impl Recall<'_> {
         let MessageId::Native(_) = &self.message.message_id else {
             return None;
         };
-        let horizon = horizon(window);
+        let horizon = self
+            .sealed_at
+            .map_or(horizon(window), |at| horizon(window).max(at));
         let (mut messages, names) = self
             .platform(window, Some(&watermark.after), |message| {
                 message.at >= horizon && !message.from_bot && !watermark.taken.contains(&message.id)
@@ -1427,6 +1448,19 @@ async fn session(
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
 ) -> &'static str {
+    let key = conversation_key(route, message);
+    let sealed = sealed_conversation(runner, &key).await;
+    match message.conversation.kind {
+        ConversationKind::Thread if sealed.is_some() => {
+            tracing::info!(event = "gateway_session_rejected", reason = "sealed");
+            answer(driver, message, SEALED_THREAD_REPLY).await;
+            return "sealed";
+        }
+        ConversationKind::Thread
+        | ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => {}
+    }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
@@ -1452,9 +1486,6 @@ async fn session(
     };
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
-    // Only trusted route configuration decides whether the subject participates in the state key;
-    // message text, transport presentation, and model output never influence that choice.
-    let key = conversation_key(route, message);
     // Removing the entry, not just refusing further calls, matters because a revoked subject's
     // exchange left resident for its idle timeout would hold exactly the text the revocation was
     // about.
@@ -1490,6 +1521,7 @@ async fn session(
         message,
         driver: driver.as_ref(),
         sender: principal.as_ref(),
+        sealed_at: sealed.map(|seal| seal.at),
     };
     let mut newest_seen = match &message.message_id {
         MessageId::Native(id) => Some(id.clone()),
@@ -1608,6 +1640,7 @@ async fn session(
     ));
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
+    let stop_notice = runner.pending_notices.lock().remove(&key);
     let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
     let frame = |text: String| {
         let text = match &delivery_notice {
@@ -1619,6 +1652,10 @@ async fn session(
         } else {
             text
         }
+    };
+    let text = match stop_notice {
+        Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
+        None => text,
     };
     let text = frame(text);
     let recorded = frame(recorded);
@@ -1813,14 +1850,12 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(&mut progress, &cancellation).await;
+                return stopped(runner, &key, &mut progress, &cancellation).await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
             let replied = progress
-                .terminal(Terminal::Failed(bound_outbound(
-                    liveness.templates.failed(),
-                )))
+                .terminal(remember_stop(runner, &key, StopCause::SessionTask))
                 .await;
             return if replied { "failed" } else { "reply-failed" };
         }
@@ -1830,7 +1865,7 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(&mut progress, &cancellation).await;
+        return stopped(runner, &key, &mut progress, &cancellation).await;
     }
 
     progress.seal();
@@ -1886,7 +1921,8 @@ async fn session(
             };
             (Terminal::Answered(reply), "answered", Some(text))
         }
-        Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
+        Err(SessionError::Model(InferenceError::OverBudget(refusal)))
+        | Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
             tracing::info!(event = "gateway_session_refused", category = "over-budget");
             (
                 Terminal::Failed(bound_outbound(&refusal.to_string())),
@@ -1911,11 +1947,19 @@ async fn session(
                 category = error.category(),
                 error = %error
             );
-            (
-                Terminal::Failed(bound_outbound(liveness.templates.failed())),
-                "failed",
-                None,
-            )
+            let terminal = match error {
+                SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
+                    remember_stop(runner, &key, StopCause::Model(error.kind()))
+                }
+                SessionError::Prompt(PromptError::EmptyAnswer) => {
+                    remember_stop(runner, &key, StopCause::EmptyAnswer)
+                }
+                SessionError::Prompt(PromptError::MaxSteps { .. }) => {
+                    remember_stop(runner, &key, StopCause::MaxSteps)
+                }
+                _ => Terminal::Failed(bound_outbound(liveness.templates.failed())),
+            };
+            (terminal, "failed", None)
         }
     };
     let delivered = progress.terminal(terminal).await;
@@ -1944,13 +1988,72 @@ async fn session(
     }
 }
 
+async fn sealed_conversation(
+    runner: &SessionRunner,
+    key: &ConversationKey,
+) -> Option<SealedConversation> {
+    let Some(journal) = runner.journal.as_ref() else {
+        return runner.sealed_conversations.lock().get(key).copied();
+    };
+    let journal = Arc::clone(journal);
+    let stem = key.journal_stem();
+    let result = tokio::task::spawn_blocking(move || journal.sealed(&stem)).await;
+    let reason = match result {
+        Ok(Ok(sealed)) => return sealed,
+        Ok(Err(error)) => error.label(),
+        Err(_) => "task",
+    };
+    tracing::warn!(event = "gateway_recall_failed", source = "seal", reason);
+    None
+}
+
+async fn seal_conversation(runner: &SessionRunner, key: &ConversationKey) {
+    let seal = SealedConversation {
+        at: SystemTime::now(),
+    };
+    let Some(journal) = runner.journal.as_ref() else {
+        runner.sealed_conversations.lock().insert(key.clone(), seal);
+        return;
+    };
+    let journal = Arc::clone(journal);
+    let stem = key.journal_stem();
+    let result = tokio::task::spawn_blocking(move || journal.seal(&stem, seal.at)).await;
+    let reason = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.label(),
+        Err(_) => "task",
+    };
+    tracing::warn!(event = "gateway_journal_seal_failed", reason);
+}
+
+fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause) -> Terminal {
+    runner
+        .pending_notices
+        .lock()
+        .insert(key.clone(), PendingNotice(cause));
+    Terminal::Stopped(cause)
+}
+
 async fn stopped(
+    runner: &SessionRunner,
+    key: &ConversationKey,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
-    progress.terminal(Terminal::Cancelled { by }).await;
+    match by {
+        CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        } => {
+            seal_conversation(runner, key).await;
+            runner.conversations.remove(key, EvictionReason::Sealed);
+        }
+        CancelSource::User { .. } | CancelSource::Operator => {}
+    }
+    progress
+        .terminal(remember_stop(runner, key, StopCause::Cancelled(by)))
+        .await;
     "cancelled"
 }
 
@@ -2275,9 +2378,7 @@ impl SessionError {
             Self::BrokerClient(_) => "broker-client",
             Self::BrokerLeg(_) => "broker-leg",
             Self::TransportId(_) => "transport-id",
-            Self::Model(InferenceError::OverBudget(_))
-            | Self::Prompt(PromptError::Model(InferenceError::OverBudget(_))) => "over-budget",
-            Self::Model(_) => "model",
+            Self::Model(error) | Self::Prompt(PromptError::Model(error)) => error.kind().as_str(),
             Self::ModelCredential(_) => "model-credential",
             Self::ProxyOnlyModel { .. } => "proxy-only-model",
             Self::Prompt(error) => error.telemetry_kind(),

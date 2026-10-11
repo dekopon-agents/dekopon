@@ -1,3 +1,4 @@
+use super::StopCause;
 use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
@@ -25,7 +26,7 @@ use crate::{
         policy::CALL_DEADLINE,
         text::{RenderState, TemplateField},
     },
-    session::{FAILURE_REPLY, STOPPED_REPLY, SessionCancellation},
+    session::{FAILURE_REPLY, STOPPED_REPLY, SessionCancellation, WALL_CLOCK_REPLY},
     transport::{
         CancelButton, CancelPress, ChatDriver, InboundReaction, LivenessTarget, MessageRef,
         NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, Status,
@@ -814,12 +815,10 @@ async fn every_terminal_clears_status_text_before_delivery_and_native_cleanup() 
             Some(FAILURE_REPLY),
         ),
         (
-            Terminal::Cancelled {
-                by: CancelSource::Budget {
-                    limit: BudgetLimit::WallClock,
-                },
-            },
-            Some(STOPPED_REPLY),
+            Terminal::Stopped(StopCause::Cancelled(CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            })),
+            Some(WALL_CLOCK_REPLY),
         ),
         (Terminal::Silent, None),
     ] {
@@ -1104,12 +1103,10 @@ async fn every_terminal_outcome_removes_or_replaces_the_note_surface() {
             vec![Call::Delete, Call::Reply(FAILURE_REPLY.to_owned())],
         ),
         (
-            Terminal::Cancelled {
-                by: CancelSource::Budget {
-                    limit: BudgetLimit::WallClock,
-                },
-            },
-            vec![Call::Finalize(STOPPED_REPLY.to_owned())],
+            Terminal::Stopped(StopCause::Cancelled(CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            })),
+            vec![Call::Finalize(WALL_CLOCK_REPLY.to_owned())],
         ),
         (Terminal::Silent, vec![Call::Delete]),
     ] {
@@ -2017,11 +2014,11 @@ async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
 
     let delivered = harness
         .policy
-        .terminal(Terminal::Cancelled {
-            by: CancelSource::User {
+        .terminal(Terminal::Stopped(StopCause::Cancelled(
+            CancelSource::User {
                 via: CancelVia::StopReply,
             },
-        })
+        )))
         .await;
     assert!(!delivered, "the ending had already been written");
     assert_eq!(
@@ -2154,7 +2151,7 @@ async fn an_answer_one_millisecond_before_the_deadline_writes_no_stop() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_second_started_rearms_the_wall_clock_deadline() {
+async fn a_second_started_keeps_the_wall_clock_deadline() {
     let harness = start_with(
         Offers::default(),
         ProgressDetail::Plain,
@@ -2172,17 +2169,10 @@ async fn a_second_started_rearms_the_wall_clock_deadline() {
     advance(Duration::from_secs(11)).await;
     assert_eq!(
         harness.cancellation.source(),
-        None,
-        "the first deadline no longer fires once a second Started arrives"
-    );
-
-    advance(Duration::from_secs(20)).await;
-    assert_eq!(
-        harness.cancellation.source(),
         Some(CancelSource::Budget {
             limit: BudgetLimit::WallClock
         }),
-        "the second Started's deadline fires a full budget after it"
+        "the original deadline has fired by 31 seconds"
     );
 }
 
@@ -2445,4 +2435,25 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_names_its_cause_in_chat() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    settle().await;
+    harness
+        .policy
+        .terminal(Terminal::Stopped(StopCause::Cancelled(
+            CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            },
+        )))
+        .await;
+    assert!(
+        harness
+            .recorder
+            .calls()
+            .contains(&Call::Reply(WALL_CLOCK_REPLY.to_owned()))
+    );
 }
