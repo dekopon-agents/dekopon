@@ -775,12 +775,15 @@ impl CancelOutcome {
     }
 }
 
+pub(crate) struct PendingNotice(StopCause);
+
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
     pub models: Arc<ModelCache>,
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     pub conversations: ConversationStore,
+    pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
     pub journal: Option<Arc<Journal>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -1618,6 +1621,7 @@ async fn session(
     ));
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
+    let stop_notice = runner.pending_notices.lock().remove(&key);
     let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
     let frame = |text: String| {
         let text = match &delivery_notice {
@@ -1631,6 +1635,10 @@ async fn session(
         }
     };
     let text = frame(text);
+    let text = match stop_notice {
+        Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
+        None => text,
+    };
     let recorded = frame(recorded);
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
@@ -1823,12 +1831,12 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(&mut progress, &cancellation).await;
+                return stopped(runner, &key, &mut progress, &cancellation).await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
             let replied = progress
-                .terminal(Terminal::Stopped(StopCause::SessionTask))
+                .terminal(remember_stop(runner, &key, StopCause::SessionTask))
                 .await;
             return if replied { "failed" } else { "reply-failed" };
         }
@@ -1838,7 +1846,7 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(&mut progress, &cancellation).await;
+        return stopped(runner, &key, &mut progress, &cancellation).await;
     }
 
     progress.seal();
@@ -1922,13 +1930,13 @@ async fn session(
             );
             let terminal = match error {
                 SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
-                    Terminal::Stopped(StopCause::Model(error.kind()))
+                    remember_stop(runner, &key, StopCause::Model(error.kind()))
                 }
                 SessionError::Prompt(PromptError::EmptyAnswer) => {
-                    Terminal::Stopped(StopCause::EmptyAnswer)
+                    remember_stop(runner, &key, StopCause::EmptyAnswer)
                 }
                 SessionError::Prompt(PromptError::MaxSteps { .. }) => {
-                    Terminal::Stopped(StopCause::MaxSteps)
+                    remember_stop(runner, &key, StopCause::MaxSteps)
                 }
                 _ => Terminal::Failed(bound_outbound(liveness.templates.failed())),
             };
@@ -1961,14 +1969,24 @@ async fn session(
     }
 }
 
+fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause) -> Terminal {
+    runner
+        .pending_notices
+        .lock()
+        .insert(key.clone(), PendingNotice(cause));
+    Terminal::Stopped(cause)
+}
+
 async fn stopped(
+    runner: &SessionRunner,
+    key: &ConversationKey,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
     progress
-        .terminal(Terminal::Stopped(StopCause::Cancelled(by)))
+        .terminal(remember_stop(runner, key, StopCause::Cancelled(by)))
         .await;
     "cancelled"
 }

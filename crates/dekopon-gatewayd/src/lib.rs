@@ -175,6 +175,7 @@ where
         dekopon_model_token_governor::Metering::system_clock(),
     ));
     let runner = Arc::new(SessionRunner {
+        pending_notices: Default::default(),
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(
             Arc::clone(&configured) as Arc<dyn session::ModelFactory>

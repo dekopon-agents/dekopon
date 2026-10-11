@@ -2826,6 +2826,7 @@ fn runner_tracking(
     max_conversations: usize,
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
+        pending_notices: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
@@ -5459,7 +5460,10 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         transcript(&[
             ("system", &expected_instructions()),
             ("user", "what broke?"),
-            ("user", "try again"),
+            (
+                "user",
+                "[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
+            ),
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
     );
@@ -14284,6 +14288,7 @@ fn journaled_runner(
     journal: &Path,
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
+        pending_notices: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(4),
@@ -15622,4 +15627,39 @@ async fn an_empty_answer_and_max_steps_name_their_cause_in_chat() {
         .await;
         assert_eq!(driver.replies(), [expected]);
     }
+}
+
+#[tokio::test]
+async fn the_stop_notice_reaches_the_next_turn_once() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::results([
+        Err(InferenceError::DeadlineExceeded),
+        Ok(answer("second answer")),
+        Ok(answer("third answer")),
+    ]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+    let driver = Arc::new(RecordingDriver::default());
+    for text in ["first question", "second question", "third question"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    let notice = "[gateway: the previous turn stopped before answering: the model call failed (deadline-exceeded). Capability calls already made were not undone.]";
+    assert_eq!(
+        models.prompt(1).last().unwrap().1,
+        format!("{notice}\nsecond question")
+    );
+    assert!(
+        models
+            .prompt(2)
+            .iter()
+            .all(|(_, text)| !text.contains(notice))
+    );
 }

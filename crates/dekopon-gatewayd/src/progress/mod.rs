@@ -98,3 +98,22 @@ impl StopCause {
         }
     }
 }
+
+impl StopCause {
+    pub(crate) fn notice(self) -> String {
+        let reason = match self {
+            Self::Cancelled(CancelSource::User { .. }) => "the person stopped it".to_owned(),
+            Self::Cancelled(CancelSource::Operator) => "the gateway stopped it".to_owned(),
+            Self::Cancelled(CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            }) => "it reached its time limit".to_owned(),
+            Self::Model(kind) => format!("the model call failed ({})", kind.as_str()),
+            Self::EmptyAnswer => "the model returned an empty answer".to_owned(),
+            Self::MaxSteps => "it reached its step limit".to_owned(),
+            Self::SessionTask => "the gateway lost its task".to_owned(),
+        };
+        format!(
+            "[gateway: the previous turn stopped before answering: {reason}. Capability calls already made were not undone.]"
+        )
+    }
+}
