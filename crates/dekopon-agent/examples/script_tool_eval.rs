@@ -1345,9 +1345,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(row.reward, 0);
-        assert_eq!(row.fatal, Some("model"));
+        assert_eq!(row.fatal, Some("deadline-exceeded"));
         assert!(row.problems.contains(&Problem::Fatal {
-            kind: "model".to_owned()
+            kind: "deadline-exceeded".to_owned()
         }));
         assert_eq!(row.turns.len(), 1);
         assert!(row.turns[0].error.is_some());
