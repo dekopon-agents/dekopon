@@ -56,7 +56,7 @@ use crate::{
     jobs::JobContext,
     journal::{self, Journal},
     metering::ChatProviderGovernor,
-    progress::{ProgressInputs, ProgressPolicy, Terminal},
+    progress::{ProgressInputs, ProgressPolicy, StopCause, Terminal},
     routes::BoundRoute,
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
@@ -71,6 +71,16 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
 pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
+pub(crate) const WALL_CLOCK_REPLY: &str =
+    "Stopped: this session reached its time limit. Capability calls already made were not undone.";
+pub(crate) const MODEL_DEADLINE_REPLY: &str =
+    "Stopped: the model did not answer in time. Capability calls already made were not undone.";
+pub(crate) const EMPTY_ANSWER_REPLY: &str =
+    "Stopped: the model returned an empty answer. Capability calls already made were not undone.";
+pub(crate) const MAX_STEPS_REPLY: &str =
+    "Stopped: this session reached its step limit. Capability calls already made were not undone.";
+pub(crate) const SESSION_TASK_REPLY: &str =
+    "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
@@ -1818,9 +1828,7 @@ async fn session(
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
             let replied = progress
-                .terminal(Terminal::Failed(bound_outbound(
-                    liveness.templates.failed(),
-                )))
+                .terminal(Terminal::Stopped(StopCause::SessionTask))
                 .await;
             return if replied { "failed" } else { "reply-failed" };
         }
@@ -1886,7 +1894,8 @@ async fn session(
             };
             (Terminal::Answered(reply), "answered", Some(text))
         }
-        Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
+        Err(SessionError::Model(InferenceError::OverBudget(refusal)))
+        | Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
             tracing::info!(event = "gateway_session_refused", category = "over-budget");
             (
                 Terminal::Failed(bound_outbound(&refusal.to_string())),
@@ -1911,11 +1920,19 @@ async fn session(
                 category = error.category(),
                 error = %error
             );
-            (
-                Terminal::Failed(bound_outbound(liveness.templates.failed())),
-                "failed",
-                None,
-            )
+            let terminal = match error {
+                SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
+                    Terminal::Stopped(StopCause::Model(error.kind()))
+                }
+                SessionError::Prompt(PromptError::EmptyAnswer) => {
+                    Terminal::Stopped(StopCause::EmptyAnswer)
+                }
+                SessionError::Prompt(PromptError::MaxSteps { .. }) => {
+                    Terminal::Stopped(StopCause::MaxSteps)
+                }
+                _ => Terminal::Failed(bound_outbound(liveness.templates.failed())),
+            };
+            (terminal, "failed", None)
         }
     };
     let delivered = progress.terminal(terminal).await;
@@ -1950,7 +1967,9 @@ async fn stopped(
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
-    progress.terminal(Terminal::Cancelled { by }).await;
+    progress
+        .terminal(Terminal::Stopped(StopCause::Cancelled(by)))
+        .await;
     "cancelled"
 }
 

@@ -4,6 +4,11 @@
 use std::time::Duration;
 
 use dekopon_agent::{BudgetLimit, CancelSource, CancelVia};
+use dekopon_model::error::InferenceErrorKind;
+
+use crate::session::{
+    EMPTY_ANSWER_REPLY, MAX_STEPS_REPLY, MODEL_DEADLINE_REPLY, SESSION_TASK_REPLY, WALL_CLOCK_REPLY,
+};
 
 mod adapter;
 mod policy;
@@ -54,5 +59,42 @@ pub(crate) const fn cancel_label(source: CancelSource) -> &'static str {
         CancelSource::Budget {
             limit: BudgetLimit::WallClock,
         } => "budget:wall-clock",
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StopCause {
+    Cancelled(CancelSource),
+    Model(InferenceErrorKind),
+    EmptyAnswer,
+    MaxSteps,
+    SessionTask,
+}
+
+impl StopCause {
+    pub(crate) fn line(self, templates: &Templates) -> &str {
+        match self {
+            Self::Cancelled(CancelSource::User { .. } | CancelSource::Operator) => {
+                templates.stopped()
+            }
+            Self::Cancelled(CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            }) => WALL_CLOCK_REPLY,
+            Self::Model(InferenceErrorKind::DeadlineExceeded) => MODEL_DEADLINE_REPLY,
+            Self::Model(
+                InferenceErrorKind::InvalidRequest
+                | InferenceErrorKind::Provider
+                | InferenceErrorKind::Transport
+                | InferenceErrorKind::Protocol
+                | InferenceErrorKind::Attachment
+                | InferenceErrorKind::Authentication
+                | InferenceErrorKind::RateLimited
+                | InferenceErrorKind::Cancelled
+                | InferenceErrorKind::OverBudget,
+            ) => templates.failed(),
+            Self::EmptyAnswer => EMPTY_ANSWER_REPLY,
+            Self::MaxSteps => MAX_STEPS_REPLY,
+            Self::SessionTask => SESSION_TASK_REPLY,
+        }
     }
 }

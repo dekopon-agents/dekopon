@@ -1821,7 +1821,7 @@ fn an_exported_but_blank_credential_is_refused_by_name() {
 }
 
 struct ModelScript {
-    turns: Mutex<VecDeque<Option<AssistantTurn>>>,
+    turns: Mutex<VecDeque<Result<AssistantTurn, InferenceError>>>,
     prompts: Mutex<Vec<Vec<ModelMessage>>>,
     tools: Mutex<Vec<Vec<ModelTool>>>,
     cache_keys: Mutex<Vec<Option<String>>>,
@@ -1836,6 +1836,16 @@ impl ModelScript {
     }
 
     fn scripted(turns: impl IntoIterator<Item = Option<AssistantTurn>>) -> Arc<Self> {
+        Self::results(turns.into_iter().map(|turn| {
+            turn.ok_or(InferenceError::Protocol(
+                dekopon_model::error::ProtocolFailure::NoChoices,
+            ))
+        }))
+    }
+
+    fn results(
+        turns: impl IntoIterator<Item = Result<AssistantTurn, InferenceError>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
             prompts: Mutex::new(Vec::new()),
@@ -1937,10 +1947,9 @@ impl ChatModel for ScriptedModel {
             .turns
             .lock()
             .pop_front()
-            .flatten()
-            .ok_or(InferenceError::Protocol(
+            .unwrap_or(Err(InferenceError::Protocol(
                 dekopon_model::error::ProtocolFailure::NoChoices,
-            ))
+            )))
     }
 }
 
@@ -12216,6 +12225,13 @@ impl CancelOrigin {
         panic!("the aborted session task never unwound");
     }
 
+    const fn reply(self) -> &'static str {
+        match self {
+            Self::User(_) | Self::Operator => crate::session::STOPPED_REPLY,
+            Self::WallClock => crate::session::WALL_CLOCK_REPLY,
+        }
+    }
+
     const fn renders_the_ending(self) -> bool {
         !matches!(self, Self::Operator)
     }
@@ -12229,12 +12245,12 @@ impl CancelOrigin {
     }
 }
 
-async fn told_it_stopped(driver: &RecordingDriver) -> bool {
+async fn told_it_stopped(driver: &RecordingDriver, origin: CancelOrigin) -> bool {
     for _ in 0..600 {
         if driver
             .rendered()
             .iter()
-            .any(|line| line.contains(crate::session::STOPPED_REPLY))
+            .any(|line| line.contains(origin.reply()))
         {
             return true;
         }
@@ -12417,7 +12433,7 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the person watching a run that had already ended: {:?}",
             driver.rendered()
         );
@@ -12494,7 +12510,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the stream saying it was still writing: {:?}",
             driver.rendered()
         );
@@ -12567,7 +12583,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} made the person wait out a call nobody was going to read: {:?}",
             driver.rendered()
         );
@@ -12575,10 +12591,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         origin.joined(session).await;
 
         assert!(
-            driver
-                .replies()
-                .iter()
-                .all(|reply| reply == crate::session::STOPPED_REPLY),
+            driver.replies().iter().all(|reply| reply == origin.reply()),
             "a stopped session answered anyway under {origin:?}: {:?}",
             driver.replies()
         );
@@ -15562,4 +15575,51 @@ async fn an_agent_without_a_budget_is_never_refused() {
     .await;
 
     assert_eq!(driver.replies(), ["hi there"]);
+}
+
+#[tokio::test]
+async fn a_model_deadline_failure_reports_deadline_exceeded() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let models = ModelScript::results([Err(InferenceError::DeadlineExceeded)]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, models, 4),
+        route(model_config()),
+        message("answer the question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::MODEL_DEADLINE_REPLY]);
+    assert!(
+        capture.events().iter().any(|(fields, _)| {
+            fields.contains("event=\"gateway_session_failed\"")
+                && fields.contains("category=\"deadline-exceeded\"")
+        }),
+        "{}",
+        capture.text()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_answer_and_max_steps_name_their_cause_in_chat() {
+    for (turn, expected) in [
+        (answer(""), crate::session::EMPTY_ANSWER_REPLY),
+        (script_call("true"), crate::session::MAX_STEPS_REPLY),
+    ] {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+        let driver = Arc::new(RecordingDriver::default());
+        let mut route = route(model_config());
+        route.limits.max_steps = 1;
+        run_session(
+            runner(broker, ModelScript::new([turn]), 4),
+            route,
+            message("answer the question"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(driver.replies(), [expected]);
+    }
 }

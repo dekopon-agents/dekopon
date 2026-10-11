@@ -18,7 +18,7 @@ use tokio::{
 use crate::{
     config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
     progress::{
-        KeepAlive,
+        KeepAlive, StopCause,
         adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, QueuedEvent, record},
         cancel_label,
         text::{LiveNote, ProgressDetail, ProgressText, RenderState},
@@ -55,7 +55,7 @@ const FINISHED: u8 = 2;
 pub(crate) enum Terminal {
     Answered(OutboundReply),
     Failed(String),
-    Cancelled { by: CancelSource },
+    Stopped(StopCause),
     Silent,
 }
 
@@ -867,8 +867,9 @@ impl Surface {
                     self.deliver(OutboundReply::text(line)).await
                 }
             },
-            Terminal::Cancelled { .. } => {
-                let stopped = self.liveness.templates.stopped().to_owned();
+            Terminal::Stopped(cause) => {
+                let stopped =
+                    crate::transport::bound_outbound(cause.line(&self.liveness.templates));
                 let reply = match streamed {
                     Some(partial) => ended(&partial, &stopped),
                     None => stopped,
@@ -982,13 +983,15 @@ impl Surface {
                 audit.event = "gateway.progress",
                 kind = match terminal {
                     Terminal::Answered(_) => "terminal_answered",
-                    Terminal::Failed(_) => "terminal_failed",
-                    Terminal::Cancelled { .. } => "terminal_cancelled",
+                    Terminal::Stopped(StopCause::Cancelled(_)) => "terminal_cancelled",
+                    Terminal::Stopped(StopCause::Model(_) | StopCause::EmptyAnswer | StopCause::MaxSteps | StopCause::SessionTask)
+                    | Terminal::Failed(_) => "terminal_failed",
                     Terminal::Silent => "terminal_silent",
                 },
                 by = match terminal {
-                    Terminal::Cancelled { by } => Some(cancel_label(*by)),
-                    Terminal::Answered(_) | Terminal::Failed(_) | Terminal::Silent => None,
+                    Terminal::Stopped(StopCause::Cancelled(by)) => Some(cancel_label(*by)),
+                    Terminal::Stopped(StopCause::Model(_) | StopCause::EmptyAnswer | StopCause::MaxSteps | StopCause::SessionTask)
+                    | Terminal::Answered(_) | Terminal::Failed(_) | Terminal::Silent => None,
                 },
                 edits = self.edits,
                 keep_alives = self.keep_alives,
@@ -1094,7 +1097,7 @@ async fn run(
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
                 let latest = text.borrow_and_update().clone();
-                surface.terminal(Terminal::Cancelled { by }, latest).await;
+                surface.terminal(Terminal::Stopped(StopCause::Cancelled(by)), latest).await;
                 break;
             }
             () = coordination.finished() => break,
