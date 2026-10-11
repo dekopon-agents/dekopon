@@ -505,7 +505,7 @@ for a new turn.
 `busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
 all process-wide permits are taken for a new conversation (`busy.cause = saturated`). `cancelled`
 means cancellation won before completion was claimed, and `failed` names a category and the `error` that
-produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
+produced it through the `gateway_session_failed` log event; a model failure's category is its error kind (`authentication`, `rate-limited`, `provider`, `transport`, `protocol`, `attachment`, `invalid-request`, `cancelled`, `deadline-exceeded` or `over-budget`), the same label as the model span's `error.kind`. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
