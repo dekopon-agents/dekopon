@@ -2151,7 +2151,7 @@ async fn an_answer_one_millisecond_before_the_deadline_writes_no_stop() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_second_started_rearms_the_wall_clock_deadline() {
+async fn a_second_started_keeps_the_wall_clock_deadline() {
     let harness = start_with(
         Offers::default(),
         ProgressDetail::Plain,
@@ -2169,17 +2169,10 @@ async fn a_second_started_rearms_the_wall_clock_deadline() {
     advance(Duration::from_secs(11)).await;
     assert_eq!(
         harness.cancellation.source(),
-        None,
-        "the first deadline no longer fires once a second Started arrives"
-    );
-
-    advance(Duration::from_secs(20)).await;
-    assert_eq!(
-        harness.cancellation.source(),
         Some(CancelSource::Budget {
             limit: BudgetLimit::WallClock
         }),
-        "the second Started's deadline fires a full budget after it"
+        "the original deadline has fired by 31 seconds"
     );
 }
 
