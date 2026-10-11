@@ -259,6 +259,7 @@ pub(crate) enum EvictionReason {
     Idle,
     Capacity,
     GrantChanged,
+    Sealed,
 }
 
 impl EvictionReason {
@@ -267,6 +268,7 @@ impl EvictionReason {
             Self::Idle => "idle",
             Self::Capacity => "capacity",
             Self::GrantChanged => "grant-changed",
+            Self::Sealed => "sealed",
         }
     }
 }

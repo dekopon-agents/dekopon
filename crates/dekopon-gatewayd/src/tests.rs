@@ -2847,6 +2847,7 @@ fn runner_tracking(
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
         stop_notices: Mutex::default(),
+        sealed: Mutex::default(),
     })
 }
 
@@ -12749,40 +12750,27 @@ async fn wall_clock_stops_after(
 #[tokio::test(start_paused = true)]
 async fn a_wall_clock_stop_names_its_cause_in_chat() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
-    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
-        answer("too late"),
-        Duration::from_secs(60),
-    ));
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("too late")]);
+    let parked = ParkedTurn::new(Arc::clone(&models), 0);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(
         broker,
-        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        Arc::new(Arc::clone(&parked)) as Arc<dyn ModelFactory>,
         4,
     );
     let session = tokio::spawn(run_session(
         Arc::clone(&runner),
-        timed_route(model_config(), Duration::from_secs(30)),
+        timed_route(model_config(), SEAL_BUDGET),
         message("take your time"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
-    model.wait_until_asked().await;
-    tokio::time::advance(Duration::from_secs(31)).await;
-    model.release_next();
+    parked.wait_until_parked().await;
+    parked.stop_at_the_wall_clock(SEAL_BUDGET).await;
     session.await.expect("the stopped session unwinds");
 
-    assert_eq!(
-        driver.replies(),
-        vec![crate::session::TIME_LIMIT_REPLY.to_owned()]
-    );
+    assert_eq!(driver.replies(), [crate::session::TIME_LIMIT_REPLY]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -14469,6 +14457,7 @@ fn journaled_runner(
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
         stop_notices: Mutex::default(),
+        sealed: Mutex::default(),
     })
 }
 
@@ -15745,4 +15734,393 @@ async fn an_agent_without_a_budget_is_never_refused() {
     .await;
 
     assert_eq!(driver.replies(), ["hi there"]);
+}
+
+struct ParkedTurn {
+    script: Arc<ModelScript>,
+    park: usize,
+    parked: tokio::sync::Notify,
+    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl ParkedTurn {
+    fn new(script: Arc<ModelScript>, park: usize) -> Arc<Self> {
+        let (release, gate) = std::sync::mpsc::channel();
+        Arc::new(Self {
+            script,
+            park,
+            parked: tokio::sync::Notify::new(),
+            gate: Mutex::new(gate),
+            release,
+        })
+    }
+
+    async fn wait_until_parked(&self) {
+        self.parked.notified().await;
+    }
+
+    async fn stop_at_the_wall_clock(&self, budget: Duration) {
+        tokio::time::advance(budget + Duration::from_secs(1)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the parked call gives up on its own timeout, which the test then sees as a \
+                      missing stop"
+        )]
+        let _ = self.release.send(());
+    }
+}
+
+impl ModelFactory for Arc<ParkedTurn> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Ok(Arc::new(ParkedTurnModel(Arc::clone(self))))
+    }
+}
+
+struct ParkedTurnModel(Arc<ParkedTurn>);
+
+impl ChatModel for ParkedTurnModel {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        if self.0.script.requests() == self.0.park {
+            self.0.parked.notify_one();
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a release that never arrives is bounded by this timeout"
+            )]
+            let _ = self.0.gate.lock().recv_timeout(Duration::from_secs(60));
+        }
+        ScriptedModel(Arc::clone(&self.0.script)).complete(messages, tools, options, on_event)
+    }
+}
+
+const SEAL_BUDGET: Duration = Duration::from_secs(30);
+
+fn sealing_route(memory: MemoryWindow) -> crate::routes::BoundRoute {
+    crate::routes::BoundRoute {
+        max_duration: Some(SEAL_BUDGET),
+        ..persistent_route(model_config(), memory)
+    }
+}
+
+fn in_conversation(kind: ConversationKind, id: u32, inbound: InboundMessage) -> InboundMessage {
+    let thread = match kind {
+        ConversationKind::Thread => Some("1700000000.000001".to_owned()),
+        ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => None,
+    };
+    InboundMessage {
+        conversation: Conversation {
+            kind,
+            container: Some("t1".to_owned()),
+            id: "c1".to_owned(),
+            thread,
+        },
+        message_id: MessageId::Native(format!("0123456789abcdef0123456789abcdef-1-{id}")),
+        ..inbound
+    }
+}
+
+fn sealed_refusals(capture: &dekopon_test_support::CaptureLayer) -> usize {
+    capture
+        .events()
+        .into_iter()
+        .filter(|(fields, _)| {
+            fields.contains(" event=\"gateway_session_rejected\"")
+                && fields.contains(" reason=\"sealed\"")
+        })
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_seals_the_thread() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("too late")]);
+    let parked = ParkedTurn::new(Arc::clone(&models), 0);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&parked)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let route = sealing_route(shared_window());
+    let thread = |id, inbound| in_conversation(ConversationKind::Thread, id, inbound);
+
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        thread(1, message("take your time")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    parked.wait_until_parked().await;
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        thread(2, message_from("tel.16035550100", "my turn next")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    parked.stop_at_the_wall_clock(SEAL_BUDGET).await;
+    session
+        .await
+        .expect("the stopped session and its queued follow-up unwind");
+    run_session(
+        Arc::clone(&runner),
+        route,
+        thread(3, message("are you still there?")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(
+        driver.replies(),
+        [
+            crate::session::TIME_LIMIT_REPLY,
+            crate::session::SEALED_THREAD_REPLY,
+            crate::session::SEALED_THREAD_REPLY,
+        ]
+    );
+    assert_eq!(
+        models.requests(),
+        1,
+        "a sealed thread never reaches a model"
+    );
+    assert_eq!(sealed_refusals(&capture), 2);
+    assert_eq!(
+        capture
+            .spans()
+            .into_iter()
+            .filter(|(_, fields)| fields.contains("outcome=\"sealed\""))
+            .count(),
+        2,
+        "{}",
+        capture.spans_text()
+    );
+}
+
+async fn a_wall_clock_stop_between_two_answers(
+    kind: ConversationKind,
+    memory: MemoryWindow,
+) -> (Vec<String>, Vec<(String, String)>, usize) {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("first"), answer("too late"), answer("third")]);
+    let parked = ParkedTurn::new(Arc::clone(&models), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&parked)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let route = sealing_route(memory);
+
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        in_conversation(kind, 1, message("one")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        in_conversation(kind, 2, message("two")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    parked.wait_until_parked().await;
+    parked.stop_at_the_wall_clock(SEAL_BUDGET).await;
+    session.await.expect("the stopped session unwinds");
+    run_session(
+        Arc::clone(&runner),
+        route,
+        in_conversation(kind, 3, message("three")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    (
+        driver.replies(),
+        models.prompt(2),
+        sealed_refusals(&capture),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_in_a_channel_starts_fresh_and_is_never_refused() {
+    let (replies, prompt, refusals) =
+        a_wall_clock_stop_between_two_answers(ConversationKind::Channel, shared_window()).await;
+
+    assert_eq!(
+        replies,
+        ["first", crate::session::TIME_LIMIT_REPLY, "third"],
+        "the channel is answered again after the stop"
+    );
+    assert_eq!(refusals, 0);
+    assert!(
+        !prompt.iter().any(|(_, content)| content == "first"),
+        "nothing from before the stop is replayed: {prompt:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_after_a_wall_clock_stop_starts_fresh_with_a_notice() {
+    let (replies, prompt, refusals) =
+        a_wall_clock_stop_between_two_answers(ConversationKind::DirectMessage, window()).await;
+
+    assert_eq!(
+        replies,
+        ["first", crate::session::TIME_LIMIT_REPLY, "third"]
+    );
+    assert_eq!(refusals, 0);
+    assert_eq!(
+        prompt[1..],
+        transcript(&[(
+            "user",
+            "[gateway: the previous turn stopped before answering: it reached its time limit. \
+             Capability calls already made were not undone.]\nthree",
+        )])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sealed_conversation_stays_sealed_after_a_restart() {
+    let directory = temporary();
+    let journal = directory.path().join("journal");
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("too late")]);
+    let parked = ParkedTurn::new(Arc::clone(&models), 0);
+    let before = journaled_runner(
+        broker.clone(),
+        Arc::new(Arc::clone(&parked)) as Arc<dyn ModelFactory>,
+        &journal,
+    );
+    let route = sealing_route(recall_window(RecallSource::Journal));
+    let thread = |id, inbound| in_conversation(ConversationKind::Thread, id, inbound);
+    let driver = Arc::new(RecordingDriver::default());
+
+    let session = tokio::spawn(run_session(
+        before,
+        route.clone(),
+        thread(1, message("take your time")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    parked.wait_until_parked().await;
+    parked.stop_at_the_wall_clock(SEAL_BUDGET).await;
+    session.await.expect("the stopped session unwinds");
+
+    let sealed = fs::read_dir(&journal)
+        .expect("journal directory")
+        .map(|entry| entry.expect("journal entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "sealed")
+        })
+        .collect::<Vec<_>>();
+    let [marker] = sealed.as_slice() else {
+        panic!("one seal marker beside the journal: {sealed:?}");
+    };
+    assert_eq!(
+        fs::metadata(marker).expect("marker").permissions().mode() & 0o777,
+        0o600
+    );
+    let marker: Value = serde_json::from_slice(&fs::read(marker).expect("marker bytes"))
+        .expect("the marker is JSON");
+    assert!(marker["atMs"].as_u64().is_some(), "{marker}");
+
+    let forbidden = ModelScript::forbidden();
+    let after = journaled_runner(
+        broker,
+        Arc::new(Arc::clone(&forbidden)) as Arc<dyn ModelFactory>,
+        &journal,
+    );
+    run_session(
+        after,
+        route,
+        thread(2, message("are you still there?")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(
+        driver.replies(),
+        [
+            crate::session::TIME_LIMIT_REPLY,
+            crate::session::SEALED_THREAD_REPLY
+        ]
+    );
+    assert_eq!(forbidden.requests(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_platform_recall_skips_messages_before_the_seal() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("too late"), answer("fresh")]);
+    let parked = ParkedTurn::new(Arc::clone(&models), 0);
+    let mut earlier = past("0000000001", "U1", SUBJECT, "before the stop");
+    earlier.at = std::time::SystemTime::now() - Duration::from_secs(60);
+    let driver = HistoryDriver::new(Ok(vec![earlier]));
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&parked)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let route = sealing_route(recall_window(RecallSource::Platform));
+
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        in_conversation(
+            ConversationKind::DirectMessage,
+            1,
+            message("take your time"),
+        ),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    parked.wait_until_parked().await;
+    parked.stop_at_the_wall_clock(SEAL_BUDGET).await;
+    session.await.expect("the stopped session unwinds");
+    driver.post(past("0000000002", "U1", SUBJECT, "after the stop"));
+    run_session(
+        runner,
+        route,
+        in_conversation(ConversationKind::DirectMessage, 2, message("again")),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let prompt = models.prompt(1);
+    assert!(
+        prompt
+            .iter()
+            .any(|(_, content)| content.contains("after the stop")),
+        "{prompt:?}"
+    );
+    assert!(
+        !prompt
+            .iter()
+            .any(|(_, content)| content.contains("before the stop")),
+        "{prompt:?}"
+    );
 }

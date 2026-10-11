@@ -22,10 +22,10 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
-    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
-    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
-    InvocationResult,
+    Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
+    DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
+    ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
+    InvocationOutcome, InvocationResult,
 };
 use dekopon_core::{ExternalSubject, PrincipalId};
 use dekopon_model::error::InferenceError;
@@ -80,6 +80,7 @@ pub(crate) const EMPTY_ANSWER_REPLY: &str =
     "Stopped: the model returned an empty answer. Capability calls already made were not undone.";
 pub(crate) const STEP_LIMIT_REPLY: &str =
     "Stopped: this session reached its step limit. Capability calls already made were not undone.";
+pub(crate) const SEALED_THREAD_REPLY: &str = "Sorry, this agent took too long and we've canceled the chat. Please feel free to start a new one with a smaller scope.";
 pub(crate) const LOST_TASK_REPLY: &str =
     "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
@@ -792,6 +793,12 @@ pub(crate) struct SessionRunner {
     pub jobs: Arc<crate::jobs::Jobs>,
     pub metering: Arc<dekopon_model_token_governor::Metering>,
     pub stop_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
+    pub sealed: Mutex<HashMap<ConversationKey, SealedConversation>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SealedConversation {
+    at: SystemTime,
 }
 
 #[derive(Clone, Copy)]
@@ -821,19 +828,55 @@ impl PendingNotice {
     }
 }
 
+// Bounded by dropping an arbitrary entry: a conversation that never speaks again would otherwise
+// hold its entry for the life of the process.
+fn insert_resident<T>(map: &mut HashMap<ConversationKey, T>, key: &ConversationKey, value: T) {
+    if map.len() >= RESIDENT_STOPS
+        && !map.contains_key(key)
+        && let Some(evicted) = map.keys().next().cloned()
+    {
+        map.remove(&evicted);
+    }
+    map.insert(key.clone(), value);
+}
+
 impl SessionRunner {
     fn stopped_with(&self, key: &ConversationKey, cause: StopCause) -> Terminal {
-        let mut notices = self.stop_notices.lock();
-        // Bounded by dropping an arbitrary notice: a conversation that never speaks again would
-        // otherwise hold its entry for the life of the process.
-        if notices.len() >= RESIDENT_STOPS
-            && !notices.contains_key(key)
-            && let Some(evicted) = notices.keys().next().cloned()
-        {
-            notices.remove(&evicted);
-        }
-        notices.insert(key.clone(), PendingNotice(cause));
+        insert_resident(&mut self.stop_notices.lock(), key, PendingNotice(cause));
         Terminal::Stopped(cause)
+    }
+
+    async fn seal(&self, key: &ConversationKey) {
+        let at = SystemTime::now();
+        self.conversations.remove(key, EvictionReason::Sealed);
+        let Some(journal) = self.journal.as_ref().map(Arc::clone) else {
+            insert_resident(&mut self.sealed.lock(), key, SealedConversation { at });
+            return;
+        };
+        let stem = key.journal_stem();
+        let reason = match tokio::task::spawn_blocking(move || journal.seal(&stem, at)).await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error.label(),
+            Err(_) => "task",
+        };
+        tracing::warn!(event = "gateway_journal_seal_failed", reason);
+    }
+
+    async fn sealed_at(&self, key: &ConversationKey) -> Option<SystemTime> {
+        let Some(journal) = self.journal.as_ref().map(Arc::clone) else {
+            return self.sealed.lock().get(key).map(|sealed| sealed.at);
+        };
+        let stem = key.journal_stem();
+        let reason =
+            match tokio::task::spawn_blocking(move || journal.sealed(&stem, SystemTime::now()))
+                .await
+            {
+                Ok(Ok(sealed)) => return sealed,
+                Ok(Err(error)) => error.label(),
+                Err(_) => "task",
+            };
+        tracing::warn!(event = "gateway_journal_seal_read_failed", reason);
+        None
     }
 }
 
@@ -875,6 +918,7 @@ struct Recall<'a> {
     message: &'a InboundMessage,
     driver: &'a dyn ChatDriver,
     sender: Option<&'a PrincipalId>,
+    sealed: Option<SystemTime>,
 }
 
 impl Recall<'_> {
@@ -930,7 +974,7 @@ impl Recall<'_> {
                 }
             }
             RecallSource::Platform => {
-                let horizon = horizon(window);
+                let horizon = horizon(window, self.sealed);
                 // Without Discord's Message Content intent other people's messages arrive with no content.
                 let (messages, names) = self
                     .platform(window, None, |message| {
@@ -957,7 +1001,7 @@ impl Recall<'_> {
         let MessageId::Native(_) = &self.message.message_id else {
             return None;
         };
-        let horizon = horizon(window);
+        let horizon = horizon(window, self.sealed);
         let (mut messages, names) = self
             .platform(window, Some(&watermark.after), |message| {
                 message.at >= horizon && !message.from_bot && !watermark.taken.contains(&message.id)
@@ -1064,10 +1108,11 @@ impl Recall<'_> {
     }
 }
 
-fn horizon(window: MemoryWindow) -> SystemTime {
-    SystemTime::now()
+fn horizon(window: MemoryWindow, sealed: Option<SystemTime>) -> SystemTime {
+    let horizon = SystemTime::now()
         .checked_sub(window.forget_after)
-        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    sealed.map_or(horizon, |sealed| horizon.max(sealed))
 }
 
 fn platform_window(
@@ -1483,6 +1528,21 @@ async fn session(
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
 ) -> &'static str {
+    // Only trusted route configuration decides whether the subject participates in the state key;
+    // message text, transport presentation, and model output never influence that choice.
+    let key = conversation_key(route, message);
+    let sealed = runner.sealed_at(&key).await;
+    match message.conversation.kind {
+        ConversationKind::Thread if sealed.is_some() => {
+            tracing::info!(event = "gateway_session_rejected", reason = "sealed");
+            answer(driver, message, SEALED_THREAD_REPLY).await;
+            return "sealed";
+        }
+        ConversationKind::Thread
+        | ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => {}
+    }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
@@ -1508,9 +1568,6 @@ async fn session(
     };
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
-    // Only trusted route configuration decides whether the subject participates in the state key;
-    // message text, transport presentation, and model output never influence that choice.
-    let key = conversation_key(route, message);
     // Removing the entry, not just refusing further calls, matters because a revoked subject's
     // exchange left resident for its idle timeout would hold exactly the text the revocation was
     // about.
@@ -1546,6 +1603,7 @@ async fn session(
         message,
         driver: driver.as_ref(),
         sender: principal.as_ref(),
+        sealed,
     };
     let mut newest_seen = match &message.message_id {
         MessageId::Native(id) => Some(id.clone()),
@@ -2021,6 +2079,12 @@ async fn stopped(
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
+    match by {
+        CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        } => runner.seal(key).await,
+        CancelSource::User { .. } | CancelSource::Operator => {}
+    }
     progress
         .terminal(runner.stopped_with(key, StopCause::Cancelled(by)))
         .await;

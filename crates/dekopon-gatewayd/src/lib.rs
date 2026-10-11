@@ -195,6 +195,7 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
         stop_notices: parking_lot::Mutex::default(),
+        sealed: parking_lot::Mutex::default(),
     });
     let mut owned_tasks = start_metering_tasks(&config, &configured, &metering).await?;
 
