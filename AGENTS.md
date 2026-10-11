@@ -170,7 +170,7 @@ A closed enum makes the compiler find every match arm when the next kind arrives
 - Yes: an implementation declares its capabilities once and callers consult that declaration; content counting passes `TextUnit::Chars` or `TextUnit::Bytes` to the implementation, not a transport-name branch.
 - Yes: a produced outcome is an enum with its label derived by exhaustive match, not a string used for dispatch.
 - Yes: `match state { State::Open => true, State::Draining | State::Closed => false }` on an enum this crate defines.
-- No: `matches!(state, State::Open)` on your own enum; it is a hidden `_ => false` the next variant slips past.
+- No: `matches!(state, State::Open)`, a wildcard arm or a `let … else` refusal on an enum this crate defines; each hides the next variant instead of making the match exhaustive.
 - Yes: an exhaustive `match (kind, shape)` with explicit `false` arms for permissions on enums this crate owns.
 
 ### Newtypes
@@ -182,7 +182,7 @@ Two `u64`s that mean different things must not be swappable.
 - Yes: a size limit is private to the type whose constructor enforces it, like `DeliveredTurnRequest::new` fitting the user text to the record.
 - No: a bare `pub const` limit that another module compares against different content, like a delivered-turn bound reused on an encoded journal line.
 - Yes: limits sourced from the implementation's capability and stored on the enforcing type, not repeated as caller constants.
-- Yes: trust-boundary text or bytes wrapped in a newtype constructed only by its producer; platform coordinates use platform-specific ID types.
+- Yes: trust-boundary text or bytes wrapped in a newtype constructed only by its producer; each implementation receives only its platform-specific ID type, not a generic `Target` it refuses at run time.
 
 ### Panics
 
