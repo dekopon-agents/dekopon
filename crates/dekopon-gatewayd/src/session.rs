@@ -2275,9 +2275,7 @@ impl SessionError {
             Self::BrokerClient(_) => "broker-client",
             Self::BrokerLeg(_) => "broker-leg",
             Self::TransportId(_) => "transport-id",
-            Self::Model(InferenceError::OverBudget(_))
-            | Self::Prompt(PromptError::Model(InferenceError::OverBudget(_))) => "over-budget",
-            Self::Model(_) => "model",
+            Self::Model(error) | Self::Prompt(PromptError::Model(error)) => error.kind().as_str(),
             Self::ModelCredential(_) => "model-credential",
             Self::ProxyOnlyModel { .. } => "proxy-only-model",
             Self::Prompt(error) => error.telemetry_kind(),
