@@ -3,6 +3,8 @@
 //! leave the retired token on disk for reuse.
 
 use std::{
+    collections::BTreeMap,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -20,7 +22,12 @@ use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::socket;
+use crate::{
+    github_app::{
+        Downscope, GithubAppCredential, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES, Installation,
+    },
+    socket,
+};
 
 pub const CREDENTIALS_API_VERSION: &str = "dekopon.dev/broker-credentials/v1alpha1";
 pub const HARD_MAX_CREDENTIALS_BYTES: usize = 1024 * 1024;
@@ -30,7 +37,7 @@ pub const HARD_MAX_CREDENTIALS: usize = 64;
 pub const HARD_MAX_CHATGPT_AUTH_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Anything not explicitly listed here is treated as transient by default, since classifying an
 /// outage as permanent would take a capability out of service until an operator noticed.
@@ -72,6 +79,16 @@ struct CredentialEntry {
     secret: Option<Redacted<String>>,
     #[serde(default)]
     auth_file: Option<PathBuf>,
+    #[serde(default)]
+    app_id: Option<NonZeroU64>,
+    #[serde(default)]
+    installation_id: Option<NonZeroU64>,
+    #[serde(default)]
+    private_key: Option<PathBuf>,
+    #[serde(default)]
+    repositories: Option<Vec<String>>,
+    #[serde(default)]
+    permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -79,6 +96,7 @@ struct CredentialEntry {
 enum CredentialKind {
     BearerToken,
     ChatgptSubscription,
+    GithubApp,
 }
 
 impl CredentialKind {
@@ -86,6 +104,7 @@ impl CredentialKind {
         match self {
             Self::BearerToken => "bearerToken",
             Self::ChatgptSubscription => "chatgptSubscription",
+            Self::GithubApp => "githubApp",
         }
     }
 }
@@ -187,6 +206,17 @@ fn resolve_entry(
             ));
         }
     };
+    if kind != CredentialKind::GithubApp {
+        for (field, present) in [
+            ("appId", entry.app_id.is_some()),
+            ("installationId", entry.installation_id.is_some()),
+            ("privateKey", entry.private_key.is_some()),
+            ("repositories", entry.repositories.is_some()),
+            ("permissions", entry.permissions.is_some()),
+        ] {
+            absent(field, present, &mut problems);
+        }
+    }
     match kind {
         CredentialKind::BearerToken => {
             absent("authFile", entry.auth_file.is_some(), &mut problems);
@@ -251,7 +281,120 @@ fn resolve_entry(
                 }
             }
         }
+        CredentialKind::GithubApp => {
+            absent("secret", entry.secret.is_some(), &mut problems);
+            absent("scheme", entry.scheme.is_some(), &mut problems);
+            absent("authFile", entry.auth_file.is_some(), &mut problems);
+            resolve_github_app(CredentialEntry { name, ..entry }, expected_uid, problems)
+        }
     }
+}
+
+fn resolve_github_app(
+    entry: CredentialEntry,
+    expected_uid: u32,
+    mut problems: Vec<String>,
+) -> Result<StoredCredential, Vec<String>> {
+    let CredentialEntry {
+        name,
+        destinations,
+        app_id,
+        installation_id,
+        private_key,
+        repositories,
+        permissions,
+        ..
+    } = entry;
+    for (field, missing) in [
+        ("appId", app_id.is_none()),
+        ("installationId", installation_id.is_none()),
+        ("privateKey", private_key.is_none()),
+    ] {
+        if missing {
+            problems.push(format!(
+                "credential {name:?} is kind githubApp and needs {field}"
+            ));
+        }
+    }
+    if repositories.as_ref().is_some_and(Vec::is_empty)
+        || permissions.as_ref().is_some_and(BTreeMap::is_empty)
+    {
+        problems.push(format!(
+            "credential {name:?} sets an empty repositories or permissions downscope; omit it \
+             to keep the installation's full grant"
+        ));
+    }
+    if let Err(source) = BoundCredential::bearer(
+        "Bearer",
+        Redacted::new("startup-destination-probe".to_owned()),
+        destinations.clone(),
+    ) {
+        problems.push(describe_structural(&name, &source));
+    }
+    let (Some(app_id), Some(installation_id), Some(private_key)) =
+        (app_id, installation_id, private_key)
+    else {
+        return Err(problems);
+    };
+    let key = match open_private_key(&name, &private_key, expected_uid) {
+        Ok(key) => key,
+        Err(problem) => {
+            problems.push(problem);
+            return Err(problems);
+        }
+    };
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let downscope = (repositories.is_some() || permissions.is_some()).then_some(Downscope {
+        repositories,
+        permissions,
+    });
+    let installation = Installation {
+        app_id,
+        installation_id,
+        downscope,
+    };
+    match GithubAppCredential::new(name.clone(), installation, key, destinations) {
+        Ok(credential) => Ok(StoredCredential::Refreshing(Arc::new(credential))),
+        Err(source) => Err(vec![format!(
+            "credential {name:?} could not be built: {source}"
+        )]),
+    }
+}
+
+fn open_private_key(
+    name: &str,
+    private_key: &Path,
+    expected_uid: u32,
+) -> Result<GithubAppKey, String> {
+    if private_key.is_relative() {
+        return Err(format!(
+            "credential {name:?} privateKey {} is relative; the broker resolves nothing against \
+             its working directory",
+            private_key.display()
+        ));
+    }
+    let pem = read_trusted_file(
+        private_key,
+        expected_uid,
+        FileTier::Private,
+        HARD_MAX_GITHUB_APP_KEY_BYTES,
+    )
+    .map_err(|source| {
+        format!(
+            "credential {name:?} privateKey {} is not trusted input ({}): {}",
+            private_key.display(),
+            source.category(),
+            error_chain(&source)
+        )
+    })?;
+    GithubAppKey::from_pem(&pem).map_err(|source| {
+        format!(
+            "credential {name:?} privateKey {}: {source}",
+            private_key.display()
+        )
+    })
 }
 
 fn describe_structural(name: &str, source: &ConfigurationError) -> String {
@@ -833,6 +976,133 @@ credentials:
         assert!(
             !rendered.contains("must-not-be-here") && !rendered.contains("fixture-secret-value"),
             "a refusal echoed a secret: {rendered}"
+        );
+    }
+
+    async fn write_private_key(root: &std::path::Path, mode: u32) -> std::path::PathBuf {
+        let path = root.join("github-app.pem");
+        tokio::fs::write(
+            &path,
+            include_bytes!("../tests/fixture/github-app-test-only.pem"),
+        )
+        .await
+        .expect("write key");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .await
+            .expect("set key mode");
+        path
+    }
+
+    fn github_app_credentials(private_key: &std::path::Path, extra: &str) -> String {
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: \
+             github-app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    \
+             privateKey: {}\n    destinations: [api.github.com]\n{extra}",
+            private_key.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn loads_a_github_app_credential_and_its_private_key() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = write_private_key(directory.path(), 0o600).await;
+        for extra in [
+            "",
+            "    repositories: [dekopon]\n    permissions:\n      contents: read\n",
+        ] {
+            write_credentials(
+                directory.path(),
+                &github_app_credentials(&key, extra),
+                0o600,
+            )
+            .await;
+            load(&directory.path().join("credentials.yaml"), uid())
+                .await
+                .expect("a trusted App key loads");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_github_app_field_problem_is_reported_at_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let readable = write_private_key(directory.path(), 0o644).await;
+        let contents = [
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1",
+            "credentials:",
+            "  - name: app-with-a-secret",
+            "    kind: githubApp",
+            "    secret: fixture-secret-value",
+            "    destinations: [api.github.com]",
+            "  - name: bearer-with-an-app-id",
+            "    kind: bearerToken",
+            "    scheme: Bearer",
+            "    secret: fixture-secret-value",
+            "    appId: 7",
+            "    destinations: [api.github.com]",
+            "  - name: app-with-empty-downscope",
+            "    kind: githubApp",
+            "    appId: 7",
+            "    installationId: 8",
+            "    privateKey: relative/key.pem",
+            "    repositories: []",
+            "    destinations: [api.github.com]",
+        ]
+        .join("\n");
+        write_credentials(directory.path(), &contents, 0o600).await;
+        let rendered = problems(
+            &load(&directory.path().join("credentials.yaml"), uid())
+                .await
+                .expect_err("wrong App entries refuse startup"),
+        );
+        for expected in [
+            "\"app-with-a-secret\" is kind githubApp and must not set secret",
+            "\"app-with-a-secret\" is kind githubApp and needs appId",
+            "\"app-with-a-secret\" is kind githubApp and needs installationId",
+            "\"app-with-a-secret\" is kind githubApp and needs privateKey",
+            "\"bearer-with-an-app-id\" is kind bearerToken and must not set appId",
+            "\"app-with-empty-downscope\" sets an empty repositories or permissions downscope",
+            "privateKey relative/key.pem is relative",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "{expected:?} missing: {rendered}"
+            );
+        }
+
+        write_credentials(
+            directory.path(),
+            &github_app_credentials(&readable, ""),
+            0o600,
+        )
+        .await;
+        let rendered = problems(
+            &load(&directory.path().join("credentials.yaml"), uid())
+                .await
+                .expect_err("a world-readable key refuses startup"),
+        );
+        assert!(rendered.contains("not trusted input"), "{rendered}");
+
+        let not_a_key = directory.path().join("not-a-key.pem");
+        tokio::fs::write(&not_a_key, "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n")
+            .await
+            .expect("write");
+        tokio::fs::set_permissions(&not_a_key, std::fs::Permissions::from_mode(0o600))
+            .await
+            .expect("mode");
+        write_credentials(
+            directory.path(),
+            &github_app_credentials(&not_a_key, ""),
+            0o600,
+        )
+        .await;
+        let rendered = problems(
+            &load(&directory.path().join("credentials.yaml"), uid())
+                .await
+                .expect_err("an SSH key refuses startup"),
+        );
+        assert!(
+            rendered.contains("not a PEM-encoded RSA private key"),
+            "{rendered}"
         );
     }
 }

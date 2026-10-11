@@ -75,6 +75,7 @@ opentelemetry_sdk = { version = "0.33.0", default-features = false, features = [
 # that one directly rather than adding a second regex engine to the graph.
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 regex-bites = "0.1.6"
+ring = "0.17.14"
 reqwest ={ version = "0.12.28", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "stream"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustix = { version = "1.1.4", features = ["fs", "net", "process"] }
