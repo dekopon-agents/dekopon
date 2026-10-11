@@ -159,6 +159,7 @@ Typed variants are what callers match on to refuse; a string can only be printed
   }
   ```
 - No: `Err(format!("asset too large: {bytes}"))`, `anyhow!("read failed")`, `Io(io::Error)` across the broker boundary, `assert!(msg.contains("too large"))` in a test.
+- Yes: an exhaustive `category()` on an error enum; callers match variants, never formatted strings.
 
 ### Dispatch
 
@@ -166,8 +167,11 @@ A closed enum makes the compiler find every match arm when the next kind arrives
 
 - Yes: `enum Source { File { fd: OwnedFd, cursor: u64, len: u64 } }` … `match source { Source::File { .. } => … }`
 - No: `Box<dyn AssetSource>` with one implementer, or `trait Source { fn read(&mut self, …) }` plus generics threaded through every caller.
+- Yes: an implementation declares its capabilities once and callers consult that declaration; content counting passes `TextUnit::Chars` or `TextUnit::Bytes` to the implementation, not a transport-name branch.
+- Yes: a produced outcome is an enum with its label derived by exhaustive match, not a string used for dispatch.
 - Yes: `match state { State::Open => true, State::Draining | State::Closed => false }` on an enum this crate defines.
 - No: `matches!(state, State::Open)` on your own enum; it is a hidden `_ => false` the next variant slips past.
+- Yes: an exhaustive `match (kind, shape)` with explicit `false` arms for permissions on enums this crate owns.
 
 ### Newtypes
 
@@ -177,6 +181,8 @@ Two `u64`s that mean different things must not be swappable.
 - No: `fn admit(id: u64, descriptor: u64, bytes: u64)`
 - Yes: a size limit is private to the type whose constructor enforces it, like `DeliveredTurnRequest::new` fitting the user text to the record.
 - No: a bare `pub const` limit that another module compares against different content, like a delivered-turn bound reused on an encoded journal line.
+- Yes: limits sourced from the implementation's capability and stored on the enforcing type, not repeated as caller constants.
+- Yes: trust-boundary text or bytes wrapped in a newtype constructed only by its producer; platform coordinates use platform-specific ID types.
 
 ### Panics
 
@@ -199,6 +205,7 @@ Own only what you store; a clone that satisfies the borrow checker is a design s
 
 - Yes: `fn register(&mut self, content_type: &str, blob: DiskBlob)`; `Arc<Mutex<Table>>`; lock, copy the field out, unlock, then `.await`.
 - No: `fn register(&mut self, content_type: String, blob: &DiskBlob) { … blob.clone() … }`; `Rc`; `let g = m.lock(); client.send(&*g).await`.
+- Yes: fixed lifecycle steps encoded as types or consumed tickets, not a `finished: bool` checked at run time.
 
 ### Async
 
@@ -219,6 +226,7 @@ and rustc fails an expectation that stops firing. Tests are exempt at each crate
 
 - Yes: tasks in a `JoinSet` the owner joins at shutdown; `mpsc::channel(N)` with the full-queue policy named; `Arc::clone(&permits).try_acquire_owned()` **before** spawning, the permit moved into the task; `parking_lot::Mutex` for bookkeeping, locked, copied out and dropped; `watch` for latest state, `oneshot` for one reply; an awaited `spawn_blocking`, carrying its permit into the closure when the job can outlive its caller; `Handle::block_on` only on a blocking thread.
 - No: `tokio::spawn` with a dropped `JoinHandle`; `unbounded_channel`; a `Condvar` drain; a lock held across `block_on`, network I/O or a channel wait; `tokio::sync::Mutex` for plain bookkeeping; `std::thread::spawn`; cancellation machinery for native work that is correct to let finish (a token rotation); a CI script, registry file or grep gate to enforce any of this.
+- Yes: one owner of a terminal race's compare-and-swap, returning a `#[must_use]` result.
 
 ### Dependencies
 
@@ -239,6 +247,7 @@ The name states the invariant and the primitives are real; one test per behaviou
 - A real-component test asserts the request it caused: the full URI with any configured prefix, exactly one call, no guest-sent credential. Before claiming coverage, name what each harness observes and the payload sizes it ran at.
 - An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
 - A fake that receives `Invoke` reads its frames with `DescriptorStream`, never plain `read(2)`: on macOS a passed `SCM_RIGHTS` descriptor stays open in the receiver (Linux closes it), so the pipe never sees EOF and the test hangs only on the Mac.
+- Yes: one consumer test against a fake capability matrix and a shared conformance contract run for every implementation.
 
 ### Telemetry
 
@@ -279,7 +288,7 @@ model-facing schema description), `compile_fail` doctests, and `// SAFETY:`.
 
 `Option<String>` where an enum belongs; `HashMap<String, serde_json::Value>` as a struct; a `bool`
 parameter; behaviour selected by comparing strings; `Result<(), String>`; `.clone()` to end a
-borrow; `Vec<u8>` handed whole between layers.
+borrow; `Vec<u8>` handed whole between layers; a `&'static str` naming an outcome, reason or primitive that is later compared; `#[allow(clippy::too_many_arguments)]` or a tuple return of three or more items.
 
 ### Review checklist
 
