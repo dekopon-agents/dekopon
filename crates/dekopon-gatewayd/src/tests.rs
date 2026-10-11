@@ -1828,6 +1828,11 @@ struct ModelScript {
     requests: AtomicUsize,
     builds: AtomicUsize,
     forbidden: bool,
+    failure: fn() -> InferenceError,
+}
+
+fn no_choices() -> InferenceError {
+    InferenceError::Protocol(dekopon_model::error::ProtocolFailure::NoChoices)
 }
 
 impl ModelScript {
@@ -1844,7 +1849,16 @@ impl ModelScript {
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
             forbidden: false,
+            failure: no_choices,
         })
+    }
+
+    fn failing(failure: fn() -> InferenceError) -> Arc<Self> {
+        let mut script = Self::scripted([]);
+        Arc::get_mut(&mut script)
+            .expect("a fresh script has one owner")
+            .failure = failure;
+        script
     }
 
     fn forbidden() -> Arc<Self> {
@@ -1856,6 +1870,7 @@ impl ModelScript {
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
             forbidden: true,
+            failure: no_choices,
         })
     }
 
@@ -1938,9 +1953,7 @@ impl ChatModel for ScriptedModel {
             .lock()
             .pop_front()
             .flatten()
-            .ok_or(InferenceError::Protocol(
-                dekopon_model::error::ProtocolFailure::NoChoices,
-            ))
+            .ok_or_else(self.0.failure)
     }
 }
 
@@ -4619,6 +4632,80 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     .await;
 
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_deadline_failure_reports_deadline_exceeded() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::failing(|| InferenceError::DeadlineExceeded);
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("think slowly"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(
+        driver.replies(),
+        vec![crate::session::MODEL_TIMEOUT_REPLY.to_owned()]
+    );
+    assert!(
+        capture.events().into_iter().any(|(fields, _)| {
+            fields.contains(" event=\"gateway_session_failed\"")
+                && fields.contains(" category=\"deadline-exceeded\"")
+        }),
+        "{}",
+        capture.events_text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_answer_and_max_steps_name_their_cause_in_chat() {
+    for (turn, steps, expected) in [
+        (
+            AssistantTurn::new(None, Vec::new(), None),
+            4,
+            crate::session::EMPTY_ANSWER_REPLY,
+        ),
+        (suggest_improvement(), 1, crate::session::STEP_LIMIT_REPLY),
+    ] {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let driver = Arc::new(RecordingDriver::default());
+        let mut route = route(model_config());
+        route.limits.max_steps = steps;
+
+        run_session(
+            runner(broker, ModelScript::new([turn]), 4),
+            route,
+            message("answer me"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+
+        assert_eq!(driver.replies(), vec![expected.to_owned()]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -12220,6 +12307,13 @@ impl CancelOrigin {
         !matches!(self, Self::Operator)
     }
 
+    const fn ending(self) -> &'static str {
+        match self {
+            Self::User(_) | Self::Operator => crate::session::STOPPED_REPLY,
+            Self::WallClock => crate::session::TIME_LIMIT_REPLY,
+        }
+    }
+
     async fn joined(self, session: tokio::task::JoinHandle<()>) {
         match session.await {
             Ok(()) => {}
@@ -12229,12 +12323,12 @@ impl CancelOrigin {
     }
 }
 
-async fn told_it_stopped(driver: &RecordingDriver) -> bool {
+async fn told_it_stopped(driver: &RecordingDriver, origin: CancelOrigin) -> bool {
     for _ in 0..600 {
         if driver
             .rendered()
             .iter()
-            .any(|line| line.contains(crate::session::STOPPED_REPLY))
+            .any(|line| line.contains(origin.ending()))
         {
             return true;
         }
@@ -12417,7 +12511,7 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the person watching a run that had already ended: {:?}",
             driver.rendered()
         );
@@ -12494,7 +12588,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the stream saying it was still writing: {:?}",
             driver.rendered()
         );
@@ -12567,7 +12661,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} made the person wait out a call nobody was going to read: {:?}",
             driver.rendered()
         );
@@ -12578,7 +12672,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
             driver
                 .replies()
                 .iter()
-                .all(|reply| reply == crate::session::STOPPED_REPLY),
+                .all(|reply| reply == origin.ending()),
             "a stopped session answered anyway under {origin:?}: {:?}",
             driver.replies()
         );
@@ -12601,6 +12695,45 @@ async fn wall_clock_stops_after(
                 && fields.contains(" by=\"budget:wall-clock\"")
         })
         .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_names_its_cause_in_chat() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
+        answer("too late"),
+        Duration::from_secs(60),
+    ));
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        timed_route(model_config(), Duration::from_secs(30)),
+        message("take your time"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_asked().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    model.release_next();
+    session.await.expect("the stopped session unwinds");
+
+    assert_eq!(
+        driver.replies(),
+        vec![crate::session::TIME_LIMIT_REPLY.to_owned()]
+    );
 }
 
 #[tokio::test(start_paused = true)]
