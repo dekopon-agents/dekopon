@@ -176,6 +176,7 @@ where
     ));
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
+        sealed_conversations: Default::default(),
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(
             Arc::clone(&configured) as Arc<dyn session::ModelFactory>

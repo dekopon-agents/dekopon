@@ -397,7 +397,7 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 `gateway.session` is the agent invocation span. Its canonical OpenTelemetry GenAI attributes use
@@ -504,8 +504,15 @@ that does not mean it was authorized. `steered` joins the sender's running turn,
 for a new turn.
 `busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
 all process-wide permits are taken for a new conversation (`busy.cause = saturated`). `cancelled`
-means cancellation won before completion was claimed, and `failed` names a category and the `error` that
-produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
+means cancellation won before completion was claimed. `sealed` means a previous wall-clock stop
+sealed the thread, so `gateway_session_rejected` reports `reason="sealed"` before any broker or model
+call. `failed` names a category and the `error` that
+produced it through the `gateway_session_failed` log event. Model errors use the same labels as
+model HTTP telemetry: `authentication`, `rate-limited`, `provider`, `transport`, `protocol`,
+`attachment`, `invalid-request`, `cancelled`, `deadline-exceeded`, and `over-budget`; in particular,
+a model timeout is `deadline-exceeded`, not `model`. Empty answers, step exhaustion and lost tasks
+are `empty-answer`, `max-steps`, and `session-task`. An over-budget refusal remains
+`gateway_session_refused` with category `over-budget`. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
@@ -642,7 +649,14 @@ error word, or the HTTP client's failure — with Discord's `status` arm carryin
 so a mention of the bot's managed role in that message did not address it; `cause` is
 `rest-cooldown`, `request`, `status`, `timeout`, `body`, or `role-shape`, with the same fields.
 
-`gateway_conversation_evicted` carries a reason of `idle`, `capacity`, or `grant-changed` and
+
+A conversation seal read failure uses `gateway_recall_failed` with `source="seal"` and reason
+`io`, `corrupt`, or `task`. A seal write failure uses `gateway_journal_seal_failed` with the same
+reason vocabulary. `gateway.progress` keeps `terminal_cancelled` and the existing `by` labels
+for cancellation causes, including `by="budget:wall-clock"`; all other stop causes and failures
+use `terminal_failed` with no `by` value.
+
+`gateway_conversation_evicted` carries a reason of `idle`, `capacity`, `grant-changed`, or `sealed` and
 nothing else, so a `maxConversations` ceiling set too low reads as eviction churn instead of as a
 bot that intermittently forgets. A conversation key carries a conversation identifier and, when
 private, a canonical subject; the key types do not implement `Debug`, so an incidental `?key` cannot

@@ -259,6 +259,7 @@ pub(crate) enum EvictionReason {
     Idle,
     Capacity,
     GrantChanged,
+    Sealed,
 }
 
 impl EvictionReason {
@@ -267,8 +268,14 @@ impl EvictionReason {
             Self::Idle => "idle",
             Self::Capacity => "capacity",
             Self::GrantChanged => "grant-changed",
+            Self::Sealed => "sealed",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SealedConversation {
+    pub at: std::time::SystemTime,
 }
 
 pub(crate) struct ConversationStore {

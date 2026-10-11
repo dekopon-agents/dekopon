@@ -2827,6 +2827,7 @@ fn runner_tracking(
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
+        sealed_conversations: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
@@ -14289,6 +14290,7 @@ fn journaled_runner(
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
+        sealed_conversations: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(4),
@@ -15662,4 +15664,276 @@ async fn the_stop_notice_reaches_the_next_turn_once() {
             .iter()
             .all(|(_, text)| !text.contains(notice))
     );
+}
+
+async fn begin_parked_turn(
+    runner: &mut Arc<SessionRunner>,
+    route: crate::routes::BoundRoute,
+    inbound: InboundMessage,
+    driver: Arc<dyn ChatDriver>,
+) -> (
+    Arc<dekopon_test_support::ScriptedStreamModel>,
+    tokio::task::JoinHandle<()>,
+) {
+    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
+        answer("too late"),
+        Duration::from_secs(30),
+    ));
+    Arc::get_mut(runner).expect("no active session").models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&model))));
+    let session = tokio::spawn(run_session(Arc::clone(runner), route, inbound, driver));
+    model.wait_until_asked().await;
+    (model, session)
+}
+
+async fn finish_wall_clock_turn(
+    model: &dekopon_test_support::ScriptedStreamModel,
+    session: tokio::task::JoinHandle<()>,
+) {
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    model.release_next();
+    session.await.expect("the stopped turn unwinds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_seals_the_thread() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(
+        directory.path(),
+        &[(SUBJECT, "xavier"), ("tel.16035550100", "other")],
+    )
+    .await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let mut route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..window()
+        },
+    );
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("the long question");
+    inbound.conversation.kind = ConversationKind::Thread;
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let mut queued = inbound.clone();
+    queued.subject = "tel.16035550100".parse().unwrap();
+    queued.text = "queued question".to_owned();
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        queued,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    inbound.text = "another question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        [
+            crate::session::WALL_CLOCK_REPLY,
+            crate::session::SEALED_THREAD_REPLY,
+            crate::session::SEALED_THREAD_REPLY
+        ]
+    );
+    assert_eq!(
+        capture
+            .spans()
+            .iter()
+            .filter(|(name, fields)| *name == "gateway.message"
+                && fields.contains("outcome=\"sealed\""))
+            .count(),
+        2
+    );
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|(fields, _)| fields.contains("audit.event=\"agent.model.prompt\""))
+            .count(),
+        1
+    );
+}
+
+async fn fresh_after_wall_clock(kind: ConversationKind) {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let mut runner = runner(broker, ModelScript::new([answer("old answer")]), 4);
+    let mut route = persistent_route(model_config(), window());
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("old question");
+    inbound.conversation.kind = kind;
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    inbound.text = "long question".to_owned();
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.text = "new question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies().last().unwrap(), "fresh answer");
+    let prompt = next.prompt(0);
+    assert_eq!(prompt.len(), 2);
+    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_in_a_channel_starts_fresh_and_is_never_refused() {
+    fresh_after_wall_clock(ConversationKind::Channel).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_after_a_wall_clock_stop_starts_fresh_with_a_notice() {
+    fresh_after_wall_clock(ConversationKind::DirectMessage).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sealed_conversation_stays_sealed_after_a_restart() {
+    for kind in [ConversationKind::Thread, ConversationKind::DirectMessage] {
+        let directory = temporary();
+        let journal = temporary();
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+        let first = ModelScript::new([answer("old answer")]);
+        let mut runner = journaled_runner(broker.clone(), Arc::new(first), journal.path());
+        let mut route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+        route.max_duration = Some(Duration::from_secs(30));
+        let mut inbound = message("old question");
+        inbound.conversation.kind = kind;
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        inbound.text = "long question".to_owned();
+        let (model, session) = begin_parked_turn(
+            &mut runner,
+            route.clone(),
+            inbound.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        finish_wall_clock_turn(&model, session).await;
+        drop(runner);
+        let next = match kind {
+            ConversationKind::Thread => ModelScript::forbidden(),
+            ConversationKind::DirectMessage => ModelScript::new([answer("fresh answer")]),
+            ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
+        };
+        let restarted = journaled_runner(broker, Arc::new(Arc::clone(&next)), journal.path());
+        inbound.text = "after restart".to_owned();
+        run_session(
+            restarted,
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        match kind {
+            ConversationKind::Thread => {
+                assert_eq!(
+                    driver.replies().last().unwrap(),
+                    crate::session::SEALED_THREAD_REPLY
+                );
+                assert_eq!(next.requests(), 0);
+            }
+            ConversationKind::DirectMessage => {
+                assert_eq!(next.prompt(0).len(), 2);
+                assert_eq!(
+                    next.prompt(0)[1],
+                    ("user".to_owned(), "after restart".to_owned())
+                );
+            }
+            ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_platform_recall_skips_messages_before_the_seal() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    route.max_duration = Some(Duration::from_secs(30));
+    let driver = HistoryDriver::new(Ok(vec![past("1", "U1", SUBJECT, "before the seal")]));
+    let mut inbound = message("long question");
+    inbound.message_id = MessageId::Native("3".to_owned());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    let sealed_at = runner
+        .sealed_conversations
+        .lock()
+        .values()
+        .next()
+        .unwrap()
+        .at;
+    let mut boundary = past("4", "U1", SUBJECT, "at the seal");
+    boundary.at = sealed_at;
+    driver.post(boundary);
+    let mut after = past("5", "U1", SUBJECT, "after the seal");
+    after.at = sealed_at + Duration::from_secs(1);
+    driver.post(after);
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.message_id = MessageId::Native("6".to_owned());
+    inbound.text = "new question".to_owned();
+    run_session(runner, route, inbound, driver as Arc<dyn ChatDriver>).await;
+    let prompt = next.prompt(0);
+    let recalled = prompt
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!recalled.contains("before the seal"));
+    assert!(recalled.contains("at the seal"));
+    assert!(recalled.contains("after the seal"));
 }

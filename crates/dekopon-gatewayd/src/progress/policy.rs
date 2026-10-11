@@ -939,6 +939,7 @@ impl Live {
                 false
             }
         };
+        // Cleanup's Idle write must precede acknowledgment, which admits the conversation's next turn.
         self.cleanup().await;
         self.coordination.finish();
         Delivered { accepted }

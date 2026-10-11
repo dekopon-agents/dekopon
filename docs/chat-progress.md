@@ -171,6 +171,14 @@ full inbox cannot retain a live old note or resurrect one already queued. Cumula
 streamed text is a *value*, not an event, so it rides a watch channel: the policy reads the latest
 value once per minimum interval, which is what it would do anyway, and no coalescing code exists.
 
+
+The surface opens once from `Pending` to `Live` on its first `Started`. Its deadline cannot be
+re-armed; typing, keep-alive, edits and stream flushes have independent schedules. Terminal delivery
+consumes `Live` into `Delivered`. The cross-task completion fence remains separate from those clocks.
+A wall-clock stop alone seals the conversation, evicts its resident window, and refuses later thread
+turns; DM, group DM and channel turns start fresh. The next permitted turn receives one resident
+stop-cause notice which is never recorded in history.
+
 Rendering, for whichever capability objects the driver returns, at the route's detail level:
 
 1. With enabled liveness, default `progress: auto` prefers native status, then typing, then the
@@ -202,7 +210,10 @@ their own agent rather than a person waiting on an answer.
 
 Default templates are operator strings overridable per transport: `Working on it…`,
 `Running {word}…`, `Still working ({elapsed_s} s)…`, `{note}…`, `{note} (~{eta_s} s)…`,
-`Stopped.`, and one fixed failure line.
+`Stopped.` for person/operator stops, and `The agent could not complete this request.` for
+failures without a fixed cause line. Session time limits, model deadlines, empty answers, step
+limits and lost tasks each have a fixed non-template sentence naming the cause; see
+[stop causes and conversation seals](gatewayd.md#liveness-progress-and-stopping-a-run).
 
 A live note has priority over both tool/status and keep-alive lines, even through individual tool
 completions. A later note replaces it; a new model turn, steering, or any terminal outcome clears
@@ -216,7 +227,7 @@ Terminal handling has exactly **one** writer, the policy task:
 | Outcome | What the person is left with |
 |---|---|
 | Answered | the surface finalized in place as the answer; attachments follow on the reply path |
-| Stopped | the partial text kept, with the fixed stopped trailer, then the terminal stopped line |
+| Stopped | the partial text kept with the cause-specific line appended; person/operator stops use `stopped`, other model failures use `failed` |
 | Failed | a progress message deleted and the fixed failure line as the reply; a streamed surface closed in place, with the partial answer above that line |
 | Declined | a progress message removed and no reply at all; a streamed surface closed on exactly the text already on screen |
 

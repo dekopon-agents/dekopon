@@ -12,7 +12,8 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
+    BrokerLeg, BrokerLegError, BudgetLimit, CancelSource, IdSequence, ProgressEvent, ProgressSink,
+    ShellRuntime,
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
@@ -21,10 +22,10 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, ChatScopeClaim, ClientError, DeliveredAnswer, DeliveredTurnRequest,
-    DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO,
-    ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome,
-    InvocationResult,
+    Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
+    DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
+    ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
+    InvocationOutcome, InvocationResult,
 };
 use dekopon_core::{ExternalSubject, PrincipalId};
 use dekopon_model::error::InferenceError;
@@ -50,8 +51,8 @@ use crate::{
         ResolvedLiveness, Steering,
     },
     conversation::{
-        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
-        Watermark,
+        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
+        SealedConversation, TakenIn, Watermark,
     },
     jobs::JobContext,
     journal::{self, Journal},
@@ -81,6 +82,7 @@ pub(crate) const MAX_STEPS_REPLY: &str =
     "Stopped: this session reached its step limit. Capability calls already made were not undone.";
 pub(crate) const SESSION_TASK_REPLY: &str =
     "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
+pub(crate) const SEALED_THREAD_REPLY: &str = "Sorry, this agent took too long and we've canceled the chat. Please feel free to start a new one with a smaller scope.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
@@ -784,6 +786,7 @@ pub(crate) struct SessionRunner {
     pub reply_on_busy: bool,
     pub conversations: ConversationStore,
     pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
+    pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -832,6 +835,7 @@ struct Recall<'a> {
     message: &'a InboundMessage,
     driver: &'a dyn ChatDriver,
     sender: Option<&'a PrincipalId>,
+    sealed_at: Option<SystemTime>,
 }
 
 impl Recall<'_> {
@@ -887,7 +891,9 @@ impl Recall<'_> {
                 }
             }
             RecallSource::Platform => {
-                let horizon = horizon(window);
+                let horizon = self
+                    .sealed_at
+                    .map_or(horizon(window), |at| horizon(window).max(at));
                 // Without Discord's Message Content intent other people's messages arrive with no content.
                 let (messages, names) = self
                     .platform(window, None, |message| {
@@ -914,7 +920,9 @@ impl Recall<'_> {
         let MessageId::Native(_) = &self.message.message_id else {
             return None;
         };
-        let horizon = horizon(window);
+        let horizon = self
+            .sealed_at
+            .map_or(horizon(window), |at| horizon(window).max(at));
         let (mut messages, names) = self
             .platform(window, Some(&watermark.after), |message| {
                 message.at >= horizon && !message.from_bot && !watermark.taken.contains(&message.id)
@@ -1440,6 +1448,19 @@ async fn session(
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
 ) -> &'static str {
+    let key = conversation_key(route, message);
+    let sealed = sealed_conversation(runner, &key).await;
+    match message.conversation.kind {
+        ConversationKind::Thread if sealed.is_some() => {
+            tracing::info!(event = "gateway_session_rejected", reason = "sealed");
+            answer(driver, message, SEALED_THREAD_REPLY).await;
+            return "sealed";
+        }
+        ConversationKind::Thread
+        | ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => {}
+    }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
@@ -1465,9 +1486,6 @@ async fn session(
     };
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
-    // Only trusted route configuration decides whether the subject participates in the state key;
-    // message text, transport presentation, and model output never influence that choice.
-    let key = conversation_key(route, message);
     // Removing the entry, not just refusing further calls, matters because a revoked subject's
     // exchange left resident for its idle timeout would hold exactly the text the revocation was
     // about.
@@ -1503,6 +1521,7 @@ async fn session(
         message,
         driver: driver.as_ref(),
         sender: principal.as_ref(),
+        sealed_at: sealed.map(|seal| seal.at),
     };
     let mut newest_seen = match &message.message_id {
         MessageId::Native(id) => Some(id.clone()),
@@ -1634,11 +1653,11 @@ async fn session(
             text
         }
     };
-    let text = frame(text);
     let text = match stop_notice {
         Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
         None => text,
     };
+    let text = frame(text);
     let recorded = frame(recorded);
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
@@ -1969,6 +1988,44 @@ async fn session(
     }
 }
 
+async fn sealed_conversation(
+    runner: &SessionRunner,
+    key: &ConversationKey,
+) -> Option<SealedConversation> {
+    let Some(journal) = runner.journal.as_ref() else {
+        return runner.sealed_conversations.lock().get(key).copied();
+    };
+    let journal = Arc::clone(journal);
+    let stem = key.journal_stem();
+    let result = tokio::task::spawn_blocking(move || journal.sealed(&stem)).await;
+    let reason = match result {
+        Ok(Ok(sealed)) => return sealed,
+        Ok(Err(error)) => error.label(),
+        Err(_) => "task",
+    };
+    tracing::warn!(event = "gateway_recall_failed", source = "seal", reason);
+    None
+}
+
+async fn seal_conversation(runner: &SessionRunner, key: &ConversationKey) {
+    let seal = SealedConversation {
+        at: SystemTime::now(),
+    };
+    let Some(journal) = runner.journal.as_ref() else {
+        runner.sealed_conversations.lock().insert(key.clone(), seal);
+        return;
+    };
+    let journal = Arc::clone(journal);
+    let stem = key.journal_stem();
+    let result = tokio::task::spawn_blocking(move || journal.seal(&stem, seal.at)).await;
+    let reason = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.label(),
+        Err(_) => "task",
+    };
+    tracing::warn!(event = "gateway_journal_seal_failed", reason);
+}
+
 fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause) -> Terminal {
     runner
         .pending_notices
@@ -1985,6 +2042,15 @@ async fn stopped(
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
+    match by {
+        CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        } => {
+            seal_conversation(runner, key).await;
+            runner.conversations.remove(key, EvictionReason::Sealed);
+        }
+        CancelSource::User { .. } | CancelSource::Operator => {}
+    }
     progress
         .terminal(remember_stop(runner, key, StopCause::Cancelled(by)))
         .await;
