@@ -18,9 +18,9 @@ use tokio::{
 use crate::{
     config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
     progress::{
-        KeepAlive,
+        KeepAlive, StopCause,
         adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, QueuedEvent, record},
-        cancel_label,
+        cancel_label, stop_line,
         text::{LiveNote, ProgressDetail, ProgressText, RenderState},
     },
     session::SessionCancellation,
@@ -54,8 +54,8 @@ const FINISHED: u8 = 2;
 #[derive(Debug)]
 pub(crate) enum Terminal {
     Answered(OutboundReply),
+    Stopped(StopCause),
     Failed(String),
-    Cancelled { by: CancelSource },
     Silent,
 }
 
@@ -249,6 +249,145 @@ enum StatusTextState {
     RestoreAttempted,
 }
 
+// A past instant resolves without a new timer: one registered after the clock has moved fires only
+// on the driver's next turn, behind every other timer that came due in the same jump.
+async fn until(at: Option<Instant>) {
+    match at {
+        Some(at) if at <= Instant::now() => {}
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    fn from_budget(started: Instant, budget: Option<Duration>) -> Self {
+        Self(budget.map(|budget| started + budget))
+    }
+
+    async fn fired(&self) {
+        until(self.0).await;
+    }
+
+    // Disarms only: once fired, a session that already claimed completion must not wake this
+    // loop again before its terminal request arrives.
+    fn spend(&mut self) {
+        self.0 = None;
+    }
+}
+
+struct Schedule {
+    next: Option<Instant>,
+    every: Duration,
+}
+
+impl Schedule {
+    const fn idle(every: Duration) -> Self {
+        Self { next: None, every }
+    }
+
+    fn arm(&mut self, from: Instant) {
+        self.next = Some(from + self.every);
+    }
+
+    fn stop(&mut self) {
+        self.next = None;
+    }
+
+    async fn due(&self) {
+        until(self.next).await;
+    }
+}
+
+struct KeepAliveTicks {
+    fired: u32,
+    next: Option<Instant>,
+}
+
+impl KeepAliveTicks {
+    fn start(cadence: &KeepAlive, from: Instant) -> Self {
+        let mut ticks = Self {
+            fired: 0,
+            next: None,
+        };
+        ticks.schedule(cadence, from);
+        ticks
+    }
+
+    fn tick(&mut self, cadence: &KeepAlive, now: Instant) -> u32 {
+        self.fired = self.fired.saturating_add(1);
+        self.schedule(cadence, now);
+        self.fired
+    }
+
+    fn schedule(&mut self, cadence: &KeepAlive, from: Instant) {
+        if self.fired >= cadence.max {
+            self.next = None;
+            return;
+        }
+        let fired = self.fired as usize;
+        let gap = match cadence.at.get(fired) {
+            Some(offset) => {
+                let previous = fired
+                    .checked_sub(1)
+                    .and_then(|index| cadence.at.get(index))
+                    .copied()
+                    .unwrap_or_default();
+                offset.saturating_sub(previous)
+            }
+            None => cadence.every,
+        };
+        self.next = Some(from + gap);
+    }
+
+    const fn exhausted(&self) -> bool {
+        self.next.is_none()
+    }
+
+    async fn due(&self) {
+        until(self.next).await;
+    }
+}
+
+struct Throttle<T> {
+    pending: Option<T>,
+    next: Option<Instant>,
+}
+
+impl<T> Throttle<T> {
+    const fn new() -> Self {
+        Self {
+            pending: None,
+            next: None,
+        }
+    }
+
+    fn waiting(&self, now: Instant) -> bool {
+        self.next.is_some_and(|next| now < next)
+    }
+
+    fn defer(&mut self, work: T) {
+        self.pending = Some(work);
+    }
+
+    fn take(&mut self) -> Option<T> {
+        self.pending.take()
+    }
+
+    fn hold(&mut self, from: Instant, interval: Duration) {
+        self.next = Some(from + interval);
+    }
+
+    async fn due(&self) {
+        if self.pending.is_some() {
+            until(self.next).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "reshaped by the unit that next rewrites this"
@@ -268,21 +407,11 @@ struct Surface {
     max_duration: Option<Duration>,
 
     state: RenderState,
-    started: Option<Instant>,
-    deadline: Option<Instant>,
-    message: Option<MessageRef>,
     streaming: bool,
     latest_text: Option<StreamedText>,
     posted_on_text: bool,
-    next_typing: Option<Instant>,
-    next_keep_alive: Option<Instant>,
-    keep_alives: u32,
     edits: u32,
     budget_reported: bool,
-    pending: Option<Line>,
-    earliest_edit: Option<Instant>,
-    next_stream: Option<Instant>,
-    stream_pending: bool,
     breakers: Breakers,
     indicator_active: bool,
     status_attempted: bool,
@@ -310,21 +439,11 @@ impl Surface {
             cancellation: inputs.cancellation,
             max_duration: inputs.max_duration,
             state: RenderState::default(),
-            started: None,
-            deadline: None,
-            message: None,
             streaming: false,
             latest_text: None,
             posted_on_text: false,
-            next_typing: None,
-            next_keep_alive: None,
-            keep_alives: 0,
             edits: 0,
             budget_reported: false,
-            pending: None,
-            earliest_edit: None,
-            next_stream: None,
-            stream_pending: false,
             breakers: Breakers::default(),
             indicator_active: false,
             status_attempted: false,
@@ -341,34 +460,8 @@ impl Surface {
         self.native() && self.settings.stream && self.driver.stream().is_some()
     }
 
-    fn writes_progress(&self) -> bool {
-        self.native()
-            && self.detail != ProgressDetail::Off
-            && match self.settings.progress {
-                ProgressSurface::Off => false,
-                ProgressSurface::Message => true,
-                ProgressSurface::Auto => {
-                    !self.indicator_active || self.message.is_some() || self.cancel_control()
-                }
-            }
-            && !self.streams()
-    }
-
     fn cancel_control(&self) -> bool {
         self.settings.cancel_button && self.driver.cancel_button().is_some()
-    }
-
-    fn next_wake(&self) -> Option<Instant> {
-        [
-            self.deadline,
-            self.next_typing,
-            self.next_keep_alive,
-            self.pending.and(self.earliest_edit),
-            self.stream_pending.then_some(self.next_stream).flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
     }
 
     fn clear_obsolete_note(&mut self) -> bool {
@@ -382,101 +475,6 @@ impl Surface {
         }
     }
 
-    async fn on_event(&mut self, queued: QueuedEvent) {
-        let QueuedEvent {
-            event,
-            note_generation,
-        } = queued;
-        match event {
-            ProgressEvent::Started { max_steps, .. } => {
-                self.state.of = max_steps;
-                let now = Instant::now();
-                self.started = Some(now);
-                self.deadline = self.max_duration.map(|budget| now + budget);
-                self.schedule_keep_alive(now);
-                self.open().await;
-            }
-            ProgressEvent::ModelTurn { turn, of } => {
-                self.state.note = None;
-                self.state.turn = turn;
-                self.state.of = of;
-                self.render(Line::Status, false).await;
-            }
-            ProgressEvent::Answered { tool_calls, .. } => {
-                self.state.word = None;
-                self.render(Line::Status, tool_calls > 0).await;
-            }
-            ProgressEvent::ToolStarted {
-                word,
-                calls_used,
-                calls_max,
-                ..
-            } => {
-                self.state.set_word(word.as_str());
-                self.state.calls = calls_used;
-                self.state.calls_max = calls_max;
-                self.render(Line::Status, true).await;
-            }
-            ProgressEvent::ToolFinished { .. } => {
-                self.state.word = None;
-                self.render(Line::Status, false).await;
-            }
-            ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
-            ProgressEvent::Note { text, eta } => {
-                if note_generation != self.counters.note_generation.load(Ordering::Acquire) {
-                    return;
-                }
-                self.state.note = Some(LiveNote {
-                    text,
-                    eta,
-                    arrived: Instant::now(),
-                    generation: note_generation,
-                });
-                self.render(Line::Status, true).await;
-            }
-            ProgressEvent::Steered { .. } => {
-                self.state.note = None;
-                self.render(Line::Status, false).await;
-            }
-            ProgressEvent::TextDelta { .. }
-            | ProgressEvent::KeepAlive { .. }
-            | ProgressEvent::Cancelled { .. }
-            | ProgressEvent::Failed { .. }
-            | ProgressEvent::Finished { .. } => {}
-        }
-    }
-
-    async fn open(&mut self) {
-        if !self.native() {
-            return;
-        }
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let driver = Arc::clone(&self.driver);
-        let auto = self.settings.progress == ProgressSurface::Auto;
-        if !auto {
-            self.open_reaction().await;
-            self.renew_typing().await;
-        }
-        if let Some(status) = driver.status() {
-            self.status_attempted = true;
-            let outcome = bounded(status.set(&target, Status::Working)).await;
-            self.indicator_active = outcome.is_ok();
-            self.observe(outcome, "status");
-            if auto && self.indicator_active {
-                return;
-            }
-        }
-        if auto && driver.typing().is_some() {
-            self.renew_typing().await;
-            return;
-        }
-        if !self.reaction_attempted {
-            self.open_reaction().await;
-        }
-    }
-
     async fn open_reaction(&mut self) {
         let Some(target) = self.target.clone() else {
             return;
@@ -487,261 +485,6 @@ impl Surface {
             let outcome = bounded(reaction.set(&target, true)).await;
             self.indicator_active |= outcome.is_ok();
             self.observe(outcome, "reaction");
-        }
-    }
-
-    async fn on_text(&mut self, text: StreamedText) {
-        if text.text.as_str().is_empty() {
-            self.latest_text = None;
-            self.stream_pending = false;
-            return;
-        }
-        self.latest_text = Some(text);
-        if self.streams() {
-            self.stream_pending = true;
-            self.flush_stream().await;
-            return;
-        }
-        if !self.posted_on_text {
-            self.posted_on_text = true;
-            if self.message.is_none() && self.status_text == StatusTextState::Waiting {
-                self.render(Line::Status, true).await;
-            }
-        }
-    }
-
-    async fn on_timer(&mut self) {
-        let now = Instant::now();
-        if let Some(deadline) = self.deadline
-            && now >= deadline
-        {
-            self.deadline = None;
-            if self.cancellation.cancel(CancelSource::Budget {
-                limit: BudgetLimit::WallClock,
-            }) {
-                tracing::info!(
-                    event = "gateway_session_stop_requested",
-                    transport = %self.transport,
-                    via = "wall-clock"
-                );
-            }
-            return;
-        }
-        if let Some(next) = self.next_typing
-            && now >= next
-        {
-            self.renew_typing().await;
-        }
-        if let Some(next) = self.next_keep_alive
-            && now >= next
-        {
-            self.keep_alives = self.keep_alives.saturating_add(1);
-            self.schedule_keep_alive(now);
-            let elapsed = now.saturating_duration_since(self.started.unwrap_or(now));
-            record(&ProgressEvent::KeepAlive {
-                elapsed,
-                count: self.keep_alives,
-            });
-            if self.state.note.as_ref().is_some_and(|note| {
-                now.saturating_duration_since(note.arrived)
-                    > note
-                        .eta
-                        .map_or(Duration::from_secs(120), |eta| eta.saturating_mul(2))
-            }) {
-                self.state.note = None;
-            }
-            self.render(Line::KeepAlive, true).await;
-            if self.next_keep_alive.is_none() {
-                self.restore_native_status().await;
-            }
-        }
-        // Cleared before attempting the render, not after, so a declined render does not leave a
-        // past deadline that wakes this loop again immediately.
-        if let Some(line) = self.pending
-            && self.earliest_edit.is_none_or(|earliest| now >= earliest)
-        {
-            self.pending = None;
-            self.render(line, false).await;
-        }
-        if self.stream_pending {
-            self.flush_stream().await;
-        }
-    }
-
-    async fn renew_typing(&mut self) {
-        if !self.coordination.running() || !self.breakers.typing.allows() {
-            self.next_typing = None;
-            return;
-        }
-        let Some(target) = self.target.clone() else {
-            self.next_typing = None;
-            return;
-        };
-        let driver = Arc::clone(&self.driver);
-        let Some(typing) = driver.typing() else {
-            self.next_typing = None;
-            return;
-        };
-        let outcome = bounded(typing.renew(&target)).await;
-        if self.settings.progress == ProgressSurface::Auto && outcome.is_ok() {
-            self.indicator_active = true;
-        }
-        self.observe(outcome, "typing");
-        if self.settings.progress == ProgressSurface::Auto && !self.breakers.typing.allows() {
-            self.indicator_active = false;
-            self.open_reaction().await;
-        }
-        self.next_typing = self
-            .breakers
-            .typing
-            .allows()
-            .then(|| Instant::now() + typing.renew_every());
-    }
-
-    fn schedule_keep_alive(&mut self, from: Instant) {
-        let keep_alive = &self.keep_alive;
-        if self.keep_alives >= keep_alive.max {
-            self.next_keep_alive = None;
-            return;
-        }
-        let fired = self.keep_alives as usize;
-        let gap = match keep_alive.at.get(fired) {
-            Some(offset) => {
-                let previous = fired
-                    .checked_sub(1)
-                    .and_then(|index| keep_alive.at.get(index))
-                    .copied()
-                    .unwrap_or_default();
-                offset.saturating_sub(previous)
-            }
-            None => keep_alive.every,
-        };
-        self.next_keep_alive = Some(from + gap);
-    }
-
-    async fn render(&mut self, line: Line, allow_post: bool) {
-        self.clear_obsolete_note();
-        if !self.coordination.running() {
-            return;
-        }
-        let driver = Arc::clone(&self.driver);
-        let status_text = if self.native()
-            && self.detail != ProgressDetail::Off
-            && self.settings.status_text
-            && !self.writes_progress()
-            && (self.state.note.is_some() || self.status_text != StatusTextState::Waiting)
-        {
-            driver.status_text()
-        } else {
-            None
-        };
-        if self.status_text != StatusTextState::Waiting && status_text.is_none() {
-            self.restore_native_status().await;
-            return;
-        }
-        if !self.writes_progress() && status_text.is_none() {
-            return;
-        }
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let progress = driver.progress();
-        let min_interval = if let Some(status_text) = status_text {
-            if !self.breakers.status_text.allows() {
-                self.restore_native_status().await;
-                return;
-            }
-            status_text.min_interval()
-        } else {
-            if !self.breakers.progress.allows() {
-                return;
-            }
-            let Some(progress) = progress else { return };
-            if self.message.is_none() && !allow_post {
-                return;
-            }
-            progress.limits().min_edit_interval
-        };
-        let now = Instant::now();
-        if (self.message.is_some() || self.status_text != StatusTextState::Waiting)
-            && let Some(earliest) = self.earliest_edit
-            && now < earliest
-        {
-            self.pending = Some(line);
-            return;
-        }
-        if self.edits >= MAX_EDITS {
-            if !self.budget_reported {
-                self.budget_reported = true;
-                tracing::debug!(
-                    event = "gateway_progress_budget_exhausted",
-                    transport = %self.transport,
-                    edits = self.edits
-                );
-            }
-            self.pending = None;
-            return;
-        }
-        self.pending = None;
-        self.state.elapsed = now.saturating_duration_since(self.started.unwrap_or(now));
-        let text = self.line(line);
-        let creating = status_text.is_none() && self.message.is_none();
-        let outcome = if let Some(status_text) = status_text {
-            if self.status_text == StatusTextState::Waiting {
-                self.status_text = StatusTextState::HandedOver;
-                if let Some(status) = driver.status() {
-                    self.status_attempted = true;
-                    let outcome = bounded(status.set(&target, Status::Idle)).await;
-                    self.observe(outcome, "status");
-                }
-            }
-            bounded(status_text.show(&target, &text))
-                .await
-                .map(|()| None)
-        } else {
-            let Some(progress) = progress else { return };
-            let cancel = self.cancel_control();
-            match self.message.clone() {
-                Some(message) => bounded(progress.edit(&message, &text, cancel))
-                    .await
-                    .map(|()| None),
-                None => bounded(progress.post(&target, &text, cancel))
-                    .await
-                    .map(Some),
-            }
-        };
-        self.earliest_edit = Some(Instant::now() + min_interval);
-        self.edits = self.edits.saturating_add(1);
-        let (breaker, primitive) = if status_text.is_some() {
-            (&mut self.breakers.status_text, "status_text")
-        } else {
-            (&mut self.breakers.progress, "progress")
-        };
-        match outcome {
-            Ok(posted) => {
-                breaker.succeeded();
-                if let Some(message) = posted {
-                    self.message = Some(message);
-                }
-                tracing::debug!(
-                    event = "gateway_progress_rendered",
-                    transport = %self.transport,
-                    primitive,
-                    outcome = "ok"
-                );
-            }
-            Err(category) if creating && category == DEADLINE_MISSED => {
-                breaker.orphaned(&self.transport, primitive)
-            }
-            Err(category) => breaker.failed(&self.transport, primitive, category),
-        }
-        if status_text.is_some()
-            && (!self.breakers.status_text.allows()
-                || driver.status_text().is_none()
-                || self.next_keep_alive.is_none()
-                || self.edits >= MAX_EDITS)
-        {
-            self.restore_native_status().await;
         }
     }
 
@@ -786,104 +529,73 @@ impl Surface {
         }
     }
 
-    async fn flush_stream(&mut self) {
-        if !self.streams() || !self.coordination.running() || !self.breakers.stream.allows() {
-            self.stream_pending = false;
-            return;
-        }
-        let now = Instant::now();
-        if let Some(next) = self.next_stream
-            && now < next
-        {
-            return;
-        }
-        let (Some(target), Some(latest)) = (self.target.clone(), self.latest_text.clone()) else {
-            self.stream_pending = false;
-            return;
-        };
-        let driver = Arc::clone(&self.driver);
-        let Some(stream) = driver.stream() else {
-            self.stream_pending = false;
-            return;
-        };
-        let limits = stream.limits();
-        let truncated = latest.text.as_str().chars().count() > limits.max_chars;
-        let text = StreamedText {
-            generation: latest.generation,
-            text: if truncated {
-                latest.text.truncated(limits.max_chars)
-            } else {
-                latest.text
-            },
-            truncated,
-        };
-        let chars = text.text.as_str().chars().count();
-        let cancel = self.cancel_control();
-        let creating = self.message.is_none();
-        let outcome = bounded(stream.show(&target, self.message.as_ref(), &text, cancel)).await;
-        self.stream_pending = false;
-        self.next_stream = Some(Instant::now() + limits.min_interval);
-        match outcome {
-            Ok(message) => {
-                self.breakers.stream.succeeded();
-                self.message = Some(message);
-                self.streaming = true;
-                tracing::debug!(
-                    event = "gateway_progress_rendered",
-                    transport = %self.transport,
-                    primitive = "stream",
-                    outcome = "ok",
-                    chars
-                );
-            }
-            Err(category) if creating && category == DEADLINE_MISSED => {
-                self.breakers.stream.orphaned(&self.transport, "stream");
-            }
-            Err(category) => self
-                .breakers
-                .stream
-                .failed(&self.transport, "stream", category),
-        }
-    }
-
-    async fn terminal(&mut self, terminal: Terminal, text: StreamedText) -> bool {
+    async fn end(
+        &mut self,
+        terminal: Terminal,
+        text: StreamedText,
+        message: Option<MessageRef>,
+        keep_alives: u32,
+    ) -> bool {
         self.state.note = None;
         let generation = text.generation;
         self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
-        self.stream_pending = false;
         self.coordination.seal();
         self.clear_status_text().await;
-        self.record_terminal(&terminal);
+        self.record_terminal(&terminal, keep_alives);
         let streamed = self.streamed_text();
         match terminal {
-            Terminal::Answered(reply) => self.finalize(reply, generation).await,
-            Terminal::Failed(line) => match streamed {
-                Some(partial) => {
-                    self.finalize(OutboundReply::text(ended(&partial, &line)), generation)
-                        .await
-                }
-                None => {
-                    self.discard().await;
-                    self.deliver(OutboundReply::text(line)).await
-                }
-            },
-            Terminal::Cancelled { .. } => {
-                let stopped = self.liveness.templates.stopped().to_owned();
+            Terminal::Answered(reply) => self.finalize(message, reply, generation).await,
+            Terminal::Stopped(cause @ StopCause::Cancelled(_)) => {
+                let stopped = stop_line(cause, &self.liveness.templates);
                 let reply = match streamed {
                     Some(partial) => ended(&partial, &stopped),
                     None => stopped,
                 };
-                self.finalize(OutboundReply::text(reply), generation).await
+                self.finalize(message, OutboundReply::text(reply), generation)
+                    .await
             }
+            Terminal::Stopped(
+                cause @ (StopCause::Model(_)
+                | StopCause::EmptyAnswer
+                | StopCause::MaxSteps
+                | StopCause::SessionTask),
+            ) => {
+                let line = stop_line(cause, &self.liveness.templates);
+                self.fail(message, line, streamed, generation).await
+            }
+            Terminal::Failed(line) => self.fail(message, line, streamed, generation).await,
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {
                     Some(partial) => {
-                        self.finalize(OutboundReply::text(partial), generation)
+                        self.finalize(message, OutboundReply::text(partial), generation)
                             .await;
                     }
-                    None => self.discard().await,
+                    None => self.discard(message).await,
                 }
                 false
+            }
+        }
+    }
+
+    async fn fail(
+        &mut self,
+        message: Option<MessageRef>,
+        line: String,
+        streamed: Option<String>,
+        generation: u64,
+    ) -> bool {
+        match streamed {
+            Some(partial) => {
+                self.finalize(
+                    message,
+                    OutboundReply::text(ended(&partial, &line)),
+                    generation,
+                )
+                .await
+            }
+            None => {
+                self.discard(message).await;
+                self.deliver(OutboundReply::text(line)).await
             }
         }
     }
@@ -898,8 +610,13 @@ impl Surface {
         })
     }
 
-    async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> bool {
-        if let Some(message) = self.message.clone() {
+    async fn finalize(
+        &mut self,
+        message: Option<MessageRef>,
+        reply: OutboundReply,
+        generation: u64,
+    ) -> bool {
+        if let Some(message) = message {
             let driver = Arc::clone(&self.driver);
             let finalized = if self.streaming {
                 match driver.stream() {
@@ -916,7 +633,6 @@ impl Surface {
             };
             match finalized {
                 Some(Ok(())) => {
-                    self.message = None;
                     tracing::debug!(
                         event = "gateway_progress_rendered",
                         transport = %self.transport,
@@ -934,19 +650,18 @@ impl Surface {
                         category
                     );
                     if category == DEADLINE_MISSED {
-                        self.message = None;
                         return self.deliver(reply).await;
                     }
                 }
                 None => {}
             }
-            self.discard().await;
+            self.discard(Some(message)).await;
         }
         self.deliver(reply).await
     }
 
-    async fn discard(&mut self) {
-        let Some(message) = self.message.take() else {
+    async fn discard(&mut self, message: Option<MessageRef>) {
+        let Some(message) = message else {
             return;
         };
         let driver = Arc::clone(&self.driver);
@@ -975,23 +690,37 @@ impl Surface {
         }
     }
 
-    fn record_terminal(&self, terminal: &Terminal) {
+    fn record_terminal(&self, terminal: &Terminal, keep_alives: u32) {
         tracing::info!(
             target: "dekopon_gatewayd::audit",
             {
                 audit.event = "gateway.progress",
                 kind = match terminal {
                     Terminal::Answered(_) => "terminal_answered",
-                    Terminal::Failed(_) => "terminal_failed",
-                    Terminal::Cancelled { .. } => "terminal_cancelled",
+                    Terminal::Stopped(StopCause::Cancelled(_)) => "terminal_cancelled",
+                    Terminal::Stopped(
+                        StopCause::Model(_)
+                        | StopCause::EmptyAnswer
+                        | StopCause::MaxSteps
+                        | StopCause::SessionTask,
+                    )
+                    | Terminal::Failed(_) => "terminal_failed",
                     Terminal::Silent => "terminal_silent",
                 },
                 by = match terminal {
-                    Terminal::Cancelled { by } => Some(cancel_label(*by)),
-                    Terminal::Answered(_) | Terminal::Failed(_) | Terminal::Silent => None,
+                    Terminal::Stopped(StopCause::Cancelled(by)) => Some(cancel_label(*by)),
+                    Terminal::Stopped(
+                        StopCause::Model(_)
+                        | StopCause::EmptyAnswer
+                        | StopCause::MaxSteps
+                        | StopCause::SessionTask,
+                    )
+                    | Terminal::Answered(_)
+                    | Terminal::Failed(_)
+                    | Terminal::Silent => None,
                 },
                 edits = self.edits,
-                keep_alives = self.keep_alives,
+                keep_alives,
                 stream.deltas = self.counters.deltas.load(Ordering::Relaxed),
                 progress.dropped = self.counters.dropped.load(Ordering::Relaxed),
                 progress.notes_dropped = self.counters.notes_dropped.load(Ordering::Relaxed),
@@ -1000,11 +729,11 @@ impl Surface {
         );
     }
 
-    async fn cleanup(&mut self) {
+    async fn cleanup(&mut self, message: Option<MessageRef>) {
         self.state.note = None;
         self.clear_status_text().await;
         if !self.streaming {
-            self.discard().await;
+            self.discard(message).await;
         }
         if !self.native() {
             return;
@@ -1050,6 +779,510 @@ impl Surface {
     }
 }
 
+struct Live {
+    surface: Surface,
+    started: Instant,
+    deadline: Deadline,
+    message: Option<MessageRef>,
+    typing: Schedule,
+    keep_alive: KeepAliveTicks,
+    edit: Throttle<Line>,
+    stream: Throttle<()>,
+}
+
+struct Delivered(Surface);
+
+impl Delivered {
+    async fn cleanup(mut self) {
+        self.0.cleanup(None).await;
+    }
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value per progress task, moved only at the Pending to Live transition"
+)]
+enum Phase {
+    Pending(Surface),
+    Live(Live),
+}
+
+impl Phase {
+    async fn on_event(self, queued: QueuedEvent) -> Self {
+        match self {
+            Self::Pending(mut surface) => match queued.event {
+                ProgressEvent::Started { max_steps, .. } => {
+                    surface.state.of = max_steps;
+                    Self::Live(Live::open(surface, Instant::now()).await)
+                }
+                ProgressEvent::ModelTurn { .. }
+                | ProgressEvent::Answered { .. }
+                | ProgressEvent::ToolStarted { .. }
+                | ProgressEvent::ToolFinished { .. }
+                | ProgressEvent::Attachment { .. }
+                | ProgressEvent::Note { .. }
+                | ProgressEvent::Steered { .. }
+                | ProgressEvent::TextDelta { .. }
+                | ProgressEvent::KeepAlive { .. }
+                | ProgressEvent::Cancelled { .. }
+                | ProgressEvent::Failed { .. }
+                | ProgressEvent::Finished { .. } => Self::Pending(surface),
+            },
+            Self::Live(mut live) => {
+                live.on_event(queued).await;
+                Self::Live(live)
+            }
+        }
+    }
+
+    async fn when<'a, F, Fut>(&'a self, timer: F)
+    where
+        F: FnOnce(&'a Live) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        match self {
+            Self::Pending(_) => std::future::pending().await,
+            Self::Live(live) => timer(live).await,
+        }
+    }
+
+    async fn terminal(self, terminal: Terminal, text: StreamedText) -> (Delivered, bool) {
+        match self {
+            Self::Pending(mut surface) => {
+                let delivered = surface.end(terminal, text, None, 0).await;
+                (Delivered(surface), delivered)
+            }
+            Self::Live(live) => live.terminal(terminal, text).await,
+        }
+    }
+
+    async fn abandon(self) {
+        match self {
+            Self::Pending(mut surface) => surface.cleanup(None).await,
+            Self::Live(mut live) => live.surface.cleanup(live.message).await,
+        }
+    }
+}
+
+impl Live {
+    async fn open(surface: Surface, now: Instant) -> Self {
+        let typing_every = surface
+            .driver
+            .typing()
+            .map_or(Duration::ZERO, |typing| typing.renew_every());
+        let mut live = Self {
+            started: now,
+            deadline: Deadline::from_budget(now, surface.max_duration),
+            message: None,
+            typing: Schedule::idle(typing_every),
+            keep_alive: KeepAliveTicks::start(&surface.keep_alive, now),
+            edit: Throttle::new(),
+            stream: Throttle::new(),
+            surface,
+        };
+        live.open_indicators().await;
+        live
+    }
+
+    fn writes_progress(&self) -> bool {
+        let surface = &self.surface;
+        surface.native()
+            && surface.detail != ProgressDetail::Off
+            && match surface.settings.progress {
+                ProgressSurface::Off => false,
+                ProgressSurface::Message => true,
+                ProgressSurface::Auto => {
+                    !surface.indicator_active || self.message.is_some() || surface.cancel_control()
+                }
+            }
+            && !surface.streams()
+    }
+
+    async fn on_event(&mut self, queued: QueuedEvent) {
+        let QueuedEvent {
+            event,
+            note_generation,
+        } = queued;
+        let state = &mut self.surface.state;
+        match event {
+            ProgressEvent::Started { max_steps, .. } => state.of = max_steps,
+            ProgressEvent::ModelTurn { turn, of } => {
+                state.note = None;
+                state.turn = turn;
+                state.of = of;
+                self.render(Line::Status, false).await;
+            }
+            ProgressEvent::Answered { tool_calls, .. } => {
+                state.word = None;
+                self.render(Line::Status, tool_calls > 0).await;
+            }
+            ProgressEvent::ToolStarted {
+                word,
+                calls_used,
+                calls_max,
+                ..
+            } => {
+                state.set_word(word.as_str());
+                state.calls = calls_used;
+                state.calls_max = calls_max;
+                self.render(Line::Status, true).await;
+            }
+            ProgressEvent::ToolFinished { .. } => {
+                state.word = None;
+                self.render(Line::Status, false).await;
+            }
+            ProgressEvent::Attachment { .. } => self.render(Line::Status, false).await,
+            ProgressEvent::Note { text, eta } => {
+                if note_generation
+                    != self
+                        .surface
+                        .counters
+                        .note_generation
+                        .load(Ordering::Acquire)
+                {
+                    return;
+                }
+                state.note = Some(LiveNote {
+                    text,
+                    eta,
+                    arrived: Instant::now(),
+                    generation: note_generation,
+                });
+                self.render(Line::Status, true).await;
+            }
+            ProgressEvent::Steered { .. } => {
+                state.note = None;
+                self.render(Line::Status, false).await;
+            }
+            ProgressEvent::TextDelta { .. }
+            | ProgressEvent::KeepAlive { .. }
+            | ProgressEvent::Cancelled { .. }
+            | ProgressEvent::Failed { .. }
+            | ProgressEvent::Finished { .. } => {}
+        }
+    }
+
+    async fn open_indicators(&mut self) {
+        if !self.surface.native() {
+            return;
+        }
+        let Some(target) = self.surface.target.clone() else {
+            return;
+        };
+        let driver = Arc::clone(&self.surface.driver);
+        let auto = self.surface.settings.progress == ProgressSurface::Auto;
+        if !auto {
+            self.surface.open_reaction().await;
+            self.renew_typing().await;
+        }
+        if let Some(status) = driver.status() {
+            self.surface.status_attempted = true;
+            let outcome = bounded(status.set(&target, Status::Working)).await;
+            self.surface.indicator_active = outcome.is_ok();
+            self.surface.observe(outcome, "status");
+            if auto && self.surface.indicator_active {
+                return;
+            }
+        }
+        if auto && driver.typing().is_some() {
+            self.renew_typing().await;
+            return;
+        }
+        if !self.surface.reaction_attempted {
+            self.surface.open_reaction().await;
+        }
+    }
+
+    async fn on_text(&mut self, text: StreamedText) {
+        if text.text.as_str().is_empty() {
+            self.surface.latest_text = None;
+            self.stream.take();
+            return;
+        }
+        self.surface.latest_text = Some(text);
+        if self.surface.streams() {
+            self.stream.defer(());
+            self.flush_stream().await;
+            return;
+        }
+        if !self.surface.posted_on_text {
+            self.surface.posted_on_text = true;
+            if self.message.is_none() && self.surface.status_text == StatusTextState::Waiting {
+                self.render(Line::Status, true).await;
+            }
+        }
+    }
+
+    fn expire(&mut self) {
+        self.deadline.spend();
+        let surface = &self.surface;
+        if surface.cancellation.cancel(CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        }) {
+            tracing::info!(
+                event = "gateway_session_stop_requested",
+                transport = %surface.transport,
+                via = "wall-clock"
+            );
+        }
+    }
+
+    async fn keep_alive_tick(&mut self) {
+        let now = Instant::now();
+        let surface = &mut self.surface;
+        let count = self.keep_alive.tick(&surface.keep_alive, now);
+        record(&ProgressEvent::KeepAlive {
+            elapsed: now.saturating_duration_since(self.started),
+            count,
+        });
+        if surface.state.note.as_ref().is_some_and(|note| {
+            now.saturating_duration_since(note.arrived)
+                > note
+                    .eta
+                    .map_or(Duration::from_secs(120), |eta| eta.saturating_mul(2))
+        }) {
+            surface.state.note = None;
+        }
+        self.render(Line::KeepAlive, true).await;
+        if self.keep_alive.exhausted() {
+            self.surface.restore_native_status().await;
+        }
+    }
+
+    async fn renew_typing(&mut self) {
+        let surface = &mut self.surface;
+        if !surface.coordination.running() || !surface.breakers.typing.allows() {
+            self.typing.stop();
+            return;
+        }
+        let Some(target) = surface.target.clone() else {
+            self.typing.stop();
+            return;
+        };
+        let driver = Arc::clone(&surface.driver);
+        let Some(typing) = driver.typing() else {
+            self.typing.stop();
+            return;
+        };
+        let outcome = bounded(typing.renew(&target)).await;
+        if surface.settings.progress == ProgressSurface::Auto && outcome.is_ok() {
+            surface.indicator_active = true;
+        }
+        surface.observe(outcome, "typing");
+        if surface.settings.progress == ProgressSurface::Auto && !surface.breakers.typing.allows() {
+            surface.indicator_active = false;
+            surface.open_reaction().await;
+        }
+        if self.surface.breakers.typing.allows() {
+            self.typing.arm(Instant::now());
+        } else {
+            self.typing.stop();
+        }
+    }
+
+    async fn render(&mut self, line: Line, allow_post: bool) {
+        self.surface.clear_obsolete_note();
+        if !self.surface.coordination.running() {
+            return;
+        }
+        let writes_progress = self.writes_progress();
+        let surface = &mut self.surface;
+        let driver = Arc::clone(&surface.driver);
+        let status_text = if surface.native()
+            && surface.detail != ProgressDetail::Off
+            && surface.settings.status_text
+            && !writes_progress
+            && (surface.state.note.is_some() || surface.status_text != StatusTextState::Waiting)
+        {
+            driver.status_text()
+        } else {
+            None
+        };
+        if surface.status_text != StatusTextState::Waiting && status_text.is_none() {
+            surface.restore_native_status().await;
+            return;
+        }
+        if !writes_progress && status_text.is_none() {
+            return;
+        }
+        let Some(target) = surface.target.clone() else {
+            return;
+        };
+        let progress = driver.progress();
+        let min_interval = if let Some(status_text) = status_text {
+            if !surface.breakers.status_text.allows() {
+                surface.restore_native_status().await;
+                return;
+            }
+            status_text.min_interval()
+        } else {
+            if !surface.breakers.progress.allows() {
+                return;
+            }
+            let Some(progress) = progress else { return };
+            if self.message.is_none() && !allow_post {
+                return;
+            }
+            progress.limits().min_edit_interval
+        };
+        let now = Instant::now();
+        if (self.message.is_some() || surface.status_text != StatusTextState::Waiting)
+            && self.edit.waiting(now)
+        {
+            self.edit.defer(line);
+            return;
+        }
+        self.edit.take();
+        if surface.edits >= MAX_EDITS {
+            if !surface.budget_reported {
+                surface.budget_reported = true;
+                tracing::debug!(
+                    event = "gateway_progress_budget_exhausted",
+                    transport = %surface.transport,
+                    edits = surface.edits
+                );
+            }
+            return;
+        }
+        surface.state.elapsed = now.saturating_duration_since(self.started);
+        let text = surface.line(line);
+        let creating = status_text.is_none() && self.message.is_none();
+        let outcome = if let Some(status_text) = status_text {
+            if surface.status_text == StatusTextState::Waiting {
+                surface.status_text = StatusTextState::HandedOver;
+                if let Some(status) = driver.status() {
+                    surface.status_attempted = true;
+                    let outcome = bounded(status.set(&target, Status::Idle)).await;
+                    surface.observe(outcome, "status");
+                }
+            }
+            bounded(status_text.show(&target, &text))
+                .await
+                .map(|()| None)
+        } else {
+            let Some(progress) = progress else { return };
+            let cancel = surface.cancel_control();
+            match &self.message {
+                Some(message) => bounded(progress.edit(message, &text, cancel))
+                    .await
+                    .map(|()| None),
+                None => bounded(progress.post(&target, &text, cancel))
+                    .await
+                    .map(Some),
+            }
+        };
+        self.edit.hold(Instant::now(), min_interval);
+        surface.edits = surface.edits.saturating_add(1);
+        let (breaker, primitive) = if status_text.is_some() {
+            (&mut surface.breakers.status_text, "status_text")
+        } else {
+            (&mut surface.breakers.progress, "progress")
+        };
+        match outcome {
+            Ok(posted) => {
+                breaker.succeeded();
+                if let Some(message) = posted {
+                    self.message = Some(message);
+                }
+                tracing::debug!(
+                    event = "gateway_progress_rendered",
+                    transport = %surface.transport,
+                    primitive,
+                    outcome = "ok"
+                );
+            }
+            Err(category) if creating && category == DEADLINE_MISSED => {
+                breaker.orphaned(&surface.transport, primitive);
+            }
+            Err(category) => breaker.failed(&surface.transport, primitive, category),
+        }
+        if status_text.is_some()
+            && (!surface.breakers.status_text.allows()
+                || driver.status_text().is_none()
+                || self.keep_alive.exhausted()
+                || surface.edits >= MAX_EDITS)
+        {
+            surface.restore_native_status().await;
+        }
+    }
+
+    async fn flush_stream(&mut self) {
+        let surface = &mut self.surface;
+        if !surface.streams()
+            || !surface.coordination.running()
+            || !surface.breakers.stream.allows()
+        {
+            self.stream.take();
+            return;
+        }
+        if self.stream.waiting(Instant::now()) {
+            return;
+        }
+        let (Some(target), Some(latest)) = (surface.target.clone(), surface.latest_text.clone())
+        else {
+            self.stream.take();
+            return;
+        };
+        let driver = Arc::clone(&surface.driver);
+        let Some(stream) = driver.stream() else {
+            self.stream.take();
+            return;
+        };
+        let limits = stream.limits();
+        let truncated = latest.text.as_str().chars().count() > limits.max_chars;
+        let text = StreamedText {
+            generation: latest.generation,
+            text: if truncated {
+                latest.text.truncated(limits.max_chars)
+            } else {
+                latest.text
+            },
+            truncated,
+        };
+        let chars = text.text.as_str().chars().count();
+        let cancel = surface.cancel_control();
+        let creating = self.message.is_none();
+        let outcome = bounded(stream.show(&target, self.message.as_ref(), &text, cancel)).await;
+        self.stream.take();
+        self.stream.hold(Instant::now(), limits.min_interval);
+        match outcome {
+            Ok(message) => {
+                surface.breakers.stream.succeeded();
+                self.message = Some(message);
+                surface.streaming = true;
+                tracing::debug!(
+                    event = "gateway_progress_rendered",
+                    transport = %surface.transport,
+                    primitive = "stream",
+                    outcome = "ok",
+                    chars
+                );
+            }
+            Err(category) if creating && category == DEADLINE_MISSED => {
+                surface
+                    .breakers
+                    .stream
+                    .orphaned(&surface.transport, "stream");
+            }
+            Err(category) => surface
+                .breakers
+                .stream
+                .failed(&surface.transport, "stream", category),
+        }
+    }
+
+    async fn terminal(self, terminal: Terminal, text: StreamedText) -> (Delivered, bool) {
+        let Self {
+            mut surface,
+            message,
+            keep_alive,
+            ..
+        } = self;
+        let delivered = surface.end(terminal, text, message, keep_alive.fired).await;
+        (Delivered(surface), delivered)
+    }
+}
+
 fn ended(partial: &str, ending: &str) -> String {
     if partial.is_empty() {
         return ending.to_owned();
@@ -1060,7 +1293,7 @@ fn ended(partial: &str, ending: &str) -> String {
 /// Single-tasked with one writer; nothing but this call's own deadline ever cancels an in-flight
 /// call, since a dropped HTTP future cannot retract bytes already sent.
 async fn run(
-    mut surface: Surface,
+    surface: Surface,
     mut events: mpsc::Receiver<QueuedEvent>,
     mut text: watch::Receiver<StreamedText>,
     mut terminal: oneshot::Receiver<TerminalRequest>,
@@ -1069,23 +1302,17 @@ async fn run(
     let mut events_open = true;
     let mut text_open = true;
     let coordination = Arc::clone(&surface.coordination);
+    let mut phase = Phase::Pending(surface);
     loop {
-        let wake = surface.next_wake();
-        let timer = async move {
-            match wake {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
         tokio::select! {
             biased;
             request = &mut terminal => {
                 let Ok(request) = request else { break };
                 let latest = text.borrow_and_update().clone();
-                let delivered = surface.terminal(request.terminal, latest).await;
+                let (ending, delivered) = phase.terminal(request.terminal, latest).await;
                 // Cleanup's Idle write must land before the caller can admit this thread's next
                 // turn, since Slack never reverts native status on its own when the reply posts.
-                surface.cleanup().await;
+                ending.cleanup().await;
                 if request.done.send(delivered).is_err() {
                     tracing::debug!(event = "gateway_progress_terminal_unobserved");
                 }
@@ -1094,27 +1321,61 @@ async fn run(
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
                 let latest = text.borrow_and_update().clone();
-                surface.terminal(Terminal::Cancelled { by }, latest).await;
-                break;
+                let (ending, _) = phase
+                    .terminal(Terminal::Stopped(StopCause::Cancelled(by)), latest)
+                    .await;
+                ending.cleanup().await;
+                coordination.finish();
+                return;
             }
             () = coordination.finished() => break,
+            () = phase.when(|live| live.deadline.fired()) => {
+                if let Phase::Live(live) = &mut phase {
+                    live.expire();
+                }
+            }
             event = events.recv(), if events_open => match event {
-                Some(event) => surface.on_event(event).await,
+                Some(event) => phase = phase.on_event(event).await,
                 None => events_open = false,
             },
             changed = text.changed(), if text_open => match changed {
                 Ok(()) => {
                     let latest = text.borrow_and_update().clone();
-                    surface.on_text(latest).await;
+                    if let Phase::Live(live) = &mut phase {
+                        live.on_text(latest).await;
+                    }
                 }
                 Err(_) => text_open = false,
             },
-            () = timer => surface.on_timer().await,
+            () = phase.when(|live| live.typing.due()) => {
+                if let Phase::Live(live) = &mut phase {
+                    live.renew_typing().await;
+                }
+            }
+            () = phase.when(|live| live.keep_alive.due()) => {
+                if let Phase::Live(live) = &mut phase {
+                    live.keep_alive_tick().await;
+                }
+            }
+            () = phase.when(|live| live.edit.due()) => {
+                if let Phase::Live(live) = &mut phase
+                    && let Some(line) = live.edit.take()
+                {
+                    live.render(line, false).await;
+                }
+            }
+            () = phase.when(|live| live.stream.due()) => {
+                if let Phase::Live(live) = &mut phase {
+                    live.flush_stream().await;
+                }
+            }
         }
-        if surface.clear_obsolete_note() {
-            surface.render(Line::Status, false).await;
+        if let Phase::Live(live) = &mut phase
+            && live.surface.clear_obsolete_note()
+        {
+            live.render(Line::Status, false).await;
         }
     }
-    surface.cleanup().await;
+    phase.abandon().await;
     coordination.finish();
 }

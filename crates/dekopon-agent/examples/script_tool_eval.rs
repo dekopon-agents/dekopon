@@ -584,21 +584,6 @@ struct TurnRecord {
     error: Option<&'static str>,
 }
 
-const fn inference_kind(error: &InferenceError) -> &'static str {
-    match error {
-        InferenceError::InvalidRequest(_) => "invalid-request",
-        InferenceError::Provider(_) => "provider",
-        InferenceError::Transport(_) => "transport",
-        InferenceError::Protocol(_) => "protocol",
-        InferenceError::Attachment(_) => "attachment",
-        InferenceError::Authentication(_) => "authentication",
-        InferenceError::RateLimited(_) => "rate-limited",
-        InferenceError::DeadlineExceeded => "deadline-exceeded",
-        InferenceError::Cancelled => "cancelled",
-        InferenceError::OverBudget(_) => "over-budget",
-    }
-}
-
 impl TurnRecord {
     fn from_turn(turn: &AssistantTurn) -> Self {
         let tool_calls = turn
@@ -637,7 +622,7 @@ impl TurnRecord {
             content_chars: 0,
             tool_calls: Vec::new(),
             usage: UsageRecord::default(),
-            error: Some(inference_kind(error)),
+            error: Some(error.kind().as_str()),
         }
     }
 }
@@ -1360,9 +1345,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(row.reward, 0);
-        assert_eq!(row.fatal, Some("model"));
+        assert_eq!(row.fatal, Some("deadline-exceeded"));
         assert!(row.problems.contains(&Problem::Fatal {
-            kind: "model".to_owned()
+            kind: "deadline-exceeded".to_owned()
         }));
         assert_eq!(row.turns.len(), 1);
         assert!(row.turns[0].error.is_some());

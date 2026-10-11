@@ -18,6 +18,8 @@ use crate::{
 };
 
 const EXTENSION: &str = "jsonl";
+// Never `jsonl`: every file with that extension is read as a transcript.
+const SEALED_EXTENSION: &str = "sealed";
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
 
@@ -68,6 +70,12 @@ struct LineAsset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
     source: AssetSourceRef,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Seal {
+    at_ms: u64,
 }
 
 pub(crate) struct Recalled {
@@ -129,6 +137,7 @@ impl Journal {
             Err(error) => return Err(error),
         };
 
+        let sealed_ms = self.sealed_ms(stem)?;
         let now_ms = millis(now);
         let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
         let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
@@ -137,7 +146,11 @@ impl Journal {
         let current = lines
             .iter()
             .rev()
-            .take_while(|line| line.grant == grant && line.at_ms >= horizon_ms)
+            .take_while(|line| {
+                line.grant == grant
+                    && line.at_ms >= horizon_ms
+                    && sealed_ms.is_none_or(|sealed_ms| line.at_ms > sealed_ms)
+            })
             .count();
         let mut kept = lines.split_off(lines.len() - current);
         let (assets, next_asset_id) = kept.last_mut().map_or((Vec::new(), 1), |last| {
@@ -230,8 +243,49 @@ impl Journal {
         Ok(())
     }
 
+    pub fn seal(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.sealed_path(stem))?;
+        let seal = serde_json::to_vec(&Seal { at_ms: millis(at) }).map_err(io::Error::from)?;
+        file.write_all(&seal)?;
+        Ok(())
+    }
+
+    pub fn sealed(&self, stem: &str, now: SystemTime) -> Result<Option<SystemTime>, JournalError> {
+        let _lock = self.lock.lock();
+        self.expire(now)?;
+        Ok(self
+            .sealed_ms(stem)?
+            .map(|at_ms| UNIX_EPOCH + Duration::from_millis(at_ms)))
+    }
+
+    fn sealed_ms(&self, stem: &str) -> Result<Option<u64>, JournalError> {
+        let path = self.sealed_path(stem);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_slice::<Seal>(&bytes) {
+            Ok(seal) => Ok(Some(seal.at_ms)),
+            Err(_) => {
+                remove(&path);
+                Err(JournalError::Corrupt)
+            }
+        }
+    }
+
     fn path(&self, stem: &str) -> PathBuf {
         self.dir.join(format!("{stem}.{EXTENSION}"))
+    }
+
+    fn sealed_path(&self, stem: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.{SEALED_EXTENSION}"))
     }
 
     // No route recalls a line older than the longest `forgetAfter`, so a file untouched for that
@@ -245,7 +299,7 @@ impl Journal {
             let path = entry.path();
             if path
                 .extension()
-                .is_some_and(|extension| extension == EXTENSION)
+                .is_some_and(|extension| extension == EXTENSION || extension == SEALED_EXTENSION)
                 && entry.metadata()?.modified()? < cutoff
             {
                 remove(&path);

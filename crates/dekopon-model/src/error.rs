@@ -41,6 +41,56 @@ pub enum InferenceError {
     OverBudget(dekopon_model_token_governor::Refusal),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceErrorKind {
+    InvalidRequest,
+    Provider,
+    Transport,
+    Protocol,
+    Attachment,
+    Authentication,
+    RateLimited,
+    DeadlineExceeded,
+    Cancelled,
+    OverBudget,
+}
+
+impl InferenceErrorKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid-request",
+            Self::Provider => "provider",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+            Self::Attachment => "attachment",
+            Self::Authentication => "authentication",
+            Self::RateLimited => "rate-limited",
+            Self::DeadlineExceeded => "deadline-exceeded",
+            Self::Cancelled => "cancelled",
+            Self::OverBudget => "over-budget",
+        }
+    }
+}
+
+impl InferenceError {
+    #[must_use]
+    pub const fn kind(&self) -> InferenceErrorKind {
+        match self {
+            Self::InvalidRequest(_) => InferenceErrorKind::InvalidRequest,
+            Self::Provider(_) => InferenceErrorKind::Provider,
+            Self::Transport(_) => InferenceErrorKind::Transport,
+            Self::Protocol(_) => InferenceErrorKind::Protocol,
+            Self::Attachment(_) => InferenceErrorKind::Attachment,
+            Self::Authentication(_) => InferenceErrorKind::Authentication,
+            Self::RateLimited(_) => InferenceErrorKind::RateLimited,
+            Self::DeadlineExceeded => InferenceErrorKind::DeadlineExceeded,
+            Self::Cancelled => InferenceErrorKind::Cancelled,
+            Self::OverBudget(_) => InferenceErrorKind::OverBudget,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RequestError {
     #[error("generation override requires http://127.0.0.1 or http://[::1]")]

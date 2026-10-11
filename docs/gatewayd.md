@@ -88,8 +88,8 @@ transports:
         keepAlive: "Still working ({elapsed_s} s)…"
         note: "{note}…"
         noteEta: "{note} (~{eta_s} s)…"
-        stopped: "Stopped."
-        failed: "The agent could not complete this request."
+        stopped: "Stopped." # a person's or operator's stop
+        failed: "The agent could not complete this request." # a failure with no named cause
   - name: community-discord
     kind: discordGateway
     botTokenEnv: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
@@ -299,7 +299,8 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a `liveness.templates` line using a placeholder that field cannot render. The known placeholders
   are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
   `{elapsed_s}`, plus `{note}` only in `note`/`noteEta` and `{eta_s}` only in `noteEta`;
-  neither note field permits `{word}`. `stopped` and `failed` render none. Every
+  neither note field permits `{word}`. `stopped` and `failed` render none; `stopped` is a person's
+  or operator's stop, `failed` a failure without a [named cause](#stop-causes). Every
   offending placeholder in the block is named, not the first;
 - an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
 - a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
@@ -542,7 +543,7 @@ Slack's native `processing` state includes a Stop button. The transport acknowle
 `agent_session_stopped` before handling it, derives its user and thread only from Slack's envelope,
 and lets the initiating subject win one atomic race against the normal answer. A Stop prevents
 subsequent model turns and capability invocations, suppresses the stale answer/history commit,
-queues `active`, and sends `Stopped.` In-flight model HTTP sends and reads, including silent
+queues `active`, and sends `Stopped.` (a wall-clock stop sends its own [fixed line](#stop-causes) instead). In-flight model HTTP sends and reads, including silent
 reasoning, select on the session watch and are cancelled locally. Remote inference or provider
 effects already accepted cannot be rolled back. A provider command word the script is waiting on is the exception: its broker round
 trip runs as one cancellable process node tied to the session's Stop, so the run is aborted and
@@ -957,7 +958,8 @@ second message beside one this session holds no reference to.
 this daemon ships. `tool` permits `{word}`; `working`, `tool`, `keepAlive`, `note`, and `noteEta`
 permit `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`. Only `note`/`noteEta` permit
 `{note}`, and only `noteEta` permits `{eta_s}`; neither permits `{word}`. `stopped` and `failed`
-render no placeholders. A placeholder a field cannot render is a startup refusal naming it.
+render no placeholders. `stopped` renders a person's or operator's stop only, and `failed` a failure
+without one of the [stop causes](#stop-causes) below. A placeholder a field cannot render is a startup refusal naming it.
 The command word comes from a provider manifest and is bounded to 32 characters. A bounded note
 on a route with `progressNotes: true` is the one model-authored text admitted to a progress line;
 no prompt, other capability argument, or provider result is admitted. Note text is inserted as a
@@ -1039,7 +1041,7 @@ session starts without prior history; the `persistent` clauses in steps 4 and 5 
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or session progress starts**. Queued or steered input may already have received its admission acknowledgment, which does not signify authorization.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
 4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored participant label naming the sender's broker principal, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered only where the route wrote `inspectAgentConfig: true`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt, followed by the chat-memory note when memory is granted, a note that the chat shows only PNG and JPEG on WhatsApp and Telegram, and one line the gateway renders from the route's limits: `[gateway: N steps, M capability calls and W minutes per message.]`, the minutes only when `maxDurationMs` is set. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. Every session also offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
-5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
+5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line: a [stop cause's sentence](#stop-causes) when it has one, otherwise `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 `steering: abort` is the route default: a same-sender message interrupts only the in-flight model
 call, never a tool, script or provider call. `boundary` waits for the current step to finish. Both
@@ -1067,6 +1069,36 @@ bounded recovery episode. A permanent refusal, exhausted episode, or reader-task
 whole gateway through the same bounded drain as shutdown, but with a nonzero exit. See
 [Connection recovery](#connection-recovery).
 
+### Stop causes
+
+A session that ends without answering carries its cause to chat and to the next turn. The chat line
+is fixed per cause and never carries error text:
+
+| Cause | Chat line |
+| --- | --- |
+| A person's stop or an operator's | `liveness.templates.stopped` (`Stopped.`) |
+| The route's `maxDurationMs` | `Stopped: this session reached its time limit. Capability calls already made were not undone.` |
+| A model call past its deadline | `Stopped: the model did not answer in time. Capability calls already made were not undone.` |
+| Any other model failure | `liveness.templates.failed` |
+| An empty answer | `Stopped: the model returned an empty answer. Capability calls already made were not undone.` |
+| The route's `maxSteps` | `Stopped: this session reached its step limit. Capability calls already made were not undone.` |
+| A lost session task | `Stopped: the gateway lost this session's task. Capability calls already made were not undone.` |
+
+Every other failure still sends `liveness.templates.failed`, and an over-budget or unreported-work
+failure its own sentence. The next message in the same conversation reaches the model once with one
+line before its text, `[gateway: the previous turn stopped before answering: <reason>. Capability
+calls already made were not undone.]`. The notice lives in memory only: it is never journaled,
+never in history, and a restart loses it.
+
+A wall-clock stop also seals the conversation. The resident window is evicted (reason `sealed`), and
+a marker records when: beside the journal as `<stem>.sealed` when `sessions.journal` is set, in
+memory otherwise. A sealed thread answers every later message, a queued follow-up included,
+with `Sorry, this agent took too long and we've canceled the chat. Please feel free to start a new
+one with a smaller scope.` and outcome `sealed`, without reaching a model. A direct message, group
+direct message or channel is never refused: its next message starts fresh, with platform and
+journal recall skipping everything at or before the seal, and the notice above is the only trace
+of the stop.
+
 ## Conversations
 
 **Status: Current.** History is a trust surface rather than a feature flag; [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
@@ -1080,7 +1112,7 @@ This subsection describes the automatic replay window, not the separate on-deman
 `idleTimeoutMs` is how long a window stays in memory, not how long it is remembered. When a message finds no window in memory (first contact, idle expiry, capacity eviction, or a restart), the route's `recall` rebuilds one before the model runs:
 
 - `none` starts empty. It is the default without `sessions.journal`, and it is the only behaviour older releases had.
-- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, every committed exchange on a journal route is appended to one JSONL file per state key, named by a SHA-256 of that key: directory `0700`, files `0600`, no fsync. Each line carries the conversation's attachment inventory at that moment and its next `chat-asset:` number; recall uses the newest line's. Only the trailing run of exchanges recorded under the message's current grant is recalled, so a narrowed grant never replays output from a wider one. Exchanges older than `forgetAfterMs` are skipped. A file past twice the route's `maxBytes` plus 64 KiB is rewritten to the window. At startup and on every recall, files not written for longer than the longest `forgetAfterMs` of any journal route are deleted. A file that does not parse, including one from an older release's format, is deleted, and that message starts empty.
+- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, every committed exchange on a journal route is appended to one JSONL file per state key, named by a SHA-256 of that key: directory `0700`, files `0600`, no fsync. Each line carries the conversation's attachment inventory at that moment and its next `chat-asset:` number; recall uses the newest line's. Only the trailing run of exchanges recorded under the message's current grant is recalled, so a narrowed grant never replays output from a wider one. Exchanges older than `forgetAfterMs` are skipped. A file past twice the route's `maxBytes` plus 64 KiB is rewritten to the window. At startup and on every recall, files not written for longer than the longest `forgetAfterMs` of any journal route are deleted. A file that does not parse, including one from an older release's format, is deleted, and that message starts empty. A wall-clock stop writes a sibling `<stem>.sealed` file, `0600`, holding `{"atMs":<u64>}`; recall skips every line at or before it, the same retention deletes it, and one that does not parse is deleted. See [Stop causes](#stop-causes).
 - `platform` asks the chat service for the conversation's recent messages (Slack `conversations.replies` or `conversations.history`, Discord `GET /channels/{id}/messages`), so the model sees what the person sees, other participants included. It reads at most `min(2 × maxTurns, 100)` messages, waits at most 5 s, and a read that fails answers from an empty window. Only Slack and Discord have a history API; startup refuses `platform` on WhatsApp, Telegram, and local routes. Discord returns other people's text only when the application has the Message Content intent enabled in the Developer Portal, whether or not the transport sets `messageContent`; without it, those messages are skipped. Each author is labelled with the broker principal it maps to, `[gateway: chat history, from simon]`: for every distinct author other than the sender, the gateway asks the broker for that author's `capabilities` in this chat scope and reads only `principal`, inside the same 5 s. An author no principal names keeps `[gateway: chat history, from <service user id>]` on a private route and becomes `[gateway: chat history, from unmapped participant]` on a `sharedConversation` route, so no platform id reaches the model there. Either label is service-reported authorship, not broker authentication, and each unmapped lookup logs `broker_capabilities_refused` with `reason: unmapped-subject` in the broker.
 
 On a `platform` route a window already in memory also catches up. The gateway remembers the newest chat message each window took in (the trigger, or the newest recalled message for a wake) and the messages steered or folded into its turns; a later commit never moves it back or forgets those. When a message from the chat service finds the window resident, a mention or a thread continuation alike, the gateway reads the messages strictly after that watermark and before the trigger, under the same `min(2 × maxTurns, 100)`, 5 s and `forgetAfterMs` bounds, drops the bot's own messages and any it already took in, and keeps the newest that fit in `maxBytes`. They reach the model as one turn of their own ahead of the message, the same `[gateway: chat history, from …]` block the cold read produces, attachments numbered as `chat-asset:N` like any other; on a `sharedConversation` route that turn carries no `authenticated participant` line, so other people's words never sit under the sender's. The window records that turn with the exchange, so the next mention reads only what came after. Slack bounds the read with `oldest` and `latest`; Discord pages with `after`, cuts at the trigger, and when one page of 100 does not reach the trigger, reads the newest messages before it instead. A failed read logs `gateway_recall_failed` and the turn runs without the block.
@@ -1492,7 +1524,7 @@ Spans follow [`observability.md`](observability.md):
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `sealed`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below. A receipt the transport declines to route records `drop.reason` instead — one word for why, such as `self-authored`, `content-withheld`, or `duplicate` — so a message that produced no reply says so in its own trace.

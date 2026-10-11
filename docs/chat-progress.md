@@ -202,7 +202,8 @@ their own agent rather than a person waiting on an answer.
 
 Default templates are operator strings overridable per transport: `Working on it…`,
 `Running {word}…`, `Still working ({elapsed_s} s)…`, `{note}…`, `{note} (~{eta_s} s)…`,
-`Stopped.`, and one fixed failure line.
+`Stopped.`, and one fixed failure line. A stop or failure with a [named cause](gatewayd.md#stop-causes)
+replaces the last two with its own fixed sentence.
 
 A live note has priority over both tool/status and keep-alive lines, even through individual tool
 completions. A later note replaces it; a new model turn, steering, or any terminal outcome clears
