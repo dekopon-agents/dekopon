@@ -7,6 +7,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.32.0] - 2026-10-11
+
+### Changed
+
+- Prepare chart 0.32.0 for core v0.45.0; pin the published image index in a separate reviewed change.
+
+## [0.45.0] - 2026-10-11
+
+### Added
+
+- the guest model proxy records one `model.proxy.call` span per call, naming the VM subject and the jail's `x-dekopon-vm-session`.
+- Model exchange spans count SSE events, merged OpenRouter reasoning items and skipped tool items, and name sanitized unrecognized delta keys.
+
+### Changed
+
+- The `script_tool_eval` example scores a directory of tasks over N trials into JSONL rows, through OpenRouter or the Codex client, with receipts and a Rust scorer.
+
+### Fixed
+
+- an empty Codex response is reported as an empty answer instead of a model protocol failure, and an attachment-only final reply succeeds.
+
 ## [dekopon-chart-0.31.0] - 2026-10-09
 
 ### Added

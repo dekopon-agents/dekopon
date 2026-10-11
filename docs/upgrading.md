@@ -8,6 +8,16 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider SDK tuples and model responses (0.45.0)
+
+When building an out-of-tree Rust provider with more than 19 capabilities, update its exact
+`dekopon-provider-sdk` pin to 0.45.0: the SDK now accepts tuples of up to 32 capabilities.
+This is additive; the provider WIT contract and deployed components do not change. An empty
+Codex response now surfaces as an empty answer rather than a protocol failure, and an
+attachment-only final reply succeeds. Upgrade broker and gateway together; no configuration
+migration is needed. Install chart 0.32.0 only after its default image index is pinned to the
+verified v0.45.0 image.
+
 ## One validator and vendor probes (0.44.0)
 
 Upgrade broker and gateway together as usual. No configuration key, broker protocol, provider WIT
