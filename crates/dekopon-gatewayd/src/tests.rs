@@ -2846,6 +2846,7 @@ fn runner_tracking(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        stop_notices: Mutex::default(),
     })
 }
 
@@ -4709,6 +4710,50 @@ async fn an_empty_answer_and_max_steps_name_their_cause_in_chat() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_stop_notice_reaches_the_next_turn_once() {
+    let directory = temporary();
+    let listing = || {
+        ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+    };
+    let (broker, _observed) =
+        stub_broker(directory.path(), vec![listing(), listing(), listing()]).await;
+    let models = ModelScript::new([
+        AssistantTurn::new(None, Vec::new(), None),
+        answer("two"),
+        answer("three"),
+    ]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    for text in ["one", "two", "three"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    let user = |index| {
+        models
+            .prompt(index)
+            .into_iter()
+            .filter_map(|(role, content)| (role == "user").then_some(content))
+            .next_back()
+            .expect("a user message")
+    };
+    assert_eq!(
+        user(1),
+        "[gateway: the previous turn stopped before answering: the model returned an empty \
+         answer. Capability calls already made were not undone.]\ntwo"
+    );
+    assert_eq!(user(2), "three");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
     let directory = temporary();
     let broker = ResolvedBroker {
@@ -5537,7 +5582,11 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         transcript(&[
             ("system", &expected_instructions()),
             ("user", "what broke?"),
-            ("user", "try again"),
+            (
+                "user",
+                "[gateway: the previous turn stopped before answering: the model call failed \
+                 (protocol). Capability calls already made were not undone.]\ntry again",
+            ),
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
     );
@@ -14419,6 +14468,7 @@ fn journaled_runner(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        stop_notices: Mutex::default(),
     })
 }
 

@@ -12,7 +12,8 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
+    BrokerLeg, BrokerLegError, BudgetLimit, CancelSource, IdSequence, ProgressEvent, ProgressSink,
+    ShellRuntime,
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
@@ -82,6 +83,7 @@ pub(crate) const STEP_LIMIT_REPLY: &str =
 pub(crate) const LOST_TASK_REPLY: &str =
     "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
+const RESIDENT_STOPS: usize = 4096;
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
 const PRINCIPAL_LOOKUPS_IN_FLIGHT: usize = 4;
@@ -789,6 +791,50 @@ pub(crate) struct SessionRunner {
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
     pub jobs: Arc<crate::jobs::Jobs>,
     pub metering: Arc<dekopon_model_token_governor::Metering>,
+    pub stop_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingNotice(StopCause);
+
+impl PendingNotice {
+    fn line(self) -> String {
+        let model_failure;
+        let reason = match self.0 {
+            StopCause::Cancelled(CancelSource::User { .. }) => "the person stopped it",
+            StopCause::Cancelled(CancelSource::Operator) => "the gateway stopped it",
+            StopCause::Cancelled(CancelSource::Budget {
+                limit: BudgetLimit::WallClock,
+            }) => "it reached its time limit",
+            StopCause::Model(kind) => {
+                model_failure = format!("the model call failed ({})", kind.as_str());
+                &model_failure
+            }
+            StopCause::EmptyAnswer => "the model returned an empty answer",
+            StopCause::MaxSteps => "it reached its step limit",
+            StopCause::SessionTask => "the gateway lost its task",
+        };
+        format!(
+            "[gateway: the previous turn stopped before answering: {reason}. Capability calls \
+             already made were not undone.]"
+        )
+    }
+}
+
+impl SessionRunner {
+    fn stopped_with(&self, key: &ConversationKey, cause: StopCause) -> Terminal {
+        let mut notices = self.stop_notices.lock();
+        // Bounded by dropping an arbitrary notice: a conversation that never speaks again would
+        // otherwise hold its entry for the life of the process.
+        if notices.len() >= RESIDENT_STOPS
+            && !notices.contains_key(key)
+            && let Some(evicted) = notices.keys().next().cloned()
+        {
+            notices.remove(&evicted);
+        }
+        notices.insert(key.clone(), PendingNotice(cause));
+        Terminal::Stopped(cause)
+    }
 }
 
 struct RecalledWindow {
@@ -1618,6 +1664,7 @@ async fn session(
     ));
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
+    let stop_notice = runner.stop_notices.lock().remove(&key);
     let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
     let frame = |text: String| {
         let text = match &delivery_notice {
@@ -1630,7 +1677,10 @@ async fn session(
             text
         }
     };
-    let text = frame(text);
+    let text = match stop_notice {
+        Some(notice) => bound_inbound(&format!("{}\n{}", notice.line(), frame(text))),
+        None => frame(text),
+    };
     let recorded = frame(recorded);
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
@@ -1823,12 +1873,12 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(&mut progress, &cancellation).await;
+                return stopped(runner, &key, &mut progress, &cancellation).await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
             let replied = progress
-                .terminal(Terminal::Stopped(StopCause::SessionTask))
+                .terminal(runner.stopped_with(&key, StopCause::SessionTask))
                 .await;
             return if replied { "failed" } else { "reply-failed" };
         }
@@ -1838,7 +1888,7 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(&mut progress, &cancellation).await;
+        return stopped(runner, &key, &mut progress, &cancellation).await;
     }
 
     progress.seal();
@@ -1924,13 +1974,13 @@ async fn session(
                     Terminal::Failed(bound_outbound(liveness.templates.failed()))
                 }
                 SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
-                    Terminal::Stopped(StopCause::Model(error.kind()))
+                    runner.stopped_with(&key, StopCause::Model(error.kind()))
                 }
                 SessionError::Prompt(PromptError::EmptyAnswer) => {
-                    Terminal::Stopped(StopCause::EmptyAnswer)
+                    runner.stopped_with(&key, StopCause::EmptyAnswer)
                 }
                 SessionError::Prompt(PromptError::MaxSteps { .. }) => {
-                    Terminal::Stopped(StopCause::MaxSteps)
+                    runner.stopped_with(&key, StopCause::MaxSteps)
                 }
                 _ => Terminal::Failed(bound_outbound(liveness.templates.failed())),
             };
@@ -1964,13 +2014,15 @@ async fn session(
 }
 
 async fn stopped(
+    runner: &SessionRunner,
+    key: &ConversationKey,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
     progress
-        .terminal(Terminal::Stopped(StopCause::Cancelled(by)))
+        .terminal(runner.stopped_with(key, StopCause::Cancelled(by)))
         .await;
     "cancelled"
 }
