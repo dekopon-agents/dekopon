@@ -76,6 +76,7 @@ spec:
                 chown "$owner:$owner" "$dest"
               }
               chmod 0755 /check
+              chmod 1777 /tmp
 {{- if $check.broker.configMap }}
               copy {{ $uid }} {{ $check.broker.configMap }} /check/broker.d /source/broker.d/*.yaml /source/broker.d/*.cedar
 {{- end }}
@@ -112,6 +113,8 @@ spec:
           volumeMounts:
             - name: check
               mountPath: /check
+            - name: tmp
+              mountPath: /tmp
 {{- if $check.broker.configMap }}
             - name: broker-source
               mountPath: /source/broker.d

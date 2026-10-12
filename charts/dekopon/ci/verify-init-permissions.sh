@@ -8,8 +8,8 @@
 # against a fixture built to match a Kubernetes projected volume exactly: real files under
 # ..<timestamp>/, ..data -> ..<timestamp>, and key -> ..data/key.
 #
-# It asserts the filesystem tiers as each distinct UID. This is rendered-layout proof,
-# not a replacement for brokerd/tests/ipc_process.rs real-daemon acceptance.
+# It asserts the filesystem tiers as each distinct UID and runs the rendered config-check
+# init and real broker check against a non-sticky tmpfs before accepting the hook.
 #
 # Requires: helm, docker (with linux/arm64 emulation or an arm64 host), python3.
 #
@@ -857,7 +857,7 @@ echo "PASS the provider-set mount cannot shadow another of the broker's mounts"
 
 echo
 echo "==> (q) the config-check hook hands dekopon-brokerd check a provider set it accepts, as UID 65532"
-for suffix in check check-broker-src check-set-src; do
+for suffix in check check-broker-src check-set-src check-tools; do
   v="${resource}-${suffix}"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume: $v" >&2
@@ -870,8 +870,34 @@ docker run --rm --platform "$platform" -v "${resource}-check-broker-src:/b" -v "
   "$busybox" sh -c '
   set -eu
   for d in /b /p; do mkdir "$d/..fixture"; ln -s ..fixture "$d/..data"; done
-  printf "apiVersion: dekopon.dev/brokerd/v1alpha1\n" > /b/..fixture/broker.yaml
-  printf "providers: []\n" > /p/..fixture/providers.yaml
+  cat > /b/..fixture/broker.yaml <<YAML
+apiVersion: dekopon.dev/brokerd/v1alpha1
+socketPath: /run/dekopon/broker.sock
+providerSet:
+  lockPath: /var/lib/dekopon/config-check/providers.lock.yaml
+  storePath: /var/lib/dekopon/config-check/store
+storage:
+  rootPath: /var/lib/dekopon-provider-storage
+  maxRootBytes: 2147483648
+  maxNamespaces: 4096
+  maxNamespaceBytes: 67108864
+  maxFilesPerNamespace: 64
+  maxFileBytes: 16777216
+  maxOpenHandles: 256
+  maxHandlesPerInvocation: 32
+  maxHostCallsPerInvocation: 4096
+  maxReadBytesPerCall: 262144
+  maxReadBytesPerInvocation: 16777216
+  maxWriteBytesPerCall: 16777216
+  maxWriteBytesPerInvocation: 16777216
+  maxEntropyBytesPerCall: 256
+  maxEntropyBytesPerInvocation: 4096
+  lockTimeoutMs: 5000
+  finalizationBudgetMs: 5000
+  maxActiveInvocations: 64
+  startupMaxEntries: 100000
+YAML
+  printf "apiVersion: dekopon.dev/provider-set/v1alpha1\nproviders:\n  - source: ghcr.io/dekopon-agents/provider-date@sha256:f67568692751c4d42b23afadb5b66844b026c4c596d8d9423b70cb3b9f1c66f9\n" > /p/..fixture/providers.yaml
   chmod 0400 /b/..fixture/broker.yaml /p/..fixture/providers.yaml
   ln -s ..data/broker.yaml /b/broker.yaml
   ln -s ..data/providers.yaml /p/providers.yaml'
@@ -888,24 +914,46 @@ init = pod["initContainers"][0]
 assert init["name"] == "prepare-candidate", init["name"]
 assert init["command"] == ["/bin/sh", "-c"]
 assert {m["name"]: m["mountPath"] for m in init["volumeMounts"]} == {
-    "check": "/check", "broker-source": "/source/broker.d",
+    "check": "/check", "tmp": "/tmp", "broker-source": "/source/broker.d",
     "provider-set-source": "/source/provider-set", "state": "/var/lib/dekopon"}
+assert "chmod 1777 /tmp" in init["args"][0]
+assert next(v for v in pod["volumes"] if v["name"] == "tmp")["emptyDir"] == {}
 broker = next(c for c in pod["containers"] if c["name"] == "check-broker")
+assert any(m["name"] == "tmp" and m["mountPath"] == "/tmp" for m in broker["volumeMounts"])
+assert broker["command"] == ["dekopon-brokerd"] and broker["args"][0:2] == ["check", "/check/broker.d"]
 assert broker["securityContext"]["runAsUser"] == broker["securityContext"]["runAsGroup"] == 65532
 flag = next(a for a in broker["args"] if a.startswith("--provider-set="))
-sys.stdout.write(flag.split("=", 1)[1] + "\n" + init["args"][0])
+sys.stdout.write(flag.split("=", 1)[1] + "\n" + broker["image"] + "\n" + init["args"][0])
 CHECKEXTRACT
 python_yaml "$(cat "$work/config-check-extract.py")" "$work/config-check-render.yaml" > "$work/config-check-out"
 provider_set=$(head -n 1 "$work/config-check-out")
-tail -n +2 "$work/config-check-out" > "$work/config-check-init.sh"
+broker_image=$(head -n 2 "$work/config-check-out" | tail -n 1)
+tail -n +3 "$work/config-check-out" > "$work/config-check-init.sh"
+docker run --rm -i --platform "$platform" -v "${resource}-check-tools":/tools \
+  "$busybox" sh -c '
+    cp /bin/busybox /tools/sh
+    cat > /tools/init.sh
+    for applet in mkdir install chmod chown cp find stat chpst; do ln -s sh "/tools/$applet"; done' \
+  < "$work/config-check-init.sh"
+
 docker run --rm --platform "$platform" \
-  --user 0:0 --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER \
-  --security-opt=no-new-privileges --read-only \
+  --user 0:0 --read-only \
+  -e PATH=/tools:/usr/local/bin:/usr/bin:/bin \
   -v "${resource}-check":/check \
   -v "${resource}-check-broker-src":/source/broker.d:ro \
   -v "${resource}-check-set-src":/source/provider-set:ro \
   -v "${resource}-state":/var/lib/dekopon \
-  "$busybox" /bin/sh -c "$(cat "$work/config-check-init.sh")"
+  -v "${resource}-check-tools":/tools:ro \
+  --tmpfs /tmp:mode=0777,uid=0,gid=0 \
+  --entrypoint /tools/sh "$broker_image" -c '
+    set -eu
+    test "$(stat -c %a /tmp)" = 777
+    /tools/sh /tools/init.sh
+    # The broker mounts only the config-check subPath, not the root-owned claim parent.
+    chmod 0755 /var/lib/dekopon
+    test "$(stat -c %a /tmp)" = 1777
+    exec chpst -u 65532:65532 dekopon-brokerd check /check/broker.d --provider-set=/check/provider-set/providers.yaml --store=/var/lib/dekopon/config-check --output=json
+  '
 # provider_manager::read_secure_file: validate_file_parent, then the file itself, O_NOFOLLOW.
 cat > "$work/config-check-set.py" <<'CHECKSET'
 import os, stat, sys
