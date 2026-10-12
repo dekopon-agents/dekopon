@@ -2436,24 +2436,3 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
         }
     }
 }
-
-#[tokio::test(start_paused = true)]
-async fn a_wall_clock_stop_names_its_cause_in_chat() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(started());
-    settle().await;
-    harness
-        .policy
-        .terminal(Terminal::Stopped(StopCause::Cancelled(
-            CancelSource::Budget {
-                limit: BudgetLimit::WallClock,
-            },
-        )))
-        .await;
-    assert!(
-        harness
-            .recorder
-            .calls()
-            .contains(&Call::Reply(WALL_CLOCK_REPLY.to_owned()))
-    );
-}

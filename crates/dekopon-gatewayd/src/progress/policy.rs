@@ -922,11 +922,36 @@ impl Live {
             Terminal::Stopped(cause) => {
                 let stopped =
                     crate::transport::bound_outbound(cause.line(&self.liveness.templates));
-                let reply = match streamed {
-                    Some(partial) => ended(&partial, &stopped),
-                    None => stopped,
-                };
-                self.finalize(OutboundReply::text(reply), generation).await
+                match (cause, streamed) {
+                    (StopCause::Cancelled(_), Some(partial)) => {
+                        self.finalize(OutboundReply::text(ended(&partial, &stopped)), generation)
+                            .await
+                    }
+                    (StopCause::Cancelled(_), None) => {
+                        self.finalize(OutboundReply::text(stopped), generation)
+                            .await
+                    }
+                    (
+                        StopCause::Model(_)
+                        | StopCause::EmptyAnswer
+                        | StopCause::MaxSteps
+                        | StopCause::SessionTask,
+                        Some(partial),
+                    ) => {
+                        self.finalize(OutboundReply::text(ended(&partial, &stopped)), generation)
+                            .await
+                    }
+                    (
+                        StopCause::Model(_)
+                        | StopCause::EmptyAnswer
+                        | StopCause::MaxSteps
+                        | StopCause::SessionTask,
+                        None,
+                    ) => {
+                        self.discard().await;
+                        self.deliver(OutboundReply::text(stopped)).await
+                    }
+                }
             }
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {

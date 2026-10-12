@@ -1448,6 +1448,8 @@ async fn session(
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
 ) -> &'static str {
+    // Only trusted route configuration decides whether the subject participates in the state key;
+    // message text, transport presentation, and model output never influence that choice.
     let key = conversation_key(route, message);
     let sealed = sealed_conversation(runner, &key).await;
     match message.conversation.kind {
@@ -1850,7 +1852,14 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(runner, &key, &mut progress, &cancellation).await;
+                return stopped(
+                    runner,
+                    &key,
+                    message.conversation.kind,
+                    &mut progress,
+                    &cancellation,
+                )
+                .await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
@@ -1865,7 +1874,14 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(runner, &key, &mut progress, &cancellation).await;
+        return stopped(
+            runner,
+            &key,
+            message.conversation.kind,
+            &mut progress,
+            &cancellation,
+        )
+        .await;
     }
 
     progress.seal();
@@ -1921,8 +1937,7 @@ async fn session(
             };
             (Terminal::Answered(reply), "answered", Some(text))
         }
-        Err(SessionError::Model(InferenceError::OverBudget(refusal)))
-        | Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
+        Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
             tracing::info!(event = "gateway_session_refused", category = "over-budget");
             (
                 Terminal::Failed(bound_outbound(&refusal.to_string())),
@@ -1948,6 +1963,9 @@ async fn session(
                 error = %error
             );
             let terminal = match error {
+                SessionError::Model(InferenceError::OverBudget(_)) => {
+                    Terminal::Failed(bound_outbound(liveness.templates.failed()))
+                }
                 SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
                     remember_stop(runner, &key, StopCause::Model(error.kind()))
                 }
@@ -2037,6 +2055,7 @@ fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause
 async fn stopped(
     runner: &SessionRunner,
     key: &ConversationKey,
+    kind: ConversationKind,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
 ) -> &'static str {
@@ -2051,9 +2070,19 @@ async fn stopped(
         }
         CancelSource::User { .. } | CancelSource::Operator => {}
     }
-    progress
-        .terminal(remember_stop(runner, key, StopCause::Cancelled(by)))
-        .await;
+    let terminal = match by {
+        CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        } if matches!(kind, ConversationKind::Thread) => {
+            Terminal::Stopped(StopCause::Cancelled(by))
+        }
+        CancelSource::Budget {
+            limit: BudgetLimit::WallClock,
+        }
+        | CancelSource::User { .. }
+        | CancelSource::Operator => remember_stop(runner, key, StopCause::Cancelled(by)),
+    };
+    progress.terminal(terminal).await;
     "cancelled"
 }
 

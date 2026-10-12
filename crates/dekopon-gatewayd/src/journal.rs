@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,6 +20,7 @@ use crate::{
 
 const EXTENSION: &str = "jsonl";
 const SEAL_EXTENSION: &str = "sealed";
+const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
 
@@ -141,7 +142,13 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        match serde_json::from_reader::<_, Seal>(BufReader::new(file)) {
+        let mut bytes = Vec::new();
+        file.take(MAX_SEAL_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SEAL_BYTES {
+            remove(&path);
+            return Err(JournalError::Corrupt);
+        }
+        match serde_json::from_slice::<Seal>(&bytes) {
             Ok(seal) => match UNIX_EPOCH.checked_add(Duration::from_millis(seal.at_ms)) {
                 Some(at) => Ok(Some(SealedConversation { at })),
                 None => {
@@ -812,6 +819,19 @@ mod tests {
         let stem = key().journal_stem();
         let path = journal.seal_path(&stem);
         fs::write(&path, b"not a marker").unwrap();
+        assert!(matches!(journal.sealed(&stem), Err(JournalError::Corrupt)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_oversized_seal_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let path = journal.seal_path(&stem);
+        let mut marker = br#"{"atMs":1}"#.to_vec();
+        marker.resize((MAX_SEAL_BYTES + 1) as usize, b' ');
+        fs::write(&path, marker).unwrap();
         assert!(matches!(journal.sealed(&stem), Err(JournalError::Corrupt)));
         assert!(!path.exists());
     }

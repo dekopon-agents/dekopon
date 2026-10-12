@@ -15585,6 +15585,48 @@ async fn an_agent_without_a_budget_is_never_refused() {
 }
 
 #[tokio::test]
+async fn a_model_over_budget_error_keeps_the_failed_outcome_and_text() {
+    use dekopon_model_token_governor::{MeterKind, Refusal, Retry, Tokens};
+
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let refusal = Refusal {
+        agent: "reviewer".parse().unwrap(),
+        meter: MeterKind::Credit,
+        limit: Tokens(10),
+        remaining: 0,
+        requested: Tokens(11),
+        retry: Retry::Never,
+    };
+    struct RefusedBuild(Refusal);
+    impl ModelFactory for RefusedBuild {
+        fn build(
+            &self,
+            _model: &ModelConfig,
+            _runtime: tokio::runtime::Handle,
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<SharedModel, SessionError> {
+            Err(SessionError::Model(InferenceError::OverBudget(
+                self.0.clone(),
+            )))
+        }
+    }
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner_with(broker, Arc::new(RefusedBuild(refusal)), 4),
+        route(model_config()),
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [FAILURE_REPLY]);
+    let text = capture.text();
+    assert!(text.contains("gateway_session_failed"), "{text}");
+    assert!(!text.contains("gateway_session_refused"), "{text}");
+}
+
+#[tokio::test]
 async fn a_model_deadline_failure_reports_deadline_exceeded() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
@@ -15675,8 +15717,21 @@ async fn begin_parked_turn(
     Arc<dekopon_test_support::ScriptedStreamModel>,
     tokio::task::JoinHandle<()>,
 ) {
+    begin_parked_turn_with_answer(runner, route, inbound, driver, answer("too late")).await
+}
+
+async fn begin_parked_turn_with_answer(
+    runner: &mut Arc<SessionRunner>,
+    route: crate::routes::BoundRoute,
+    inbound: InboundMessage,
+    driver: Arc<dyn ChatDriver>,
+    turn: AssistantTurn,
+) -> (
+    Arc<dekopon_test_support::ScriptedStreamModel>,
+    tokio::task::JoinHandle<()>,
+) {
     let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
-        answer("too late"),
+        turn,
         Duration::from_secs(30),
     ));
     Arc::get_mut(runner).expect("no active session").models =
@@ -15696,6 +15751,86 @@ async fn finish_wall_clock_turn(
     }
     model.release_next();
     session.await.expect("the stopped turn unwinds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_answer_with_a_progress_message_posts_a_fresh_reply() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    Arc::get_mut(&mut runner).unwrap().liveness.insert(
+        "dev".to_owned(),
+        Arc::new(ResolvedLiveness {
+            settings: LivenessSettings {
+                mode: LivenessMode::Native,
+                progress: ProgressSurface::Message,
+                ..LivenessSettings::default()
+            },
+            ..ResolvedLiveness::default()
+        }),
+    );
+    let driver = Arc::new(RecordingDriver::default().with_progress(4000, Duration::ZERO));
+    let mut inbound = message("question");
+    inbound.liveness = Some(LivenessTarget::Local { connection: 1 });
+    let (model, session) = begin_parked_turn_with_answer(
+        &mut runner,
+        route(model_config()),
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        answer(""),
+    )
+    .await;
+    tokio::time::advance(Duration::from_secs(16)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        driver.calls().iter().any(|call| matches!(
+            call,
+            dekopon_test_support::DriverCall::Progress(ProgressCall::Post { .. })
+        )),
+        "{:?}",
+        driver.calls()
+    );
+    model.release_next();
+    session.await.expect("the empty turn unwinds");
+    let calls = driver.calls();
+    let deleted = calls
+        .iter()
+        .position(|call| {
+            matches!(
+                call,
+                dekopon_test_support::DriverCall::Progress(ProgressCall::Delete { .. })
+            )
+        })
+        .expect("the progress surface was removed");
+    let replied = calls.iter().position(|call| matches!(
+        call,
+        dekopon_test_support::DriverCall::Reply { text, .. } if text == crate::session::EMPTY_ANSWER_REPLY
+    )).expect("the stop line was a fresh reply");
+    assert!(deleted < replied, "{calls:?}");
+    assert!(!calls.iter().any(|call| matches!(
+        call,
+        dekopon_test_support::DriverCall::Progress(ProgressCall::Finalize { .. })
+    )));
+    assert_eq!(driver.replies(), [crate::session::EMPTY_ANSWER_REPLY]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_names_its_cause_in_chat() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        timed_route(model_config(), Duration::from_secs(30)),
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    assert_eq!(driver.replies(), [crate::session::WALL_CLOCK_REPLY]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -15737,6 +15872,7 @@ async fn a_wall_clock_stop_seals_the_thread() {
     )
     .await;
     finish_wall_clock_turn(&model, session).await;
+    assert!(runner.pending_notices.lock().is_empty());
     inbound.text = "another question".to_owned();
     run_session(
         runner,

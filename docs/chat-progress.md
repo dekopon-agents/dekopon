@@ -172,9 +172,9 @@ streamed text is a *value*, not an event, so it rides a watch channel: the polic
 value once per minimum interval, which is what it would do anyway, and no coalescing code exists.
 
 
-The surface opens once from `Pending` to `Live` on its first `Started`. Its deadline cannot be
-re-armed; typing, keep-alive, edits and stream flushes have independent schedules. Terminal delivery
-consumes `Live` into `Delivered`. The cross-task completion fence remains separate from those clocks.
+The surface opens on the first start event. Its deadline cannot be re-armed; typing, keep-alive,
+edits and stream flushes have independent schedules. Once terminal delivery begins, the surface
+accepts no further writes. The cross-task completion fence remains separate from those clocks.
 A wall-clock stop alone seals the conversation, evicts its resident window, and refuses later thread
 turns; DM, group DM and channel turns start fresh. The next permitted turn receives one resident
 stop-cause notice which is never recorded in history.
