@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.32.1] - 2026-10-12
+
+### Fixed
+
+- The config-check hook's broker check no longer fails on the pod's default /tmp; its init container makes the scratch ancestor sticky before the broker check runs.
+
 ## [dekopon-chart-0.32.0] - 2026-10-11
 
 ### Changed
