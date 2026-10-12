@@ -1454,6 +1454,7 @@ async fn session(
     let sealed = sealed_conversation(runner, &key).await;
     match message.conversation.kind {
         ConversationKind::Thread if sealed.is_some() => {
+            revoke_thread_ownership(runner, message);
             tracing::info!(event = "gateway_session_rejected", reason = "sealed");
             answer(driver, message, SEALED_THREAD_REPLY).await;
             return "sealed";
@@ -1975,7 +1976,29 @@ async fn session(
                 SessionError::Prompt(PromptError::MaxSteps { .. }) => {
                     remember_stop(runner, &key, StopCause::MaxSteps)
                 }
-                _ => Terminal::Failed(bound_outbound(liveness.templates.failed())),
+                SessionError::BrokerClient(_)
+                | SessionError::BrokerLeg(_)
+                | SessionError::TransportId(_)
+                | SessionError::ModelCredential(_)
+                | SessionError::ProxyOnlyModel { .. }
+                | SessionError::Prompt(
+                    PromptError::Cancelled
+                    | PromptError::ZeroSteps
+                    | PromptError::UnknownTool(_)
+                    | PromptError::TooManyToolCalls { .. }
+                    | PromptError::EmptyToolCallId
+                    | PromptError::InvalidArguments { .. }
+                    | PromptError::ArgumentsNotObject { .. }
+                    | PromptError::AgentConfigArgumentsNotEmpty { .. }
+                    | PromptError::DeclineReplyArgumentsNotEmpty { .. }
+                    | PromptError::MissingCommand { .. }
+                    | PromptError::MissingAssetId { .. }
+                    | PromptError::MissingSkillName { .. }
+                    | PromptError::UnexpectedSkillArguments { .. }
+                    | PromptError::InvalidSuggestion { .. }
+                    | PromptError::InvalidWake { .. }
+                    | PromptError::UnreportedCapabilityWork,
+                ) => Terminal::Failed(bound_outbound(liveness.templates.failed())),
             };
             (terminal, "failed", None)
         }
@@ -2025,23 +2048,24 @@ async fn sealed_conversation(
     None
 }
 
-async fn seal_conversation(runner: &SessionRunner, key: &ConversationKey) {
+async fn seal_conversation(runner: &SessionRunner, key: &ConversationKey) -> bool {
     let seal = SealedConversation {
         at: SystemTime::now(),
     };
     let Some(journal) = runner.journal.as_ref() else {
         runner.sealed_conversations.lock().insert(key.clone(), seal);
-        return;
+        return true;
     };
     let journal = Arc::clone(journal);
     let stem = key.journal_stem();
     let result = tokio::task::spawn_blocking(move || journal.seal(&stem, seal.at)).await;
     let reason = match result {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) => return true,
         Ok(Err(error)) => error.label(),
         Err(_) => "task",
     };
     tracing::warn!(event = "gateway_journal_seal_failed", reason);
+    false
 }
 
 fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause) -> Terminal {
@@ -2061,26 +2085,20 @@ async fn stopped(
 ) -> &'static str {
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
-    match by {
+    let sealed = match by {
         CancelSource::Budget {
             limit: BudgetLimit::WallClock,
         } => {
-            seal_conversation(runner, key).await;
+            let sealed = seal_conversation(runner, key).await;
             runner.conversations.remove(key, EvictionReason::Sealed);
+            sealed
         }
-        CancelSource::User { .. } | CancelSource::Operator => {}
-    }
-    let terminal = match by {
-        CancelSource::Budget {
-            limit: BudgetLimit::WallClock,
-        } if matches!(kind, ConversationKind::Thread) => {
-            Terminal::Stopped(StopCause::Cancelled(by))
-        }
-        CancelSource::Budget {
-            limit: BudgetLimit::WallClock,
-        }
-        | CancelSource::User { .. }
-        | CancelSource::Operator => remember_stop(runner, key, StopCause::Cancelled(by)),
+        CancelSource::User { .. } | CancelSource::Operator => false,
+    };
+    let terminal = if sealed && kind == ConversationKind::Thread {
+        Terminal::Stopped(StopCause::Cancelled(by))
+    } else {
+        remember_stop(runner, key, StopCause::Cancelled(by))
     };
     progress.terminal(terminal).await;
     "cancelled"

@@ -15908,6 +15908,50 @@ async fn a_wall_clock_stop_seals_the_thread() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_sealed_thread_relinquishes_its_inherited_claim() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let mut route = route(model_config());
+    route.max_duration = Some(Duration::from_secs(30));
+    let initial = owned_slack_message("<@u0botbot> question", false);
+    let claim = initial.thread_continuation.as_ref().unwrap().claim.clone();
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        initial,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        ownership.claimed.lock().as_slice(),
+        std::slice::from_ref(&claim)
+    );
+    finish_wall_clock_turn(&model, session).await;
+    run_session(
+        runner,
+        route,
+        owned_slack_message("unaddressed follow-up", true),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(*ownership.revoked.lock(), [claim]);
+    assert_eq!(
+        driver.replies().last().unwrap(),
+        crate::session::SEALED_THREAD_REPLY
+    );
+}
+
 async fn fresh_after_wall_clock(kind: ConversationKind) {
     let directory = temporary();
     let (broker, _observed) =
@@ -15959,6 +16003,51 @@ async fn a_wall_clock_stop_in_a_channel_starts_fresh_and_is_never_refused() {
 #[tokio::test(start_paused = true)]
 async fn a_dm_after_a_wall_clock_stop_starts_fresh_with_a_notice() {
     fresh_after_wall_clock(ConversationKind::DirectMessage).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_seal_leaves_the_stop_notice_for_the_next_turn() {
+    let directory = temporary();
+    let journal = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let mut runner = journaled_runner(broker, Arc::new(ModelScript::forbidden()), journal.path());
+    let mut route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..recall_window(RecallSource::Journal)
+        },
+    );
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("long question");
+    inbound.conversation.kind = ConversationKind::Thread;
+    let stem = ConversationKey::shared(&route.agent, &route.transport, &inbound.conversation.key())
+        .journal_stem();
+    let marker = journal.path().join(format!("{stem}.sealed"));
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    std::fs::create_dir(&marker).unwrap();
+    finish_wall_clock_turn(&model, session).await;
+    std::fs::remove_dir(&marker).unwrap();
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.text = "next question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies().last().unwrap(), "fresh answer");
+    assert!(next.prompt(0).iter().any(|(_, text)| text.ends_with("[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnext question")));
 }
 
 #[tokio::test(start_paused = true)]

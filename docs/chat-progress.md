@@ -227,7 +227,7 @@ Terminal handling has exactly **one** writer, the policy task:
 | Outcome | What the person is left with |
 |---|---|
 | Answered | the surface finalized in place as the answer; attachments follow on the reply path |
-| Stopped | the partial text kept with the cause-specific line appended; person/operator stops use `stopped`, other model failures use `failed` |
+| Stopped | with streamed partial text, the cause-specific line is appended in place; without streamed text, the progress message is removed and the line is posted as a fresh reply. Person/operator stops use `stopped`, other model failures use `failed` |
 | Failed | a progress message deleted and the fixed failure line as the reply; a streamed surface closed in place, with the partial answer above that line |
 | Declined | a progress message removed and no reply at all; a streamed surface closed on exactly the text already on screen |
 

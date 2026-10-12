@@ -127,7 +127,6 @@ impl Journal {
 
     pub fn sealed(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
         let _lock = self.lock.lock();
-        self.expire(SystemTime::now())?;
         self.read_seal(stem)
     }
 
@@ -142,6 +141,13 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let modified = file.metadata()?.modified()?;
+        if SystemTime::now()
+            .checked_sub(self.retention)
+            .is_some_and(|cutoff| modified < cutoff)
+        {
+            return Ok(None);
+        }
         let mut bytes = Vec::new();
         file.take(MAX_SEAL_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_SEAL_BYTES {
@@ -837,6 +843,23 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_seal_does_not_expire_other_conversations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let old = journal.seal_path("other");
+        fs::write(&old, br#"{"atMs":1}"#).unwrap();
+        let now = SystemTime::now();
+        File::open(&old)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(now - RETENTION - Duration::from_secs(1)))
+            .unwrap();
+        assert!(journal.sealed(&key().journal_stem()).unwrap().is_none());
+        assert!(old.exists());
+        journal.expire(now).unwrap();
+        assert!(!old.exists());
+    }
+
+    #[test]
     fn a_seal_expires_with_the_journal_retention() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION).expect("open");
@@ -849,6 +872,7 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(now - RETENTION - Duration::from_secs(1)))
             .unwrap();
         assert!(journal.sealed(&stem).unwrap().is_none());
+        journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
     }
 }
