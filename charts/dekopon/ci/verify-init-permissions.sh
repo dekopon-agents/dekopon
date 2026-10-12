@@ -24,6 +24,8 @@ resource="dekopon-init-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 : > "$work/volumes"
 : > "$work/containers"
 cleanup() {
+  command docker run --rm --label campaign=dekopon -v /dev/shm:/host-shm "$busybox" \
+    rm -rf "/host-shm/$resource" >/dev/null 2>&1 || true
   while IFS= read -r name; do command docker rm -f "$name" >/dev/null 2>&1 || true; done < "$work/containers"
   while IFS= read -r name; do command docker volume rm "$name" >/dev/null 2>&1 || true; done < "$work/volumes"
   rm -rf "$work"
@@ -857,7 +859,7 @@ echo "PASS the provider-set mount cannot shadow another of the broker's mounts"
 
 echo
 echo "==> (q) the config-check hook hands dekopon-brokerd check a provider set it accepts, as UID 65532"
-for suffix in check check-broker-src check-set-src check-tools; do
+for suffix in check check-broker-src check-set-src; do
   v="${resource}-${suffix}"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume: $v" >&2
@@ -913,6 +915,13 @@ pod = job["spec"]["template"]["spec"]
 init = pod["initContainers"][0]
 assert init["name"] == "prepare-candidate", init["name"]
 assert init["command"] == ["/bin/sh", "-c"]
+assert init["securityContext"] == {
+    "runAsUser": 0, "runAsGroup": 0, "runAsNonRoot": False,
+    "allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+    "seccompProfile": {"type": "RuntimeDefault"},
+    "capabilities": {"drop": ["ALL"], "add": ["CHOWN", "FOWNER"]}}
+assert pod["securityContext"]["runAsUser"] == pod["securityContext"]["runAsGroup"] == 65532
+assert pod["securityContext"]["supplementalGroups"] == [65534]
 assert {m["name"]: m["mountPath"] for m in init["volumeMounts"]} == {
     "check": "/check", "tmp": "/tmp", "broker-source": "/source/broker.d",
     "provider-set-source": "/source/provider-set", "state": "/var/lib/dekopon"}
@@ -922,6 +931,9 @@ broker = next(c for c in pod["containers"] if c["name"] == "check-broker")
 assert any(m["name"] == "tmp" and m["mountPath"] == "/tmp" for m in broker["volumeMounts"])
 assert broker["command"] == ["dekopon-brokerd"] and broker["args"][0:2] == ["check", "/check/broker.d"]
 assert broker["securityContext"]["runAsUser"] == broker["securityContext"]["runAsGroup"] == 65532
+assert broker["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+assert broker["securityContext"]["readOnlyRootFilesystem"]
+assert not broker["securityContext"]["allowPrivilegeEscalation"]
 flag = next(a for a in broker["args"] if a.startswith("--provider-set="))
 sys.stdout.write(flag.split("=", 1)[1] + "\n" + broker["image"] + "\n" + init["args"][0])
 CHECKEXTRACT
@@ -929,31 +941,29 @@ python_yaml "$(cat "$work/config-check-extract.py")" "$work/config-check-render.
 provider_set=$(head -n 1 "$work/config-check-out")
 broker_image=$(head -n 2 "$work/config-check-out" | tail -n 1)
 tail -n +3 "$work/config-check-out" > "$work/config-check-init.sh"
-docker run --rm -i --platform "$platform" -v "${resource}-check-tools":/tools \
-  "$busybox" sh -c '
-    cp /bin/busybox /tools/sh
-    cat > /tools/init.sh
-    for applet in mkdir install chmod chown cp find stat chpst; do ln -s sh "/tools/$applet"; done' \
-  < "$work/config-check-init.sh"
-
+# /dev/shm is the Docker host's tmpfs. A unique bind mount keeps the same initially
+# non-sticky scratch directory across separate init and broker containers.
+docker run --rm --platform "$platform" -v /dev/shm:/host-shm "$busybox" \
+  sh -c 'mkdir -m 0777 "$1"; test "$(stat -c %a "$1")" = 777' sh "/host-shm/$resource"
 docker run --rm --platform "$platform" \
-  --user 0:0 --read-only \
-  -e PATH=/tools:/usr/local/bin:/usr/bin:/bin \
+  --user 0:0 --group-add=65534 --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER \
+  --security-opt=no-new-privileges --read-only \
   -v "${resource}-check":/check \
   -v "${resource}-check-broker-src":/source/broker.d:ro \
   -v "${resource}-check-set-src":/source/provider-set:ro \
   -v "${resource}-state":/var/lib/dekopon \
-  -v "${resource}-check-tools":/tools:ro \
-  --tmpfs /tmp:mode=0777,uid=0,gid=0 \
-  --entrypoint /tools/sh "$broker_image" -c '
-    set -eu
-    test "$(stat -c %a /tmp)" = 777
-    /tools/sh /tools/init.sh
-    # The broker mounts only the config-check subPath, not the root-owned claim parent.
-    chmod 0755 /var/lib/dekopon
-    test "$(stat -c %a /tmp)" = 1777
-    exec chpst -u 65532:65532 dekopon-brokerd check /check/broker.d --provider-set=/check/provider-set/providers.yaml --store=/var/lib/dekopon/config-check --output=json
-  '
+  --mount "type=bind,source=/dev/shm/$resource,target=/tmp" \
+  "$busybox" /bin/sh -c "$(cat "$work/config-check-init.sh")"
+docker run --rm --platform "$platform" -v /dev/shm:/host-shm "$busybox" \
+  sh -c 'test "$(stat -c %a "$1")" = 1777' sh "/host-shm/$resource"
+docker run --rm --platform "$platform" \
+  --user 65532:65532 --group-add=65534 --cap-drop=ALL \
+  --security-opt=no-new-privileges --read-only \
+  -v "${resource}-check":/check:ro \
+  --mount "type=volume,source=${resource}-state,target=/var/lib/dekopon/config-check,volume-subpath=config-check" \
+  --mount "type=bind,source=/dev/shm/$resource,target=/tmp" \
+  --entrypoint dekopon-brokerd "$broker_image" check /check/broker.d \
+    --provider-set=/check/provider-set/providers.yaml --store=/var/lib/dekopon/config-check --output=json
 # provider_manager::read_secure_file: validate_file_parent, then the file itself, O_NOFOLLOW.
 cat > "$work/config-check-set.py" <<'CHECKSET'
 import os, stat, sys
