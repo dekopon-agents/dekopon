@@ -1853,14 +1853,7 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(
-                    runner,
-                    &key,
-                    message.conversation.kind,
-                    &mut progress,
-                    &cancellation,
-                )
-                .await;
+                return stopped(runner, &key, message, &mut progress, &cancellation).await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
@@ -1875,14 +1868,7 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(
-            runner,
-            &key,
-            message.conversation.kind,
-            &mut progress,
-            &cancellation,
-        )
-        .await;
+        return stopped(runner, &key, message, &mut progress, &cancellation).await;
     }
 
     progress.seal();
@@ -2079,7 +2065,7 @@ fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause
 async fn stopped(
     runner: &SessionRunner,
     key: &ConversationKey,
-    kind: ConversationKind,
+    message: &InboundMessage,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
 ) -> &'static str {
@@ -2095,7 +2081,8 @@ async fn stopped(
         }
         CancelSource::User { .. } | CancelSource::Operator => false,
     };
-    let terminal = if sealed && kind == ConversationKind::Thread {
+    let terminal = if sealed && message.conversation.kind == ConversationKind::Thread {
+        revoke_thread_ownership(runner, message);
         Terminal::Stopped(StopCause::Cancelled(by))
     } else {
         remember_stop(runner, key, StopCause::Cancelled(by))

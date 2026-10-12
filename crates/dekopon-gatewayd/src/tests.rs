@@ -15938,14 +15938,14 @@ async fn a_sealed_thread_relinquishes_its_inherited_claim() {
         std::slice::from_ref(&claim)
     );
     finish_wall_clock_turn(&model, session).await;
+    assert_eq!(*ownership.revoked.lock(), [claim]);
     run_session(
         runner,
         route,
-        owned_slack_message("unaddressed follow-up", true),
+        owned_slack_message("<@u0botbot> addressed follow-up", false),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    assert_eq!(*ownership.revoked.lock(), [claim]);
     assert_eq!(
         driver.replies().last().unwrap(),
         crate::session::SEALED_THREAD_REPLY
