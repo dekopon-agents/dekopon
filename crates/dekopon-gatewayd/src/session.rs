@@ -1456,7 +1456,13 @@ async fn session(
         ConversationKind::Thread if sealed.is_some() => {
             revoke_thread_ownership(runner, message);
             tracing::info!(event = "gateway_session_rejected", reason = "sealed");
-            answer(driver, message, SEALED_THREAD_REPLY).await;
+            if !message
+                .thread_continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.inherited)
+            {
+                answer(driver, message, SEALED_THREAD_REPLY).await;
+            }
             return "sealed";
         }
         ConversationKind::Thread

@@ -15909,7 +15909,7 @@ async fn a_wall_clock_stop_seals_the_thread() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_sealed_thread_relinquishes_its_inherited_claim() {
+async fn a_sealed_thread_relinquishes_its_claim_and_answers_only_addressed_messages() {
     let directory = temporary();
     let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let ownership = Arc::new(RecordingThreadOwnership::default());
@@ -15939,6 +15939,14 @@ async fn a_sealed_thread_relinquishes_its_inherited_claim() {
     );
     finish_wall_clock_turn(&model, session).await;
     assert_eq!(*ownership.revoked.lock(), [claim]);
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        owned_slack_message("unaddressed follow-up", true),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::WALL_CLOCK_REPLY]);
     run_session(
         runner,
         route,
