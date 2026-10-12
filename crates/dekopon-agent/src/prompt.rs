@@ -1603,7 +1603,7 @@ impl PromptError {
         match self {
             Self::Cancelled => "cancelled",
             Self::ZeroSteps => "zero-steps",
-            Self::Model(_) => "model",
+            Self::Model(error) => error.kind().as_str(),
             Self::UnknownTool(_) => "unknown-tool",
             Self::TooManyToolCalls { .. } => "too-many-tool-calls",
             Self::EmptyToolCallId => "empty-tool-call-id",

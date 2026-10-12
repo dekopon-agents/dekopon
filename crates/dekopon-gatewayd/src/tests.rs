@@ -1821,7 +1821,7 @@ fn an_exported_but_blank_credential_is_refused_by_name() {
 }
 
 struct ModelScript {
-    turns: Mutex<VecDeque<Option<AssistantTurn>>>,
+    turns: Mutex<VecDeque<Result<AssistantTurn, InferenceError>>>,
     prompts: Mutex<Vec<Vec<ModelMessage>>>,
     tools: Mutex<Vec<Vec<ModelTool>>>,
     cache_keys: Mutex<Vec<Option<String>>>,
@@ -1836,6 +1836,16 @@ impl ModelScript {
     }
 
     fn scripted(turns: impl IntoIterator<Item = Option<AssistantTurn>>) -> Arc<Self> {
+        Self::results(turns.into_iter().map(|turn| {
+            turn.ok_or(InferenceError::Protocol(
+                dekopon_model::error::ProtocolFailure::NoChoices,
+            ))
+        }))
+    }
+
+    fn results(
+        turns: impl IntoIterator<Item = Result<AssistantTurn, InferenceError>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
             prompts: Mutex::new(Vec::new()),
@@ -1937,10 +1947,9 @@ impl ChatModel for ScriptedModel {
             .turns
             .lock()
             .pop_front()
-            .flatten()
-            .ok_or(InferenceError::Protocol(
+            .unwrap_or(Err(InferenceError::Protocol(
                 dekopon_model::error::ProtocolFailure::NoChoices,
-            ))
+            )))
     }
 }
 
@@ -2817,6 +2826,8 @@ fn runner_tracking(
     max_conversations: usize,
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
+        pending_notices: Default::default(),
+        sealed_conversations: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
@@ -5450,7 +5461,10 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         transcript(&[
             ("system", &expected_instructions()),
             ("user", "what broke?"),
-            ("user", "try again"),
+            (
+                "user",
+                "[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
+            ),
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
     );
@@ -12216,6 +12230,13 @@ impl CancelOrigin {
         panic!("the aborted session task never unwound");
     }
 
+    const fn reply(self) -> &'static str {
+        match self {
+            Self::User(_) | Self::Operator => crate::session::STOPPED_REPLY,
+            Self::WallClock => crate::session::WALL_CLOCK_REPLY,
+        }
+    }
+
     const fn renders_the_ending(self) -> bool {
         !matches!(self, Self::Operator)
     }
@@ -12229,12 +12250,12 @@ impl CancelOrigin {
     }
 }
 
-async fn told_it_stopped(driver: &RecordingDriver) -> bool {
+async fn told_it_stopped(driver: &RecordingDriver, origin: CancelOrigin) -> bool {
     for _ in 0..600 {
         if driver
             .rendered()
             .iter()
-            .any(|line| line.contains(crate::session::STOPPED_REPLY))
+            .any(|line| line.contains(origin.reply()))
         {
             return true;
         }
@@ -12417,7 +12438,7 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the person watching a run that had already ended: {:?}",
             driver.rendered()
         );
@@ -12494,7 +12515,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} left the stream saying it was still writing: {:?}",
             driver.rendered()
         );
@@ -12567,7 +12588,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         }
         origin.landed(&session).await;
         assert!(
-            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            !origin.renders_the_ending() || told_it_stopped(&driver, origin).await,
             "{origin:?} made the person wait out a call nobody was going to read: {:?}",
             driver.rendered()
         );
@@ -12575,10 +12596,7 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         origin.joined(session).await;
 
         assert!(
-            driver
-                .replies()
-                .iter()
-                .all(|reply| reply == crate::session::STOPPED_REPLY),
+            driver.replies().iter().all(|reply| reply == origin.reply()),
             "a stopped session answered anyway under {origin:?}: {:?}",
             driver.replies()
         );
@@ -14271,6 +14289,8 @@ fn journaled_runner(
     journal: &Path,
 ) -> Arc<SessionRunner> {
     Arc::new(SessionRunner {
+        pending_notices: Default::default(),
+        sealed_conversations: Default::default(),
         broker,
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(4),
@@ -15562,4 +15582,591 @@ async fn an_agent_without_a_budget_is_never_refused() {
     .await;
 
     assert_eq!(driver.replies(), ["hi there"]);
+}
+
+#[tokio::test]
+async fn a_model_over_budget_error_keeps_the_failed_outcome_and_text() {
+    use dekopon_model_token_governor::{MeterKind, Refusal, Retry, Tokens};
+
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let refusal = Refusal {
+        agent: "reviewer".parse().unwrap(),
+        meter: MeterKind::Credit,
+        limit: Tokens(10),
+        remaining: 0,
+        requested: Tokens(11),
+        retry: Retry::Never,
+    };
+    struct RefusedBuild(Refusal);
+    impl ModelFactory for RefusedBuild {
+        fn build(
+            &self,
+            _model: &ModelConfig,
+            _runtime: tokio::runtime::Handle,
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<SharedModel, SessionError> {
+            Err(SessionError::Model(InferenceError::OverBudget(
+                self.0.clone(),
+            )))
+        }
+    }
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner_with(broker, Arc::new(RefusedBuild(refusal)), 4),
+        route(model_config()),
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [FAILURE_REPLY]);
+    let text = capture.text();
+    assert!(text.contains("gateway_session_failed"), "{text}");
+    assert!(!text.contains("gateway_session_refused"), "{text}");
+}
+
+#[tokio::test]
+async fn a_model_deadline_failure_reports_deadline_exceeded() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let models = ModelScript::results([Err(InferenceError::DeadlineExceeded)]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, models, 4),
+        route(model_config()),
+        message("answer the question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::MODEL_DEADLINE_REPLY]);
+    assert!(
+        capture.events().iter().any(|(fields, _)| {
+            fields.contains("event=\"gateway_session_failed\"")
+                && fields.contains("category=\"deadline-exceeded\"")
+        }),
+        "{}",
+        capture.text()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_answer_and_max_steps_name_their_cause_in_chat() {
+    for (turn, expected) in [
+        (answer(""), crate::session::EMPTY_ANSWER_REPLY),
+        (script_call("true"), crate::session::MAX_STEPS_REPLY),
+    ] {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+        let driver = Arc::new(RecordingDriver::default());
+        let mut route = route(model_config());
+        route.limits.max_steps = 1;
+        run_session(
+            runner(broker, ModelScript::new([turn]), 4),
+            route,
+            message("answer the question"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(driver.replies(), [expected]);
+    }
+}
+
+#[tokio::test]
+async fn the_stop_notice_reaches_the_next_turn_once() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::results([
+        Err(InferenceError::DeadlineExceeded),
+        Ok(answer("second answer")),
+        Ok(answer("third answer")),
+    ]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+    let driver = Arc::new(RecordingDriver::default());
+    for text in ["first question", "second question", "third question"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    let notice = "[gateway: the previous turn stopped before answering: the model call failed (deadline-exceeded). Capability calls already made were not undone.]";
+    assert_eq!(
+        models.prompt(1).last().unwrap().1,
+        format!("{notice}\nsecond question")
+    );
+    assert!(
+        models
+            .prompt(2)
+            .iter()
+            .all(|(_, text)| !text.contains(notice))
+    );
+}
+
+async fn begin_parked_turn(
+    runner: &mut Arc<SessionRunner>,
+    route: crate::routes::BoundRoute,
+    inbound: InboundMessage,
+    driver: Arc<dyn ChatDriver>,
+) -> (
+    Arc<dekopon_test_support::ScriptedStreamModel>,
+    tokio::task::JoinHandle<()>,
+) {
+    begin_parked_turn_with_answer(runner, route, inbound, driver, answer("too late")).await
+}
+
+async fn begin_parked_turn_with_answer(
+    runner: &mut Arc<SessionRunner>,
+    route: crate::routes::BoundRoute,
+    inbound: InboundMessage,
+    driver: Arc<dyn ChatDriver>,
+    turn: AssistantTurn,
+) -> (
+    Arc<dekopon_test_support::ScriptedStreamModel>,
+    tokio::task::JoinHandle<()>,
+) {
+    let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
+        turn,
+        Duration::from_secs(30),
+    ));
+    Arc::get_mut(runner).expect("no active session").models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&model))));
+    let session = tokio::spawn(run_session(Arc::clone(runner), route, inbound, driver));
+    model.wait_until_asked().await;
+    (model, session)
+}
+
+async fn finish_wall_clock_turn(
+    model: &dekopon_test_support::ScriptedStreamModel,
+    session: tokio::task::JoinHandle<()>,
+) {
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    model.release_next();
+    session.await.expect("the stopped turn unwinds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_answer_with_a_progress_message_posts_a_fresh_reply() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    Arc::get_mut(&mut runner).unwrap().liveness.insert(
+        "dev".to_owned(),
+        Arc::new(ResolvedLiveness {
+            settings: LivenessSettings {
+                mode: LivenessMode::Native,
+                progress: ProgressSurface::Message,
+                ..LivenessSettings::default()
+            },
+            ..ResolvedLiveness::default()
+        }),
+    );
+    let driver = Arc::new(RecordingDriver::default().with_progress(4000, Duration::ZERO));
+    let mut inbound = message("question");
+    inbound.liveness = Some(LivenessTarget::Local { connection: 1 });
+    let (model, session) = begin_parked_turn_with_answer(
+        &mut runner,
+        route(model_config()),
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        answer(""),
+    )
+    .await;
+    tokio::time::advance(Duration::from_secs(16)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        driver.calls().iter().any(|call| matches!(
+            call,
+            dekopon_test_support::DriverCall::Progress(ProgressCall::Post { .. })
+        )),
+        "{:?}",
+        driver.calls()
+    );
+    model.release_next();
+    session.await.expect("the empty turn unwinds");
+    let calls = driver.calls();
+    let deleted = calls
+        .iter()
+        .position(|call| {
+            matches!(
+                call,
+                dekopon_test_support::DriverCall::Progress(ProgressCall::Delete { .. })
+            )
+        })
+        .expect("the progress surface was removed");
+    let replied = calls.iter().position(|call| matches!(
+        call,
+        dekopon_test_support::DriverCall::Reply { text, .. } if text == crate::session::EMPTY_ANSWER_REPLY
+    )).expect("the stop line was a fresh reply");
+    assert!(deleted < replied, "{calls:?}");
+    assert!(!calls.iter().any(|call| matches!(
+        call,
+        dekopon_test_support::DriverCall::Progress(ProgressCall::Finalize { .. })
+    )));
+    assert_eq!(driver.replies(), [crate::session::EMPTY_ANSWER_REPLY]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_names_its_cause_in_chat() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        timed_route(model_config(), Duration::from_secs(30)),
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    assert_eq!(driver.replies(), [crate::session::WALL_CLOCK_REPLY]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_seals_the_thread() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(
+        directory.path(),
+        &[(SUBJECT, "xavier"), ("tel.16035550100", "other")],
+    )
+    .await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let mut route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..window()
+        },
+    );
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("the long question");
+    inbound.conversation.kind = ConversationKind::Thread;
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let mut queued = inbound.clone();
+    queued.subject = "tel.16035550100".parse().unwrap();
+    queued.text = "queued question".to_owned();
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        queued,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    assert!(runner.pending_notices.lock().is_empty());
+    inbound.text = "another question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        [
+            crate::session::WALL_CLOCK_REPLY,
+            crate::session::SEALED_THREAD_REPLY,
+            crate::session::SEALED_THREAD_REPLY
+        ]
+    );
+    assert_eq!(
+        capture
+            .spans()
+            .iter()
+            .filter(|(name, fields)| *name == "gateway.message"
+                && fields.contains("outcome=\"sealed\""))
+            .count(),
+        2
+    );
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|(fields, _)| fields.contains("audit.event=\"agent.model.prompt\""))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sealed_thread_relinquishes_its_claim_and_answers_only_addressed_messages() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    Arc::get_mut(&mut runner)
+        .expect("fixture owns its runner")
+        .thread_ownership
+        .insert(
+            "scientist-slack".to_owned(),
+            Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+        );
+    let mut route = route(model_config());
+    route.max_duration = Some(Duration::from_secs(30));
+    let initial = owned_slack_message("<@u0botbot> question", false);
+    let claim = initial.thread_continuation.as_ref().unwrap().claim.clone();
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        initial,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        ownership.claimed.lock().as_slice(),
+        std::slice::from_ref(&claim)
+    );
+    finish_wall_clock_turn(&model, session).await;
+    assert_eq!(*ownership.revoked.lock(), [claim]);
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        owned_slack_message("unaddressed follow-up", true),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::WALL_CLOCK_REPLY]);
+    run_session(
+        runner,
+        route,
+        owned_slack_message("<@u0botbot> addressed follow-up", false),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies().last().unwrap(),
+        crate::session::SEALED_THREAD_REPLY
+    );
+}
+
+async fn fresh_after_wall_clock(kind: ConversationKind) {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let mut runner = runner(broker, ModelScript::new([answer("old answer")]), 4);
+    let mut route = persistent_route(model_config(), window());
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("old question");
+    inbound.conversation.kind = kind;
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    inbound.text = "long question".to_owned();
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.text = "new question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies().last().unwrap(), "fresh answer");
+    let prompt = next.prompt(0);
+    assert_eq!(prompt.len(), 2);
+    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_stop_in_a_channel_starts_fresh_and_is_never_refused() {
+    fresh_after_wall_clock(ConversationKind::Channel).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_after_a_wall_clock_stop_starts_fresh_with_a_notice() {
+    fresh_after_wall_clock(ConversationKind::DirectMessage).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_seal_leaves_the_stop_notice_for_the_next_turn() {
+    let directory = temporary();
+    let journal = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let mut runner = journaled_runner(broker, Arc::new(ModelScript::forbidden()), journal.path());
+    let mut route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..recall_window(RecallSource::Journal)
+        },
+    );
+    route.max_duration = Some(Duration::from_secs(30));
+    let mut inbound = message("long question");
+    inbound.conversation.kind = ConversationKind::Thread;
+    let stem = ConversationKey::shared(&route.agent, &route.transport, &inbound.conversation.key())
+        .journal_stem();
+    let marker = journal.path().join(format!("{stem}.sealed"));
+    let driver = Arc::new(RecordingDriver::default());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    std::fs::create_dir(&marker).unwrap();
+    finish_wall_clock_turn(&model, session).await;
+    std::fs::remove_dir(&marker).unwrap();
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.text = "next question".to_owned();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies().last().unwrap(), "fresh answer");
+    assert!(next.prompt(0).iter().any(|(_, text)| text.ends_with("[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnext question")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sealed_conversation_stays_sealed_after_a_restart() {
+    for kind in [ConversationKind::Thread, ConversationKind::DirectMessage] {
+        let directory = temporary();
+        let journal = temporary();
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+        let first = ModelScript::new([answer("old answer")]);
+        let mut runner = journaled_runner(broker.clone(), Arc::new(first), journal.path());
+        let mut route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+        route.max_duration = Some(Duration::from_secs(30));
+        let mut inbound = message("old question");
+        inbound.conversation.kind = kind;
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            inbound.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        inbound.text = "long question".to_owned();
+        let (model, session) = begin_parked_turn(
+            &mut runner,
+            route.clone(),
+            inbound.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        finish_wall_clock_turn(&model, session).await;
+        drop(runner);
+        let next = match kind {
+            ConversationKind::Thread => ModelScript::forbidden(),
+            ConversationKind::DirectMessage => ModelScript::new([answer("fresh answer")]),
+            ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
+        };
+        let restarted = journaled_runner(broker, Arc::new(Arc::clone(&next)), journal.path());
+        inbound.text = "after restart".to_owned();
+        run_session(
+            restarted,
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        match kind {
+            ConversationKind::Thread => {
+                assert_eq!(
+                    driver.replies().last().unwrap(),
+                    crate::session::SEALED_THREAD_REPLY
+                );
+                assert_eq!(next.requests(), 0);
+            }
+            ConversationKind::DirectMessage => {
+                assert_eq!(next.prompt(0).len(), 2);
+                assert_eq!(
+                    next.prompt(0)[1],
+                    ("user".to_owned(), "after restart".to_owned())
+                );
+            }
+            ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_platform_recall_skips_messages_before_the_seal() {
+    let directory = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let mut runner = runner(broker, ModelScript::forbidden(), 4);
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    route.max_duration = Some(Duration::from_secs(30));
+    let driver = HistoryDriver::new(Ok(vec![past("1", "U1", SUBJECT, "before the seal")]));
+    let mut inbound = message("long question");
+    inbound.message_id = MessageId::Native("3".to_owned());
+    let (model, session) = begin_parked_turn(
+        &mut runner,
+        route.clone(),
+        inbound.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    finish_wall_clock_turn(&model, session).await;
+    let sealed_at = runner
+        .sealed_conversations
+        .lock()
+        .values()
+        .next()
+        .unwrap()
+        .at;
+    let mut boundary = past("4", "U1", SUBJECT, "at the seal");
+    boundary.at = sealed_at;
+    driver.post(boundary);
+    let mut after = past("5", "U1", SUBJECT, "after the seal");
+    after.at = sealed_at + Duration::from_secs(1);
+    driver.post(after);
+    let next = ModelScript::new([answer("fresh answer")]);
+    Arc::get_mut(&mut runner).unwrap().models =
+        Arc::new(ModelCache::new(Arc::new(Arc::clone(&next))));
+    inbound.message_id = MessageId::Native("6".to_owned());
+    inbound.text = "new question".to_owned();
+    run_session(runner, route, inbound, driver as Arc<dyn ChatDriver>).await;
+    let prompt = next.prompt(0);
+    let recalled = prompt
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!recalled.contains("before the seal"));
+    assert!(recalled.contains("at the seal"));
+    assert!(recalled.contains("after the seal"));
 }
