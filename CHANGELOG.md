@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.33.0] - 2026-10-12
+
+### Changed
+
+- Prepare chart 0.33.0 for core v0.46.0; pin the published image index in a separate reviewed change.
+
+## [0.46.0] - 2026-10-12
+
+### Added
+
+- The next turn after a stopped one carries a one-line gateway notice naming why the previous turn stopped; the model sees it once and it is never stored in history or the journal.
+- A session time limit seals the conversation: later turns in that thread are refused with a fixed sentence (outcome `sealed`), and DM, group DM and channel turns start fresh with the old window evicted (reason `sealed`) and recall cut at the seal; with `sessions.journal` the seal is a `<stem>.sealed` sibling file that survives restart until journal retention expires it.
+
+### Changed
+
+- A stopped turn's chat line names its cause: a session time limit, a model timeout, an empty model answer, a step limit or a lost session task each end with a fixed "Stopped: …" sentence; person and operator stops keep the `stopped` template and other failures the `failed` template.
+- `gateway_session_failed` carries the model failure category (`deadline-exceeded`, `transport`, `provider`, …) in place of `model`.
+
+### Fixed
+
+- A session's time limit is fixed when its progress surface opens; a later progress start or a steer no longer extends it.
+
 ## [dekopon-chart-0.32.1] - 2026-10-12
 
 ### Fixed

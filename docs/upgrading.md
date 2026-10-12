@@ -8,6 +8,19 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Stopped turns, progress and session seals (0.46.0)
+
+Upgrade the broker and gateway together; no configuration migration, provider WIT or SDK re-pin
+is needed. A stopped turn now ends with a fixed cause-specific sentence, and the next turn gets
+one gateway notice naming that cause (not persisted in history or the journal). A session time
+limit is fixed when the progress surface opens: restarting progress or steering does not extend
+it. On expiry the conversation is sealed; later turns in that thread are refused, while DM,
+group DM and channel turns start a fresh window with recall cut at the seal. With
+`sessions.journal` enabled, the seal survives a restart in a sibling `.sealed` file until
+journal retention expires it. Operators querying `gateway_session_failed` should use its typed
+model failure category instead of the former `model` value. Install chart 0.33.0 only after its
+default image index is pinned to the verified v0.46.0 stock image.
+
 ## Provider SDK tuples and model responses (0.45.0)
 
 When building an out-of-tree Rust provider with more than 19 capabilities, update its exact
