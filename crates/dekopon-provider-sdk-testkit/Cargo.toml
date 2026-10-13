@@ -39,7 +39,7 @@ clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
 dekopon-test-support = { path = "../dekopon-test-support" }
 tokio.workspace = true
-wat = "=1.259.0"
+wat = "=1.261.0"
 
 [lints]
 workspace = true
