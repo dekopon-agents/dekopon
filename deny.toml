@@ -4,7 +4,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml 0.2.11 reaches the workspace only through serde_yaml_ng 0.10; removable once config parsing moves to a maintained YAML crate such as serde-saphyr" },
+]
 
 [licenses]
 version = 2
