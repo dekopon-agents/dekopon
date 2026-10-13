@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.46.1] - 2026-10-13
+
+### Fixed
+
+- A Slack reply line that is only a number followed by `.` or `)` (an answer of `391.`) now renders as that number instead of an empty list item.
+
 ## [dekopon-chart-0.33.0] - 2026-10-12
 
 ### Changed
