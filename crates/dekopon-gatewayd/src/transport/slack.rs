@@ -707,7 +707,7 @@ impl ChatDriver for SlackReplier {
         let mut body = json!({
             "channel": channel,
             "text": text,
-            "blocks": [{ "type": "markdown", "text": text }],
+            "blocks": [markdown_block(&text)],
         });
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts.clone());
@@ -1126,7 +1126,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": reply.text,
-            "blocks": [{ "type": "markdown", "text": reply.text }],
+            "blocks": [markdown_block(&reply.text)],
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
     }
@@ -1360,7 +1360,7 @@ impl SlackReplier {
     }
 
     fn progress_blocks(&self, text: &str, cancel: bool, conversation_id: &str) -> Value {
-        let mut blocks = vec![json!({ "type": "markdown", "text": text })];
+        let mut blocks = vec![markdown_block(text)];
         if cancel && self.experience == SlackExperience::Classic {
             blocks.push(json!({
                 "type": "actions",
@@ -1457,6 +1457,56 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_PROGRESS_COOLDOWN, Duration::from_secs);
     seconds.min(MAX_PROGRESS_COOLDOWN)
+}
+
+fn markdown_block(text: &str) -> Value {
+    json!({ "type": "markdown", "text": escape_bare_list_markers(text) })
+}
+
+fn escape_bare_list_markers(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let mut fence: Option<(char, usize)> = None;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            escaped.push('\n');
+        }
+        let body = line.trim_start_matches(' ');
+        let indent = line.len() - body.len();
+        let run = fence_run(body);
+        if let Some((mark, len)) = fence {
+            if indent <= 3
+                && run.is_some_and(|(closing, count)| {
+                    closing == mark && count >= len && body[count..].trim().is_empty()
+                })
+            {
+                fence = None;
+            }
+        } else if indent <= 3 && run.is_some() {
+            fence = run;
+        } else if indent <= 3
+            && let Some(digits) = bare_list_marker(body)
+        {
+            let (marker, rest) = line.split_at(indent + digits);
+            escaped.push_str(marker);
+            escaped.push('\\');
+            escaped.push_str(rest);
+            continue;
+        }
+        escaped.push_str(line);
+    }
+    escaped
+}
+
+fn fence_run(line: &str) -> Option<(char, usize)> {
+    let mark = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let count = line.chars().take_while(|&c| c == mark).count();
+    (count >= 3).then_some((mark, count))
+}
+
+fn bare_list_marker(line: &str) -> Option<usize> {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = line[digits..].strip_prefix(['.', ')'])?;
+    ((1..=9).contains(&digits) && rest.trim().is_empty()).then_some(digits)
 }
 
 struct Tracked<T> {
@@ -3228,6 +3278,40 @@ mod owned_thread_tests {
         assert!(
             owned.contains(&other_sender),
             "revocation is exact to one sender/thread"
+        );
+    }
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::{escape_bare_list_markers, markdown_block};
+
+    #[test]
+    fn a_bare_ordered_list_marker_is_escaped_so_slack_renders_the_number() {
+        assert_eq!(escape_bare_list_markers("391."), r"391\.");
+        assert_eq!(escape_bare_list_markers("391)"), r"391\)");
+        assert_eq!(markdown_block("391.")["text"], r"391\.");
+    }
+
+    #[test]
+    fn only_the_bare_marker_line_of_a_longer_message_is_escaped() {
+        assert_eq!(
+            escape_bare_list_markers("The answer is\n\n  42.  \n\nDone."),
+            "The answer is\n\n  42\\.  \n\nDone."
+        );
+    }
+
+    #[test]
+    fn a_list_item_with_content_is_left_as_a_list() {
+        let list = "1. foo\n2) bar";
+        assert_eq!(escape_bare_list_markers(list), list);
+    }
+
+    #[test]
+    fn a_bare_marker_inside_a_fenced_block_is_left_alone_until_the_fence_closes() {
+        assert_eq!(
+            escape_bare_list_markers("```\n7.\n```\n~~~~\n8)\n~~~\n~~~~\n9."),
+            "```\n7.\n```\n~~~~\n8)\n~~~\n~~~~\n9\\."
         );
     }
 }
