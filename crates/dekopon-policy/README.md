@@ -62,18 +62,25 @@ one list is nonempty; no conflicting world is returned.
 
 ## Context
 
-Capability actions carry `{ via?, subject?, agent?, effect, risk }`. `agent.prompt`
-carries `{ via?, subject?, agent? }`. `secret.use` carries those routing fields plus the exact
-capability, provider, and native sink the public DRN was proposed for. Strict validation prevents a
-field from being read on an action that never carries it.
+Every action requires the string fields `via` and `agent`. Capability actions additionally require
+`effect` and `risk`; `agent.prompt` requires no additional fields; `secret.use` additionally requires
+`capability`, `provider`, and `sink`, identifying the exact capability, provider, and native sink the
+public DRN was proposed for. A request missing a required field is refused before policy evaluation,
+even if a policy would otherwise permit it.
+
+All three action types optionally carry `subject`, `transportKind`, `transport`, `trigger`, and
+`conversation`. When present, `conversation` requires `kind` and `id`; its `container` and `thread`
+fields are optional. Policies must guard optional fields with `has` before reading them. Strict
+validation also prevents a field from being read on an action that never carries it.
 
 Every value is rendered by the broker from authenticated transport state or owner-controlled
 configuration:
 
-- `via` — the attestor peer an attested context was derived through; absent for direct peers. This
-  is the hinge that keeps attested and direct authority disjoint.
+- `via` — the attestor peer an attested context was derived through. Direct peers have no `via`, so
+  their requests fail the required-context check.
 - `subject` — the canonical external subject an attested context stands for.
-- `agent` — the agent identity of an agent actor; absent for human and service actors.
+- `agent` — the agent identity of an agent actor. Human and service actors have no `agent`, so their
+  requests fail the required-context check.
 - `effect` / `risk` — the trusted classification the broker will execute under,
   matched byte for byte against the loaded manifest at startup.
 
