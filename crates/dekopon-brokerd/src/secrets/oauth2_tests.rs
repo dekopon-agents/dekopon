@@ -180,8 +180,111 @@ fn success() -> (&'static str, String) {
     )
 }
 
+fn seeded_resolver(path: &Path, seed: &Path, endpoint: &str) -> MapResolver {
+    let mut resolver = resolver(path, endpoint, &["one"]);
+    let mut value = source_value(path, endpoint);
+    value["seedPath"] = json!(seed);
+    resolver.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(value).unwrap();
+    resolver
+}
+
+fn write_seed(path: &Path, value: &str) {
+    fs::write(path, value).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 fn content(request: &str) -> &str {
     request.split_once("\r\n\r\n").expect("request body").1
+}
+
+#[tokio::test]
+async fn new_seed_is_adopted_only_once_and_a_changed_seed_replaces_a_live_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    write_seed(&seed, "seed-one");
+    let api = TokenApi::serving_with_request(|count, request| {
+        assert!(content(request).contains(if count == 1 {
+            "refresh_token=seed-one"
+        } else {
+            "refresh_token=seed-two"
+        }));
+        success()
+    });
+    let resolver = seeded_resolver(&path, &seed, &api.endpoint);
+    for _ in 0..2 {
+        assert!(resolver.resolve(&drn("one")).await.is_ok());
+    }
+    assert_eq!(api.requests().len(), 1);
+    write_seed(&seed, "seed-two");
+    assert!(resolver.resolve(&drn("one")).await.is_ok());
+    assert_eq!(api.requests().len(), 2);
+    let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["refresh"], NEW_REFRESH);
+    assert_ne!(record["adoptedSeedSha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn concurrent_first_adoption_spends_one_seed_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    write_seed(&seed, "seed-once");
+    let api = TokenApi::serving_with_request(|count, request| {
+        assert_eq!(count, 1, "seed replayed");
+        assert!(content(request).contains("refresh_token=seed-once"));
+        success()
+    });
+    let resolver = Arc::new(seeded_resolver(&path, &seed, &api.endpoint));
+    let tasks = (0..4)
+        .map(|_| {
+            let resolver = Arc::clone(&resolver);
+            tokio::spawn(async move { resolver.resolve(&drn("one")).await })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
+    let restarted = seeded_resolver(&path, &seed, &api.endpoint);
+    assert!(restarted.resolve(&drn("one")).await.is_ok());
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn changed_seed_unseals_but_unchanged_seed_never_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    write_seed(&seed, "seed-one");
+    let api = TokenApi::serving(|count| {
+        if count == 1 {
+            (
+                "400 Bad Request",
+                json!({"error":"invalid_grant"}).to_string(),
+            )
+        } else {
+            success()
+        }
+    });
+    let resolver = seeded_resolver(&path, &seed, &api.endpoint);
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    assert_eq!(api.requests().len(), 1);
+    write_seed(&seed, "seed-two");
+    assert!(resolver.resolve(&drn("one")).await.is_ok());
+    assert_eq!(api.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -201,11 +304,15 @@ async fn sealed_and_malformed_records_refuse_without_affecting_another_secret() 
     ] {
         fs::write(&path, invalid.to_string()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let result = super::oauth2::resolve(
-            &path,
-            &api.endpoint,
-            "public-client-id",
-            1000,
+        let result = super::oauth2::resolve_for(
+            None,
+            super::oauth2::OAuth2Source {
+                path: &path,
+                seed_path: None,
+                endpoint: &api.endpoint,
+                client_id: "public-client-id",
+                timeout_ms: 1000,
+            },
             rustix::process::geteuid().as_raw(),
             &reqwest::Client::new(),
         )
@@ -312,7 +419,6 @@ async fn invalid_grant_needs_reauthorization_and_never_replays_the_old_token() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
-    let initial = fs::read(&path).unwrap();
     let api = TokenApi::serving(|_| {
         (
             "400 Bad Request",
@@ -320,15 +426,35 @@ async fn invalid_grant_needs_reauthorization_and_never_replays_the_old_token() {
         )
     });
     let resolver = resolver(&path, &api.endpoint, &["one"]);
+    let capture = CaptureLayer::new();
     for _ in 0..2 {
         assert_eq!(
-            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            resolver
+                .resolve(&drn("one"))
+                .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+                .await
+                .unwrap_err()
+                .category,
             "reauthorization-required"
         );
     }
-    assert_eq!(fs::read(&path).unwrap(), initial);
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::audit",
+                &[
+                    ("audit.event", "broker.credential.sealed"),
+                    ("credential", drn("one").as_str()),
+                    ("cause", "reauthorization-required")
+                ]
+            )
+            .len(),
+        1
+    );
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["state"], "sealed");
     let requests = api.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(
         requests
             .iter()
@@ -700,7 +826,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
 }
 
 #[tokio::test]
-async fn a_rotation_whose_save_fails_still_returns_the_token() {
+async fn a_rotation_whose_save_fails_refuses_unpersisted_access() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
@@ -716,25 +842,71 @@ async fn a_rotation_whose_save_fails_still_returns_the_token() {
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(result.unwrap(), NEW_ACCESS.as_bytes());
-    let errors = capture
-        .records()
-        .into_iter()
-        .filter_map(|record| match record {
-            Record::Event {
-                level: "ERROR",
-                fields,
-                ..
-            } => Some(fields.to_string()),
-            Record::Event { .. } | Record::Span { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].contains(&format!(" record_path={}", path.display())));
-    assert!(errors[0].contains(" error=Permission denied"), "{errors:?}");
-    for token in [OLD_REFRESH, NEW_REFRESH, NEW_ACCESS] {
-        assert!(!errors[0].contains(token), "error event disclosed {token}");
+    assert!(matches!(result, Err(SourceError::Io)));
+    let errors = capture.events_where(
+        "credential",
+        &[("event", "broker.credential.refresh_save_failed")],
+    );
+    assert_eq!(errors.len(), 1);
+    let on_disk: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["refresh"], OLD_REFRESH);
+    assert_eq!(
+        resolver
+            .resolve_source(&entry.source, &entry.client)
+            .await
+            .unwrap(),
+        NEW_ACCESS.as_bytes()
+    );
+    assert_eq!(api.requests().len(), 2);
+    for token in [
+        OLD_REFRESH,
+        NEW_REFRESH,
+        NEW_ACCESS,
+        dir.path().to_str().unwrap(),
+    ] {
+        assert!(
+            !capture.events_text().contains(token),
+            "error event disclosed private value"
+        );
     }
+}
+
+#[tokio::test]
+async fn restart_after_failed_save_can_seal_a_spent_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    expired(&path);
+    let guard = dekopon_core::private_file::PrivateFileLock::acquire(&path).unwrap();
+    drop(guard);
+    let api = TokenApi::serving(|count| {
+        if count == 1 {
+            success()
+        } else {
+            (
+                "400 Bad Request",
+                json!({"error":"refresh_token_reused"}).to_string(),
+            )
+        }
+    });
+    let original = resolver(&path, &api.endpoint, &["one"]);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    assert_eq!(
+        original.resolve(&drn("one")).await.unwrap_err().category,
+        "io"
+    );
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let restarted = resolver(&path, &api.endpoint, &["one"]);
+    assert_eq!(
+        restarted.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    assert_eq!(
+        restarted.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    assert_eq!(api.requests().len(), 2);
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["state"], "sealed");
 }
 
 #[tokio::test]
@@ -764,7 +936,7 @@ async fn a_group_readable_or_missing_record_fails_without_a_refresh() {
     fs::remove_file(&path).unwrap();
     assert_eq!(
         resolver.resolve(&drn("one")).await.unwrap_err().category,
-        "io"
+        "missing"
     );
     assert!(api.requests().is_empty());
 }
@@ -802,19 +974,18 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
         );
         assert_eq!(
             resolver.resolve(&drn("one")).await.unwrap_err().category,
-            "bootstrap-reflected"
+            "reauthorization-required"
         );
         let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["refresh"], OLD_REFRESH);
-        assert_eq!(stored["expiresAt"], 1);
-        assert_eq!(api.requests().len(), 3);
+        assert_eq!(stored["state"], "sealed");
+        assert_eq!(api.requests().len(), 2);
         for _ in 0..2 {
             assert_eq!(
                 resolver.resolve(&drn("one")).await.unwrap_err().category,
-                "bootstrap-reflected"
+                "reauthorization-required"
             );
         }
-        assert_eq!(api.requests().len(), 5);
+        assert_eq!(api.requests().len(), 2);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
@@ -830,7 +1001,7 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
         assert!(!recorded.contains(secret), "trace disclosed {secret}");
     }
     assert!(recorded.contains("reauth-required"), "{recorded}");
-    assert_eq!(api.requests().len(), 5);
+    assert_eq!(api.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -863,13 +1034,240 @@ async fn a_shared_record_with_a_different_endpoint_or_client_is_refused() {
     for (first, second) in [("one", "two"), ("one", "three"), ("two", "three")] {
         assert!(
             problems.iter().any(|problem| {
-                problem.contains(&path.display().to_string())
-                    && problem.contains(drn(first).as_str())
-                    && problem.contains(drn(second).as_str())
+                problem.contains(drn(first).as_str()) && problem.contains(drn(second).as_str())
             }),
             "{problems:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_shared_record_cannot_have_two_seed_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let mut file = map(&path, "https://example.org/token", None);
+    for (entry, name) in file.secrets.iter_mut().zip(["seed-one", "seed-two"]) {
+        let mut value = source_value(&path, "https://example.org/token");
+        value["seedPath"] = json!(dir.path().join(name));
+        entry.source = serde_json::from_value(value).unwrap();
+    }
+    let Err(SecretMapError::Validation { problems }) = validate_map(
+        file,
+        &dir.path().join("map.json"),
+        rustix::process::geteuid().as_raw(),
+    )
+    .await
+    else {
+        panic!("different seed path must refuse")
+    };
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains(drn("one").as_str())
+                && problem.contains(drn("two").as_str()))
+    );
+}
+
+#[tokio::test]
+async fn unsafe_present_seed_refuses_at_boot_but_missing_seed_allows_live_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    write_record(&record, u64::MAX);
+    let mut file = map(&record, "https://example.org/token", None);
+    for entry in &mut file.secrets {
+        let mut source = source_value(&record, "https://example.org/token");
+        source["seedPath"] = json!(seed);
+        entry.source = serde_json::from_value(source).unwrap();
+    }
+    let map_path = dir.path().join("map.json");
+    assert!(
+        validate_map(file.clone(), &map_path, rustix::process::geteuid().as_raw())
+            .await
+            .is_ok()
+    );
+    let api = TokenApi::serving(|_| success());
+    let resolver = seeded_resolver(&record, &seed, &api.endpoint);
+    let entry = resolver.entries.get(&drn("one")).unwrap();
+    assert_eq!(
+        resolver
+            .resolve_source(&entry.source, &entry.client)
+            .await
+            .unwrap(),
+        b"old-access-private-sentinel"
+    );
+    assert!(api.requests().is_empty());
+    write_seed(&seed, "seed-one");
+    fs::set_permissions(&seed, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        validate_map(file, &map_path, rustix::process::geteuid().as_raw()).await,
+        Err(SecretMapError::Validation { .. })
+    ));
+}
+
+#[tokio::test]
+async fn every_listed_reauthorization_code_seals() {
+    for code in [
+        "invalid_grant",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+        "refresh_token_expired",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        expired(&path);
+        let api =
+            TokenApi::serving(move |_| ("400 Bad Request", json!({"error":code}).to_string()));
+        let resolver = resolver(&path, &api.endpoint, &["one"]);
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            "reauthorization-required"
+        );
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            "reauthorization-required"
+        );
+        assert_eq!(api.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn transient_oauth_failures_do_not_seal_and_can_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    expired(&path);
+    let api = TokenApi::serving(|count| match count {
+        1 => ("403 Forbidden", "not json".to_owned()),
+        2 => ("400 Bad Request", json!({"error":"other_code"}).to_string()),
+        3 => ("500 Internal Server Error", "unavailable".to_owned()),
+        _ => success(),
+    });
+    let resolver = resolver(&path, &api.endpoint, &["one"]);
+    for category in ["rejected", "rejected", "transport"] {
+        assert_eq!(
+            resolver.resolve(&drn("one")).await.unwrap_err().category,
+            category
+        );
+        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["state"], "live");
+    }
+    assert!(resolver.resolve(&drn("one")).await.is_ok());
+    assert_eq!(api.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn injected_clock_drives_record_expiry_and_refresh_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    expired(&path);
+    let api = TokenApi::serving(|_| {
+        (
+            "200 OK",
+            json!({"access_token":NEW_ACCESS,"refresh_token":NEW_REFRESH,"expires_in":7200})
+                .to_string(),
+        )
+    });
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(100));
+    let inputs = super::oauth2::RefreshInputs {
+        credential: None,
+        path: path.clone(),
+        seed_path: None,
+        endpoint: api.endpoint.clone(),
+        client_id: "public-client-id".to_owned(),
+        timeout: Duration::from_secs(5),
+        uid: rustix::process::geteuid().as_raw(),
+        client: reqwest::Client::new(),
+        clock: Arc::new({
+            let now = Arc::clone(&now);
+            move || now.load(Ordering::SeqCst)
+        }),
+    };
+    assert_eq!(
+        super::oauth2::resolve_with_clock(inputs).await.unwrap(),
+        NEW_ACCESS.as_bytes()
+    );
+    let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["lastRefresh"], 100);
+    assert_eq!(record["expiresAt"], 7300);
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn reflected_seed_seals_due_live_without_serving_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    let seed_value = "new-seed-private-sentinel";
+    write_seed(&seed, seed_value);
+    expired(&path);
+    let mut live: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    live["adoptedSeedSha256"] = json!(super::hex_sha256(seed_value.as_bytes()));
+    fs::write(&path, live.to_string()).unwrap();
+    let api = TokenApi::serving(|_| {
+        (
+            "200 OK",
+            json!({"access_token":"new-seed-private-sentinel","refresh_token":NEW_REFRESH,"expires_in":7200}).to_string(),
+        )
+    });
+    let resolver = seeded_resolver(&path, &seed, &api.endpoint);
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "bootstrap-reflected"
+    );
+    assert_eq!(api.requests().len(), 1);
+    assert!(content(&api.requests()[0]).contains("refresh_token=old-refresh-private-sentinel"));
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["state"], "sealed");
+    assert_eq!(stored["cause"], "bootstrap-reflected");
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn reflected_refresh_seals_without_returning_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    expired(&path);
+    let api = TokenApi::serving(|_| {
+        (
+            "200 OK",
+            json!({"access_token":OLD_REFRESH,"refresh_token":NEW_REFRESH,"expires_in":7200})
+                .to_string(),
+        )
+    });
+    let resolver = resolver(&path, &api.endpoint, &["one"]);
+    let capture = CaptureLayer::new();
+    assert_eq!(
+        resolver
+            .resolve(&drn("one"))
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap_err()
+            .category,
+        "bootstrap-reflected"
+    );
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::audit",
+                &[
+                    ("audit.event", "broker.credential.sealed"),
+                    ("cause", "bootstrap-reflected")
+                ]
+            )
+            .len(),
+        1
+    );
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["cause"], "bootstrap-reflected");
+    assert_eq!(api.requests().len(), 1);
 }
 
 #[tokio::test]

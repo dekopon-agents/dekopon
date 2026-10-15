@@ -264,37 +264,46 @@ source:
   recordPath: /var/lib/dekopon/broker-chatgpt/example-oauth2.json
   tokenEndpoint: https://auth.example/oauth/token
   clientId: public-client-id
+  refresh: lazy # or scheduled; omitted is lazy
+  seedPath: /run/dekopon-private/example-refresh-seed # optional broker-private file
   timeoutMs: 10000
 ```
 
-Only `recordPath`, `tokenEndpoint`, `clientId`, and optional `timeoutMs` are accepted. The broker
-reads the broker-UID-owned, regular, single-link `0600` JSON record (at most 64 KiB):
-`{"version":1,"access":"...","refresh":"...","expiresAt":<Unix seconds>}`. Version 1
-and non-empty tokens are required. Every authorized resolution takes the sibling `.lock`, re-reads
-the record, and reuses its access token until 60 seconds before expiry; then it sends one OAuth
-refresh-token grant to the configured endpoint, writes the replacement `0600` file by atomic rename,
-and returns the access token. An omitted response `refresh_token` retains the predecessor; no
-in-memory token cache or retry exists. Two DRNs may share one record and lock only when their
-`tokenEndpoint` and `clientId` match. The record needs its own file-name stem: the broker writes
+The broker reads a broker-UID-owned, regular, single-link `0600` JSON record (at most 64 KiB).
+Only tagged version 2 records are supported: Live
+`{"version":2,"state":"live","access":"...","refresh":"...","expiresAt":<Unix seconds>,"lastRefresh":<Unix seconds>,"adoptedSeedSha256":"<optional digest>"}`
+or Sealed `{"version":2,"state":"sealed","since":<Unix seconds>,"cause":"reauthorization-required","adoptedSeedSha256":"<optional digest>"}`.
+The digest identifies the input seed, never the rotated token. An optional `seedPath` is a protected,
+bounded, private refresh token, not an access token. On use a new seed is exchanged under the record
+lock and the result saved before access is served; an equal seed cannot overwrite a rotation or
+unseal a record. A missing seed permits an existing Live record to serve, but cannot initialize or
+unseal one. An invalid configured seed refuses boot; the `check` command does not open the map.
+Every authorized resolution takes the sibling `.lock`, re-reads the record, and reuses its access
+token until 60 seconds before expiry; then it sends one bare OAuth refresh-token grant to the
+configured endpoint, writes the replacement `0600` file by atomic rename, and returns the access
+token. An omitted response `refresh_token` retains the predecessor; no in-memory token cache exists.
+`scheduled` idle rotation and its 22-hour cycle, 2-hour expiry buffer and 5-minute retry are added
+by the broker scheduler separately. Two DRNs may share one record and lock only when their
+`tokenEndpoint`, `clientId` and `seedPath` match. The record needs its own file-name stem: the broker writes
 `<stem>.tmp-<pid>` beside it and sweeps `<stem>.tmp-*` under the lock, so a sibling with the same
 stem (for example ChatGPT `auth.json` beside `auth.oauth`) shares those temporaries. The configured
 endpoint must use HTTPS or literal loopback HTTP; redirects and ambient proxies are disabled.
 
-`reauthorization-required` means the OAuth error code says the token family is retired: re-import
-a working record. Other 4xx responses are `rejected`, 5xx and connection failures are `transport`,
+`reauthorization-required` means a listed OAuth error code retired the family: install a new seed.
+Only listed reauthorization codes and bootstrap reflection seal; a sealed use makes no HTTP call.
+Other 4xx responses (including non-JSON bodies) are `rejected`, 5xx and connection failures are `transport`,
 a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
 `insecure-file`; a missing file is `io`.
 `bootstrap-reflected` means the access contains the current or predecessor refresh token; a
-reflected rotation is saved already expired (`expiresAt: 0`), so the next resolution refreshes
-again rather than serving it.
+reflected rotation seals instead of serving it.
 `too-large` means the record file on read or the response headers exceed their ceilings, or the
 returned token exceeds the final material limit after the rotation is saved. An over-ceiling
 response body or serialized record is `malformed`.
 `internal` means a blocking or refresh task did not complete.
-If saving a rotated token fails, an otherwise valid invocation still returns the new access token
-and logs the path and I/O error. A refresh whose response is lost costs
-one re-import: the old refresh token remains on disk, and the next use may get `invalid_grant`.
-A rotation the broker cannot parse or cannot save costs the same re-import.
+If saving a rotated token fails, the resolution refuses and logs no path or credential value.
+A later attempt may retry; after a restart the on-disk predecessor may be spent again, receive a
+reused-token response and seal, requiring a fresh seed. There is no durable spent marker.
+Malformed records refuse per use; reset by deleting the record and providing a new seed.
 
 The broker image is distroless: it has no shell, `cat`, `mv`, or `tar`, so neither `kubectl exec` with
 `sh` nor `kubectl cp` works. To enroll or reset from a trusted local `record.json`, stop the broker

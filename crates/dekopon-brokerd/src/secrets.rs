@@ -324,6 +324,7 @@ impl SecretResolver for MapResolver {
                 target: "credential",
                 "broker.credential.refresh",
                 credential = %secret,
+                trigger = "use",
                 outcome = tracing::field::Empty,
                 secret.source.kind = "oauth2-refresh",
                 duration_ms = tracing::field::Empty,
@@ -342,7 +343,7 @@ impl SecretResolver for MapResolver {
             | SecretSource::KubernetesApi { .. } => tracing::Span::none(),
         };
         let bytes = self
-            .resolve_source(&entry.source, &entry.client)
+            .resolve_source_for(Some(secret), &entry.source, &entry.client)
             .instrument(span)
             .await
             .map_err(|error| {
@@ -371,12 +372,22 @@ impl SecretResolver for MapResolver {
 }
 
 impl MapResolver {
+    #[cfg(test)]
+    async fn resolve_source(
+        &self,
+        source: &SecretSource,
+        client: &reqwest::Client,
+    ) -> Result<Vec<u8>, SourceError> {
+        self.resolve_source_for(None, source, client).await
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    async fn resolve_source(
+    async fn resolve_source_for(
         &self,
+        credential: Option<&SecretDrn>,
         source: &SecretSource,
         client: &reqwest::Client,
     ) -> Result<Vec<u8>, SourceError> {
@@ -393,14 +404,18 @@ impl MapResolver {
                 client_id,
                 timeout_ms,
                 refresh,
-                ..
+                seed_path,
             } => {
                 let _mode = refresh;
-                oauth2::resolve(
-                    record_path,
-                    token_endpoint,
-                    client_id,
-                    *timeout_ms,
+                oauth2::resolve_for(
+                    credential,
+                    oauth2::OAuth2Source {
+                        path: record_path,
+                        seed_path: seed_path.as_deref(),
+                        endpoint: token_endpoint,
+                        client_id,
+                        timeout_ms: *timeout_ms,
+                    },
                     self.expected_uid,
                     client,
                 )
@@ -1383,15 +1398,18 @@ async fn validate_map(
             record_path,
             token_endpoint,
             client_id,
+            seed_path,
             ..
         } = &entry.source
         {
             let owners = oauth2_records.entry(record_path.clone()).or_default();
             for owner in owners.iter() {
-                if owner.token_endpoint != *token_endpoint || owner.client_id != *client_id {
+                if owner.token_endpoint != *token_endpoint
+                    || owner.client_id != *client_id
+                    || owner.seed_path != *seed_path
+                {
                     problems.push(format!(
-                        "oauth2Refresh record {} has conflicting tokenEndpoint or clientId for {} and {}",
-                        record_path.display(),
+                        "oauth2Refresh record has conflicting tokenEndpoint, clientId or seedPath for {} and {}",
                         owner.drn,
                         entry.drn,
                     ));
@@ -1401,6 +1419,7 @@ async fn validate_map(
                 drn: entry.drn.clone(),
                 token_endpoint: token_endpoint.clone(),
                 client_id: client_id.clone(),
+                seed_path: seed_path.clone(),
             });
         }
         if let Some(path) = entry.source.bootstrap_path() {
@@ -1490,6 +1509,23 @@ async fn validate_map(
             "secret bindings contain {} entries; maximum is {MAX_SECRET_BINDINGS}",
             bindings.len()
         ));
+    }
+    for (drn, (source, _)) in &entries {
+        if let SecretSource::OAuth2Refresh {
+            seed_path: Some(path),
+            ..
+        } = source
+        {
+            match tokio::fs::symlink_metadata(path).await {
+                Ok(_) => {
+                    if read_token(path, expected_uid).await.is_err() {
+                        problems.push(format!("{drn} seedPath is not a protected private token"));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => problems.push(format!("{drn} seedPath cannot be inspected")),
+            }
+        }
     }
     if !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
@@ -1754,6 +1790,7 @@ struct OAuth2RecordOwner {
     drn: SecretDrn,
     token_endpoint: String,
     client_id: String,
+    seed_path: Option<PathBuf>,
 }
 
 fn headers_within_limits(response: &reqwest::Response) -> bool {
