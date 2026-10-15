@@ -361,16 +361,26 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
     assert_eq!(subjects, [subject(), OTHER.parse().expect("other subject")]);
     assert_eq!(driver.replies(), ["a1", "a2"]);
     let records = capture.records();
-    let completed = records.iter().position(|record| matches!(record,
-        Record::Span { name: "gateway.message", fields, .. } if fields.contains("outcome=\"answered\""))).expect("holder outcome");
+    let completed = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                Record::Span {
+                    name: "gateway.message",
+                    ..
+                }
+            ) && record.field("outcome") == Some("answered")
+        })
+        .expect("holder outcome");
     let finished_receipts: Vec<_> = records
         .iter()
         .enumerate()
         .filter_map(|(index, record)| match record {
-            Record::Event { fields, parent, .. }
-                if fields.contains("gateway_input_disposition") =>
+            Record::Event { parent, .. }
+                if record.field("event") == Some("gateway_input_disposition") =>
             {
-                assert!(fields.contains("outcome=\"answered\""), "{fields}");
+                assert_eq!(record.field("outcome"), Some("answered"), "{record:?}");
                 Some((index, parent.as_deref()))
             }
             _ => None,
@@ -380,8 +390,8 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
-            matches!(record, Record::Span { name: "gateway.session", fields, .. }
-            if fields.contains("gen_ai.operation.name=\"invoke_agent\""))
+            matches!(record, Record::Span { name: "gateway.session", .. }
+            if record.field("gen_ai.operation.name") == Some("invoke_agent"))
             .then_some(index)
         })
         .collect();

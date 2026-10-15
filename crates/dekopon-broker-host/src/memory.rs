@@ -301,7 +301,7 @@ mod tests {
             }
             assert_eq!(guest.data().refusal().map(|r| r.requested), Some(PAGE));
         });
-        assert!(capture.records().iter().any(|record| matches!(record, Record::Event { target, fields, level, .. } if target == "memory" && level == &"WARN" && fields.contains("message=memory.refused"))));
+        assert!(capture.records().iter().any(|record| matches!(record, Record::Event { target, level, .. } if target == "memory" && level == &"WARN" && record.field("message") == Some("memory.refused"))));
         let refusals = capture
             .events()
             .into_iter()
@@ -397,7 +397,7 @@ mod tests {
             limiter.finish("succeeded");
             drop(limiter);
         });
-        assert!(capture.records().iter().any(|record| matches!(record, Record::Event { target, fields, level, .. } if target == "memory" && level == &"INFO" && fields.contains("message=memory.store"))));
+        assert!(capture.records().iter().any(|record| matches!(record, Record::Event { target, level, .. } if target == "memory" && level == &"INFO" && record.field("message") == Some("memory.store"))));
         let events = capture.events();
         assert_eq!(events.len(), 1, "{}", capture.text());
         let (fields, parent) = &events[0];

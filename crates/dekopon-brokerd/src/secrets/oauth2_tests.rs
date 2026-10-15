@@ -586,7 +586,7 @@ async fn a_rotation_whose_save_fails_still_returns_the_token() {
                 level: "ERROR",
                 fields,
                 ..
-            } => Some(fields),
+            } => Some(fields.to_string()),
             Record::Event { .. } | Record::Span { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -618,8 +618,9 @@ async fn a_group_readable_or_missing_record_fails_without_a_refresh() {
     );
     assert!(capture.records().iter().any(|record| matches!(
         record,
-        Record::Event { parent: Some(parent), fields, .. }
-            if parent == "broker.credential.refresh" && fields.contains("file-hygiene")
+        Record::Event { parent: Some(parent), .. }
+            if parent == "broker.credential.refresh"
+                && record.field("cause_type") == Some("file-hygiene")
     )));
     fs::remove_file(&path).unwrap();
     assert_eq!(

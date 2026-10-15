@@ -115,41 +115,15 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-fn audit_records(captured: &CaptureLayer) -> Vec<(String, Option<String>)> {
-    captured
-        .records()
-        .into_iter()
-        .filter_map(|record| match record {
-            Record::Event {
-                target,
-                fields,
-                parent,
-                ..
-            } if target == "dekopon_broker::audit" => Some((fields, parent)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn only<'a>(
-    records: &'a [(String, Option<String>)],
-    needles: &[&str],
-) -> (&'a str, Option<&'a str>) {
-    let mut matching = records
-        .iter()
-        .filter(|(fields, _)| needles.iter().all(|needle| fields.contains(needle)));
-    let (fields, parent) = matching.next().unwrap_or_else(|| {
-        panic!("no audit record matched {needles:?} among {records:?}");
+fn only(captured: &CaptureLayer, fields: &[(&str, &str)]) -> Record {
+    let matching = captured.events_where("dekopon_broker::audit", fields);
+    let [record] = <[Record; 1]>::try_from(matching).unwrap_or_else(|matching| {
+        panic!(
+            "{} audit records matched {fields:?}: {matching:?}",
+            matching.len()
+        )
     });
-    assert!(
-        matching.next().is_none(),
-        "more than one audit record matched {needles:?} among {records:?}"
-    );
-    (fields.as_str(), parent.as_deref())
+    record
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -239,59 +213,59 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     .expect("an unconstrained capability is still an accounted decision");
     assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
 
-    let records = audit_records(&captured);
+    let records = captured.events_where("dekopon_broker::audit", &[]);
     assert_eq!(
         records.len(),
         3,
         "one decision each and one execution, no more and no fewer: {records:?}"
     );
 
-    let (decision, parent) = only(
-        &records,
-        &["broker.decision", "invocation.id=invoke-audited"],
+    let decision = only(
+        &captured,
+        &[
+            ("audit.event", "broker.decision"),
+            ("invocation.id", "invoke-audited"),
+        ],
     );
-    assert_eq!(parent, Some("broker.execute"), "{decision}");
-    for expected in [
-        "capability.id=http-probe.fetch",
-        "decision.allowed=true",
-        "principal=\"caller\"",
-        "actor.kind=\"agent\"",
-        "actor.id=\"provider-test\"",
-        "provider=\"http-probe\"",
-        "policy.revision=\"policy-test\"",
-        "policy.ids=\"http-fetch\"",
-        "policy.digest=",
+    assert_eq!(decision.parent(), Some("broker.execute"), "{decision:?}");
+    for (name, value) in [
+        ("capability.id", "http-probe.fetch"),
+        ("decision.allowed", "true"),
+        ("principal", "caller"),
+        ("actor.kind", "agent"),
+        ("actor.id", "provider-test"),
+        ("provider", "http-probe"),
+        ("policy.revision", "policy-test"),
+        ("policy.ids", "http-fetch"),
     ] {
-        assert!(
-            decision.contains(expected),
-            "{expected} missing: {decision}"
-        );
+        assert_eq!(decision.field(name), Some(value), "{name}: {decision:?}");
     }
+    assert!(decision.field("policy.digest").is_some(), "{decision:?}");
 
-    let (execution, parent) = only(&records, &["broker.execution"]);
-    assert_eq!(parent, Some("broker.execute"), "{execution}");
-    assert!(!execution.contains("output.digest="), "{execution}");
-    for expected in [
-        "invocation.id=invoke-audited",
-        "outcome=Succeeded",
-        "effect=ReadOnly",
-        "risk=Low",
-        "credential=\"fetch-token\"",
-        "\\\"credentialInjected\\\":true",
+    let execution = only(&captured, &[("audit.event", "broker.execution")]);
+    assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
+    assert_eq!(execution.field("output.digest"), None, "{execution:?}");
+    for (name, value) in [
+        ("invocation.id", "invoke-audited"),
+        ("outcome", "Succeeded"),
+        ("effect", "ReadOnly"),
+        ("risk", "Low"),
+        ("credential", "fetch-token"),
     ] {
-        assert!(
-            execution.contains(expected),
-            "{expected} missing: {execution}"
-        );
+        assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
     }
-    let (refusal, parent) = only(&records, &["invocation.id=invoke-refused"]);
-    assert_eq!(parent, Some("broker.authorize"), "{refusal}");
-    assert!(refusal.contains("decision.allowed=false"), "{refusal}");
-    assert!(
-        refusal.contains("decision.reason=\"unconstrained-capability\""),
-        "{refusal}"
+    let calls: serde_json::Value =
+        serde_json::from_str(execution.field("http.calls").unwrap()).unwrap();
+    assert_eq!(calls[0]["credentialInjected"], true, "{calls}");
+
+    let refusal = only(&captured, &[("invocation.id", "invoke-refused")]);
+    assert_eq!(refusal.parent(), Some("broker.authorize"), "{refusal:?}");
+    assert_eq!(refusal.field("decision.allowed"), Some("false"));
+    assert_eq!(
+        refusal.field("decision.reason"),
+        Some("unconstrained-capability")
     );
-    assert!(!refusal.contains("policy.ids="), "{refusal}");
+    assert_eq!(refusal.field("policy.ids"), None, "{refusal:?}");
 
     let everything = captured.events_text() + &captured.spans_text();
     assert!(!everything.contains(SECRET), "a record leaked the secret");

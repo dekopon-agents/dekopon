@@ -309,8 +309,8 @@ mod tests {
             ("cleanup", "transport.delivery"),
         ] {
             let spans = capture.records().into_iter().filter(|record| matches!(record,
-                Record::Span { name: "asset.spool", fields, parent: actual }
-                if fields.contains(&format!("operation=\"{operation}\"")) && actual.as_deref() == Some(parent)
+                Record::Span { name: "asset.spool", parent: actual, .. }
+                if record.field("operation") == Some(operation) && actual.as_deref() == Some(parent)
             )).count();
             assert_eq!(spans, 2, "{}", capture.text());
         }
@@ -323,8 +323,8 @@ mod tests {
             .records()
             .into_iter()
             .filter(|record| {
-                matches!(record, Record::Span { name: "asset.spool", fields, .. }
-                    if fields.contains(&"operation=\"read\"".to_owned()))
+                matches!(record, Record::Span { name: "asset.spool", .. }
+                    if record.field("operation") == Some("read"))
             })
             .count()
     }

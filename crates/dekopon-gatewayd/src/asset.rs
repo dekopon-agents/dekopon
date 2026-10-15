@@ -1508,8 +1508,8 @@ mod retention_tests {
             tracing::info!(target: "legacy_gateway::audit", "wrong audit target");
         });
         assert!(capture.records().iter().any(|record| matches!(record,
-            dekopon_test_support::Record::Event { target, fields, parent: Some(parent), .. }
-            if target == "dekopon_gatewayd::audit" && fields.contains("gateway.asset.retention_miss") && parent == "gateway.session")));
+            dekopon_test_support::Record::Event { target, parent: Some(parent), .. }
+            if target == "dekopon_gatewayd::audit" && record.field("audit.event") == Some("gateway.asset.retention_miss") && parent == "gateway.session")));
         assert!(capture.records().iter().any(|record| matches!(
             record,
             dekopon_test_support::Record::Span {
@@ -1747,8 +1747,8 @@ mod retention_tests {
             let pin = store.admit(&access, pinned_id, PNG).unwrap();
             let is_write = |record: &dekopon_test_support::Record| {
                 matches!(record,
-                dekopon_test_support::Record::Span { name: "asset.spool", fields, .. }
-                if fields.contains("write"))
+                dekopon_test_support::Record::Span { name: "asset.spool", .. }
+                if record.field("operation") == Some("write"))
             };
             assert!(
                 capture.records().iter().any(is_write),

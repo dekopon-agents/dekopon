@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod broker;
 mod capture;
 mod driver;
 mod model;
@@ -20,7 +21,8 @@ mod model;
 mod runtime;
 mod transcripts;
 
-pub use capture::{CaptureLayer, Record};
+pub use broker::{BrokerFixture, Reply};
+pub use capture::{CaptureLayer, Fields, Record};
 pub use driver::{
     DriverCall, FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver,
     RecordingProgress, RecordingReaction, RecordingStatus, RecordingSteerAck, RecordingStream,

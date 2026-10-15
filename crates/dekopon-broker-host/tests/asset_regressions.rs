@@ -208,7 +208,16 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             .unwrap();
         assert_eq!(stdout.json(), json!({"read":payload.len()}));
         let records = capture.records();
-        let hashes = records.iter().filter(|record| matches!(record, dekopon_test_support::Record::Event { fields, scope, .. } if fields.contains(&format!("asset.id={id}")) && fields.contains(&hash) && fields.contains(r#"asset.content_type="text/plain""#) && scope.contains(&"provider.invoke"))).count();
+        let id = id.to_string();
+        let hashes = records
+            .iter()
+            .filter(|record| {
+                matches!(record, dekopon_test_support::Record::Event { scope, .. } if scope.contains(&"provider.invoke"))
+                    && record.field("asset.id") == Some(id.as_str())
+                    && record.field("asset.sha256") == Some(hash.as_str())
+                    && record.field("asset.content_type") == Some("text/plain")
+            })
+            .count();
         assert_eq!(hashes, 1);
     }
     assert!(
