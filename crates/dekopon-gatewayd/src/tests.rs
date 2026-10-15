@@ -53,9 +53,9 @@ use crate::{
     cache_key,
     config::{
         self, ConfigError, ConfigProblem, DEFAULT_FORGET_AFTER, DEFAULT_SCRIPT_TIMEOUT_MS,
-        LivenessConfig, LivenessMode, LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow,
-        ModelConfig, ProgressSurface, RecallSource, ResolvedBroker, ResolvedLiveness, SeenReaction,
-        SlackExperience, WorkingReaction,
+        IndicatorSurface, LivenessConfig, LivenessMode, LivenessSettings, MemoryPolicy,
+        MemoryScope, MemoryWindow, ModelConfig, ProgressSurface, RecallSource, ResolvedBroker,
+        ResolvedLiveness, SeenReaction, SlackExperience, WorkingReaction,
     },
     conversation::{
         ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
@@ -2095,8 +2095,9 @@ fn rendered_target(target: &LivenessTarget) -> String {
         LivenessTarget::Slack {
             channel_id,
             thread_ts,
+            message_ts,
             ..
-        } => format!("slack:{channel_id}:{thread_ts}"),
+        } => format!("slack:{channel_id}:{thread_ts}:{message_ts}"),
         LivenessTarget::Discord {
             channel_id,
             message_id,
@@ -2107,7 +2108,10 @@ fn rendered_target(target: &LivenessTarget) -> String {
             message_id,
             ..
         } => format!("telegram:{chat_id}:{message_id}"),
-        LivenessTarget::WhatsApp { recipient, .. } => format!("whatsapp:{recipient}"),
+        LivenessTarget::WhatsApp {
+            recipient,
+            inbound_message_id,
+        } => format!("whatsapp:{recipient}:{inbound_message_id}"),
         LivenessTarget::Local { connection } => format!("local:{connection}"),
     }
 }
@@ -3926,6 +3930,313 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
         .await
         .expect("the service's own indicator is returned to rest after the answer");
     assert_eq!(driver.events(), ["working-start", "reply", "idle"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
+    use dekopon_test_support::DriverCall;
+
+    for (working, status, typing, status_off, typing_off, reaction_expected) in [
+        (WorkingReaction::Off, false, false, false, false, false),
+        (WorkingReaction::On, true, false, false, false, true),
+        (WorkingReaction::On, false, true, false, false, true),
+        (WorkingReaction::Auto, true, false, false, false, false),
+        (WorkingReaction::Auto, false, true, false, false, false),
+        (WorkingReaction::Auto, false, false, false, false, true),
+        (WorkingReaction::Auto, true, true, true, true, true),
+        (WorkingReaction::Auto, true, true, true, false, false),
+    ] {
+        let directory = temporary();
+        let (broker, _) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let mut driver = RecordingDriver::default().with_reaction();
+        if status {
+            driver = driver.with_status();
+        }
+        if typing {
+            driver = driver.with_typing(Duration::from_secs(3600));
+        }
+        let driver = Arc::new(driver);
+        let mut route = route(model_config());
+        route.indicators.insert(
+            ConversationKind::DirectMessage,
+            Arc::new(ResolvedLiveness {
+                settings: LivenessSettings {
+                    mode: LivenessMode::Native,
+                    working,
+                    seen: SeenReaction::On,
+                    status: if status_off {
+                        IndicatorSurface::Off
+                    } else {
+                        IndicatorSurface::Auto
+                    },
+                    typing: if typing_off {
+                        IndicatorSurface::Off
+                    } else {
+                        IndicatorSurface::Auto
+                    },
+                    progress: ProgressSurface::Auto,
+                    ..LivenessSettings::default()
+                },
+                ..ResolvedLiveness::default()
+            }),
+        );
+        let mut inbound = message("answer me");
+        let target = LivenessTarget::Discord {
+            channel_id: "200000000000000001".to_owned(),
+            message_id: "300000000000000002".to_owned(),
+            conversation_id: inbound.conversation.key(),
+        };
+        inbound.liveness = Some(target.clone());
+        let model = BlockedModel::new("All good.");
+        let session = tokio::spawn(run_session(
+            runner_with(
+                broker,
+                Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+                4,
+            ),
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        model.wait_until_entered().await;
+        model.release();
+        session.await.expect("session completes");
+        if reaction_expected {
+            driver
+                .reaction_object()
+                .expect("reaction")
+                .wait_for_calls(2)
+                .await;
+        }
+        let calls = driver.calls();
+        let reactions: Vec<_> = calls
+            .iter()
+            .filter_map(|call| match call {
+                DriverCall::Reaction { target, present } => Some((target.as_str(), *present)),
+                _ => None,
+            })
+            .collect();
+        let expected_target = rendered_target(&target);
+        assert_eq!(
+            reactions,
+            if reaction_expected {
+                vec![
+                    (expected_target.as_str(), true),
+                    (expected_target.as_str(), false),
+                ]
+            } else {
+                vec![]
+            },
+            "working={working:?} status={status} typing={typing}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(
+                    call,
+                    DriverCall::Status {
+                        status: "working",
+                        ..
+                    }
+                ))
+                .count(),
+            usize::from(status && !status_off)
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DriverCall::Typing { .. }))
+                .count(),
+            usize::from(typing && !typing_off && (status_off || !status))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, DriverCall::Seen { .. })),
+            "seen is independent of working"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, DriverCall::Reply { text, .. } if text == "All good."))
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_working_reaction_is_cleared_without_losing_the_reply() {
+    use dekopon_test_support::{DriverCall, FailureKind};
+
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let driver = Arc::new(
+        RecordingDriver::default()
+            .with_reaction()
+            .configure_reaction(|reaction| reaction.failing_call(0, FailureKind::Response)),
+    );
+    let model = BlockedModel::new("still delivered");
+    let mut route = route(model_config());
+    route.indicators.insert(
+        ConversationKind::DirectMessage,
+        Arc::new(ResolvedLiveness {
+            settings: LivenessSettings {
+                mode: LivenessMode::Native,
+                working: WorkingReaction::On,
+                progress: ProgressSurface::Auto,
+                ..LivenessSettings::default()
+            },
+            ..ResolvedLiveness::default()
+        }),
+    );
+    let mut inbound = message("work");
+    inbound.liveness = Some(LivenessTarget::Discord {
+        channel_id: "200000000000000001".to_owned(),
+        message_id: "300000000000000002".to_owned(),
+        conversation_id: inbound.conversation.key(),
+    });
+    let running = tokio::spawn(run_session(
+        runner_with(
+            broker,
+            Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+            4,
+        ),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_entered().await;
+    model.release();
+    running.await.expect("turn finishes");
+    driver
+        .reaction_object()
+        .expect("reaction")
+        .wait_for_calls(2)
+        .await;
+    let calls = driver.calls();
+    assert!(matches!(
+        &calls[0],
+        DriverCall::Reaction { present: true, .. }
+    ));
+    assert!(
+        calls.iter().any(
+            |call| matches!(call, DriverCall::Reply { text, .. } if text == "still delivered")
+        )
+    );
+    assert!(matches!(
+        calls.last(),
+        Some(DriverCall::Reaction { present: false, .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_drivers() {
+    use dekopon_test_support::DriverCall;
+
+    for transport in ["slack", "discord", "whatsapp"] {
+        let directory = temporary();
+        let (broker, _) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let model = BlockedModel::new("final answer");
+        let runner = runner_with(
+            broker,
+            Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+            4,
+        );
+        let driver = Arc::new(RecordingDriver::default().with_steer_ack());
+        let mut route = route(model_config());
+        route.indicators.insert(
+            ConversationKind::DirectMessage,
+            Arc::new(ResolvedLiveness {
+                settings: LivenessSettings {
+                    mode: LivenessMode::Native,
+                    seen: SeenReaction::On,
+                    ..LivenessSettings::default()
+                },
+                ..ResolvedLiveness::default()
+            }),
+        );
+        let target = |id: &str| match transport {
+            "slack" => LivenessTarget::Slack {
+                channel_id: "D123".to_owned(),
+                thread_ts: "1700000000.000001".to_owned(),
+                message_ts: id.to_owned(),
+                initiator_user_id: "U123".to_owned(),
+                conversation_id: "dev".to_owned(),
+            },
+            "discord" => LivenessTarget::Discord {
+                channel_id: "200000000000000001".to_owned(),
+                message_id: id.to_owned(),
+                conversation_id: "dev".to_owned(),
+            },
+            "whatsapp" => LivenessTarget::WhatsApp {
+                recipient: "16034700182".to_owned(),
+                inbound_message_id: id.to_owned(),
+            },
+            _ => unreachable!(),
+        };
+        let mut first = message("first");
+        first.liveness = Some(target("inbound-1"));
+        let running = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            first,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        model.wait_until_entered().await;
+        let mut second = message("second");
+        second.message_id = MessageId::Native("0123456789abcdef0123456789abcdef-2-2".to_owned());
+        second.liveness = Some(target("inbound-2"));
+        run_session(
+            runner,
+            route,
+            second,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(
+            driver
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    DriverCall::Seen { target } => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [rendered_target(&target("inbound-2"))],
+            "{transport}"
+        );
+        assert!(
+            !driver
+                .calls()
+                .iter()
+                .any(|call| matches!(call, DriverCall::Reaction { .. }))
+        );
+        model.release();
+        running.await.expect("first turn finishes");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7252,7 +7563,7 @@ fn slack(endpoint: &str) -> crate::transport::slack::SlackTransport {
 fn slack_with(
     endpoint: &str,
     experience: SlackExperience,
-    liveness: LivenessConfig,
+    _liveness: LivenessConfig,
 ) -> crate::transport::slack::SlackTransport {
     crate::transport::slack::SlackTransport::new(
         "scientist-slack".to_owned(),
@@ -7260,7 +7571,6 @@ fn slack_with(
         "xapp-test-app-token".to_owned(),
         "xoxb-test-bot-token".to_owned(),
         experience,
-        liveness.settings(),
     )
     .expect("slack transport builds")
 }
@@ -8119,8 +8429,8 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
             Some(status) => {
                 assert_eq!(session, 0, "the refusal is remembered across sessions");
                 assert!(
-                    driver.reaction().is_none(),
-                    "the fallback is not offered while the native status is live"
+                    driver.reaction().is_some(),
+                    "the policy selects fallback or additive reactions"
                 );
                 let refused = status
                     .set(&target, Status::Working)

@@ -897,12 +897,11 @@ never a second gateway message beside it, which is why `stream: true` means the 
 surface and no separate progress line is posted.
 
 **Opt-in by default.** An absent indicator block or `mode: off` disables all intermediate
-presentation. Both `reaction.working` and `reaction.seen` default to `off`; the S1 runtime gates
-working and steer reactions on these resolved settings. With `mode: native`, omitted `progress`
-means `auto`, which currently prefers native status, then typing. The schema accepts
-`reaction.working: on|auto` and `status`/`typing: off`, but S1 does **not yet** implement additive
-`on` or consistently honor the status/typing leaves: S2 owns working-reaction selection and
-presentation evaluation. Do not rely on those opt-ins until S2 lands. Healthy Slack Agent status or Telegram/Discord typing
+presentation. Both `reaction.working` and `reaction.seen` default to `off`. With
+`mode: native`, omitted `progress` means `auto`, which prefers enabled native status,
+then typing. `reaction.working: on` adds a reaction beside those surfaces, while `auto`
+falls back only when neither is active; `status: off` and `typing: off` disable their
+respective surfaces. Healthy Slack Agent status or Telegram/Discord typing
 therefore needs no placeholder message; the complete answer is a fresh reply. WhatsApp remains
 typing-only. Slack's definitive native-status refusal exposes its configured reaction fallback in
 the same session without changing the configured conversation experience. Transient errors do not

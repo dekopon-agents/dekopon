@@ -408,6 +408,19 @@ impl RecordingDriver {
     }
 
     #[must_use]
+    pub fn configure_reaction(
+        mut self,
+        configure: impl FnOnce(RecordingReaction) -> RecordingReaction,
+    ) -> Self {
+        let reaction = self
+            .reaction
+            .take()
+            .expect("the reaction object is present");
+        self.reaction = Some(configure(reaction));
+        self
+    }
+
+    #[must_use]
     pub fn failing_replies_from(self, index: usize, kind: FailureKind) -> Self {
         *self.replies.from.lock() = Some((index, kind));
         self

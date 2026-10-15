@@ -667,6 +667,7 @@ impl ModelHold {
 #[derive(Default)]
 struct Timing {
     jobs: bool,
+    route_seen_only: bool,
     keep_alive: Option<Value>,
     model_delay: Duration,
     model_hold: Option<ModelHold>,
@@ -747,6 +748,13 @@ async fn boot_with(
     }
     if timing.jobs {
         config["routes"][0]["limits"]["jobTimeoutMs"] = json!(20_000);
+    }
+    if timing.route_seen_only {
+        config["transports"][0]
+            .as_object_mut()
+            .expect("transport")
+            .remove("indicators");
+        config["routes"][0]["indicators"] = json!({"mode": "native", "reaction": {"seen": "on"}});
     }
     write_owner_only(
         &gateway_path,
@@ -1436,6 +1444,43 @@ async fn keep_alive_ticks_edit_one_message_until_the_budget_stops_them() {
             .expect("the answer carries text"),
         "That took a while."
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn route_only_seen_reaches_the_local_steer_frame() {
+    let _audit = Audit::exclusive().await;
+    let hold = ModelHold::new();
+    let fixture = boot_with(
+        temporary(),
+        vec![final_answer("discarded"), final_answer("finished")],
+        None,
+        "plain",
+        false,
+        &Timing {
+            model_hold: Some(hold.clone()),
+            route_seen_only: true,
+            ..Timing::default()
+        },
+    )
+    .await;
+    let socket = fixture.socket();
+    let asking = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "first"));
+    hold.wait_until_entered().await;
+    let stream = UnixStream::connect(fixture.socket()).expect("steering connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read bound");
+    let seen = tokio::task::spawn_blocking(move || {
+        ask_lines_on(stream, MAPPED_SUBJECT, "second", |value| {
+            value["reaction"] == true
+        })
+    })
+    .await
+    .expect("steer frame");
+    assert_eq!(seen, [json!({"reaction": true})]);
+    hold.release();
+    assert_eq!(asking.await.expect("answer"), "finished");
     fixture.shutdown().await;
 }
 

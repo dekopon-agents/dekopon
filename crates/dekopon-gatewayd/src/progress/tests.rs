@@ -1335,10 +1335,10 @@ async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
         harness.recorder.calls(),
         vec![
             Call::Reaction(true),
-            Call::Typing,
-            Call::Status(Status::Working)
+            Call::Status(Status::Working),
+            Call::Typing
         ],
-        "the cheapest signal first, then the lease, then the durable state"
+        "additive reaction accompanies status and typing"
     );
 
     harness.sink.emit(answered_with_tool(1));
