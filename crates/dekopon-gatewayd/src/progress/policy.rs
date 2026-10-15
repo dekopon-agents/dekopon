@@ -28,8 +28,8 @@ use crate::{
     },
     session::SessionCancellation,
     transport::{
-        ChatDriver, LivenessTarget, MessageRef, OutboundReply, ReplyTarget, Status, StreamedText,
-        TransportError,
+        ChatDriver, LivenessTarget, MessageRef, NativeStatus, OutboundReply, ReplyTarget, Status,
+        StreamedText, TransportError,
     },
 };
 
@@ -559,9 +559,7 @@ impl Live {
         if !auto && self.settings.typing == IndicatorSurface::Auto {
             self.renew_typing().await;
         }
-        if self.settings.status == IndicatorSurface::Auto
-            && let Some(status) = driver.status()
-        {
+        if let Some(status) = native_status(&*driver, &self.settings) {
             self.status_attempted = true;
             let outcome = bounded(status.set(&target, Status::Working)).await;
             self.status_active = outcome.is_ok();
@@ -753,7 +751,7 @@ impl Live {
         let outcome = if let Some(status_text) = status_text {
             if self.status_text == StatusTextState::Waiting {
                 self.status_text = StatusTextState::HandedOver;
-                if let Some(status) = driver.status() {
+                if let Some(status) = native_status(&*driver, &self.settings) {
                     self.status_attempted = true;
                     let outcome = bounded(status.set(&target, Status::Idle)).await;
                     self.observe(outcome, "status");
@@ -815,7 +813,9 @@ impl Live {
         }
         self.status_text = StatusTextState::RestoreAttempted;
         let driver = Arc::clone(&self.driver);
-        if let (Some(target), Some(status)) = (&self.target, driver.status()) {
+        if let (Some(target), Some(status)) =
+            (&self.target, native_status(&*driver, &self.settings))
+        {
             self.status_attempted = true;
             let outcome = bounded(status.set(target, Status::Working)).await;
             self.observe(outcome, "status");
@@ -1080,7 +1080,7 @@ impl Live {
         };
         let driver = Arc::clone(&self.driver);
         if self.status_attempted
-            && let Some(status) = driver.status()
+            && let Some(status) = native_status(&*driver, &self.settings)
         {
             let outcome = bounded(status.set(&target, Status::Idle)).await;
             self.observe(outcome, "status");
@@ -1113,6 +1113,16 @@ impl Live {
             }
             Err(category) => breaker.failed(&self.transport, primitive, category),
         }
+    }
+}
+
+fn native_status<'a>(
+    driver: &'a dyn ChatDriver,
+    settings: &LivenessSettings,
+) -> Option<&'a dyn NativeStatus> {
+    match settings.status {
+        IndicatorSurface::Auto => driver.status(),
+        IndicatorSurface::Off => None,
     }
 }
 
