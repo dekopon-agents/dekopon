@@ -219,7 +219,6 @@ async fn broker_over<A: AuditLog>(policies: &str, audit: Arc<A>) -> Arc<Broker<A
             "broker-test"
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
-            "policy-test".to_owned(),
             probe_engine(policies, ["caller", "cpetersen"]),
             probe_catalog(),
             CredentialStore::empty(),
@@ -920,7 +919,6 @@ async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
         Broker::new(
             registry,
             "broker-test".parse().unwrap(),
-            "policy-test".to_owned(),
             probe_engine(POLICY, ["caller", "cpetersen"]),
             probe_catalog(),
             CredentialStore::empty(),
@@ -1537,7 +1535,6 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         Broker::new(
             registry,
             "broker-test".parse().unwrap(),
-            "policy-test".to_owned(),
             engine,
             catalog,
             CredentialStore::empty(),
@@ -1776,7 +1773,6 @@ impl SpawnBroker {
             Broker::new(
                 registry,
                 "broker-test".parse().unwrap(),
-                "policy-test".to_owned(),
                 spawn_policy(),
                 spawn_catalog(),
                 CredentialStore::empty(),

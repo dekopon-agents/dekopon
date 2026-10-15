@@ -78,7 +78,6 @@ async fn broker() -> Broker<InMemoryAuditLog> {
     Broker::new(
         registry,
         principal("broker-test"),
-        "span-payloads".to_owned(),
         PolicyEngine::new(POLICIES, &world).expect("the policy set validates"),
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         CredentialStore::empty(),

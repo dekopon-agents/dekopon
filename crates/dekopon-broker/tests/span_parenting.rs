@@ -96,7 +96,6 @@ async fn broker(audit: Arc<GatedAudit>) -> Broker<GatedAudit> {
     Broker::new(
         registry,
         principal("broker-test"),
-        "span-parenting".to_owned(),
         PolicyEngine::new(POLICIES, &world).expect("the policy set validates"),
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         CredentialStore::empty(),

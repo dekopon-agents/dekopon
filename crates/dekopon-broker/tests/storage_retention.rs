@@ -73,7 +73,6 @@ when { context.via == "gateway" && context.agent == "reviewer" };
     let broker = Broker::new(
         registry,
         "broker-test".parse().unwrap(),
-        "retention-test".to_owned(),
         policy,
         ConstraintCatalog::new([(
             capability,

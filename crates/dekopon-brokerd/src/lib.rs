@@ -104,11 +104,14 @@ where
         warning.log();
     }
     let Some(Candidate {
-        ready: Ready { broker, identities },
+        ready: Ready {
+            broker, identities, ..
+        },
         socket_path,
         provider_lock,
         limits,
         storage,
+        ..
     }) = candidate
     else {
         return Err(BrokerdError::from_problems(report.problems));
@@ -231,11 +234,20 @@ struct Candidate {
     provider_lock: Option<lock_watch::LoadedLock>,
     limits: ServerLimits,
     storage: Option<dekopon_storage_host::StorageHost>,
+    snapshot: config::ConfigSnapshot,
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
 /// did not is reported as skipped.
 async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, CheckReport) {
+    load_candidate_with(config_path, mode, None).await
+}
+
+async fn load_candidate_with(
+    config_path: &Path,
+    mode: Mode,
+    active: Option<&Candidate>,
+) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let uid = current_uid();
     let load_mode = match mode {
@@ -262,6 +274,14 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
         }
         return (None, report);
     };
+    let restart_categories = active
+        .map(|active| active.snapshot.restart_required(&config.snapshot))
+        .unwrap_or_default();
+    if !restart_categories.is_empty() {
+        report.problems.push(BrokerdError::RestartRequired {
+            categories: restart_categories.clone(),
+        });
+    }
     let providers_resolved = match mode {
         Mode::Boot => true,
         Mode::Check(providers) => {
@@ -342,11 +362,15 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
     let storage = runtime.storage.clone();
+    let snapshot = config.snapshot.clone();
     let prepared = prepare(
         config,
         frame_limits.max_frame_bytes,
         runtime,
         &mut report.warnings,
+        active
+            .filter(|_| restart_categories.is_empty())
+            .map(|candidate| candidate.ready.registry.clone()),
     )
     .await;
     drop(scratch);
@@ -358,6 +382,7 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
                 provider_lock,
                 limits,
                 storage,
+                snapshot,
             }),
             report,
         ),
@@ -544,6 +569,7 @@ struct Runtime {
 struct Ready {
     broker: Broker<TraceOnlyAuditLog>,
     identities: BTreeMap<u32, MappedPeer>,
+    registry: BrokerProviderRegistry,
 }
 
 /// Every problem found before the broker is built is returned together; the policy and the
@@ -557,29 +583,34 @@ async fn prepare(
     max_frame_bytes: usize,
     runtime: Runtime,
     warnings: &mut Vec<StartupWarning>,
+    resident_registry: Option<BrokerProviderRegistry>,
 ) -> Result<Ready, Vec<BrokerdError>> {
     let uid = current_uid();
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid).map_err(|error| vec![error.into()])?;
     }
-    let mut registry = match config.locked_providers {
-        Some(sources) => {
-            BrokerProviderRegistry::load_locked_with_options(
-                sources,
-                config.host_limits,
-                runtime.storage,
-                &config.host_options,
-            )
-            .await
-        }
-        None => {
-            BrokerProviderRegistry::load_with_options(
-                config.providers,
-                config.host_limits,
-                runtime.storage,
-                &config.host_options,
-            )
-            .await
+    let mut registry = if let Some(registry) = resident_registry {
+        Ok(registry)
+    } else {
+        match config.locked_providers {
+            Some(sources) => {
+                BrokerProviderRegistry::load_locked_with_options(
+                    sources,
+                    config.host_limits,
+                    runtime.storage,
+                    &config.host_options,
+                )
+                .await
+            }
+            None => {
+                BrokerProviderRegistry::load_with_options(
+                    config.providers,
+                    config.host_limits,
+                    runtime.storage,
+                    &config.host_options,
+                )
+                .await
+            }
         }
     }
     .map_err(|error| vec![BrokerdError::Host(error)])?;
@@ -696,20 +727,17 @@ async fn prepare(
                 .map(|(agent, binding)| (agent, binding.credentials))
                 .collect(),
         );
-    // The revision stamped on receipts and audit records is the policy set's own fingerprint, so
-    // it moves exactly when authorization can.
-    let revision = policy.digest().to_owned();
     let leniency = if config.strict {
         Leniency::Strict
     } else {
         Leniency::Tolerant
     };
+    let shared_registry = registry.clone();
     let (broker, broker_warnings) = Broker::start(
         registry,
         BROKER_PRINCIPAL
             .parse()
             .expect("the broker principal is a valid identifier"),
-        revision,
         policy,
         constraints,
         credential_store,
@@ -746,7 +774,11 @@ async fn prepare(
     }
     validate_capability_responses(&broker, &identities, max_frame_bytes)
         .map_err(|error| vec![error])?;
-    Ok(Ready { broker, identities })
+    Ok(Ready {
+        broker,
+        identities,
+        registry: shared_registry,
+    })
 }
 
 fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) -> Option<T> {
@@ -1034,6 +1066,8 @@ pub enum BrokerdError {
     Server(#[from] ServerError),
     #[error("{}", render_errors(.problems))]
     Startup { problems: Vec<BrokerdError> },
+    #[error("broker configuration changed restart-required categories: {categories:?}")]
+    RestartRequired { categories: Vec<&'static str> },
     #[error("the configuration names a providerSet; check it with --provider-set and --store")]
     ProviderSetRequired,
     #[error("the configuration names provider paths; --provider-set does not apply to it")]

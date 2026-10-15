@@ -79,7 +79,6 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tracing::Instrument as _;
 
-const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
 const POLICY_STACK_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SECRET_BINDINGS: usize = 1024;
@@ -1251,16 +1250,6 @@ impl Default for BrokerLimits {
     }
 }
 
-fn validate_policy_revision(revision: &str) -> Result<(), BrokerBuildError> {
-    if revision.trim().is_empty()
-        || revision.trim() != revision
-        || revision.len() > MAX_POLICY_REVISION_BYTES
-    {
-        return Err(BrokerBuildError::InvalidPolicyRevision);
-    }
-    Ok(())
-}
-
 /// Every value here comes from the broker's own authenticated-context view; caller-supplied
 /// proposal input is deliberately excluded so no policy can be made to depend on it.
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
@@ -1500,8 +1489,6 @@ pub enum BrokerBuildError {
         #[source]
         source: std::io::Error,
     },
-    #[error("policy revision must contain at most 256 bytes")]
-    InvalidPolicyRevision,
     #[error("configuration contains {count} constraint sets; broker maximum is {maximum}")]
     TooManyConstraintSets { count: usize, maximum: usize },
     #[error("policy permits capability {capability}, which has no constraint set")]
@@ -1773,7 +1760,6 @@ impl AuditError {
 pub struct Broker<A> {
     registry: BrokerProviderRegistry,
     policy: Arc<PolicyEngine>,
-    policy_revision: String,
     policy_digest: String,
     constraints: ConstraintCatalog,
     credentials: CredentialStore,
@@ -1799,7 +1785,6 @@ where
     pub fn new(
         registry: BrokerProviderRegistry,
         broker_principal: PrincipalId,
-        policy_revision: String,
         policy: PolicyEngine,
         constraints: ConstraintCatalog,
         credentials: CredentialStore,
@@ -1810,7 +1795,6 @@ where
         Self::start(
             registry,
             broker_principal,
-            policy_revision,
             policy,
             constraints,
             credentials,
@@ -1831,7 +1815,6 @@ where
     pub fn start(
         registry: BrokerProviderRegistry,
         broker_principal: PrincipalId,
-        policy_revision: String,
         policy: PolicyEngine,
         constraints: ConstraintCatalog,
         credentials: CredentialStore,
@@ -1847,7 +1830,6 @@ where
                 field: "max_constraint_sets",
             });
         }
-        validate_policy_revision(&policy_revision)?;
         if leniency == Leniency::Tolerant {
             // Unrouted constraint sets must be dropped before validate runs, since validate cannot
             // prove a set with no route either way.
@@ -1883,7 +1865,6 @@ where
                 registry,
                 policy_digest: policy.digest().to_owned(),
                 policy: Arc::new(policy),
-                policy_revision,
                 constraints,
                 credentials,
                 secrets: SecretCatalog::empty(),
@@ -3124,7 +3105,6 @@ where
             secret_use: request.secret_use.as_ref(),
             provider: None,
             authorized_by: &self.broker_principal,
-            policy_revision: &self.policy_revision,
             policy_ids: &policy_ids,
             policy_digest: &self.policy_digest,
             constraints: None,
@@ -3359,7 +3339,6 @@ where
             let subject = context.attested_subject().cloned();
             let provider = set.provider.clone();
             let broker_principal = self.broker_principal.clone();
-            let policy_revision = self.policy_revision.clone();
             let policy_digest = self.policy_digest.clone();
             let effect = set.effect;
             let risk = set.risk;
@@ -3403,7 +3382,6 @@ where
                     secret_use: None,
                     provider: Some(&provider),
                     authorized_by: &broker_principal,
-                    policy_revision: &policy_revision,
                     policy_ids: &result.determining_policy_ids,
                     policy_digest: &policy_digest,
                     constraints: None,
@@ -4587,7 +4565,6 @@ struct DecisionMaterial<'a> {
     secret_use: Option<&'a SecretUseProposal>,
     provider: Option<&'a ProviderId>,
     authorized_by: &'a PrincipalId,
-    policy_revision: &'a str,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     policy_ids: &'a [String],
     policy_digest: &'a str,

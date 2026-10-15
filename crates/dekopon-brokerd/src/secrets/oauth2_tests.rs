@@ -735,7 +735,6 @@ async fn two_drns_over_one_record_share_one_refresh() {
         Broker::new(
             registry,
             "broker-test".parse().unwrap(),
-            "policy-test".to_owned(),
             oauth_policy(),
             constraints,
             CredentialStore::empty(),

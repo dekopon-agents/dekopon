@@ -296,9 +296,146 @@ impl ServerLimitsConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Disposition {
+    Swap,
+    Restart,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConfigSnapshot(BTreeMap<&'static str, (Disposition, serde_yaml::Value)>);
+
+impl ConfigSnapshot {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(bytes)
+            .map_err(|source| ConfigError::Decode { source })?;
+        Ok(Self::from_mapping(&mapping))
+    }
+
+    pub(crate) fn from_mapping(mapping: &serde_yaml::Mapping) -> Self {
+        const SWAP: &[&str] = &[
+            "credentialsPath",
+            "secretMapPath",
+            "strict",
+            "identities",
+            "principals",
+            "agents",
+            "policiesPath",
+            "capabilities",
+        ];
+        const RESTART: &[&str] = &[
+            "apiVersion",
+            "socketPath",
+            "providers",
+            "providerSet",
+            "compileOnLoad",
+            "providerSettings",
+            "http",
+            "hostLimits",
+            "brokerLimits",
+            "serverLimits",
+            "assets",
+            "storage",
+            "chatMemory",
+            "telemetry",
+        ];
+        Self(
+            SWAP.iter()
+                .map(|&key| (key, Disposition::Swap))
+                .chain(RESTART.iter().map(|&key| (key, Disposition::Restart)))
+                .map(|(key, disposition)| {
+                    (
+                        key,
+                        (
+                            disposition,
+                            mapping
+                                .get(serde_yaml::Value::String(key.to_owned()))
+                                .cloned()
+                                .unwrap_or(serde_yaml::Value::Null),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn record_sources(
+        &mut self,
+        policies: &str,
+        providers: &[PathBuf],
+    ) -> Result<(), ConfigError> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt as _;
+
+        let policy_hash = Sha256::digest(policies.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.0.insert(
+            "policies",
+            (Disposition::Swap, serde_yaml::Value::String(policy_hash)),
+        );
+        let mut digests = Vec::with_capacity(providers.len());
+        for path in providers {
+            let mut file =
+                tokio::fs::File::open(path)
+                    .await
+                    .map_err(|source| ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|source| ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            let hash = digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            digests.push(serde_yaml::Value::String(format!(
+                "{}:{hash}",
+                path.display()
+            )));
+        }
+        self.0.insert(
+            "providerArtifacts",
+            (Disposition::Restart, serde_yaml::Value::Sequence(digests)),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn restart_required(&self, next: &Self) -> Vec<&'static str> {
+        self.0
+            .iter()
+            .filter_map(|(&category, (disposition, value))| match disposition {
+                Disposition::Swap => None,
+                Disposition::Restart if value == &next.0[category].1 => None,
+                Disposition::Restart => Some(if category == "providerArtifacts" {
+                    "providers"
+                } else {
+                    category
+                }),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub source: PathBuf,
+    pub(crate) snapshot: ConfigSnapshot,
     pub socket_path: PathBuf,
     pub credentials_path: Option<PathBuf>,
     pub secret_map_path: Option<PathBuf>,
@@ -373,13 +510,19 @@ pub async fn load_in(
     if !config.capabilities.is_empty() && config.policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
     }
+    let snapshot = ConfigSnapshot::from_bytes(&bytes)?;
     let mut resolved = resolve(config, path, expected_uid, mode).await?;
+    resolved.snapshot = snapshot;
     if let Some(policies_path) = resolved.policies_path.clone() {
         let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
         resolved.policies = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 {
             path: policies_path,
         })?;
     }
+    resolved
+        .snapshot
+        .record_sources(&resolved.policies, &resolved.providers)
+        .await?;
     Ok((resolved, None))
 }
 
@@ -425,6 +568,7 @@ async fn load_directory(
     };
     // A later refusal is reported as the collision it may well be caused by.
     let later = |error: ConfigError, refusal: Option<ConfigError>| refusal.unwrap_or(error);
+    let snapshot = ConfigSnapshot::from_mapping(&merged);
     let config = match serde_yaml::from_value::<BrokerdConfig>(serde_yaml::Value::Mapping(merged)) {
         Ok(config) => config,
         Err(source) => return Err(later(ConfigError::Decode { source }, refusal)),
@@ -439,6 +583,7 @@ async fn load_directory(
         Ok(resolved) => resolved,
         Err(error) => return Err(later(error, refusal)),
     };
+    resolved.snapshot = snapshot;
     let mut policies = String::new();
     for path in policy_files {
         let bytes = read_owner_only(&path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
@@ -453,6 +598,10 @@ async fn load_directory(
         }
     }
     resolved.policies = policies;
+    resolved
+        .snapshot
+        .record_sources(&resolved.policies, &resolved.providers)
+        .await?;
     Ok((resolved, refusal))
 }
 
@@ -953,6 +1102,7 @@ async fn resolve(
 
     Ok(ResolvedConfig {
         source,
+        snapshot: ConfigSnapshot::default(),
         socket_path,
         credentials_path,
         secret_map_path,

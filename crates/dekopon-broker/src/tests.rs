@@ -137,7 +137,6 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
         Broker::new(
             registry,
             "broker".parse().expect("principal"),
-            "smoke-policy".to_owned(),
             PolicyEngine::new("", &world).expect("policy"),
             ConstraintCatalog::new([]).expect("constraints"),
             CredentialStore::empty(),

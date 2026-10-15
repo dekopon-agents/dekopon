@@ -291,7 +291,6 @@ async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog>
     Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "smoke-memory-policy".to_owned(),
         policy,
         constraints,
         CredentialStore::empty(),
@@ -569,7 +568,6 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     let broker = Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "probe-write-policy".to_owned(),
         policy,
         constraints,
         CredentialStore::empty(),
@@ -672,7 +670,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     let broker = Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "reservation-policy".to_owned(),
         policy,
         constraints,
         CredentialStore::empty(),
@@ -811,7 +808,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     let broker = Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "composition-policy".to_owned(),
         policy,
         constraints,
         CredentialStore::empty(),
@@ -905,7 +901,6 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
         let broker = Broker::new(
             registry,
             "broker".parse().expect("broker"),
-            "renamed-route-policy".to_owned(),
             policy,
             constraints,
             CredentialStore::empty(),
@@ -1113,7 +1108,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     let broker = Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "unrouted-memory-policy".to_owned(),
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
         CredentialStore::empty(),
@@ -1212,7 +1206,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
     let error = Broker::new(
         registry,
         "broker".parse().expect("broker"),
-        "route-conflict-policy".to_owned(),
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
         CredentialStore::empty(),
