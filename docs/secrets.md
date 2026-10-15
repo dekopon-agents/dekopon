@@ -282,8 +282,8 @@ Every authorized resolution takes the sibling `.lock`, re-reads the record, and 
 token until 60 seconds before expiry; then it sends one bare OAuth refresh-token grant to the
 configured endpoint, writes the replacement `0600` file by atomic rename, and returns the access
 token. An omitted response `refresh_token` retains the predecessor; no in-memory token cache exists.
-`scheduled` idle rotation and its 22-hour cycle, 2-hour expiry buffer and 5-minute retry are added
-by the broker scheduler separately. Two DRNs may share one record and lock only when their
+`scheduled` is accepted in configuration but idle rotation does not ship yet; refresh
+happens on use, as with `lazy`. Two DRNs may share one record and lock only when their
 `tokenEndpoint`, `clientId` and `seedPath` match. The record needs its own file-name stem: the broker writes
 `<stem>.tmp-<pid>` beside it and sweeps `<stem>.tmp-*` under the lock, so a sibling with the same
 stem (for example ChatGPT `auth.json` beside `auth.oauth`) shares those temporaries. The configured
@@ -293,7 +293,7 @@ endpoint must use HTTPS or literal loopback HTTP; redirects and ambient proxies 
 Only listed reauthorization codes and bootstrap reflection seal; a sealed use makes no HTTP call.
 Other 4xx responses (including non-JSON bodies) are `rejected`, 5xx and connection failures are `transport`,
 a deadline is `timeout`, and a malformed/incomplete response is `malformed`. An insecure file is
-`insecure-file`; a missing file is `io`.
+`insecure-file`; a missing record without a seed is `missing`.
 `bootstrap-reflected` means the access contains the current or predecessor refresh token; a
 reflected rotation seals instead of serving it.
 `too-large` means the record file on read or the response headers exceed their ceilings, or the

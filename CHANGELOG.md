@@ -7,6 +7,61 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.34.0] - 2026-10-15
+
+### Changed
+
+- Prepare chart 0.34.0 for core v0.47.0; pin the published image index in a separate reviewed change.
+
+## [0.47.0] - 2026-10-15
+
+### Added
+
+- Every admitted outgoing HTTP request emits a `broker.decision` record with `decision.point=http.request`, its determining `policy.ids`, and `policy.error_ids`/`policy.errors_present` for evaluation errors; invocation decisions carry `decision.point=invocation`.
+- `/dev/null` is an empty input operand for grep, sort, uniq, wc, cut, head and tail.
+- Slack forwards retain their quoted text, original author/channel/time labels and inline files in chat and in platform recall, under the forwarding speaker.
+- grep, sort, uniq, wc, cut, head and tail read one named redirection buffer as an input operand (`-` is stdin); a name that is not a buffer is refused without touching host files.
+- Shell jq accepts --arg NAME VALUE, binding $NAME to the exact string value (repeated names keep the last value; --argjson is refused); the stage's filter and bindings are charged against the value-byte budget while it runs.
+- Broker policy can inspect bounded outgoing HTTP request facts and refuse a request before DNS or credential injection.
+- Outbound `video/mp4` attachments are named `asset-N.mp4`; Slack, Discord and the local transport deliver them after an authorized `asset.send`, WhatsApp refuses them before upload, Telegram's API rejects them after upload, and the model is never shown one.
+- chart `gateway.proxy` (`enabled`, `port`, `tlsSecret`) renders a gateway-only container port, a `vm-proxy` ClusterIP Service port and a read-only TLS Secret mount in the gateway and the config-check hook; disabled renders nothing; enabled refuses a port outside 1-65535 or a missing Secret, and with inline `gateway.config.inline` refuses a missing `proxy:` block or a `proxy.bind` port different from `gateway.proxy.port`.
+- `oauth2Refresh` sources adopt the refresh seed at `seedPath` under the record lock on first use and whenever its digest changes, in Live or Sealed state, abandoning the previous token family; the rotation is saved before access is served, an unchanged seed is never sent again, a missing seed leaves an existing Live record serving, a missing record without a seed refuses as `missing` without HTTP, and entries sharing a `recordPath` must share one `seedPath`.
+- `broker.credential.sealed` audit event when an `oauth2Refresh` family seals: public DRN, Unix `since`, bounded `cause` (`reauthorization-required` or `bootstrap-reflected`) and the static re-seed instruction; never a token, digest or path.
+- Shell grep accepts -q/--quiet (status only, closing upstream at the first match) and -A/-B/-C context windows (ordered, `--` between disjoint groups, -n marks matches with `:` and context with `-`); head accepts -c N/--bytes N for the first N raw bytes (zero closes input unread; -c with -n is refused).
+- `indicators.reaction.working: on` adds a working reaction beside native status or typing, and `auto` falls back only when neither surface is active, including after a typing failure.
+- `indicators.status: off` and `indicators.typing: off` suppress that surface for the route and kind, including Slack's native status hand-over and restore around a `statusText` note.
+- dekopon-policy exposes PolicyEngine::authorize_http, which evaluates guarded request forbids against bounded HTTP request facts as context.request (method, url host/path/query, lower-cased guest headers, and a representable JSON body of at most 16 KiB); the broker does not call it yet.
+- A capability's owner-authored `defaultSecretUse: {drn, sink: httpBearer}` supplies the public DRN proposal when a request omits one; an explicit proposal wins, and the private binding and separate Cedar `secret.use` decision still apply, so a missing binding or grant denies without injecting anything.
+- Shell text builtins (grep, sort, uniq, wc, cut, head, tail, xargs, jq) accept bundled short flags, attached and --key=value option values, -- as the option terminator, and head/tail --lines N; provider command arguments are unchanged.
+- Gateway `indicators` resolve from `sessions.indicators`, `transports[].indicators`, `indicators.conversations.<kind>` and `routes[].indicators`; the last layer wins, absent or null inherits, resolved `mode: off` suppresses every indicator, and each route/kind logs a bounded `gateway_indicators_effective` record.
+- `githubApp` broker credentials mint and renew GitHub App installation tokens, optionally downscoped to repositories and permissions.
+- Refuse malformed HTTP request policies at broker startup and report all parsed violating policy IDs.
+
+### Changed
+
+- `dekopon_broker::AuditLog` implementors must be `'static`.
+- A Slack forward whose files push the message past ten attachments is refused with the existing "too many attachments" reply instead of being admitted with the forward ignored.
+- An outgoing HTTP method token with lowercase letters is refused before the grant check and is never sent.
+- an `oauth2Refresh` refresh answered with `invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated` or `refresh_token_expired`, or whose access token reflects a refresh token or the seed, seals the record durably; a sealed record refuses every use without HTTP until a changed seed arrives.
+- other `oauth2Refresh` 4xx responses, including non-JSON bodies, are `rejected` and leave the record Live for the next attempt instead of being `malformed`.
+- an `oauth2Refresh` rotation or seal whose atomic save fails refuses the resolution as `io` instead of returning the unsaved access token; `broker.credential.refresh_save_failed` no longer carries the record path or I/O error. After a restart the on-disk predecessor may be spent again, seal on the reused-token reply and require a new seed.
+- the `broker.credential.refresh` span carries `trigger = use`.
+- Fetched chat assets carried in one model request (images, documents and clamped text) are bounded at 40 MiB decoded; a crossing `fetch_chat_asset` refuses, names the unseen `chat-asset:N` and leaves earlier assets in the request; the 8 MiB per-asset, 60 s per-fetch and `sessions.assetRetentionBytes` bounds are unchanged.
+- `oauth2Refresh` records are tagged version 2 (`state: live` with `lastRefresh`, or `state: sealed`); a version-1, untagged, inconsistent or unknown-field record is refused as `malformed` on each use while other secrets keep serving; delete the record and re-enroll a version-2 one.
+- `oauth2Refresh` sources accept `refresh: lazy | scheduled` (absent means `lazy`) and an absolute `seedPath` distinct from the record and the map; both are validated at boot only; scheduled refresh arrives in a later release.
+- A reflected OAuth rotation (access token equal to a refresh token) is refused before saving instead of being stored already expired.
+- A secret map that fails strict parsing reports the error class, line, column and schema field name, never the offending value.
+- Working reactions and steer acknowledgement reactions default off (`reaction.working`, `reaction.seen`); WhatsApp refuses `reaction.working: on|auto` until a verified clear exists.
+
+### Removed
+
+- The four-fetch-per-session cap on chat attachments; `fetch_chat_asset` can show every addressable attachment (32 per conversation) across a session.
+- `transports[].liveness` and `classicFallback` are refused at load; migrate `classicFallback: reaction` to `reaction.working: auto` (docs/upgrading.md).
+
+### Fixed
+
+- Codex subscription requests send the prompt cache key as the `session-id` header ChatGPT derives cache affinity from, on the first request and on the credential-refresh resend; previously only the request body carried it, and a request without a key still sends no header.
+
 ## [0.46.3] - 2026-10-15
 
 ### Fixed
