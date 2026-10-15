@@ -1193,11 +1193,16 @@ async fn injected_clock_drives_record_expiry_and_refresh_time() {
 }
 
 #[tokio::test]
-async fn reflected_seed_seals_first_adoption_without_serving_it() {
+async fn reflected_seed_seals_due_live_without_serving_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     let seed = dir.path().join("seed");
-    write_seed(&seed, "new-seed-private-sentinel");
+    let seed_value = "new-seed-private-sentinel";
+    write_seed(&seed, seed_value);
+    expired(&path);
+    let mut live: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    live["adoptedSeedSha256"] = json!(super::hex_sha256(seed_value.as_bytes()));
+    fs::write(&path, live.to_string()).unwrap();
     let api = TokenApi::serving(|_| {
         (
             "200 OK",
@@ -1209,6 +1214,8 @@ async fn reflected_seed_seals_first_adoption_without_serving_it() {
         resolver.resolve(&drn("one")).await.unwrap_err().category,
         "bootstrap-reflected"
     );
+    assert_eq!(api.requests().len(), 1);
+    assert!(content(&api.requests()[0]).contains("refresh_token=old-refresh-private-sentinel"));
     let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(stored["state"], "sealed");
     assert_eq!(stored["cause"], "bootstrap-reflected");
