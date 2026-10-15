@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -1845,6 +1845,8 @@ struct ModelScript {
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
     builds: AtomicUsize,
+    capture_images: AtomicBool,
+    image_bytes: Mutex<Vec<Vec<u8>>>,
     forbidden: bool,
 }
 
@@ -1871,6 +1873,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: false,
         })
     }
@@ -1883,6 +1887,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: true,
         })
     }
@@ -1954,6 +1960,23 @@ impl ChatModel for ScriptedModel {
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
+        if self.0.capture_images.load(Ordering::SeqCst) {
+            for data in messages
+                .iter()
+                .filter_map(ModelMessage::parts)
+                .flatten()
+                .filter_map(|part| match part {
+                    dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                    dekopon_model::model::ContentPart::Text(_)
+                    | dekopon_model::model::ContentPart::File { .. } => None,
+                })
+            {
+                self.0
+                    .image_bytes
+                    .lock()
+                    .push(data.read().expect("model can read fetched image"));
+            }
+        }
         self.0.prompts.lock().push(messages.to_vec());
         self.0.tools.lock().push(tools.to_vec());
         self.0
@@ -8036,6 +8059,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         fetch_call(),
         answer("That image is not in your conversation."),
     ]);
+    models.capture_images.store(true, Ordering::SeqCst);
     let mut runner = runner(broker, Arc::clone(&models), 4);
     let fetches = Arc::new(AtomicUsize::new(0));
     Arc::get_mut(&mut runner)
@@ -8118,6 +8142,10 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         );
     }
     assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
     assert!(tool_message(&models, 4).contains("There is no chat-asset:1"));
     assert_eq!(
         driver.replies(),
