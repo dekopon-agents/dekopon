@@ -249,6 +249,9 @@ impl BlobReference {
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
         self.source.read()
     }
+    pub fn pin(&self) -> Result<DiskBlob, BlobError> {
+        self.source.pin()
+    }
     #[must_use]
     pub fn release_notice(&self) -> String {
         format!(
