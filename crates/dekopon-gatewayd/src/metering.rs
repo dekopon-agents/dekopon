@@ -738,22 +738,36 @@ mod tests {
             &'static str,
             &'static str,
             &'static str,
+            u64,
         );
+        let estimated_input = Estimate::from_sizes(
+            Sizes {
+                bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
+                    + json_bytes::<[ModelTool]>(&[]),
+                images: 0,
+            },
+            None,
+            Tokens(0),
+        )
+        .input
+        .0;
         let cases: [FailureCase; 2] = [
             (
                 || InferenceError::Cancelled,
                 "cancelled",
                 "cancelled",
                 "estimated",
+                estimated_input,
             ),
             (
                 || InferenceError::InvalidRequest(RequestError::EmptyModel),
                 "invalid-request",
                 "failed",
                 "estimated",
+                0,
             ),
         ];
-        for (failure, kind, outcome, source) in cases {
+        for (failure, kind, outcome, source, expected_input) in cases {
             let capture = CaptureLayer::new();
             let _guard = tracing_subscriber::registry()
                 .with(capture.clone())
@@ -768,22 +782,7 @@ mod tests {
             assert_eq!(charge.field("outcome"), Some(outcome));
             assert_eq!(charge.field("usage.source"), Some(source));
             assert_eq!(charge.field("meter.schema"), Some("1"));
-            let input = if kind == "invalid-request" {
-                0
-            } else {
-                Estimate::from_sizes(
-                    Sizes {
-                        bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
-                            + json_bytes::<[ModelTool]>(&[]),
-                        images: 0,
-                    },
-                    None,
-                    Tokens(0),
-                )
-                .input
-                .0
-            }
-            .to_string();
+            let input = expected_input.to_string();
             assert_eq!(charge.field("usage.input_tokens"), Some(input.as_str()));
             assert_eq!(charge.field("usage.output_tokens"), Some("0"));
         }

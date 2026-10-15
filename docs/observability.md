@@ -81,7 +81,7 @@ when it keeps the live meters ([best effort](gatewayd.md#restoring-token-windows
 
 | Count separately | Meaning |
 |---|---|
-| `gateway.message` spans | Received message attempts, including drops and queued messages; not model calls |
+| `gateway.message` spans | Routed messages that start a session (including queued follow-ups); excludes unrouted, unaddressed and collection-refused drops before session start; not all received messages or model calls |
 | `gateway.session` spans | Admitted sessions; one session can make several model calls |
 | `model.complete` spans | Model attempts observed in exported traces, including failures; sampling/retention can omit them |
 | Exported `meter` charges | Model charges visible in the log store, including refused and cancelled calls; export is best effort |
