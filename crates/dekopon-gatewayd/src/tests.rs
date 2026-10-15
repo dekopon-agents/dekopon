@@ -16963,7 +16963,8 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
 
 #[test]
 fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
-    let store = ConversationStore::with_arena_limit(4, 90);
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 300);
     let allowed = granted(&["cli-probe.upper"]);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let now = Instant::now();
@@ -16982,13 +16983,34 @@ fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
     assert!(store.snapshot(&key, &granted(&["different"])).is_none());
     commit("two");
     let new = store.snapshot(&key, &allowed).unwrap();
-    assert_eq!(old.read(1), Some("one"));
-    assert_eq!(new.read(1), Some("one"));
-    assert_eq!(new.read(2), Some("two"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(old.read(1).unwrap()).unwrap()["user"],
+        "one"
+    );
+    assert_eq!(new.read(1), old.read(1));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["user"],
+        "two"
+    );
     commit("three");
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
+    );
     assert_eq!(store.snapshot(&key, &allowed).unwrap().read(3), None);
-    assert_eq!(old.read(1), Some("one"));
-    assert_eq!(new.read(2), Some("two"));
+    assert_eq!(old.read(1), new.read(1));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["answer"],
+        "ok"
+    );
 }
 
 #[test]

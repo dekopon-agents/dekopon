@@ -322,7 +322,7 @@ impl Conversation {
             .record_ids
             .iter()
             .zip(self.history.turns())
-            .map(|(id, turn)| (*id, turn.user()))
+            .map(|(id, turn)| (*id, turn))
             .collect();
         if let Err(reason) = self.arena.repack(&records) {
             tracing::warn!(

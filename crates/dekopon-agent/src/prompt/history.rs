@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    io::{self, Write},
     ops::Range,
     sync::{Arc, Weak},
 };
@@ -108,6 +109,35 @@ pub enum ArenaRefusal {
     DuplicateRecord,
 }
 
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedBytes {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other("arena transient headroom exceeded"));
+        }
+        self.bytes.extend_from_slice(input);
+        if self.bytes.capacity() > self.limit {
+            return Err(io::Error::other("arena transient headroom exceeded"));
+        }
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct PackedTurn<'a> {
+    user: &'a str,
+    answer: Option<&'a str>,
+    exchanges: &'a [Exchange],
+}
+
 pub struct PackedArena {
     current: ArcSwap<ArenaSnapshot>,
     publication: Mutex<Vec<Weak<ArenaSnapshot>>>,
@@ -129,7 +159,7 @@ impl PackedArena {
         self.current.load_full()
     }
 
-    pub fn repack(&self, records: &[(u64, &str)]) -> Result<(), ArenaRefusal> {
+    pub fn repack(&self, records: &[(u64, &ConversationTurn)]) -> Result<(), ArenaRefusal> {
         let mut live = self.publication.lock();
         live.retain(|snapshot| snapshot.strong_count() != 0);
         let current = self.current.load_full();
@@ -146,31 +176,30 @@ impl PackedArena {
         if handles_bytes > self.max_transient_bytes.saturating_sub(resident) {
             return Err(ArenaRefusal::TransientHeadroom);
         }
-        let mut size = 0usize;
+        let mut bytes = BoundedBytes {
+            bytes: Vec::new(),
+            limit: self.max_transient_bytes - resident - handles_bytes,
+        };
+        let mut handles = Vec::with_capacity(records.len());
         let mut ids = std::collections::HashSet::new();
-        for (id, text) in records {
+        for (id, turn) in records {
             if !ids.insert(*id) {
                 return Err(ArenaRefusal::DuplicateRecord);
             }
-            size = size
-                .checked_add(text.len())
-                .ok_or(ArenaRefusal::TransientHeadroom)?;
-        }
-        let allocated = size
-            .checked_add(handles_bytes)
-            .ok_or(ArenaRefusal::TransientHeadroom)?;
-        if allocated > self.max_transient_bytes.saturating_sub(resident) {
-            return Err(ArenaRefusal::TransientHeadroom);
-        }
-        let mut bytes = Vec::with_capacity(size);
-        let mut handles = Vec::with_capacity(records.len());
-        for (id, text) in records {
-            let start = bytes.len();
-            bytes.extend_from_slice(text.as_bytes());
-            handles.push((*id, start..bytes.len()));
+            let start = bytes.bytes.len();
+            serde_json::to_writer(
+                &mut bytes,
+                &PackedTurn {
+                    user: turn.user(),
+                    answer: turn.answer(),
+                    exchanges: turn.exchanges(),
+                },
+            )
+            .map_err(|_serialize| ArenaRefusal::TransientHeadroom)?;
+            handles.push((*id, start..bytes.bytes.len()));
         }
         let next = Arc::new(ArenaSnapshot {
-            bytes,
+            bytes: bytes.bytes,
             records: handles,
         });
         let previous = self.current.swap(next);
@@ -431,39 +460,76 @@ impl History {
 
 #[cfg(test)]
 mod arena_tests {
-    use super::{ArenaRefusal, PackedArena};
+    use super::{ArenaRefusal, ConversationTurn, Exchange, PackedArena, Representation};
 
     #[test]
     fn a_reader_survives_publication_with_stable_record_handles() {
-        let arena = PackedArena::new(512);
-        arena.repack(&[(11, "one 🟠"), (12, "two")]).unwrap();
+        let arena = PackedArena::new(4096);
+        let first =
+            ConversationTurn::completed("one 🟠", "answered").with_exchanges(vec![Exchange {
+                tool: "bash".into(),
+                request: vec![Representation::original("echo hi", "v")],
+                result: vec![Representation::original("failed", "v")],
+                outcome: "failed".into(),
+                exit_status: Some(1),
+            }]);
+        let two = ConversationTurn::completed("two", "answer two");
+        let changed = ConversationTurn::completed("new two", "new answer");
+        let three = ConversationTurn::completed("three", "answer three");
+        arena.repack(&[(11, &first), (12, &two)]).unwrap();
         let old = arena.snapshot();
-        arena.repack(&[(12, "new two"), (13, "three")]).unwrap();
+        arena.repack(&[(12, &changed), (13, &three)]).unwrap();
         let new = arena.snapshot();
-        assert_eq!(old.read(11), Some("one 🟠"));
-        assert_eq!(old.read(12), Some("two"));
+        let before: serde_json::Value = serde_json::from_str(old.read(11).unwrap()).unwrap();
+        assert_eq!(before["user"], "one 🟠");
+        assert_eq!(before["answer"], "answered");
+        assert_eq!(before["exchanges"][0]["request"][0]["text"], "echo hi");
+        assert_eq!(before["exchanges"][0]["result"][0]["text"], "failed");
+        assert_eq!(before["exchanges"][0]["exitStatus"], 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(old.read(12).unwrap()).unwrap()["user"],
+            "two"
+        );
         assert_eq!(new.read(11), None);
-        assert_eq!(new.read(12), Some("new two"));
-        assert_eq!(new.read(13), Some("three"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(new.read(12).unwrap()).unwrap()["answer"],
+            "new answer"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(new.read(13).unwrap()).unwrap()["user"],
+            "three"
+        );
     }
 
     #[test]
     fn held_readers_count_against_headroom_and_refusal_does_not_publish() {
-        let arena = PackedArena::new(110);
-        arena.repack(&[(1, "old")]).unwrap();
+        let arena = PackedArena::new(270);
+        let first = ConversationTurn::completed("old", "ok");
+        let second = ConversationTurn::completed("next", "ok");
+        let third = ConversationTurn::completed("a".repeat(35), "ok");
+        arena.repack(&[(1, &first)]).unwrap();
         let old = arena.snapshot();
-        arena.repack(&[(2, "next")]).unwrap();
+        arena.repack(&[(2, &second)]).unwrap();
         let new = arena.snapshot();
         assert_eq!(
-            arena.repack(&[(3, "a".repeat(35).as_str())]),
+            arena.repack(&[(3, &third)]),
             Err(ArenaRefusal::TransientHeadroom)
         );
-        assert_eq!(old.read(1), Some("old"));
-        assert_eq!(new.read(2), Some("next"));
-        assert_eq!(arena.snapshot().read(2), Some("next"));
+        assert_eq!(
+            old.read(1),
+            Some(r#"{"user":"old","answer":"ok","exchanges":[]}"#)
+        );
+        assert_eq!(
+            new.read(2),
+            Some(r#"{"user":"next","answer":"ok","exchanges":[]}"#)
+        );
+        assert_eq!(arena.snapshot().read(2), new.read(2));
         drop(old);
         drop(new);
-        arena.repack(&[(3, "a".repeat(35).as_str())]).unwrap();
-        assert_eq!(arena.snapshot().read(3), Some("a".repeat(35).as_str()));
+        arena.repack(&[(3, &third)]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arena.snapshot().read(3).unwrap()).unwrap()["user"],
+            "a".repeat(35)
+        );
     }
 }
