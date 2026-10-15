@@ -8,8 +8,10 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Gateway indicator configuration (next gateway release)
+## Gateway indicators and OAuth2 records (0.47.0)
 
+Upgrade the broker and gateway together. Before starting the new gateway, migrate route
+fragments: the removed `transports[].liveness` and `classicFallback` keys are refused.
 The gateway replaces `transports[].liveness` with layered `indicators`: `sessions.indicators`,
 `transports[].indicators`, `transports[].indicators.conversations.<kind>`, then
 `routes[].indicators`, in that order. The last authored leaf wins; absent or `null` inherits.
@@ -31,6 +33,19 @@ configuration migration note, **not** an edit to those manifests. Ship the revie
 pin first and the manifest migration immediately after it in a separate PR; both old and
 new binaries reject the other's keys, so an incompatible-key crash loop is expected
 between those changes. Do not promise zero downtime or opt in a live route during migration.
+
+The broker now accepts only tagged version-2 `oauth2Refresh` records: a Live record has
+`state: live` and `lastRefresh`, while a Sealed record has `state: sealed` and refuses use
+until a changed seed is adopted. An old version-1 or untagged record is refused as
+`malformed` per use; other secrets continue serving. Stop the broker before replacing a
+record, remove the old record and re-enroll a version-2 record with a new seed; see the
+[OAuth2 source contract](secrets.md#oauth2refresh). `refresh: scheduled` is accepted in
+configuration but idle scheduled refresh does not ship yet. A changed `seedPath` token is
+adopted on use under the record lock, including from a sealed record; unchanged seeds do
+not undo a rotation.
+
+Install chart 0.34.0 only after its default image index is pinned to the verified
+v0.47.0 stock image.
 
 ## Stopped turns, progress and session seals (0.46.0)
 
