@@ -1638,8 +1638,8 @@ pub enum AuditEvent {
         policy_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_error_ids: Vec<String>,
-        #[serde(default)]
-        policy_errors_present: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_errors_present: Option<bool>,
         #[serde(default)]
         decision_point: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3165,7 +3165,7 @@ where
             policy_revision: Some(self.policy_revision.clone()),
             policy_ids,
             policy_error_ids: Vec::new(),
-            policy_errors_present: false,
+            policy_errors_present: None,
             decision_point: "invocation".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
             allowed: false,
@@ -3412,7 +3412,20 @@ where
                 let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reason =
                     (!result.allowed).then(|| denial_reason(&result, "policy-denied").to_owned());
-                let event = digest.ok().map(|decision_digest| AuditEvent::Decision {
+                let decision_digest = match digest {
+                    Ok(digest) => digest,
+                    Err(source) => {
+                        tracing::error!(
+                            event = "broker_decision_evidence_failed",
+                            invocation = %invocation,
+                            point = "http.request",
+                            cause_type = std::any::type_name_of_val(&source),
+                        );
+                        return Box::pin(async { false })
+                            as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>;
+                    }
+                };
+                let event = AuditEvent::Decision {
                     invocation: invocation.clone(),
                     trace,
                     principal: Some(principal.clone()),
@@ -3428,7 +3441,7 @@ where
                     policy_revision: Some(policy_revision.clone()),
                     policy_ids: result.determining_policy_ids,
                     policy_error_ids: result.erroring_policy_ids,
-                    policy_errors_present: result.errors_present,
+                    policy_errors_present: Some(result.errors_present),
                     decision_point: "http.request".to_owned(),
                     policy_digest: Some(policy_digest.clone()),
                     allowed: result.allowed,
@@ -3436,14 +3449,18 @@ where
                     decision_digest,
                     storage_scope_commitment: None,
                     storage: None,
-                });
+                };
                 let audit = Arc::clone(&audit);
+                let invocation = invocation.clone();
                 Box::pin(async move {
-                    let Some(event) = event else {
-                        return false;
-                    };
                     emit_audit_event(&event);
-                    audit.append(event).await.is_ok() && result.allowed
+                    match audit.append(event).await {
+                        Ok(()) => result.allowed,
+                        Err(source) => {
+                            report_audit_failure("decision", &invocation, &source);
+                            false
+                        }
+                    }
                 }) as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
             }) as dekopon_broker_host::RequestAuthorizer
         });
@@ -3496,7 +3513,7 @@ where
             policy_revision: Some(self.policy_revision.clone()),
             policy_ids: policy_ids.clone(),
             policy_error_ids: Vec::new(),
-            policy_errors_present: false,
+            policy_errors_present: None,
             decision_point: "invocation".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
             allowed: true,

@@ -70,8 +70,8 @@ even if a policy would otherwise permit it.
 
 All three action types optionally carry `subject`, `transportKind`, `transport`, `trigger`, and
 `conversation`. When present, `conversation` requires `kind` and `id`; its `container` and `thread`
-fields are optional. Policies must guard optional fields with `has` before reading them. Strict
-validation also prevents a field from being read on an action that never carries it.
+fields are optional. Policies must guard optional fields with `has` before reading them. Ordinary
+policies' strict validation also prevents a field from being read on an action that never carries it.
 
 Every value is rendered by the broker from authenticated transport state or owner-controlled
 configuration:

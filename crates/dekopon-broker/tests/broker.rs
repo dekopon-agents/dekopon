@@ -783,7 +783,16 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
                 "{id}"
             );
         }
+        if id == "top-level" {
+            assert_eq!(
+                events[0].field("policy.ids"),
+                Some("no-broadcast,reply-only")
+            );
+            assert_eq!(events[0].field("policy.error_ids"), Some("thread-required"));
+            assert_eq!(events[0].field("policy.errors_present"), Some("true"));
+        }
         if id == "form" || id == "multipart" {
+            assert_eq!(events[0].field("policy.ids"), Some("reply-only"), "{id}");
             assert_eq!(
                 events[0].field("policy.error_ids"),
                 Some("no-broadcast,thread-required"),
@@ -901,6 +910,87 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
         "guest sent no credential"
     );
     server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
+    use dekopon_test_support::CaptureLayer;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider loads");
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints("no-such-egress.invalid")),
+        )]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::new(InMemoryAuditLog::new(1).expect("one invocation decision")),
+        BrokerLimits::default(),
+    )
+    .expect("broker loads");
+    let capture = CaptureLayer::new();
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "audit-full",
+            "http-probe.fetch",
+            json!({
+                "uri": "https://no-such-egress.invalid/reply", "method": "GET"
+            }),
+        ),
+    )
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert!(
+        matches!(result, Err(BrokerError::OutcomeAudit { .. })),
+        "the full sink also refuses the terminal outcome"
+    );
+    let spans = capture.records();
+    assert!(
+        spans.iter().any(|record| matches!(
+            record,
+            dekopon_test_support::Record::Span {
+                name: "http.request",
+                ..
+            }
+        ) && record.field("error.code") == Some("Denied")),
+        "request must not reach DNS"
+    );
+    assert!(spans.iter().any(|record| matches!(
+        record,
+        dekopon_test_support::Record::Span {
+            name: "http.request",
+            ..
+        }
+    ) && record.field("error.message")
+        == Some("HTTP request denied by policy")));
+    let decisions = capture.events_where(
+        "dekopon_broker::audit",
+        &[("decision.point", "http.request")],
+    );
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].field("decision.allowed"), Some("true"));
+    let failures = capture.events_where(
+        "dekopon_broker",
+        &[
+            ("event", "broker_audit_append_failed"),
+            ("audit.stage", "decision"),
+        ],
+    );
+    assert_eq!(failures.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2372,6 +2462,10 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_policy() {
+    use dekopon_test_support::CaptureLayer;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
     let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
     let broker = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
@@ -2487,6 +2581,7 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
             direct_peer("cpetersen", "some-agent"),
         ),
     ] {
+        let capture = CaptureLayer::new();
         let direct = broker
             .invoke(
                 &peer,
@@ -2495,8 +2590,16 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
                 request(id, "cli-probe.upper", json!({"text": "direct"})),
                 Default::default(),
             )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
             .await
             .expect("direct proposal is accounted");
+        let decisions = capture.events_where(
+            "dekopon_broker::audit",
+            &[("audit.event", "broker.decision"), ("invocation.id", id)],
+        );
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].field("decision.reason"), Some("policy-error"));
+        assert_eq!(decisions[0].field("policy.errors_present"), None);
         assert_eq!(
             direct.result.outcome,
             dekopon_capability::InvocationOutcome::Denied,

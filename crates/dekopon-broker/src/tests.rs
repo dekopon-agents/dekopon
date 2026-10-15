@@ -117,7 +117,7 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         policy_revision: Some("policy-test".to_owned()),
         policy_ids: Vec::new(),
         policy_error_ids: Vec::new(),
-        policy_errors_present: false,
+        policy_errors_present: None,
         decision_point: "invocation".to_owned(),
         policy_digest: None,
         allowed,
