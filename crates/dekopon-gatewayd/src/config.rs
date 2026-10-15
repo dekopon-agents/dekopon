@@ -1017,6 +1017,10 @@ pub async fn load_in(
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "decode constructs only Decode; other ConfigError variants cannot arise here"
+)]
 pub(crate) async fn load_reporting(
     path: &Path,
     expected_uid: u32,
