@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -1845,6 +1845,8 @@ struct ModelScript {
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
     builds: AtomicUsize,
+    capture_images: AtomicBool,
+    image_bytes: Mutex<Vec<Vec<u8>>>,
     forbidden: bool,
 }
 
@@ -1871,6 +1873,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: false,
         })
     }
@@ -1883,6 +1887,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: true,
         })
     }
@@ -1954,6 +1960,23 @@ impl ChatModel for ScriptedModel {
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
+        if self.0.capture_images.load(Ordering::SeqCst) {
+            for data in messages
+                .iter()
+                .filter_map(ModelMessage::parts)
+                .flatten()
+                .filter_map(|part| match part {
+                    dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                    dekopon_model::model::ContentPart::Text(_)
+                    | dekopon_model::model::ContentPart::File { .. } => None,
+                })
+            {
+                self.0
+                    .image_bytes
+                    .lock()
+                    .push(data.read().expect("model can read fetched image"));
+            }
+        }
         self.0.prompts.lock().push(messages.to_vec());
         self.0.tools.lock().push(tools.to_vec());
         self.0
@@ -8365,6 +8388,339 @@ async fn a_slack_upload_is_routed_and_described_for_numbering() {
             }),
         }]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one live forward scenario across private, shared and inaccessible fetches"
+)]
+async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
+    struct ForwardImage(Arc<AtomicUsize>, bool);
+    impl AssetFetcher for ForwardImage {
+        fn fetch(
+            &self,
+            source: &AssetSourceRef,
+            _max_bytes: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            assert!(
+                matches!(source, AssetSourceRef::Slack { file_id, .. } if file_id == "F-FORWARD")
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if self.1 {
+                Box::pin(async { Err(TransportError::Response) })
+            } else {
+                Box::pin(async { Ok(b"\x89PNG\r\n\x1a\nforwarded pixels".to_vec()) })
+            }
+        }
+    }
+
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "forward",
+        json!({
+            "type": "message", "channel": "d0123abc", "channel_type": "im",
+            "user": "u9xyz", "ts": "1700000000.000001", "text": "What is in this image?",
+            "attachments": [{
+                "is_share": true, "is_msg_unfurl": true,
+                "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
+                "ts": "1700000000.000100", "text": "the original question",
+                "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
+                    "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
+            }]
+        }),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("connected Slack transport");
+    let inbound = next_message(&mut transport).await;
+    let transport_name = inbound.transport.clone();
+    let slack_route = move |model, memory| {
+        let mut route = persistent_route(model, memory);
+        route.transport = transport_name.clone();
+        route
+    };
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(6, &["cli-probe.upper"])).await;
+    let fetch_call = || {
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "forward-fetch".into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".into(),
+                    arguments: "{\"id\":1}".into(),
+                },
+            }],
+            None,
+        )
+    };
+    let models = ModelScript::new([
+        answer("I can inspect it."),
+        fetch_call(),
+        answer("The image was inspected."),
+        fetch_call(),
+        answer("That image is not in your conversation."),
+    ]);
+    models.capture_images.store(true, Ordering::SeqCst);
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            inbound.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&fetches), false)) as Arc<dyn AssetFetcher>,
+        );
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let route = slack_route(model, window());
+    let driver = Arc::new(RecordingDriver::default());
+    let inaccessible = inbound.clone();
+    let shared_first = inbound.clone();
+    let mut follow_up = inbound.clone();
+    follow_up.message_id = MessageId::Native("1700000000.000002".into());
+    follow_up.text = "Please inspect the earlier image".into();
+    follow_up.assets.clear();
+    let mut other_speaker = follow_up.clone();
+    other_speaker.subject = "slack.t0123abc.u8xyz".parse().expect("other Slack user");
+    other_speaker.message_id = MessageId::Native("1700000000.000003".into());
+    let shared_second = other_speaker.clone();
+    for (inbound, label) in [
+        (inbound, "first"),
+        (follow_up, "follow-up"),
+        (other_speaker, "other speaker"),
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                inbound,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} session completed"));
+    }
+
+    let initial = models.prompt(0);
+    let question = &initial.last().expect("question").1;
+    assert!(question.contains("What is in this image?"), "{initial:?}");
+    assert!(question.contains("the original question"), "{initial:?}");
+    assert!(
+        initial.last().expect("question").1.contains("chat-asset:1"),
+        "{initial:?}"
+    );
+    let follow = models.prompt(1);
+    assert!(
+        follow
+            .last()
+            .expect("follow-up")
+            .1
+            .contains("Please inspect the earlier image"),
+        "{follow:?}"
+    );
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    {
+        let fetched = models.prompts.lock();
+        assert!(
+            fetched[2]
+                .iter()
+                .filter_map(ModelMessage::parts)
+                .flatten()
+                .any(|part| matches!(part, dekopon_model::model::ContentPart::Image { .. })),
+            "model received forwarded image as an image part"
+        );
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
+    assert!(tool_message(&models, 4).contains("There is no chat-asset:1"));
+    assert_eq!(
+        driver.replies(),
+        [
+            "I can inspect it.",
+            "The image was inspected.",
+            "That image is not in your conversation."
+        ]
+    );
+
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        answer("Shared image ready."),
+        fetch_call(),
+        answer("Shared image inspected."),
+    ]);
+    models.capture_images.store(true, Ordering::SeqCst);
+    let mut shared_runner = self::runner(broker, Arc::clone(&models), 4);
+    let shared_fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut shared_runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            shared_first.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&shared_fetches), false)) as Arc<dyn AssetFetcher>,
+        );
+    let mut shared_model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut shared_model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let shared_route = slack_route(shared_model, shared_window());
+    let shared_driver = Arc::new(RecordingDriver::default());
+    for inbound in [shared_first, shared_second] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&shared_runner),
+                shared_route.clone(),
+                inbound,
+                Arc::clone(&shared_driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("shared turn completed");
+    }
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(!tool_message(&models, 2).contains("There is no chat-asset"));
+    assert_eq!(shared_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
+
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([fetch_call(), answer("Image unavailable.")]);
+    let mut failed_runner = self::runner(broker, Arc::clone(&models), 4);
+    let failed_fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut failed_runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            inaccessible.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&failed_fetches), true)) as Arc<dyn AssetFetcher>,
+        );
+    let gated_forward = inaccessible.clone();
+    let driver = Arc::new(RecordingDriver::default());
+    let mut failed_model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut failed_model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    run_session(
+        failed_runner,
+        slack_route(failed_model, window()),
+        inaccessible,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(failed_fetches.load(Ordering::SeqCst), 1);
+    let prompt = models.prompt(0);
+    assert!(
+        !prompt
+            .last()
+            .expect("forward question")
+            .1
+            .contains("unavailable"),
+        "{prompt:?}"
+    );
+    assert!(tool_message(&models, 1).contains("could not be read (response)"));
+
+    for (index, broker) in [
+        {
+            let directory = temporary();
+            let (broker, _observed) = stub_broker(
+                directory.path(),
+                vec![ResponseEnvelope::capabilities(
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                )],
+            )
+            .await;
+            (directory, broker)
+        },
+        {
+            let directory = temporary();
+            let broker = ResolvedBroker {
+                socket_path: directory.path().join("absent.sock"),
+                server_uid: crate::current_uid(),
+                frame: FrameLimits::default(),
+            };
+            (directory, broker)
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let models = ModelScript::forbidden();
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            self::runner(broker.1, Arc::clone(&models), 4),
+            slack_route(model_config(), window()),
+            gated_forward.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(
+            driver.replies(),
+            [if index == 0 {
+                UNAUTHORIZED_REPLY
+            } else {
+                FAILURE_REPLY
+            }]
+        );
+        assert_eq!(models.requests(), 0);
+    }
+
+    let mut sealed_forward = gated_forward;
+    sealed_forward.conversation.kind = ConversationKind::Thread;
+    sealed_forward.conversation.thread = Some("1700000000.000001".to_owned());
+    let route = slack_route(model_config(), window());
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &sealed_forward.conversation.key(),
+        &sealed_forward.subject,
+    );
+    let directory = temporary();
+    let broker = ResolvedBroker {
+        socket_path: directory.path().join("absent.sock"),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let models = ModelScript::forbidden();
+    let runner = self::runner(broker, Arc::clone(&models), 4);
+    assert!(crate::session::seal_conversation(&runner, &route, &sealed_forward, &key).await);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        sealed_forward,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::SEALED_THREAD_REPLY]);
+    assert_eq!(models.requests(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
