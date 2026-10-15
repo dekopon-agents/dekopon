@@ -1045,8 +1045,9 @@ normal horizon and the seal. Journal recall excludes timestamps at or before the
 ## Detached jobs
 
 A route opts into jobs with `limits.jobTimeoutMs`; without it, `&`, `jobs`, `wait` and
-`kill` report that jobs are off. `cmd &` starts a job that outlives its script and turn,
-prints `[N]`, and sets `$!`. `jobs` lists the person's jobs in that conversation;
+`kill` report that jobs are off. `jobTimeoutMs` is the deadline of each job a turn starts; a job
+started by a probe or by another job shares its starter's deadline and budgets. `cmd &` starts a
+job that outlives its script and turn, prints `[N]`, and sets `$!`. `jobs` lists the person's jobs in that conversation;
 `wait %N` waits without a completion notice, and `kill %N` stops one. A finished job
 not waited for sends a bounded notice as a separate turn or a steer; a busy gateway
 may drop it, so `jobs` is the fallback. `sessions.maxJobs` (default 2) bounds running
