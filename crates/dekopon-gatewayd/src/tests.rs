@@ -15629,13 +15629,14 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
     )
     .await
     .expect("follow session completes");
-    let delivered = driver.delivered.lock();
-    assert!(
-        matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })]
-        if text == UNREPORTED_WORK_REPLY),
-        "one fixed warning while the ticket is active: {delivered:?}"
-    );
-    drop(delivered);
+    {
+        let delivered = driver.delivered.lock();
+        assert!(
+            matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })]
+            if text == UNREPORTED_WORK_REPLY),
+            "one fixed warning while the ticket is active: {delivered:?}"
+        );
+    }
     assert_eq!(
         fs::read(&marker).unwrap(),
         original,
