@@ -665,7 +665,11 @@ pub struct HttpRequestFacts {
     pub content_type: Option<String>,
 }
 
-pub type RequestAuthorizer = std::sync::Arc<dyn Fn(HttpRequestFacts) -> bool + Send + Sync>;
+pub type RequestAuthorizer = std::sync::Arc<
+    dyn Fn(HttpRequestFacts) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
@@ -1243,7 +1247,7 @@ impl BufferedHttpClient {
                 body: (streamed.is_none()).then_some(request.body.clone()),
                 content_type: content_type.map(str::to_owned),
             };
-            if !authorize(facts) {
+            if !authorize(facts).await {
                 return Err(http_error(
                     ErrorCode::Denied,
                     "HTTP request denied by policy",
@@ -1881,9 +1885,9 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = {
             let seen = Arc::clone(&seen);
-            Arc::new(move |facts: super::HttpRequestFacts| {
+            Arc::new(move |facts: super::HttpRequestFacts| -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
                 seen.lock().expect("facts").push(facts);
-                false
+                Box::pin(async { false })
             }) as super::RequestAuthorizer
         };
         let mut client = BufferedHttpClient::authorized(
@@ -1965,7 +1969,7 @@ mod tests {
             sender
                 .send(std::thread::current().id())
                 .expect("decision observation");
-            false
+            Box::pin(async { false })
         }));
         let result = client
             .send(Request {
@@ -2004,10 +2008,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let hook = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |_| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                false
-            }) as super::RequestAuthorizer
+            Arc::new(
+                move |_| -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { false })
+                },
+            ) as super::RequestAuthorizer
         };
         let mut client = BufferedHttpClient::authorized(
             slack_replies("127.0.0.1:9"),
@@ -2040,7 +2046,7 @@ mod tests {
         .expect("lowercase grant admits the token")
         .with_request_authorizer(std::sync::Arc::new(move |_| {
             lower_calls.fetch_add(1, Ordering::SeqCst);
-            false
+            Box::pin(async { false })
         }));
         let error = lowercase
             .send(Request {
@@ -2768,7 +2774,7 @@ mod tests {
         .expect("valid fixture authorization")
         .with_request_authorizer(std::sync::Arc::new(move |request| {
             facts.lock().expect("facts").push(request);
-            true
+            Box::pin(async { true })
         }));
         credentialed
             .send(request_to(&authority))
@@ -3082,7 +3088,7 @@ mod tests {
         ]))
         .with_request_authorizer(Arc::new(move |request| {
             facts.lock().expect("facts").push(request);
-            true
+            Box::pin(async { true })
         }));
         client
             .send(Request {

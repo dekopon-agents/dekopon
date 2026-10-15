@@ -1233,6 +1233,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_and_stream_share_the_pre_dns_request_decision() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let grant = HttpConstraints {
+            allowed_hosts: vec!["no-such-egress.invalid".to_owned()],
+            allowed_methods: vec!["POST".to_owned()],
+            max_requests: 2,
+            max_request_bytes: 4096,
+            max_response_bytes: 1024,
+            allow_plaintext_loopback: false,
+            propagate_trace: false,
+            request_templates: Vec::new(),
+        };
+        let mut client = BufferedHttpClient::authorized(
+            grant,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_request_authorizer(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { false })
+        }));
+        let uri = "https://no-such-egress.invalid/reply".to_owned();
+        let denied = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: uri.clone(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await
+            .expect_err("send refuses before DNS");
+        assert_eq!(denied.code, ErrorCode::Denied);
+        let root = tempfile::tempdir().unwrap();
+        let denied = client
+            .stream(
+                StreamedRequest {
+                    method: "POST".to_owned(),
+                    uri,
+                    headers: vec![],
+                    body: vec![],
+                },
+                &AssetDirectory::new(root.path().to_owned(), 1024),
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(HttpError {
+                code: ErrorCode::Denied,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn every_delivered_body_is_decoded_or_refused_on_send_and_stream() {
         let plain = b"plain response text";
         for path in [Path::Send, Path::Stream] {

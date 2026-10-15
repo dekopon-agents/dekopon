@@ -1636,6 +1636,12 @@ pub enum AuditEvent {
         policy_revision: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        policy_error_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_errors_present: Option<bool>,
+        #[serde(default)]
+        decision_point: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_digest: Option<String>,
         allowed: bool,
@@ -1694,7 +1700,7 @@ pub enum AuditEvent {
     },
 }
 
-pub trait AuditLog: Send + Sync {
+pub trait AuditLog: Send + Sync + 'static {
     fn append(&self, event: AuditEvent) -> impl Future<Output = Result<(), AuditError>> + Send;
 }
 
@@ -3158,6 +3164,9 @@ where
             decision_id: decision_id.clone(),
             policy_revision: Some(self.policy_revision.clone()),
             policy_ids,
+            policy_error_ids: Vec::new(),
+            policy_errors_present: None,
+            decision_point: "invocation".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
             allowed: false,
             reason: Some(reason.to_owned()),
@@ -3341,18 +3350,30 @@ where
         .with_secret_use(secret_use);
         let request_authorizer = set.constraints.http.as_ref().map(|_| {
             let policy = Arc::clone(&self.policy);
+            let audit = Arc::clone(&self.audit);
             let principal = context.principal().clone();
-            let target = PolicyTarget::Capability {
-                capability: capability.clone(),
-                provider: set.provider.clone(),
-                effect: set.effect,
-                risk: set.risk,
-            };
+            let actor = context.actor().clone();
+            let via = context.via().cloned();
+            let subject = context.attested_subject().cloned();
+            let provider = set.provider.clone();
+            let broker_principal = self.broker_principal.clone();
+            let policy_revision = self.policy_revision.clone();
+            let policy_digest = self.policy_digest.clone();
+            let effect = set.effect;
+            let risk = set.risk;
+            let invocation = invocation_id.clone();
+            let capability = capability.clone();
             let context = policy_context(context);
+            let sequence = std::sync::atomic::AtomicUsize::new(0);
             Arc::new(move |facts: dekopon_broker_host::HttpRequestFacts| {
                 let request = PolicyRequest {
                     principal: principal.clone(),
-                    target: target.clone(),
+                    target: PolicyTarget::Capability {
+                        capability: capability.clone(),
+                        provider: provider.clone(),
+                        effect,
+                        risk,
+                    },
                     context: context.clone(),
                 };
                 let facts = dekopon_policy::HttpRequestFacts {
@@ -3366,9 +3387,81 @@ where
                 };
                 // Cedar measures its recursion reserve against stacker's thread bounds, which a
                 // Wasmtime fiber stack falls outside, so it evaluates on a segment stacker tracks.
-                stacker::grow(POLICY_STACK_BYTES, || {
-                    Self::decide_capability(&policy, request, Some(facts)).allowed
-                })
+                let result = stacker::grow(POLICY_STACK_BYTES, || {
+                    Self::decide_capability(&policy, request, Some(facts))
+                });
+                let material = DecisionMaterial {
+                    invocation: &invocation,
+                    trace,
+                    principal: &principal,
+                    actor: &actor,
+                    via: via.as_ref(),
+                    attested_subject: subject.as_ref(),
+                    capability: &capability,
+                    secret_use: None,
+                    provider: Some(&provider),
+                    authorized_by: &broker_principal,
+                    policy_revision: &policy_revision,
+                    policy_ids: &result.determining_policy_ids,
+                    policy_digest: &policy_digest,
+                    constraints: None,
+                    allowed: result.allowed,
+                    reason: (!result.allowed).then(|| denial_reason(&result, "policy-denied")),
+                };
+                let digest = decision_evidence_digest("policy-decision", &material);
+                let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reason =
+                    (!result.allowed).then(|| denial_reason(&result, "policy-denied").to_owned());
+                let decision_digest = match digest {
+                    Ok(digest) => digest,
+                    Err(source) => {
+                        tracing::error!(
+                            event = "broker_decision_evidence_failed",
+                            invocation = %invocation,
+                            point = "http.request",
+                            cause_type = std::any::type_name_of_val(&source),
+                        );
+                        return Box::pin(async { false })
+                            as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>;
+                    }
+                };
+                let event = AuditEvent::Decision {
+                    invocation: invocation.clone(),
+                    trace,
+                    principal: Some(principal.clone()),
+                    actor: Some(actor.clone()),
+                    via: via.clone(),
+                    attested_subject: subject.clone(),
+                    capability: capability.clone(),
+                    secret: None,
+                    secret_sink: None,
+                    provider: Some(provider.clone()),
+                    authorized_by: Some(broker_principal.clone()),
+                    decision_id: format!("http-{invocation}-{ordinal}"),
+                    policy_revision: Some(policy_revision.clone()),
+                    policy_ids: result.determining_policy_ids,
+                    policy_error_ids: result.erroring_policy_ids,
+                    policy_errors_present: Some(result.errors_present),
+                    decision_point: "http.request".to_owned(),
+                    policy_digest: Some(policy_digest.clone()),
+                    allowed: result.allowed,
+                    reason,
+                    decision_digest,
+                    storage_scope_commitment: None,
+                    storage: None,
+                };
+                let audit = Arc::clone(&audit);
+                let invocation = invocation.clone();
+                Box::pin(async move {
+                    emit_audit_event(&event);
+                    match audit.append(event).await {
+                        Ok(()) => result.allowed,
+                        Err(source) => {
+                            report_audit_failure("decision", &invocation, &source);
+                            false
+                        }
+                    }
+                }) as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
             }) as dekopon_broker_host::RequestAuthorizer
         });
         let authorized = self
@@ -3419,6 +3512,9 @@ where
             decision_id: decision_id.clone(),
             policy_revision: Some(self.policy_revision.clone()),
             policy_ids: policy_ids.clone(),
+            policy_error_ids: Vec::new(),
+            policy_errors_present: None,
+            decision_point: "invocation".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
             allowed: true,
             reason: None,
@@ -4247,6 +4343,9 @@ fn emit_audit_event(event: &AuditEvent) {
             decision_id,
             policy_revision,
             policy_ids,
+            policy_error_ids,
+            policy_errors_present,
+            decision_point,
             policy_digest,
             allowed,
             reason,
@@ -4272,6 +4371,9 @@ fn emit_audit_event(event: &AuditEvent) {
                 authorized.by = authorized_by.as_ref().map(ToString::to_string),
                 policy.revision = policy_revision.as_deref(),
                 policy.ids = joined(policy_ids),
+                policy.error_ids = joined(policy_error_ids),
+                policy.errors_present = policy_errors_present,
+                decision.point = decision_point.as_str(),
                 policy.digest = policy_digest.as_deref(),
                 secret = secret.as_ref().map(ToString::to_string),
                 secret.sink = secret_sink.as_ref().map(ToString::to_string),

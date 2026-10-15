@@ -268,7 +268,7 @@ async fn wit_send_and_stream_each_cross_one_pre_dns_decision() {
         Arc::new(move |facts| {
             decisions.fetch_add(1, Ordering::SeqCst);
             observed.lock().expect("facts").push(facts);
-            false
+            Box::pin(async { false })
         })
     };
     for (mode, method) in [("buffered", "POST"), ("stream", "POST")] {

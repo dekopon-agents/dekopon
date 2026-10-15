@@ -120,7 +120,7 @@ async fn only_opted_in_requests_send_the_egress_parent_outside_accounted_bytes()
             "injected traceparent is never a guest header fact"
         );
         facts.fetch_add(1, Ordering::SeqCst);
-        true
+        Box::pin(async { true })
     }));
     for _ in 0..2 {
         opted_in
