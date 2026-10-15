@@ -7,6 +7,29 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.46.2] - 2026-10-15
+
+### Changed
+
+- Broker-native HTTP decodes gzip and deflate response bodies before byte limits and the credential echo scan, and refuses any other content encoding; providers receive decoded bodies.
+- A storage grant no longer fsyncs the `last-used` marker while holding the namespace observation lock; the marker's mtime is still refreshed.
+- Shell capture reduction is bounded by the shell tree's retained-value limit, the same one `jq` and value retention use, instead of the running job's own copy.
+- Document that `limits.jobTimeoutMs` is the deadline of each job a turn starts; a job started by a probe or by another job shares its starter's deadline and budgets.
+- Clarify required via and agent fields and optional routing fields in the policy README.
+
+### Fixed
+
+- A model script that recurses through `$( )`, `${ }` or compound commands no longer overflows the 2 MiB script thread and aborts `dekopon-gatewayd`; function calls, `$( )`, `${ }` and `if`/`for`/`while`/`case`/`{ }`/`[[ ]]` share one run-time nesting depth, now 32, and a script past it ends with a named error.
+- An arithmetic expansion whose operators nest more than 64 deep (`$(( !!!…1 ))`, a long `1+1+…` chain) is a syntax error instead of a stack overflow that aborted the gateway.
+- A panicking broker connection now ends only that connection and logs `broker_connection_failed` with `category=task-panicked`, instead of stopping `dekopon-brokerd` for every client.
+- Buffered HTTP `send` could return a credential echoed inside a compressed response body past the credential echo scan.
+
+### Security
+
+- wasmtime moves to 49.0.3 for RUSTSEC-2026-0353 through RUSTSEC-2026-0364.
+- The memory-optimized Wasmtime build and its `-wasmtime-optimization` images move to the C12 fork rebased onto Wasmtime 49.0.3 (`2c52d870`), so they carry the same fixes.
+- rustls moves to 0.23.46 for RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+
 ## [0.46.1] - 2026-10-13
 
 ### Fixed

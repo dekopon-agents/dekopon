@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-agent"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-broker-protocol",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "dekopon-broker-host",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-protocol"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-brokerd"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-gatewayd"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-http-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-proxy"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "axum",
  "bytes",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-token-governor"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "parking_lot",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-policy"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "cedar-policy",
  "dekopon-capability",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-process"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk-testkit"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "axum",
  "clap",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-shell"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-storage-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-telemetry"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-test-support"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-agent",
  "dekopon-broker-protocol",

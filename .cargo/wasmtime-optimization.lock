@@ -586,24 +586,24 @@ dependencies = [
 
 [[package]]
 name = "cranelift-assembler-x64"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
 
 [[package]]
 name = "cranelift-assembler-x64-meta"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-srcgen",
 ]
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -611,8 +611,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "serde",
  "serde_derive",
@@ -621,8 +621,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -651,8 +651,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-meta"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -663,21 +663,21 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-shared"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 
 [[package]]
 name = "cranelift-control"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "arbitrary",
 ]
 
 [[package]]
 name = "cranelift-entity"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -687,8 +687,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -699,13 +699,13 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 
 [[package]]
 name = "cranelift-native"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -714,8 +714,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-srcgen"
-version = "0.136.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "0.136.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 
 [[package]]
 name = "crc32fast"
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-agent"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-broker-protocol",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "dekopon-broker-host",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-protocol"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-brokerd"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-gatewayd"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-http-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-proxy"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "axum",
  "bytes",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-token-governor"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "parking_lot",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-policy"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "cedar-policy",
  "dekopon-capability",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-process"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk-testkit"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "axum",
  "clap",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-shell"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-storage-host"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-telemetry"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-test-support"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "dekopon-agent",
  "dekopon-broker-protocol",
@@ -2873,8 +2873,8 @@ dependencies = [
 
 [[package]]
 name = "pulley-interpreter"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -2884,8 +2884,8 @@ dependencies = [
 
 [[package]]
 name = "pulley-macros"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4414,8 +4414,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -4456,8 +4456,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-environ"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -4486,8 +4486,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-component-macro"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -4500,13 +4500,13 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-component-util"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
@@ -4515,8 +4515,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-cranelift"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-codegen",
  "cranelift-control",
@@ -4540,8 +4540,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-fiber"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cc",
  "libc",
@@ -4553,8 +4553,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-jit-debug"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -4562,8 +4562,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "libc",
  "wasmtime-internal-core",
@@ -4572,8 +4572,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-unwinder"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -4583,8 +4583,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4593,8 +4593,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
-version = "49.0.2"
-source = "git+https://github.com/dekopon-agents/wasmtime?rev=7cd4d6da8f90661629f05f16ea3e7564d322a41b#7cd4d6da8f90661629f05f16ea3e7564d322a41b"
+version = "49.0.3"
+source = "git+https://github.com/dekopon-agents/wasmtime?rev=2c52d8709720d7e788fccfe2b26f025417435acc#2c52d8709720d7e788fccfe2b26f025417435acc"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
