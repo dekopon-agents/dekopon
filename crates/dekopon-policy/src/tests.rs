@@ -189,7 +189,8 @@ fn only_entire_representable_json_records_enter_request_context() {
     let at_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(16 * 1024 - 8));
     input.body = Some(at_limit.into_bytes());
     assert!(request_json(input.clone()).get("body").is_some());
-    input.body = Some(vec![b'a'; 16 * 1024 + 100]);
+    let over_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(17 * 1024));
+    input.body = Some(over_limit.into_bytes());
     assert!(request_json(input.clone()).get("body").is_none());
     for bad in [
         "",
