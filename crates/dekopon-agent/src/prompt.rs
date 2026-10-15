@@ -4018,7 +4018,8 @@ mod tests {
             .flatten()
             .filter_map(|part| match part {
                 dekopon_model::model::ContentPart::Image { data, .. } => Some(data.read().unwrap()),
-                _ => None,
+                dekopon_model::model::ContentPart::Text(_)
+                | dekopon_model::model::ContentPart::File { .. } => None,
             })
             .collect();
         assert_eq!(images, (1..=8).map(|id| vec![id; 32]).collect::<Vec<_>>());
@@ -4076,7 +4077,8 @@ mod tests {
             .flatten()
             .filter_map(|part| match part {
                 dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
-                _ => None,
+                dekopon_model::model::ContentPart::Text(_)
+                | dekopon_model::model::ContentPart::File { .. } => None,
             })
             .collect();
         assert_eq!(images.len(), 8);
