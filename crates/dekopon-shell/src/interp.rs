@@ -534,9 +534,9 @@ impl<'a> Evaluator<'a> {
             FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
                 "dekopon-shell: step budget exhausted after {maximum} steps; the script is doing too much work or looping without progress"
             ),
-            FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => {
-                format!("dekopon-shell: shell functions nested deeper than {maximum} frames")
-            }
+            FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => format!(
+                "dekopon-shell: function calls, `$( )` substitutions, `${{ }}` expansions and compound commands (`if`, `for`, `while`, `case`, `{{ }}`, `[[ ]]`) nested deeper than {maximum} levels while running; replace recursion with a loop, or move inner results into variables first"
+            ),
             FatalError::Limit(LimitExceeded::Deadline { timeout_ms }) => {
                 format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline")
             }
@@ -1758,7 +1758,15 @@ impl<'a> Evaluator<'a> {
             Command::Compound {
                 statement,
                 redirects,
-            } => self.execute_compound_command(statement, redirects, input, capture_output),
+            } => match self.budget.enter_nesting() {
+                Ok(()) => {
+                    let executed =
+                        self.execute_compound_command(statement, redirects, input, capture_output);
+                    self.budget.leave_nesting();
+                    executed
+                }
+                Err(limit) => Err(limit.into()),
+            },
         };
         self.expansion_charges = parent;
         result
@@ -3105,7 +3113,7 @@ impl<'a> Evaluator<'a> {
         };
 
         self.budget.charge_step_with(self.invoker)?;
-        self.budget.enter_call()?;
+        self.budget.enter_nesting()?;
         let positional = arguments
             .iter()
             .map(|argument| Value::String(argument.clone()))
@@ -3156,7 +3164,7 @@ impl<'a> Evaluator<'a> {
             self.stdin.pop();
         }
         self.frames.pop();
-        self.budget.leave_call();
+        self.budget.leave_nesting();
 
         let mut retained = capture_charges(&mut captured);
         let value = if capture_output {
@@ -3406,13 +3414,10 @@ impl<'a> Evaluator<'a> {
                 modifier,
                 length,
             } => {
-                let (value, bound) = self.select_parameter(name, indices)?;
-                if self.options.nounset && !bound && *modifier == Modifier::None {
-                    return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
-                        "{name}: unbound variable, and `set -u` is on"
-                    ))));
-                }
-                let value = self.apply_modifier(name, indices, modifier, value, bound)?;
+                self.budget.enter_nesting()?;
+                let value = self.named_parameter_value(name, indices, modifier);
+                self.budget.leave_nesting();
+                let value = value?;
                 if *length {
                     parameter_length(&value)
                 } else {
@@ -3440,6 +3445,21 @@ impl<'a> Evaluator<'a> {
                 .last
                 .map_or_else(|| Value::String(String::new()), |id| Value::from(id.get())),
         })
+    }
+
+    fn named_parameter_value(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+        modifier: &Modifier,
+    ) -> Result<Value, CommandFailure> {
+        let (value, bound) = self.select_parameter(name, indices)?;
+        if self.options.nounset && !bound && *modifier == Modifier::None {
+            return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
+                "{name}: unbound variable, and `set -u` is on"
+            ))));
+        }
+        self.apply_modifier(name, indices, modifier, value, bound)
     }
 
     fn select_parameter(
@@ -3616,8 +3636,10 @@ impl<'a> Evaluator<'a> {
     }
 
     fn run_substitution(&mut self, program: &Program) -> Result<CommandResult, CommandFailure> {
+        self.budget.enter_nesting()?;
         self.captures.push(Vec::new());
         let flow = self.execute_program(program);
+        self.budget.leave_nesting();
         let mut captured = self.captures.pop().unwrap_or_default();
         let flow = flow.map_err(CommandFailure::Fatal)?;
 

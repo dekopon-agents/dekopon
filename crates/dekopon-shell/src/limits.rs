@@ -6,7 +6,9 @@ use std::{collections::VecDeque, time::Duration};
 use crate::{CallBudget, CapabilityInvoker, TreeContext};
 
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
-pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
+/// Function calls, `$( )`, `${ }` and compound commands all recurse on the native stack against
+/// this one depth; 32 keeps the deepest measured script inside a 2 MiB thread even in a debug build.
+pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 32;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -117,7 +119,7 @@ impl Budget {
         self.tree.remaining()
     }
 
-    pub fn enter_call(&mut self) -> Result<(), LimitExceeded> {
+    pub fn enter_nesting(&mut self) -> Result<(), LimitExceeded> {
         if self.depth >= self.limits.max_recursion_depth {
             return Err(LimitExceeded::RecursionDepth {
                 maximum: self.limits.max_recursion_depth,
@@ -127,7 +129,7 @@ impl Budget {
         Ok(())
     }
 
-    pub fn leave_call(&mut self) {
+    pub fn leave_nesting(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
@@ -353,14 +355,14 @@ mod tests {
             max_recursion_depth: 2,
             ..Limits::default()
         });
-        assert!(budget.enter_call().is_ok());
-        assert!(budget.enter_call().is_ok());
+        assert!(budget.enter_nesting().is_ok());
+        assert!(budget.enter_nesting().is_ok());
         assert_eq!(
-            budget.enter_call(),
+            budget.enter_nesting(),
             Err(LimitExceeded::RecursionDepth { maximum: 2 })
         );
-        budget.leave_call();
-        assert!(budget.enter_call().is_ok());
+        budget.leave_nesting();
+        assert!(budget.enter_nesting().is_ok());
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //!
 //! - a step budget covering statements, loop iterations, function calls, arithmetic nodes, and
 //!   values pulled from a `jq` filter,
-//! - a shell-function recursion depth cap,
+//! - one run-time nesting depth that function calls, `$( )` substitutions, `${ }` expansions and
+//!   compound commands share, because each recurses on the native stack,
 //! - independent output byte and line ceilings with head-and-tail truncation,
 //! - a wall-clock deadline, re-read on every step and around every capability call,
 //! - a capability-invocation ceiling that is deliberately separate from the step budget,

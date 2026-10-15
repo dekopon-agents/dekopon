@@ -842,7 +842,7 @@ fn functions_participate_in_pipelines_in_both_directions() {
     assert_eq!(output("f() { echo one; echo two; }\nf | grep one"), "one");
     assert_eq!(output("f() { echo one; echo two; }\nf"), "one\ntwo");
     assert_eq!(
-        output("f() { if [ $1 -gt 0 ]; then f $(($1 - 1)); else echo done; fi; }; f 40 | cat"),
+        output("f() { if [ $1 -gt 0 ]; then f $(($1 - 1)); else echo done; fi; }; f 12 | cat"),
         "done"
     );
     assert_eq!(output("echo a\nq() { true; }\nq\necho b"), "a\nb");
@@ -973,6 +973,12 @@ countdown() {
 }
 countdown 3";
     assert_eq!(output(script), "3\n2\n1");
+    let script = "\
+down() {
+  if [ $1 -gt 0 ]; then echo $(down $(( $1 - 1 ))); else echo \"${label:-bottom}\"; fi
+}
+down 8";
+    assert_eq!(output(script), "bottom");
 }
 
 #[test]
@@ -2214,6 +2220,40 @@ fn the_recursion_cap_stops_runaway_shell_functions() {
         "{}",
         outcome.output
     );
+}
+
+#[test]
+fn recursion_through_substitutions_and_blocks_is_refused_before_it_overflows_a_2_mib_stack() {
+    for script in [
+        "f() { echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(f)))))))); }; f".to_owned(),
+        format!(
+            "f() {{ {}f{}; }}; f",
+            "if true; then ".repeat(30),
+            "; fi".repeat(30)
+        ),
+        format!("f() {{ [[ {}-n $(f) ]]; }}; f", "! ".repeat(58)),
+        format!(
+            "f() {{ echo {}$(f){}; }}; f",
+            "${a:-".repeat(31),
+            "}".repeat(31)
+        ),
+        "f() {\nxargs f <<EOF\na\nEOF\n}\nf".to_owned(),
+    ] {
+        let outcome = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn_scoped(scope, || run(&script))
+                .expect("a 2 MiB thread")
+                .join()
+                .expect("the script returns an outcome")
+        });
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert!(
+            outcome.output.contains("nested deeper than 32 levels"),
+            "{script}: {}",
+            outcome.output
+        );
+    }
 }
 
 #[test]
