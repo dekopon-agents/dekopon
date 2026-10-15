@@ -1282,6 +1282,274 @@ mod retention_tests {
         ))
     }
 
+    struct OneByteFetcher;
+
+    impl AssetFetcher for OneByteFetcher {
+        fn fetch(
+            &self,
+            _: &AssetSourceRef,
+            _: u64,
+        ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, crate::transport::TransportError>>
+        {
+            Box::pin(async { Ok(vec![9]) })
+        }
+    }
+
+    struct FetchScript {
+        calls: std::sync::atomic::AtomicUsize,
+        last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
+    }
+
+    impl dekopon_model::model::ChatModel for FetchScript {
+        fn complete(
+            &self,
+            messages: &[dekopon_model::model::ModelMessage],
+            _tools: &[dekopon_model::model::ModelTool],
+            _options: &dekopon_model::model::CompletionOptions,
+            _on_event: &mut (
+                     dyn FnMut(dekopon_model::TurnEvent) -> std::ops::ControlFlow<()> + Send
+                 ),
+        ) -> Result<dekopon_model::model::AssistantTurn, dekopon_model::error::InferenceError>
+        {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 9 {
+                *self.last.lock() = messages.to_vec();
+                Ok(dekopon_model::model::AssistantTurn::new(
+                    Some("seen".into()),
+                    vec![],
+                    None,
+                ))
+            } else {
+                Ok(dekopon_model::model::AssistantTurn::new(
+                    None,
+                    vec![dekopon_model::model::ModelToolCall {
+                        id: format!("fetch-{call}").into(),
+                        kind: "function".into(),
+                        function: dekopon_model::model::ModelFunctionCall {
+                            name: "fetch_chat_asset".into(),
+                            arguments: json!({"id": call + 1}).to_string(),
+                        },
+                    }],
+                    None,
+                ))
+            }
+        }
+    }
+
+    struct NoScripts;
+
+    impl dekopon_agent::prompt::ScriptRuntime for NoScripts {
+        fn run_script(&self, _: &str) -> dekopon_shell::ScriptOutcome {
+            panic!("this model only fetches chat assets")
+        }
+        fn capability_calls_used(&self) -> u32 {
+            0
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crossing_fetch_preserves_the_real_store_images_at_both_retention_budgets() {
+        use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+        use dekopon_model::model::ContentPart;
+        use tracing_subscriber::prelude::*;
+
+        for budget in [40 * 1024 * 1024, 64 * 1024 * 1024] {
+            let store = store(budget);
+            let access = access("crossing");
+            let ids: Vec<_> = (1..=8).map(|_| register(&store, &access)).collect();
+            for (index, id) in ids.iter().enumerate() {
+                drop(
+                    store
+                        .admit(&access, *id, &vec![(index + 1) as u8; 5 * 1024 * 1024])
+                        .unwrap(),
+                );
+            }
+            let crossing_id = store
+                .assets_for_access(
+                    &access,
+                    vec![PendingAsset {
+                        name: "ninth.png".into(),
+                        mime: "image/png".into(),
+                        size: Some(1),
+                        source: Some(AssetSourceRef::Telegram {
+                            file_id: "ninth".into(),
+                        }),
+                    }],
+                    true,
+                    Instant::now(),
+                )
+                .arrived[0];
+            assert_eq!(crossing_id, 9);
+            let session = SessionAssets::new(
+                store,
+                access,
+                Some(Arc::new(OneByteFetcher)),
+                Handle::current(),
+                true,
+                true,
+            );
+            tokio::task::spawn_blocking(move || {
+                let capture = dekopon_test_support::CaptureLayer::workspace();
+                let _guard = tracing_subscriber::registry()
+                    .with(capture.clone())
+                    .set_default();
+                let model = FetchScript {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    last: Mutex::new(vec![]),
+                };
+                run_prompt_session(
+                    &model,
+                    &NoScripts,
+                    SessionInputs::new(
+                        "show each photo",
+                        PromptLimits {
+                            max_steps: 11,
+                            max_capability_calls: 0,
+                        },
+                    )
+                    .with_assets(&session),
+                    &mut History::default(),
+                )
+                .unwrap();
+                let last = model.last.lock();
+                let images: Vec<_> = last
+                    .iter()
+                    .filter_map(|message| message.parts())
+                    .flatten()
+                    .filter_map(|part| match part {
+                        ContentPart::Image { data, .. } => {
+                            Some(data.read().expect("previous image remains resident"))
+                        }
+                        ContentPart::Text(_) | ContentPart::File { .. } => None,
+                    })
+                    .collect();
+                assert_eq!(images.len(), 8);
+                assert!(
+                    !last
+                        .iter()
+                        .filter_map(|message| message.content())
+                        .any(|text| text.contains("was released from disk retention"))
+                );
+                for (index, image) in images.iter().enumerate() {
+                    assert_eq!(image.len(), 5 * 1024 * 1024);
+                    assert!(image.iter().all(|byte| *byte == (index + 1) as u8));
+                }
+                let refusal = last
+                    .iter()
+                    .filter(|message| message.role() == "tool")
+                    .filter_map(|message| message.content())
+                    .find(|text| text.contains("chat-asset:9"))
+                    .expect("crossing ID appears in the tool response");
+                assert!(
+                    refusal.contains(if budget == 40 * 1024 * 1024 {
+                        "unavailable"
+                    } else {
+                        "will not be shown"
+                    }),
+                    "{refusal}"
+                );
+                assert_eq!(
+                    capture
+                        .events_where(
+                            "dekopon_agent::audit",
+                            &[("audit.event", "agent.asset.refused"), ("asset.id", "9")]
+                        )
+                        .len(),
+                    1
+                );
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_fetch_cannot_cross_the_model_request_byte_limit() {
+        use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+        use tracing_subscriber::prelude::*;
+
+        let store = store(64 * 1024 * 1024);
+        let access = access("text-crossing");
+        let ids: Vec<_> = (1..=8).map(|_| register(&store, &access)).collect();
+        for (index, id) in ids.iter().enumerate() {
+            drop(
+                store
+                    .admit(&access, *id, &vec![(index + 1) as u8; 5 * 1024 * 1024])
+                    .unwrap(),
+            );
+        }
+        let text_id = store
+            .assets_for_access(
+                &access,
+                vec![PendingAsset {
+                    name: "note.txt".into(),
+                    mime: "text/plain".into(),
+                    size: Some(1),
+                    source: Some(AssetSourceRef::Telegram {
+                        file_id: "note".into(),
+                    }),
+                }],
+                true,
+                Instant::now(),
+            )
+            .arrived[0];
+        assert_eq!(text_id, 9);
+        drop(store.admit(&access, text_id, b"x").unwrap());
+        let session = SessionAssets::new(store, access, None, Handle::current(), true, true);
+        tokio::task::spawn_blocking(move || {
+            let capture = dekopon_test_support::CaptureLayer::workspace();
+            let _guard = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let model = FetchScript {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                last: Mutex::new(vec![]),
+            };
+            run_prompt_session(
+                &model,
+                &NoScripts,
+                SessionInputs::new(
+                    "show the note",
+                    PromptLimits {
+                        max_steps: 11,
+                        max_capability_calls: 0,
+                    },
+                )
+                .with_assets(&session),
+                &mut History::default(),
+            )
+            .unwrap();
+            let last = model.last.lock();
+            assert_eq!(
+                last.iter()
+                    .filter_map(|message| message.parts())
+                    .flatten()
+                    .filter(|part| matches!(part, dekopon_model::model::ContentPart::Image { .. }))
+                    .count(),
+                8
+            );
+            let refusal = last
+                .iter()
+                .filter(|message| message.role() == "tool")
+                .filter_map(|message| message.content())
+                .find(|text| text.contains("chat-asset:9"))
+                .expect("the unseen text ID is reported");
+            assert!(refusal.contains("will not be shown"), "{refusal}");
+            assert!(!last.iter().any(|message| message.content() == Some("x")));
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_agent::audit",
+                        &[("audit.event", "agent.asset.refused"), ("asset.id", "9")]
+                    )
+                    .len(),
+                1
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn eight_retained_photos_can_be_fetched_in_one_session() {
         let store = store(64);
