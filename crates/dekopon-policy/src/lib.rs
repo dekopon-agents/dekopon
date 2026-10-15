@@ -866,7 +866,10 @@ fn references_request(value: &serde_json::Value) -> bool {
             refers || fields.values().any(references_request)
         }
         serde_json::Value::Array(values) => values.iter().any(references_request),
-        _ => false,
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
     }
 }
 
