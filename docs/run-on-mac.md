@@ -57,8 +57,8 @@ The application release publishes the workspace's crates in dependency order thr
 trusted publishing. Install both daemons at the same available version:
 
 ```console
-cargo install --locked --version 0.46.1 dekopon-brokerd
-cargo install --locked --version 0.46.1 dekopon-gatewayd
+cargo install --locked --version 0.46.2 dekopon-brokerd
+cargo install --locked --version 0.46.2 dekopon-gatewayd
 ```
 
 A crate publication can trail the Git tag or stop partway; use the tap or release archives if the
