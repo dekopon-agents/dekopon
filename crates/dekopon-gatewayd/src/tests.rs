@@ -8665,6 +8665,7 @@ async fn slack_auto_posts_only_the_answer_and_uses_same_session_native_refusal_f
             liveness,
             cancellation: crate::session::SessionCancellation::new(),
             max_duration: None,
+            silent_until_success: false,
         });
         sink.emit(ProgressEvent::Started {
             agent: "tester".to_owned(),
@@ -12774,6 +12775,34 @@ async fn parked_broker(
     )
 }
 
+struct FailingStreamModel(Arc<dekopon_test_support::ScriptedStreamModel>);
+
+impl ChatModel for FailingStreamModel {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        self.0.complete(messages, tools, options, on_event)?;
+        Err(InferenceError::Protocol(
+            dekopon_model::error::ProtocolFailure::NoChoices,
+        ))
+    }
+}
+
+impl ModelFactory for Arc<FailingStreamModel> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Ok(Arc::clone(self) as SharedModel)
+    }
+}
+
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
     fn build(
         &self,
@@ -13090,6 +13119,97 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
             "a stop before turn 1 must not buy a model turn: {origin:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let first_delta = dekopon_model::events_from_transcript(
+        dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+    )
+    .expect("model fixture parses")
+    .into_iter()
+    .find(|event| matches!(event, TurnEvent::TextDelta(_)))
+    .expect("fixture emits a text delta");
+    let stream = Arc::new(dekopon_test_support::ScriptedStreamModel::scripted(
+        vec![first_delta],
+        answer("ignored"),
+    ));
+    let model = Arc::new(FailingStreamModel(Arc::clone(&stream)));
+    let mut runner = Arc::into_inner(runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    ))
+    .expect("one runner owner");
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message("ambient");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    inbound.liveness = Some(LivenessTarget::Discord {
+        channel_id: "200000000000000001".into(),
+        message_id: "300000000000000002".into(),
+        conversation_id: inbound.conversation.key(),
+    });
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(table);
+    let driver = Arc::new(
+        RecordingDriver::default()
+            .with_stream(2_000, Duration::from_millis(10))
+            .with_progress(2_000, Duration::from_millis(10)),
+    );
+    let task = tokio::spawn(run_session(
+        Arc::new(runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    stream.release_next();
+    tokio::time::timeout(Duration::from_secs(5), stream.wait_for_event())
+        .await
+        .expect("delta emitted");
+    let surface = driver.stream_object().expect("streaming driver");
+    let posted_before_failure =
+        tokio::time::timeout(Duration::from_millis(200), surface.wait_for_calls(1))
+            .await
+            .is_ok();
+    stream.release_next();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("turn ended")
+        .expect("task joined");
+    assert_eq!(stream.emitted(), 1, "the failing model emitted a delta");
+    assert!(
+        !posted_before_failure,
+        "a streamed partial must not reach the surface"
+    );
+    assert!(
+        driver.calls().is_empty(),
+        "no partial, status, progress, or failure post is sent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

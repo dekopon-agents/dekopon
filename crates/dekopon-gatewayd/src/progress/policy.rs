@@ -62,6 +62,27 @@ pub(crate) enum Terminal {
     Silent,
 }
 
+fn final_delivery(terminal: Terminal, silent_until_success: bool) -> Terminal {
+    match terminal {
+        Terminal::Answered(reply) => Terminal::Answered(reply),
+        Terminal::Failed(line) => {
+            if silent_until_success {
+                Terminal::Silent
+            } else {
+                Terminal::Failed(line)
+            }
+        }
+        Terminal::Stopped(cause) => {
+            if silent_until_success {
+                Terminal::Silent
+            } else {
+                Terminal::Stopped(cause)
+            }
+        }
+        Terminal::Silent => Terminal::Silent,
+    }
+}
+
 struct TerminalRequest {
     terminal: Terminal,
     done: oneshot::Sender<bool>,
@@ -117,6 +138,7 @@ pub(crate) struct ProgressInputs {
     pub keep_alive: KeepAlive,
     pub cancellation: SessionCancellation,
     pub max_duration: Option<Duration>,
+    pub silent_until_success: bool,
 }
 
 pub(crate) struct ProgressPolicy {
@@ -347,6 +369,7 @@ impl Pending {
     }
 
     async fn terminal(self, terminal: Terminal) -> Delivered {
+        let terminal = final_delivery(terminal, self.inputs.silent_until_success);
         record_terminal(&terminal, &self.counters, 0, 0);
         let reply = match terminal {
             Terminal::Answered(reply) => Some(reply),
@@ -391,6 +414,7 @@ struct Live {
     deadline: Deadline,
     message: Option<MessageRef>,
     streaming: bool,
+    silent_until_success: bool,
     latest_text: Option<StreamedText>,
     posted_on_text: bool,
     typing: Schedule<()>,
@@ -431,6 +455,7 @@ impl Live {
             deadline: Deadline::new(now, inputs.max_duration),
             message: None,
             streaming: false,
+            silent_until_success: inputs.silent_until_success,
             latest_text: None,
             posted_on_text: false,
             typing: Schedule::new(now),
@@ -908,6 +933,7 @@ impl Live {
     }
 
     async fn terminal(mut self, terminal: Terminal, text: StreamedText) -> Delivered {
+        let terminal = final_delivery(terminal, self.silent_until_success);
         self.state.note = None;
         let generation = text.generation;
         self.latest_text = (!text.text.as_str().is_empty()).then_some(text);
@@ -961,6 +987,10 @@ impl Live {
                         self.deliver(OutboundReply::text(stopped)).await
                     }
                 }
+            }
+            Terminal::Silent if self.silent_until_success => {
+                self.discard().await;
+                false
             }
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {

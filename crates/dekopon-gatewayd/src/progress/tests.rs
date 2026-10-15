@@ -464,6 +464,7 @@ fn start_with(
         liveness,
         cancellation: cancellation.clone(),
         max_duration,
+        silent_until_success: false,
     });
     Harness {
         policy,
@@ -864,6 +865,7 @@ async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() 
         liveness: Arc::clone(&liveness),
         cancellation: SessionCancellation::new(),
         max_duration: None,
+        silent_until_success: false,
     };
 
     // Run A starts and then finishes; its cleanup's Idle write is delayed, standing in for a
@@ -2432,6 +2434,7 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                 liveness: config,
                 cancellation: SessionCancellation::new(),
                 max_duration: None,
+                silent_until_success: false,
             });
             sink.emit(started());
             if stream {

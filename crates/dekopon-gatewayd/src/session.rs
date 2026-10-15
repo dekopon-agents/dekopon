@@ -1759,7 +1759,10 @@ async fn session(
         .with_chat_asset_inputs(ChatAssetInputs::new(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
-    let (settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
+    let (mut settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
+    if is_follow {
+        settings.mode = crate::config::LivenessMode::Off;
+    }
     // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
     // wake ahead of the terminal reply being sent.
     let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
@@ -1774,6 +1777,7 @@ async fn session(
         keep_alive,
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
+        silent_until_success: is_follow,
     });
     sink.emit(ProgressEvent::Started {
         agent: route.agent.to_string(),
