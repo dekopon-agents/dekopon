@@ -502,7 +502,8 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(&path)?;
-        file.write_all(&encode_line(&line)?)?;
+        let encoded = encode_line(&line)?;
+        file.write_all(&encoded)?;
         let bytes = file.metadata()?.len();
         drop(file);
         if bytes > compaction_threshold(window) {
@@ -514,8 +515,14 @@ impl Journal {
                 result => result?,
             }
         }
-        if let Some((agent, _)) = stem.split_once('/') {
-            self.enforce_agent_cap(agent)?;
+        if let Some((agent, _)) = stem.split_once('/')
+            && self.enforce_agent_cap(agent, Some((&path, line.record_id)))?
+        {
+            tracing::warn!(
+                event = "gateway_memory_retention_failed",
+                reason = "agent-byte-cap",
+                encoded_bytes = encoded.len()
+            );
         }
         Ok(())
     }
@@ -527,13 +534,17 @@ impl Journal {
             if is_agent_directory(&path)
                 && let Some(agent) = path.file_name().and_then(|name| name.to_str())
             {
-                self.enforce_agent_cap(agent)?;
+                self.enforce_agent_cap(agent, None)?;
             }
         }
         Ok(())
     }
 
-    fn enforce_agent_cap(&self, agent: &str) -> Result<(), JournalError> {
+    fn enforce_agent_cap(
+        &self,
+        agent: &str,
+        appended: Option<(&Path, u64)>,
+    ) -> Result<bool, JournalError> {
         let limit = self
             .agent_bytes
             .get(agent)
@@ -541,7 +552,7 @@ impl Journal {
             .unwrap_or(self.max_bytes_per_agent);
         let directory = self.dir.join(agent);
         if !directory.exists() {
-            return Ok(());
+            return Ok(false);
         }
         let mut paths = Vec::new();
         let mut total = 0u64;
@@ -554,7 +565,7 @@ impl Journal {
             }
         }
         if total <= limit {
-            return Ok(());
+            return Ok(false);
         }
         let mut files = paths
             .into_iter()
@@ -563,6 +574,7 @@ impl Journal {
                 Ok((path, size, lines, 0usize))
             })
             .collect::<Result<Vec<_>, JournalError>>()?;
+        let mut lost_append = false;
         while total > limit {
             let oldest = files
                 .iter()
@@ -574,7 +586,9 @@ impl Journal {
             let Some((_, _, index)) = oldest else {
                 break;
             };
-            let (_, size, lines, removed) = &mut files[index];
+            let (path, size, lines, removed) = &mut files[index];
+            lost_append |= appended
+                .is_some_and(|(new_path, id)| new_path == path && lines[*removed].record_id == id);
             let dropped = encode_line(&lines[*removed])?.len() as u64;
             *removed += 1;
             *size = size.saturating_sub(dropped);
@@ -590,7 +604,7 @@ impl Journal {
                 rewrite(&path, &lines[removed..])?;
             }
         }
-        Ok(())
+        Ok(lost_append)
     }
 
     fn path(&self, stem: &str) -> PathBuf {
@@ -1310,19 +1324,23 @@ mod tests {
             ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "second").journal_stem();
         let other =
             ConversationKey::shared(&"another".parse().unwrap(), "slack", "third").journal_stem();
-        append(&journal, &first, now - Duration::from_secs(3), GRANT, "old");
         append(
             &journal,
-            &second,
+            &first,
             now - Duration::from_secs(2),
             GRANT,
             "middle",
         );
+        append(
+            &journal,
+            &second,
+            now - Duration::from_secs(3),
+            GRANT,
+            "old",
+        );
         append(&journal, &first, now - Duration::from_secs(1), GRANT, "new");
         append(&journal, &other, now, GRANT, "other agent");
-        let old_size = encode_line(&read_lines(&journal.path(&first)).unwrap()[0])
-            .unwrap()
-            .len() as u64;
+        let old_size = fs::metadata(journal.path(&second)).unwrap().len();
         let total = fs::metadata(journal.path(&first)).unwrap().len()
             + fs::metadata(journal.path(&second)).unwrap().len();
         journal
@@ -1331,17 +1349,14 @@ mod tests {
         journal.enforce_caps().unwrap();
         assert_eq!(
             users(&journal.recall(&first, GRANT, window(), now).unwrap()),
-            ["new"]
+            ["middle", "new"]
         );
-        assert_eq!(
-            users(&journal.recall(&second, GRANT, window(), now).unwrap()),
-            ["middle"]
-        );
+        assert!(!journal.path(&second).exists());
         assert_eq!(
             users(&journal.recall(&other, GRANT, window(), now).unwrap()),
             ["other agent"]
         );
-        assert_eq!(read_lines(&journal.path(&first)).unwrap()[0].record_id, 2);
+        assert_eq!(read_lines(&journal.path(&first)).unwrap()[0].record_id, 1);
         append(&journal, &first, now, GRANT, "after cap");
         assert_eq!(
             read_lines(&journal.path(&first))
@@ -1360,6 +1375,32 @@ mod tests {
             users(&journal.recall(&other, GRANT, window(), now).unwrap()),
             ["other agent"]
         );
+    }
+
+    #[test]
+    fn oversized_turn_emits_bounded_retention_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        journal.agent_bytes.insert("reviewer".into(), 1);
+        let (capture, _guard) = crate::tests::capture_spans();
+        append(
+            &journal,
+            &key().journal_stem(),
+            SystemTime::now(),
+            GRANT,
+            "oversized",
+        );
+        let failures = capture.events_where(
+            "dekopon_gatewayd",
+            &[
+                ("event", "gateway_memory_retention_failed"),
+                ("reason", "agent-byte-cap"),
+            ],
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].field("encoded_bytes").is_some());
+        assert!(failures[0].field("user").is_none());
+        assert!(!journal.path(&key().journal_stem()).exists());
     }
 
     #[test]
