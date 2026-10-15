@@ -441,7 +441,7 @@ impl Audit {
             .into_iter()
             .filter_map(|record| match record {
                 Record::Event { target, fields, .. } if target.starts_with("dekopon_broker") => {
-                    Some(fields)
+                    Some(fields.to_string())
                 }
                 Record::Event { .. } | Record::Span { .. } => None,
             })
@@ -454,9 +454,9 @@ impl Audit {
             .into_iter()
             .filter_map(|record| match record {
                 Record::Event { fields, scope, .. }
-                    if has(&fields, "audit.event", "\"gateway.progress\"") =>
+                    if fields.get("audit.event") == Some("gateway.progress") =>
                 {
-                    Some((fields, scope))
+                    Some((fields.to_string(), scope))
                 }
                 Record::Event { .. } | Record::Span { .. } => None,
             })

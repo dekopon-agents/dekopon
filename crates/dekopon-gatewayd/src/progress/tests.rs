@@ -518,9 +518,7 @@ async fn producer_events(
     command: Option<&str>,
 ) -> Vec<ProgressEvent> {
     use dekopon_agent::BrokerLeg;
-    use dekopon_broker_protocol::{
-        BrokerClient, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
-    };
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits, ResponseEnvelope};
     use dekopon_shell::CapabilityInvoker;
     use std::os::unix::fs::PermissionsExt;
 
@@ -533,48 +531,37 @@ async fn producer_events(
     }
     let directory = tempfile::tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = directory.path().join("broker.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let client = BrokerClient::new(&socket, crate::current_uid(), FrameLimits::default()).unwrap();
-    let server = async {
-        let mut responses = vec![ResponseEnvelope::capabilities(
-            Vec::new(),
-            command.into_iter().map(str::to_owned).collect(),
-            BTreeMap::new(),
-        )];
-        if command.is_some() {
-            responses.push(ResponseEnvelope::error("denied", "fixture refusal"));
-        }
-        for response in responses {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _request = read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
-                .await
-                .unwrap();
-            write_frame(&mut stream, &response, FrameLimits::default())
-                .await
-                .unwrap();
-        }
-    };
+    let mut responses = vec![ResponseEnvelope::capabilities(
+        Vec::new(),
+        command.into_iter().map(str::to_owned).collect(),
+        BTreeMap::new(),
+    )];
+    if command.is_some() {
+        responses.push(ResponseEnvelope::error("denied", "fixture refusal"));
+    }
+    let broker = dekopon_test_support::BrokerFixture::answering(directory.path(), responses);
+    let client = BrokerClient::new(
+        broker.socket(),
+        crate::current_uid(),
+        FrameLimits::default(),
+    )
+    .unwrap();
     let notes = Arc::new(Notes::default());
     let sink = Arc::clone(&notes) as Arc<dyn ProgressSink>;
-    let producer = async {
-        let leg = BrokerLeg::connect(client, None)
-            .await
-            .unwrap()
-            .with_progress(sink, dekopon_shell::CallBudget::new(1))
-            .with_progress_notes();
-        leg.note(text, eta);
-        if let Some(word) = command {
-            let word = word.to_owned();
-            tokio::task::spawn_blocking(move || {
-                assert!(leg.run_command(&word, &[], false).is_some());
-            })
-            .await
-            .unwrap();
-        }
-    };
-    tokio::join!(producer, server);
+    let leg = BrokerLeg::connect(client, None)
+        .await
+        .unwrap()
+        .with_progress(sink, dekopon_shell::CallBudget::new(1))
+        .with_progress_notes();
+    leg.note(text, eta);
+    if let Some(word) = command {
+        let word = word.to_owned();
+        tokio::task::spawn_blocking(move || {
+            assert!(leg.run_command(&word, &[], false).is_some());
+        })
+        .await
+        .unwrap();
+    }
     std::mem::take(&mut *notes.0.lock())
 }
 

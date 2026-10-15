@@ -398,21 +398,31 @@ async fn a_detached_job_records_its_start_root_finish_and_notice() {
     .with_subscriber(subscriber)
     .await;
     let records = capture.records();
-    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Span { name: "gateway.job", parent: None, fields } if fields.contains("job.id=1"))), "{records:?}");
+    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Span { name: "gateway.job", parent: None, .. } if record.field("job.id") == Some("1"))), "{records:?}");
     assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Span { name: "shell.script", parent: Some(parent), .. } if parent == "gateway.job")), "{records:?}");
-    for (field, parent) in [
-        ("job.deadline_ms=", Some("shell.script")),
-        ("job.outcome=\"succeeded\"", Some("gateway.job")),
-        ("job.notice.delivery=\"new-turn\"", Some("gateway.message")),
+    for (field, value, parent) in [
+        ("job.deadline_ms", None, Some("shell.script")),
+        ("job.outcome", Some("succeeded"), Some("gateway.job")),
+        (
+            "job.notice.delivery",
+            Some("new-turn"),
+            Some("gateway.message"),
+        ),
     ] {
-        assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { fields, parent: actual, .. } if fields.contains("job.id=1") && fields.contains(field) && actual.as_deref() == parent)), "{field}: {records:?}");
+        assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { parent: actual, .. } if actual.as_deref() == parent) && record.field("job.id") == Some("1") && record.field(field).is_some_and(|actual| value.is_none_or(|value| actual == value))), "{field}: {records:?}");
     }
-    let context = [
-        format!("conversation.id={}", message("start").conversation.key()),
-        format!("subject={}", subject().canonical()),
-        "agent=".to_owned(),
-    ];
-    assert!(records.iter().any(|record| matches!(record, dekopon_test_support::Record::Event { fields, .. } if fields.contains("job.notice.delivery") && context.iter().all(|field| fields.contains(field.as_str())))), "{context:?}: {records:?}");
+    let conversation = message("start").conversation.key().to_string();
+    let canonical = subject().canonical();
+    assert!(
+        records.iter().any(
+            |record| matches!(record, dekopon_test_support::Record::Event { .. })
+                && record.field("job.notice.delivery").is_some()
+                && record.field("conversation.id") == Some(&*conversation)
+                && record.field("subject") == Some(&*canonical)
+                && record.field("agent").is_some()
+        ),
+        "{records:?}"
+    );
 
     provider.force_flush().unwrap();
     let spans = exported.0.lock().clone();
@@ -2015,13 +2025,8 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
         .into_iter()
         .filter_map(|record| match record {
             dekopon_test_support::Record::Event { fields, .. } => {
-                let field = |name: &str| {
-                    fields
-                        .split_whitespace()
-                        .find_map(|token| token.strip_prefix(name))
-                        .and_then(|value| value.parse::<u64>().ok())
-                };
-                Some((field("job.id=")?, field("job.deadline_ms=")?))
+                let field = |name| fields.get(name)?.parse::<u64>().ok();
+                Some((field("job.id")?, field("job.deadline_ms")?))
             }
             dekopon_test_support::Record::Span { .. } => None,
         })

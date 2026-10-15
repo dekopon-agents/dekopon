@@ -14634,13 +14634,10 @@ fn mention(id: &str, text: &str) -> InboundMessage {
     }
 }
 
-fn recalled_events(capture: &dekopon_test_support::CaptureLayer) -> Vec<String> {
-    capture
-        .events()
-        .into_iter()
-        .map(|(fields, _)| fields)
-        .filter(|fields| fields.contains("gateway_recalled"))
-        .collect()
+fn recalled_events(
+    capture: &dekopon_test_support::CaptureLayer,
+) -> Vec<dekopon_test_support::Record> {
+    capture.events_where("dekopon_gatewayd", &[("event", "gateway_recalled")])
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -14702,14 +14699,13 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
     assert_eq!(replayed.matches("a photo").count(), 1, "{following:?}");
     assert_eq!(replayed.matches("first answer").count(), 1, "{following:?}");
     let events = recalled_events(&capture);
-    assert_eq!(events.len(), 2, "one event per seeded window: {events:?}");
-    assert!(
-        events[0].contains("messages=0") && events[0].contains("delta=0"),
-        "{events:?}"
-    );
-    assert!(
-        events[1].contains("messages=1") && events[1].contains("delta=1"),
-        "{events:?}"
+    assert_eq!(
+        events
+            .iter()
+            .map(|record| [record.field("messages"), record.field("delta")])
+            .collect::<Vec<_>>(),
+        [[Some("0"), Some("0")], [Some("1"), Some("1")]],
+        "one event per seeded window: {events:?}"
     );
 }
 

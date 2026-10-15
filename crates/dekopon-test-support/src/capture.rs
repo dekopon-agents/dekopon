@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use tracing::{
     Metadata,
@@ -13,15 +13,70 @@ pub enum Record {
     Event {
         level: &'static str,
         target: String,
-        fields: String,
+        fields: Fields,
         parent: Option<String>,
         scope: Vec<&'static str>,
     },
     Span {
         name: &'static str,
-        fields: String,
+        fields: Fields,
         parent: Option<String>,
     },
+}
+
+impl Record {
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<&str> {
+        match self {
+            Self::Event { fields, .. } | Self::Span { fields, .. } => fields.get(name),
+        }
+    }
+
+    #[must_use]
+    pub fn parent(&self) -> Option<&str> {
+        match self {
+            Self::Event { parent, .. } | Self::Span { parent, .. } => parent.as_deref(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Fields(Vec<(&'static str, Value)>);
+
+#[derive(Clone)]
+enum Value {
+    Str(String),
+    Formatted(String),
+}
+
+impl Fields {
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, value)| match value {
+                Value::Str(value) | Value::Formatted(value) => value.as_str(),
+            })
+    }
+}
+
+impl fmt::Display for Fields {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (name, value) in &self.0 {
+            match value {
+                Value::Str(value) => write!(formatter, " {name}={value:?}")?,
+                Value::Formatted(value) => write!(formatter, " {name}={value}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Fields {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.to_string(), formatter)
+    }
 }
 
 const WORKSPACE_CATEGORIES: &[&str] = &[
@@ -90,7 +145,7 @@ impl CaptureLayer {
         self.records()
             .into_iter()
             .filter_map(|record| match record {
-                Record::Event { fields, parent, .. } => Some((fields, parent)),
+                Record::Event { fields, parent, .. } => Some((fields.to_string(), parent)),
                 Record::Span { .. } => None,
             })
             .collect()
@@ -101,7 +156,7 @@ impl CaptureLayer {
         self.records()
             .into_iter()
             .filter_map(|record| match record {
-                Record::Span { name, fields, .. } => Some((name, fields)),
+                Record::Span { name, fields, .. } => Some((name, fields.to_string())),
                 Record::Event { .. } => None,
             })
             .collect()
@@ -114,6 +169,24 @@ impl CaptureLayer {
             .filter_map(|record| match record {
                 Record::Span { name, parent, .. } => Some((name, parent)),
                 Record::Event { .. } => None,
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn events_where(&self, target: &str, fields: &[(&str, &str)]) -> Vec<Record> {
+        self.records()
+            .into_iter()
+            .filter(|record| match record {
+                Record::Event { target: actual, .. } => {
+                    actual
+                        .strip_prefix(target)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+                        && fields
+                            .iter()
+                            .all(|(name, value)| record.field(name) == Some(*value))
+                }
+                Record::Span { .. } => false,
             })
             .collect()
     }
@@ -174,11 +247,11 @@ fn render<'a>(records: impl Iterator<Item = &'a Record>) -> String {
                 output.push_str(level);
                 output.push(' ');
                 output.push_str(target);
-                output.push_str(fields);
+                output.push_str(&fields.to_string());
             }
             Record::Span { name, fields, .. } => {
                 output.push_str(name);
-                output.push_str(fields);
+                output.push_str(&fields.to_string());
             }
         }
         output.push('\n');
@@ -208,7 +281,7 @@ where
         id: &tracing::span::Id,
         context: Context<'_, S>,
     ) {
-        let mut fields = String::new();
+        let mut fields = Fields::default();
         attributes.record(&mut Visitor(&mut fields));
         self.push(Record::Span {
             name: attributes.metadata().name(),
@@ -229,7 +302,7 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        let mut fields = String::new();
+        let mut fields = Fields::default();
         values.record(&mut Visitor(&mut fields));
         self.push(Record::Span {
             name: span.metadata().name(),
@@ -241,7 +314,7 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
-        let mut fields = String::new();
+        let mut fields = Fields::default();
         event.record(&mut Visitor(&mut fields));
         let attributed = context.event_span(event);
         self.push(Record::Event {
@@ -263,11 +336,17 @@ where
 
 /// This renders every field including Debug ones, since a redaction test checking only expected
 /// fields would miss a new one leaking a secret.
-struct Visitor<'a>(&'a mut String);
+struct Visitor<'a>(&'a mut Fields);
 
 impl Visit for Visitor<'_> {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.0.push((field.name(), Value::Str(value.to_owned())));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0
+            .0
+            .push((field.name(), Value::Formatted(format!("{value:?}"))));
     }
 }
 
@@ -312,5 +391,70 @@ mod tests {
         for category in super::WORKSPACE_CATEGORIES {
             assert!(targets.iter().any(|target| target == category));
         }
+    }
+
+    #[test]
+    fn a_field_reads_by_name_while_the_text_keeps_debug_quoting() {
+        let capture = CaptureLayer::new();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                tracing::info!(
+                    target: "dekopon_gatewayd::session",
+                    event = "gateway_recalled",
+                    messages = 2_u64,
+                    route = %"slack:C1",
+                    path = ?"/tmp/x"
+                );
+            },
+        );
+        let records = capture.records();
+        assert_eq!(
+            ["event", "messages", "route", "path", "absent"].map(|name| records[0].field(name)),
+            [
+                Some("gateway_recalled"),
+                Some("2"),
+                Some("slack:C1"),
+                Some("\"/tmp/x\""),
+                None
+            ]
+        );
+        assert_eq!(
+            capture.text(),
+            "INFO dekopon_gatewayd::session event=\"gateway_recalled\" messages=2 route=slack:C1 \
+             path=\"/tmp/x\"\n"
+        );
+    }
+
+    #[test]
+    fn events_where_matches_a_target_by_whole_module_path_segments() {
+        let capture = CaptureLayer::new();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                tracing::info!(target: "dekopon_gatewayd::session", event = "gateway_recalled");
+                tracing::info!(target: "dekopon_gatewayd", event = "gateway_recalled");
+                tracing::info!(target: "dekopon_gatewayd_extra", event = "gateway_recalled");
+                tracing::info!(target: "dekopon_gatewayd", event = "gateway_other");
+            },
+        );
+        let targets = |target| {
+            capture
+                .events_where(target, &[("event", "gateway_recalled")])
+                .into_iter()
+                .map(|record| match record {
+                    Record::Event { target, .. } => target,
+                    Record::Span { name, .. } => name.to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            targets("dekopon_gatewayd"),
+            ["dekopon_gatewayd::session", "dekopon_gatewayd"]
+        );
+        assert_eq!(
+            targets("dekopon_gatewayd::session"),
+            ["dekopon_gatewayd::session"]
+        );
     }
 }
