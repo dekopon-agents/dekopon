@@ -116,8 +116,7 @@ pub(crate) struct GithubAppCredential {
     body: Option<Vec<u8>>,
     destinations: Vec<String>,
     client: reqwest::Client,
-    // Held across the mint so concurrent resolutions share one installation token.
-    cached: tokio::sync::Mutex<Option<CachedToken>>,
+    cached: parking_lot::Mutex<Option<CachedToken>>,
 }
 
 struct CachedToken {
@@ -185,7 +184,7 @@ impl GithubAppCredential {
             body,
             destinations,
             client,
-            cached: tokio::sync::Mutex::new(None),
+            cached: parking_lot::Mutex::new(None),
         })
     }
 
@@ -319,12 +318,14 @@ impl RefreshingCredential for GithubAppCredential {
     }
 
     async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError> {
-        let mut cached = self.cached.lock().await;
         let now = OffsetDateTime::now_utc();
-        if let Some(current) = cached.as_ref()
-            && now < current.renew_at
         {
-            return self.bind(&current.token);
+            let cached = self.cached.lock();
+            if let Some(current) = cached.as_ref()
+                && now < current.renew_at
+            {
+                return self.bind(&current.token);
+            }
         }
         let span = tracing::info_span!(
             "broker.credential.refresh",
@@ -340,7 +341,7 @@ impl RefreshingCredential for GithubAppCredential {
         };
         span.record("outcome", "renewed");
         let bound = self.bind(&minted.token)?;
-        *cached = Some(minted);
+        *self.cached.lock() = Some(minted);
         Ok(bound)
     }
 }
@@ -354,6 +355,7 @@ mod tests {
     use dekopon_test_support::LoopbackServer;
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{Downscope, GithubAppCredential, GithubAppKey, Installation};
 
@@ -388,6 +390,10 @@ mod tests {
     }
 
     fn credential(server: &LoopbackServer, downscope: Option<Downscope>) -> GithubAppCredential {
+        credential_at(&server.url(), downscope)
+    }
+
+    fn credential_at(api_base: &str, downscope: Option<Downscope>) -> GithubAppCredential {
         GithubAppCredential::with_api_base(
             "github-app-fixture".to_owned(),
             Installation {
@@ -397,7 +403,7 @@ mod tests {
             },
             GithubAppKey::from_pem(KEY_PEM).expect("the fixture key parses"),
             vec!["api.github.com".to_owned()],
-            &server.url(),
+            api_base,
         )
         .expect("the credential builds")
     }
@@ -425,24 +431,12 @@ mod tests {
             .expect("the mint carries a bearer JWT")
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn github_app_mints_once_per_cache_window() {
         let server = LoopbackServer::once(&token_response(TOKEN, time::Duration::hours(1)));
-        let shared = Arc::new(credential(&server, None));
-
-        let (first, second) = tokio::join!(
-            tokio::spawn({
-                let credential = Arc::clone(&shared);
-                async move { credential.resolve().await }
-            }),
-            tokio::spawn({
-                let credential = Arc::clone(&shared);
-                async move { credential.resolve().await }
-            }),
-        );
-        first.expect("join").expect("first resolution");
-        second.expect("join").expect("second resolution");
-        shared.resolve().await.expect("cached resolution");
+        let cached = credential(&server, None);
+        cached.resolve().await.expect("first resolution");
+        cached.resolve().await.expect("cached resolution");
 
         let request = server.request_text();
         assert!(
@@ -471,6 +465,56 @@ mod tests {
             );
         }
         renewing.join();
+    }
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) {
+        let mut head = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(read, 0, "the client closed before sending a request");
+            head.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn github_app_resolution_does_not_wait_on_another_resolutions_slow_mint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the token endpoint");
+        let address = listener.local_addr().expect("endpoint address");
+        let (slow_arrived, slow_seen) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let endpoint = tokio::spawn(async move {
+            let (mut slow, _) = listener.accept().await.expect("slow connection");
+            read_head(&mut slow).await;
+            slow_arrived
+                .send(())
+                .expect("the test awaits the slow mint");
+            let (mut fast, _) = listener.accept().await.expect("fast connection");
+            read_head(&mut fast).await;
+            fast.write_all(&token_response(TOKEN, time::Duration::hours(1)))
+                .await
+                .expect("answer the fast mint");
+            released.await.expect("the test releases the slow mint");
+            slow.write_all(&token_response(TOKEN, time::Duration::hours(1)))
+                .await
+                .expect("answer the slow mint");
+        });
+        let shared = Arc::new(credential_at(&format!("http://{address}"), None));
+
+        let slow = tokio::spawn({
+            let credential = Arc::clone(&shared);
+            async move { credential.resolve().await }
+        });
+        slow_seen.await.expect("the slow mint reached the endpoint");
+        tokio::time::timeout(std::time::Duration::from_secs(5), shared.resolve())
+            .await
+            .expect("the second resolution finished while the first mint was still in flight")
+            .expect("second resolution");
+        release.send(()).expect("the endpoint awaits the release");
+        slow.await.expect("join").expect("slow resolution");
+        endpoint.await.expect("endpoint");
     }
 
     #[tokio::test]
