@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc,
@@ -129,14 +129,14 @@ pub(crate) enum FollowTicket {
 pub(crate) struct FollowTable {
     journal: Arc<Journal>,
     resident: Mutex<HashMap<String, FollowMarker>>,
-    writer: Mutex<()>,
+    writer: Mutex<HashSet<String>>,
 }
 
 impl FollowTable {
     pub(crate) fn load(journal: Arc<Journal>) -> Result<Self, JournalError> {
         Ok(Self {
             resident: Mutex::new(journal.load_follow()?.into_iter().collect()),
-            writer: Mutex::new(()),
+            writer: Mutex::new(HashSet::new()),
             journal,
         })
     }
@@ -152,11 +152,16 @@ impl FollowTable {
     }
 
     pub(crate) fn stay(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
-        let _writer = self.writer.lock();
-        self.persist(key, now)
+        let writer = self.writer.lock();
+        if writer.contains(key) {
+            return Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+            });
+        }
+        self.persist(key, now, writer.len())
     }
 
-    fn persist(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
+    fn persist(&self, key: &str, now: SystemTime, suspended: usize) -> Result<(), JournalError> {
         let at_ms = millis(now);
         let until_ms = at_ms
             .checked_add(LAPSE.as_millis() as u64)
@@ -175,7 +180,7 @@ impl FollowTable {
             self.resident.lock().remove(&old);
         }
         let resident = self.resident.lock();
-        if !resident.contains_key(key) && resident.len() == MAX_TICKETS {
+        if !resident.contains_key(key) && resident.len() + suspended >= MAX_TICKETS {
             return Err(JournalError::Io {
                 kind: io::ErrorKind::OutOfMemory,
             });
@@ -191,23 +196,28 @@ impl FollowTable {
     }
 
     pub(crate) fn refresh(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
-        let _writer = self.writer.lock();
-        if !matches!(self.ticket(key, now), FollowTicket::Active { .. }) {
+        let writer = self.writer.lock();
+        if writer.contains(key) || !matches!(self.ticket(key, now), FollowTicket::Active { .. }) {
             return Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
             });
         }
-        self.persist(key, now)
+        self.persist(key, now, writer.len())
     }
 
     pub(crate) fn leave(&self, key: &str) -> Result<(), JournalError> {
-        let _writer = self.writer.lock();
+        let mut writer = self.writer.lock();
         self.resident.lock().remove(key);
-        self.journal.remove_follow(key)
+        self.journal.remove_follow(key)?;
+        writer.remove(key);
+        Ok(())
     }
 
     pub(crate) fn suspend(&self, key: &str) {
-        self.resident.lock().remove(key);
+        let mut writer = self.writer.lock();
+        if self.resident.lock().remove(key).is_some() {
+            writer.insert(key.to_owned());
+        }
     }
 }
 
@@ -581,6 +591,26 @@ mod tests {
                 .ticket(&key, SystemTime::now()),
             FollowTicket::Active { .. }
         ));
+    }
+
+    #[test]
+    fn a_banished_ticket_cannot_be_reinvited_before_marker_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = FollowTable::load(journal).unwrap();
+        let now = SystemTime::now();
+        let key = "c".repeat(64);
+        table.stay(&key, now).unwrap();
+        table.suspend(&key);
+        assert_eq!(table.ticket(&key, now), FollowTicket::Absent);
+        assert!(matches!(
+            table.stay(&key, now),
+            Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied
+            })
+        ));
+        table.leave(&key).unwrap();
+        assert!(table.stay(&key, now).is_ok());
     }
 
     #[test]
