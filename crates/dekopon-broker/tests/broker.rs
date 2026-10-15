@@ -1237,31 +1237,13 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    for (binding_present, grant_present, explicit, expected) in [
-        (
-            true,
-            true,
-            false,
-            dekopon_capability::InvocationOutcome::Succeeded,
-        ),
-        (
-            true,
-            false,
-            false,
-            dekopon_capability::InvocationOutcome::Denied,
-        ),
-        (
-            false,
-            true,
-            false,
-            dekopon_capability::InvocationOutcome::Denied,
-        ),
-        (
-            true,
-            true,
-            true,
-            dekopon_capability::InvocationOutcome::Succeeded,
-        ),
+    use dekopon_capability::InvocationOutcome::{Denied, Succeeded};
+    for (default_present, binding_present, grant_present, explicit, expected) in [
+        (false, true, true, false, Succeeded),
+        (true, true, true, false, Succeeded),
+        (true, true, false, false, Denied),
+        (true, false, true, false, Denied),
+        (true, true, true, true, Succeeded),
     ] {
         let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
         let authority = server.authority().to_owned();
@@ -1277,14 +1259,16 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         .await
         .unwrap();
         let mut set = set("http-probe", loopback_constraints(&authority));
-        set.default_secret_use = Some(DefaultSecretUse {
-            drn: if explicit {
-                "drn:com.xrl:secret:test:unbound/token".parse().unwrap()
-            } else {
-                secret_drn()
-            },
-            sink: DefaultSecretSink::HttpBearer,
-        });
+        if default_present {
+            set.default_secret_use = Some(DefaultSecretUse {
+                drn: if explicit {
+                    "drn:com.xrl:secret:test:unbound/token".parse().unwrap()
+                } else {
+                    secret_drn()
+                },
+                sink: DefaultSecretSink::HttpBearer,
+            });
+        }
         let broker = Broker::new(
             registry,
             principal("broker-test"),
@@ -1348,11 +1332,15 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
             &[("audit.event", "broker.decision")],
         );
         assert_eq!(decision_events.len(), 1);
+        let expected_drn = secret_drn();
         assert_eq!(
             decision_events[0].field("secret"),
-            Some(secret_drn().as_str())
+            default_present.then_some(expected_drn.as_str())
         );
-        assert_eq!(decision_events[0].field("secret.sink"), Some("httpBearer"));
+        assert_eq!(
+            decision_events[0].field("secret.sink"),
+            default_present.then_some("httpBearer")
+        );
         assert_eq!(
             decision_events[0].field("decision.allowed"),
             Some(
@@ -1364,10 +1352,10 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
             )
         );
         if expected == dekopon_capability::InvocationOutcome::Succeeded {
-            assert!(
-                server
-                    .request_text()
-                    .contains("authorization: Bearer default-private-sentinel")
+            let request = server.request_text();
+            assert_eq!(
+                request.contains("authorization: Bearer default-private-sentinel"),
+                default_present
             );
             server.join();
         }

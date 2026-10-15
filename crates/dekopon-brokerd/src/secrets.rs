@@ -1248,31 +1248,71 @@ impl SecretSource {
     }
 }
 
-fn sanitized_yaml_diagnostic(error: &serde_yaml::Error) -> String {
+fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String {
     let message = error.to_string();
-    let class = if message.starts_with("unknown field") {
+    let class = if message.contains("unknown field") {
         "unknown field"
-    } else if message.starts_with("unknown variant") {
+    } else if message.contains("unknown variant") {
         "unknown variant"
-    } else if message.starts_with("missing field") {
+    } else if message.contains("missing field") {
         "missing field"
-    } else if message.starts_with("invalid type") {
+    } else if message.contains("invalid type") {
         "invalid type"
-    } else if message.starts_with("invalid value") {
+    } else if message.contains("invalid value") {
         "invalid value"
     } else {
         "invalid document"
     };
-    let field = [
+    // Only fixed schema names can enter diagnostics; an unknown key may itself be a token.
+    const FIELDS: &[&str] = &[
         "refresh",
         "seedPath",
         "recordPath",
         "tokenEndpoint",
         "clientId",
-    ]
-    .into_iter()
-    .find(|field| message.contains(field))
-    .unwrap_or("secret map");
+        "timeoutMs",
+        "cycle",
+        "buffer",
+        "extraFormFields",
+        "kind",
+        "bindings",
+        "projection",
+    ];
+    let unknown = message
+        .split_once("unknown field `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(name, _)| name);
+    let field = if let Some(name) = unknown {
+        FIELDS.iter().copied().find(|field| *field == name)
+    } else if class == "unknown variant" && message.contains("`lazy` or `scheduled`") {
+        Some("refresh")
+    } else if class == "unknown variant" {
+        Some("kind")
+    } else if class == "invalid type" && message.contains("expected u64") {
+        Some("timeoutMs")
+    } else {
+        error.location().and_then(|location| {
+            let line = bytes
+                .split(|byte| *byte == b'\n')
+                .nth(location.line().saturating_sub(1))?;
+            let prefix = line
+                .get(..location.column().saturating_sub(1))
+                .unwrap_or(line);
+            let text = std::str::from_utf8(prefix).ok()?;
+            FIELDS
+                .iter()
+                .filter_map(|field| {
+                    let yaml = format!("{field}:");
+                    let json = format!("\"{field}\":");
+                    text.rfind(&json)
+                        .or_else(|| text.rfind(&yaml))
+                        .map(|offset| (offset, *field))
+                })
+                .max_by_key(|(offset, _)| *offset)
+                .map(|(_, field)| field)
+        })
+    }
+    .unwrap_or("unrecognized field");
     match error.location() {
         Some(location) => format!(
             "{class} at line {}, column {} ({field})",
@@ -1292,7 +1332,7 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
         })?;
     let file = serde_yaml::from_slice::<SecretMapFile>(&bytes).map_err(|source| {
         SecretMapError::Decode {
-            diagnostic: sanitized_yaml_diagnostic(&source),
+            diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
         }
     })?;
     validate_map(file, path, expected_uid).await

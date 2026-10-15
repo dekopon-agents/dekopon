@@ -33,7 +33,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{
     MapResolver, Projection, ResolvedEntry, SecretMapError, SecretMapFile, SecretSource,
-    validate_map,
+    SourceError, validate_map,
 };
 
 const OLD_REFRESH: &str = "old-refresh-private-sentinel";
@@ -201,24 +201,19 @@ async fn sealed_and_malformed_records_refuse_without_affecting_another_secret() 
     ] {
         fs::write(&path, invalid.to_string()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = super::oauth2::resolve(
+            &path,
+            &api.endpoint,
+            "public-client-id",
+            1000,
+            rustix::process::geteuid().as_raw(),
+            &reqwest::Client::new(),
+        )
+        .await;
         if invalid["state"] == "sealed" {
-            assert_eq!(
-                resolver(&path, &api.endpoint, &["bad"])
-                    .resolve(&drn("bad"))
-                    .await
-                    .unwrap_err()
-                    .category,
-                "reauthorization-required"
-            );
+            assert!(matches!(result, Err(SourceError::ReauthorizationRequired)));
         } else {
-            assert_eq!(
-                resolver(&path, &api.endpoint, &["bad"])
-                    .resolve(&drn("bad"))
-                    .await
-                    .unwrap_err()
-                    .category,
-                "malformed"
-            );
+            assert!(matches!(result, Err(SourceError::Malformed)));
         }
         let working = resolver(&good, &api.endpoint, &["good"]);
         let entry = working.entries.get(&drn("good")).unwrap();
@@ -455,6 +450,31 @@ async fn refresh_modes_parse_strictly_and_semantic_errors_name_each_drn() {
     );
 }
 
+#[tokio::test]
+async fn unknown_source_fields_and_variants_fail_whole_map_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("map.json");
+    for (key, value, expected_field) in [
+        ("cycle", json!("22h"), "cycle"),
+        ("kind", json!("unlisted"), "kind"),
+    ] {
+        let mut source = source_value(&dir.path().join("record.json"), "https://example.org/token");
+        source[key] = value;
+        let bytes = serde_json::to_vec(&json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1", "mapRevision":"test", "secrets":[{"drn":drn("one"), "source":source, "bindings":[]}]})).unwrap();
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = super::load(&path, rustix::process::geteuid().as_raw())
+            .await
+            .unwrap_err();
+        let SecretMapError::Decode { diagnostic } = error else {
+            panic!("whole-map parsing must fail")
+        };
+        assert!(diagnostic.contains(expected_field), "{diagnostic}");
+        assert!(!diagnostic.contains("unlisted"));
+        assert!(!diagnostic.contains("22h"));
+    }
+}
+
 #[test]
 fn parse_diagnostics_never_repeat_invalid_values() {
     let bad = "private-token-shaped-value-sentinel";
@@ -463,7 +483,9 @@ fn parse_diagnostics_never_repeat_invalid_values() {
         source[field] = json!(bad);
         let bytes = serde_json::to_vec(&json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1", "mapRevision":"test", "secrets":[{"drn":drn("one"), "source":source, "bindings":[]}]})).unwrap();
         let error = serde_yaml::from_slice::<SecretMapFile>(&bytes).unwrap_err();
-        assert!(!super::sanitized_yaml_diagnostic(&error).contains(bad));
+        let diagnostic = super::sanitized_yaml_diagnostic(&error, &bytes);
+        assert!(!diagnostic.contains(bad));
+        assert!(diagnostic.contains(field), "{diagnostic}");
     }
 }
 
