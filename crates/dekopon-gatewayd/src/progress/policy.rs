@@ -556,6 +556,9 @@ impl Live {
         if self.settings.working == WorkingReaction::On {
             self.open_reaction().await;
         }
+        if !auto && self.settings.typing == IndicatorSurface::Auto {
+            self.renew_typing().await;
+        }
         if self.settings.status == IndicatorSurface::Auto
             && let Some(status) = driver.status()
         {
@@ -565,7 +568,7 @@ impl Live {
             self.indicator_active |= self.status_active;
             self.observe(outcome, "status");
         }
-        if self.settings.typing == IndicatorSurface::Auto && (!auto || !self.status_active) {
+        if auto && self.settings.typing == IndicatorSurface::Auto && !self.status_active {
             self.renew_typing().await;
         }
         if self.settings.working == WorkingReaction::Auto && !self.indicator_active {

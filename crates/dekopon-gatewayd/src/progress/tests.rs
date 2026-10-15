@@ -1335,8 +1335,8 @@ async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
         harness.recorder.calls(),
         vec![
             Call::Reaction(true),
-            Call::Status(Status::Working),
-            Call::Typing
+            Call::Typing,
+            Call::Status(Status::Working)
         ],
         "additive reaction accompanies status and typing"
     );
