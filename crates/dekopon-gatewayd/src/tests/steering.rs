@@ -190,7 +190,20 @@ async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() 
         let mut route = route(model_config());
         route.steering = Steering::Boundary;
         if !seen {
-            route.indicators.clear();
+            let config = load(directory.path(), &document(directory.path()))
+                .await
+                .expect("default gateway config resolves");
+            let routes = RoutingTable::bind(&config, &catalog(true, Some("reasoning")))
+                .expect("default route binds");
+            route = routes
+                .route(&message("first"))
+                .expect("default route matches")
+                .clone();
+            route.steering = Steering::Boundary;
+            let defaults = &route.indicators[&ConversationKind::DirectMessage].settings;
+            assert_eq!(defaults.mode, LivenessMode::Off);
+            assert_eq!(defaults.working, WorkingReaction::Off);
+            assert_eq!(defaults.seen, SeenReaction::Off);
         }
         if master_off {
             let indicators = route

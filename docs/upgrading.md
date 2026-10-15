@@ -15,8 +15,9 @@ The gateway replaces `transports[].liveness` with layered `indicators`: `session
 `routes[].indicators`, in that order. The last authored leaf wins; absent or `null` inherits.
 `mode: off` suppresses every indicator. In `mode: native`, reaction defaults are
 `reaction: { working: off, seen: off }`. Migrate `classicFallback: reaction` to
-`reaction.working: auto` (not a default-on reaction); `reaction.working: on` adds a working
-reaction alongside status or typing. WhatsApp rejects `working: on` and `auto` until a
+`reaction.working: auto` (not a default-on reaction). Additive `reaction.working: on` and
+`status`/`typing: off` evaluation remain pending the following S2 gateway step; do not rely
+on them in an S1-only binary. WhatsApp rejects `working: on` and `auto` until a
 verified Cloud API clear is supported. Set `reaction.seen: on` on a route only if the
 operator wants the persistent steer/queue 👀; otherwise **the former automatic steer 👀
 disappears**. Neither the old `liveness` nor `classicFallback` key is accepted.

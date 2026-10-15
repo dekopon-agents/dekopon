@@ -1473,7 +1473,8 @@ pub(crate) fn resolve(
                     &mut problems,
                     index,
                 );
-                if route.progress_detail == ProgressDetail::Off
+                if resolved.settings.mode == LivenessMode::Native
+                    && route.progress_detail == ProgressDetail::Off
                     && resolved.settings.cancel_button
                     && !resolved.settings.stream
                 {
@@ -2711,6 +2712,32 @@ routes:
             assert_eq!(settings.progress, progress, "{block}");
             assert!(!settings.stream);
         }
+    }
+
+    #[test]
+    fn mode_off_suppresses_a_detail_off_stop_button_after_route_override() {
+        use dekopon_broker_protocol::ConversationKind;
+        let config = resolved(
+            "transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+    indicators: { mode: native, progress: off, cancelButton: true }
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+    progressDetail: off
+    indicators: { mode: off }
+",
+        )
+        .expect("an off route has no active Stop control");
+        let settings = config.routes[0].indicators[&ConversationKind::DirectMessage].settings;
+        assert_eq!(settings.mode, LivenessMode::Off);
+        assert!(
+            settings.cancel_button,
+            "off suppresses rather than erases leaves"
+        );
     }
 
     #[test]
