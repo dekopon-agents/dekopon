@@ -17014,6 +17014,85 @@ fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
 }
 
 #[test]
+fn two_conversations_share_the_arena_transient_ceiling() {
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 100);
+    let allowed = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    let a = private_conversation_key("dev", "first", SUBJECT);
+    let b = private_conversation_key("dev", "second", SUBJECT);
+    for key in [&a, &b] {
+        let seed = store.begin(key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed("one", "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    }
+    assert!(store.snapshot(&a, &allowed).unwrap().read(1).is_some());
+    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
+    );
+}
+
+#[test]
+fn an_evicted_conversations_held_reader_keeps_its_headroom_charge() {
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 100);
+    let allowed = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    let a = private_conversation_key("dev", "first", SUBJECT);
+    let b = private_conversation_key("dev", "second", SUBJECT);
+    let c = private_conversation_key("dev", "third", SUBJECT);
+    let commit = |key: &_| {
+        let seed = store.begin(key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed("one", "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    };
+    commit(&a);
+    let held = store.snapshot(&a, &allowed).unwrap();
+    assert!(store.remove(&a, EvictionReason::Capacity));
+    commit(&b);
+    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(held.read(1).unwrap()).unwrap()["user"],
+        "one"
+    );
+    drop(held);
+    commit(&c);
+    assert!(store.snapshot(&c, &allowed).unwrap().read(1).is_some());
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
+    );
+}
+
+#[test]
 fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it() {
     let store = ConversationStore::new(4);
     let allowed = granted(&["cli-probe.upper"]);

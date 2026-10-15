@@ -772,6 +772,11 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
+thread_local! {
+    static WINDOW_READ_SAMPLE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
 fn read_window(
     path: &Path,
     grant: &str,
@@ -795,6 +800,12 @@ fn read_window(
             return Err(JournalError::Corrupt);
         }
         previous = Some(line.next_record_id);
+        #[cfg(test)]
+        WINDOW_READ_SAMPLE.with(|sample| {
+            if let Some((scanned, peak)) = sample.get() {
+                sample.set(Some((scanned + 1, peak.max(history.bytes()))));
+            }
+        });
         if line.grant != grant
             || line.at_ms < horizon_ms
             || line.at_ms < age_horizon_ms
@@ -813,6 +824,12 @@ fn read_window(
         }
         last = Some(line);
     }
+    #[cfg(test)]
+    WINDOW_READ_SAMPLE.with(|sample| {
+        if let Some((scanned, peak)) = sample.get() {
+            sample.set(Some((scanned, peak.max(history.bytes()))));
+        }
+    });
     Ok((history, last))
 }
 
@@ -1177,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_recall_streams_the_window_without_discarding_older_disk_records() {
+    fn cold_recall_scans_into_bounded_residency_without_discarding_disk_records() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -1185,7 +1202,11 @@ mod tests {
         for index in 0..6 {
             append(&journal, &stem, now, GRANT, &format!("turn {index}"));
         }
+        WINDOW_READ_SAMPLE.with(|sample| sample.set(Some((0, 0))));
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
+        let (scanned, peak_bytes) = WINDOW_READ_SAMPLE.with(|sample| sample.take().unwrap());
+        assert_eq!(scanned, 6, "every disk record was validated by the stream");
+        assert!(peak_bytes <= window().limits.max_bytes);
         assert_eq!(users(&recalled), ["turn 2", "turn 3", "turn 4", "turn 5"]);
         let persisted = read_lines(&journal.path(&stem)).expect("disk records");
         assert_eq!(persisted.len(), 6);
