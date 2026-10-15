@@ -1086,6 +1086,17 @@ async fn unsafe_present_seed_refuses_at_boot_but_missing_seed_allows_live_record
             .await
             .is_ok()
     );
+    let api = TokenApi::serving(|_| success());
+    let resolver = seeded_resolver(&record, &seed, &api.endpoint);
+    let entry = resolver.entries.get(&drn("one")).unwrap();
+    assert_eq!(
+        resolver
+            .resolve_source(&entry.source, &entry.client)
+            .await
+            .unwrap(),
+        b"old-access-private-sentinel"
+    );
+    assert!(api.requests().is_empty());
     write_seed(&seed, "seed-one");
     fs::set_permissions(&seed, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(matches!(
@@ -1096,7 +1107,12 @@ async fn unsafe_present_seed_refuses_at_boot_but_missing_seed_allows_live_record
 
 #[tokio::test]
 async fn every_listed_reauthorization_code_seals() {
-    for code in crate::credentials::REAUTHORIZATION_CODES {
+    for code in [
+        "invalid_grant",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+        "refresh_token_expired",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.json");
         expired(&path);
@@ -1173,6 +1189,33 @@ async fn injected_clock_drives_record_expiry_and_refresh_time() {
     let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(record["lastRefresh"], 100);
     assert_eq!(record["expiresAt"], 7300);
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn reflected_seed_seals_first_adoption_without_serving_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let seed = dir.path().join("seed");
+    write_seed(&seed, "new-seed-private-sentinel");
+    let api = TokenApi::serving(|_| {
+        (
+            "200 OK",
+            json!({"access_token":"new-seed-private-sentinel","refresh_token":NEW_REFRESH,"expires_in":7200}).to_string(),
+        )
+    });
+    let resolver = seeded_resolver(&path, &seed, &api.endpoint);
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "bootstrap-reflected"
+    );
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["state"], "sealed");
+    assert_eq!(stored["cause"], "bootstrap-reflected");
+    assert_eq!(
+        resolver.resolve(&drn("one")).await.unwrap_err().category,
+        "reauthorization-required"
+    );
     assert_eq!(api.requests().len(), 1);
 }
 
