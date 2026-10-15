@@ -123,6 +123,11 @@ fn head_bytes_closes_a_flood_after_the_exact_prefix() {
         &Processes::default(),
     );
     assert_eq!(outcome.output, "bGk=141 0 0", "{outcome:?}");
+    let zero = Interpreter::new(Limits::default()).run(
+        "flood | head -c 0; echo ${PIPESTATUS[@]}",
+        &Processes::default(),
+    );
+    assert_eq!(zero.output, "141 0", "{zero:?}");
 }
 
 #[test]
