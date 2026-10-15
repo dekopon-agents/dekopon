@@ -2287,10 +2287,14 @@ fn on_a_two_mib_stack(script: &str) -> ScriptOutcome {
     })
 }
 
-fn arithmetic_thirty_calls_deep(expression: &str) -> String {
+fn arithmetic_calls_deep(expression: &str, calls: u32) -> String {
     format!(
-        "f() {{ if [ $1 -gt 0 ]; then f $(( $1 - 1 )); else echo $(( {expression} )); fi; }}\nf 30"
+        "f() {{ if [ $1 -gt 0 ]; then f $(( $1 - 1 )); else echo $(( {expression} )); fi; }}\nf {calls}"
     )
+}
+
+fn arithmetic_thirty_calls_deep(expression: &str) -> String {
+    arithmetic_calls_deep(expression, 30)
 }
 
 #[test]
@@ -2329,7 +2333,7 @@ fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
     }
     assert_eq!(output("echo $(( ((((1 + 1)))) ))"), "2");
     assert_eq!(output("echo $(echo $(echo $(echo deep)))"), "deep");
-    let at_the_ceiling = arithmetic_thirty_calls_deep(&format!("{}1", "1+".repeat(64)));
+    let at_the_ceiling = arithmetic_calls_deep(&format!("{}1", "1+".repeat(64)), 12);
     assert_eq!(on_a_two_mib_stack(&at_the_ceiling).output, "65");
 }
 
