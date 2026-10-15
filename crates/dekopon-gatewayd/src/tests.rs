@@ -15268,17 +15268,29 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         directory.path(),
         [
             ResponseEnvelope::chat_capabilities(
+                vec![capability("cli-probe.reverse")],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("owner".parse().unwrap()),
+            ),
+            ResponseEnvelope::chat_capabilities(
                 vec![capability("cli-probe.upper")],
                 vec!["probe".into()],
                 BTreeMap::new(),
                 None,
                 Some("non-owner".parse().unwrap()),
             ),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "cli-probe.reverse", "input": {"text": "secret"}
+            })).unwrap()),
             upper_proposal("hello"),
             ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
         ],
     );
     let models = ModelScript::new([
+        answer("Owner replied."),
+        script_call("probe reverse --text secret"),
         script_call("probe upper --text hello"),
         answer("The probe answered HELLO."),
     ]);
@@ -15309,25 +15321,41 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     table.stay(&key, SystemTime::now()).unwrap();
     runner.follow = Some(table);
     let driver = Arc::new(RecordingDriver::default());
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        run_session(
-            Arc::new(runner),
-            route,
-            inbound.clone(),
-            Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        ),
-    )
-    .await
-    .expect("follow turn completes");
-    assert_eq!(driver.replies(), ["The probe answered HELLO."]);
-    assert_eq!(models.requests(), 2);
+    let runner = Arc::new(runner);
+    let mut owner = message_from("tel.16034700182", "owner invites another speaker");
+    owner.message_id = MessageId::Follow("owner-id".into());
+    for speaker in [owner.clone(), inbound.clone()] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                speaker,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("follow turn completes");
+    }
+    assert_eq!(
+        driver.replies(),
+        ["Owner replied.", "The probe answered HELLO."]
+    );
+    assert_eq!(models.requests(), 4);
     assert!(
         !models
             .tool_names(0)
             .iter()
             .any(|name| name.contains("memory"))
     );
+    let previous = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(owner_claim),
+    } = previous.request
+    else {
+        panic!("owner turn must open its own leg: {previous:?}");
+    };
+    assert_eq!(owner_claim.subject, owner.subject);
     let capabilities = broker.request().await;
     let BrokerRequest::Capabilities {
         attestation: Some(claim),
@@ -15340,6 +15368,23 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         claim.scope.as_ref().unwrap().trigger,
         dekopon_broker_protocol::Trigger::Message
     );
+    let unlisted = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(unlisted_claim),
+        word: unlisted_word,
+        argv: unlisted_argv,
+        ..
+    } = unlisted.request
+    else {
+        panic!("unlisted command is resolved without invocation: {unlisted:?}");
+    };
+    assert_eq!(unlisted_claim.subject, inbound.subject);
+    assert_eq!(
+        unlisted_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert_eq!(unlisted_word, "probe");
+    assert_eq!(unlisted_argv, ["reverse", "--text", "secret"]);
     let command = broker.request().await;
     let BrokerRequest::RunCommand {
         attestation: Some(claim),
@@ -15351,6 +15396,10 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         panic!("second request must resolve the named command: {command:?}");
     };
     assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
     assert_eq!(word, "probe");
     assert_eq!(argv, ["upper", "--text", "hello"]);
     let invocation = broker.request().await;
@@ -15363,12 +15412,16 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         panic!("third request must invoke the named capability: {invocation:?}");
     };
     assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
     assert!(claim.binds(&invocation.id));
     assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
     assert_eq!(invocation.input, json!({"text": "hello"}));
     assert!(
         broker.recorded().is_empty(),
-        "one capabilities request and one invocation"
+        "two fresh capabilities requests, one permitted invocation and no unlisted invocation"
     );
 }
 
@@ -15432,7 +15485,9 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         assert!(driver.replies().is_empty(), "{label}");
         let request = broker.request().await;
         assert!(
-            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(ref claim) } if claim.subject == inbound.subject),
+            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(ref claim) }
+                if claim.subject == inbound.subject
+                    && claim.scope.as_ref().is_some_and(|scope| scope.trigger == dekopon_broker_protocol::Trigger::Message)),
             "{label}"
         );
         assert!(
