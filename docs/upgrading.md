@@ -296,8 +296,9 @@ that `&`, `jobs`, `wait` and `kill` now exit 1 with a message naming `limits.job
 instead of being refused as unsupported shell syntax.
 
 - **`limits.jobTimeoutMs`** (per route, optional): turns on detached jobs for that route and sets
-  each job's deadline. Absent means jobs are off; 0 or a value too large to be a deadline fails
-  boot naming the key.
+  the deadline of each job a turn starts. A job started by a probe or by another job shares its
+  starter's deadline and budgets. Absent means jobs are off; 0 or a value too large to be a
+  deadline fails boot naming the key.
 - **`sessions.maxJobs`** (optional, default 2): the most jobs running at once across the gateway,
   and the most job rows it keeps. 0 fails boot.
 

@@ -114,3 +114,30 @@ fn structured_capture_counts_escaped_bytes_before_reduction() {
     drop(retained);
     assert_eq!(tree.value_bytes(), 0);
 }
+
+#[test]
+fn capture_reduction_is_bounded_by_the_tree_value_limit() {
+    let tree = TreeContext::new(
+        Limits {
+            max_value_bytes: 1024,
+            ..Limits::default()
+        },
+        CallBudget::new(1),
+    );
+    let budget = Budget::start_tree(
+        Limits {
+            max_value_bytes: 64,
+            ..Limits::default()
+        },
+        tree.clone(),
+    );
+    let captured = vec![
+        CommandResult::value(Value::String("x".repeat(100))),
+        CommandResult::value(Value::String("y".repeat(100))),
+    ];
+    let mut retained = Vec::new();
+    let reduced = reduce_charged(&budget, captured, &mut retained).expect("within the tree limit");
+    assert_eq!(reduced.as_str().map(str::len), Some(201));
+    assert_eq!(tree.value_bytes(), 217);
+    assert_eq!(budget.max_value_bytes(), 1024);
+}

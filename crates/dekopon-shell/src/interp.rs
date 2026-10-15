@@ -3941,7 +3941,7 @@ fn reduce_charged(
     retained: &mut Vec<crate::RetainedBytes>,
 ) -> Result<Value, LimitExceeded> {
     if captured.len() > 1 {
-        let maximum = budget.value_limit();
+        let maximum = budget.max_value_bytes();
         let too_large = || LimitExceeded::ValueBytes { maximum };
         let mut bytes = 16u64;
         let mut previous_suppressed = true;

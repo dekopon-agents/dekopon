@@ -93,8 +93,7 @@ fn touch_marker(base: &Directory, create: bool) -> Result<(), StorageHostError> 
         .and_then(|metadata| metadata.modified())
         .map_err(|source| base.io_error(source))?;
     file.set_times(FileTimes::new().set_modified(now.max(previous)))
-        .map_err(|source| base.io_error(source))?;
-    file.sync_all().map_err(|source| base.io_error(source))
+        .map_err(|source| base.io_error(source))
 }
 
 #[derive(Debug)]
