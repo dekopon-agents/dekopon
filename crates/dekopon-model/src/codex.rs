@@ -196,8 +196,13 @@ impl CodexClient {
             )
             .header("openai-beta", "responses=experimental")
             .header("accept", "text/event-stream")
-            .header("content-type", JSON_CONTENT_TYPE)
-            .body(encoded);
+            .header("content-type", JSON_CONTENT_TYPE);
+        let builder = if let Some(key) = request.options.prompt_cache_key() {
+            builder.header("session-id", key)
+        } else {
+            builder
+        }
+        .body(encoded);
         let first = builder.try_clone().ok_or(RequestError::NonReplayableBody)?;
         let mut secrets = DiagnosticSecrets::new(Some(&credentials.access));
         let refreshed;
@@ -1202,12 +1207,20 @@ mod tests {
         client: &CodexClient,
         control: &TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
+        generate_with_options(client, &CompletionOptions::default(), control).await
+    }
+
+    async fn generate_with_options(
+        client: &CodexClient,
+        options: &CompletionOptions,
+        control: &TurnControl,
+    ) -> Result<AssistantTurn, InferenceError> {
         client
             .generate(
                 GenerateRequest {
                     messages: &[ModelMessage::user("test")],
                     tools: &[],
-                    options: &CompletionOptions::default(),
+                    options,
                 },
                 &mut |_| ControlFlow::Continue(()),
                 control,
@@ -1309,6 +1322,35 @@ mod tests {
         );
         assert!(trace.text().contains("model.returned"));
         assert_eq!(server.requests.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cache_key_survives_a_credential_refresh_resend() {
+        let (directory, server, client) = fixture(vec![
+            MockResponse::failure(401, serde_json::json!({"error":"expired"})),
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
+        write_credential(&directory, "rotated", u64::MAX);
+        generate_with_options(
+            &client,
+            &CompletionOptions::default().with_prompt_cache_key("session-7"),
+            &control(),
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.trim_end_matches('\r') == "session-id: session-7")
+            );
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["prompt_cache_key"], "session-7");
+        }
     }
 
     #[tokio::test]

@@ -1683,13 +1683,24 @@ mod tests {
         .await
         .expect("keyed turn");
 
-        let requests = server.requests.lock();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
         assert!(
-            !requests[0].contains("prompt_cache_key"),
-            "complete sent a cache key nobody asked for"
+            !requests[0]
+                .lines()
+                .any(|line| line.trim_end_matches('\r').starts_with("session-id:"))
         );
-        assert!(requests[1].contains("prompt_cache_key"));
-        assert!(requests[1].contains("session-7"));
+        let (_, plain) = requests[0].split_once("\r\n\r\n").unwrap();
+        let plain: serde_json::Value = serde_json::from_str(plain).unwrap();
+        assert!(plain.get("prompt_cache_key").is_none());
+        assert!(
+            requests[1]
+                .lines()
+                .any(|line| line.trim_end_matches('\r') == "session-id: session-7")
+        );
+        let (_, keyed) = requests[1].split_once("\r\n\r\n").unwrap();
+        let keyed: serde_json::Value = serde_json::from_str(keyed).unwrap();
+        assert_eq!(keyed["prompt_cache_key"], "session-7");
     }
 
     #[test]

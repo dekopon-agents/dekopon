@@ -176,7 +176,8 @@ counts are a subset of output, not an extra charge added to it.
 ## Prompt cache key lifecycle
 
 A key is a routing hint, not a cache handle: `prompt_cache_key` on Codex and compatible requests,
-`session_id` on OpenRouter. Dekopon cannot use it to read another response,
+`session_id` on OpenRouter. Codex also sends the same key in the `session-id` header, including on
+credential-refresh resends; without a key, it sends neither field nor header. Dekopon cannot use it to read another response,
 enumerate cache contents, or delete provider state, and it is minted from entropy rather than from a
 subject, channel, phone number, or account ID. [`gatewayd.md`](gatewayd.md#the-prompt-cache-key) owns
 its scope, minting, and rotation.
