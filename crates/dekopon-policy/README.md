@@ -84,20 +84,18 @@ configuration:
 - `effect` / `risk` — the trusted classification the broker will execute under,
   matched byte for byte against the loaded manifest at startup.
 
-Message content and arbitrary provider input are **not** context. A public DRN is the one narrow
-caller-supplied exception: it is a strongly validated resource on a separate action and remains
-inert without an independently validated owner binding. Open JSON has no policy schema and cannot
-influence a decision.
+Invocation context excludes message content and arbitrary provider input; at the per-request Cedar point, `context.request` exposes bounded outgoing HTTP facts, including only representable buffered JSON record bodies of at most 16 KiB. A public DRN remains a separate strongly validated resource on a separate action, inert without an owner binding.
 
 ## Determinism and bounds
 
-Everything is startup-fixed. There is no per-request parsing, compilation, or entity resolution.
+Policies compile once at startup; the per-request Cedar point converts bounded HTTP facts without parsing policy source or resolving entities.
 
 - Policy source is capped at 1 MiB and 1024 static policies.
 - Templates are refused: an unlinked template is policy that silently never applies.
-- The schema is generated from the declared world and the policy set is validated against it in
-  Cedar's **strict** mode. An unknown action, unknown entity type, or ill-typed expression refuses
-  construction with the validator's own diagnostics.
+- The schema is generated from the declared world and ordinary policies are validated against it in
+  Cedar's **strict** mode. Guarded request-referencing forbids bypass strict validation and evaluate
+  schemaless; their shape is checked at load. Ordinary unknown actions, entity types, or ill-typed
+  expressions refuse construction with the validator's own diagnostics.
 - Empty policy text is valid and permits nothing.
 - Any evaluation error at decision time denies, and surfaces as a stable
   `PolicyDecision::errors_present` flag rather than error text. Policy source reaches a caller only
@@ -106,8 +104,9 @@ Everything is startup-fixed. There is no per-request parsing, compilation, or en
 
 ## Explaining a decision
 
-`PolicyDecision::determining_policy_ids` carries the identifiers of the policies that decided the
-answer, sorted, and the broker writes them into every audit record as `policy.ids`. Every statement
+`PolicyDecision::determining_policy_ids` carries the sorted identifiers of policies that decided the
+answer; `erroring_policy_ids` separately names policies that errored. The broker writes determining
+IDs as `policy.ids` and request-point errors as `policy.error_ids` without copying evaluator text. Every statement
 requires an `@id("…")` annotation naming it, because Cedar's positional names (`policy0`, `policy1`,
 …) shift whenever a policy is added, which an audit trail cannot tolerate:
 

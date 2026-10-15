@@ -3,9 +3,9 @@
 //! This crate is the only place Cedar appears in the workspace. It wraps `cedar-policy` behind an
 //! API with three properties the broker depends on:
 //!
-//! 1. **Startup-fixed.** A [`PolicyEngine`] parses its policies once, generates a schema from the
-//!    deployment's declared world, and validates the policy set against that schema in strict
-//!    mode. Nothing is parsed, compiled, or resolved per request.
+//! 1. **Startup-fixed policies.** A [`PolicyEngine`] parses policies once and strictly validates
+//!    ordinary policies against the declared world. Guarded HTTP request forbids bypass the
+//!    schema validator and evaluate schemaless at the per-request Cedar point.
 //! 2. **Deny-by-default at every layer.** Empty policy text is valid and permits nothing. A policy
 //!    naming an unknown action, entity type, principal, or provider refuses construction. An
 //!    evaluation error at decision time denies.
@@ -42,8 +42,9 @@
 //! Capability actions carry `{ via, agent, subject?, effect, risk }`;
 //! `agent.prompt` carries routing fields only. `secret.use` adds exact capability/provider/sink
 //! fields beside the authenticated routing context. The public DRN is strongly typed untrusted
-//! proposal data and remains inert without an owner binding; message content and arbitrary provider
-//! JSON remain absent from policy.
+//! proposal data and remains inert without an owner binding. Invocation policy excludes message
+//! content and arbitrary provider JSON; only bounded, representable outgoing HTTP facts enter
+//! `context.request` at the per-request decision point.
 //!
 //! ```
 //! use dekopon_core::{CapabilityId, PrincipalId, ProviderId};
@@ -451,6 +452,7 @@ pub struct PolicyRequest {
 pub struct PolicyDecision {
     pub allowed: bool,
     pub determining_policy_ids: Vec<String>,
+    pub erroring_policy_ids: Vec<String>,
     /// A stable flag rather than the error text, since a denial explanation must not become a
     /// channel for policy source or entity data on a per-request path.
     pub errors_present: bool,
@@ -462,6 +464,7 @@ impl PolicyDecision {
         Self {
             allowed: false,
             determining_policy_ids: Vec::new(),
+            erroring_policy_ids: Vec::new(),
             errors_present: true,
             refusal: Some(error.to_string()),
         }
@@ -662,7 +665,18 @@ impl PolicyEngine {
         let response =
             self.authorizer
                 .is_authorized(&cedar_request, &self.policies, &self.entities);
-        let errors_present = response.diagnostics().errors().next().is_some();
+        let mut erroring_policy_ids = response
+            .diagnostics()
+            .errors()
+            .map(|error| match error {
+                cedar_policy::AuthorizationError::PolicyEvaluationError(error) => {
+                    error.policy_id().to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        erroring_policy_ids.sort();
+        erroring_policy_ids.dedup();
+        let errors_present = !erroring_policy_ids.is_empty();
         let mut determining_policy_ids = response
             .diagnostics()
             .reason()
@@ -673,6 +687,7 @@ impl PolicyEngine {
         PolicyDecision {
             allowed: matches!(response.decision(), Decision::Allow) && !errors_present,
             determining_policy_ids,
+            erroring_policy_ids,
             errors_present,
             refusal: None,
         }
