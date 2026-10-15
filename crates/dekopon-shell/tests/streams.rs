@@ -108,6 +108,29 @@ fn head_closing_a_provider_pipeline_exits_141_upstream_and_eof_reaches_every_sta
 }
 
 #[test]
+fn quiet_grep_drops_the_flood_reader_after_the_first_match() {
+    let outcome = Interpreter::new(Limits::default()).run(
+        "flood | grep -q 'line 0'; echo ${PIPESTATUS[@]}",
+        &Processes::default(),
+    );
+    assert_eq!(outcome.output, "141 0", "{outcome:?}");
+}
+
+#[test]
+fn head_bytes_closes_a_flood_after_the_exact_prefix() {
+    let outcome = Interpreter::new(Limits::default()).run(
+        "flood | head -c 2 | base64; echo ${PIPESTATUS[@]}",
+        &Processes::default(),
+    );
+    assert_eq!(outcome.output, "bGk=141 0 0", "{outcome:?}");
+    let zero = Interpreter::new(Limits::default()).run(
+        "flood | head -c 0; echo ${PIPESTATUS[@]}",
+        &Processes::default(),
+    );
+    assert_eq!(zero.output, "141 0", "{zero:?}");
+}
+
+#[test]
 fn a_provider_with_nothing_piped_sees_no_stdin_and_its_exit_status_is_the_stage_s() {
     let processes = Processes::default();
     let outcome = Interpreter::new(Limits::default()).run(

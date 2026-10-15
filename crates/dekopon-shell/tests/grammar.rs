@@ -267,13 +267,13 @@ fn converted_builtin_argv_keeps_clusters_values_and_refusals_local() {
     let result = run("grep --bogus; echo after");
     assert_eq!(
         result.output,
-        "grep: option not yet supported: --bogus (supported: -v -i -c -n -E)\nafter"
+        "grep: option not yet supported: --bogus (supported: -v -i -c -n -E -q -A N -B N -C N)\nafter"
     );
     assert_eq!(result.exit_code.get(), 0);
     let result = run("printf 'unread\\n' | { grep --bogus; cat; }");
     assert_eq!(
         result.output,
-        "unread\ngrep: option not yet supported: --bogus (supported: -v -i -c -n -E)"
+        "unread\ngrep: option not yet supported: --bogus (supported: -v -i -c -n -E -q -A N -B N -C N)"
     );
     let result = run("head -n 3 --help; echo after");
     assert!(result.output.contains("--help"), "{result:?}");
@@ -715,6 +715,55 @@ fn grep_and_sed_stream_fragmented_lines_without_adding_newlines() {
     assert_eq!(output("printf 'abc\\ndef' | grep -i -v 'ABC'"), "def");
     assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|'"), "x");
     assert_eq!(output("printf 'a/b\\n' | sed 's|a\\/b|x|' | wc -c"), "2");
+}
+
+#[test]
+fn grep_quiet_context_and_head_bytes_change_pipeline_effects() {
+    assert_eq!(
+        output("printf 'a\\nb\\n' | grep -qc b; echo ${PIPESTATUS[@]}"),
+        "0 0"
+    );
+    assert_eq!(
+        output("printf 'a\\n' | grep -q -c z; echo ${PIPESTATUS[@]}"),
+        "0 1"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\nc\\nd\\ne\\nf\\ng' | grep -n -B1 -A1 -E '^(b|f)$'"),
+        "1-a\n2:b\n3-c\n--\n5-e\n6:f\n7-g"
+    );
+    assert_eq!(
+        output("printf 'a\\nb\\nc\\nd' | grep -nC1 -E '^(b|c)$'"),
+        "1-a\n2:b\n3:c\n4-d"
+    );
+    assert_eq!(
+        output("printf 'a\\nP\\nb\\nc' | grep -inA2 p"),
+        "2:P\n3-b\n4-c"
+    );
+    assert_eq!(
+        output("printf 'a\\nP\\nb\\nc' | grep -C1 -A2 P"),
+        "a\nP\nb\nc"
+    );
+    assert_eq!(output("printf 'a\\nP\\nb\\nc' | grep -A2 -C1 P"), "a\nP\nb");
+    assert_eq!(output("printf 'aé' | head -c 2 | base64"), "YcM=");
+    assert_eq!(
+        output("printf 'aé' | head -c 2 > buf; cat buf | base64"),
+        "YcM="
+    );
+    assert_eq!(
+        output("printf 'aé' > buf; cat buf | head --bytes=2 | base64"),
+        "YcM="
+    );
+    assert_eq!(output("printf abc | head -c 0 | base64"), "");
+    assert_eq!(output("printf abc | head -c 3 | base64"), "YWJj");
+    for script in [
+        "head -c +5",
+        "head -n 1 -c 2",
+        "grep -A +5 x",
+        "grep -B 184467440737095516160 x",
+    ] {
+        assert_eq!(code(script), 2, "{script}");
+    }
+    assert_eq!(code("set -o pipefail; printf a | grep -q z"), 1);
 }
 
 #[test]
@@ -1367,12 +1416,12 @@ fn help_interception_decides_on_the_unexpanded_word_not_the_expanded_string() {
     assert_eq!(output(r#"x=--help; echo "$x""#), "--help");
     assert_eq!(
         output(r#"pat=--help; grep "$pat""#),
-        "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
+        "grep: option not yet supported: --help (supported: -v -i -c -n -E -q -A N -B N -C N)"
     );
     assert_eq!(output(r#"printf 'a\n--help\n' | xargs echo"#), "a\n--help");
     assert_eq!(
         output(r#"f() { "$@" --help; }; f grep -v"#),
-        "grep: option not yet supported: --help (supported: -v -i -c -n -E)"
+        "grep: option not yet supported: --help (supported: -v -i -c -n -E -q -A N -B N -C N)"
     );
 }
 
@@ -2795,11 +2844,10 @@ fn uniq_selects_duplicate_and_unique_pipe_lines() {
 
 #[test]
 fn cut_refuses_missing_and_conflicting_field_selections() {
+    let missing = run("printf 'a:b' | cut -f");
+    assert_eq!(missing.exit_code.get(), 2, "{missing:?}");
+    assert!(missing.output.contains("--fields"), "{missing:?}");
     for (script, cause) in [
-        (
-            "printf 'a:b' | cut -f",
-            "cut: error: a value is required for '--fields",
-        ),
         ("printf 'a:b' | cut", "cut: -f or -c is required"),
         (
             "printf 'a:b' | cut -f 1 -c 1",
