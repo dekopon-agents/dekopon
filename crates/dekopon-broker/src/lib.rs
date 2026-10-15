@@ -430,6 +430,12 @@ impl fmt::Display for CapabilityRoute {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintSet {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_default_secret_use"
+    )]
+    pub default_secret_use: Option<DefaultSecretUse>,
     #[serde(default, skip_serializing_if = "CapabilityRoute::is_generic")]
     pub route: CapabilityRoute,
     pub provider: ProviderId,
@@ -441,6 +447,28 @@ pub struct ConstraintSet {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
     pub constraints: ExecutionConstraints,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DefaultSecretUse {
+    pub drn: SecretDrn,
+    pub sink: DefaultSecretSink,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DefaultSecretSink {
+    HttpBearer,
+}
+
+fn deserialize_default_secret_use<'de, D>(
+    deserializer: D,
+) -> Result<Option<DefaultSecretUse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    DefaultSecretUse::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2837,7 +2865,7 @@ where
     async fn invoke_inner(
         &self,
         context: &AuthenticatedContext,
-        request: InvocationRequest,
+        mut request: InvocationRequest,
         refusal: Option<Refusal>,
         assets: dekopon_broker_host::asset::AssetInputs,
         outputs: &mut dekopon_broker_host::asset::AssetOutputs,
@@ -2891,6 +2919,15 @@ where
                     .await
                     .map(ControlFlow::Break);
             };
+            if request.secret_use.is_none()
+                && let Some(default) = &set.default_secret_use
+            {
+                request.secret_use = Some(match default.sink {
+                    DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
+                        secret: default.drn.clone(),
+                    },
+                });
+            }
             if !probe_permits(context, set.effect) {
                 authorize.record("outcome", "probe-write");
                 return self

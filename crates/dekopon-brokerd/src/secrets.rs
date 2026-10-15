@@ -187,6 +187,10 @@ enum SecretSource {
         record_path: PathBuf,
         token_endpoint: String,
         client_id: String,
+        #[serde(default)]
+        refresh: OAuth2RefreshMode,
+        #[serde(default)]
+        seed_path: Option<PathBuf>,
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
@@ -214,6 +218,14 @@ enum SecretSource {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum OAuth2RefreshMode {
+    #[default]
+    Lazy,
+    Scheduled,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -380,7 +392,10 @@ impl MapResolver {
                 token_endpoint,
                 client_id,
                 timeout_ms,
+                refresh,
+                ..
             } => {
+                let _mode = refresh;
                 oauth2::resolve(
                     record_path,
                     token_endpoint,
@@ -977,9 +992,8 @@ impl SecretSource {
             | Self::AwsSsmParameter {
                 credentials_file, ..
             } => Some(credentials_file.clone()),
-            Self::SecureFile { .. }
-            | Self::KubernetesProjection { .. }
-            | Self::OAuth2Refresh { .. } => None,
+            Self::OAuth2Refresh { seed_path, .. } => seed_path.clone(),
+            Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
         }
     }
 
@@ -1025,8 +1039,13 @@ impl SecretSource {
                 token_endpoint,
                 client_id,
                 timeout_ms,
+                seed_path,
+                refresh: _,
             } => {
                 validate_absolute(record_path)?;
+                if let Some(seed_path) = seed_path {
+                    validate_absolute(seed_path)?;
+                }
                 validate_endpoint(token_endpoint, true)?;
                 validate_texts([client_id])?;
                 validate_timeout(*timeout_ms)
@@ -1229,6 +1248,41 @@ impl SecretSource {
     }
 }
 
+fn sanitized_yaml_diagnostic(error: &serde_yaml::Error) -> String {
+    let message = error.to_string();
+    let class = if message.starts_with("unknown field") {
+        "unknown field"
+    } else if message.starts_with("unknown variant") {
+        "unknown variant"
+    } else if message.starts_with("missing field") {
+        "missing field"
+    } else if message.starts_with("invalid type") {
+        "invalid type"
+    } else if message.starts_with("invalid value") {
+        "invalid value"
+    } else {
+        "invalid document"
+    };
+    let field = [
+        "refresh",
+        "seedPath",
+        "recordPath",
+        "tokenEndpoint",
+        "clientId",
+    ]
+    .into_iter()
+    .find(|field| message.contains(field))
+    .unwrap_or("secret map");
+    match error.location() {
+        Some(location) => format!(
+            "{class} at line {}, column {} ({field})",
+            location.line(),
+            location.column()
+        ),
+        None => format!("{class} ({field})"),
+    }
+}
+
 pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
@@ -1236,8 +1290,11 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
             path: path.to_path_buf(),
             source,
         })?;
-    let file = serde_yaml::from_slice::<SecretMapFile>(&bytes)
-        .map_err(|source| SecretMapError::Decode { source })?;
+    let file = serde_yaml::from_slice::<SecretMapFile>(&bytes).map_err(|source| {
+        SecretMapError::Decode {
+            diagnostic: sanitized_yaml_diagnostic(&source),
+        }
+    })?;
     validate_map(file, path, expected_uid).await
 }
 
@@ -2166,11 +2223,8 @@ pub enum SecretMapError {
         #[source]
         source: SourceError,
     },
-    #[error("private secret map is not strict valid YAML or JSON")]
-    Decode {
-        #[source]
-        source: serde_yaml::Error,
-    },
+    #[error("private secret map is not strict valid YAML or JSON: {diagnostic}")]
+    Decode { diagnostic: String },
     #[error("private secret map has conflicts: {}", problems.join("; "))]
     Validation { problems: Vec<String> },
     #[error("private secret map HTTP client could not be built")]

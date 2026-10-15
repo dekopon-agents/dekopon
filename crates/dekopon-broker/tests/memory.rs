@@ -99,6 +99,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     entries.push((
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
@@ -123,6 +124,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
         entries.push((
             "http-probe.fetch".parse().expect("capability"),
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: "http-probe".parse().expect("provider"),
                 effect: EffectKind::ReadOnly,
@@ -278,6 +280,7 @@ async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog>
             (
                 name.parse().expect("capability"),
                 ConstraintSet {
+                    default_secret_use: None,
                     provider: "memory".parse().expect("provider"),
                     ..memory_constraint(route, effect, risk, access)
                 },
@@ -543,6 +546,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     let constraints = ConstraintCatalog::new([(
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
@@ -842,6 +846,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             "storage-probe",
             "storage-probe.run",
             ConstraintSet {
+                default_secret_use: None,
                 provider: "storage-probe".parse().expect("provider"),
                 ..memory_constraint(
                     CapabilityRoute::ChatMemoryRecord,
@@ -1029,6 +1034,7 @@ fn memory_constraint(
     access: StorageAccess,
 ) -> ConstraintSet {
     ConstraintSet {
+        default_secret_use: None,
         route,
         provider: "memory-chat".parse().expect("provider"),
         effect,
@@ -1052,6 +1058,7 @@ fn memory_constraint(
 
 fn reserved_read_constraint() -> ConstraintSet {
     ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "memory-chat".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
@@ -1084,6 +1091,7 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     let constraints = ConstraintCatalog::new([(
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
@@ -1161,6 +1169,7 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
     )
     .expect("policy world");
     let routed = |route, provider: &str, storage| ConstraintSet {
+        default_secret_use: None,
         route,
         provider: provider.parse().expect("provider"),
         effect: EffectKind::ReadOnly,

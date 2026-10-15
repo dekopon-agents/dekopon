@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use dekopon_broker::{CapabilityRoute, ConstraintSet};
+use dekopon_broker::{CapabilityRoute, ConstraintSet, DefaultSecretUse};
 use dekopon_capability::{
     AssetConstraints, EffectKind, ExecutionConstraints, HttpConstraints, RequestTemplate,
     SecretUseGrant, StorageConstraints,
@@ -24,6 +24,8 @@ pub struct ProviderCapabilities {
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct CapabilityConfig {
     pub route: CapabilityRoute,
+    #[serde(deserialize_with = "deserialize_default_secret_use")]
+    pub default_secret_use: Option<DefaultSecretUse>,
     pub credential: Option<String>,
     pub constraints: ConstraintsPatch,
 }
@@ -51,6 +53,15 @@ pub struct HttpPatch {
     pub allow_plaintext_loopback: Option<bool>,
     pub propagate_trace: Option<bool>,
     pub request_templates: Option<Vec<RequestTemplate>>,
+}
+
+fn deserialize_default_secret_use<'de, D>(
+    deserializer: D,
+) -> Result<Option<DefaultSecretUse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    DefaultSecretUse::deserialize(deserializer).map(Some)
 }
 
 impl ConstraintsPatch {
@@ -203,6 +214,7 @@ pub fn constraint_sets<'a>(
                     sets.insert(
                         capability.id.clone(),
                         ConstraintSet {
+                            default_secret_use: listed.default_secret_use.clone(),
                             route: listed.route,
                             provider: provider.clone(),
                             effect: capability.effect,
@@ -229,7 +241,34 @@ mod tests {
     use dekopon_capability::EffectKind;
     use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 
-    use super::{CapabilityProblem, ManifestCapability, ProviderCapabilities, constraint_sets};
+    use super::{
+        CapabilityConfig, CapabilityProblem, ManifestCapability, ProviderCapabilities,
+        constraint_sets,
+    };
+
+    #[test]
+    fn default_secret_use_requires_a_canonical_bearer_drn_and_rejects_null() {
+        let valid = serde_json::json!({"defaultSecretUse":{"drn":"drn:com.xrl:secret:test:skylight/token", "sink":"httpBearer"}});
+        assert!(
+            serde_json::from_value::<CapabilityConfig>(valid)
+                .unwrap()
+                .default_secret_use
+                .is_some()
+        );
+        assert!(
+            serde_json::from_value::<CapabilityConfig>(serde_json::json!({}))
+                .unwrap()
+                .default_secret_use
+                .is_none()
+        );
+        for invalid in [
+            serde_json::json!({"defaultSecretUse":null}),
+            serde_json::json!({"defaultSecretUse":{"drn":"bad", "sink":"httpBearer"}}),
+            serde_json::json!({"defaultSecretUse":{"drn":"drn:com.xrl:secret:test:skylight/token", "sink":"httpBasic"}}),
+        ] {
+            assert!(serde_json::from_value::<CapabilityConfig>(invalid).is_err());
+        }
+    }
 
     fn id(value: &str) -> CapabilityId {
         value.parse().expect("capability")

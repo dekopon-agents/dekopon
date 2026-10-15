@@ -78,6 +78,7 @@ when { context.via == "gateway" && context.agent == "reviewer" };
         ConstraintCatalog::new([(
             capability,
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider,
                 effect: EffectKind::LocalWrite,

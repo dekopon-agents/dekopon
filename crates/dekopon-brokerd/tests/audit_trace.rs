@@ -320,6 +320,7 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
                     .parse::<CapabilityId>()
                     .expect("capability"),
                 ConstraintSet {
+                    default_secret_use: None,
                     route: CapabilityRoute::Generic,
                     provider: "cli-probe".parse::<ProviderId>().expect("provider"),
                     effect: EffectKind::ReadOnly,

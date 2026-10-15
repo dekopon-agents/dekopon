@@ -16,14 +16,62 @@ use super::{SourceError, classified};
 const RECORD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct OAuth2Record {
-    version: u8,
-    #[serde(serialize_with = "dekopon_core::serialize_exposed")]
-    access: Redacted<String>,
-    #[serde(serialize_with = "dekopon_core::serialize_exposed")]
-    refresh: Redacted<String>,
-    expires_at: u64,
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum OAuth2Record {
+    Live {
+        version: u8,
+        #[serde(serialize_with = "dekopon_core::serialize_exposed")]
+        access: Redacted<String>,
+        #[serde(serialize_with = "dekopon_core::serialize_exposed")]
+        refresh: Redacted<String>,
+        expires_at: u64,
+        last_refresh: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_seed_digest"
+        )]
+        adopted_seed_sha256: Option<String>,
+    },
+    Sealed {
+        version: u8,
+        since: u64,
+        cause: SealCause,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_seed_digest"
+        )]
+        adopted_seed_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SealCause {
+    ReauthorizationRequired,
+    BootstrapReflected,
+}
+
+impl OAuth2Record {
+    fn access(&self) -> Result<&Redacted<String>, SourceError> {
+        match self {
+            Self::Live { access, .. } => Ok(access),
+            Self::Sealed { .. } => Err(SourceError::ReauthorizationRequired),
+        }
+    }
+
+    const fn expires_at(&self) -> Option<u64> {
+        match self {
+            Self::Live { expires_at, .. } => Some(*expires_at),
+            Self::Sealed { .. } => None,
+        }
+    }
 }
 
 struct OpenedRecord {
@@ -95,13 +143,18 @@ impl RefreshResult {
     fn checked(self) -> Result<Self, SourceError> {
         match &self {
             Self::NotDue(record) => {
-                super::reject_bootstrap_reflection(
-                    record.access.expose().as_bytes().to_vec(),
-                    &[record.refresh.expose()],
-                )?;
+                if let OAuth2Record::Live {
+                    access, refresh, ..
+                } = record
+                {
+                    super::reject_bootstrap_reflection(
+                        access.expose().as_bytes().to_vec(),
+                        &[refresh.expose()],
+                    )?;
+                }
             }
             Self::Refreshed(record) => {
-                if record.expires_at == 0 {
+                if record.expires_at() == Some(0) {
                     return Err(SourceError::BootstrapReflected);
                 }
             }
@@ -156,6 +209,22 @@ fn read_locked(path: PathBuf, uid: u32) -> Result<OpenedRecord, SourceError> {
     Ok(OpenedRecord { lock, record })
 }
 
+fn deserialize_seed_digest<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+fn valid_digest(digest: &Option<String>) -> bool {
+    digest.as_ref().is_none_or(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
 fn read_record(path: &Path, uid: u32) -> Result<OAuth2Record, SourceError> {
     let bytes = read_trusted_file(path, uid, FileTier::Private, RECORD_BYTES).map_err(|error| {
         let mapped = match error {
@@ -171,10 +240,29 @@ fn read_record(path: &Path, uid: u32) -> Result<OAuth2Record, SourceError> {
     })?;
     let record: OAuth2Record = serde_json::from_slice(&bytes)
         .map_err(|source| classified(SourceError::Malformed, &source))?;
-    if record.version != 1
-        || record.access.expose().is_empty()
-        || record.refresh.expose().is_empty()
-    {
+    let valid = match &record {
+        OAuth2Record::Live {
+            version,
+            access,
+            refresh,
+            expires_at,
+            last_refresh,
+            adopted_seed_sha256,
+        } => {
+            *version == 2
+                && !access.expose().is_empty()
+                && !refresh.expose().is_empty()
+                && *expires_at > *last_refresh
+                && valid_digest(adopted_seed_sha256)
+        }
+        OAuth2Record::Sealed {
+            version,
+            since,
+            cause: _,
+            adopted_seed_sha256,
+        } => *version == 2 && *since > 0 && valid_digest(adopted_seed_sha256),
+    };
+    if !valid {
         return Err(SourceError::Malformed);
     }
     Ok(record)
@@ -216,9 +304,10 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
             let record = result.record();
             span.record(
                 "credential.expires_at_unix_ms",
-                i64::try_from(record.expires_at.saturating_mul(1000)).unwrap_or(i64::MAX),
+                i64::try_from(record.expires_at().unwrap_or(0).saturating_mul(1000))
+                    .unwrap_or(i64::MAX),
             );
-            Ok(record.access.expose().as_bytes().to_vec())
+            Ok(record.access()?.expose().as_bytes().to_vec())
         }
         Err(error) => {
             span.record(
@@ -254,10 +343,27 @@ async fn refresh(
     timeout: Duration,
     client: reqwest::Client,
 ) -> Result<RefreshResult, SourceError> {
-    if now_seconds() < opened.record.expires_at.saturating_sub(60) {
-        return Ok(RefreshResult::NotDue(opened.record));
+    let OAuth2Record::Live {
+        access,
+        refresh: predecessor,
+        expires_at,
+        last_refresh,
+        adopted_seed_sha256,
+        ..
+    } = opened.record
+    else {
+        return Err(SourceError::ReauthorizationRequired);
+    };
+    if now_seconds() < expires_at.saturating_sub(60) {
+        return Ok(RefreshResult::NotDue(OAuth2Record::Live {
+            version: 2,
+            access,
+            refresh: predecessor,
+            expires_at,
+            last_refresh,
+            adopted_seed_sha256,
+        }));
     }
-    let predecessor = opened.record.refresh;
     let sent_at = now_seconds();
     let replacement = post(&client, &endpoint, &client_id, &predecessor, timeout).await?;
     let next_refresh = replacement.refresh_token.as_ref().unwrap_or(&predecessor);
@@ -265,20 +371,21 @@ async fn refresh(
         replacement.access_token.expose().as_bytes(),
         &[predecessor.expose(), next_refresh.expose()],
     );
-    let expires_at = if reflected {
-        0
-    } else {
-        sent_at
-            .checked_add(replacement.expires_in.get())
-            .ok_or(SourceError::Malformed)?
-    };
-    let record = OAuth2Record {
-        version: 1,
+    if reflected {
+        return Err(SourceError::BootstrapReflected);
+    }
+    let expires_at = sent_at
+        .checked_add(replacement.expires_in.get())
+        .ok_or(SourceError::Malformed)?;
+    let record = OAuth2Record::Live {
+        version: 2,
         access: replacement.access_token,
         refresh: replacement
             .refresh_token
             .unwrap_or_else(|| predecessor.clone()),
         expires_at,
+        last_refresh: sent_at,
+        adopted_seed_sha256,
     };
     let bytes = serde_json::to_vec(&record)
         .map_err(|source| classified(SourceError::Malformed, &source))?;

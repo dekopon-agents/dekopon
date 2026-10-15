@@ -47,6 +47,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
         capability(),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe"
                 .parse::<ProviderId>()

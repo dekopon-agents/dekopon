@@ -68,6 +68,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
             .parse()
             .expect("valid capability fixture"),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe"
                 .parse::<ProviderId>()
