@@ -227,9 +227,7 @@ pub(crate) fn parse_flags(
                 return if word.starts_with('-') {
                     unsupported_flag(name, word, help)
                 } else {
-                    CommandFailure::usage(format!(
-                        "{name}: unexpected argument {word:?}; input arrives through a pipe"
-                    ))
+                    CommandFailure::usage(format!("{name}: unexpected argument {word:?}"))
                 };
             }
             error = error.format(&mut grammar);
@@ -337,8 +335,6 @@ mod clap_spike {
 #[cfg(test)]
 pub(crate) mod test_support {
 
-    use std::collections::BTreeMap;
-
     use serde_json::Value;
 
     use crate::{
@@ -370,8 +366,7 @@ pub(crate) mod test_support {
         arguments: &[&str],
         input: Option<Value>,
     ) -> Result<CommandResult, CommandFailure> {
-        let mut buffers = BTreeMap::new();
-        run_builtin_with(builtin, arguments, input, Limits::default(), &mut buffers)
+        run_builtin_with(builtin, arguments, input, Limits::default())
     }
 
     pub(crate) fn run_builtin_with_invoker(
@@ -397,7 +392,6 @@ pub(crate) mod test_support {
         arguments: &[&str],
         input: Option<Value>,
         limits: Limits,
-        _buffers: &mut BTreeMap<String, Vec<u8>>,
     ) -> Result<CommandResult, CommandFailure> {
         let invoker = NoCapabilities;
         let mut budget = Budget::start(limits);
