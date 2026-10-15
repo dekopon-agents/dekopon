@@ -353,7 +353,7 @@ the `context.transport == "console-smoke"` restriction and the gateway's `via`
 (`context.via == "dekopon-gatewayd"`), rather than trusting a console-authored transport.
 
 Storage audit records carry every field a non-storage record does — principal, actor/agent,
-via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —
+via/subject, provider, broker principal, policy IDs and digest, and credential —
 plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
 content commitment, evidence, authority, and generations are separate unkeyed SHA-256 domains, so
 no two are equal. Nothing in them is secret: isolation is the broker granting only the caller's

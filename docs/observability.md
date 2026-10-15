@@ -971,7 +971,7 @@ A storage-backed invocation is traced and audited like every other one: no field
 non-storage span or audit record is withheld on a storage-backed one. `broker.invocation`,
 `broker.authorize`, `broker.execute`, and `provider.invoke` carry the capability, provider, subject,
 agent, `via`, and `input` they carry for any capability, and `broker.decision` and `broker.execution`
-carry the principal, actor, provider, policy revision, policy identifiers and digest, and credential.
+carry the principal, actor, provider, policy identifiers and digest, and credential.
 `recordDeliveredTurn` opens a complete `broker.invocation` from the turn it records.
 
 Storage adds fields on top. `broker.execute` records `storage = true`, `storage.reset`, and

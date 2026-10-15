@@ -260,7 +260,7 @@ The current local broker protocol and service define:
 - `via` as policy context, so a policy that requires an attestor cannot authorize a direct peer and one that forbids it cannot authorize an attested proposal — configuring a gateway cannot widen a grant that already exists;
 - an explicit `agent.prompt` action, so permitting a principal to drive an agent's session is its own policy statement rather than a side effect of holding any capability;
 - canonical proposal and decision identifiers;
-- policy revision, the determining policy identifiers, and a policy-set digest in every decision record;
+- the determining policy identifiers and policy-set digest in each applicable decision record;
 - timeout, output, exact network, and host-call constraints;
 - evidence digests and one audit log record per decision;
 - denial and partial-failure semantics.
