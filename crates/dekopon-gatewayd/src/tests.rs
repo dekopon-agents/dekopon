@@ -8110,14 +8110,9 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     }
 
     let initial = models.prompt(0);
-    assert!(
-        initial
-            .last()
-            .expect("question")
-            .1
-            .contains("the original question"),
-        "{initial:?}"
-    );
+    let question = &initial.last().expect("question").1;
+    assert!(question.contains("What is in this image?"), "{initial:?}");
+    assert!(question.contains("the original question"), "{initial:?}");
     assert!(
         initial.last().expect("question").1.contains("chat-asset:1"),
         "{initial:?}"
@@ -8170,6 +8165,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         fetch_call(),
         answer("Shared image inspected."),
     ]);
+    models.capture_images.store(true, Ordering::SeqCst);
     let mut shared_runner = self::runner(broker, Arc::clone(&models), 4);
     let shared_fetches = Arc::new(AtomicUsize::new(0));
     Arc::get_mut(&mut shared_runner)
@@ -8205,6 +8201,10 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     );
     assert!(!tool_message(&models, 2).contains("There is no chat-asset"));
     assert_eq!(shared_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
 
     let directory = temporary();
     let (broker, _observed) =
