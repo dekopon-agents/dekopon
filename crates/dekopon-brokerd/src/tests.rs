@@ -1814,6 +1814,96 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     assert_ne!(next.unwrap().ready.broker.policy_digest(), digest);
 }
 
+struct ResidentFixture {
+    root: tempfile::TempDir,
+    path: std::path::PathBuf,
+    cedar: std::path::PathBuf,
+    document: serde_json::Value,
+    active: super::Candidate,
+    live: std::path::PathBuf,
+}
+
+impl ResidentFixture {
+    async fn boot() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("broker.yaml");
+        let cedar = root.path().join("policies.cedar");
+        let component =
+            fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+        write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+        write_owner_only(&cedar, POLICIES.as_bytes());
+        let mut document = attested_document(current_uid());
+        document["identities"].as_array_mut().unwrap().truncate(1);
+        let mut storage =
+            serde_json::to_value(dekopon_storage_host::StorageLimits::default()).unwrap();
+        storage["rootPath"] = json!("provider-storage");
+        document["storage"] = storage;
+        document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 1_048_576});
+        write_config(&path, &document);
+        let (active, report) = super::load_candidate(&path, super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let live = root.path().join("assets/live");
+        write_owner_only(&live, b"active asset");
+        Self {
+            root,
+            path,
+            cedar,
+            document,
+            active: active.expect("boot with storage and assets"),
+            live,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_valid_policy_reload_prepares_with_an_active_storage_writer() {
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(
+        &fixture.cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(
+        prepared.is_some(),
+        "valid policy edit must prepare alongside the active writer"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_policy_reload_keeps_the_live_asset() {
+    use super::BrokerdError;
+    use dekopon_broker::PolicyBuildError;
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(&fixture.cedar, b"not cedar");
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy {
+            source: PolicyBuildError::Parse { .. }
+        }
+    )));
+}
+
+#[tokio::test]
+async fn changed_storage_refuses_without_creating_the_candidate_root() {
+    use super::BrokerdError;
+    let mut fixture = ResidentFixture::boot().await;
+    fixture.document["storage"]["rootPath"] = json!("other-storage");
+    write_config(&fixture.path, &fixture.document);
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert!(matches!(report.problems.as_slice(),
+        [BrokerdError::RestartRequired { categories }] if categories == &["storage"]));
+    assert!(!fixture.root.path().join("other-storage").exists());
+}
+
 #[tokio::test]
 async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     use super::{BrokerdError, Mode};
@@ -1829,6 +1919,7 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     let (active, report) = super::load_candidate(&path, Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.unwrap();
+    let digest = active.ready.broker.policy_digest().to_owned();
     write_owner_only(
         &root.path().join("bad-credentials.yaml"),
         b"not-a-credential-map",
@@ -1856,6 +1947,37 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
                 .any(|problem| matches!(problem, BrokerdError::Secrets(_)))
         );
     }
+
+    write_config(
+        &root.path().join("valid-credentials.yaml"),
+        &json!({
+            "apiVersion": super::CREDENTIALS_API_VERSION,
+            "credentials": [{
+                "name": "present", "kind": "bearerToken", "scheme": "Bearer",
+                "destinations": ["api.example.com"], "secret": "fixture-value-long-enough"
+            }]
+        }),
+    );
+    document["credentialsPath"] = json!("valid-credentials.yaml");
+    document.as_object_mut().unwrap().remove("secretMapPath");
+    document["capabilities"]["cli-probe"]["credential"] = json!("present");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["api.example.com"], "allowedMethods": ["GET"],
+        "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    document["agents"] = json!({"chat-agent": {"credentials": {"present": "absent"}}});
+    write_config(&path, &document);
+    let checked = super::check(&path, None).await;
+    assert!(checked.problems.is_empty(), "{checked:?}");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Broker(dekopon_broker::BrokerBuildError::UnknownCredential { name, .. })
+            if name == "absent")),
+        "{report:?}"
+    );
+    assert_eq!(active.ready.broker.policy_digest(), digest);
 }
 
 #[tokio::test]
