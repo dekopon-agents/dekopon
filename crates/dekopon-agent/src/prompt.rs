@@ -54,8 +54,10 @@ const MAX_IGNORED_ARGUMENT_NAMES_BYTES: usize = 256;
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
-const OPTIONAL_REPLY_INSTRUCTION: &str = "This thread message was not addressed to you. Reply only \
-if it helps; for thanks or side talk, call `decline_chat_reply`.";
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. If you can \
+help, give a specific, useful reply. For thanks, side talk, or when you cannot help, call \
+`decline_chat_reply` before doing any capability work. After capability work, report what happened \
+instead of declining, even if you requested to leave the conversation.";
 
 const DECLINE_AFTER_WORK_RESULT: &str = "Not declined: a capability already ran, so reply with what \
 happened. None of this turn's tool calls ran.";

@@ -3429,9 +3429,9 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         ],
     )
     .await;
-    let models = ModelScript::new([decline_reply()]);
+    let models = InterruptibleModel::new([decline_reply()]);
     let driver = Arc::new(RecordingDriver::default().with_status());
-    let runner = runner(broker, Arc::clone(&models), 4);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 4);
     let route = persistent_route(model_config(), window());
     let mut message = owned_slack_message("OK, thanks", true);
     message.liveness = Some(LivenessTarget::Slack {
@@ -3448,23 +3448,37 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &message.subject,
     );
 
-    run_session(
+    let session = tokio::spawn(run_session(
         Arc::clone(&runner),
         route,
         message,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        driver
+            .status_object()
+            .expect("the driver publishes native status")
+            .wait_for_calls(1),
     )
-    .await;
+    .await
+    .expect("Working status arrives before model release");
+    models.release();
+    session.await.expect("decline session completes");
 
     assert!(
         driver.replies().is_empty(),
         "declining must not call chat.postMessage"
     );
-    driver
-        .status_object()
-        .expect("the driver publishes native status")
-        .wait_for_calls(2)
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        driver
+            .status_object()
+            .expect("the driver publishes native status")
+            .wait_for_calls(2),
+    )
+    .await
+    .expect("status returns to idle after decline");
     assert_eq!(
         driver.rendered().last().map(String::as_str),
         Some("status:idle"),
@@ -15608,6 +15622,415 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             .ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one follow witness spans two speakers and their ordered broker requests"
+)]
+async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = dekopon_test_support::BrokerFixture::answering(
+        directory.path(),
+        [
+            ResponseEnvelope::chat_capabilities(
+                vec![capability("cli-probe.reverse")],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("owner".parse().unwrap()),
+            ),
+            ResponseEnvelope::chat_capabilities(
+                vec![capability("cli-probe.upper")],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("non-owner".parse().unwrap()),
+            ),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "cli-probe.reverse", "input": {"text": "secret"}
+            })).unwrap()),
+            upper_proposal("hello"),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    );
+    let models = ModelScript::new([
+        answer("Owner replied."),
+        script_call("probe reverse --text secret"),
+        script_call("probe upper --text hello"),
+        answer("The probe answered HELLO."),
+    ]);
+    let mut runner = Arc::into_inner(runner(
+        ResolvedBroker {
+            socket_path: broker.socket().to_path_buf(),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        Arc::clone(&models),
+        4,
+    ))
+    .unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message_from("tel.16034700183", "check hello");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(table);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = Arc::new(runner);
+    let mut owner = message_from("tel.16034700182", "owner invites another speaker");
+    owner.message_id = MessageId::Follow("owner-id".into());
+    for speaker in [owner.clone(), inbound.clone()] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                speaker,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("follow turn completes");
+    }
+    assert_eq!(
+        driver.replies(),
+        ["Owner replied.", "The probe answered HELLO."]
+    );
+    assert_eq!(models.requests(), 4);
+    let previous = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(owner_claim),
+    } = previous.request
+    else {
+        panic!("owner turn must open its own leg: {previous:?}");
+    };
+    assert_eq!(owner_claim.subject, owner.subject);
+    assert_eq!(
+        owner_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    let capabilities = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(claim),
+    } = capabilities.request
+    else {
+        panic!("first request must open the speaker's leg: {capabilities:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    let unlisted = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(unlisted_claim),
+        word: unlisted_word,
+        argv: unlisted_argv,
+        ..
+    } = unlisted.request
+    else {
+        panic!("unlisted command is resolved without invocation: {unlisted:?}");
+    };
+    assert_eq!(unlisted_claim.subject, inbound.subject);
+    assert_eq!(
+        unlisted_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert_eq!(unlisted_word, "probe");
+    assert_eq!(unlisted_argv, ["reverse", "--text", "secret"]);
+    let command = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(claim),
+        word,
+        argv,
+        ..
+    } = command.request
+    else {
+        panic!("second request must resolve the named command: {command:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert_eq!(word, "probe");
+    assert_eq!(argv, ["upper", "--text", "hello"]);
+    let invocation = broker.request().await;
+    let BrokerRequest::Invoke {
+        attestation: Some(claim),
+        invocation,
+        ..
+    } = invocation.request
+    else {
+        panic!("third request must invoke the named capability: {invocation:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert!(claim.binds(&invocation.id));
+    assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
+    assert_eq!(invocation.input, json!({"text": "hello"}));
+    assert!(
+        broker.recorded().is_empty(),
+        "two fresh capabilities requests, one permitted invocation and no unlisted invocation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts() {
+    for (label, response) in [
+        (
+            "unmapped",
+            ResponseEnvelope::error(dekopon_broker_protocol::ERROR_UNAUTHENTICATED, "unmapped"),
+        ),
+        (
+            "forbidden",
+            ResponseEnvelope::error(dekopon_broker_protocol::ERROR_UNAUTHENTICATED, "forbidden"),
+        ),
+        (
+            "empty-or-revoked",
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new()),
+        ),
+    ] {
+        let directory = temporary();
+        let journal_dir = temporary();
+        let mut broker =
+            dekopon_test_support::BrokerFixture::answering(directory.path(), [response]);
+        let resolved = ResolvedBroker {
+            socket_path: broker.socket().to_path_buf(),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        };
+        let models = ModelScript::forbidden();
+        let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400))
+                .unwrap(),
+        );
+        let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+        let mut route = route(model_config());
+        route.follow = true;
+        let mut inbound = message_from("tel.16034700183", "ambient sentinel");
+        inbound.message_id = MessageId::Follow("native-id".into());
+        let key = crate::follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            &inbound.conversation.key(),
+        );
+        table.stay(&key, SystemTime::now()).unwrap();
+        runner.follow = Some(table);
+        let driver = Arc::new(RecordingDriver::default());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::new(runner),
+                route,
+                inbound.clone(),
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("refused turn completes");
+        assert_eq!(models.requests(), 0, "{label}");
+        assert!(driver.replies().is_empty(), "{label}");
+        let request = broker.request().await;
+        assert!(
+            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(ref claim) }
+                if claim.subject == inbound.subject
+                    && claim.scope.as_ref().is_some_and(|scope| scope.trigger == dekopon_broker_protocol::Trigger::Message)),
+            "{label}"
+        );
+        assert!(
+            broker.recorded().is_empty(),
+            "{label}: no capability invocation"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_inactive_follow_turn_records_only_category_metadata() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (capture, _guard) = capture_spans();
+    let mut broker = dekopon_test_support::BrokerFixture::answering(directory.path(), []);
+    let resolved = ResolvedBroker {
+        socket_path: broker.socket().to_path_buf(),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let models = ModelScript::forbidden();
+    let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    runner.follow = Some(Arc::new(crate::follow::FollowTable::load(journal).unwrap()));
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message_from("tel.16034700183", "private payload sentinel");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::new(runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 0);
+    assert!(broker.recorded().is_empty());
+    assert!(driver.replies().is_empty());
+    let events = capture.events_where("dekopon_gatewayd", &[("audit.event", "gateway.follow")]);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].field("operation"), Some("refused"));
+    assert_eq!(events[0].field("reason"), Some("inactive"));
+    for forbidden in [
+        "subject",
+        "principal",
+        "conversation",
+        "text",
+        "payload",
+        "capabilities",
+    ] {
+        assert_eq!(events[0].field(forbidden), None);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (capture, _guard) = capture_spans();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper"), leaving],
+                vec!["probe".into(), "follow".into()],
+                BTreeMap::new(),
+            ),
+            upper_proposal("hi"),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+            })).unwrap()),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("probe upper --text hi; follow leave"),
+        decline_reply(),
+    ]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    route.limits.max_steps = 2;
+    let mut inbound = message("work and leave");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table
+        .stay(&key, SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let marker = journal_dir.path().join(format!("{key}.followed"));
+    let original = fs::read(&marker).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let driver = Arc::new(FarewellOrderDriver {
+        table: Arc::clone(&table),
+        key: key.clone(),
+        delivered: Mutex::new(Vec::new()),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("follow session completes");
+    {
+        let delivered = driver.delivered.lock();
+        assert!(
+            matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })]
+            if text == UNREPORTED_WORK_REPLY),
+            "one fixed warning while the ticket is active: {delivered:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        original,
+        "a failed turn cannot refresh its ticket"
+    );
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
+    let failed = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_session_failed"),
+            ("category", "unreported-capability-work"),
+        ],
+    );
+    assert_eq!(failed.len(), 1, "the worked turn remains failed");
+    assert!(capture.records().iter().any(|record| matches!(record,
+        dekopon_test_support::Record::Span { name: "gateway.message", .. }
+        if record.field("outcome") == Some("failed"))));
+    let mut requests = Vec::new();
+    for _ in 0..5 {
+        requests.push(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("broker request arrives")
+                .expect("broker request is recorded"),
+        );
+    }
+    assert!(
+        matches!(&requests[2].request, BrokerRequest::Invoke { invocation, .. }
+        if invocation.capability.as_str() == "cli-probe.upper")
+    );
+    assert!(
+        matches!(&requests[4].request, BrokerRequest::Invoke { invocation, .. }
+        if invocation.capability.as_str() == "dekopon-provider-follow.leave")
+    );
+    assert!(observed.try_recv().is_err());
 }
 
 struct FarewellOrderDriver {
