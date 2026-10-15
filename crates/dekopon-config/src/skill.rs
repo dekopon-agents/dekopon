@@ -3,6 +3,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -35,6 +36,10 @@ pub struct Skill {
     body: String,
     resources: Vec<SkillResource>,
     source: PathBuf,
+    #[serde(skip)]
+    file: String,
+    #[serde(skip)]
+    directories: BTreeMap<PathBuf, Vec<OsString>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -100,6 +105,18 @@ impl Skill {
     #[must_use]
     pub fn source(&self) -> &Path {
         &self.source
+    }
+
+    #[must_use]
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+
+    /// Every directory listed while loading, with all entry names in sorted order, hidden ones
+    /// included.
+    #[must_use]
+    pub fn directories(&self) -> &BTreeMap<PathBuf, Vec<OsString>> {
+        &self.directories
     }
 }
 
@@ -200,7 +217,15 @@ pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
 
     let mut resources = Vec::new();
     let mut total_bytes = 0_usize;
-    collect_resources(directory, directory, 0, &mut resources, &mut total_bytes)?;
+    let mut directories = BTreeMap::new();
+    collect_resources(
+        directory,
+        directory,
+        0,
+        &mut resources,
+        &mut total_bytes,
+        &mut directories,
+    )?;
     resources.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(Skill {
@@ -219,6 +244,8 @@ pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
         body: body.trim().to_owned(),
         resources,
         source: directory.to_path_buf(),
+        file: text,
+        directories,
     })
 }
 
@@ -256,6 +283,7 @@ fn collect_resources(
     depth: usize,
     resources: &mut Vec<SkillResource>,
     total_bytes: &mut usize,
+    directories: &mut BTreeMap<PathBuf, Vec<OsString>>,
 ) -> Result<(), SkillError> {
     let mut entries = fs::read_dir(directory)
         .map_err(|source| SkillError::Read {
@@ -268,6 +296,10 @@ fn collect_resources(
             source,
         })?;
     entries.sort_by_key(fs::DirEntry::file_name);
+    directories.insert(
+        directory.to_path_buf(),
+        entries.iter().map(fs::DirEntry::file_name).collect(),
+    );
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
@@ -291,7 +323,7 @@ fn collect_resources(
                     maximum: MAX_SKILL_RESOURCE_DEPTH,
                 });
             }
-            collect_resources(root, &path, depth + 1, resources, total_bytes)?;
+            collect_resources(root, &path, depth + 1, resources, total_bytes, directories)?;
             continue;
         }
         if !metadata.is_file() {

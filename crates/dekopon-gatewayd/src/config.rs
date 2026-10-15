@@ -2,6 +2,7 @@
 //! models and credential env vars, so a writable or symlinked copy could redirect the daemon.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     env, io,
     net::SocketAddr,
@@ -1391,54 +1392,14 @@ pub(crate) async fn source_snapshot(
     catalog: Option<&dekopon_config::LocalCatalog>,
     expected_uid: u32,
 ) -> Result<SourceSnapshot, ConfigError> {
-    let mut paths = Vec::new();
-    if source.is_dir() {
-        paths.extend(scan_gateway_directory(source, expected_uid)?);
+    let mut paths = if source.is_dir() {
+        scan_gateway_directory(source, expected_uid)?
     } else {
-        paths.push(source.to_path_buf());
-    }
-    if let Some(catalog) = catalog {
-        let root = catalog.source();
-        if root.is_dir() {
-            paths.extend(scan_gateway_directory(root, expected_uid)?);
-        } else {
-            paths.push(root.to_path_buf());
-        }
-        let base = if root.is_dir() {
-            root
-        } else {
-            root.parent().ok_or(ConfigError::MissingParent)?
-        };
-        for agent in catalog.agents() {
-            if let Some(instructions) = &agent.spec.instructions_file {
-                paths.push(if instructions.is_absolute() {
-                    instructions.clone()
-                } else {
-                    base.join(instructions)
-                });
-            }
-            let id = agent
-                .metadata
-                .name
-                .parse()
-                .map_err(|_invalid| ConfigError::InvalidCatalogAgent)?;
-            for skill in catalog.agent_skills(&id) {
-                let root = skill.source();
-                paths.push(root.to_path_buf());
-                paths.push(root.join("SKILL.md"));
-                for resource in skill.resources() {
-                    let file = root.join(&resource.path);
-                    for directory in file
-                        .ancestors()
-                        .skip(1)
-                        .take_while(|directory| directory.starts_with(root))
-                    {
-                        paths.push(directory.to_path_buf());
-                    }
-                    paths.push(file);
-                }
-            }
-        }
+        vec![source.to_path_buf()]
+    };
+    let loaded = catalog.map(loaded_catalog_bytes).transpose()?;
+    if let Some(loaded) = &loaded {
+        paths.extend(loaded.keys().cloned());
     }
     paths.sort();
     paths.dedup();
@@ -1446,14 +1407,88 @@ pub(crate) async fn source_snapshot(
     for path in paths {
         entries.insert(path.clone(), read_source_entry(path, expected_uid).await?);
     }
+    // A catalog serves what it loaded, so its snapshot must be those bytes, not a later read.
+    if let Some(loaded) = loaded
+        && !entries
+            .iter()
+            .map(|(path, bytes)| (path, bytes.as_slice()))
+            .eq(loaded.iter().map(|(path, bytes)| (path, bytes.as_ref())))
+    {
+        return Err(ConfigError::ChangedDuringLoad);
+    }
     Ok(SourceSnapshot(entries))
 }
 
-async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
-    use std::os::unix::{
-        ffi::OsStrExt as _,
-        fs::{MetadataExt as _, PermissionsExt as _},
+fn loaded_catalog_bytes(
+    catalog: &dekopon_config::LocalCatalog,
+) -> Result<BTreeMap<PathBuf, Cow<'_, [u8]>>, ConfigError> {
+    let mut loaded = BTreeMap::new();
+    for (path, text) in catalog.files() {
+        record_loaded(&mut loaded, path.clone(), Cow::Borrowed(text.as_bytes()))?;
+    }
+    let root = catalog.source();
+    let base = if root.is_dir() {
+        root
+    } else {
+        root.parent().ok_or(ConfigError::MissingParent)?
     };
+    for agent in catalog.agents() {
+        if let Some(file) = &agent.spec.instructions_file {
+            let text = agent
+                .spec
+                .instructions
+                .as_deref()
+                .ok_or(ConfigError::ChangedDuringLoad)?;
+            record_loaded(&mut loaded, base.join(file), Cow::Borrowed(text.as_bytes()))?;
+        }
+        let id = agent
+            .metadata
+            .name
+            .parse()
+            .map_err(|_invalid| ConfigError::InvalidCatalogAgent)?;
+        for skill in catalog.agent_skills(&id) {
+            let root = skill.source();
+            record_loaded(
+                &mut loaded,
+                root.join(dekopon_config::skill::SKILL_FILE_NAME),
+                Cow::Borrowed(skill.file().as_bytes()),
+            )?;
+            for resource in skill.resources() {
+                record_loaded(
+                    &mut loaded,
+                    root.join(&resource.path),
+                    Cow::Borrowed(resource.text.as_bytes()),
+                )?;
+            }
+            for (directory, names) in skill.directories() {
+                record_loaded(
+                    &mut loaded,
+                    directory.clone(),
+                    Cow::Owned(listing_bytes(directory, names)?),
+                )?;
+            }
+        }
+    }
+    Ok(loaded)
+}
+
+fn record_loaded<'a>(
+    loaded: &mut BTreeMap<PathBuf, Cow<'a, [u8]>>,
+    path: PathBuf,
+    bytes: Cow<'a, [u8]>,
+) -> Result<(), ConfigError> {
+    match loaded.entry(path) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(bytes);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == bytes => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => Err(ConfigError::ChangedDuringLoad),
+    }
+}
+
+async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let metadata = std::fs::symlink_metadata(&path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
@@ -1487,15 +1522,24 @@ async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, 
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if names.len() > 1024 {
-        return Err(ConfigError::InsecureProjection { path });
-    }
     names.sort();
+    listing_bytes(&path, &names)
+}
+
+fn listing_bytes(path: &Path, sorted: &[std::ffi::OsString]) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if sorted.len() > 1024 {
+        return Err(ConfigError::InsecureProjection {
+            path: path.to_path_buf(),
+        });
+    }
     let mut bytes = Vec::new();
-    for name in names {
+    for name in sorted {
         let name = name.as_bytes();
         if bytes.len().saturating_add(name.len()).saturating_add(4) > HARD_MAX_CONFIG_BYTES {
-            return Err(ConfigError::InsecureProjection { path });
+            return Err(ConfigError::InsecureProjection {
+                path: path.to_path_buf(),
+            });
         }
         bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
         bytes.extend_from_slice(name);

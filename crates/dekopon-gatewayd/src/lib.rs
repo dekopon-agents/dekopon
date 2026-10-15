@@ -413,12 +413,6 @@ pub(crate) async fn load_candidate_against(
         .problems
         .extend(refusals.into_iter().map(GatewaydError::from));
     let catalog_path = catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()));
-    let before_catalog = match catalog_path {
-        Some(path) if config.is_some() => {
-            Some(config::source_snapshot(path, None, current_uid()).await)
-        }
-        _ => None,
-    };
     let catalog = match catalog_path {
         Some(path) => match LocalCatalog::load(path) {
             Ok(catalog) => Some(catalog),
@@ -474,14 +468,8 @@ pub(crate) async fn load_candidate_against(
             let after_config = config::source_snapshot(config_path, None, current_uid()).await;
             let after_catalog =
                 config::source_snapshot(catalog.source(), Some(&catalog), current_uid()).await;
-            match (before_config, after_config, before_catalog, after_catalog) {
-                (Ok(before), Ok(after), Some(Ok(catalog_before)), Ok(catalog_after))
-                    if before == after
-                        && catalog_before
-                            .0
-                            .iter()
-                            .all(|(path, bytes)| catalog_after.0.get(path) == Some(bytes)) =>
-                {
+            match (before_config, after_config, after_catalog) {
+                (Ok(before), Ok(after), Ok(catalog_after)) if before == after => {
                     let sources = config::GatewaySources {
                         config: after,
                         catalog: catalog_after,
@@ -509,10 +497,7 @@ pub(crate) async fn load_candidate_against(
                         }
                     }
                 }
-                (Err(error), _, _, _)
-                | (_, Err(error), _, _)
-                | (_, _, Some(Err(error)), _)
-                | (_, _, _, Err(error)) => {
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                     report.problems.push(error.into());
                     None
                 }
