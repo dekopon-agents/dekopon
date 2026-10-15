@@ -90,12 +90,12 @@ alone retains them. This adapter accepts any concrete valid media type. Route in
 state that accepted set; invalid labels are refused. See
 [asset handles](../../docs/gatewayd.md#asset-handles-and-delivery) for the bounds.
 
-## Configure in-flight liveness
+## Configure in-flight indicators
 
-Session liveness is opt-in and starts after fresh broker authorization. A same-sender steer joins
+Session indicators are opt-in and starts after fresh broker authorization. A same-sender steer joins
 the running leg; a queued sender opens a fresh leg when their turn starts. Accepted steers and
-queued non-wake messages with liveness targets get best-effort `eyes`, independent of `classicFallback` but
-subject to reaction-scope availability. This admission acknowledgment can precede a later
+queued non-wake messages get best-effort `eyes` only when their resolved route opts in with
+`reaction.seen: on`, subject to reaction-scope availability. This admission acknowledgment can precede a later
 authorization refusal; it does not signify permission to run. Unauthorized turns get no session
 progress or inference. Busy refusals, unrouted and ambient messages get no liveness indicator;
 a busy refusal can still get the configured text reply.
@@ -105,9 +105,9 @@ Classic/free profile:
 ```yaml
 kind: slackSocketMode
 experience: classic
-liveness:
+indicators:
   mode: native
-  classicFallback: reaction
+  reaction: { working: auto, seen: off }
   progress: message
   cancelButton: true
 ```
@@ -117,9 +117,9 @@ Agent profile, optionally showing opted-in route notes on the thread status line
 ```yaml
 kind: slackSocketMode
 experience: agent
-liveness:
+indicators:
   mode: native
-  classicFallback: reaction
+  reaction: { working: auto, seen: off }
   progress: off
   statusText: true
 ```

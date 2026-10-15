@@ -8,6 +8,28 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Gateway indicator configuration (next gateway release)
+
+The gateway replaces `transports[].liveness` with layered `indicators`: `sessions.indicators`,
+`transports[].indicators`, `transports[].indicators.conversations.<kind>`, then
+`routes[].indicators`, in that order. The last authored leaf wins; absent or `null` inherits.
+`mode: off` suppresses every indicator. In `mode: native`, reaction defaults are
+`reaction: { working: off, seen: off }`. Migrate `classicFallback: reaction` to
+`reaction.working: auto` (not a default-on reaction); `reaction.working: on` adds a working
+reaction alongside status or typing. WhatsApp rejects `working: on` and `auto` until a
+verified Cloud API clear is supported. Set `reaction.seen: on` on a route only if the
+operator wants the persistent steer/queue 👀; otherwise **the former automatic steer 👀
+disappears**. Neither the old `liveness` nor `classicFallback` key is accepted.
+
+Before upgrading the deployed gateway, migrate the five host fragments under
+`manifests/dekopon/config/gatewayd.d/`: `slack-scientist.yaml`, `slack-dekoponville.yaml`,
+`slack-nestedset.yaml`, `discord-dekopon.yaml`, and `whatsapp.yaml`. Each migrated fragment
+explicitly sets `reaction.seen: off`; do not add WhatsApp working reactions. This is a
+configuration migration note, **not** an edit to those manifests. Ship the reviewed core
+pin first and the manifest migration immediately after it in a separate PR; both old and
+new binaries reject the other's keys, so an incompatible-key crash loop is expected
+between those changes. Do not promise zero downtime or opt in a live route in this step.
+
 ## Stopped turns, progress and session seals (0.46.0)
 
 Upgrade the broker and gateway together; no configuration migration, provider WIT or SDK re-pin

@@ -75,9 +75,11 @@ transports:
     botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
     endpoint: https://slack.com               # optional, tests only: the pinned origin or a literal loopback http:// URL
     experience: agent                         # optional: classic (default) | agent
-    liveness:                                 # optional; absent means off
-      mode: native                            # off | native
-      classicFallback: reaction               # none (default) | reaction; slackSocketMode only
+    indicators:                               # optional; absent mode is off
+      mode: native                            # off (default) | native
+      status: auto                            # auto (default) | off
+      typing: auto                            # auto (default) | off
+      reaction: { working: auto, seen: off }  # working off (default) | on | auto; seen off (default) | on
       progress: auto                          # auto (default) | off | message
       statusText: false                       # Agent only; true requires progress: off or auto
       cancelButton: false                     # default false; refused on whatsappCloudApi and experience: agent
@@ -95,11 +97,11 @@ transports:
     botTokenEnv: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
     messageContent: false                     # optional, default false; true requests the privileged Message Content
                                               # intent, which the Developer Portal must allow (see Discord Gateway)
-    liveness: { mode: native, progress: message, cancelButton: true }
+    indicators: { mode: native, progress: message, cancelButton: true }
   - name: tg
     kind: telegramLongPoll
     botTokenEnv: DEKOPON_GATEWAYD_TELEGRAM_TOKEN
-    liveness: { mode: native, progress: message, cancelButton: true }
+    indicators: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
     debounceMs: 5000                      # quiet interval; 0 bypasses collection
@@ -112,11 +114,11 @@ transports:
     wabaId: "123456789"
     phoneNumberId: "987654321"
     graphApiVersion: v23.0                 # explicit; no implicit/latest version
-    liveness: { mode: native }             # typing only: WhatsApp cannot edit a message
+    indicators: { mode: native }           # typing only: WhatsApp cannot clear a working reaction
   - name: dev
     kind: local
     socketPath: /path/to/gatewayd-dev.sock
-    liveness: { mode: native, progress: message, stream: true, cancelButton: true }
+    indicators: { mode: native, progress: message, stream: true, cancelButton: true }
 
 stopWords: [stop, cancel]                     # optional, default shown; see Stopping a run
 
@@ -156,6 +158,7 @@ routes:                                       # first match wins; order matters
   - transport: scientist-slack
     conversation: { kind: [channel, thread], ids: [c0123abc] }
     agent: incident-responder                 # one named channel and the threads under it
+    indicators: { reaction: { seen: on } }    # optional route override; opt in to steer acknowledgements
   - transport: scientist-slack
     conversation: { kind: [channel, thread] } # any other channel the bot is invited to
     agent: xaviers-conditional-writer
@@ -188,6 +191,7 @@ routes:                                       # first match wins; order matters
     wakes: true                               # optional, default false; offers the wake tool, needs sessions.wakes
 
 sessions:
+  indicators: { reaction: { seen: off } }    # optional defaults; absent/null leaves inherit
   maxConcurrent: 4                            # optional, default 4
   maxJobs: 2                                  # optional, default 2; 0 refused
   replyOnBusy: true                           # default true; saturation or a full mailbox only
@@ -279,24 +283,19 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a route still written with the retired `match` key, or a `mode`/`scope`/`idleTimeoutMs`/`maxTurns`/`maxBytes` key under `conversation:`. Both name their replacement: the route match is `conversation:`, and the memory window is `memory:`;
 - a selector that can never name a conversation: an empty or duplicated `kind` list, an empty `ids` list, an id or `container` the transport would never mint, a `container` on Telegram (which has nothing above a chat), a kind the transport never produces (`groupDirectMessage` on Discord, `channel` on WhatsApp), or an `ids` entry in `id:thread` form — a selector names the parent, and the kind list decides whether its threads come with it;
 - `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
-- a `liveness.conversations.<kind>` key for a kind the transport never produces;
+- an `indicators.conversations.<kind>` key for a kind the transport never produces;
 - a missing or blank chat or bound-route model credential environment variable. An `openaiCompatible` model's `apiKeyEnv` is optional (OpenRouter requires it), and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
-- an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
-  Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
-  fallback, is also refused because the configured fallback could never take effect;
-- `liveness.progress: message`, `liveness.stream: true`, `liveness.statusText: true`, or `liveness.cancelButton: true` while `liveness.mode` is
-  `off`, where none of them could ever take effect; each one is named;
-- `liveness.stream` or `liveness.cancelButton` on `whatsappCloudApi`, which can neither edit a
-  message nor carry an interactive component; `liveness.stream` on any Slack transport, since Slack
-  progress now streams through Agent status text or the progress message instead of
-  `chat.appendStream`; and `liveness.cancelButton` on a Slack transport with `experience: agent`,
-  which renders its own Stop control;
-- `liveness.statusText: true` on anything except Slack's Agent experience, or effective
-  `statusText` alongside `progress: message`, including conversation overrides;
-- `liveness.classicFallback` on a transport that is not `slackSocketMode`;
-- a `liveness.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of zero is a render
-  loop rather than a keep-alive;
-- a `liveness.templates` line using a placeholder that field cannot render. The known placeholders
+- an unknown Slack experience, indicator key or enum value; the former `liveness` and
+  `classicFallback` keys are unknown and refused rather than silently migrated;
+- fully resolved `indicators.stream` or `indicators.cancelButton` on `whatsappCloudApi`, which
+  can neither edit a message nor carry an interactive component; `reaction.working: on|auto`
+  on WhatsApp is also refused until a verified working-reaction clear exists;
+  `indicators.stream` on Slack, or `indicators.cancelButton` on Slack Agent, is refused;
+- resolved `indicators.statusText: true` on anything except Slack Agent, or alongside
+  `progress: message`, including conversation and route overrides;
+- an effective `indicators.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of
+  zero is a render loop rather than a keep-alive;
+- an `indicators.templates` line using a placeholder that field cannot render. The known placeholders
   are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
   `{elapsed_s}`, plus `{note}` only in `note`/`noteEta` and `{eta_s}` only in `noteEta`;
   neither note field permits `{word}`. `stopped` (person/operator stops) and `failed` (failures without a fixed cause line) render none. Every
@@ -514,8 +513,8 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
 `experience` controls Slack's conversation model and is never inferred from a cosmetic API result:
 
 - `classic` (default) retains top-level DM replies and one whole-DM conversation. With native
-  liveness and `classicFallback: reaction`, the gateway adds its fixed `:tangerine:` reaction to
-  the inbound message and removes only a reaction that generation successfully added.
+  indicators and `reaction.working: auto`, the gateway adds its fixed `:tangerine:` reaction to
+  the inbound message and removes only this turn's attempted working reaction.
 - `agent` makes DMs thread-scoped like Slack Agent sessions and enables authorization-fed channel
   thread continuation. After fresh broker authorization the gateway calls
   `agents.sessions.setStatus(processing)` once; Slack owns the standard Working UI and one-hour
@@ -523,10 +522,10 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
   no-reply completion it asynchronously returns the session to `active`; no-reply means
   no chat message, not omission of that cosmetic cleanup.
   `feature_disabled`, `missing_scope`, and equivalent permanent installation errors disable Agent
-  status for that transport and select the configured reaction fallback, then no-op if reactions
+  status for that transport; `reaction.working: auto` can fall back, then no-op if reactions
   are also unavailable. It never guesses the workspace plan.
 
-An Agent transport may opt into `liveness.statusText: true` (default false, also overridable per
+An Agent transport may opt into `indicators.statusText: true` (default false, also overridable per
 conversation kind), with `progress: off` or `auto`. Where no progress message is
 being written, the first opted-in note returns the native session to `active` and shows the existing
 rendered line through `assistant.threads.setStatus`. The handover is one-way for the run: subsequent
@@ -593,7 +592,7 @@ Discord Gateway v10 is another outbound WebSocket transport. The daemon discover
 - Absence of `guild_id` is a direct message. A guild message is a channel message and must address the bot: its user in `mentions`, or its managed role in `mention_roles` (see [How @mentions reach the bot on Discord](#how-mentions-reach-the-bot-on-discord)). Subject: `discord.<user id>`; Discord user snowflakes are global, so a guild is not part of the canonical subject.
 - A Discord thread is itself a channel. Its channel ID is the route key, conversation identity, and reply destination. A catch-all channel route covers transient threads; a route naming only a parent channel does not automatically claim its thread IDs.
 - Replies use `POST /api/v10/channels/{channel}/messages`. Provider attachments ride the first post as multipart attachments; the first guild post references the incoming message with `fail_if_not_exists: false`; every post disables parsed/reply mentions, so model-authored text cannot ping a user, role, or `@everyone`. Discord's 2,000-character ceiling is handled by lossless multi-message splitting, with Markdown left unchanged. Failure after an accepted attachment or first chunk is partial delivery rather than a complete receipt.
-- With `liveness.mode: native`, an authorized session immediately triggers `POST /channels/{id}/typing` and renews around every eight seconds, inside Discord's ten-second native lease. Typing has no explicit clear; sealing stops renewal and the final message clears it sooner. Calls use a short deadline, honor a `429` cooldown, never take the final-message REST lock, and cannot fail the answer.
+- With `indicators.mode: native`, an authorized session immediately triggers `POST /channels/{id}/typing` and renews around every eight seconds, inside Discord's ten-second native lease. Typing has no explicit clear; sealing stops renewal and the final message clears it sooner. Calls use a short deadline, honor a `429` cooldown, never take the final-message REST lock, and cannot fail the answer.
 
 [`../examples/discord/`](../examples/discord/README.md) is the bot installation, permission, token, route, and identity-mapping walkthrough.
 
@@ -732,7 +731,7 @@ identity, replies, generated-photo uploads, and liveness, so a forum-topic pulse
 another topic. Generated PNGs use `sendPhoto`; text up to Telegram's 1,024-unit caption ceiling is
 accepted with the first photo, while longer text follows as losslessly split `sendMessage` calls; a
 failure after any accepted part is partial delivery. With
-`liveness.mode: native`, an authorized session sends `sendChatAction(action=typing)` and renews
+`indicators.mode: native`, an authorized session sends `sendChatAction(action=typing)` and renews
 around every four seconds inside Telegram's five-second lease. There is no explicit clear; renewal
 stops before the final message, which clears the action. Calls override the long-poll client's
 70-second timeout with a short deadline, honor `retry_after`, and remain cosmetic.
@@ -882,17 +881,26 @@ Nor do two people in one channel share a conversation **by default**. A persiste
 
 ## Liveness, progress, and stopping a run
 
-A long turn used to look like a hang. `liveness:` is what one transport shows while a session runs,
-and `stopWords:` plus `limits.maxDurationMs` are how a run ends before it finishes on its own.
+A long turn used to look like a hang. Layered `indicators:` determine what a routed conversation
+shows while a session runs; `stopWords:` and `limits.maxDurationMs` end a run early.
+An optional leaf resolves from built-in defaults, `sessions.indicators`, transport
+`indicators`, its matching `indicators.conversations.<kind>`, then route `indicators`.
+The last authored value wins, even when an earlier layer set `off`; absent and `null`
+inherit without resetting unrelated leaves. Resolved `mode: off` suppresses all indicators.
+For every route/kind, startup and reload emit a bounded `gateway_indicators_effective` record
+with route index, transport name, kind, enum settings and booleans only, not message text,
+identity, coordinates or credentials.
 
 **One message per session.** Whatever the policy posts, it posts once and then edits: a keep-alive
 is an edit, a streamed answer grows in place, and the answer finalizes the same message. There is
 never a second gateway message beside it, which is why `stream: true` means the stream *is* the
 surface and no separate progress line is posted.
 
-**Native-first by default.** An absent liveness block or `mode: off` still disables all intermediate
-presentation. With `mode: native`, omitted `progress` means `auto`: prefer native status, then typing,
-then the configured/implemented reaction. Healthy Slack Agent status or Telegram/Discord typing
+**Opt-in by default.** An absent indicator block or `mode: off` disables all intermediate
+presentation. With `mode: native`, omitted `progress` means `auto`: prefer native status, then typing;
+`reaction.working: auto` is a fallback only when neither is active, while `on` adds a working
+reaction alongside them. The `status` and `typing` leaves default to `auto` and accept `off`.
+Both `reaction.working` and `reaction.seen` default to `off`. Healthy Slack Agent status or Telegram/Discord typing
 therefore needs no placeholder message; the complete answer is a fresh reply. WhatsApp remains
 typing-only. Slack's definitive native-status refusal exposes its configured reaction fallback in
 the same session without changing the configured conversation experience. Transient errors do not
@@ -932,7 +940,8 @@ message fallback even when no typing is visible. Lease visibility and actual not
 verified by loopback tests; no cooldown or reaction-ownership redesign is included.
 
 **Steering acknowledgment.** Accepted steers and queued non-wake follow-ups get a best-effort 👀 on their own
-inbound message when it has a liveness target. Slack uses `eyes` independently of `classicFallback`
+inbound message only with resolved `mode: native` and `reaction.seen: on`. The default route
+sends no reaction or steer 👀. Slack uses `eyes` independently of working reactions
 but honors reaction-scope availability; Discord, Telegram and WhatsApp send 👀. Local keeps its
 `{"reaction": true}` frame. Slack does not track eyes for progress cleanup. Acknowledgment calls run
 outside the admission lock with a two-second bound; failure is debug-only

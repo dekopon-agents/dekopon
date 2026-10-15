@@ -401,19 +401,25 @@ fn ticking() -> Arc<ResolvedLiveness> {
     liveness_with(false, KeepAlive::default())
 }
 
+fn additive(mut liveness: Arc<ResolvedLiveness>) -> Arc<ResolvedLiveness> {
+    Arc::get_mut(&mut liveness)
+        .expect("fresh fixture")
+        .settings
+        .working = crate::config::WorkingReaction::On;
+    liveness
+}
+
 fn liveness_with(stream: bool, keep_alive: KeepAlive) -> Arc<ResolvedLiveness> {
     Arc::new(ResolvedLiveness {
         settings: LivenessSettings {
             mode: LivenessMode::Native,
-            classic_fallback: crate::config::SlackLivenessFallback::None,
+            working: crate::config::WorkingReaction::Auto,
             progress: ProgressSurface::Message,
             stream,
-            status_text: false,
-            cancel_button: false,
+            ..LivenessSettings::default()
         },
         keep_alive,
         templates: templates(),
-        conversations: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1266,8 +1272,63 @@ async fn a_one_turn_answer_posts_no_progress_message() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn native_reaction_off_does_not_send_even_with_no_other_indicator() {
+    let mut liveness = liveness(false);
+    Arc::get_mut(&mut liveness)
+        .expect("fresh fixture")
+        .settings
+        .working = crate::config::WorkingReaction::Off;
+    let harness = start(Offers::default(), ProgressDetail::Plain, liveness);
+    harness.sink.emit(started());
+    settle().await;
+    assert!(
+        !harness
+            .recorder
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Reaction(_)))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn working_auto_reacts_only_without_status_or_typing() {
+    for (offers, reaction) in [
+        (Offers::default(), false),
+        (
+            Offers {
+                status: false,
+                typing: false,
+                ..Offers::default()
+            },
+            true,
+        ),
+    ] {
+        let mut liveness = liveness(false);
+        Arc::get_mut(&mut liveness)
+            .expect("fresh fixture")
+            .settings
+            .progress = ProgressSurface::Auto;
+        let harness = start(offers, ProgressDetail::Plain, liveness);
+        harness.sink.emit(started());
+        settle().await;
+        assert_eq!(
+            harness
+                .recorder
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Reaction(true))),
+            reaction
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    let mut harness = start(
+        Offers::default(),
+        ProgressDetail::Plain,
+        additive(liveness(false)),
+    );
     harness.sink.emit(started());
     settle().await;
     assert_eq!(
@@ -2186,7 +2247,7 @@ async fn a_failed_session_removes_the_surface_and_replies_the_fixed_line() {
 
 #[tokio::test(start_paused = true)]
 async fn detail_off_renders_typing_status_and_reaction_and_nothing_else() {
-    let harness = start(Offers::default(), ProgressDetail::Off, ticking());
+    let harness = start(Offers::default(), ProgressDetail::Off, additive(ticking()));
     harness.sink.emit(started());
     harness.sink.emit(answered_with_tool(1));
     settle().await;

@@ -80,10 +80,36 @@ pub(crate) enum Steering {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub enum SlackLivenessFallback {
+pub enum IndicatorSurface {
     #[default]
-    None,
-    Reaction,
+    Auto,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkingReaction {
+    #[default]
+    Off,
+    On,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum SeenReaction {
+    #[default]
+    Off,
+    On,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReactionConfig {
+    #[serde(default)]
+    pub working: Option<WorkingReaction>,
+    #[serde(default)]
+    pub seen: Option<SeenReaction>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -131,34 +157,33 @@ const fn default_keep_alive_max() -> u32 {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LivenessConfig {
-    #[serde(default)]
-    pub mode: LivenessMode,
-    #[serde(default)]
-    pub classic_fallback: SlackLivenessFallback,
-    #[serde(default)]
-    pub progress: ProgressSurface,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub status_text: bool,
-    #[serde(default)]
-    pub cancel_button: bool,
-    #[serde(default)]
-    pub keep_alive: KeepAliveConfig,
-    #[serde(default)]
-    pub templates: TemplateOverrides,
-    #[serde(default)]
+    pub mode: Option<LivenessMode>,
+    pub status: Option<IndicatorSurface>,
+    pub typing: Option<IndicatorSurface>,
+    pub reaction: Option<ReactionConfig>,
+    pub progress: Option<ProgressSurface>,
+    pub stream: Option<bool>,
+    pub status_text: Option<bool>,
+    pub cancel_button: Option<bool>,
+    pub keep_alive: Option<KeepAliveConfig>,
+    pub templates: Option<TemplateOverrides>,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LivenessOverride {
+    pub mode: Option<LivenessMode>,
+    pub status: Option<IndicatorSurface>,
+    pub typing: Option<IndicatorSurface>,
+    pub reaction: Option<ReactionConfig>,
     pub progress: Option<ProgressSurface>,
     pub stream: Option<bool>,
     pub status_text: Option<bool>,
     pub cancel_button: Option<bool>,
     pub keep_alive: Option<KeepAliveConfig>,
+    pub templates: Option<TemplateOverrides>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -173,26 +198,81 @@ pub struct TemplateOverrides {
     pub failed: Option<String>,
 }
 
+impl TemplateOverrides {
+    fn overlay(&mut self, other: &Self) {
+        if other.working.is_some() {
+            self.working.clone_from(&other.working);
+        }
+        if other.tool.is_some() {
+            self.tool.clone_from(&other.tool);
+        }
+        if other.keep_alive.is_some() {
+            self.keep_alive.clone_from(&other.keep_alive);
+        }
+        if other.note.is_some() {
+            self.note.clone_from(&other.note);
+        }
+        if other.note_eta.is_some() {
+            self.note_eta.clone_from(&other.note_eta);
+        }
+        if other.stopped.is_some() {
+            self.stopped.clone_from(&other.stopped);
+        }
+        if other.failed.is_some() {
+            self.failed.clone_from(&other.failed);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LivenessSettings {
     pub mode: LivenessMode,
-    pub classic_fallback: SlackLivenessFallback,
+    pub status: IndicatorSurface,
+    pub typing: IndicatorSurface,
+    pub working: WorkingReaction,
+    pub seen: SeenReaction,
     pub progress: ProgressSurface,
     pub stream: bool,
     pub status_text: bool,
     pub cancel_button: bool,
 }
 
+impl LivenessSettings {
+    fn overlay(&mut self, value: &LivenessOverride) {
+        self.mode = value.mode.unwrap_or(self.mode);
+        self.status = value.status.unwrap_or(self.status);
+        self.typing = value.typing.unwrap_or(self.typing);
+        if let Some(reaction) = value.reaction {
+            self.working = reaction.working.unwrap_or(self.working);
+            self.seen = reaction.seen.unwrap_or(self.seen);
+        }
+        self.progress = value.progress.unwrap_or(self.progress);
+        self.stream = value.stream.unwrap_or(self.stream);
+        self.status_text = value.status_text.unwrap_or(self.status_text);
+        self.cancel_button = value.cancel_button.unwrap_or(self.cancel_button);
+    }
+}
+
 impl LivenessConfig {
     #[must_use]
-    pub const fn settings(&self) -> LivenessSettings {
-        LivenessSettings {
+    pub fn settings(&self) -> LivenessSettings {
+        let mut settings = LivenessSettings::default();
+        settings.overlay(&self.override_fields());
+        settings
+    }
+
+    fn override_fields(&self) -> LivenessOverride {
+        LivenessOverride {
             mode: self.mode,
-            classic_fallback: self.classic_fallback,
+            status: self.status,
+            typing: self.typing,
+            reaction: self.reaction,
             progress: self.progress,
             stream: self.stream,
             status_text: self.status_text,
             cancel_button: self.cancel_button,
+            keep_alive: self.keep_alive.clone(),
+            templates: self.templates.clone(),
         }
     }
 }
@@ -202,31 +282,14 @@ pub(crate) struct ResolvedLiveness {
     pub settings: LivenessSettings,
     pub keep_alive: KeepAlive,
     pub templates: Templates,
-    pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
 }
 
-impl ResolvedLiveness {
-    pub(crate) fn for_kind(&self, kind: ConversationKind) -> (LivenessSettings, KeepAlive) {
-        let Some(override_for_kind) = self.conversations.get(&kind) else {
-            return (self.settings, self.keep_alive.clone());
-        };
-        let settings = LivenessSettings {
-            progress: override_for_kind.progress.unwrap_or(self.settings.progress),
-            stream: override_for_kind.stream.unwrap_or(self.settings.stream),
-            status_text: override_for_kind
-                .status_text
-                .unwrap_or(self.settings.status_text),
-            cancel_button: override_for_kind
-                .cancel_button
-                .unwrap_or(self.settings.cancel_button),
-            ..self.settings
-        };
-        let keep_alive = override_for_kind
-            .keep_alive
-            .as_ref()
-            .map_or_else(|| self.keep_alive.clone(), keep_alive_from);
-        (settings, keep_alive)
-    }
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn keep_alive_from(config: &KeepAliveConfig) -> KeepAlive {
@@ -249,7 +312,6 @@ impl Default for ResolvedLiveness {
             settings: LivenessSettings::default(),
             keep_alive: KeepAlive::default(),
             templates,
-            conversations: BTreeMap::new(),
         }
     }
 }
@@ -305,7 +367,7 @@ pub enum TransportConfig {
         bot_token_env: String,
         #[serde(default)]
         experience: SlackExperience,
-        #[serde(default)]
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
         liveness: LivenessConfig,
         #[serde(default)]
         endpoint: Option<String>,
@@ -315,7 +377,7 @@ pub enum TransportConfig {
         bot_token_env: String,
         #[serde(default)]
         message_content: bool,
-        #[serde(default)]
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
         liveness: LivenessConfig,
         #[serde(default)]
         endpoint: Option<String>,
@@ -340,7 +402,7 @@ pub enum TransportConfig {
             deserialize_with = "deserialize_collection_millis"
         )]
         debounce_max_wait_ms: u32,
-        #[serde(default)]
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
         liveness: LivenessConfig,
         #[serde(default)]
         graph_endpoint: Option<String>,
@@ -348,7 +410,7 @@ pub enum TransportConfig {
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
-        #[serde(default)]
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
         liveness: LivenessConfig,
         #[serde(default)]
         endpoint: Option<String>,
@@ -356,7 +418,7 @@ pub enum TransportConfig {
     Local {
         name: String,
         socket_path: PathBuf,
-        #[serde(default)]
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
         liveness: LivenessConfig,
     },
 }
@@ -709,6 +771,8 @@ pub struct RouteConfig {
     pub(crate) progress_notes: bool,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub indicators: LivenessOverride,
     #[serde(default)]
     pub wakes: bool,
 }
@@ -751,6 +815,7 @@ pub struct ResolvedRoute {
     pub(crate) steering: Steering,
     pub(crate) progress_notes: bool,
     pub memory: MemoryPolicy,
+    pub(crate) indicators: BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
 }
 
@@ -806,6 +871,8 @@ pub struct ResolvedJournal {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionsConfig {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub indicators: LivenessOverride,
     #[serde(default = "default_asset_retention_bytes")]
     pub asset_retention_bytes: usize,
     #[serde(default = "default_max_concurrent")]
@@ -825,6 +892,7 @@ pub struct SessionsConfig {
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
+            indicators: LivenessOverride::default(),
             asset_retention_bytes: DEFAULT_ASSET_RETENTION_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
@@ -897,7 +965,6 @@ pub struct ResolvedConfig {
     pub models: Vec<ModelConfig>,
     pub(crate) model_files: BTreeMap<String, PathBuf>,
     pub routes: Vec<ResolvedRoute>,
-    pub(crate) liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub journal: Option<ResolvedJournal>,
@@ -1125,7 +1192,6 @@ pub(crate) fn resolve(
     let mut transport_names = BTreeSet::new();
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
-    let mut liveness_settings = BTreeMap::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
@@ -1138,10 +1204,23 @@ pub(crate) fn resolve(
             continue;
         }
         transport_kinds.insert(name.clone(), transport.chat_kind());
-        liveness_settings.insert(
-            name.clone(),
-            Arc::new(resolve_liveness(&transport, &mut problems)),
-        );
+        let indicators = match &transport {
+            TransportConfig::SlackSocketMode { liveness, .. }
+            | TransportConfig::DiscordGateway { liveness, .. }
+            | TransportConfig::TelegramLongPoll { liveness, .. }
+            | TransportConfig::WhatsappCloudApi { liveness, .. }
+            | TransportConfig::Local { liveness, .. } => liveness,
+        };
+        for kind in indicators
+            .conversations
+            .keys()
+            .filter(|kind| !transport.chat_kind().produces(**kind))
+        {
+            problems.push(ConfigProblem::ImpossibleLivenessConversation {
+                transport: name.clone(),
+                kind: kind.as_str(),
+            });
+        }
         transports.push(match transport {
             TransportConfig::SlackSocketMode {
                 name,
@@ -1374,29 +1453,43 @@ pub(crate) fn resolve(
         if route.progress_notes && route.progress_detail == ProgressDetail::Off {
             problems.push(ConfigProblem::ProgressNotesWithoutDetail { route: index });
         }
-        if route.progress_detail == ProgressDetail::Off
-            && let (Some(liveness), Some(chat_kind)) = (
-                liveness_settings.get(&route.transport),
-                transport_kinds.get(&route.transport),
-            )
-            && [
+        let mut indicators = BTreeMap::new();
+        if let Some(transport) = transports.iter().find(|t| t.name() == route.transport) {
+            for kind in [
                 ConversationKind::DirectMessage,
                 ConversationKind::GroupDirectMessage,
                 ConversationKind::Channel,
                 ConversationKind::Thread,
             ]
             .into_iter()
-            .filter(|kind| chat_kind.produces(*kind) && conversation.kind.contains(*kind))
-            .any(|kind| {
-                let (settings, _) = liveness.for_kind(kind);
-                settings.cancel_button && !settings.stream
-            })
-        {
-            problems.push(ConfigProblem::UnsupportedLivenessSurface {
-                transport: route.transport.clone(),
-                surface: "cancelButton",
-                reason: "progressDetail: off requires streaming for a message-backed Stop control",
-            });
+            .filter(|kind| {
+                transport.chat_kind().produces(*kind) && conversation.kind.contains(*kind)
+            }) {
+                let resolved = resolve_liveness(
+                    &config.sessions.indicators,
+                    transport,
+                    &route.indicators,
+                    kind,
+                    &mut problems,
+                    index,
+                );
+                if route.progress_detail == ProgressDetail::Off
+                    && resolved.settings.cancel_button
+                    && !resolved.settings.stream
+                {
+                    problems.push(ConfigProblem::UnsupportedRouteIndicator {
+                        route: index, surface: "cancelButton",
+                        reason: "progressDetail: off requires streaming for a message-backed Stop control",
+                    });
+                }
+                tracing::info!(event = "gateway_indicators_effective", route = index, transport = %route.transport.chars().take(64).collect::<String>(),
+                    kind = kind.as_str(), mode = ?resolved.settings.mode, status = ?resolved.settings.status,
+                    typing = ?resolved.settings.typing, working = ?resolved.settings.working,
+                    seen = ?resolved.settings.seen, progress = ?resolved.settings.progress,
+                    stream = resolved.settings.stream, status_text = resolved.settings.status_text,
+                    cancel_button = resolved.settings.cancel_button);
+                indicators.insert(kind, Arc::new(resolved));
+            }
         }
         let direct_message_only = conversation.kind
             == ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]);
@@ -1570,6 +1663,7 @@ pub(crate) fn resolve(
             steering: route.steering,
             progress_notes: route.progress_notes,
             memory,
+            indicators,
             wakes: route.wakes,
         });
     }
@@ -1703,7 +1797,6 @@ pub(crate) fn resolve(
                 transports,
                 models: config.models,
                 routes,
-                liveness: liveness_settings,
                 stop_words,
                 sessions: config.sessions,
                 journal,
@@ -1721,204 +1814,120 @@ pub(crate) fn resolve(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "reshaped by the unit that next rewrites this"
-)]
 fn resolve_liveness(
+    sessions: &LivenessOverride,
     transport: &TransportConfig,
+    route: &LivenessOverride,
+    kind: ConversationKind,
     problems: &mut Vec<ConfigProblem>,
+    index: usize,
 ) -> ResolvedLiveness {
-    let name = transport.name().to_owned();
-    let (liveness, experience) = match transport {
-        TransportConfig::SlackSocketMode {
-            liveness,
-            experience,
-            ..
-        } => (liveness, Some(*experience)),
-        TransportConfig::DiscordGateway { liveness, .. }
+    let config = match transport {
+        TransportConfig::SlackSocketMode { liveness, .. }
+        | TransportConfig::DiscordGateway { liveness, .. }
         | TransportConfig::TelegramLongPoll { liveness, .. }
         | TransportConfig::WhatsappCloudApi { liveness, .. }
-        | TransportConfig::Local { liveness, .. } => (liveness, None),
+        | TransportConfig::Local { liveness, .. } => liveness,
     };
-
-    if liveness.mode == LivenessMode::Off {
-        for surface in [
-            (liveness.progress == ProgressSurface::Message).then_some("progress"),
-            liveness.stream.then_some("stream"),
-            liveness.status_text.then_some("statusText"),
-            liveness.cancel_button.then_some("cancelButton"),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            problems.push(ConfigProblem::LivenessSurfaceWithoutMode {
-                transport: name.clone(),
-                surface,
-            });
+    let mut settings = LivenessSettings::default();
+    let mut keep_alive = KeepAliveConfig::default();
+    let mut templates = TemplateOverrides::default();
+    let transport_fields = config.override_fields();
+    let layers = [
+        Some(sessions),
+        Some(&transport_fields),
+        config.conversations.get(&kind),
+        Some(route),
+    ];
+    for layer in layers.into_iter().flatten() {
+        settings.overlay(layer);
+        if let Some(value) = &layer.keep_alive {
+            keep_alive = value.clone();
+        }
+        if let Some(value) = &layer.templates {
+            templates.overlay(value);
         }
     }
-
-    let whatsapp = matches!(transport, TransportConfig::WhatsappCloudApi { .. });
-    let slack = matches!(transport, TransportConfig::SlackSocketMode { .. });
-    let slack_agent = experience == Some(SlackExperience::Agent);
-    fn unsupported_surfaces(
-        problems: &mut Vec<ConfigProblem>,
-        transport: &str,
-        whatsapp: bool,
-        slack: bool,
-        slack_agent: bool,
-        settings: LivenessSettings,
-    ) {
-        if settings.status_text && !slack_agent {
-            problems.push(ConfigProblem::UnsupportedLivenessSurface {
-                transport: transport.to_owned(),
-                surface: "statusText",
-                reason: "only Slack's Agent experience has a thread status line",
-            });
-        }
-        if whatsapp {
-            for surface in [
-                settings.stream.then_some("stream"),
-                settings.cancel_button.then_some("cancelButton"),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                problems.push(ConfigProblem::UnsupportedLivenessSurface {
-                    transport: transport.to_owned(),
-                    surface,
-                    reason:
-                        "WhatsApp messages cannot be edited and carry no interactive components",
-                });
-            }
-        }
-        if slack && settings.stream {
-            problems.push(ConfigProblem::UnsupportedLivenessSurface {
-                transport: transport.to_owned(),
-                surface: "stream",
-                reason: "Slack no longer streams the answer; progress notes carry it as Agent status text or the progress message",
-            });
-        }
-        if slack_agent && settings.cancel_button {
-            problems.push(ConfigProblem::UnsupportedLivenessSurface {
-                transport: transport.to_owned(),
-                surface: "cancelButton",
-                reason: "Slack's Agent experience renders its own Stop control",
-            });
-        }
-    }
-    unsupported_surfaces(
-        problems,
-        &name,
-        whatsapp,
-        slack,
-        slack_agent,
-        liveness.settings(),
-    );
-    let chat_kind = transport.chat_kind();
-    for (kind, overlay) in &liveness.conversations {
-        if !chat_kind.produces(*kind) {
-            problems.push(ConfigProblem::ImpossibleLivenessConversation {
-                transport: name.clone(),
-                kind: kind.as_str(),
-            });
-        }
-        unsupported_surfaces(
-            problems,
-            &name,
-            whatsapp,
-            slack,
-            slack_agent,
-            LivenessSettings {
-                stream: overlay.stream.unwrap_or_default(),
-                cancel_button: overlay.cancel_button.unwrap_or_default(),
-                status_text: overlay.status_text.unwrap_or_default(),
-                ..LivenessSettings::default()
-            },
-        );
-        if let Some(keep_alive) = &overlay.keep_alive
-            && (keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0))
-        {
-            problems.push(ConfigProblem::InvalidKeepAlive {
-                transport: name.clone(),
-            });
-        }
-    }
-
-    match experience {
-        Some(experience) => {
-            let coherent = match (experience, liveness.mode) {
-                (_, LivenessMode::Off) => liveness.classic_fallback == SlackLivenessFallback::None,
-                (SlackExperience::Classic, LivenessMode::Native) => {
-                    liveness.classic_fallback == SlackLivenessFallback::Reaction
-                }
-                (SlackExperience::Agent, LivenessMode::Native) => true,
-            };
-            if !coherent {
-                problems.push(ConfigProblem::InvalidSlackLiveness {
-                    transport: name.clone(),
-                });
-            }
-        }
-        None if liveness.classic_fallback != SlackLivenessFallback::None => {
-            problems.push(ConfigProblem::UnsupportedLivenessFallback {
-                transport: name.clone(),
-            });
-        }
-        None => {}
-    }
-
-    if liveness.keep_alive.every_seconds == 0 || liveness.keep_alive.at_seconds.contains(&0) {
+    if keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0) {
         problems.push(ConfigProblem::InvalidKeepAlive {
-            transport: name.clone(),
+            transport: transport.name().to_owned(),
         });
     }
-
     let (templates, template_problems) =
-        Templates::resolve(&liveness.templates, STOPPED_REPLY, FAILURE_REPLY);
+        Templates::resolve(&templates, STOPPED_REPLY, FAILURE_REPLY);
     for problem in template_problems {
         problems.push(ConfigProblem::InvalidLivenessTemplate {
-            transport: name.clone(),
+            transport: transport.name().to_owned(),
             field: problem.field.key(),
             placeholder: problem.placeholder,
         });
     }
-
-    let resolved = ResolvedLiveness {
-        settings: liveness.settings(),
-        keep_alive: keep_alive_from(&liveness.keep_alive),
-        templates,
-        conversations: liveness.conversations.clone(),
+    let mut unsupported = |surface, reason| {
+        problems.push(ConfigProblem::UnsupportedRouteIndicator {
+            route: index,
+            surface,
+            reason,
+        })
     };
-    let mut settings = [
-        ConversationKind::DirectMessage,
-        ConversationKind::GroupDirectMessage,
-        ConversationKind::Channel,
-        ConversationKind::Thread,
-    ]
-    .into_iter()
-    .filter(|kind| chat_kind.produces(*kind))
-    .map(|kind| resolved.for_kind(kind).0);
-    if settings.clone().any(|settings| {
-        settings.cancel_button && !settings.stream && settings.progress == ProgressSurface::Off
-    }) {
-        problems.push(ConfigProblem::UnsupportedLivenessSurface {
-            transport: name.clone(),
-            surface: "cancelButton",
-            reason: "a message-backed Stop control requires progress or streaming",
-        });
-    }
-    if settings
-        .any(|settings| settings.status_text && settings.progress == ProgressSurface::Message)
+    if matches!(transport, TransportConfig::WhatsappCloudApi { .. })
+        && settings.working != WorkingReaction::Off
     {
-        problems.push(ConfigProblem::UnsupportedLivenessSurface {
-            transport: name,
-            surface: "statusText",
-            reason: "statusText replaces the progress message; use progress: off or auto",
-        });
+        unsupported(
+            "reaction.working",
+            "WhatsApp cannot clear a working reaction",
+        );
     }
-    resolved
+    if settings.mode == LivenessMode::Native {
+        if settings.status_text
+            && !matches!(
+                transport,
+                TransportConfig::SlackSocketMode {
+                    experience: SlackExperience::Agent,
+                    ..
+                }
+            )
+        {
+            unsupported(
+                "statusText",
+                "only Slack's Agent experience has a thread status line",
+            );
+        }
+        if matches!(transport, TransportConfig::WhatsappCloudApi { .. }) {
+            if settings.stream {
+                unsupported("stream", "WhatsApp messages cannot be edited");
+            }
+            if settings.cancel_button {
+                unsupported("cancelButton", "WhatsApp has no interactive components");
+            }
+        }
+        if matches!(transport, TransportConfig::SlackSocketMode { .. }) && settings.stream {
+            unsupported("stream", "Slack does not stream answers");
+        }
+        if matches!(
+            transport,
+            TransportConfig::SlackSocketMode {
+                experience: SlackExperience::Agent,
+                ..
+            }
+        ) && settings.cancel_button
+        {
+            unsupported("cancelButton", "Slack Agent renders its own Stop control");
+        }
+        if settings.cancel_button && !settings.stream && settings.progress == ProgressSurface::Off {
+            unsupported(
+                "cancelButton",
+                "a message-backed Stop control requires progress or streaming",
+            );
+        }
+        if settings.status_text && settings.progress == ProgressSurface::Message {
+            unsupported("statusText", "statusText replaces the progress message");
+        }
+    }
+    ResolvedLiveness {
+        settings,
+        keep_alive: keep_alive_from(&keep_alive),
+        templates,
+    }
 }
 
 fn check_env_name(name: &str, problems: &mut Vec<ConfigProblem>) {
@@ -2119,33 +2128,18 @@ pub enum ConfigProblem {
     DuplicateModel { name: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
-    #[error(
-        "Slack transport {transport:?} has a liveness fallback that cannot take effect; off requires fallback none, and a classic app with native liveness requires fallback reaction"
-    )]
-    InvalidSlackLiveness { transport: String },
-    #[error(
-        "transport {transport:?} sets liveness.{surface} while liveness.mode is off, where it can never take effect"
-    )]
-    LivenessSurfaceWithoutMode {
-        transport: String,
-        surface: &'static str,
-    },
-    #[error("transport {transport:?} cannot use liveness.{surface}: {reason}")]
-    UnsupportedLivenessSurface {
-        transport: String,
+    #[error("routes[{route}] cannot use indicators.{surface}: {reason}")]
+    UnsupportedRouteIndicator {
+        route: usize,
         surface: &'static str,
         reason: &'static str,
     },
     #[error(
-        "transport {transport:?} sets liveness.classicFallback, which only a slackSocketMode transport has"
-    )]
-    UnsupportedLivenessFallback { transport: String },
-    #[error(
-        "transport {transport:?} has a liveness.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
+        "transport {transport:?} has an indicators.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
     )]
     InvalidKeepAlive { transport: String },
     #[error(
-        "transport {transport:?} liveness template {field} uses {{{placeholder}}}, which it cannot render"
+        "transport {transport:?} indicators template {field} uses {{{placeholder}}}, which it cannot render"
     )]
     InvalidLivenessTemplate {
         transport: String,
@@ -2234,7 +2228,7 @@ pub enum ConfigProblem {
     )]
     SharedMemoryOnDmRoute { route: usize },
     #[error(
-        "transport {transport:?} overrides liveness for conversation kind {kind}, which it never produces"
+        "transport {transport:?} overrides indicators for conversation kind {kind}, which it never produces"
     )]
     ImpossibleLivenessConversation {
         transport: String,
@@ -2334,7 +2328,7 @@ mod tests {
 
     use super::{
         ConfigError, DEFAULT_SCRIPT_TIMEOUT_MS, Duration, LivenessMode, ModelConfig,
-        ProgressDetail, ProgressSurface, SlackLivenessFallback, resolve,
+        ProgressDetail, ProgressSurface, SeenReaction, resolve,
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
 
@@ -2375,6 +2369,174 @@ mod tests {
     }
 
     #[test]
+    fn indicator_leaves_resolve_sessions_transport_conversation_then_route() {
+        use dekopon_broker_protocol::ConversationKind;
+        let config = resolved(
+            "sessions:
+  indicators: { mode: off, status: off, reaction: { working: off, seen: on } }
+transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+    indicators:
+      mode: native
+      reaction: { seen: off }
+      conversations: { directMessage: { status: auto, reaction: { seen: on } } }
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+    indicators: { reaction: { seen: off, working: on } }
+",
+        )
+        .unwrap();
+        let settings = config.routes[0].indicators[&ConversationKind::DirectMessage].settings;
+        assert_eq!(settings.mode, LivenessMode::Native);
+        assert_eq!(settings.status, super::IndicatorSurface::Auto);
+        assert_eq!(settings.seen, SeenReaction::Off);
+        assert_eq!(settings.working, super::WorkingReaction::On);
+    }
+
+    #[test]
+    fn null_inherits_and_later_on_overrides_earlier_off_but_final_off_suppresses() {
+        use dekopon_broker_protocol::ConversationKind;
+        let document = "sessions:
+  indicators: { mode: off, reaction: { seen: on } }
+transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+    indicators: { mode: null, reaction: { seen: null } }
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+    indicators: { mode: native, reaction: { seen: null } }
+";
+        let config = resolved(document).unwrap();
+        let settings = config.routes[0].indicators[&ConversationKind::DirectMessage].settings;
+        assert_eq!(settings.mode, LivenessMode::Native);
+        assert_eq!(settings.seen, SeenReaction::On);
+        let inherited = resolved(
+            &document
+                .replace(
+                    "indicators: { mode: null, reaction: { seen: null } }",
+                    "indicators: null",
+                )
+                .replace(
+                    "mode: native, reaction: { seen: null }",
+                    "mode: native, reaction: null",
+                ),
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.routes[0].indicators[&ConversationKind::DirectMessage]
+                .settings
+                .seen,
+            SeenReaction::On
+        );
+        let off =
+            resolved(&document.replace("mode: native, reaction", "mode: off, reaction")).unwrap();
+        assert_eq!(
+            off.routes[0].indicators[&ConversationKind::DirectMessage]
+                .settings
+                .mode,
+            LivenessMode::Off
+        );
+        assert_eq!(
+            off.routes[0].indicators[&ConversationKind::DirectMessage]
+                .settings
+                .seen,
+            SeenReaction::On
+        );
+    }
+
+    #[test]
+    fn route_keep_alive_replaces_cadence_without_resetting_progress() {
+        use dekopon_broker_protocol::ConversationKind;
+        let config = resolved("transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+    indicators: { mode: native, progress: message, keepAlive: { atSeconds: [15], everySeconds: 60, max: 10 } }
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+    indicators: { keepAlive: { atSeconds: [30], everySeconds: 120, max: 5 } }
+").unwrap();
+        let resolved = &config.routes[0].indicators[&ConversationKind::DirectMessage];
+        assert_eq!(resolved.settings.progress, ProgressSurface::Message);
+        assert_eq!(resolved.keep_alive.at, vec![Duration::from_secs(30)]);
+        assert_eq!(resolved.keep_alive.every, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn old_keys_and_unknown_indicator_values_refuse_at_the_parse_boundary() {
+        let valid = format!("{PREAMBLE}{TAIL}");
+        assert!(super::decode(valid.as_bytes()).is_ok());
+        for invalid in [
+            valid.replace(
+                "socketPath: dev.sock",
+                "socketPath: dev.sock\n    liveness: {mode: native}",
+            ),
+            valid.replace(
+                "socketPath: dev.sock",
+                "socketPath: dev.sock\n    indicators: {classicFallback: reaction}",
+            ),
+            valid.replace(
+                "socketPath: dev.sock",
+                "socketPath: dev.sock\n    indicators: {reaction: {seen: maybe}}",
+            ),
+        ] {
+            assert!(matches!(
+                super::decode(invalid.as_bytes()),
+                Err(ConfigError::Decode { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn effective_indicator_event_has_only_settings_and_no_message_or_identity() {
+        let (capture, _guard) = crate::tests::capture_spans();
+        let config = resolved(
+            "transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+",
+        )
+        .unwrap();
+        assert_eq!(config.routes.len(), 1);
+        let events = capture.events_where(
+            "dekopon_gatewayd",
+            &[("event", "gateway_indicators_effective")],
+        );
+        assert_eq!(events.len(), 1);
+        let record = &events[0];
+        assert_eq!(record.field("route"), Some("0"));
+        assert_eq!(record.field("seen"), Some("Off"));
+        assert_eq!(record.field("working"), Some("Off"));
+        for forbidden in [
+            "agent",
+            "subject",
+            "principal",
+            "conversation",
+            "conversation_id",
+            "message",
+            "payload",
+            "token",
+            "coordinate",
+        ] {
+            assert!(record.field(forbidden).is_none());
+        }
+    }
+
+    #[test]
     fn status_text_defaults_off_and_resolves_slack_agent_conversation_overrides() {
         use dekopon_broker_protocol::ConversationKind;
         for (block, direct, channel) in [
@@ -2395,18 +2557,16 @@ mod tests {
                 true,
             ),
         ] {
-            let config = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {block}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap();
+            let config = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    indicators: {block}\nroutes:\n  - transport: slack\n    conversation: {{ kind: any }}\n    agent: reviewer\n")).unwrap();
             assert_eq!(
-                config.liveness["slack"]
-                    .for_kind(ConversationKind::DirectMessage)
-                    .0
+                config.routes[0].indicators[&ConversationKind::DirectMessage]
+                    .settings
                     .status_text,
                 direct
             );
             assert_eq!(
-                config.liveness["slack"]
-                    .for_kind(ConversationKind::Channel)
-                    .0
+                config.routes[0].indicators[&ConversationKind::Channel]
+                    .settings
                     .status_text,
                 channel
             );
@@ -2414,42 +2574,48 @@ mod tests {
     }
 
     #[test]
-    fn status_text_collects_disabled_mode_unsupported_transport_and_surface_conflicts() {
-        let error = resolved("transports:
-  - name: disabled
+    fn fully_resolved_invalid_surfaces_aggregate_across_routes() {
+        let error = resolved(
+            "transports:
+  - name: dev
+    kind: local
+    socketPath: dev.sock
+  - name: slack
     kind: slackSocketMode
     appTokenEnv: A
     botTokenEnv: B
     experience: agent
-    liveness: { statusText: true }
-  - name: classic
-    kind: slackSocketMode
-    appTokenEnv: C
-    botTokenEnv: D
-    liveness: { mode: native, classicFallback: reaction, statusText: true }
-  - name: local
-    kind: local
-    socketPath: dev.sock
-    liveness: { mode: native, conversations: { directMessage: { statusText: true } } }
-  - name: conflicting
-    kind: slackSocketMode
-    appTokenEnv: E
-    botTokenEnv: F
-    experience: agent
-    liveness: { mode: native, statusText: true, progress: off, conversations: { channel: { progress: message } } }
 routes:
-  - transport: disabled
+  - transport: dev
     conversation: { kind: [directMessage] }
     agent: reviewer
-").unwrap_err();
+    indicators: { mode: native, statusText: true }
+  - transport: slack
+    conversation: { kind: [directMessage] }
+    agent: reviewer
+    indicators: { mode: native, statusText: true, progress: message }
+",
+        )
+        .unwrap_err();
         let ConfigError::Invalid { problems, .. } = error else {
-            panic!("expected semantic refusals")
+            panic!("semantic errors");
         };
-        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::LivenessSurfaceWithoutMode { transport, surface: "statusText" } if transport == "disabled")));
-        for name in ["classic", "local"] {
-            assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "only Slack's Agent experience has a thread status line" } if transport == name)));
-        }
-        assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::UnsupportedLivenessSurface { transport, surface: "statusText", reason: "statusText replaces the progress message; use progress: off or auto" } if transport == "conflicting")));
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            super::ConfigProblem::UnsupportedRouteIndicator {
+                route: 0,
+                surface: "statusText",
+                ..
+            }
+        )));
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            super::ConfigProblem::UnsupportedRouteIndicator {
+                route: 1,
+                surface: "statusText",
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2458,13 +2624,13 @@ routes:
             "progress: message".to_owned(),
             "conversations: { channel: { progress: message } }".to_owned(),
         ] {
-            let error = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    liveness: {{ mode: native, statusText: true, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n")).unwrap_err();
+            let error = resolved(&format!("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\n    indicators: {{ mode: native, statusText: true, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: any }}\n    agent: reviewer\n")).unwrap_err();
             let ConfigError::Invalid { problems, .. } = error else {
                 panic!("expected a semantic refusal")
             };
             assert!(problems.iter().any(|problem| matches!(
                 problem,
-                super::ConfigProblem::UnsupportedLivenessSurface {
+                super::ConfigProblem::UnsupportedRouteIndicator {
                     surface: "statusText",
                     ..
                 }
@@ -2473,13 +2639,13 @@ routes:
     }
 
     #[test]
-    fn slack_cannot_use_liveness_stream_however_it_is_set() {
+    fn slack_cannot_use_indicators_stream_however_it_is_set() {
         for block in [
             "stream: true".to_owned(),
             "conversations: { channel: { stream: true } }".to_owned(),
         ] {
             let error = resolved(&format!(
-                "transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    liveness: {{ mode: native, classicFallback: reaction, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n"
+                "transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    indicators: {{ mode: native, {block} }}\nroutes:\n  - transport: slack\n    conversation: {{ kind: any }}\n    agent: reviewer\n"
             ))
             .unwrap_err();
             let ConfigError::Invalid { problems, .. } = error else {
@@ -2487,100 +2653,52 @@ routes:
             };
             assert!(problems.iter().any(|problem| matches!(
                 problem,
-                super::ConfigProblem::UnsupportedLivenessSurface {
-                    transport,
+                super::ConfigProblem::UnsupportedRouteIndicator {
+                    route: 0,
                     surface: "stream",
                     ..
-                } if transport == "slack"
+                }
             )));
         }
     }
 
     #[test]
-    fn every_liveness_conflict_in_one_file_is_reported_together() {
-        let error = resolved(
-            "transports:\n\
-             \x20 - name: slack\n\
-             \x20   kind: slackSocketMode\n\
-             \x20   appTokenEnv: A\n\
-             \x20   botTokenEnv: B\n\
-             \x20   experience: agent\n\
-             \x20   liveness: { mode: native, cancelButton: true }\n\
-             \x20 - name: wa\n\
-             \x20   kind: whatsappCloudApi\n\
-             \x20   appSecretEnv: C\n\
-             \x20   verifyTokenEnv: D\n\
-             \x20   accessTokenEnv: E\n\
-             \x20   bind: 0.0.0.0:9080\n\
-             \x20   callbackPath: /hook\n\
-             \x20   wabaId: \"1\"\n\
-             \x20   phoneNumberId: \"2\"\n\
-             \x20   graphApiVersion: v23.0\n\
-             \x20   liveness: { mode: native, stream: true, cancelButton: true }\n\
-             \x20 - name: tg\n\
-             \x20   kind: telegramLongPoll\n\
-             \x20   botTokenEnv: F\n\
-             \x20   liveness:\n\
-             \x20     mode: \"off\"\n\
-             \x20     progress: message\n\
-             \x20     classicFallback: reaction\n\
-             \x20     keepAlive: { everySeconds: 0 }\n\
-             \x20     templates: { working: \"Busy with {word}\" }\n\
-             stopWords: []\n\
-             routes:\n\
-             \x20 - transport: slack\n\
-             \x20   conversation: { kind: [directMessage] }\n\
-             \x20   agent: reviewer\n\
-             \x20   limits: { maxDurationMs: 0 }\n",
-        )
-        .expect_err("a file this broken must not resolve");
-
-        let rendered = error.to_string();
-        for expected in [
-            "transport \"slack\" cannot use liveness.cancelButton",
-            "transport \"wa\" cannot use liveness.stream",
-            "transport \"wa\" cannot use liveness.cancelButton",
-            "transport \"tg\" sets liveness.progress while liveness.mode is off",
-            "transport \"tg\" sets liveness.classicFallback",
-            "transport \"tg\" has a liveness.keepAlive bound of zero",
-            "liveness template working uses {word}",
-            "stopWords must not be empty",
-            "limits.maxDurationMs to 0",
-        ] {
+    fn whatsapp_working_refuses_both_on_and_auto_even_when_typing_exists() {
+        for working in ["on", "auto"] {
+            let error = resolved(&format!("transports:\n  - name: wa\n    kind: whatsappCloudApi\n    appSecretEnv: C\n    verifyTokenEnv: D\n    accessTokenEnv: E\n    bind: 0.0.0.0:9080\n    callbackPath: /hook\n    wabaId: '1'\n    phoneNumberId: '2'\n    graphApiVersion: v23.0\nroutes:\n  - transport: wa\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n    indicators: {{ mode: native, reaction: {{ working: {working} }} }}\n")).unwrap_err();
             assert!(
-                rendered.contains(expected),
-                "every conflict is reported together; {expected:?} is missing from:\n{rendered}"
+                matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedRouteIndicator { route: 0, surface: "reaction.working", .. })))
             );
         }
     }
 
     #[test]
-    fn auto_defaults_preserve_disabled_liveness_and_explicit_overrides() {
+    fn auto_defaults_preserve_disabled_indicators_and_explicit_overrides() {
         use dekopon_broker_protocol::ConversationKind;
         for (block, mode, progress) in [
             ("", LivenessMode::Off, ProgressSurface::Auto),
             (
-                "liveness: { mode: native }",
+                "indicators: { mode: native }",
                 LivenessMode::Native,
                 ProgressSurface::Auto,
             ),
             (
-                "liveness: { mode: native, progress: message }",
+                "indicators: { mode: native, progress: message }",
                 LivenessMode::Native,
                 ProgressSurface::Message,
             ),
             (
-                "liveness: { mode: native, progress: off }",
+                "indicators: { mode: native, progress: off }",
                 LivenessMode::Native,
                 ProgressSurface::Off,
             ),
             (
-                "liveness: { mode: native, progress: auto, conversations: { directMessage: { progress: message } } }",
+                "indicators: { mode: native, progress: auto, conversations: { directMessage: { progress: message } } }",
                 LivenessMode::Native,
                 ProgressSurface::Message,
             ),
             (
-                "liveness: { mode: native, progress: message, conversations: { directMessage: { progress: auto } } }",
+                "indicators: { mode: native, progress: message, conversations: { directMessage: { progress: auto } } }",
                 LivenessMode::Native,
                 ProgressSurface::Auto,
             ),
@@ -2588,7 +2706,7 @@ routes:
             let config = resolved(&format!(
                 "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    {block}\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n"
             )).expect("defaults and explicit settings resolve");
-            let (settings, _) = config.liveness["dev"].for_kind(ConversationKind::DirectMessage);
+            let settings = config.routes[0].indicators[&ConversationKind::DirectMessage].settings;
             assert_eq!(settings.mode, mode, "{block}");
             assert_eq!(settings.progress, progress, "{block}");
             assert!(!settings.stream);
@@ -2629,7 +2747,7 @@ routes:
             ),
         ] {
             let result = resolved(&format!(
-                "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    liveness: {{ mode: native, {block} }}\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n    progressDetail: {detail}\n"
+                "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    indicators: {{ mode: native, {block} }}\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n    progressDetail: {detail}\n"
             ));
             assert_eq!(result.is_ok(), valid, "{block} / {detail}: {result:?}");
             if let Err(error) = result {
@@ -2640,7 +2758,7 @@ routes:
             }
         }
         let error = resolved(
-            "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    liveness: { mode: native, progress: off, cancelButton: true }\nroutes:\n  - transport: dev\n    conversation: { kind: [directMessage] }\n    agent: reviewer\n    progressDetail: off\n"
+            "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    indicators: { mode: native, progress: off, cancelButton: true }\nroutes:\n  - transport: dev\n    conversation: { kind: [directMessage] }\n    agent: reviewer\n    progressDetail: off\n"
         ).expect_err("both incompatible settings must be reported");
         let rendered = error.to_string();
         assert!(
@@ -2654,13 +2772,13 @@ routes:
     }
 
     #[test]
-    fn a_liveness_block_resolves_to_the_documented_defaults() {
+    fn an_indicators_block_resolves_to_the_documented_defaults() {
         let config = resolved(
             "transports:\n\
              \x20 - name: dev\n\
              \x20   kind: local\n\
              \x20   socketPath: dev.sock\n\
-             \x20   liveness: { mode: native, progress: message }\n\
+             \x20   indicators: { mode: native, progress: message }\n\
              routes:\n\
              \x20 - transport: dev\n\
              \x20   conversation: { kind: [directMessage] }\n\
@@ -2676,13 +2794,11 @@ routes:
         let route = config.routes.first().expect("one route");
         assert_eq!(route.progress_detail, ProgressDetail::Plain);
         assert_eq!(route.limits.max_duration_ms, None);
-        let liveness = config.liveness.get("dev").expect("the transport resolved");
+        let liveness =
+            &config.routes[0].indicators[&dekopon_broker_protocol::ConversationKind::DirectMessage];
         assert_eq!(liveness.settings.mode, LivenessMode::Native);
         assert_eq!(liveness.settings.progress, ProgressSurface::Message);
-        assert_eq!(
-            liveness.settings.classic_fallback,
-            SlackLivenessFallback::None
-        );
+        assert_eq!(liveness.settings.seen, SeenReaction::Off);
         assert!(!liveness.settings.stream && !liveness.settings.cancel_button);
         assert_eq!(liveness.keep_alive, KeepAlive::default());
         assert_eq!(liveness.keep_alive.max, DEFAULT_KEEP_ALIVE_MAX);

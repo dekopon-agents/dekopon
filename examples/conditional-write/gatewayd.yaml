@@ -29,10 +29,10 @@ transports:
     # This example uses examples/slack/manifest-agent.yaml. Agent DMs are thread-scoped; if the
     # workspace plan/admin disables Agent status, the fixed tangerine reaction is used instead.
     experience: agent
-    liveness:
+    indicators:
       mode: native
-      classicFallback: reaction
-      # Prefer native status/reaction, then a fresh answer. Use message for editable progress.
+      reaction: { working: auto, seen: off }
+      # Prefer native status, fall back to a working reaction, then a fresh answer.
       progress: auto
 
 models:

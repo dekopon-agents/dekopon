@@ -53,9 +53,9 @@ use crate::{
     cache_key,
     config::{
         self, ConfigError, ConfigProblem, DEFAULT_FORGET_AFTER, DEFAULT_SCRIPT_TIMEOUT_MS,
-        LivenessConfig, LivenessMode, LivenessOverride, LivenessSettings, MemoryPolicy,
-        MemoryScope, MemoryWindow, ModelConfig, ProgressSurface, RecallSource, ResolvedBroker,
-        ResolvedLiveness, SlackExperience, SlackLivenessFallback,
+        LivenessConfig, LivenessMode, LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow,
+        ModelConfig, ProgressSurface, RecallSource, ResolvedBroker, ResolvedLiveness, SeenReaction,
+        SlackExperience, WorkingReaction,
     },
     conversation::{
         ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency, TakenIn,
@@ -406,7 +406,7 @@ async fn slack_liveness_and_experience_are_explicit_and_strict() {
         "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN",
         "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
         "experience": "agent",
-        "liveness": {"mode": "native", "classicFallback": "reaction"}
+        "indicators": {"mode": "native", "reaction": {"working": "auto"}}
     });
     document["routes"][0]["transport"] = json!("workspace-slack");
 
@@ -418,15 +418,14 @@ async fn slack_liveness_and_experience_are_explicit_and_strict() {
         Some(config::TransportConfig::SlackSocketMode {
             experience: SlackExperience::Agent,
             liveness: LivenessConfig {
-                mode: LivenessMode::Native,
-                classic_fallback: SlackLivenessFallback::Reaction,
+                mode: Some(LivenessMode::Native),
                 ..
             },
             ..
         })
     ));
 
-    document["transports"][0]["liveness"]["unexpected"] = json!(true);
+    document["transports"][0]["indicators"]["unexpected"] = json!(true);
     let error = load(directory.path(), &document)
         .await
         .expect_err("unknown cosmetic settings still fail strict decoding");
@@ -595,10 +594,7 @@ async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
     assert!(matches!(
         resolved.transports.first(),
         Some(config::TransportConfig::DiscordGateway {
-            liveness: LivenessConfig {
-                mode: LivenessMode::Off,
-                ..
-            },
+            liveness: LivenessConfig { mode: None, .. },
             ..
         })
     ));
@@ -773,16 +769,30 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
         ),
         (
-            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
-            "liveness": {"mode": "off", "classicFallback": "reaction"}}]}),
-            |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
+            json!({"/routes/0/indicators": {"mode": "native", "statusText": true}}),
+            |problem| {
+                matches!(
+                    problem,
+                    ConfigProblem::UnsupportedRouteIndicator {
+                        route: 0,
+                        surface: "statusText",
+                        ..
+                    }
+                )
+            },
         ),
         (
-            json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
-            "appTokenEnv": "DEKOPON_GATEWAYD_SLACK_APP_TOKEN", "botTokenEnv": "DEKOPON_GATEWAYD_SLACK_BOT_TOKEN",
-            "experience": "classic", "liveness": {"mode": "native", "classicFallback": "none"}}]}),
-            |problem| matches!(problem, ConfigProblem::InvalidSlackLiveness { .. }),
+            json!({"/routes/0/indicators": {"mode": "native", "progress": "off", "cancelButton": true}}),
+            |problem| {
+                matches!(
+                    problem,
+                    ConfigProblem::UnsupportedRouteIndicator {
+                        route: 0,
+                        surface: "cancelButton",
+                        ..
+                    }
+                )
+            },
         ),
         (
             json!({"/transports": [{"name": "dev", "kind": "slackSocketMode",
@@ -2577,6 +2587,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         steering: crate::config::Steering::Abort,
         progress_notes: false,
         memory: MemoryPolicy::OneShot,
+        indicators: fixture_liveness(),
         wakes: false,
         cache_key: cache_key::for_route(),
     }
@@ -2746,15 +2757,16 @@ fn liveness_settings(mode: LivenessMode) -> LivenessSettings {
     }
 }
 
-fn fixture_liveness() -> BTreeMap<String, Arc<ResolvedLiveness>> {
+fn fixture_liveness() -> BTreeMap<ConversationKind, Arc<ResolvedLiveness>> {
     let liveness = Arc::new(ResolvedLiveness {
         settings: LivenessSettings {
             mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::None,
+            working: WorkingReaction::Auto,
+            seen: SeenReaction::On,
             progress: ProgressSurface::Message,
             stream: true,
-            status_text: false,
             cancel_button: true,
+            ..LivenessSettings::default()
         },
         keep_alive: KeepAlive {
             at: vec![Duration::from_secs(3_600)],
@@ -2763,10 +2775,15 @@ fn fixture_liveness() -> BTreeMap<String, Arc<ResolvedLiveness>> {
         },
         ..ResolvedLiveness::default()
     });
-    ["dev", "scientist-slack"]
-        .into_iter()
-        .map(|transport| (transport.to_owned(), Arc::clone(&liveness)))
-        .collect()
+    [
+        ConversationKind::DirectMessage,
+        ConversationKind::GroupDirectMessage,
+        ConversationKind::Channel,
+        ConversationKind::Thread,
+    ]
+    .into_iter()
+    .map(|kind| (kind, Arc::clone(&liveness)))
+    .collect()
 }
 
 fn runner(
@@ -2839,7 +2856,6 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
-        liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
@@ -4669,7 +4685,7 @@ async fn an_oversized_failure_template_is_bounded_before_delivery() {
     .await;
     let models = ModelScript::new([]);
     let driver = Arc::new(RecordingDriver::default());
-    let mut runner = runner(broker, models, 4);
+    let runner = runner(broker, models, 4);
     let (templates, problems) = crate::progress::Templates::resolve(
         &crate::config::TemplateOverrides {
             failed: Some("x".repeat(MAX_OUTBOUND_TEXT_BYTES * 2)),
@@ -4679,20 +4695,18 @@ async fn an_oversized_failure_template_is_bounded_before_delivery() {
         FAILURE_REPLY,
     );
     assert!(problems.is_empty());
-    Arc::get_mut(&mut runner)
-        .expect("unshared runner")
-        .liveness
-        .insert(
-            "dev".to_owned(),
-            Arc::new(ResolvedLiveness {
-                templates,
-                ..ResolvedLiveness::default()
-            }),
-        );
+    let mut route = route(model_config());
+    route.indicators.insert(
+        ConversationKind::DirectMessage,
+        Arc::new(ResolvedLiveness {
+            templates,
+            ..ResolvedLiveness::default()
+        }),
+    );
 
     run_session(
         runner,
-        route(model_config()),
+        route,
         message("fail"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
@@ -7866,8 +7880,11 @@ async fn slack_agent_status_uses_thread_sessions_and_explicit_lifecycle_states()
         &http.base,
         SlackExperience::Agent,
         LivenessConfig {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::Reaction,
+            mode: Some(LivenessMode::Native),
+            reaction: Some(crate::config::ReactionConfig {
+                working: Some(WorkingReaction::Auto),
+                ..Default::default()
+            }),
             ..LivenessConfig::default()
         },
     );
@@ -7941,8 +7958,11 @@ async fn slack_auto_posts_only_the_answer_and_uses_same_session_native_refusal_f
             _ => json!({"ok": false, "error": "unknown_method"}),
         });
         let settings = LivenessConfig {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::Reaction,
+            mode: Some(LivenessMode::Native),
+            reaction: Some(crate::config::ReactionConfig {
+                working: Some(WorkingReaction::Auto),
+                ..Default::default()
+            }),
             ..LivenessConfig::default()
         };
         let mut transport = slack_with(&http.base, SlackExperience::Agent, settings.clone());
@@ -8079,8 +8099,11 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
         &http.base,
         SlackExperience::Agent,
         LivenessConfig {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::Reaction,
+            mode: Some(LivenessMode::Native),
+            reaction: Some(crate::config::ReactionConfig {
+                working: Some(WorkingReaction::Auto),
+                ..Default::default()
+            }),
             ..LivenessConfig::default()
         },
     );
@@ -8173,8 +8196,11 @@ async fn slack_does_not_remove_a_reaction_this_generation_did_not_add() {
         &http.base,
         SlackExperience::Classic,
         LivenessConfig {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::Reaction,
+            mode: Some(LivenessMode::Native),
+            reaction: Some(crate::config::ReactionConfig {
+                working: Some(WorkingReaction::Auto),
+                ..Default::default()
+            }),
             ..LivenessConfig::default()
         },
     );
@@ -8232,8 +8258,11 @@ async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
         &http.base,
         SlackExperience::Classic,
         LivenessConfig {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::Reaction,
+            mode: Some(LivenessMode::Native),
+            reaction: Some(crate::config::ReactionConfig {
+                working: Some(WorkingReaction::Auto),
+                ..Default::default()
+            }),
             ..LivenessConfig::default()
         },
     );
@@ -11378,7 +11407,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         .expect("image write and flush are accepted");
 }
 
-fn capture_spans() -> (
+pub(crate) fn capture_spans() -> (
     dekopon_test_support::CaptureLayer,
     tracing::subscriber::DefaultGuard,
 ) {
@@ -12003,20 +12032,20 @@ async fn an_opted_in_script_note_uses_the_local_progress_frame() {
         script_call("progress \"rendering the image\" --eta 40; probe upper --text hi"),
         answer("done"),
     ]);
-    let mut runner = runner(broker, models, 4);
+    let runner = runner(broker, models, 4);
     let settings = LivenessSettings {
         mode: LivenessMode::Native,
         progress: ProgressSurface::Message,
         ..LivenessSettings::default()
     };
-    Arc::get_mut(&mut runner).unwrap().liveness.insert(
-        "dev".to_owned(),
+    let mut route = route(model_config());
+    route.indicators.insert(
+        ConversationKind::DirectMessage,
         Arc::new(ResolvedLiveness {
             settings,
             ..ResolvedLiveness::default()
         }),
     );
-    let mut route = route(model_config());
     route.progress_notes = true;
     let socket_path = directory.path().join("notes.sock");
     let mut transport = crate::transport::local::LocalTransport::new(
@@ -12920,70 +12949,6 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
     session.await.expect("the cancelled session exits");
 
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
-}
-
-#[test]
-fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_alive() {
-    let base = ResolvedLiveness {
-        settings: LivenessSettings {
-            mode: LivenessMode::Native,
-            classic_fallback: SlackLivenessFallback::None,
-            progress: ProgressSurface::Message,
-            stream: false,
-            status_text: false,
-            cancel_button: true,
-        },
-        keep_alive: KeepAlive {
-            at: vec![Duration::from_secs(15), Duration::from_secs(45)],
-            every: Duration::from_secs(60),
-            max: 10,
-        },
-        conversations: [
-            (
-                ConversationKind::DirectMessage,
-                LivenessOverride {
-                    stream: Some(true),
-                    ..LivenessOverride::default()
-                },
-            ),
-            (
-                ConversationKind::Thread,
-                LivenessOverride {
-                    keep_alive: Some(crate::config::KeepAliveConfig {
-                        at_seconds: vec![30],
-                        every_seconds: 120,
-                        max: 5,
-                    }),
-                    ..LivenessOverride::default()
-                },
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        ..ResolvedLiveness::default()
-    };
-
-    let (settings, keep_alive) = base.for_kind(ConversationKind::Channel);
-    assert_eq!(settings, base.settings);
-    assert_eq!(keep_alive, base.keep_alive);
-
-    let (settings, keep_alive) = base.for_kind(ConversationKind::DirectMessage);
-    assert!(settings.stream, "one reader in a direct message: stream");
-    assert_eq!(settings.progress, ProgressSurface::Message);
-    assert!(settings.cancel_button);
-    assert_eq!(settings.mode, LivenessMode::Native);
-    assert_eq!(keep_alive, base.keep_alive, "no cadence was overridden");
-
-    let (settings, keep_alive) = base.for_kind(ConversationKind::Thread);
-    assert_eq!(settings, base.settings);
-    assert_eq!(
-        keep_alive,
-        KeepAlive {
-            at: vec![Duration::from_secs(30)],
-            every: Duration::from_secs(120),
-            max: 5,
-        }
-    );
 }
 
 #[tokio::test]
@@ -14301,7 +14266,6 @@ fn journaled_runner(
         )),
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
         asset_fetchers: HashMap::new(),
-        liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
@@ -15231,6 +15195,97 @@ async fn run_refuses_with_exactly_the_problem_check_reports() {
 }
 
 #[tokio::test]
+async fn invalid_indicators_have_the_same_check_and_boot_refusal() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("chat.yaml");
+    let mut chat: Value =
+        serde_json::from_slice(&fs::read(&path).expect("chat fragment")).expect("json fragment");
+    chat["routes"][0]["indicators"] = json!({"mode": "native", "statusText": true});
+    fs::write(
+        &path,
+        serde_json::to_vec(&chat).expect("serialize fragment"),
+    )
+    .expect("write fragment");
+    let report = crate::check(&directory, None, None).await;
+    let boot = crate::run(&directory, std::future::pending())
+        .await
+        .expect_err("invalid surface refuses boot");
+    let [problem] = report.problems.as_slice() else {
+        panic!("one check problem: {:?}", report.problems);
+    };
+    assert!(
+        matches!(problem, crate::GatewaydError::Config(ConfigError::Invalid { problems, .. }) if problems.iter().any(|p| matches!(p, ConfigProblem::UnsupportedRouteIndicator { route: 0, surface: "statusText", .. })))
+    );
+    assert!(matches!(
+        &boot,
+        crate::GatewaydError::Config(ConfigError::Invalid { .. })
+    ));
+    assert_eq!(
+        dekopon_core::error_chain(&boot),
+        dekopon_core::error_chain(problem)
+    );
+}
+
+#[tokio::test]
+async fn unknown_indicator_value_produces_only_a_file_parse_diagnostic() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("chat.yaml");
+    let mut chat: Value =
+        serde_json::from_slice(&fs::read(&path).expect("chat fragment")).expect("json fragment");
+    chat["routes"][0]["indicators"] = json!({"reaction": {"seen": "maybe"}});
+    fs::write(
+        &path,
+        serde_json::to_vec(&chat).expect("serialize fragment"),
+    )
+    .expect("write fragment");
+    let report = crate::check(&directory, None, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Decode { .. })
+    )));
+    assert!(!report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Invalid { .. })
+    )));
+    let boot = crate::run(&directory, std::future::pending())
+        .await
+        .expect_err("parse failure refuses boot");
+    assert!(matches!(
+        boot,
+        crate::GatewaydError::Config(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
+async fn deployed_liveness_fragment_refuses_in_check_and_boot() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("chat.yaml");
+    let mut chat: Value =
+        serde_json::from_slice(&fs::read(&path).expect("chat fragment")).expect("json fragment");
+    chat["transports"][0]["liveness"] = json!({"mode": "native", "classicFallback": "reaction"});
+    fs::write(
+        &path,
+        serde_json::to_vec(&chat).expect("serialize fragment"),
+    )
+    .expect("write fragment");
+    let report = crate::check(&directory, None, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Decode { .. })
+    )));
+    let boot = crate::run(&directory, std::future::pending())
+        .await
+        .expect_err("legacy key refuses boot");
+    assert!(matches!(
+        boot,
+        crate::GatewaydError::Config(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
 async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
     let root = temporary();
     let directory = check_fixture(
@@ -15754,8 +15809,9 @@ async fn an_empty_answer_with_a_progress_message_posts_a_fresh_reply() {
     let directory = temporary();
     let (broker, _) = stub_broker(directory.path(), vec![probe_listing()]).await;
     let mut runner = runner(broker, ModelScript::forbidden(), 4);
-    Arc::get_mut(&mut runner).unwrap().liveness.insert(
-        "dev".to_owned(),
+    let mut route = route(model_config());
+    route.indicators.insert(
+        ConversationKind::DirectMessage,
         Arc::new(ResolvedLiveness {
             settings: LivenessSettings {
                 mode: LivenessMode::Native,
@@ -15770,7 +15826,7 @@ async fn an_empty_answer_with_a_progress_message_posts_a_fresh_reply() {
     inbound.liveness = Some(LivenessTarget::Local { connection: 1 });
     let (model, session) = begin_parked_turn_with_answer(
         &mut runner,
-        route(model_config()),
+        route,
         inbound,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
         answer(""),

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use dekopon_config::LocalCatalog;
 use dekopon_gatewayd::{
-    GatewaydConfig, LivenessConfig, LivenessMode, SlackExperience, SlackLivenessFallback,
+    GatewaydConfig, LivenessConfig, LivenessMode, SlackExperience, WorkingReaction,
 };
 
 fn example(name: &str) -> PathBuf {
@@ -48,8 +48,11 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
         dekopon_gatewayd::TransportConfig::SlackSocketMode {
             experience: SlackExperience::Agent,
             liveness: LivenessConfig {
-                mode: LivenessMode::Native,
-                classic_fallback: SlackLivenessFallback::Reaction,
+                mode: Some(LivenessMode::Native),
+                reaction: Some(dekopon_gatewayd::ReactionConfig {
+                    working: Some(WorkingReaction::Auto),
+                    ..
+                }),
                 ..
             },
             ..

@@ -559,6 +559,12 @@ when a non-exporting session's minted trace falls back to the hasher constructio
 `gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
 minted from something predictable.
 
+`gateway_indicators_effective` is emitted once per resolved route/conversation kind at
+configuration load: route index, transport name, kind, mode, status, typing, working, seen,
+progress, stream, status-text, and cancel-button values only. It contains no subject,
+conversation coordinate, principal, message, credential or model text. It is configuration
+telemetry, not a broker decision or an indication that a chat service accepted a reaction.
+
 In-flight presentation is metadata-minimal apart from opted-in progress notes. Each admitted event a running session produces is one
 `gateway.progress` record on the message's own trace, carrying `kind` and whichever of `agent`,
 `turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,

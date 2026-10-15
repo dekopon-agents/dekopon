@@ -143,8 +143,9 @@ fn gateway_config_with(
                 "name": "dev",
                 "kind": "local",
                 "socketPath": directory.join("dev.sock"),
-                "liveness": {
+                "indicators": {
                     "mode": "native",
+                    "reaction": {"working": "on", "seen": "on"},
                     "progress": "message",
                     "stream": stream,
                     "cancelButton": progress_detail != "off" || stream,
@@ -742,7 +743,7 @@ async fn boot_with(
         stream,
     );
     if let Some(keep_alive) = &timing.keep_alive {
-        config["transports"][0]["liveness"]["keepAlive"] = keep_alive.clone();
+        config["transports"][0]["indicators"]["keepAlive"] = keep_alive.clone();
     }
     if timing.jobs {
         config["routes"][0]["limits"]["jobTimeoutMs"] = json!(20_000);

@@ -135,9 +135,9 @@ gateway:
           appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
           botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
           experience: agent
-          liveness:
+          indicators:
             mode: native
-            classicFallback: reaction
+            reaction: { working: auto, seen: off }
             progress: message
       models:
         - name: hosted-reasoning
