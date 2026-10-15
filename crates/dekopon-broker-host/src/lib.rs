@@ -597,6 +597,7 @@ struct CompiledComponent {
     command_export: CommandExport,
 }
 
+#[derive(Clone)]
 pub struct BrokerWasmProvider {
     runtime: Arc<Runtime>,
     pre: bindings::ProviderPre<StoreState>,
@@ -1352,7 +1353,7 @@ impl BrokerWasmProvider {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BrokerProviderRegistry {
     providers: Vec<BrokerWasmProvider>,
     routes: BTreeMap<CapabilityId, usize>,

@@ -1257,7 +1257,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let broker = Broker::new(
         registry,
         "broker-test".parse().expect("valid broker principal"),
-        "policy-test".to_owned(),
         PolicyEngine::new(POLICIES, &world).expect("fixture policy validates"),
         catalog,
         CredentialStore::empty(),
@@ -1602,6 +1601,405 @@ fn example_path(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+#[test]
+fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
+    let original = serde_yaml::from_str::<serde_yaml::Mapping>(
+        "socketPath: broker.sock\ncredentialsPath: a\nproviders: [provider.wasm]\n",
+    )
+    .unwrap();
+    let active = config::ConfigSnapshot::from_mapping(&original);
+    for (key, value, expected) in [
+        ("socketPath", "elsewhere.sock", "socketPath"),
+        (
+            "providerSettings",
+            "{cli-probe: {key: changed}}",
+            "providerSettings",
+        ),
+        (
+            "telemetry",
+            "{endpoint: http://localhost:4318}",
+            "telemetry",
+        ),
+        ("http", "{plaintextHosts: [localhost]}", "http"),
+        ("serverLimits", "{maxConnections: 12}", "serverLimits"),
+        (
+            "assets",
+            "{rootPath: different, maxInFlightBytes: 12}",
+            "assets",
+        ),
+        ("storage", "{rootPath: different}", "storage"),
+        ("chatMemory", "{enabled: true}", "chatMemory"),
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::from_str::<serde_yaml::Value>(value).unwrap(),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert_eq!(active.restart_required(&next), [expected], "{key}");
+    }
+    for key in [
+        "apiVersion",
+        "providers",
+        "providerSet",
+        "compileOnLoad",
+        "hostLimits",
+        "brokerLimits",
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String("changed".to_owned()),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert_eq!(active.restart_required(&next), [key], "{key}");
+    }
+    for key in [
+        "credentialsPath",
+        "secretMapPath",
+        "strict",
+        "identities",
+        "principals",
+        "agents",
+        "policiesPath",
+        "capabilities",
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String("changed".to_owned()),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert!(active.restart_required(&next).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn an_unlisted_config_category_refuses_in_either_direction() {
+    let original =
+        serde_yaml::from_str::<serde_yaml::Mapping>("socketPath: broker.sock\n").unwrap();
+    let mut edited = original.clone();
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::String("value".to_owned()),
+    );
+    let active = config::ConfigSnapshot::from_mapping(&original);
+    let proposed = config::ConfigSnapshot::from_mapping(&edited);
+    assert_eq!(active.restart_required(&proposed), ["futureEffectiveInput"]);
+    assert_eq!(proposed.restart_required(&active), ["futureEffectiveInput"]);
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::Null,
+    );
+    let omitted = config::ConfigSnapshot::from_mapping(&edited);
+    assert!(active.restart_required(&omitted).is_empty());
+}
+
+#[tokio::test]
+async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cli-probe.wasm");
+    write_owner_only(&path, b"fixture");
+    let mapping = serde_yaml::from_str::<serde_yaml::Mapping>(
+        "http: {extraCABundles: [/same/path]}\nproviders: [cli-probe.wasm]\n",
+    )
+    .unwrap();
+    let mut active = config::ConfigSnapshot::from_mapping(&mapping);
+    let mut next = active.clone();
+    active
+        .record_sources("", std::slice::from_ref(&path), 0, &[b"first CA".to_vec()])
+        .await
+        .unwrap();
+    next.record_sources("", std::slice::from_ref(&path), 0, &[b"second CA".to_vec()])
+        .await
+        .unwrap();
+    assert_eq!(active.restart_required(&next), ["http"]);
+}
+
+#[tokio::test]
+async fn broker_projection_does_not_relax_owner_only_source_rules() {
+    use super::{BrokerdError, Mode};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.yaml");
+    let generation = root.path().join("..2026");
+    fs::create_dir(&generation).unwrap();
+    write_config(
+        &generation.join("broker.yaml"),
+        &attested_document(current_uid()),
+    );
+    std::os::unix::fs::symlink("..2026", root.path().join("..data")).unwrap();
+    std::os::unix::fs::symlink("..data/broker.yaml", &path).unwrap();
+    for report in [
+        super::check(&path, None).await,
+        super::load_candidate(&path, Mode::Boot).await.1,
+    ] {
+        assert!(
+            report.problems.iter().any(|problem| matches!(
+                problem,
+                BrokerdError::Config(config::ConfigError::Read { path: refused, source })
+                    if refused == &path && source.raw_os_error() == Some(libc::ELOOP)
+            )),
+            "{report:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reload_refuses_resident_category_and_invalid_authority_without_replacing_active() {
+    use super::{BrokerdError, Mode};
+    use dekopon_broker::PolicyBuildError;
+
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.path().join("broker.yaml");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    let cedar = root.path().join("policies.cedar");
+    write_owner_only(&cedar, POLICIES.as_bytes());
+    let mut document = attested_document(current_uid());
+    document["identities"].as_array_mut().unwrap().truncate(1);
+    write_config(&path, &document);
+    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("boot candidate");
+    let digest = active.ready.broker.policy_digest().to_owned();
+
+    document["serverLimits"] = json!({"maxConnections": 12});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
+
+    document.as_object_mut().unwrap().remove("serverLimits");
+    write_config(&path, &document);
+    write_owner_only(&root.path().join("cli-probe.wasm"), b"not a component");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::RestartRequired { categories } if categories == &["providers"])));
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+
+    write_owner_only(&cedar, b"not cedar");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy {
+            source: PolicyBuildError::Parse { .. }
+        }
+    )));
+
+    write_owner_only(&cedar, format!("{POLICIES}\n@id(\"unrecognized\") permit(principal in Dekopon::Group::\"strangers\", action, resource);\n").as_bytes());
+    document["capabilities"]["cli-probe"]["constraints"] = json!({});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } } if group == "strangers")));
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Capabilities { problems } if problems.iter().any(|problem| matches!(problem,
+            super::capabilities::CapabilityProblem::MissingField { field: "timeoutMs", .. })) )));
+
+    document["capabilities"] = probe_capabilities();
+    document["identities"][0]["attestor"] = json!({"namespaces": []});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Config(config::ConfigError::Attestor { .. })
+    )));
+
+    document["identities"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("attestor");
+    write_config(&path, &document);
+    write_owner_only(
+        &cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let (next, report) = super::load_candidate(&path, Mode::Reload(&active))
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(
+        capture
+            .events_where("dekopon_broker_host", &[("provider", "cli-probe")])
+            .is_empty()
+    );
+    assert_ne!(next.unwrap().ready.broker.policy_digest(), digest);
+}
+
+struct ResidentFixture {
+    root: tempfile::TempDir,
+    path: std::path::PathBuf,
+    cedar: std::path::PathBuf,
+    document: serde_json::Value,
+    active: super::Candidate,
+    live: std::path::PathBuf,
+}
+
+impl ResidentFixture {
+    async fn boot() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("broker.yaml");
+        let cedar = root.path().join("policies.cedar");
+        let component =
+            fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+        write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+        write_owner_only(&cedar, POLICIES.as_bytes());
+        let mut document = attested_document(current_uid());
+        document["identities"].as_array_mut().unwrap().truncate(1);
+        let mut storage =
+            serde_json::to_value(dekopon_storage_host::StorageLimits::default()).unwrap();
+        storage["rootPath"] = json!("provider-storage");
+        document["storage"] = storage;
+        document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 1_048_576});
+        write_config(&path, &document);
+        let (active, report) = super::load_candidate(&path, super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let live = root.path().join("assets/live");
+        write_owner_only(&live, b"active asset");
+        Self {
+            root,
+            path,
+            cedar,
+            document,
+            active: active.expect("boot with storage and assets"),
+            live,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_valid_policy_reload_prepares_with_an_active_storage_writer() {
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(
+        &fixture.cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(
+        prepared.is_some(),
+        "valid policy edit must prepare alongside the active writer"
+    );
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
+}
+
+#[tokio::test]
+async fn a_refused_policy_reload_keeps_the_live_asset() {
+    use super::BrokerdError;
+    use dekopon_broker::PolicyBuildError;
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(&fixture.cedar, b"not cedar");
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy {
+            source: PolicyBuildError::Parse { .. }
+        }
+    )));
+}
+
+#[tokio::test]
+async fn changed_storage_refuses_without_creating_the_candidate_root() {
+    use super::BrokerdError;
+    let mut fixture = ResidentFixture::boot().await;
+    fixture.document["storage"]["rootPath"] = json!("other-storage");
+    write_config(&fixture.path, &fixture.document);
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert!(matches!(report.problems.as_slice(),
+        [BrokerdError::RestartRequired { categories }] if categories == &["storage"]));
+    assert!(!fixture.root.path().join("other-storage").exists());
+}
+
+#[tokio::test]
+async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
+    use super::{BrokerdError, Mode};
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.path().join("broker.yaml");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
+    let mut document = attested_document(current_uid());
+    document["identities"].as_array_mut().unwrap().truncate(1);
+    write_config(&path, &document);
+    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.unwrap();
+    write_owner_only(
+        &root.path().join("bad-credentials.yaml"),
+        b"not-a-credential-map",
+    );
+    write_owner_only(&root.path().join("bad-secrets.yaml"), b"not-a-secret-map");
+    document["credentialsPath"] = json!("bad-credentials.yaml");
+    document["secretMapPath"] = json!("bad-secrets.yaml");
+    write_config(&path, &document);
+    let checked = super::check(&path, None).await;
+    assert!(checked.problems.is_empty(), "{checked:?}");
+    for report in [
+        super::load_candidate(&path, Mode::Boot).await.1,
+        super::load_candidate(&path, Mode::Reload(&active)).await.1,
+    ] {
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, BrokerdError::Credentials(_)))
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, BrokerdError::Secrets(_)))
+        );
+    }
+
+    write_config(
+        &root.path().join("valid-credentials.yaml"),
+        &json!({
+            "apiVersion": super::CREDENTIALS_API_VERSION,
+            "credentials": [{
+                "name": "present", "kind": "bearerToken", "scheme": "Bearer",
+                "destinations": ["api.example.com"], "secret": "fixture-value-long-enough"
+            }]
+        }),
+    );
+    document["credentialsPath"] = json!("valid-credentials.yaml");
+    document.as_object_mut().unwrap().remove("secretMapPath");
+    document["capabilities"]["cli-probe"]["credential"] = json!("present");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["api.example.com"], "allowedMethods": ["GET"],
+        "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    document["agents"] = json!({"chat-agent": {"credentials": {"present": "absent"}}});
+    write_config(&path, &document);
+    let checked = super::check(&path, None).await;
+    assert!(checked.problems.is_empty(), "{checked:?}");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Broker(dekopon_broker::BrokerBuildError::UnknownCredential { name, .. })
+            if name == "absent")),
+        "{report:?}"
+    );
+}
+
 #[tokio::test]
 async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
     use super::{BrokerdError, Mode};
@@ -1911,6 +2309,33 @@ impl ManagedBroker {
         .await
         .expect("broker binds its socket");
     }
+}
+
+#[tokio::test]
+async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed provider boot candidate");
+    let loaded = active.provider_lock.as_ref().expect("active provider lock");
+
+    broker.publish_lock('2');
+    let current = super::provider_manager::lock_digest(&broker.lock(), current_uid())
+        .await
+        .unwrap();
+    assert_ne!(current, loaded.digest);
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let next = next.expect("lock-only change belongs to lock_watch, not reload refusal");
+    assert_eq!(
+        next.provider_lock
+            .as_ref()
+            .expect("carried provider lock")
+            .digest,
+        loaded.digest
+    );
 }
 
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);

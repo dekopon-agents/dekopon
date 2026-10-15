@@ -102,7 +102,6 @@ async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "refusal-logging".to_owned(),
         PolicyEngine::new(POLICIES, &world).expect("the refusal policy set validates"),
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         CredentialStore::empty(),

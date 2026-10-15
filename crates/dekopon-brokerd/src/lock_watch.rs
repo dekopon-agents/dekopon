@@ -105,6 +105,10 @@ impl<'a> Observer<'a> {
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt as _};
 
+    use dekopon_test_support::CaptureLayer;
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
+    use tracing_subscriber::prelude::*;
+
     use super::*;
 
     fn read(digest: &str) -> Result<String, &'static str> {
@@ -207,13 +211,27 @@ mod tests {
         );
 
         replace(&lock.path, b"providers: [b]\n");
+        let capture = CaptureLayer::new();
         assert_eq!(
-            tokio::time::timeout(FAST * 15, watch(&lock, uid, FAST))
-                .await
-                .expect("an atomic replacement signals"),
+            tokio::time::timeout(
+                FAST * 15,
+                watch(&lock, uid, FAST)
+                    .instrument(tracing::info_span!("provider_lock_witness"))
+                    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            )
+            .await
+            .expect("an atomic replacement signals"),
             LockStop::Changed
         );
-
+        let changed = capture.events_where(
+            "dekopon_brokerd::lock_watch",
+            &[("event", "broker_provider_lock_changed")],
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            changed[0].field("event"),
+            Some("broker_provider_lock_changed")
+        );
         fs::remove_file(&lock.path).unwrap();
         assert_eq!(
             tokio::time::timeout(FAST * 15, watch(&lock, uid, FAST))

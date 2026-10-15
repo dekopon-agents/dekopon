@@ -134,7 +134,6 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
         Broker::new(
             registry,
             "broker-test".parse::<PrincipalId>().expect("principal"),
-            "policy-test".to_owned(),
             PolicyEngine::new(POLICY, &world).expect("fixture policy validates"),
             catalog,
             CredentialStore::empty(),

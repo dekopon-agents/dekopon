@@ -90,7 +90,6 @@ async fn broker() -> Broker<InMemoryAuditLog> {
     Broker::new(
         registry,
         principal("broker-test"),
-        "policy-decision-table".to_owned(),
         policy_engine(),
         ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
             .expect("one capability builds a catalog"),

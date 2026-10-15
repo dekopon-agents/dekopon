@@ -2116,8 +2116,9 @@ mod retention_tests {
             _: u64,
         ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, crate::transport::TransportError>>
         {
-            self.entered.notify_one();
             Box::pin(async {
+                // Signalled on first poll, after the caller has fixed its fetch deadline.
+                self.entered.notify_one();
                 let _released = self.release.acquire().await;
                 Ok(b"ok".to_vec())
             })

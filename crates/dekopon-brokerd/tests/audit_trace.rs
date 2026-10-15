@@ -313,7 +313,6 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
         Broker::new(
             registry,
             principal("broker-test"),
-            "policy-test".to_owned(),
             PolicyEngine::new(POLICY, &world).expect("fixture policy validates"),
             ConstraintCatalog::new([(
                 "cli-probe.upper"
