@@ -1,56 +1,58 @@
-use super::CommandFailure;
+use clap::{Arg, Command};
+
+use super::{CommandFailure, parse_flags};
+use crate::builtins::text::lines::parse_count;
 
 pub(crate) const NAME: &str = "xargs";
 pub(crate) const HELP: &str = "-I -n";
 
-pub(crate) struct Template<'a> {
-    words: &'a [String],
-    placeholder: Option<&'a str>,
+pub(crate) struct Template {
+    words: Vec<String>,
+    placeholder: Option<String>,
 }
 
-pub(crate) fn parse(arguments: &[String]) -> Result<Template<'_>, CommandFailure> {
-    let mut placeholder = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "-I" | "--replace" => {
-                let Some(value) = arguments.get(index + 1) else {
-                    return Err(CommandFailure::usage(
-                        "xargs: -I requires a placeholder token",
-                    ));
-                };
-                if value.is_empty() {
-                    return Err(CommandFailure::usage(
-                        "xargs: the -I placeholder must not be empty",
-                    ));
-                }
-                placeholder = Some(value.as_str());
-                index += 2;
-            }
-            "-n" => {
-                let Some(value) = arguments.get(index + 1) else {
-                    return Err(CommandFailure::usage("xargs: -n requires a count"));
-                };
-                if value != "1" {
-                    return Err(CommandFailure::usage(
-                        "xargs: only -n 1 is supported; each element becomes one invocation",
-                    ));
-                }
-                index += 2;
-            }
-            flag if flag.starts_with('-') && flag.len() > 1 => {
-                return Err(super::unsupported_flag("xargs", flag, HELP));
-            }
-            _ => break,
-        }
-    }
-    let words = &arguments[index..];
-    let Some(command) = words.first() else {
+pub(crate) fn parse(arguments: &[String]) -> Result<Template, CommandFailure> {
+    let matches = parse_flags(
+        Command::new(NAME)
+            .arg(
+                Arg::new("replace")
+                    .short('I')
+                    .long("replace")
+                    .num_args(1)
+                    .allow_hyphen_values(true),
+            )
+            .arg(Arg::new("count").short('n').num_args(1))
+            .arg(
+                Arg::new("child")
+                    .required(true)
+                    .num_args(1..)
+                    .trailing_var_arg(true),
+            ),
+        arguments,
+        NAME,
+        HELP,
+    )?;
+    let placeholder = matches.get_one::<String>("replace").cloned();
+    if placeholder.as_deref() == Some("") {
         return Err(CommandFailure::usage(
-            "xargs: a command is required, as in `xargs gh issue view`",
+            "xargs: the -I placeholder must not be empty",
         ));
-    };
-    if command.starts_with('-') {
+    }
+    if let Some(count) = matches.get_one::<String>("count")
+        && parse_count(NAME, count)? != 1
+    {
+        return Err(CommandFailure::usage(
+            "xargs: only -n 1 is supported; each element becomes one invocation",
+        ));
+    }
+    let words = matches
+        .get_many::<String>("child")
+        .expect("required by clap")
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(command) = words.first()
+        && command.starts_with('-')
+    {
         return Err(CommandFailure::usage(format!(
             "xargs: expected a command, found flag {command}"
         )));
@@ -58,11 +60,11 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Template<'_>, CommandFailure
     Ok(Template { words, placeholder })
 }
 
-impl Template<'_> {
+impl Template {
     pub(crate) fn expanded_bytes(&self, element: &str) -> Option<u64> {
         let mut total = 0u64;
-        for word in self.words {
-            let length = match self.placeholder {
+        for word in &self.words {
+            let length = match self.placeholder.as_deref() {
                 Some(token) => {
                     let count = u64::try_from(word.matches(token).count()).ok()?;
                     let original = u64::try_from(word.len()).ok()?;
@@ -85,7 +87,7 @@ impl Template<'_> {
         let mut invocation: Vec<String> = self
             .words
             .iter()
-            .map(|word| match self.placeholder {
+            .map(|word| match self.placeholder.as_deref() {
                 Some(token) => word.replace(token, element),
                 None => word.clone(),
             })
@@ -107,6 +109,13 @@ mod tests {
         let template = parse(&words).expect("template");
         assert_eq!(template.expanded_bytes("abc"), Some(10));
         assert_eq!(template.expand("abc"), ["echo", "abcabc"]);
+    }
+
+    #[test]
+    fn child_flags_remain_child_words_after_attached_count() {
+        let args = ["-n1", "grep", "-in", "P"].map(str::to_owned);
+        let template = parse(&args).expect("child argv");
+        assert_eq!(template.expand("needle"), ["grep", "-in", "P", "needle"]);
     }
 
     #[test]

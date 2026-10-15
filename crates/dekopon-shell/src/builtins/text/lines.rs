@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 
+use clap::{Arg, Command};
+
 use crate::{
     CapabilityInvoker, RetainedBytes,
-    builtins::{CommandFailure, unsupported_flag},
+    builtins::{CommandFailure, parse_flags, unsupported_flag},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
@@ -13,10 +15,21 @@ pub(crate) enum LineCommand {
     Tail,
 }
 
-enum Selection {
+pub(crate) enum Selection {
     First(usize),
     Last(usize),
     From(usize),
+}
+
+pub(crate) fn parse_count(name: &str, digits: &str) -> Result<usize, CommandFailure> {
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CommandFailure::usage(format!(
+            "{name}: count must be nonnegative decimal digits"
+        )));
+    }
+    digits
+        .parse::<usize>()
+        .map_err(|_overflow| CommandFailure::usage(format!("{name}: count exceeds platform size")))
 }
 
 impl LineCommand {
@@ -42,37 +55,42 @@ impl LineCommand {
         }
     }
 
-    fn selection(self, arguments: &[String]) -> Result<Selection, CommandFailure> {
+    pub(crate) fn selection(self, arguments: &[String]) -> Result<Selection, CommandFailure> {
         let name = self.name();
-        let number = match arguments {
-            [] => "10",
-            [flag, number] if flag == "-n" => number.as_str(),
-            [short] if short.starts_with('-') && short.len() > 1 => {
-                if short.as_bytes()[1] == b'+' {
-                    return Err(unsupported_flag(name, short, self.help()));
-                }
-                &short[1..]
-            }
-            [flag, ..] if flag.starts_with('-') => {
-                return Err(unsupported_flag(name, flag, self.help()));
-            }
-            [other, ..] => {
-                return Err(CommandFailure::usage(format!(
-                    "{name}: unexpected argument {other:?}; input arrives through a pipe"
-                )));
-            }
-        };
-        let (from, digits) = if let Some(digits) = number.strip_prefix('+') {
-            (true, digits)
-        } else {
-            (false, number)
-        };
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(unsupported_flag(name, &format!("-{number}"), self.help()));
+        if let Some(first) = arguments.first()
+            && first.starts_with('+')
+        {
+            return Err(unsupported_flag(name, first, self.help()));
         }
-        let count = digits.parse::<usize>().map_err(|_overflow| {
-            CommandFailure::usage(format!("{name}: line count exceeds platform size"))
-        })?;
+        let mut rewritten = arguments.to_vec();
+        if let Some(first) = rewritten.first()
+            && first.starts_with('-')
+            && !first[1..].is_empty()
+            && first[1..].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            rewritten.splice(..1, ["-n".to_owned(), first[1..].to_owned()]);
+        }
+        let matches = parse_flags(
+            Command::new(name).arg(
+                Arg::new("lines")
+                    .short('n')
+                    .long("lines")
+                    .num_args(1)
+                    .allow_hyphen_values(true),
+            ),
+            &rewritten,
+            name,
+            self.help(),
+        )?;
+        let number = matches
+            .get_one::<String>("lines")
+            .map(String::as_str)
+            .unwrap_or("10");
+        let (from, digits) = match (self, number.strip_prefix('+')) {
+            (Self::Tail, Some(digits)) => (true, digits),
+            _ => (false, number),
+        };
+        let count = parse_count(name, digits)?;
         match (self, from) {
             (Self::Head, true) => Err(unsupported_flag(name, &format!("-n {number}"), self.help())),
             (Self::Head, false) => Ok(Selection::First(count)),
@@ -83,13 +101,12 @@ impl LineCommand {
 
     pub(crate) fn run(
         self,
-        arguments: &[String],
+        selection: Selection,
         reader: &mut PipeReader,
         budget: &mut Budget,
         invoker: &dyn CapabilityInvoker,
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<(), CommandFailure> {
-        let selection = self.selection(arguments)?;
         if matches!(selection, Selection::First(0) | Selection::Last(0)) {
             return Ok(());
         }

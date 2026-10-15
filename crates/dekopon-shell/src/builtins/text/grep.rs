@@ -1,8 +1,8 @@
-use crate::builtins::{CommandFailure, unsupported_flag};
+use clap::{Arg, ArgAction, Command};
+
+use crate::builtins::{CommandFailure, parse_flags};
 
 use super::Pattern;
-
-const HELP: &str = "-v -i -c -n -E";
 
 pub(crate) struct GrepConfig {
     invert: bool,
@@ -13,44 +13,40 @@ pub(crate) struct GrepConfig {
 
 impl GrepConfig {
     pub(crate) fn parse(arguments: &[String]) -> Result<Self, CommandFailure> {
-        let mut invert = false;
-        let mut ignore_case = false;
-        let mut count_only = false;
-        let mut number = false;
-        let mut extended = false;
-        let mut pattern = None;
-
-        for argument in arguments {
-            match argument.as_str() {
-                "-v" | "--invert-match" => invert = true,
-                "-i" | "--ignore-case" => ignore_case = true,
-                "-c" | "--count" => count_only = true,
-                "-n" | "--line-number" => number = true,
-                "-E" | "--extended-regexp" => extended = true,
-                flag if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag("grep", flag, HELP));
-                }
-                literal => {
-                    if pattern.is_some() {
-                        return Err(CommandFailure::usage(
-                            "grep: exactly one pattern argument is supported",
-                        ));
-                    }
-                    pattern = Some(literal.to_owned());
-                }
-            }
+        let mut grammar = Command::new("grep");
+        for (id, short, long) in [
+            ("invert", 'v', "invert-match"),
+            ("ignore", 'i', "ignore-case"),
+            ("count", 'c', "count"),
+            ("number", 'n', "line-number"),
+            ("extended", 'E', "extended-regexp"),
+        ] {
+            grammar = grammar.arg(
+                Arg::new(id)
+                    .short(short)
+                    .long(long)
+                    .action(ArgAction::SetTrue),
+            );
         }
-
-        let Some(pattern) = pattern else {
-            return Err(CommandFailure::usage(
-                "grep: a pattern argument is required",
-            ));
-        };
+        let matches = parse_flags(
+            grammar.arg(Arg::new("pattern").required(true)),
+            arguments,
+            "grep",
+            super::stream::TextStream::Grep.help(),
+        )?;
+        let pattern = matches
+            .get_one::<String>("pattern")
+            .expect("required by clap");
         Ok(Self {
-            invert,
-            count_only,
-            number,
-            pattern: Pattern::compile("grep", &pattern, ignore_case, extended)?,
+            invert: matches.get_flag("invert"),
+            count_only: matches.get_flag("count"),
+            number: matches.get_flag("number"),
+            pattern: Pattern::compile(
+                "grep",
+                pattern,
+                matches.get_flag("ignore"),
+                matches.get_flag("extended"),
+            )?,
         })
     }
 

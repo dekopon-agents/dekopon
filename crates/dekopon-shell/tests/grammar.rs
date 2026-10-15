@@ -228,6 +228,80 @@ fn code(script: &str) -> u8 {
 }
 
 #[test]
+fn converted_builtin_argv_keeps_clusters_values_and_refusals_local() {
+    for (script, expected) in [
+        ("printf 'aa\\nbb\\n' | grep -inv bb", "1:aa"),
+        ("printf 'aa\\nbb\\n' | grep -i -n -v bb", "1:aa"),
+        ("printf 'aa\\nbb\\n' | grep -i -i -n -v bb", "1:aa"),
+        ("printf 'a\\nb\\n' | wc -lwc", "[2,2,4]"),
+        ("printf '2\\n1\\n1\\n' | sort -rnu", "2\n1"),
+        ("printf '2\\n1\\n1\\n' | sort -r -n -u", "2\n1"),
+        ("printf 'a:b\\n' | cut -d: -f1", "a"),
+        ("printf 'a:b\\n' | cut -c1-1", "a"),
+        ("printf 'a\\nb\\nc\\n' | head -n2", "a\nb"),
+        ("printf 'a\\nb\\nc\\n' | head --lines=2", "a\nb"),
+        ("printf 'a\\nb\\nc\\n' | head --lines 2", "a\nb"),
+        ("printf 'a\\nb\\nc\\n' | head -2", "a\nb"),
+        ("printf 'a\\nb\\nc\\n' | head -n1 -n2", "a\nb"),
+        ("printf 'a\\nb\\nc\\n' | tail -2", "b\nc"),
+        ("printf '{\"a\":1}' | jq -rc .a", "1"),
+        ("printf '{\"a\":1}' | jq -r -c .a", "1"),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+    for script in [
+        "head -n 3 -5",
+        "tail +5",
+        "head -n +5",
+        "cut -f 1 -c 1",
+        "uniq -d -u",
+        "xargs -n +1 echo",
+        "grep -o a",
+        "head -n",
+        "jq --arg s v .",
+    ] {
+        assert_eq!(code(script), 2, "{script}");
+    }
+    assert_eq!(output("printf 'a\\nb\\n' | grep -- -"), "");
+    assert_eq!(output("echo -x | grep -- -x"), "-x");
+    let result = run("grep --bogus; echo after");
+    assert_eq!(
+        result.output,
+        "grep: option not yet supported: --bogus (supported: -v -i -c -n -E)\nafter"
+    );
+    assert_eq!(result.exit_code.get(), 0);
+    let result = run("printf 'unread\\n' | { grep --bogus; cat; }");
+    assert_eq!(
+        result.output,
+        "unread\ngrep: option not yet supported: --bogus (supported: -v -i -c -n -E)"
+    );
+    let result = run("head -n 3 --help; echo after");
+    assert!(result.output.contains("--help"), "{result:?}");
+    assert!(result.output.ends_with("after"), "{result:?}");
+    assert_eq!(code("head -n 3 --help"), 2);
+}
+
+#[test]
+fn head_twenty_and_tail_long_line_options_select_the_requested_counts() {
+    let lines = (1..=25).map(|n| format!("line {n}")).collect::<Vec<_>>();
+    let input = format!("printf '{}\\n'", lines.join("\\n"));
+    let first_twenty = lines[..20].join("\n");
+    for flag in ["-20", "-n 20", "--lines 20", "--lines=20"] {
+        let script = format!("{input} | head {flag}");
+        let result = run(&script);
+        assert_eq!(result.exit_code.get(), 0, "{script}: {result:?}");
+        assert_eq!(result.output, first_twenty, "{script}");
+    }
+    let last_two = lines[23..].join("\n");
+    for flag in ["-2", "-n 2", "--lines 2", "--lines=2"] {
+        let script = format!("{input} | tail {flag}");
+        let result = run(&script);
+        assert_eq!(result.exit_code.get(), 0, "{script}: {result:?}");
+        assert_eq!(result.output, last_two, "{script}");
+    }
+}
+
+#[test]
 fn assigns_and_expands_variables() {
     assert_eq!(output("name=world\necho \"hello $name\""), "hello world");
     assert_eq!(output("x=1\ny=$x\necho ${y}"), "1");
@@ -2722,7 +2796,10 @@ fn uniq_selects_duplicate_and_unique_pipe_lines() {
 #[test]
 fn cut_refuses_missing_and_conflicting_field_selections() {
     for (script, cause) in [
-        ("printf 'a:b' | cut -f", "cut: -f requires a value"),
+        (
+            "printf 'a:b' | cut -f",
+            "cut: error: a value is required for '--fields",
+        ),
         ("printf 'a:b' | cut", "cut: -f or -c is required"),
         (
             "printf 'a:b' | cut -f 1 -c 1",

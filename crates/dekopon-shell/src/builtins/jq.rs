@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use clap::{Arg, ArgAction, Command as ClapCommand};
 use jaq_core::{
     Compiler, Ctx, Exn, Vars, data,
     load::{Arena, File, Loader},
@@ -12,7 +13,7 @@ use jaq_core::{
 use jaq_json::{Num, Val};
 use serde_json::Value;
 
-use super::{CommandFailure, unsupported_flag};
+use super::{CommandFailure, parse_flags};
 use crate::{
     CapabilityInvoker, ExitCode,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
@@ -27,46 +28,49 @@ const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 pub(crate) const HELP: &str = "-r -c -n -s";
 
 #[derive(Default)]
-struct Options<'a> {
-    filter: Option<&'a str>,
+pub(crate) struct Options {
+    filter: Option<String>,
     raw: bool,
     null_input: bool,
     slurp: bool,
 }
 
-fn options(arguments: &[String]) -> Result<Options<'_>, CommandFailure> {
-    let mut opts = Options::default();
-    for argument in arguments {
-        match argument.as_str() {
-            "-r" | "--raw-output" => opts.raw = true,
-            "-c" | "--compact-output" => {}
-            "-n" | "--null-input" => opts.null_input = true,
-            "-s" | "--slurp" => opts.slurp = true,
-            flag if flag.starts_with('-') && flag.len() > 1 => {
-                return Err(unsupported_flag("jq", flag, HELP));
-            }
-            filter if opts.filter.is_none() => opts.filter = Some(filter),
-            _ => {
-                return Err(CommandFailure::usage(
-                    "jq: exactly one filter argument is supported",
-                ));
-            }
-        }
+pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
+    let mut grammar = ClapCommand::new("jq");
+    for (id, short, long) in [
+        ("raw", 'r', "raw-output"),
+        ("compact", 'c', "compact-output"),
+        ("null", 'n', "null-input"),
+        ("slurp", 's', "slurp"),
+    ] {
+        grammar = grammar.arg(
+            Arg::new(id)
+                .short(short)
+                .long(long)
+                .action(ArgAction::SetTrue),
+        );
     }
-    if opts.filter.is_none() {
-        return Err(CommandFailure::usage("jq: a filter argument is required"));
-    }
-    Ok(opts)
+    let matches = parse_flags(
+        grammar.arg(Arg::new("filter").required(true)),
+        arguments,
+        "jq",
+        HELP,
+    )?;
+    Ok(Options {
+        filter: matches.get_one::<String>("filter").cloned(),
+        raw: matches.get_flag("raw"),
+        null_input: matches.get_flag("null"),
+        slurp: matches.get_flag("slurp"),
+    })
 }
 
 pub(crate) fn stream(
-    arguments: &[String],
+    opts: Options,
     reader: &mut PipeReader,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
-    let opts = options(arguments)?;
     evaluate(opts, reader, budget, invoker, emit)
 }
 
@@ -182,7 +186,7 @@ fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailu
 const STDERR_BYTES: u64 = 4096;
 
 fn evaluate(
-    opts: Options<'_>,
+    opts: Options,
     input: &mut PipeReader,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
@@ -219,7 +223,10 @@ fn evaluate(
         let writer = scope.spawn(
             move || -> Result<Vec<crate::RetainedBytes>, CommandFailure> {
                 let mut stdin = io::BufWriter::new(stdin);
-                serde_json::to_writer(&mut stdin, &(opts.filter.unwrap_or_default(), opts.slurp))
+                serde_json::to_writer(
+                    &mut stdin,
+                    &(opts.filter.as_deref().unwrap_or_default(), opts.slurp),
+                )
                 .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
                 stdin.write_all(b"\n").map_err(input_error)?;
                 if opts.null_input {

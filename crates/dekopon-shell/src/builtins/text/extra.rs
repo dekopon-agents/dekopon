@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
 
+use clap::{Arg, ArgAction, Command};
+
 use crate::{
     CapabilityInvoker, ExitCode, RetainedBytes,
-    builtins::{CommandFailure, unsupported_flag},
+    builtins::{CommandFailure, parse_flags},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
@@ -36,15 +38,32 @@ impl ExtraStream {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn run(
         self,
         arguments: &[String],
         reader: &mut PipeReader,
         budget: &mut Budget,
         invoker: &dyn CapabilityInvoker,
+        emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<ExitCode, CommandFailure> {
+        self.run_parsed(
+            Operation::parse(self, arguments)?,
+            reader,
+            budget,
+            invoker,
+            emit,
+        )
+    }
+
+    pub(crate) fn run_parsed(
+        self,
+        operation: Operation,
+        reader: &mut PipeReader,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
-        let operation = Operation::parse(self, arguments)?;
         let mut state = State::new(operation);
         if matches!(self, Self::Wc) {
             while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
@@ -85,7 +104,7 @@ impl ExtraStream {
     }
 }
 
-enum Operation {
+pub(crate) enum Operation {
     Cut {
         delimiter: char,
         mode: CutMode,
@@ -107,70 +126,71 @@ enum Operation {
     },
 }
 
-enum CutMode {
+pub(crate) enum CutMode {
     Fields(Selection),
     Characters(Selection),
 }
 
 impl Operation {
-    fn parse(command: ExtraStream, args: &[String]) -> Result<Self, CommandFailure> {
-        let mut delimiter = '\t';
-        let (mut fields, mut characters) = (None, None);
-        let (mut count, mut duplicates, mut unique) = (false, false, false);
-        let (mut lines, mut words, mut bytes) = (false, false, false);
-        let (mut reverse, mut numeric) = (false, false);
-        let mut i = 0;
-        while i < args.len() {
-            let flag = args[i].as_str();
-            match (command, flag) {
-                (
-                    ExtraStream::Cut,
-                    "-d" | "--delimiter" | "-f" | "--fields" | "-c" | "--characters",
-                ) => {
-                    let value = args.get(i + 1).ok_or_else(|| {
-                        CommandFailure::usage(format!("cut: {flag} requires a value"))
-                    })?;
-                    i += 1;
-                    match flag {
-                        "-d" | "--delimiter" => {
-                            let mut chars = value.chars();
-                            delimiter = chars.next().ok_or_else(|| {
-                                CommandFailure::usage("cut: -d requires a delimiter")
-                            })?;
-                            if chars.next().is_some() {
-                                return Err(CommandFailure::usage(
-                                    "cut: -d accepts exactly one delimiter character",
-                                ));
-                            }
-                        }
-                        "-f" | "--fields" => fields = Some(Selection::parse("cut", value)?),
-                        "-c" | "--characters" => characters = Some(Selection::parse("cut", value)?),
-                        _ => unreachable!(),
-                    }
-                }
-                (ExtraStream::Uniq, "-c" | "--count") => count = true,
-                (ExtraStream::Uniq, "-d" | "--repeated") => duplicates = true,
-                (ExtraStream::Uniq, "-u" | "--unique") => unique = true,
-                (ExtraStream::Wc, "-l" | "--lines") => lines = true,
-                (ExtraStream::Wc, "-w" | "--words") => words = true,
-                (ExtraStream::Wc, "-c" | "--bytes") => bytes = true,
-                (ExtraStream::Sort, "-r" | "--reverse") => reverse = true,
-                (ExtraStream::Sort, "-n" | "--numeric-sort") => numeric = true,
-                (ExtraStream::Sort, "-u" | "--unique") => unique = true,
-                (_, flag) if flag.starts_with('-') && flag.len() > 1 => {
-                    return Err(unsupported_flag(command.name(), flag, command.help()));
-                }
-                (_, other) => {
-                    return Err(CommandFailure::usage(format!(
-                        "{}: unexpected argument {other:?}; input arrives through a pipe",
-                        command.name()
-                    )));
-                }
-            }
-            i += 1;
+    pub(crate) fn parse(command: ExtraStream, args: &[String]) -> Result<Self, CommandFailure> {
+        let flags: &[(&str, char, &str, bool)] = match command {
+            ExtraStream::Cut => &[
+                ("delimiter", 'd', "delimiter", true),
+                ("fields", 'f', "fields", true),
+                ("characters", 'c', "characters", true),
+            ],
+            ExtraStream::Uniq => &[
+                ("count", 'c', "count", false),
+                ("duplicates", 'd', "repeated", false),
+                ("unique", 'u', "unique", false),
+            ],
+            ExtraStream::Wc => &[
+                ("lines", 'l', "lines", false),
+                ("words", 'w', "words", false),
+                ("bytes", 'c', "bytes", false),
+            ],
+            ExtraStream::Sort => &[
+                ("reverse", 'r', "reverse", false),
+                ("numeric", 'n', "numeric-sort", false),
+                ("unique", 'u', "unique", false),
+            ],
+        };
+        let mut grammar = Command::new(command.name());
+        for &(id, short, long, value) in flags {
+            let mut arg = Arg::new(id).short(short).long(long);
+            arg = if value {
+                arg.num_args(1).allow_hyphen_values(true)
+            } else {
+                arg.action(ArgAction::SetTrue)
+            };
+            grammar = grammar.arg(arg);
         }
+        let matches = parse_flags(grammar, args, command.name(), command.help())?;
+        let value = |id| matches.get_one::<String>(id).map(String::as_str);
+        let flag = |id| matches.get_flag(id);
         Ok(match command {
             ExtraStream::Cut => {
+                let delimiter = match value("delimiter") {
+                    None => '\t',
+                    Some(text) => {
+                        let mut chars = text.chars();
+                        let ch = chars
+                            .next()
+                            .ok_or_else(|| CommandFailure::usage("cut: -d requires a delimiter"))?;
+                        if chars.next().is_some() {
+                            return Err(CommandFailure::usage(
+                                "cut: -d accepts exactly one delimiter character",
+                            ));
+                        }
+                        ch
+                    }
+                };
+                let fields = value("fields")
+                    .map(|v| Selection::parse("cut", v))
+                    .transpose()?;
+                let characters = value("characters")
+                    .map(|v| Selection::parse("cut", v))
+                    .transpose()?;
                 let mode = match (fields, characters) {
                     (Some(_), Some(_)) => {
                         return Err(CommandFailure::usage(
@@ -184,6 +204,8 @@ impl Operation {
                 Self::Cut { delimiter, mode }
             }
             ExtraStream::Uniq => {
+                let (count, duplicates, unique) =
+                    (flag("count"), flag("duplicates"), flag("unique"));
                 if duplicates && unique {
                     return Err(CommandFailure::usage(
                         "uniq: -d and -u are mutually exclusive",
@@ -196,14 +218,14 @@ impl Operation {
                 }
             }
             ExtraStream::Wc => Self::Wc {
-                lines,
-                words,
-                bytes,
+                lines: flag("lines"),
+                words: flag("words"),
+                bytes: flag("bytes"),
             },
             ExtraStream::Sort => Self::Sort {
-                reverse,
-                numeric,
-                unique,
+                reverse: flag("reverse"),
+                numeric: flag("numeric"),
+                unique: flag("unique"),
             },
         })
     }
