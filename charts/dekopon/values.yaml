@@ -90,7 +90,7 @@ initSecurityContext:
 #   <configDir>/gatewayd.yaml             0600 65533  (gateway-only volume)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
-#   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
+#   <catalogDir>/<catalog key>            root or gateway UID, no group/world write; root requires a read-only mount
 # A ConfigMap key holding extra PEM roots both daemons trust for their OTLP exporters, beside the
 # public roots; each gets it as OTEL_EXPORTER_OTLP_CERTIFICATE. For a receiver on a private CA.
 otlp:
@@ -363,8 +363,8 @@ gateway:
   configDirectory:
     configMap: ""
 
-  # catalogPath is the one file with no hygiene rules at all — dekopon-gatewayd reads it with a plain
-  # read_to_string. A ConfigMap mount is fine and nothing is copied.
+  # catalogPath and referenced instruction/skill files are checked for owner and mode; a root-owned
+  # ConfigMap key is accepted on a read-only mount. The chart does not copy catalog keys.
   catalog:
     inline: ""
     existingConfigMap: ""
