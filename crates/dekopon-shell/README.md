@@ -213,7 +213,7 @@ The shell has no clock. Reading the wall time from here would be ambient authori
 
 This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, a recursion-depth cap, independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept separate from the step budget, and a shared ceiling on retained value bytes, refunded when their owners drop or replace them — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
 
-Parsing has its own fixed nesting ceiling, applied before any budget exists, because the parser is recursive and runs on the native stack: deeply nested `$( $( ... ) )` is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
+Parsing has its own fixed nesting ceiling of 64 levels, applied before any budget exists, because the parser and the arithmetic evaluator are recursive and run on the native stack: deeply nested `$( $( ... ) )`, or a `$(( ))` whose operators nest deeper than that (`!!!…1`, or a `1+1+…` chain), is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
 
 The variable namespace is seeded only from the script's own assignments; the host process environment is never read. That includes `jq`: jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 

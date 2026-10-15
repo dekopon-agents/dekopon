@@ -2236,6 +2236,23 @@ fn the_capability_call_cap_is_independent_of_the_step_budget() {
     );
 }
 
+fn on_a_two_mib_stack(script: &str) -> ScriptOutcome {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, || run(script))
+            .expect("spawn the interpreter thread")
+            .join()
+            .expect("join the interpreter thread")
+    })
+}
+
+fn arithmetic_thirty_calls_deep(expression: &str) -> String {
+    format!(
+        "f() {{ if [ $1 -gt 0 ]; then f $(( $1 - 1 )); else echo $(( {expression} )); fi; }}\nf 30"
+    )
+}
+
 #[test]
 fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
     for script in [
@@ -2251,8 +2268,13 @@ fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
             "$(".repeat(1_000),
             ")".repeat(1_000)
         ),
+        arithmetic_thirty_calls_deep(&format!("{}1", "!".repeat(4_094))),
+        arithmetic_thirty_calls_deep(&format!("{}1", "- ".repeat(4_094))),
+        arithmetic_thirty_calls_deep(&format!("{}1", "! - ".repeat(2_047))),
+        arithmetic_thirty_calls_deep(&format!("{}1", "1+".repeat(2_047))),
+        arithmetic_thirty_calls_deep(&format!("{}1", "1+".repeat(65))),
     ] {
-        let outcome = run(&script);
+        let outcome = on_a_two_mib_stack(&script);
         assert_eq!(
             outcome.exit_code,
             ExitCode::SYNTAX,
@@ -2267,6 +2289,8 @@ fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
     }
     assert_eq!(output("echo $(( ((((1 + 1)))) ))"), "2");
     assert_eq!(output("echo $(echo $(echo $(echo deep)))"), "deep");
+    let at_the_ceiling = arithmetic_thirty_calls_deep(&format!("{}1", "1+".repeat(64)));
+    assert_eq!(on_a_two_mib_stack(&at_the_ceiling).output, "65");
 }
 
 #[test]
