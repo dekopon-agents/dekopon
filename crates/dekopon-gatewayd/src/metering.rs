@@ -493,7 +493,10 @@ impl ChatModel for ChatProviderGovernor {
             admission.observe_usage(*usage);
             self.hint.observe(usage);
         }
-        admission.settle(outcome(&result));
+        match &result {
+            Ok(_) => admission.settle(outcome(&result)),
+            Err(error) => admission.settle_with_kind(outcome(&result), error.kind().as_str()),
+        }
         result
     }
 }
@@ -561,7 +564,10 @@ mod tests {
 
     use dekopon_model::error::{ProtocolFailure, RequestError};
     use dekopon_model_token_governor::{ModelUsage, Retry, UnixMillis};
-    use dekopon_test_support::{OPENAI_CHAT_COMPLETIONS_TWO_DELTAS, ScriptedStreamModel};
+    use dekopon_test_support::{
+        CaptureLayer, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS, ScriptedStreamModel,
+    };
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::*;
 
@@ -723,6 +729,97 @@ mod tests {
             ask(&governed(Arc::new(Failing(failure)), &metering)).unwrap_err();
             assert!(used(&metering) >= 100, "the input estimate is charged");
         }
+    }
+
+    #[test]
+    fn returned_model_failures_charge_one_typed_meter_record() {
+        let cases: [(fn() -> InferenceError, &str, &str, &str); 3] = [
+            (
+                || InferenceError::DeadlineExceeded,
+                "deadline-exceeded",
+                "failed",
+                "estimated",
+            ),
+            (
+                || InferenceError::Cancelled,
+                "cancelled",
+                "cancelled",
+                "estimated",
+            ),
+            (
+                || InferenceError::InvalidRequest(RequestError::EmptyModel),
+                "invalid-request",
+                "failed",
+                "estimated",
+            ),
+        ];
+        for (failure, kind, outcome, source) in cases {
+            let capture = CaptureLayer::new();
+            let _guard = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let metering = metering(LIMIT);
+            let error = ask(&governed(Arc::new(Failing(failure)), &metering)).unwrap_err();
+            assert_eq!(error.kind().as_str(), kind);
+            let records = capture.events_where("meter", &[("message", "model call charged")]);
+            assert_eq!(records.len(), 1);
+            let charge = &records[0];
+            assert_eq!(charge.field("error.kind"), Some(kind));
+            assert_eq!(charge.field("outcome"), Some(outcome));
+            assert_eq!(charge.field("usage.source"), Some(source));
+            assert_eq!(charge.field("meter.schema"), Some("1"));
+            let input = if kind == "invalid-request" {
+                0
+            } else {
+                Estimate::from_sizes(
+                    Sizes {
+                        bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
+                            + json_bytes::<[ModelTool]>(&[]),
+                        images: 0,
+                    },
+                    None,
+                    Tokens(0),
+                )
+                .input
+                .0
+            }
+            .to_string();
+            assert_eq!(charge.field("usage.input_tokens"), Some(input.as_str()));
+            assert_eq!(charge.field("usage.output_tokens"), Some("0"));
+        }
+    }
+
+    #[test]
+    fn success_and_pre_admission_refusal_have_no_error_kind() {
+        let capture = CaptureLayer::new();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let allowed = metering(LIMIT);
+        ask(&governed(
+            streaming(Some(ModelUsage {
+                input_tokens: Some(700),
+                output_tokens: Some(9),
+                ..ModelUsage::default()
+            })),
+            &allowed,
+        ))
+        .unwrap();
+        let refused = metering(10);
+        let error = ask(&governed(streaming(None), &refused)).unwrap_err();
+        assert!(matches!(error, InferenceError::OverBudget(_)));
+        let records = capture.events_where("meter", &[("message", "model call charged")]);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].field("error.kind"), None);
+        assert_eq!(records[0].field("outcome"), Some("succeeded"));
+        assert_eq!(records[0].field("usage.source"), Some("reported"));
+        assert_eq!(records[0].field("usage.input_tokens"), Some("700"));
+        assert_eq!(records[0].field("usage.output_tokens"), Some("9"));
+        assert_eq!(records[1].field("error.kind"), None);
+        assert_eq!(records[1].field("outcome"), Some("refused"));
+        assert_eq!(records[1].field("usage.source"), Some("estimated"));
+        assert_eq!(records[1].field("usage.input_tokens"), Some("0"));
+        assert_eq!(records[1].field("usage.output_tokens"), Some("0"));
     }
 
     fn parse(yaml: &str) -> Result<MeteringConfig, serde_yaml::Error> {

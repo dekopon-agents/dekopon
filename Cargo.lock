@@ -1187,6 +1187,7 @@ name = "dekopon-model-token-governor"
 version = "0.46.3"
 dependencies = [
  "dekopon-core",
+ "dekopon-test-support",
  "parking_lot",
  "tokio",
  "tracing",
