@@ -133,10 +133,10 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     tracing_subscriber::registry().with(captured.clone()).init();
 
     let fixture = provider_fixture("http-probe-provider.wasm");
-    let expected_digest = format!(
-        "{:x}",
-        Sha256::digest(std::fs::read(&fixture).expect("fixture bytes"))
-    );
+    let expected_digest = Sha256::digest(std::fs::read(&fixture).expect("fixture bytes"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let registry = BrokerProviderRegistry::load([fixture], BrokerHostLimits::default())
         .await
         .expect("HTTP provider fixture loads");
