@@ -258,6 +258,12 @@ async fn open_journal(
         .iter()
         .map(|(id, agent)| (id.as_str().to_owned(), agent.max_age))
         .collect();
+    let agent_bytes = memory
+        .agents
+        .iter()
+        .map(|(id, agent)| (id.as_str().to_owned(), agent.max_bytes.get()))
+        .collect();
+    let max_bytes_per_agent = memory.retention.max_bytes_per_agent.get();
     let journal = tokio::task::spawn_blocking(move || {
         let mut journal = journal::Journal::open_with_age(
             &config.dir,
@@ -266,6 +272,9 @@ async fn open_journal(
             config.seal_retention,
         )?;
         journal.agent_ages = agent_ages;
+        journal.agent_bytes = agent_bytes;
+        journal.max_bytes_per_agent = max_bytes_per_agent;
+        journal.enforce_caps()?;
         Ok::<_, journal::JournalError>(journal)
     })
     .await

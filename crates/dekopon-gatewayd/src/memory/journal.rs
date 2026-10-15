@@ -129,6 +129,8 @@ pub(crate) struct Journal {
     dir: PathBuf,
     max_age: Duration,
     pub(crate) agent_ages: HashMap<String, Duration>,
+    pub(crate) agent_bytes: HashMap<String, u64>,
+    pub(crate) max_bytes_per_agent: u64,
     retention: Duration,
     seal_retention: Duration,
     lock: Mutex<()>,
@@ -175,6 +177,8 @@ impl Journal {
             dir: dir.to_path_buf(),
             max_age,
             agent_ages: HashMap::new(),
+            agent_bytes: HashMap::new(),
+            max_bytes_per_agent: 64 * 1024 * 1024,
             retention,
             seal_retention,
             lock: Mutex::new(()),
@@ -510,6 +514,82 @@ impl Journal {
                 result => result?,
             }
         }
+        if let Some((agent, _)) = stem.split_once('/') {
+            self.enforce_agent_cap(agent)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enforce_caps(&self) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        for entry in fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if is_agent_directory(&path)
+                && let Some(agent) = path.file_name().and_then(|name| name.to_str())
+            {
+                self.enforce_agent_cap(agent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_agent_cap(&self, agent: &str) -> Result<(), JournalError> {
+        let limit = self
+            .agent_bytes
+            .get(agent)
+            .copied()
+            .unwrap_or(self.max_bytes_per_agent);
+        let directory = self.dir.join(agent);
+        if !directory.exists() {
+            return Ok(());
+        }
+        let mut paths = Vec::new();
+        let mut total = 0u64;
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if is_journal_file(&path) {
+                let size = fs::metadata(&path)?.len();
+                total = total.saturating_add(size);
+                paths.push((path, size));
+            }
+        }
+        if total <= limit {
+            return Ok(());
+        }
+        let mut files = paths
+            .into_iter()
+            .map(|(path, size)| {
+                let lines = read_lines(&path)?;
+                Ok((path, size, lines, 0usize))
+            })
+            .collect::<Result<Vec<_>, JournalError>>()?;
+        while total > limit {
+            let oldest = files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (path, _, lines, removed))| {
+                    lines.get(*removed).map(|line| (line.at_ms, path, index))
+                })
+                .min_by_key(|(at, path, _)| (*at, *path));
+            let Some((_, _, index)) = oldest else {
+                break;
+            };
+            let (_, size, lines, removed) = &mut files[index];
+            let dropped = encode_line(&lines[*removed])?.len() as u64;
+            *removed += 1;
+            *size = size.saturating_sub(dropped);
+            total = total.saturating_sub(dropped);
+        }
+        for (path, _, lines, removed) in files {
+            if removed == 0 {
+                continue;
+            }
+            if removed == lines.len() {
+                fs::remove_file(path)?;
+            } else {
+                rewrite(&path, &lines[removed..])?;
+            }
+        }
         Ok(())
     }
 
@@ -714,6 +794,16 @@ fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
 fn compact(path: &Path, max_age: Duration, now: SystemTime) -> Result<(), JournalError> {
     let horizon = millis(now).saturating_sub(duration_millis(max_age));
     let lines = read_lines(path)?;
+    rewrite(
+        path,
+        &lines
+            .into_iter()
+            .filter(|line| line.at_ms >= horizon)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn rewrite(path: &Path, lines: &[Line]) -> Result<(), JournalError> {
     let temporary = path.with_extension("compact");
     let mut file = OpenOptions::new()
         .create(true)
@@ -721,7 +811,7 @@ fn compact(path: &Path, max_age: Duration, now: SystemTime) -> Result<(), Journa
         .truncate(true)
         .mode(0o600)
         .open(&temporary)?;
-    for line in lines.iter().filter(|line| line.at_ms >= horizon) {
+    for line in lines {
         file.write_all(&encode_line(line)?)?;
     }
     file.sync_all()?;
@@ -1208,6 +1298,90 @@ mod tests {
         assert_eq!(read_lines(&journal.path(&first)).unwrap()[0].record_id, 1);
         assert_eq!(read_lines(&journal.path(&other)).unwrap()[0].record_id, 1);
         assert_ne!(journal.path(&first).parent(), journal.path(&other).parent());
+    }
+
+    #[test]
+    fn encoded_agent_cap_evicts_oldest_whole_turn_across_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let now = SystemTime::now();
+        let first = key().journal_stem();
+        let second =
+            ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "second").journal_stem();
+        let other =
+            ConversationKey::shared(&"another".parse().unwrap(), "slack", "third").journal_stem();
+        append(&journal, &first, now - Duration::from_secs(3), GRANT, "old");
+        append(
+            &journal,
+            &second,
+            now - Duration::from_secs(2),
+            GRANT,
+            "middle",
+        );
+        append(&journal, &first, now - Duration::from_secs(1), GRANT, "new");
+        append(&journal, &other, now, GRANT, "other agent");
+        let old_size = encode_line(&read_lines(&journal.path(&first)).unwrap()[0])
+            .unwrap()
+            .len() as u64;
+        let total = fs::metadata(journal.path(&first)).unwrap().len()
+            + fs::metadata(journal.path(&second)).unwrap().len();
+        journal
+            .agent_bytes
+            .insert("reviewer".into(), total - old_size);
+        journal.enforce_caps().unwrap();
+        assert_eq!(
+            users(&journal.recall(&first, GRANT, window(), now).unwrap()),
+            ["new"]
+        );
+        assert_eq!(
+            users(&journal.recall(&second, GRANT, window(), now).unwrap()),
+            ["middle"]
+        );
+        assert_eq!(
+            users(&journal.recall(&other, GRANT, window(), now).unwrap()),
+            ["other agent"]
+        );
+        assert_eq!(read_lines(&journal.path(&first)).unwrap()[0].record_id, 2);
+        append(&journal, &first, now, GRANT, "after cap");
+        assert_eq!(
+            read_lines(&journal.path(&first))
+                .unwrap()
+                .last()
+                .unwrap()
+                .record_id,
+            3
+        );
+        let remaining = [first, second]
+            .iter()
+            .map(|stem| fs::metadata(journal.path(stem)).map_or(0, |meta| meta.len()))
+            .sum::<u64>();
+        assert!(remaining <= total - old_size);
+        assert_eq!(
+            users(&journal.recall(&other, GRANT, window(), now).unwrap()),
+            ["other agent"]
+        );
+    }
+
+    #[test]
+    fn failed_cap_rewrite_keeps_the_previous_whole_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now - Duration::from_secs(1), GRANT, "old");
+        append(&journal, &stem, now, GRANT, "new");
+        let path = journal.path(&stem);
+        let before = fs::read(&path).unwrap();
+        let first_size = encode_line(&read_lines(&path).unwrap()[0]).unwrap().len() as u64;
+        journal
+            .agent_bytes
+            .insert("reviewer".into(), before.len() as u64 - first_size);
+        fs::create_dir(path.with_extension("compact")).unwrap();
+        assert!(matches!(
+            journal.enforce_caps(),
+            Err(JournalError::Io { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
