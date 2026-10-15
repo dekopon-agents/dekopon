@@ -14,7 +14,7 @@ pub(crate) enum TextStream {
     Sed,
 }
 
-enum Operation {
+pub(crate) enum Operation {
     Grep(GrepConfig),
     Sed(Substitution),
 }
@@ -40,18 +40,33 @@ impl TextStream {
         }
     }
 
+    pub(crate) fn parse(self, arguments: &[String]) -> Result<Operation, CommandFailure> {
+        match self {
+            Self::Grep => Ok(Operation::Grep(GrepConfig::parse(arguments)?)),
+            Self::Sed => Ok(Operation::Sed(super::sed::parse_arguments(arguments)?)),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn run(
         self,
         arguments: &[String],
         reader: &mut PipeReader,
         budget: &mut Budget,
         invoker: &dyn CapabilityInvoker,
+        emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<ExitCode, CommandFailure> {
+        self.run_parsed(self.parse(arguments)?, reader, budget, invoker, emit)
+    }
+
+    pub(crate) fn run_parsed(
+        self,
+        operation: Operation,
+        reader: &mut PipeReader,
+        budget: &mut Budget,
+        invoker: &dyn CapabilityInvoker,
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
-        let operation = match self {
-            Self::Grep => Operation::Grep(GrepConfig::parse(arguments)?),
-            Self::Sed => Operation::Sed(super::sed::parse_arguments(arguments)?),
-        };
         let mut pending = Vec::new();
         let mut charges: Vec<RetainedBytes> = Vec::new();
         let mut progress = LineProgress::default();
@@ -180,11 +195,14 @@ pub(crate) fn run_test(
     let mut reader = PipeReader::from_bytes(bytes);
     let mut budget = Budget::start(Limits::default());
     let mut output = Vec::new();
-    let status = command.run(
+    let operation = command.parse(
         &arguments
             .iter()
             .map(|arg| (*arg).to_owned())
             .collect::<Vec<_>>(),
+    )?;
+    let status = command.run_parsed(
+        operation,
         &mut reader,
         &mut budget,
         &NoCapabilities,

@@ -89,6 +89,38 @@ enum StreamCommand {
     Jq,
 }
 
+enum ParsedStream {
+    Lines(
+        builtins::text::lines::LineCommand,
+        builtins::text::lines::Selection,
+    ),
+    Text(
+        builtins::text::stream::TextStream,
+        builtins::text::stream::Operation,
+    ),
+    Extra(
+        builtins::text::extra::ExtraStream,
+        builtins::text::extra::Operation,
+    ),
+    Jq(builtins::jq::Options),
+}
+
+impl StreamCommand {
+    fn parse(self, arguments: &[String]) -> Result<ParsedStream, CommandFailure> {
+        match self {
+            Self::Lines(cmd) => cmd
+                .selection(arguments)
+                .map(|args| ParsedStream::Lines(cmd, args)),
+            Self::Text(cmd) => cmd
+                .parse(arguments)
+                .map(|args| ParsedStream::Text(cmd, args)),
+            Self::Extra(cmd) => builtins::text::extra::Operation::parse(cmd, arguments)
+                .map(|args| ParsedStream::Extra(cmd, args)),
+            Self::Jq => builtins::jq::options(arguments).map(ParsedStream::Jq),
+        }
+    }
+}
+
 /// Each non-final stage thread reserves this much stack, charged against retained bytes until its
 /// join, so the default budget admits sixteen concurrent producers.
 const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
@@ -2385,6 +2417,15 @@ impl<'a> Evaluator<'a> {
         if literal_help {
             return Ok(Executed::Result(stream_help(command)));
         }
+        let parsed = command.parse(arguments);
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(failure) => {
+                return Ok(Executed::Result(CommandResult::status(
+                    self.absorb(failure)?,
+                )));
+            }
+        };
         let retention_budget = self.budget.fork();
         let mut redirected_bytes = Vec::new();
         let mut redirect_charges = Vec::new();
@@ -2479,38 +2520,34 @@ impl<'a> Evaluator<'a> {
             }
             Ok(true)
         };
-        let outcome = match command {
-            StreamCommand::Lines(command) => command
+        let outcome = match parsed {
+            ParsedStream::Lines(command, selection) => command
                 .run(
-                    arguments,
+                    selection,
                     &mut reader,
                     &mut self.budget,
                     self.invoker,
                     &mut emit,
                 )
                 .map(|()| ExitCode::SUCCESS),
-            StreamCommand::Extra(command) => command.run(
-                arguments,
+            ParsedStream::Extra(command, operation) => command.run_parsed(
+                operation,
                 &mut reader,
                 &mut self.budget,
                 self.invoker,
                 &mut emit,
             ),
-            StreamCommand::Text(command) => command.run(
-                arguments,
+            ParsedStream::Text(command, operation) => command.run_parsed(
+                operation,
                 &mut reader,
                 &mut self.budget,
                 self.invoker,
                 &mut emit,
             ),
-            StreamCommand::Jq => builtins::jq::stream(
-                arguments,
-                &mut reader,
-                &mut self.budget,
-                self.invoker,
-                &mut emit,
-            )
-            .map(|()| ExitCode::SUCCESS),
+            ParsedStream::Jq(opts) => {
+                builtins::jq::stream(opts, &mut reader, &mut self.budget, self.invoker, &mut emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
         };
         let mut status = match outcome {
             Ok(status) => status,

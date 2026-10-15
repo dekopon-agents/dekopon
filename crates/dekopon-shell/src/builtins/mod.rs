@@ -212,9 +212,125 @@ pub(crate) fn unsupported_flag(command: &str, flag: &str, supported: &str) -> Co
     ))
 }
 
+pub(crate) fn parse_flags(
+    mut grammar: clap::Command,
+    arguments: &[String],
+    name: &str,
+    help: &str,
+) -> Result<clap::ArgMatches, CommandFailure> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    grammar = grammar
+        .no_binary_name(true)
+        .disable_help_flag(true)
+        .args_override_self(true);
+    grammar
+        .try_get_matches_from_mut(arguments)
+        .map_err(|mut error| {
+            if error.kind() == ErrorKind::UnknownArgument
+                && let Some(ContextValue::String(word)) = error.get(ContextKind::InvalidArg)
+            {
+                return unsupported_flag(name, word, help);
+            }
+            error = error.format(&mut grammar);
+            CommandFailure::usage(format!("{name}: {}", error.render()))
+        })
+}
+
 pub(crate) fn help_result(name: &str, help: &str) -> CommandResult {
     let help = if help.is_empty() { "no flags" } else { help };
     CommandResult::value(Value::String(format!("{name}: {help}")))
+}
+
+#[cfg(test)]
+mod clap_spike {
+    use clap::{Arg, ArgAction, Command};
+
+    use super::{CommandFailure, parse_flags};
+
+    #[test]
+    fn paired_values_keep_empty_and_hyphen_led_words() {
+        let grammar = || {
+            Command::new("jq").arg(
+                Arg::new("arg")
+                    .long("arg")
+                    .num_args(2)
+                    .allow_hyphen_values(true),
+            )
+        };
+        for value in ["", "-hello", "--=x"] {
+            let args = ["--arg", "s", value].map(str::to_owned);
+            let matches = parse_flags(grammar(), &args, "jq", "").unwrap();
+            assert_eq!(
+                matches
+                    .get_many::<String>("arg")
+                    .unwrap()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["s", value]
+            );
+        }
+    }
+
+    #[test]
+    fn option_terminator_and_attached_clusters_are_distinct() {
+        let grammar = || {
+            Command::new("grep")
+                .arg(Arg::new("i").short('i').action(ArgAction::SetTrue))
+                .arg(Arg::new("n").short('n').action(ArgAction::SetTrue))
+                .arg(Arg::new("pattern").required(true))
+        };
+        for (words, expected) in [
+            (vec!["-in", "-"], "-"),
+            (vec!["-in", "--", "--=x"], "--=x"),
+            (vec!["--", "-in"], "-in"),
+        ] {
+            let matches = parse_flags(
+                grammar(),
+                &words.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "grep",
+                "-i -n",
+            )
+            .unwrap();
+            assert_eq!(matches.get_one::<String>("pattern").unwrap(), expected);
+        }
+        assert!(matches!(
+            parse_flags(grammar(), &["--=x".into()], "grep", "-i -n"),
+            Err(CommandFailure::Status { .. })
+        ));
+    }
+
+    #[test]
+    fn trailing_child_argv_is_not_parsed_and_bad_options_do_not_exit() {
+        let grammar = || {
+            Command::new("xargs")
+                .arg(Arg::new("n").short('n').num_args(1))
+                .arg(
+                    Arg::new("child")
+                        .required(true)
+                        .num_args(1..)
+                        .trailing_var_arg(true),
+                )
+        };
+        let args = ["-n1", "grep", "-in", "P"].map(str::to_owned);
+        let matches = parse_flags(grammar(), &args, "xargs", "-n").unwrap();
+        assert_eq!(
+            matches
+                .get_many::<String>("child")
+                .unwrap()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["grep", "-in", "P"]
+        );
+        let failure =
+            parse_flags(Command::new("grep"), &["--bogus".into()], "grep", "-i").unwrap_err();
+        assert!(matches!(
+            failure,
+            CommandFailure::Status {
+                status: crate::ExitCode::SYNTAX,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
