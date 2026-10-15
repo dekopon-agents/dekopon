@@ -18,6 +18,7 @@ pub mod capabilities;
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
 mod config;
 mod credentials;
+mod github_app;
 mod lock_watch;
 mod provider_manager;
 mod reaper;

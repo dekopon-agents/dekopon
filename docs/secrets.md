@@ -559,7 +559,7 @@ will be replaced by public DRNs. The migration must retain the shared refresh se
 binding, and companion header described here; it is not implemented by the current private map
 ([migration requirements](design.md#legacy-credential-bindings)).
 
-The two legacy kinds in `broker-credentials.yaml` differ in *when the value exists*, not in how it is
+The legacy kinds in `broker-credentials.yaml` differ in *when the value exists*, not in how it is
 bound or audited. `bearerToken` carries a `secret` an operator rotates by hand. `chatgptSubscription`
 carries an absolute `authFile` instead, because a ChatGPT subscription access token expires hourly and
 its refresh token rotates on every renewal:
@@ -577,7 +577,7 @@ credentials:
 the file is validated as a whole: every missing field, surplus field, malformed name and duplicate
 name is reported in one startup refusal.
 
-Both legacy kinds go through the credential echo check the way a DRN-bound credential does: the
+Every legacy kind goes through the credential echo check the way a DRN-bound credential does: the
 native host refuses a response whose body or headers carry the secret rather than returning it to
 the component. A `bearerToken` `secret` is therefore held to a shape the check can search for — at
 least 16 bytes of printable ASCII, no whitespace or control bytes — and an entry that breaks that
@@ -627,6 +627,56 @@ family is eventually revoked for both. See
 `credential-unavailable` and logs `broker_chatgpt_credential_reauth_required`: an operator must log in
 again. Everything else — transport, a 5xx, a malformed token response — fails as
 `credential-refresh-failed`. Either way the broker keeps serving every other capability.
+
+### `githubApp`
+
+`githubApp` acts as a GitHub App installation rather than as a person. A personal access token stays
+a `bearerToken`. The entry names the App, the installation and an absolute path to the RSA private
+key GitHub generated for the App (the `.pem` download, PKCS#1 or PKCS#8; not an SSH key):
+
+```yaml
+apiVersion: dekopon.dev/broker-credentials/v1alpha1
+credentials:
+  - name: github-app
+    kind: githubApp
+    appId: 123456
+    installationId: 7890123
+    privateKey: /var/lib/dekopon/broker-github/app.pem
+    destinations: [api.github.com]
+    repositories: [dekopon]   # optional downscope
+    permissions:              # optional downscope
+      contents: read
+      issues: write
+```
+
+`secret`, `scheme` and `authFile` are prohibited for this kind, and `appId`, `installationId`,
+`privateKey`, `repositories` and `permissions` are prohibited for the others. The key file passes the
+same Tier A check as the credentials file under a 16 KiB ceiling; it is read once at startup and
+never rewritten, so its parent needs no write permission. A relative path, an untrusted file, or a
+document that is not an RSA private key refuses startup naming the cause, and every entry problem is
+reported in the one refusal.
+
+**Renewal.** An installation token lasts one hour. On the first authorized invocation, and on any
+invocation within five minutes of the cached token's `expires_at`, the broker signs an RS256 JWT
+(`iss` = `appId`, `iat` 60 s in the past to absorb clock drift, `exp` nine minutes ahead) and posts it
+to `https://api.github.com/app/installations/{installationId}/access_tokens`. One lock per entry
+serializes resolution, so concurrent invocations mint once and share the cached token. The token is
+presented as `authorization: Bearer <token>` on the entry's `destinations` only. As with
+`chatgptSubscription`, the mint is the broker's own HTTPS call: it is not charged to `maxRequests`,
+produces no evidence entry, and the JWT, key and token appear in no log, span, error or audit record.
+
+**Downscoping.** With `repositories` (names) or `permissions` (a map of GitHub permission name to access
+level, such as `read` or `write`) set, the mint sends them as its JSON body and GitHub issues a token limited to that
+subset of the installation's grant. Without either, the request has no body and the token carries
+the installation's full grant. An empty list or map refuses startup instead of silently meaning
+"everything".
+
+**Failure classification.** A 401 from the mint means GitHub no longer accepts the App's JWT (a
+revoked or rotated key, a deleted App, or the broker's clock is more than a minute ahead of GitHub's): the invocation fails as `credential-unavailable` and logs
+`broker_github_app_credential_reauth_required`; an operator must correct clock skew, restore a deleted App, or replace a revoked or wrong key. Everything
+else — transport, a 5xx, another refusal such as a removed installation, a malformed response —
+fails as `credential-refresh-failed` and logs `broker_github_app_credential_refresh_failed`; the
+next invocation tries again.
 
 ## Resolution and rotation
 
