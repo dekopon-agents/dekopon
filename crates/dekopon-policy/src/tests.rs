@@ -89,6 +89,23 @@ fn facts(body: Option<&[u8]>) -> HttpRequestFacts {
     }
 }
 
+fn header_decision(facts: HttpRequestFacts, unless: &str) -> PolicyDecision {
+    let policy = format!(
+        r#"
+        @id("allow") permit(principal, action, resource);
+        @id("header-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        unless {{ {unless} }};
+    "#
+    );
+    PolicyEngine::new(&policy, &world())
+        .expect("valid guarded header policy")
+        .authorize_http(
+            capability_request("cpetersen", "cli-probe.upper", session()),
+            facts,
+        )
+}
+
 fn request_json(facts: HttpRequestFacts) -> serde_json::Value {
     facts
         .context()
@@ -101,27 +118,58 @@ fn request_json(facts: HttpRequestFacts) -> serde_json::Value {
 #[test]
 fn request_url_method_and_guest_headers_are_exact_or_absent() {
     let mut input = facts(None);
-    input.headers = vec![("X-Guest".into(), b"caf\xc3\xa9".to_vec())];
     let request = request_json(input.clone());
     assert_eq!(request["method"], "POST");
     assert_eq!(
         request["url"],
         json!({"host":"example.com","path":"/api/send"})
     );
-    assert_eq!(request["headers"], json!({"x-guest":"café"}));
     input.method = "PATCH".into();
     input.query = "a=1".into();
     assert_eq!(request_json(input.clone())["method"], "PATCH");
     assert_eq!(request_json(input.clone())["url"]["query"], "a=1");
+
+    input.headers = vec![("X-Guest".into(), b"caf\xc3\xa9".to_vec())];
+    let decision = header_decision(
+        input.clone(),
+        "context.request.headers[\"x-guest\"] == \"café\"",
+    );
+    assert!(decision.allowed && !decision.errors_present);
     input.headers.push(("x-GUEST".into(), b"other".to_vec()));
-    assert!(request_json(input.clone()).get("headers").is_none());
-    input.headers = vec![("Other".into(), vec![0xff])];
-    assert!(request_json(input.clone()).get("headers").is_none());
-    input.headers = vec![(
-        "__entity".into(),
-        b"Dekopon::Principal::\"cpetersen\"".to_vec(),
-    )];
-    assert!(request_json(input).get("headers").is_none());
+    let decision = header_decision(input.clone(), "context.request has headers");
+    assert!(!decision.allowed && !decision.errors_present);
+    input.headers = vec![
+        ("Good".into(), b"yes".to_vec()),
+        ("Other".into(), vec![0xff]),
+    ];
+    let decision = header_decision(input.clone(), "context.request has headers");
+    assert!(!decision.allowed && !decision.errors_present);
+
+    for name in ["__entity", "__extn", "__expr"] {
+        input.headers = vec![(name.into(), b"x".to_vec())];
+        let condition = format!("context.request.headers[\"{name}\"] == \"x\"");
+        let decision = header_decision(input.clone(), &condition);
+        assert!(
+            decision.allowed && !decision.errors_present,
+            "{name}: {decision:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unread_expr_header_does_not_refuse_an_otherwise_permitted_request() {
+    let engine = PolicyEngine::new(
+        r#"@id("allow") permit(principal, action, resource);"#,
+        &world(),
+    )
+    .expect("ordinary permit");
+    let mut input = facts(None);
+    input.headers = vec![("__expr".into(), b"x".to_vec())];
+    let decision = engine.authorize_http(
+        capability_request("cpetersen", "cli-probe.upper", session()),
+        input,
+    );
+    assert!(decision.allowed && !decision.errors_present, "{decision:?}");
 }
 
 #[test]
@@ -139,9 +187,9 @@ fn only_entire_representable_json_records_enter_request_context() {
     assert!(request_json(input.clone()).get("body").is_none());
     input.content_type = Some("application/json".into());
     let at_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(16 * 1024 - 8));
-    input.body = Some(at_limit.as_bytes().to_vec());
+    input.body = Some(at_limit.into_bytes());
     assert!(request_json(input.clone()).get("body").is_some());
-    input.body.as_mut().unwrap().insert(7, b'a');
+    input.body = Some(vec![b'a'; 16 * 1024 + 100]);
     assert!(request_json(input.clone()).get("body").is_none());
     for bad in [
         "",
