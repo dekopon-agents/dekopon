@@ -150,7 +150,7 @@ where
     let journal = match config.journal.clone() {
         Some(journal) => Some(Arc::new(
             tokio::task::spawn_blocking(move || {
-                journal::Journal::open(&journal.dir, journal.retention)
+                journal::Journal::open(&journal.dir, journal.retention, journal.seal_retention)
             })
             .await
             .map_err(GatewaydError::TransportTask)?

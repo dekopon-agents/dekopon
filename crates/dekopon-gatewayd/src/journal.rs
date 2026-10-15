@@ -108,23 +108,30 @@ pub(crate) struct Entry<'a> {
 pub(crate) struct Journal {
     dir: PathBuf,
     retention: Duration,
+    seal_retention: Duration,
     lock: Mutex<()>,
 }
 
 impl Journal {
-    pub fn open(dir: &Path, retention: Duration) -> Result<Self, JournalError> {
-        Self::open_at(dir, retention, SystemTime::now())
+    pub fn open(
+        dir: &Path,
+        retention: Duration,
+        seal_retention: Duration,
+    ) -> Result<Self, JournalError> {
+        Self::open_at(dir, retention, seal_retention, SystemTime::now())
     }
 
     pub(crate) fn open_at(
         dir: &Path,
         retention: Duration,
+        seal_retention: Duration,
         now: SystemTime,
     ) -> Result<Self, JournalError> {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let journal = Self {
             dir: dir.to_path_buf(),
             retention,
+            seal_retention,
             lock: Mutex::new(()),
         };
         journal.expire(now)?;
@@ -143,9 +150,13 @@ impl Journal {
         Ok(())
     }
 
-    pub fn sealed(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
+    pub fn sealed(
+        &self,
+        stem: &str,
+        forget_after: Duration,
+    ) -> Result<Option<SealedConversation>, JournalError> {
         let _lock = self.lock.lock();
-        self.read_seal(stem)
+        self.read_seal(stem, forget_after)
     }
 
     fn follow_path(&self, key: &str) -> PathBuf {
@@ -259,7 +270,11 @@ impl Journal {
         self.dir.join(format!("{stem}.{SEAL_EXTENSION}"))
     }
 
-    fn read_seal(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
+    fn read_seal(
+        &self,
+        stem: &str,
+        forget_after: Duration,
+    ) -> Result<Option<SealedConversation>, JournalError> {
         let path = self.seal_path(stem);
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -268,9 +283,10 @@ impl Journal {
         };
         let modified = file.metadata()?.modified()?;
         if SystemTime::now()
-            .checked_sub(self.retention)
+            .checked_sub(forget_after)
             .is_some_and(|cutoff| modified < cutoff)
         {
+            remove(&path);
             return Ok(None);
         }
         let mut bytes = Vec::new();
@@ -319,7 +335,7 @@ impl Journal {
             Err(error) => return Err(error),
         };
 
-        if let Some(seal) = self.read_seal(stem)? {
+        if let Some(seal) = self.read_seal(stem, window.forget_after)? {
             lines.retain(|line| line.at_ms > millis(seal.at));
         }
         let now_ms = millis(now);
@@ -430,13 +446,18 @@ impl Journal {
     // Follow markers expire by their lifecycle deadline, not the journal window's file mtime.
     fn expire(&self, now: SystemTime) -> io::Result<()> {
         let cutoff = now.checked_sub(self.retention);
+        let seal_cutoff = now.checked_sub(self.seal_retention);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
             let stale = match path.extension() {
                 Some(extension) if extension == EXTENSION || extension == SEAL_EXTENSION => {
                     let modified = entry.metadata()?.modified()?;
-                    cutoff.is_some_and(|limit| modified < limit)
+                    if extension == SEAL_EXTENSION {
+                        seal_cutoff.is_some_and(|limit| modified < limit)
+                    } else {
+                        cutoff.is_some_and(|limit| modified < limit)
+                    }
                 }
                 Some(extension) if extension == FOLLOW_EXTENSION => {
                     read_follow_marker(&path)?.is_some_and(|marker| marker.until_ms <= millis(now))
@@ -690,11 +711,11 @@ mod tests {
         let stem = key().journal_stem();
         let now = SystemTime::now();
         {
-            let journal = Journal::open(dir.path(), RETENTION).expect("open");
+            let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
             append(&journal, &stem, now, GRANT, "one");
             append(&journal, &stem, now, GRANT, "two");
         }
-        let journal = Journal::open(dir.path(), RETENTION).expect("reopen");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("reopen");
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(users(&recalled), ["one", "two"]);
         assert_eq!(recalled.history.turns()[1].answer(), Some("re: two"));
@@ -710,13 +731,13 @@ mod tests {
         let answer = "\u{1}".repeat(90_000);
         let inventory = photos(1, whatsapp);
         {
-            let journal = Journal::open(dir.path(), RETENTION).expect("open");
+            let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
             let photo = ConversationTurn::completed("photo", "seen photo");
             append_turn(&journal, &stem, now, GRANT, &photo, &inventory, window);
             let escaped = ConversationTurn::completed("question", answer.as_str());
             append_turn(&journal, &stem, now, GRANT, &escaped, &inventory, window);
         }
-        let journal = Journal::open(dir.path(), RETENTION).expect("reopen");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("reopen");
         let recalled = journal.recall(&stem, GRANT, window, now).expect("recall");
         assert_eq!(users(&recalled), ["photo", "question"]);
         assert_eq!(recalled.history.turns()[1].answer(), Some(answer.as_str()));
@@ -731,7 +752,7 @@ mod tests {
     #[test]
     fn a_conversation_with_no_file_recalls_an_empty_window() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let recalled = journal
             .recall(&key().journal_stem(), GRANT, window(), SystemTime::now())
             .expect("recall");
@@ -742,7 +763,7 @@ mod tests {
     #[test]
     fn only_the_trailing_run_under_the_current_grant_is_recalled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         append(&journal, &stem, now, GRANT, "narrow");
@@ -755,7 +776,7 @@ mod tests {
     #[test]
     fn an_exchange_exactly_at_the_horizon_is_recalled_and_one_older_is_not() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = UNIX_EPOCH + Duration::from_secs(10_000_000);
         let horizon = now - window().forget_after;
@@ -774,7 +795,7 @@ mod tests {
     #[test]
     fn recall_restores_the_newest_snapshot_under_its_numbers_and_counter() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         let inventory = photos(4, whatsapp);
@@ -793,7 +814,7 @@ mod tests {
     #[test]
     fn a_generated_asset_is_not_journaled_but_keeps_its_number() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         let inventory = photos(1, |_| AssetSourceRef::Generated {
@@ -809,7 +830,7 @@ mod tests {
     #[test]
     fn whatsapp_media_past_its_lifetime_is_recalled_without_a_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
         let long = MemoryWindow {
@@ -828,7 +849,7 @@ mod tests {
     #[test]
     fn an_asset_older_than_the_horizon_is_not_recalled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         let mut inventory = photos(2, whatsapp);
@@ -847,7 +868,7 @@ mod tests {
     #[test]
     fn a_file_past_its_threshold_compacts_to_the_window_and_keeps_the_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         let inventory = photos(1, whatsapp);
@@ -865,7 +886,7 @@ mod tests {
     #[test]
     fn a_file_untouched_past_the_retention_is_deleted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let now = SystemTime::now();
         let stems = ["stale", "fresh"].map(|conversation| {
             ConversationKey::shared(&"reviewer".parse().expect("agent"), "slack", conversation)
@@ -890,7 +911,7 @@ mod tests {
     #[test]
     fn a_file_from_an_older_format_is_refused_once_and_then_starts_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         let old = format!(
@@ -910,7 +931,7 @@ mod tests {
     fn the_directory_and_its_files_are_private_to_the_daemon() {
         let parent = tempfile::tempdir().expect("tempdir");
         let dir = parent.path().join("journal");
-        let journal = Journal::open(&dir, RETENTION).expect("open");
+        let journal = Journal::open(&dir, RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         append(&journal, &stem, SystemTime::now(), GRANT, "one");
         let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
@@ -922,7 +943,7 @@ mod tests {
     fn a_seal_has_private_sibling_storage_and_leaves_the_transcript_unchanged() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         append(&journal, &stem, now, GRANT, "old turn");
@@ -941,7 +962,7 @@ mod tests {
     #[test]
     fn a_seal_filters_journal_lines_at_and_before_it() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         append(
@@ -969,31 +990,37 @@ mod tests {
     #[test]
     fn a_corrupt_seal_is_removed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let path = journal.seal_path(&stem);
         fs::write(&path, b"not a marker").unwrap();
-        assert!(matches!(journal.sealed(&stem), Err(JournalError::Corrupt)));
+        assert!(matches!(
+            journal.sealed(&stem, RETENTION),
+            Err(JournalError::Corrupt)
+        ));
         assert!(!path.exists());
     }
 
     #[test]
     fn an_oversized_seal_is_removed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let path = journal.seal_path(&stem);
         let mut marker = br#"{"atMs":1}"#.to_vec();
         marker.resize((MAX_SEAL_BYTES + 1) as usize, b' ');
         fs::write(&path, marker).unwrap();
-        assert!(matches!(journal.sealed(&stem), Err(JournalError::Corrupt)));
+        assert!(matches!(
+            journal.sealed(&stem, RETENTION),
+            Err(JournalError::Corrupt)
+        ));
         assert!(!path.exists());
     }
 
     #[test]
     fn reading_a_seal_does_not_expire_other_conversations() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let old = journal.seal_path("other");
         fs::write(&old, br#"{"atMs":1}"#).unwrap();
         let now = SystemTime::now();
@@ -1001,16 +1028,63 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(now - RETENTION - Duration::from_secs(1)))
             .unwrap();
-        assert!(journal.sealed(&key().journal_stem()).unwrap().is_none());
+        assert!(
+            journal
+                .sealed(&key().journal_stem(), RETENTION)
+                .unwrap()
+                .is_none()
+        );
         assert!(old.exists());
         journal.expire(now).unwrap();
         assert!(!old.exists());
     }
 
     #[test]
+    fn seal_expires_by_route_forget_while_younger_journal_file_survives_memory_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory_age = Duration::from_secs(7 * 86400);
+        let forget = Duration::from_secs(86400);
+        let now = SystemTime::now();
+        let journal = Journal::open(dir.path(), memory_age, forget).expect("open");
+        let stem = key().journal_stem();
+        append(&journal, &stem, now, GRANT, "recent");
+        journal.seal(&stem, now - 2 * forget).expect("seal");
+        let seal_path = journal.seal_path(&stem);
+        File::open(&seal_path)
+            .expect("seal file")
+            .set_modified(now - 2 * forget)
+            .expect("age seal");
+        let file_path = journal.path(&stem);
+        File::open(&file_path)
+            .expect("journal file")
+            .set_modified(now - 2 * forget)
+            .expect("age journal file");
+        let recalled = journal
+            .recall(
+                &stem,
+                GRANT,
+                MemoryWindow {
+                    forget_after: forget,
+                    ..window()
+                },
+                now,
+            )
+            .expect("recall");
+        assert_eq!(users(&recalled), ["recent"]);
+        assert!(
+            !seal_path.exists(),
+            "route forget must expire the seal independently"
+        );
+        assert!(
+            file_path.exists(),
+            "memory age still protects the journal file"
+        );
+    }
+
+    #[test]
     fn a_seal_expires_with_the_journal_retention() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION).expect("open");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
         let now = SystemTime::now();
         journal.seal(&stem, now).unwrap();
@@ -1019,7 +1093,7 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(now - RETENTION - Duration::from_secs(1)))
             .unwrap();
-        assert!(journal.sealed(&stem).unwrap().is_none());
+        assert!(journal.sealed(&stem, RETENTION).unwrap().is_none());
         journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
     }

@@ -1480,7 +1480,17 @@ async fn session(
             return "follow-inactive";
         }
     }
-    let sealed = sealed_conversation(runner, &key).await;
+    let sealed = sealed_conversation(
+        runner,
+        &key,
+        route
+            .memory
+            .window()
+            .map_or(crate::config::DEFAULT_FORGET_AFTER, |window| {
+                window.forget_after
+            }),
+    )
+    .await;
     match message.conversation.kind {
         ConversationKind::Thread if sealed.is_some() => {
             revoke_thread_ownership(runner, message);
@@ -2162,13 +2172,14 @@ async fn session(
 async fn sealed_conversation(
     runner: &SessionRunner,
     key: &ConversationKey,
+    forget_after: Duration,
 ) -> Option<SealedConversation> {
     let Some(journal) = runner.journal.as_ref() else {
         return runner.sealed_conversations.lock().get(key).copied();
     };
     let journal = Arc::clone(journal);
     let stem = key.journal_stem();
-    let result = tokio::task::spawn_blocking(move || journal.sealed(&stem)).await;
+    let result = tokio::task::spawn_blocking(move || journal.sealed(&stem, forget_after)).await;
     let reason = match result {
         Ok(Ok(sealed)) => return sealed,
         Ok(Err(error)) => error.label(),

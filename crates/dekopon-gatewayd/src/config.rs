@@ -885,6 +885,7 @@ pub struct JournalConfig {
 pub struct ResolvedJournal {
     pub dir: PathBuf,
     pub retention: Duration,
+    pub seal_retention: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1789,6 +1790,11 @@ pub(crate) fn resolve(
         .as_ref()
         .map(|journal| ResolvedJournal {
             dir: resolve_path(journal.path.clone()),
+            seal_retention: routes
+                .iter()
+                .filter_map(|route| route.memory.window().map(|window| window.forget_after))
+                .max()
+                .unwrap_or(DEFAULT_FORGET_AFTER),
             retention: routes
                 .iter()
                 .filter_map(|route| match route.memory {

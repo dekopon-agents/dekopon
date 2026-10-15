@@ -1140,7 +1140,7 @@ This subsection describes the automatic replay window, not the separate on-deman
 
 With `sessions.journal` configured, a wall-clock seal writes only a sibling `<stem>.sealed`
 file containing `{"atMs":<u64>}`, mode `0600`; it never writes a transcript line on the cancel path.
-The `.sealed` marker is never consumed or cleared. Its mtime follows the journal's retention rule (the separate `.followed` invitation uses its stored `untilMs` deadline instead), so expiry
+The `.sealed` marker is never consumed or cleared by a successful turn. Its mtime expires by the route's `forgetAfterMs` on read, and the longest configured forget interval bounds its directory sweep independently of the journal's memory-age file sweep (the separate `.followed` invitation uses its stored `untilMs` deadline instead), so expiry
 lifts the seal. A marker that does not parse is removed like a corrupt journal. A restart preserves
 the seal and the fresh DM window, but loses the notice. Without a journal, seals live only in a
 resident map and restart forgets them. A seal write failure is reported as `gateway_journal_seal_failed`.

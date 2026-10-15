@@ -442,6 +442,23 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
             ..
         }
     )));
+    input["models"]
+        .as_array_mut()
+        .expect("models fixture")
+        .push(json!({
+            "name": "proxy-claude", "kind": "anthropic", "model": "claude-sonnet-4-5",
+            "apiKeyEnv": "ANTHROPIC_API_KEY"
+        }));
+    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("proxy-claude");
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("proxy-only model");
+    assert!(reports(
+        &error,
+        |problem| matches!(problem, ConfigProblem::MemoryPolicy {
+        problem: crate::config::memory::PolicyProblem::ProxyOnlyModel(model), ..
+    } if model == "proxy-claude")
+    ));
     input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("local-qwen");
     assert!(
         load(directory.path(), &input).await.is_ok(),
@@ -780,6 +797,7 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
     assert_eq!(window.recall, RecallSource::Journal);
     let journal = resolved.journal.expect("journal");
     assert_eq!(journal.retention, Duration::from_secs(7 * 86_400));
+    assert_eq!(journal.seal_retention, Duration::from_secs(86_400));
     assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
     let policy = resolved.routes[0]
         .memory_policy
@@ -7251,6 +7269,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         crate::journal::Journal::open(
             &directory.path().join("journal"),
             Duration::from_secs(604800),
+            Duration::from_secs(604800),
         )
         .unwrap(),
     );
@@ -7401,6 +7420,7 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     let journal = Arc::new(
         crate::journal::Journal::open(
             &directory.path().join("journal"),
+            Duration::from_secs(604800),
             Duration::from_secs(604800),
         )
         .unwrap(),
@@ -13465,6 +13485,7 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
         crate::journal::Journal::open(
             &directory.path().join("journal"),
             Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
         )
         .unwrap(),
     );
@@ -15310,7 +15331,12 @@ fn journaled_runner(
         reply_on_busy: true,
         conversations: ConversationStore::new(1024),
         journal: Some(Arc::new(
-            crate::journal::Journal::open(journal, Duration::from_secs(3600)).expect("journal"),
+            crate::journal::Journal::open(
+                journal,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            )
+            .expect("journal"),
         )),
         follow: None,
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
@@ -15362,7 +15388,12 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         .await
         .unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
     let key = crate::follow::follow_key(
@@ -15470,7 +15501,12 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
     let models = ModelScript::new([script_call("follow leave"), answer("Farewell.")]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
     let mut route = route(model_config());
