@@ -1700,7 +1700,7 @@ pub enum AuditEvent {
     },
 }
 
-pub trait AuditLog: Send + Sync {
+pub trait AuditLog: Send + Sync + 'static {
     fn append(&self, event: AuditEvent) -> impl Future<Output = Result<(), AuditError>> + Send;
 }
 
@@ -1790,7 +1790,7 @@ pub struct Broker<A> {
 
 impl<A> Broker<A>
 where
-    A: AuditLog + 'static,
+    A: AuditLog,
 {
     #[allow(
         clippy::too_many_arguments,
