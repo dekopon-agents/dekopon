@@ -10714,14 +10714,14 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("clip.mov", "video/quicktime", 700 * 1024 * 1024)],
+        vec![pending("clip.mp4", "video/mp4", 1024)],
         true,
         Instant::now(),
     );
     let note = asset::reference_note(&registered, true).expect("a note");
 
     assert!(!registered.fetchable);
-    assert!(note.contains("clip.mov"), "{note}");
+    assert!(note.contains("clip.mp4"), "{note}");
     assert!(!note.contains("chat-asset:"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
