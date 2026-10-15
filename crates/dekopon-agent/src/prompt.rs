@@ -1418,7 +1418,7 @@ fn fetch_asset_into(
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
     if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(*asset_bytes) {
         let reason = format!(
-            "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Answer with the assets already shown."
+            "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Say that chat-asset:{id} went unseen."
         );
         tracing::info!(
             target: "dekopon_agent::audit",
