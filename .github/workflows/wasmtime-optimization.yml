@@ -1,0 +1,74 @@
+name: Wasmtime optimization
+
+on:
+  workflow_call:
+    inputs:
+      runners:
+        type: string
+        required: true
+  push:
+    branches: [main]
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/wasmtime-optimization.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "ci/fetch-external-provider-components.sh"
+      - "crates/**"
+      - "examples/conditional-write/**"
+      - "examples/providers/**"
+      - "wit/**"
+  pull_request:
+    paths:
+      - ".cargo/wasmtime-optimization.lock"
+      - ".cargo/wasmtime-optimization.toml"
+      - ".github/workflows/wasmtime-optimization.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasmtime-optimization-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasmtime_optimization:
+    name: Wasmtime optimization (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # ci.yml already calls this with the ARM64 runner on every Rust pull request.
+        os: ${{ fromJSON(inputs.runners || (github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]')) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Select the optimized dependency lock
+        run: cp .cargo/wasmtime-optimization.lock Cargo.lock
+      - name: Cache optimized dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: wasmtime-optimization-v1
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.arch == 'ARM64' }}
+      - name: Verify the pinned Wasmtime source
+        shell: bash
+        run: |
+          set -euo pipefail
+          spec=$(python3 -c 'import tomllib; p = tomllib.load(open(".cargo/wasmtime-optimization.toml", "rb"))["patch"]["crates-io"]["wasmtime"]; print("git+" + p["git"] + "?rev=" + p["rev"] + "#wasmtime")')
+          cargo --config .cargo/wasmtime-optimization.toml tree --locked -p "$spec"
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      - name: Test optimized broker and component host
+        run: cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
+      - name: Build optimized release CLIs
+        run: cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
