@@ -88,9 +88,10 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 ## Authority
 
 `dekopon-gatewayd` has none. It holds chat bot credentials and model credentials — the things it
-needs to hear a question and to ask a model — and it never holds a provider credential, a
-policy, or an authorization. Every effect a session drives is submitted to
-`dekopon-brokerd` as an on-behalf-of proposal, and the broker alone maps the subject to a
+needs to hear a question and to ask a model — and it holds no policy or authorization, and no
+provider credential except the shared DekoponVille Slack bot token named in
+[the security model](../../docs/security-model.md#current-gateway-posture). Every provider effect
+a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal, and the broker alone maps the subject to a
 principal, decides what it may do, resolves credentials, and executes it. Its normal dependency
 graph excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`,
 `dekopon-storage-host`, and `dekopon-policy`, and CI's `cargo tree` gate enforces that; only its

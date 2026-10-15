@@ -2,7 +2,7 @@
 
 `dekopon-gatewayd` is the unprivileged half of the deployment boundary in [`design.md`](design.md): it connects to chat services, waits for a wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model session with the sandboxed shell and safe on-demand meta tools, and replies with the answer.
 
-It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It never holds a provider credential, a policy, or an authorization. Every effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
+It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It holds no policy or authorization, and no provider credential except the shared DekoponVille Slack bot token named in [the security model](security-model.md#current-gateway-posture). Every provider effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
 
 **Status: Current.** A route is `persistent` unless configured otherwise; durable memory is a separate
 broker/agent opt-in and does not turn that default into automatic replay. The chart enforces the
