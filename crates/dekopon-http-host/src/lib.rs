@@ -32,10 +32,9 @@ use dekopon_capability::{
     ChatSlotValues, HttpConstraints, HttpConstraintsError, PathSegment, SecretUseGrant,
 };
 use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
-use futures_util::StreamExt as _;
 use reqwest::{
     Method, Url,
-    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
+    header::{ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
     redirect,
 };
 use serde::{Deserialize, Serialize};
@@ -1291,24 +1290,14 @@ impl BufferedHttpClient {
         .map_err(|_| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
         .map_err(|error| map_reqwest_error(&error))?;
 
-        let (status, headers, mut response_bytes) =
-            self.accept_head(&response, grant, evidence_index)?;
+        let stream::Head {
+            status,
+            headers,
+            bytes: mut response_bytes,
+            body: mut decoded,
+        } = self.accept_head(response, grant, evidence_index)?;
         let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        loop {
-            let remaining = self.remaining()?;
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", \
-                          which the Timeout message already states"
-            )]
-            let chunk = match timeout(remaining, stream.next())
-                .await
-                .map_err(|_| http_error(ErrorCode::Timeout, "response body timed out"))?
-            {
-                Some(chunk) => chunk.map_err(|error| map_reqwest_error(&error))?,
-                None => break,
-            };
+        while let Some(chunk) = decoded.next().await? {
             response_bytes = response_bytes
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| {
@@ -1346,6 +1335,10 @@ impl BufferedHttpClient {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .no_proxy()
+            .default_headers(HeaderMap::from_iter([(
+                ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip, deflate"),
+            )]))
             .connect_timeout(budget)
             .resolve_to_addrs(host, addresses);
         let pinned_ca = self
