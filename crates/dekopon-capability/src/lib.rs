@@ -674,7 +674,7 @@ impl Default for ExecutionConstraints {
 pub struct AuthorizationReceipt {
     decision_id: String,
     authorized_by: PrincipalId,
-    policy_revision: String,
+    policy_digest: String,
 }
 
 impl AuthorizationReceipt {
@@ -689,8 +689,8 @@ impl AuthorizationReceipt {
     }
 
     #[must_use]
-    pub fn policy_revision(&self) -> &str {
-        &self.policy_revision
+    pub fn policy_digest(&self) -> &str {
+        &self.policy_digest
     }
 }
 
@@ -732,7 +732,28 @@ impl AuthorizedInvocation {
 pub struct DecisionReference {
     pub decision_id: String,
     pub authorized_by: PrincipalId,
-    pub policy_revision: String,
+    #[serde(deserialize_with = "deserialize_policy_digest")]
+    pub policy_digest: String,
+}
+
+fn valid_policy_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn deserialize_policy_digest<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let digest = String::deserialize(deserializer)?;
+    if valid_policy_digest(&digest) {
+        Ok(digest)
+    } else {
+        Err(serde::de::Error::custom(
+            "policyDigest must be 64 lowercase hexadecimal characters",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -774,8 +795,8 @@ pub struct InvocationResult {
 pub enum AuthorizationError {
     #[error("authorization decision identifier must not be empty")]
     EmptyDecisionId,
-    #[error("authorization policy revision must not be empty")]
-    EmptyPolicyRevision,
+    #[error("authorization policy digest must be 64 lowercase hexadecimal characters")]
+    InvalidPolicyDigest,
     #[error("authorization timeout must be greater than zero")]
     ZeroTimeout,
     #[error(transparent)]
@@ -823,14 +844,14 @@ pub mod broker {
             provider: ProviderId,
             decision_id: String,
             authorized_by: PrincipalId,
-            policy_revision: String,
+            policy_digest: String,
             constraints: ExecutionConstraints,
         ) -> Result<AuthorizedInvocation, AuthorizationError> {
             if decision_id.trim().is_empty() {
                 return Err(AuthorizationError::EmptyDecisionId);
             }
-            if policy_revision.trim().is_empty() {
-                return Err(AuthorizationError::EmptyPolicyRevision);
+            if !super::valid_policy_digest(&policy_digest) {
+                return Err(AuthorizationError::InvalidPolicyDigest);
             }
             if constraints.timeout_ms == 0 {
                 return Err(AuthorizationError::ZeroTimeout);
@@ -864,7 +885,7 @@ pub mod broker {
                 receipt: AuthorizationReceipt {
                     decision_id,
                     authorized_by,
-                    policy_revision,
+                    policy_digest,
                 },
                 constraints,
             })
@@ -920,7 +941,7 @@ mod tests {
                 "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
-                "policy-1".to_owned(),
+                "a".repeat(64),
                 ExecutionConstraints::default(),
             )
             .expect("valid broker decision");
@@ -943,7 +964,7 @@ mod tests {
                 "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
-                "policy-1".to_owned(),
+                "a".repeat(64),
                 constraints,
             )
             .expect_err("zero timeout must fail");
@@ -1050,7 +1071,7 @@ mod tests {
                     "github".parse().expect("valid provider fixture"),
                     "decision-1".to_owned(),
                     "broker".parse::<PrincipalId>().expect("valid fixture"),
-                    "policy-1".to_owned(),
+                    "a".repeat(64),
                     ExecutionConstraints {
                         http: Some(http),
                         ..ExecutionConstraints::default()
@@ -1137,6 +1158,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_digest_is_required_and_has_the_same_shape_on_receipt_and_reference() {
+        for invalid in ["", "policy-1", &"A".repeat(64), &"g".repeat(64)] {
+            let err = broker::AuthorizationGate::new()
+                .authorize(
+                    proposal(),
+                    "github".parse().unwrap(),
+                    "decision-1".into(),
+                    "broker".parse().unwrap(),
+                    invalid.into(),
+                    ExecutionConstraints::default(),
+                )
+                .expect_err("malformed receipt digest must fail");
+            assert!(matches!(err, AuthorizationError::InvalidPolicyDigest));
+            let value = json!({"decisionId": "decision-1", "authorizedBy": "broker", "policyDigest": invalid});
+            assert!(serde_json::from_value::<super::DecisionReference>(value).is_err());
+        }
+        let old = json!({"decisionId": "decision-1", "authorizedBy": "broker", "policyRevision": "a".repeat(64)});
+        assert!(serde_json::from_value::<super::DecisionReference>(old).is_err());
+        let valid = json!({"decisionId": "decision-1", "authorizedBy": "broker", "policyDigest": "a".repeat(64)});
+        let reference: super::DecisionReference =
+            serde_json::from_value(valid.clone()).expect("new record decodes");
+        assert_eq!(serde_json::to_value(reference).unwrap(), valid);
+    }
+
+    #[test]
     fn authorized_invocation_serialization_preserves_linkage() {
         let constraints = ExecutionConstraints {
             http: Some(HttpConstraints {
@@ -1157,7 +1203,7 @@ mod tests {
                 "github".parse().expect("valid provider fixture"),
                 "decision-1".to_owned(),
                 "broker".parse::<PrincipalId>().expect("valid fixture"),
-                "policy-1".to_owned(),
+                "a".repeat(64),
                 constraints,
             )
             .expect("valid broker decision");
@@ -1177,7 +1223,7 @@ mod tests {
                 "receipt": {
                     "decisionId": "decision-1",
                     "authorizedBy": "broker",
-                    "policyRevision": "policy-1"
+                    "policyDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 },
                 "constraints": {
                     "timeoutMs": 30_000,

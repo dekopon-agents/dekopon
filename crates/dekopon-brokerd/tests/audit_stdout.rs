@@ -195,7 +195,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
     assert_eq!(decision["decision.allowed"], true);
     assert_eq!(decision["policy.ids"], "cpetersen-upper");
     assert!(decision["policy.digest"].is_string(), "{decision}");
-    assert_eq!(decision["policy.revision"], decision["policy.digest"]);
+    assert!(decision.get("policy.revision").is_none(), "{decision}");
     assert_eq!(decision["target"], "dekopon_broker::audit");
 
     let execution = records
@@ -205,6 +205,8 @@ permit(principal == Dekopon::Principal::"cpetersen",
     assert_eq!(execution["outcome"], "Succeeded");
     assert_eq!(execution["provider"], "cli-probe");
     assert!(execution.get("output.digest").is_none(), "{execution}");
+    assert!(execution.get("policy.revision").is_none(), "{execution}");
+    assert_eq!(execution["policy.digest"], decision["policy.digest"]);
 
     assert!(decision.get("trace_id").is_none(), "{decision}");
     assert!(decision.get("span_id").is_none(), "{decision}");

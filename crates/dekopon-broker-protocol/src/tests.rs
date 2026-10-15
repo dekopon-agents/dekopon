@@ -2350,7 +2350,7 @@ fn failed_with_detail() -> InvocationResult {
         decision: DecisionReference {
             decision_id: "decision-gpt-image".to_owned(),
             authorized_by: "broker".parse().expect("valid principal fixture"),
-            policy_revision: "policy-1".to_owned(),
+            policy_digest: "a".repeat(64),
         },
         outcome: InvocationOutcome::Failed,
         exit_status: None,

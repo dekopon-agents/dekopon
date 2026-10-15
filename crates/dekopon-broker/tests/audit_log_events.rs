@@ -14,6 +14,7 @@ use dekopon_core::{
     RiskLevel,
 };
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const SECRET: &str = "audit-log-record-must-never-see-this";
@@ -126,17 +127,47 @@ fn only(captured: &CaptureLayer, fields: &[(&str, &str)]) -> Record {
     record
 }
 
+fn assert_loaded_execution(captured: &CaptureLayer, expected_digest: &str) {
+    let execution = only(captured, &[("audit.event", "broker.execution")]);
+    assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
+    assert_eq!(execution.field("output.digest"), None, "{execution:?}");
+    assert_eq!(
+        execution.field("provider.artifact_sha256"),
+        Some(expected_digest)
+    );
+    assert_eq!(execution.field("policy.revision"), None);
+    for (name, value) in [
+        ("invocation.id", "invoke-audited"),
+        ("outcome", "Succeeded"),
+        ("effect", "ReadOnly"),
+        ("risk", "Low"),
+        ("credential", "fetch-token"),
+    ] {
+        assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
+    }
+    let calls: serde_json::Value =
+        serde_json::from_str(execution.field("http.calls").unwrap()).unwrap();
+    assert_eq!(calls[0]["credentialInjected"], true, "{calls}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
+    let fixture = provider_fixture("http-probe-provider.wasm");
+    let expected_digest = Sha256::digest(std::fs::read(&fixture).expect("fixture bytes"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let registry = BrokerProviderRegistry::load([fixture], BrokerHostLimits::default())
+        .await
+        .expect("HTTP provider fixture loads");
+    let artifact_digest = registry
+        .loaded_provider_metadata()
+        .next()
+        .expect("loaded fixture")
+        .artifact_sha256;
     let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
@@ -237,12 +268,12 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         ("actor.kind", "agent"),
         ("actor.id", "provider-test"),
         ("provider", "http-probe"),
-        ("policy.revision", "policy-test"),
         ("policy.ids", "http-fetch"),
     ] {
         assert_eq!(decision.field(name), Some(value), "{name}: {decision:?}");
     }
     assert!(decision.field("policy.digest").is_some(), "{decision:?}");
+    assert_eq!(decision.field("policy.revision"), None);
     let request_decision = only(
         &captured,
         &[
@@ -254,21 +285,9 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     assert_eq!(request_decision.parent(), Some("http.request"));
     assert_eq!(request_decision.field("decision.allowed"), Some("true"));
 
-    let execution = only(&captured, &[("audit.event", "broker.execution")]);
-    assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
-    assert_eq!(execution.field("output.digest"), None, "{execution:?}");
-    for (name, value) in [
-        ("invocation.id", "invoke-audited"),
-        ("outcome", "Succeeded"),
-        ("effect", "ReadOnly"),
-        ("risk", "Low"),
-        ("credential", "fetch-token"),
-    ] {
-        assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
-    }
-    let calls: serde_json::Value =
-        serde_json::from_str(execution.field("http.calls").unwrap()).unwrap();
-    assert_eq!(calls[0]["credentialInjected"], true, "{calls}");
+    assert_eq!(artifact_digest, expected_digest);
+    assert_eq!(expected_digest.len(), 64);
+    assert_loaded_execution(&captured, &expected_digest);
 
     let refusal = only(&captured, &[("invocation.id", "invoke-refused")]);
     assert_eq!(refusal.parent(), Some("broker.authorize"), "{refusal:?}");

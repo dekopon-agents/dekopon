@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -2030,6 +2030,8 @@ struct ModelScript {
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
     builds: AtomicUsize,
+    capture_images: AtomicBool,
+    image_bytes: Mutex<Vec<Vec<u8>>>,
     forbidden: bool,
 }
 
@@ -2056,6 +2058,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: false,
         })
     }
@@ -2068,6 +2072,8 @@ impl ModelScript {
             cache_keys: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             builds: AtomicUsize::new(0),
+            capture_images: AtomicBool::new(false),
+            image_bytes: Mutex::new(Vec::new()),
             forbidden: true,
         })
     }
@@ -2139,6 +2145,23 @@ impl ChatModel for ScriptedModel {
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
+        if self.0.capture_images.load(Ordering::SeqCst) {
+            for data in messages
+                .iter()
+                .filter_map(ModelMessage::parts)
+                .flatten()
+                .filter_map(|part| match part {
+                    dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                    dekopon_model::model::ContentPart::Text(_)
+                    | dekopon_model::model::ContentPart::File { .. } => None,
+                })
+            {
+                self.0
+                    .image_bytes
+                    .lock()
+                    .push(data.read().expect("model can read fetched image"));
+            }
+        }
         self.0.prompts.lock().push(messages.to_vec());
         self.0.tools.lock().push(tools.to_vec());
         self.0
@@ -2662,7 +2685,7 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
         "decision": {
             "decisionId": "record-result-decision",
             "authorizedBy": "broker",
-            "policyRevision": "record-result-policy"
+            "policyDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         },
         "outcome": outcome,
         "error": error,
@@ -3592,9 +3615,9 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         ],
     )
     .await;
-    let models = ModelScript::new([decline_reply()]);
+    let models = InterruptibleModel::new([decline_reply()]);
     let driver = Arc::new(RecordingDriver::default().with_status());
-    let runner = runner(broker, Arc::clone(&models), 4);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 4);
     let route = persistent_route(model_config(), window());
     let mut message = owned_slack_message("OK, thanks", true);
     message.liveness = Some(LivenessTarget::Slack {
@@ -3611,23 +3634,37 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &message.subject,
     );
 
-    run_session(
+    let session = tokio::spawn(run_session(
         Arc::clone(&runner),
         route,
         message,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        driver
+            .status_object()
+            .expect("the driver publishes native status")
+            .wait_for_calls(1),
     )
-    .await;
+    .await
+    .expect("Working status arrives before model release");
+    models.release();
+    session.await.expect("decline session completes");
 
     assert!(
         driver.replies().is_empty(),
         "declining must not call chat.postMessage"
     );
-    driver
-        .status_object()
-        .expect("the driver publishes native status")
-        .wait_for_calls(2)
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        driver
+            .status_object()
+            .expect("the driver publishes native status")
+            .wait_for_calls(2),
+    )
+    .await
+    .expect("status returns to idle after decline");
     assert_eq!(
         driver.rendered().last().map(String::as_str),
         Some("status:idle"),
@@ -8553,6 +8590,339 @@ async fn a_slack_upload_is_routed_and_described_for_numbering() {
             }),
         }]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one live forward scenario across private, shared and inaccessible fetches"
+)]
+async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
+    struct ForwardImage(Arc<AtomicUsize>, bool);
+    impl AssetFetcher for ForwardImage {
+        fn fetch(
+            &self,
+            source: &AssetSourceRef,
+            _max_bytes: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            assert!(
+                matches!(source, AssetSourceRef::Slack { file_id, .. } if file_id == "F-FORWARD")
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if self.1 {
+                Box::pin(async { Err(TransportError::Response) })
+            } else {
+                Box::pin(async { Ok(b"\x89PNG\r\n\x1a\nforwarded pixels".to_vec()) })
+            }
+        }
+    }
+
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "forward",
+        json!({
+            "type": "message", "channel": "d0123abc", "channel_type": "im",
+            "user": "u9xyz", "ts": "1700000000.000001", "text": "What is in this image?",
+            "attachments": [{
+                "is_share": true, "is_msg_unfurl": true,
+                "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
+                "ts": "1700000000.000100", "text": "the original question",
+                "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
+                    "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
+            }]
+        }),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("connected Slack transport");
+    let inbound = next_message(&mut transport).await;
+    let transport_name = inbound.transport.clone();
+    let slack_route = move |model, memory| {
+        let mut route = persistent_route(model, memory);
+        route.transport = transport_name.clone();
+        route
+    };
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(6, &["cli-probe.upper"])).await;
+    let fetch_call = || {
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "forward-fetch".into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".into(),
+                    arguments: "{\"id\":1}".into(),
+                },
+            }],
+            None,
+        )
+    };
+    let models = ModelScript::new([
+        answer("I can inspect it."),
+        fetch_call(),
+        answer("The image was inspected."),
+        fetch_call(),
+        answer("That image is not in your conversation."),
+    ]);
+    models.capture_images.store(true, Ordering::SeqCst);
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            inbound.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&fetches), false)) as Arc<dyn AssetFetcher>,
+        );
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let route = slack_route(model, window());
+    let driver = Arc::new(RecordingDriver::default());
+    let inaccessible = inbound.clone();
+    let shared_first = inbound.clone();
+    let mut follow_up = inbound.clone();
+    follow_up.message_id = MessageId::Native("1700000000.000002".into());
+    follow_up.text = "Please inspect the earlier image".into();
+    follow_up.assets.clear();
+    let mut other_speaker = follow_up.clone();
+    other_speaker.subject = "slack.t0123abc.u8xyz".parse().expect("other Slack user");
+    other_speaker.message_id = MessageId::Native("1700000000.000003".into());
+    let shared_second = other_speaker.clone();
+    for (inbound, label) in [
+        (inbound, "first"),
+        (follow_up, "follow-up"),
+        (other_speaker, "other speaker"),
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                inbound,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} session completed"));
+    }
+
+    let initial = models.prompt(0);
+    let question = &initial.last().expect("question").1;
+    assert!(question.contains("What is in this image?"), "{initial:?}");
+    assert!(question.contains("the original question"), "{initial:?}");
+    assert!(
+        initial.last().expect("question").1.contains("chat-asset:1"),
+        "{initial:?}"
+    );
+    let follow = models.prompt(1);
+    assert!(
+        follow
+            .last()
+            .expect("follow-up")
+            .1
+            .contains("Please inspect the earlier image"),
+        "{follow:?}"
+    );
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    {
+        let fetched = models.prompts.lock();
+        assert!(
+            fetched[2]
+                .iter()
+                .filter_map(ModelMessage::parts)
+                .flatten()
+                .any(|part| matches!(part, dekopon_model::model::ContentPart::Image { .. })),
+            "model received forwarded image as an image part"
+        );
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
+    assert!(tool_message(&models, 4).contains("There is no chat-asset:1"));
+    assert_eq!(
+        driver.replies(),
+        [
+            "I can inspect it.",
+            "The image was inspected.",
+            "That image is not in your conversation."
+        ]
+    );
+
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        answer("Shared image ready."),
+        fetch_call(),
+        answer("Shared image inspected."),
+    ]);
+    models.capture_images.store(true, Ordering::SeqCst);
+    let mut shared_runner = self::runner(broker, Arc::clone(&models), 4);
+    let shared_fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut shared_runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            shared_first.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&shared_fetches), false)) as Arc<dyn AssetFetcher>,
+        );
+    let mut shared_model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut shared_model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let shared_route = slack_route(shared_model, shared_window());
+    let shared_driver = Arc::new(RecordingDriver::default());
+    for inbound in [shared_first, shared_second] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&shared_runner),
+                shared_route.clone(),
+                inbound,
+                Arc::clone(&shared_driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("shared turn completed");
+    }
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(!tool_message(&models, 2).contains("There is no chat-asset"));
+    assert_eq!(shared_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
+
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([fetch_call(), answer("Image unavailable.")]);
+    let mut failed_runner = self::runner(broker, Arc::clone(&models), 4);
+    let failed_fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut failed_runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            inaccessible.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&failed_fetches), true)) as Arc<dyn AssetFetcher>,
+        );
+    let gated_forward = inaccessible.clone();
+    let driver = Arc::new(RecordingDriver::default());
+    let mut failed_model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut failed_model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    run_session(
+        failed_runner,
+        slack_route(failed_model, window()),
+        inaccessible,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(failed_fetches.load(Ordering::SeqCst), 1);
+    let prompt = models.prompt(0);
+    assert!(
+        !prompt
+            .last()
+            .expect("forward question")
+            .1
+            .contains("unavailable"),
+        "{prompt:?}"
+    );
+    assert!(tool_message(&models, 1).contains("could not be read (response)"));
+
+    for (index, broker) in [
+        {
+            let directory = temporary();
+            let (broker, _observed) = stub_broker(
+                directory.path(),
+                vec![ResponseEnvelope::capabilities(
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                )],
+            )
+            .await;
+            (directory, broker)
+        },
+        {
+            let directory = temporary();
+            let broker = ResolvedBroker {
+                socket_path: directory.path().join("absent.sock"),
+                server_uid: crate::current_uid(),
+                frame: FrameLimits::default(),
+            };
+            (directory, broker)
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let models = ModelScript::forbidden();
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            self::runner(broker.1, Arc::clone(&models), 4),
+            slack_route(model_config(), window()),
+            gated_forward.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(
+            driver.replies(),
+            [if index == 0 {
+                UNAUTHORIZED_REPLY
+            } else {
+                FAILURE_REPLY
+            }]
+        );
+        assert_eq!(models.requests(), 0);
+    }
+
+    let mut sealed_forward = gated_forward;
+    sealed_forward.conversation.kind = ConversationKind::Thread;
+    sealed_forward.conversation.thread = Some("1700000000.000001".to_owned());
+    let route = slack_route(model_config(), window());
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &sealed_forward.conversation.key(),
+        &sealed_forward.subject,
+    );
+    let directory = temporary();
+    let broker = ResolvedBroker {
+        socket_path: directory.path().join("absent.sock"),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let models = ModelScript::forbidden();
+    let runner = self::runner(broker, Arc::clone(&models), 4);
+    assert!(crate::session::seal_conversation(&runner, &route, &sealed_forward, &key).await);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        sealed_forward,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::SEALED_THREAD_REPLY]);
+    assert_eq!(models.requests(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -15451,6 +15821,434 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             .ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one follow witness spans two speakers and their ordered broker requests"
+)]
+async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = dekopon_test_support::BrokerFixture::answering(
+        directory.path(),
+        [
+            ResponseEnvelope::chat_capabilities(
+                vec![capability("cli-probe.reverse")],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("owner".parse().unwrap()),
+            ),
+            ResponseEnvelope::chat_capabilities(
+                vec![capability("cli-probe.upper")],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("non-owner".parse().unwrap()),
+            ),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "cli-probe.reverse", "input": {"text": "secret"}
+            })).unwrap()),
+            upper_proposal("hello"),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    );
+    let models = ModelScript::new([
+        answer("Owner replied."),
+        script_call("probe reverse --text secret"),
+        script_call("probe upper --text hello"),
+        answer("The probe answered HELLO."),
+    ]);
+    let mut runner = Arc::into_inner(runner(
+        ResolvedBroker {
+            socket_path: broker.socket().to_path_buf(),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        Arc::clone(&models),
+        4,
+    ))
+    .unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message_from("tel.16034700183", "check hello");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(table);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = Arc::new(runner);
+    let mut owner = message_from("tel.16034700182", "owner invites another speaker");
+    owner.message_id = MessageId::Follow("owner-id".into());
+    for speaker in [owner.clone(), inbound.clone()] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                speaker,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("follow turn completes");
+    }
+    assert_eq!(
+        driver.replies(),
+        ["Owner replied.", "The probe answered HELLO."]
+    );
+    assert_eq!(models.requests(), 4);
+    let previous = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(owner_claim),
+    } = previous.request
+    else {
+        panic!("owner turn must open its own leg: {previous:?}");
+    };
+    assert_eq!(owner_claim.subject, owner.subject);
+    assert_eq!(
+        owner_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    let capabilities = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(claim),
+    } = capabilities.request
+    else {
+        panic!("first request must open the speaker's leg: {capabilities:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    let unlisted = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(unlisted_claim),
+        word: unlisted_word,
+        argv: unlisted_argv,
+        ..
+    } = unlisted.request
+    else {
+        panic!("unlisted command is resolved without invocation: {unlisted:?}");
+    };
+    assert_eq!(unlisted_claim.subject, inbound.subject);
+    assert_eq!(
+        unlisted_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert_eq!(unlisted_word, "probe");
+    assert_eq!(unlisted_argv, ["reverse", "--text", "secret"]);
+    let command = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(claim),
+        word,
+        argv,
+        ..
+    } = command.request
+    else {
+        panic!("second request must resolve the named command: {command:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert_eq!(word, "probe");
+    assert_eq!(argv, ["upper", "--text", "hello"]);
+    let invocation = broker.request().await;
+    let BrokerRequest::Invoke {
+        attestation: Some(claim),
+        invocation,
+        ..
+    } = invocation.request
+    else {
+        panic!("third request must invoke the named capability: {invocation:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    assert!(claim.binds(&invocation.id));
+    assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
+    assert_eq!(invocation.input, json!({"text": "hello"}));
+    assert!(
+        broker.recorded().is_empty(),
+        "two fresh capabilities requests, one permitted invocation and no unlisted invocation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts() {
+    for (label, response) in [
+        (
+            "unmapped",
+            ResponseEnvelope::error(dekopon_broker_protocol::ERROR_UNAUTHENTICATED, "unmapped"),
+        ),
+        (
+            "forbidden",
+            ResponseEnvelope::error(dekopon_broker_protocol::ERROR_UNAUTHENTICATED, "forbidden"),
+        ),
+        (
+            "empty-or-revoked",
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new()),
+        ),
+    ] {
+        let directory = temporary();
+        let journal_dir = temporary();
+        let mut broker =
+            dekopon_test_support::BrokerFixture::answering(directory.path(), [response]);
+        let resolved = ResolvedBroker {
+            socket_path: broker.socket().to_path_buf(),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        };
+        let models = ModelScript::forbidden();
+        let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
+        let journal = Arc::new(
+            crate::journal::Journal::open(
+                journal_dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+        let mut route = route(model_config());
+        route.follow = true;
+        let mut inbound = message_from("tel.16034700183", "ambient sentinel");
+        inbound.message_id = MessageId::Follow("native-id".into());
+        let key = crate::follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            &inbound.conversation.key(),
+        );
+        table.stay(&key, SystemTime::now()).unwrap();
+        runner.follow = Some(table);
+        let driver = Arc::new(RecordingDriver::default());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                Arc::new(runner),
+                route,
+                inbound.clone(),
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            ),
+        )
+        .await
+        .expect("refused turn completes");
+        assert_eq!(models.requests(), 0, "{label}");
+        assert!(driver.replies().is_empty(), "{label}");
+        let request = broker.request().await;
+        assert!(
+            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(ref claim) }
+                if claim.subject == inbound.subject
+                    && claim.scope.as_ref().is_some_and(|scope| scope.trigger == dekopon_broker_protocol::Trigger::Message)),
+            "{label}"
+        );
+        assert!(
+            broker.recorded().is_empty(),
+            "{label}: no capability invocation"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_inactive_follow_turn_records_only_category_metadata() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (capture, _guard) = capture_spans();
+    let mut broker = dekopon_test_support::BrokerFixture::answering(directory.path(), []);
+    let resolved = ResolvedBroker {
+        socket_path: broker.socket().to_path_buf(),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let models = ModelScript::forbidden();
+    let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    runner.follow = Some(Arc::new(crate::follow::FollowTable::load(journal).unwrap()));
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message_from("tel.16034700183", "private payload sentinel");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::new(runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 0);
+    assert!(broker.recorded().is_empty());
+    assert!(driver.replies().is_empty());
+    let events = capture.events_where("dekopon_gatewayd", &[("audit.event", "gateway.follow")]);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].field("operation"), Some("refused"));
+    assert_eq!(events[0].field("reason"), Some("inactive"));
+    for forbidden in [
+        "subject",
+        "principal",
+        "conversation",
+        "text",
+        "payload",
+        "capabilities",
+    ] {
+        assert_eq!(events[0].field(forbidden), None);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (capture, _guard) = capture_spans();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper"), leaving],
+                vec!["probe".into(), "follow".into()],
+                BTreeMap::new(),
+            ),
+            upper_proposal("hi"),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+            })).unwrap()),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("probe upper --text hi; follow leave"),
+        decline_reply(),
+    ]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    route.limits.max_steps = 2;
+    let mut inbound = message("work and leave");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table
+        .stay(&key, SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let marker = journal_dir.path().join(format!("{key}.followed"));
+    let original = fs::read(&marker).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let driver = Arc::new(FarewellOrderDriver {
+        table: Arc::clone(&table),
+        key: key.clone(),
+        delivered: Mutex::new(Vec::new()),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("follow session completes");
+    {
+        let delivered = driver.delivered.lock();
+        assert!(
+            matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })]
+            if text == UNREPORTED_WORK_REPLY),
+            "one fixed warning while the ticket is active: {delivered:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        original,
+        "a failed turn cannot refresh its ticket"
+    );
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
+    let failed = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_session_failed"),
+            ("category", "unreported-capability-work"),
+        ],
+    );
+    assert_eq!(failed.len(), 1, "the worked turn remains failed");
+    assert!(capture.records().iter().any(|record| matches!(record,
+        dekopon_test_support::Record::Span { name: "gateway.message", .. }
+        if record.field("outcome") == Some("failed"))));
+    let mut requests = Vec::new();
+    for _ in 0..5 {
+        requests.push(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("broker request arrives")
+                .expect("broker request is recorded"),
+        );
+    }
+    assert!(
+        matches!(&requests[2].request, BrokerRequest::Invoke { invocation, .. }
+        if invocation.capability.as_str() == "cli-probe.upper")
+    );
+    assert!(
+        matches!(&requests[4].request, BrokerRequest::Invoke { invocation, .. }
+        if invocation.capability.as_str() == "dekopon-provider-follow.leave")
+    );
+    assert!(observed.try_recv().is_err());
 }
 
 struct FarewellOrderDriver {
