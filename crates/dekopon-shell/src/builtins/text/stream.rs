@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_before_window_retains_charges_and_context_stays_step_bounded() {
+    fn grep_before_window_retains_charges() {
         let mut reader = PipeReader::from_bytes(b"abc\nabc\nabc\nmatch\n".to_vec());
         let mut budget = Budget::start(Limits {
             max_value_bytes: 7,
@@ -491,6 +491,37 @@ mod tests {
             CommandFailure::Fatal(crate::builtins::FatalError::Limit(
                 LimitExceeded::ValueBytes { maximum: 7 }
             ))
+        ));
+    }
+
+    #[test]
+    fn grep_after_context_emits_before_exhausting_the_next_chunk_step() {
+        let mut bytes = b"match\nctx\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 2 * pipe::CHUNK_BYTES));
+        let mut reader = PipeReader::from_bytes(bytes);
+        let mut budget = Budget::start(Limits {
+            max_steps: 3,
+            ..Limits::default()
+        });
+        let mut emitted = Vec::new();
+        let failure = TextStream::Grep
+            .run(
+                &["-A2".to_owned(), "match".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |part| {
+                    emitted.extend_from_slice(part);
+                    Ok(true)
+                },
+            )
+            .expect_err("context processing charges the next chunk");
+        assert_eq!(emitted, b"match\nctx\n");
+        assert!(matches!(
+            failure,
+            CommandFailure::Fatal(crate::builtins::FatalError::Limit(LimitExceeded::Steps {
+                maximum: 3
+            }))
         ));
     }
 

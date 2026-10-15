@@ -335,15 +335,16 @@ fn old_and_malformed_worker_headers_are_refused() {
 fn binding_header_is_charged_before_worker_input() {
     worker();
     let outcome = Interpreter::new(Limits {
-        max_value_bytes: 128,
+        max_value_bytes: 118,
         ..Limits::default()
     })
     .run(
-        &format!("jq -n --arg s '{}' '$s'", "x".repeat(130)),
+        &format!("jq -n --arg s '{}' '1'", "\u{1}".repeat(16)),
         &Invoker,
     );
+    assert_eq!(outcome.exit_code.get(), 2, "{outcome:?}");
     assert!(
-        outcome.output.contains("more than 128 bytes"),
+        outcome.output.contains("more than 118 bytes"),
         "{outcome:?}"
     );
 }

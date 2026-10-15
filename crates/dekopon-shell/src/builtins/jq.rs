@@ -41,6 +41,17 @@ pub(crate) struct Options {
     slurp: bool,
 }
 
+fn request_header(
+    opts: &mut Options,
+    budget: &Budget,
+) -> Result<(Vec<u8>, crate::RetainedBytes), CommandFailure> {
+    let header = serde_json::to_vec(&(&opts.filter, opts.slurp, &opts.bindings))
+        .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
+    let charge = budget.charge_value_bytes(header.len() as u64)?;
+    drop(std::mem::take(&mut opts.bindings));
+    Ok((header, charge))
+}
+
 pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
     let mut grammar = ClapCommand::new("jq");
     for (id, short, long) in [
@@ -214,15 +225,13 @@ fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailu
 const STDERR_BYTES: u64 = 4096;
 
 fn evaluate(
-    opts: Options,
+    mut opts: Options,
     input: &mut PipeReader,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
-    let header = serde_json::to_vec(&(&opts.filter, opts.slurp, &opts.bindings))
-        .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
-    let _header_charge = budget.charge_value_bytes(header.len() as u64)?;
+    let (header, _header_charge) = request_header(&mut opts, budget)?;
     let path =
         executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
     let child = Command::new(path)
@@ -652,6 +661,41 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_header_releases_binding_copies_and_orders_last_appearances() {
+        let mut opts = options(
+            &[
+                "--arg", "s", "first", "--arg", "t", "two", "--arg", "s", "last", "$s",
+            ]
+            .map(str::to_owned),
+        )
+        .expect("valid bindings");
+        let expected = serde_json::to_vec(&("$s", false, [("t", "two"), ("s", "last")]))
+            .expect("expected header");
+        let binding_bytes: usize = opts
+            .bindings
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let limit = expected.len() + 1;
+        assert!(binding_bytes > 1);
+        assert!(expected.len() + binding_bytes > limit);
+        let budget = Budget::start(crate::Limits {
+            max_value_bytes: limit as u64,
+            ..crate::Limits::default()
+        });
+        let (header, charge) =
+            request_header(&mut opts, &budget).expect("one retained header fits");
+        assert_eq!(header, expected);
+        assert!(
+            opts.bindings.is_empty(),
+            "bindings must not coexist with the charged header"
+        );
+        assert_eq!(budget.value_bytes(), header.len() as u64);
+        drop(charge);
+        assert_eq!(budget.value_bytes(), 0);
+    }
 
     #[test]
     fn slurp_refuses_an_oversized_document_before_finishing_its_parse() {
