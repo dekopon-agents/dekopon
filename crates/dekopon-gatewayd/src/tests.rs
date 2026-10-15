@@ -14620,6 +14620,106 @@ fn journaled_runner(
     })
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
+    use dekopon_shell::CapabilityInvoker as _;
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = dekopon_test_support::BrokerFixture::answering(
+        directory.path(),
+        [
+            ResponseEnvelope::chat_capabilities(
+                vec![capability("dekopon-provider-follow.stay")],
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("speaker".parse().unwrap()),
+            ),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    );
+    let message = message("invite");
+    let route = route(model_config());
+    let claim = Attestation::for_chat(
+        message.subject.clone(),
+        route.agent.clone(),
+        dekopon_broker_protocol::ChatScopeClaim {
+            transport: message.transport.parse().unwrap(),
+            kind: message.transport_kind,
+            conversation: message.conversation.clone(),
+            trigger: message.message_id.trigger(),
+        },
+    );
+    let client = dekopon_broker_protocol::BrokerClient::new(
+        broker.socket(),
+        crate::current_uid(),
+        FrameLimits::default(),
+    )
+    .unwrap();
+    let leg = dekopon_agent::BrokerLeg::connect(client, Some(claim.clone()))
+        .await
+        .unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &message.conversation.key(),
+    );
+    let invoker =
+        crate::follow::FollowInvoker::new(leg, Some((Arc::clone(&table), key.clone(), 0)));
+    let result = tokio::task::spawn_blocking(move || {
+        let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let calls = dekopon_shell::CallBudget::new(2);
+        invoker.invoke(
+            dekopon_shell::CommandProposal::new("dekopon-provider-follow.stay", json!({}), None),
+            dekopon_shell::Streams {
+                stdin: None,
+                stdout: std::os::fd::OwnedFd::from(stdout),
+            },
+            &dekopon_shell::TreeContext::new(dekopon_shell::Limits::default(), calls),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        dekopon_shell::CapabilityCallResult::Succeeded
+    ));
+    let requested = broker.request().await;
+    assert!(
+        matches!(requested.request, BrokerRequest::Capabilities { attestation: Some(ref actual) } if actual == &claim)
+    );
+    let invoked = broker.request().await;
+    let BrokerRequest::Invoke {
+        attestation,
+        invocation,
+        ..
+    } = invoked.request
+    else {
+        panic!("broker did not receive an invocation")
+    };
+    let actual = attestation.expect("invocation carries its chat attestation");
+    assert_eq!(actual.subject, claim.subject);
+    assert_eq!(actual.agent, claim.agent);
+    assert_eq!(actual.scope, claim.scope);
+    assert!(actual.binds(&invocation.id));
+    assert_eq!(
+        invocation.capability.to_string(),
+        "dekopon-provider-follow.stay"
+    );
+    assert_eq!(invocation.input, json!({}));
+    assert!(matches!(
+        crate::follow::FollowTable::load(journal)
+            .unwrap()
+            .ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
+}
+
 #[tokio::test]
 async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
     let directory = temporary();
