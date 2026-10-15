@@ -503,6 +503,60 @@ async fn a_changed_gateway_source_permission_or_missing_file_cannot_prepare() {
     ));
 }
 
+#[tokio::test]
+async fn regular_gateway_sources_allow_root_only_on_read_only_mounts() {
+    let uid = crate::current_uid();
+    assert_eq!(config::gateway_regular_owner(0, 65533, true), 0);
+    assert_eq!(config::gateway_regular_owner(0, 65533, false), 65533);
+    assert_eq!(config::gateway_regular_owner(65533, 65533, false), 65533);
+
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    assert!(
+        !config::read_config_file(path.clone(), uid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        config::read_config_file(path.clone(), uid + 1).await,
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::WrongOwner { .. },
+            ..
+        })
+    ));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        config::read_config_file(path, uid).await,
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::InsecureMode { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_projection_switch_during_read_is_a_changed_candidate() {
+    let root = temporary();
+    for generation in ["..old", "..new"] {
+        let directory = root.path().join(generation);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("gateway.yaml"), b"valid bytes").unwrap();
+    }
+    let data = root.path().join("..data");
+    let path = root.path().join("gateway.yaml");
+    std::os::unix::fs::symlink("..old", &data).unwrap();
+    std::os::unix::fs::symlink("..data/gateway.yaml", &path).unwrap();
+    assert!(matches!(
+        config::read_gateway_projection_with(&path, crate::current_uid(), true, || {
+            let next = root.path().join("..next");
+            std::os::unix::fs::symlink("..new", &next).unwrap();
+            fs::rename(next, &data).unwrap();
+        }),
+        Err(ConfigError::ChangedDuringLoad)
+    ));
+}
+
 #[test]
 fn a_read_only_projection_follows_the_replaced_data_generation() {
     let root = temporary();

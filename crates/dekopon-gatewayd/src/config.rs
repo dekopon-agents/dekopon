@@ -1571,6 +1571,15 @@ pub(crate) fn read_gateway_projection_at(
     expected_uid: u32,
     read_only: bool,
 ) -> Result<Vec<u8>, ConfigError> {
+    read_gateway_projection_with(path, expected_uid, read_only, || {})
+}
+
+pub(crate) fn read_gateway_projection_with(
+    path: &Path,
+    expected_uid: u32,
+    read_only: bool,
+    after_read: impl FnOnce(),
+) -> Result<Vec<u8>, ConfigError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let insecure = || ConfigError::InsecureProjection {
         path: path.to_path_buf(),
@@ -1631,17 +1640,29 @@ pub(crate) fn read_gateway_projection_at(
         path: path.to_path_buf(),
         source,
     })?;
+    after_read();
     if std::fs::read_link(root.join("..data")).map_err(read_error)? != generation {
-        return Err(insecure());
+        return Err(ConfigError::ChangedDuringLoad);
     }
     Ok(bytes)
+}
+
+pub(crate) fn gateway_regular_owner(observed: u32, expected_uid: u32, read_only: bool) -> u32 {
+    if observed == 0 && read_only {
+        0
+    } else {
+        expected_uid
+    }
 }
 
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+pub(crate) async fn read_config_file(
+    path: PathBuf,
+    expected_uid: u32,
+) -> Result<Vec<u8>, ConfigError> {
     // This file isn't a secret, since credentials live in the environment and transport credential
     // files, so the bar here is only that nobody else can rewrite it.
     let owned = path.clone();
@@ -1656,9 +1677,31 @@ async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, C
             })?;
     }
     tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::MetadataExt as _;
+        let observed = std::fs::symlink_metadata(&owned)
+            .map_err(|source| FileHygieneError::Io {
+                path: owned.clone(),
+                source,
+            })?
+            .uid();
+        let read_only = if observed == 0 && expected_uid != 0 {
+            let parent = owned.parent().ok_or_else(|| FileHygieneError::Io {
+                path: owned.clone(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "source has no parent"),
+            })?;
+            rustix::fs::statvfs(parent)
+                .map_err(|source| FileHygieneError::Io {
+                    path: owned.clone(),
+                    source: source.into(),
+                })?
+                .f_flag
+                .contains(rustix::fs::StatVfsMountFlags::RDONLY)
+        } else {
+            false
+        };
         read_trusted_file(
             &owned,
-            expected_uid,
+            gateway_regular_owner(observed, expected_uid, read_only),
             FileTier::NotWorldWritable,
             HARD_MAX_CONFIG_BYTES,
         )
