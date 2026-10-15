@@ -2,12 +2,14 @@ use std::{
     fmt,
     io::{self, Write},
     ops::Range,
-    sync::{Arc, Weak},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use arc_swap::ArcSwap;
 use dekopon_model::model::{AssistantTurn, ModelMessage, assistant_message};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -66,10 +68,57 @@ pub struct Selection {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ArenaHeadroom {
+    limit: usize,
+    charged: AtomicUsize,
+}
+
+impl ArenaHeadroom {
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            charged: AtomicUsize::new(0),
+        })
+    }
+
+    #[must_use]
+    pub fn charged(&self) -> usize {
+        self.charged.load(Ordering::Acquire)
+    }
+
+    fn charge(self: &Arc<Self>, bytes: usize) -> Result<Charge, ArenaRefusal> {
+        self.charged
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged
+                    .checked_add(bytes)
+                    .filter(|total| *total <= self.limit)
+            })
+            .map_err(|_exhausted| ArenaRefusal::TransientHeadroom)?;
+        Ok(Charge {
+            headroom: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+struct Charge {
+    headroom: Arc<ArenaHeadroom>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.headroom
+            .charged
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 pub struct ArenaSnapshot {
     bytes: Vec<u8>,
     records: Vec<(u64, Range<usize>)>,
+    _charge: Charge,
 }
 
 impl fmt::Debug for ArenaSnapshot {
@@ -93,20 +142,28 @@ impl ArenaSnapshot {
     pub fn bytes(&self) -> usize {
         self.bytes.len()
     }
-
-    fn allocated_bytes(&self) -> usize {
-        self.bytes.capacity().saturating_add(
-            self.records
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(u64, Range<usize>)>()),
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArenaRefusal {
     TransientHeadroom,
     DuplicateRecord,
+}
+
+struct Measured(usize);
+
+impl Write for Measured {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(input.len())
+            .ok_or_else(|| io::Error::other("arena size overflow"))?;
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BoundedBytes {
@@ -120,9 +177,6 @@ impl Write for BoundedBytes {
             return Err(io::Error::other("arena transient headroom exceeded"));
         }
         self.bytes.extend_from_slice(input);
-        if self.bytes.capacity() > self.limit {
-            return Err(io::Error::other("arena transient headroom exceeded"));
-        }
         Ok(input.len())
     }
 
@@ -138,19 +192,35 @@ struct PackedTurn<'a> {
     exchanges: &'a [Exchange],
 }
 
+impl<'a> PackedTurn<'a> {
+    fn of(turn: &'a ConversationTurn) -> Self {
+        Self {
+            user: turn.user(),
+            answer: turn.answer(),
+            exchanges: turn.exchanges(),
+        }
+    }
+}
+
 pub struct PackedArena {
     current: ArcSwap<ArenaSnapshot>,
-    publication: Mutex<Vec<Weak<ArenaSnapshot>>>,
-    max_transient_bytes: usize,
+    headroom: Arc<ArenaHeadroom>,
 }
 
 impl PackedArena {
     #[must_use]
-    pub fn new(max_transient_bytes: usize) -> Self {
+    pub fn new(headroom: Arc<ArenaHeadroom>) -> Self {
+        let empty = ArenaSnapshot {
+            bytes: Vec::new(),
+            records: Vec::new(),
+            _charge: Charge {
+                headroom: Arc::clone(&headroom),
+                bytes: 0,
+            },
+        };
         Self {
-            current: ArcSwap::from_pointee(ArenaSnapshot::default()),
-            publication: Mutex::new(Vec::new()),
-            max_transient_bytes,
+            current: ArcSwap::from_pointee(empty),
+            headroom,
         }
     }
 
@@ -159,53 +229,44 @@ impl PackedArena {
         self.current.load_full()
     }
 
+    /// Callers serialize repacks of one arena; the shared headroom itself is safe to charge from
+    /// any number of arenas at once.
     pub fn repack(&self, records: &[(u64, &ConversationTurn)]) -> Result<(), ArenaRefusal> {
-        let mut live = self.publication.lock();
-        live.retain(|snapshot| snapshot.strong_count() != 0);
-        let current = self.current.load_full();
-        let resident = live
-            .iter()
-            .filter_map(Weak::upgrade)
-            .fold(current.allocated_bytes(), |sum, snapshot| {
-                sum.saturating_add(snapshot.allocated_bytes())
-            });
-        let handles_bytes = records
-            .len()
-            .checked_mul(std::mem::size_of::<(u64, Range<usize>)>())
-            .ok_or(ArenaRefusal::TransientHeadroom)?;
-        if handles_bytes > self.max_transient_bytes.saturating_sub(resident) {
-            return Err(ArenaRefusal::TransientHeadroom);
-        }
-        let mut bytes = BoundedBytes {
-            bytes: Vec::new(),
-            limit: self.max_transient_bytes - resident - handles_bytes,
-        };
-        let mut handles = Vec::with_capacity(records.len());
         let mut ids = std::collections::HashSet::new();
+        let mut measured = Measured(0);
         for (id, turn) in records {
             if !ids.insert(*id) {
                 return Err(ArenaRefusal::DuplicateRecord);
             }
+            serde_json::to_writer(&mut measured, &PackedTurn::of(turn))
+                .map_err(|_overflow| ArenaRefusal::TransientHeadroom)?;
+        }
+        let handles_bytes = records
+            .len()
+            .checked_mul(std::mem::size_of::<(u64, Range<usize>)>())
+            .ok_or(ArenaRefusal::TransientHeadroom)?;
+        let charge = self.headroom.charge(
+            measured
+                .0
+                .checked_add(handles_bytes)
+                .ok_or(ArenaRefusal::TransientHeadroom)?,
+        )?;
+        let mut bytes = BoundedBytes {
+            bytes: Vec::with_capacity(measured.0),
+            limit: measured.0,
+        };
+        let mut handles = Vec::with_capacity(records.len());
+        for (id, turn) in records {
             let start = bytes.bytes.len();
-            serde_json::to_writer(
-                &mut bytes,
-                &PackedTurn {
-                    user: turn.user(),
-                    answer: turn.answer(),
-                    exchanges: turn.exchanges(),
-                },
-            )
-            .map_err(|_serialize| ArenaRefusal::TransientHeadroom)?;
+            serde_json::to_writer(&mut bytes, &PackedTurn::of(turn))
+                .map_err(|_exceeded| ArenaRefusal::TransientHeadroom)?;
             handles.push((*id, start..bytes.bytes.len()));
         }
-        let next = Arc::new(ArenaSnapshot {
+        self.current.store(Arc::new(ArenaSnapshot {
             bytes: bytes.bytes,
             records: handles,
-        });
-        let previous = self.current.swap(next);
-        if Arc::strong_count(&previous) > 1 {
-            live.push(Arc::downgrade(&previous));
-        }
+            _charge: charge,
+        }));
         Ok(())
     }
 }
@@ -460,11 +521,13 @@ impl History {
 
 #[cfg(test)]
 mod arena_tests {
-    use super::{ArenaRefusal, ConversationTurn, Exchange, PackedArena, Representation};
+    use super::{
+        ArenaHeadroom, ArenaRefusal, ConversationTurn, Exchange, PackedArena, Representation,
+    };
 
     #[test]
     fn a_reader_survives_publication_with_stable_record_handles() {
-        let arena = PackedArena::new(4096);
+        let arena = PackedArena::new(ArenaHeadroom::new(4096));
         let first =
             ConversationTurn::completed("one 🟠", "answered").with_exchanges(vec![Exchange {
                 tool: "bash".into(),
@@ -503,7 +566,7 @@ mod arena_tests {
 
     #[test]
     fn held_readers_count_against_headroom_and_refusal_does_not_publish() {
-        let arena = PackedArena::new(270);
+        let arena = PackedArena::new(ArenaHeadroom::new(200));
         let first = ConversationTurn::completed("old", "ok");
         let second = ConversationTurn::completed("next", "ok");
         let third = ConversationTurn::completed("a".repeat(35), "ok");

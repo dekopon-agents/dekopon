@@ -37,8 +37,9 @@ pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
 pub use history::{
-    ArenaRefusal, ArenaSnapshot, ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, Exchange,
-    History, HistoryLimits, PackedArena, Pin, RawAnswer, ReadRef, Representation, Selection,
+    ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_TURNS, Exchange, History, HistoryLimits, PackedArena, Pin, RawAnswer, ReadRef,
+    Representation, Selection,
 };
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";

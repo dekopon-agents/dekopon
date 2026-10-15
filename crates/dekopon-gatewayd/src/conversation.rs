@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{ArenaSnapshot, ConversationTurn, History, PackedArena};
+use dekopon_agent::prompt::{
+    ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, History, PackedArena,
+};
 use dekopon_core::{AgentId, ExternalSubject};
 use sha2::{Digest, Sha256};
 
@@ -210,7 +212,7 @@ impl ConversationLease<'_> {
                 None => {
                     let mut conversation = Conversation::new(
                         History::new(window.limits),
-                        self.store.arena_limit,
+                        &self.store.headroom,
                         declared_cache_key.to_owned(),
                         now,
                     );
@@ -285,13 +287,18 @@ pub(crate) struct SealedConversation {
 
 pub(crate) struct ConversationStore {
     capacity: usize,
-    arena_limit: usize,
+    headroom: Arc<ArenaHeadroom>,
     state: Mutex<StoreState>,
 }
 
 impl Conversation {
-    fn new(history: History, arena_limit: usize, cache_key: String, now: Instant) -> Self {
-        let arena = Arc::new(PackedArena::new(arena_limit));
+    fn new(
+        history: History,
+        headroom: &Arc<ArenaHeadroom>,
+        cache_key: String,
+        now: Instant,
+    ) -> Self {
+        let arena = Arc::new(PackedArena::new(Arc::clone(headroom)));
         let record_ids = (1..=history.len() as u64).collect();
         let next_record_id = history.len() as u64 + 1;
         let conversation = Self {
@@ -328,8 +335,8 @@ impl Conversation {
             tracing::warn!(
                 event = "gateway_memory_retention_failed",
                 reason = match reason {
-                    dekopon_agent::prompt::ArenaRefusal::TransientHeadroom => "arena-headroom",
-                    dekopon_agent::prompt::ArenaRefusal::DuplicateRecord => "duplicate-record",
+                    ArenaRefusal::TransientHeadroom => "arena-headroom",
+                    ArenaRefusal::DuplicateRecord => "duplicate-record",
                 }
             );
         }
@@ -345,7 +352,7 @@ impl ConversationStore {
     pub fn with_arena_limit(capacity: usize, arena_limit: usize) -> Self {
         Self {
             capacity,
-            arena_limit,
+            headroom: ArenaHeadroom::new(arena_limit),
             state: Mutex::new(StoreState {
                 next_generation: 1,
                 slots: HashMap::new(),
@@ -415,9 +422,8 @@ impl ConversationStore {
             let generation = allocate_generation(&mut state);
             let asset_fence = Arc::new(AssetFence::new());
             let cache_key = cache_key::for_conversation();
-            let live = recalled.map(|history| {
-                Conversation::new(history, self.arena_limit, cache_key.clone(), now)
-            });
+            let live = recalled
+                .map(|history| Conversation::new(history, &self.headroom, cache_key.clone(), now));
             let history = live.as_ref().map_or_else(
                 || History::new(window.limits),
                 |conversation| conversation.history.clone(),
@@ -464,7 +470,7 @@ impl ConversationStore {
         {
             slot.live = Some(Conversation::new(
                 history,
-                self.arena_limit,
+                &self.headroom,
                 cache_key::for_conversation(),
                 now,
             ));
