@@ -597,7 +597,7 @@ mod tests {
             .set_default();
         {
             let store = Arc::new(Store(std::sync::atomic::AtomicUsize::new(0)));
-            let queue = ReplyAttachments::new(1, Arc::clone(&store), "local".into());
+            let queue = ReplyAttachments::new(1, Arc::<Store>::clone(&store), "local".into());
             let blob = DiskBlob::from_bytes(b"mp4\0frames").unwrap();
             let metadata = NewAsset {
                 descriptor: 0,
