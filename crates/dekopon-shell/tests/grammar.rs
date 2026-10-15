@@ -1237,6 +1237,9 @@ fn text_operands_read_exact_named_buffers_without_host_paths() {
         assert_eq!(output(script), expected, "{script}");
     }
     assert_eq!(output("printf 'a\\nb\\n' | wc -l -"), "2");
+    let null = run("wc -l /dev/null");
+    assert_eq!(null.output, "0", "{null:?}");
+    assert_eq!(null.exit_code.get(), 0, "{null:?}");
     assert_eq!(output("printf 'a\\nb\\n' > buf; head -5 buf"), "a\nb");
     assert_eq!(code("printf a > buf; tail +5 buf"), 2);
     let missing = run("wc -l /tmp/epic.txt");
@@ -1250,6 +1253,14 @@ fn text_operands_read_exact_named_buffers_without_host_paths() {
     ] {
         let outcome = run(&format!("echo a | {command} first second"));
         assert_eq!(outcome.exit_code.get(), 2, "{command}: {outcome:?}");
+        assert!(
+            outcome.output.contains("unexpected argument \"second\""),
+            "{command}: {outcome:?}"
+        );
+        assert!(
+            !outcome.output.contains("input arrives through a pipe"),
+            "{outcome:?}"
+        );
     }
     assert_eq!(
         output("printf '/w==' | base64 -d > buf; head -c 1 buf | base64"),

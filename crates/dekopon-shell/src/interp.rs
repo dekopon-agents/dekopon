@@ -2422,6 +2422,9 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
     ) -> Result<(PipeReader, Option<crate::RetainedBytes>), CommandFailure> {
         if let Some(name) = operand.filter(|name| *name != "-") {
+            if name == DEV_NULL {
+                return Ok((PipeReader::default(), None));
+            }
             let bytes = self.buffers.get(name).ok_or_else(|| {
                 CommandFailure::failed(format!(
                     "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"

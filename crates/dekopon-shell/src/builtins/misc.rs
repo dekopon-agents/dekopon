@@ -717,7 +717,7 @@ mod tests {
             ..Limits::default()
         };
         let started = std::time::Instant::now();
-        let failure = run_builtin_with(&Sleep, &["30"], None, limits, &mut Default::default())
+        let failure = run_builtin_with(&Sleep, &["30"], None, limits)
             .expect_err("an oversized sleep trips the deadline");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -741,9 +741,8 @@ mod tests {
         };
         for duration in ["1e30", "99999999999999999999", "1e300"] {
             let started = std::time::Instant::now();
-            let failure =
-                run_builtin_with(&Sleep, &[duration], None, limits, &mut Default::default())
-                    .expect_err("an oversized sleep trips the deadline");
+            let failure = run_builtin_with(&Sleep, &[duration], None, limits)
+                .expect_err("an oversized sleep trips the deadline");
             assert!(matches!(failure, CommandFailure::Fatal(_)), "{duration}");
             assert!(started.elapsed() < Duration::from_secs(5), "{duration}");
         }
@@ -751,14 +750,8 @@ mod tests {
 
     #[test]
     fn cat_without_arguments_preserves_input() {
-        let result = run_builtin_with(
-            &Cat,
-            &[],
-            Some(json!("hi")),
-            Limits::default(),
-            &mut Default::default(),
-        )
-        .expect("cat runs");
+        let result =
+            run_builtin_with(&Cat, &[], Some(json!("hi")), Limits::default()).expect("cat runs");
         assert_eq!(result.value, json!("hi"));
     }
 }
