@@ -411,6 +411,13 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
 }
 
 #[cfg(test)]
+impl FollowTable {
+    pub(crate) fn writing_for_test(&self) -> bool {
+        self.disk.try_lock().is_none()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use dekopon_broker_protocol::{ConversationKind, ConversationKindMatch};
@@ -605,6 +612,59 @@ mod tests {
                 .ticket(&key, SystemTime::now()),
             FollowTicket::Active { .. }
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_racing_a_banish_cannot_reinsert_its_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
+        let key = "c".repeat(64);
+        table.stay(&key, SystemTime::now()).unwrap();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+        let held = Arc::clone(&journal);
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _lock = held.hold_io_for_test();
+            locked.send(()).unwrap();
+            unblock
+                .recv_timeout(Duration::from_secs(8))
+                .expect("release");
+        });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let writing = Arc::clone(&table);
+        let writing_key = key.clone();
+        let refresh =
+            tokio::task::spawn_blocking(move || writing.refresh(&writing_key, SystemTime::now()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !table.writing_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh entered disk stage");
+        table.suspend(&key);
+        assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), refresh)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied
+            })
+        ));
+        assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        table.leave(&key).unwrap();
+        assert!(!dir.path().join(format!("{key}.followed")).exists());
     }
 
     #[test]

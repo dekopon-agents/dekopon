@@ -552,6 +552,13 @@ fn compact(path: &Path, window: MemoryWindow) -> Result<(), JournalError> {
 }
 
 #[cfg(test)]
+impl Journal {
+    pub(crate) fn hold_io_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.lock.lock()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Instant};
 

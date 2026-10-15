@@ -7220,6 +7220,148 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["transports"][0] = json!({"name": "discord", "kind": "discordGateway", "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN", "messageContent": true});
+    config["routes"][0]["transport"] = json!("discord");
+    config["routes"][0]["conversation"] = json!({"kind": ["channel"]});
+    config["routes"][0]["follow"] = json!(true);
+    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    let config = resolved(directory.path(), &config).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(604800),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let (broker, _) = stub_broker(directory.path(), Vec::new()).await;
+    let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let runner = Arc::new(runner);
+    let mut stop = message("stop");
+    stop.transport = "discord".into();
+    stop.transport_kind = dekopon_broker_protocol::ChatTransportKind::Discord;
+    stop.conversation.kind = ConversationKind::Channel;
+    stop.conversation.id = "c0123abc".into();
+    stop.addressed = Some(false);
+    stop.reply = ReplyTarget::Discord {
+        channel_id: "c0123abc".into(),
+        reply_to: None,
+    };
+    let route = routes.route(&stop).unwrap();
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &stop.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    let path = directory
+        .path()
+        .join("journal")
+        .join(format!("{key}.followed"));
+
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held_journal = Arc::clone(&journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _held = held_journal.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(8))
+            .expect("journal lock released");
+    });
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .expect("lock held")
+        .unwrap();
+    let writing = Arc::clone(&table);
+    let writing_key = key.clone();
+    let refresh =
+        tokio::task::spawn_blocking(move || writing.refresh(&writing_key, SystemTime::now()));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !table.writing_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refresh entered the disk stage");
+
+    let dispatch_runner = Arc::clone(&runner);
+    let dispatch_routes = Arc::clone(&routes);
+    let dispatch_table = Arc::clone(&table);
+    let dispatch_key = key.clone();
+    let mut dispatch = tokio::task::spawn_blocking(move || {
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut collector = crate::collection::Collector::new(&[], 4);
+        let mut pending = crate::follow::Debounce::default();
+        crate::dispatch(
+            &dispatch_runner,
+            &dispatch_routes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &["stop".into()],
+            &mut sessions,
+            &mut collector,
+            &mut pending,
+            stop,
+        );
+        let absent = matches!(
+            dispatch_table.ticket(&dispatch_key, SystemTime::now()),
+            crate::follow::FollowTicket::Absent
+        );
+        (sessions, absent)
+    });
+    let dispatched = tokio::time::timeout(Duration::from_secs(2), &mut dispatch).await;
+    let returned_without_disk = dispatched.is_ok();
+    release.send(()).expect("release blocked writer");
+    tokio::time::timeout(Duration::from_secs(3), blocker)
+        .await
+        .expect("blocker ends")
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), refresh)
+        .await
+        .expect("refresh completes")
+        .unwrap();
+    let (mut sessions, absent) = match dispatched {
+        Ok(result) => result.expect("dispatch completes"),
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), dispatch)
+            .await
+            .expect("dispatch completes after disk release")
+            .expect("dispatch task succeeds"),
+    };
+    assert!(
+        returned_without_disk,
+        "dispatch must not wait on the writer's disk lock"
+    );
+    assert!(absent, "banish hides the resident ticket immediately");
+    assert!(matches!(
+        result,
+        Err(crate::journal::JournalError::Io {
+            kind: std::io::ErrorKind::PermissionDenied
+        })
+    ));
+    while let Some(done) = tokio::time::timeout(Duration::from_secs(3), sessions.join_next())
+        .await
+        .expect("leave finishes")
+    {
+        done.unwrap();
+    }
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    ));
+    assert!(
+        !path.exists(),
+        "the spawned leave removes the marker after the stalled write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -15109,6 +15251,123 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             .unwrap()
             .ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
+    ));
+}
+
+struct FarewellOrderDriver {
+    table: Arc<crate::follow::FollowTable>,
+    key: String,
+    delivered: Mutex<Vec<(String, crate::follow::FollowTicket)>>,
+}
+
+#[async_trait]
+impl ChatDriver for FarewellOrderDriver {
+    async fn reply(
+        &self,
+        _target: &ReplyTarget,
+        reply: OutboundReply,
+    ) -> Result<(), TransportError> {
+        self.delivered
+            .lock()
+            .push((reply.text, self.table.ticket(&self.key, SystemTime::now())));
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivered() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+        ResponseEnvelope::capabilities(vec![leaving], vec!["follow".into()], BTreeMap::new()),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({
+            "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+        })).unwrap()),
+        ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+    ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("follow leave"), answer("Farewell.")]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message("leaving");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let driver = Arc::new(FarewellOrderDriver {
+        table: Arc::clone(&table),
+        key: key.clone(),
+        delivered: Mutex::new(Vec::new()),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("farewell session completes");
+    {
+        let delivered = driver.delivered.lock();
+        assert!(
+            matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })] if text == "Farewell."),
+            "transport sees the farewell while the ticket still exists: {delivered:?}"
+        );
+    }
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    assert!(!journal_dir.path().join(format!("{key}.followed")).exists());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::RunCommand { .. }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::Invoke { .. }
     ));
 }
 
