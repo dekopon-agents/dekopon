@@ -30,11 +30,12 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageId, MessageRef,
-        NativeStatus, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, Status, StatusText, SteerAck, ThreadClaim, ThreadContinuation, ThreadOwnership,
-        TransportError, TransportEvent, TransportIdentity, asset_buffer, bound_inbound,
-        credential_client, floor_boundary, receive_span, record_conversation, reserve_for_chunk,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES,
+        MessageId, MessageRef, NativeStatus, OutboundReply, PastMessage, ProgressLimits,
+        ProgressMessage, ReplyTarget, SeenIds, Status, StatusText, SteerAck, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
+        record_conversation, reserve_for_chunk,
     },
 };
 
@@ -351,9 +352,8 @@ impl SlackTransport {
         let (Some(channel), Some(ts)) = (event["channel"].as_str(), event["ts"].as_str()) else {
             return Ok(None);
         };
-        let text = bound_inbound(event["text"].as_str().unwrap_or_default());
-        let assets = pending_assets(&event["files"]);
-        if text.trim().is_empty() && assets.is_empty() {
+        let top_text = event["text"].as_str().unwrap_or_default();
+        if top_text.trim().is_empty() && pending_assets(&event["files"]).is_empty() {
             return Ok(None);
         }
         // Slack sets thread_ts equal to the message's own ts on a post threaded later; treating
@@ -366,7 +366,7 @@ impl SlackTransport {
         // Keep the mention-text fallback: the plain message event can win Slack's dedup race before
         // the authoritative app_mention event arrives.
         let explicitly_addressed =
-            event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(&text);
+            event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(top_text);
         if !self.seen.insert(format!("{channel}:{ts}")) {
             return Ok(None);
         }
@@ -410,6 +410,7 @@ impl SlackTransport {
         // The conversation key is minted once and carried rather than re-derived, since a Stop
         // button spelling it a second way would name no session at all.
         let conversation_id = conversation.key();
+        let projection = project_message(event);
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
@@ -417,8 +418,8 @@ impl SlackTransport {
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
-            text,
-            assets,
+            text: projection.text,
+            assets: projection.assets,
             addressed: is_shared.then_some(explicitly_addressed),
             thread_continuation,
             reply: ReplyTarget::Slack {
@@ -437,9 +438,7 @@ impl SlackTransport {
             native_group: None,
             constituents: Vec::new(),
             folded: Vec::new(),
-            asset_overflow: event["files"]
-                .as_array()
-                .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
+            asset_overflow: projection.asset_overflow,
         }))
     }
 
@@ -1657,6 +1656,111 @@ impl OwnedThreads {
     }
 }
 
+struct SlackProjection {
+    text: String,
+    assets: Vec<PendingAsset>,
+    asset_overflow: bool,
+}
+
+fn project_message(message: &Value) -> SlackProjection {
+    let mut text = message["text"].as_str().unwrap_or_default().to_owned();
+    let top_files = message["files"].as_array();
+    let mut assets = pending_assets(&message["files"]);
+    let mut file_count = top_files.map_or(0, Vec::len);
+
+    if let Some(forward) = message["attachments"].as_array().and_then(|attachments| {
+        attachments.iter().find(|attachment| {
+            attachment["is_share"] == true && attachment["is_msg_unfurl"] == true
+        })
+    }) {
+        let label = |value: Option<&str>| {
+            value.filter(|value| !value.is_empty()).map_or_else(
+                || "unavailable".to_owned(),
+                |value| json!(value).to_string(),
+            )
+        };
+        let author = label(forward["author_id"].as_str());
+        let channel = label(forward["channel_id"].as_str());
+        let time = label(forward["ts"].as_str().filter(|ts| canonical_timestamp(ts)));
+        let quoted = forward["text"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty());
+        let block_text = quoted.is_none().then(|| forward_blocks(&forward["blocks"]));
+        let quoted =
+            quoted.or_else(|| block_text.as_deref().filter(|text| !text.trim().is_empty()));
+        let nested_files = forward["files"].as_array();
+        file_count += nested_files.map_or(0, Vec::len);
+        let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
+        let forwarded = pending_assets(&forward["files"]);
+        let unavailable = forwarded
+            .iter()
+            .take(remaining)
+            .filter(|file| file.source.is_none())
+            .count();
+        assets.extend(forwarded.into_iter().take(remaining));
+        text.push_str(&format!(
+            "\n[quoted Slack forward — author: {author}; channel: {channel}; time: {time}]"
+        ));
+        match quoted {
+            Some(quoted) => {
+                text.push('\n');
+                text.push_str(quoted);
+            }
+            None if nested_files.is_none_or(Vec::is_empty) => {
+                text.push_str("\n[forwarded content unavailable]");
+            }
+            None => {}
+        }
+        for _ in 0..unavailable {
+            text.push_str("\n[forwarded attachment unavailable]");
+        }
+        text.push_str("\n[/quoted Slack forward]");
+    }
+
+    SlackProjection {
+        text: bound_inbound(&text),
+        assets,
+        asset_overflow: file_count > MAX_ATTACHMENTS,
+    }
+}
+
+fn forward_blocks(blocks: &Value) -> String {
+    let mut text = String::new();
+    let Some(blocks) = blocks.as_array() else {
+        return text;
+    };
+    for block in blocks {
+        if block["type"] != "rich_text" {
+            continue;
+        }
+        let Some(sections) = block["elements"].as_array() else {
+            continue;
+        };
+        for section in sections {
+            if section["type"] != "rich_text_section" {
+                continue;
+            }
+            let Some(elements) = section["elements"].as_array() else {
+                continue;
+            };
+            for element in elements {
+                if element["type"] == "text"
+                    && let Some(part) = element["text"].as_str()
+                {
+                    let room = MAX_INBOUND_TEXT_BYTES
+                        .saturating_add(1)
+                        .saturating_sub(text.len());
+                    text.push_str(&part[..floor_boundary(part, room)]);
+                    if text.len() > MAX_INBOUND_TEXT_BYTES {
+                        return text;
+                    }
+                }
+            }
+        }
+    }
+    text
+}
+
 fn pending_assets(files: &Value) -> Vec<PendingAsset> {
     let Some(files) = files.as_array() else {
         return Vec::new();
@@ -1665,10 +1769,11 @@ fn pending_assets(files: &Value) -> Vec<PendingAsset> {
         .iter()
         .take(MAX_ATTACHMENTS)
         .map(|file| {
-            let source = file["id"].as_str().zip(
+            let source = file["id"].as_str().filter(|id| !id.is_empty()).zip(
                 file["url_private_download"]
                     .as_str()
-                    .or_else(|| file["url_private"].as_str()),
+                    .filter(|url| !url.is_empty())
+                    .or_else(|| file["url_private"].as_str().filter(|url| !url.is_empty())),
             );
             let name = file["name"].as_str().unwrap_or("attachment");
             let name = name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)].to_owned();
@@ -1848,18 +1953,23 @@ fn past_message(message: &Value, team: &str, bot: &str) -> Option<PastMessage> {
     let user = message["user"].as_str()?;
     let ts = message["ts"].as_str()?;
     let at = slack_instant(ts)?;
-    let text = bound_inbound(message["text"].as_str().unwrap_or_default());
-    let assets = pending_assets(&message["files"]);
-    if text.trim().is_empty() && assets.is_empty() {
+    if message["text"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        && pending_assets(&message["files"]).is_empty()
+    {
         return None;
     }
+    let projection = project_message(message);
     Some(PastMessage {
         id: ts.to_owned(),
         from_bot: user == bot,
         author: user.to_owned(),
         subject: ExternalSubject::slack(team, user).ok()?,
-        text,
-        assets,
+        text: projection.text,
+        assets: projection.assets,
         at,
     })
 }
@@ -1927,7 +2037,7 @@ mod driver_tests {
     use super::{
         CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
         MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier,
-        SlackTransport, Tracked,
+        SlackTransport, Tracked, past_message,
     };
     use crate::{
         config::{SlackExperience, TemplateOverrides},
@@ -2910,6 +3020,171 @@ mod driver_tests {
             "size": 42,
             "url_private_download": "http://127.0.0.1:1/files/cat.png",
         }])
+    }
+
+    fn forward(text: Value, files: Value) -> Value {
+        json!({
+            "is_share": true, "is_msg_unfurl": true,
+            "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
+            "ts": "1700000000.000100", "text": text, "files": files,
+        })
+    }
+
+    fn forwarded_event(top_text: &str, attachment: Value) -> Value {
+        json!({
+            "type": "message", "channel": CHANNEL, "channel_type": "channel",
+            "user": USER, "ts": INBOUND_TS, "text": top_text,
+            "attachments": [attachment],
+        })
+    }
+
+    #[tokio::test]
+    async fn forwarded_text_and_files_have_the_same_ingress_and_history_projection() {
+        let file = photo()[0].clone();
+        let cases = [
+            forward(json!("a quoted answer"), json!([])),
+            forward(json!(""), json!([file.clone()])),
+            forward(json!("an image"), json!([file])),
+            forward(
+                Value::Null,
+                json!([{"id": "FSTUB", "file_access": "check_file_info"}]),
+            ),
+            forward(Value::Null, json!([])),
+            {
+                let mut attachment = forward(Value::Null, json!([]));
+                attachment["blocks"] = json!([{"type":"rich_text", "elements":[{
+                    "type":"rich_text_section", "elements":[{"type":"text", "text":"from blocks"}]
+                }]}]);
+                attachment
+            },
+        ];
+        for (index, attachment) in cases.into_iter().enumerate() {
+            let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+            let top = format!("<@B0123ABC> wrapper {index}");
+            let mut event = forwarded_event(&top, attachment);
+            event["type"] = json!("app_mention");
+            let ingress = transport
+                .routable(TEAM, &event, &Span::none())
+                .await
+                .expect("readable")
+                .expect("addressed");
+            let history = past_message(&event, TEAM, BOT_USER).expect("history");
+            assert_eq!(ingress.text, history.text);
+            assert_eq!(ingress.assets, history.assets);
+            assert_eq!(ingress.subject, history.subject);
+            assert_eq!(history.author, USER);
+            assert!(ingress.text.contains("author: \"UORIGINAL\""));
+            assert!(!ingress.asset_overflow);
+            if index == 3 {
+                assert_eq!(
+                    ingress
+                        .text
+                        .matches("[forwarded attachment unavailable]")
+                        .count(),
+                    1
+                );
+                assert!(ingress.assets[0].source.is_none());
+            }
+            if index == 4 {
+                assert!(ingress.text.contains("[forwarded content unavailable]"));
+            }
+            if index == 5 {
+                assert!(ingress.text.contains("from blocks"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quoted_mention_cannot_admit_or_claim_a_turn() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let event = forwarded_event(
+            "ordinary comment",
+            forward(json!("<@B0123ABC> answer me"), json!([])),
+        );
+        assert!(
+            transport
+                .routable(TEAM, &event, &Span::none())
+                .await
+                .expect("readable")
+                .is_none()
+        );
+        assert!(transport.thread_ownership.owned.lock().order.is_empty());
+        let mut empty = forwarded_event("", forward(json!("<@B0123ABC> answer me"), photo()));
+        empty["ts"] = json!(POSTED_TS);
+        assert!(
+            transport
+                .routable(TEAM, &empty, &Span::none())
+                .await
+                .expect("readable")
+                .is_none()
+        );
+        assert!(past_message(&empty, TEAM, BOT_USER).is_none());
+        assert!(transport.thread_ownership.owned.lock().order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_metadata_is_unavailable_without_changing_speaker_or_fetch_failure() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let mut attachment = forward(json!("quoted"), json!([photo()[0].clone()]));
+        attachment["author_id"] = Value::Null;
+        attachment["channel_id"] = json!({"id": "CORIGINAL"});
+        attachment["ts"] = json!("not-a-time");
+        let mut event = forwarded_event("<@B0123ABC> question", attachment);
+        event["type"] = json!("app_mention");
+        let ingress = transport
+            .routable(TEAM, &event, &Span::none())
+            .await
+            .expect("readable")
+            .expect("addressed");
+        assert!(
+            ingress
+                .text
+                .contains("author: unavailable; channel: unavailable; time: unavailable")
+        );
+        assert!(!ingress.text.contains("[forwarded attachment unavailable]"));
+        assert_eq!(ingress.subject.to_string(), SUBJECT);
+        assert_eq!(
+            ingress.assets,
+            past_message(&event, TEAM, BOT_USER)
+                .expect("history")
+                .assets
+        );
+        assert!(
+            transport
+                .routable(TEAM, &event, &Span::none())
+                .await
+                .expect("dedup readable")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_union_counts_files_and_gives_combined_text_one_budget() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let mut event = forwarded_event(
+            &format!("<@B0123ABC> {}", "x".repeat(16_300)),
+            forward(json!("y".repeat(400)), json!(vec![photo()[0].clone(); 8])),
+        );
+        event["files"] = json!(vec![photo()[0].clone(); 3]);
+        event["type"] = json!("app_mention");
+        let ingress = transport
+            .routable(TEAM, &event, &Span::none())
+            .await
+            .expect("readable")
+            .expect("addressed");
+        let history = past_message(&event, TEAM, BOT_USER).expect("history");
+        assert_eq!(ingress.assets.len(), 10);
+        assert_eq!(history.assets, ingress.assets);
+        assert!(ingress.asset_overflow);
+        assert_eq!(ingress.text, history.text);
+        assert_eq!(
+            ingress
+                .text
+                .matches("[message truncated by the gateway]")
+                .count(),
+            1
+        );
+        assert!(ingress.text.len() > 16 * 1024);
     }
 
     #[tokio::test]
