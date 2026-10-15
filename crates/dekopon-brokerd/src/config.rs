@@ -363,6 +363,7 @@ impl ConfigSnapshot {
         &mut self,
         policies: &str,
         providers: &[PathBuf],
+        ca_bundles: &[Vec<u8>],
     ) -> Result<(), ConfigError> {
         use sha2::{Digest as _, Sha256};
         use tokio::io::AsyncReadExt as _;
@@ -413,6 +414,21 @@ impl ConfigSnapshot {
             "providerArtifacts",
             (Disposition::Restart, serde_yaml::Value::Sequence(digests)),
         );
+        let bundles = ca_bundles
+            .iter()
+            .map(|pem| {
+                serde_yaml::Value::String(
+                    Sha256::digest(pem)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.0.insert(
+            "caBundles",
+            (Disposition::Restart, serde_yaml::Value::Sequence(bundles)),
+        );
         Ok(())
     }
 
@@ -422,10 +438,10 @@ impl ConfigSnapshot {
             .filter_map(|(&category, (disposition, value))| match disposition {
                 Disposition::Swap => None,
                 Disposition::Restart if value == &next.0[category].1 => None,
-                Disposition::Restart => Some(if category == "providerArtifacts" {
-                    "providers"
-                } else {
-                    category
+                Disposition::Restart => Some(match category {
+                    "providerArtifacts" => "providers",
+                    "caBundles" => "http",
+                    _ => category,
                 }),
             })
             .collect()
@@ -521,7 +537,11 @@ pub async fn load_in(
     }
     resolved
         .snapshot
-        .record_sources(&resolved.policies, &resolved.providers)
+        .record_sources(
+            &resolved.policies,
+            &resolved.providers,
+            &resolved.host_options.extra_ca_bundles,
+        )
         .await?;
     Ok((resolved, None))
 }
@@ -600,7 +620,11 @@ async fn load_directory(
     resolved.policies = policies;
     resolved
         .snapshot
-        .record_sources(&resolved.policies, &resolved.providers)
+        .record_sources(
+            &resolved.policies,
+            &resolved.providers,
+            &resolved.host_options.extra_ca_bundles,
+        )
         .await?;
     Ok((resolved, refusal))
 }

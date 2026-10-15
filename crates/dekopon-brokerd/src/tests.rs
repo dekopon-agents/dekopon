@@ -1675,6 +1675,27 @@ fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
 }
 
 #[tokio::test]
+async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cli-probe.wasm");
+    write_owner_only(&path, b"fixture");
+    let mapping = serde_yaml::from_str::<serde_yaml::Mapping>(
+        "http: {extraCABundles: [/same/path]}\nproviders: [cli-probe.wasm]\n",
+    )
+    .unwrap();
+    let mut active = config::ConfigSnapshot::from_mapping(&mapping);
+    let mut next = active.clone();
+    active
+        .record_sources("", &[path.clone()], &[b"first CA".to_vec()])
+        .await
+        .unwrap();
+    next.record_sources("", &[path], &[b"second CA".to_vec()])
+        .await
+        .unwrap();
+    assert_eq!(active.restart_required(&next), ["http"]);
+}
+
+#[tokio::test]
 async fn broker_projection_does_not_relax_owner_only_source_rules() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
