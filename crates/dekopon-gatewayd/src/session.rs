@@ -1941,9 +1941,12 @@ async fn session(
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
-            let replied = progress
-                .terminal(remember_stop(runner, &key, StopCause::SessionTask))
-                .await;
+            let terminal = if is_follow {
+                Terminal::Silent
+            } else {
+                remember_stop(runner, &key, StopCause::SessionTask)
+            };
+            let replied = progress.terminal(terminal).await;
             return if replied { "failed" } else { "reply-failed" };
         }
     };
@@ -2038,13 +2041,25 @@ async fn session(
                     Terminal::Failed(bound_outbound(liveness.templates.failed()))
                 }
                 SessionError::Model(error) | SessionError::Prompt(PromptError::Model(error)) => {
-                    remember_stop(runner, &key, StopCause::Model(error.kind()))
+                    if is_follow {
+                        Terminal::Silent
+                    } else {
+                        remember_stop(runner, &key, StopCause::Model(error.kind()))
+                    }
                 }
                 SessionError::Prompt(PromptError::EmptyAnswer) => {
-                    remember_stop(runner, &key, StopCause::EmptyAnswer)
+                    if is_follow {
+                        Terminal::Silent
+                    } else {
+                        remember_stop(runner, &key, StopCause::EmptyAnswer)
+                    }
                 }
                 SessionError::Prompt(PromptError::MaxSteps { .. }) => {
-                    remember_stop(runner, &key, StopCause::MaxSteps)
+                    if is_follow {
+                        Terminal::Silent
+                    } else {
+                        remember_stop(runner, &key, StopCause::MaxSteps)
+                    }
                 }
                 SessionError::BrokerClient(_)
                 | SessionError::BrokerLeg(_)

@@ -239,7 +239,7 @@ impl Journal {
                     && key.bytes().all(|byte| byte.is_ascii_hexdigit())
                     && !retained.contains(key)
                 {
-                    fs::remove_file(path)?;
+                    remove(&path);
                 }
             }
             tracing::warn!(
