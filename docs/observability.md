@@ -616,7 +616,7 @@ thread, message, subject, status text, emoji, raw service response, or credentia
 Every other transport's volume is bounded by a service the daemon dialed. The WhatsApp callback is
 public, so an unauthenticated caller decides how many refusals happen, and this sink is a 30-day
 retention claim rather than an infinite one. Refusals are therefore rate-limited rather than
-per-request. Media/refusal work after admission is bounded by the existing session and fetch budgets.
+per-request. Media/refusal work after admission is bounded by the session step limit, 8 MiB per asset and 40 MiB per model request.
 WhatsApp events at `info` or above include:
 
 | Event | Level | Fields |

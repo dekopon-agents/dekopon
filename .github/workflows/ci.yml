@@ -578,6 +578,32 @@ jobs:
             exit 1
           fi
           grep -q 'broker.configDirectory.configMap replaces broker.config' "$RUNNER_TEMP/config-directory.err"
+          cat > "$RUNNER_TEMP/gateway-proxy.yaml" <<'YAML'
+          broker: {serverUid: 65532}
+          proxy: {bind: '0.0.0.0:9091'}
+          YAML
+          proxy_args=(-f charts/dekopon/values-pr-summarizer-linter.yaml
+            --set gateway.proxy.enabled=true --set gateway.proxy.tlsSecret=proxy-cert)
+          if helm template dekopon charts/dekopon "${proxy_args[@]}" \
+            > /dev/null 2> "$RUNNER_TEMP/proxy.err"; then
+            echo "enabled proxy without an inline daemon proxy rendered" >&2
+            exit 1
+          fi
+          grep -q 'requires a proxy: block' "$RUNNER_TEMP/proxy.err"
+          if helm template dekopon charts/dekopon "${proxy_args[@]}" \
+            --set-file gateway.config.inline="$RUNNER_TEMP/gateway-proxy.yaml" \
+            > /dev/null 2> "$RUNNER_TEMP/proxy.err"; then
+            echo "mismatched inline proxy port rendered" >&2
+            exit 1
+          fi
+          grep -q 'must match gatewayd.yaml proxy.bind port' "$RUNNER_TEMP/proxy.err"
+          helm template dekopon charts/dekopon "${proxy_args[@]}" \
+            --set gateway.proxy.port=9091 \
+            --set-file gateway.config.inline="$RUNNER_TEMP/gateway-proxy.yaml" \
+            > "$RUNNER_TEMP/proxy.yaml"
+          helm template dekopon charts/dekopon -f charts/dekopon/ci/values-config-directory.yaml \
+            --set gateway.proxy.enabled=true --set gateway.proxy.tlsSecret=proxy-cert \
+            > "$RUNNER_TEMP/opaque-proxy.yaml"
           # Retired broker UI configuration must fail, never silently disappear.
           if helm template dekopon charts/dekopon --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml" 2> "$RUNNER_TEMP/http-bind.err"; then
             echo "retired broker listener configuration was accepted" >&2

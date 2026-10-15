@@ -445,7 +445,7 @@ rules for active sessions. Shutdown discards pending batches without starting th
 receipt traces retain their input and terminal disposition. Ordinary collected executions export
 causal links to every constituent; consumed steers link their constituents only to the admission
 span, not the running execution (see [observability](observability.md)). Asset leases, history
-scope, generation fences and on-demand fetch budgets are unchanged.
+scope and generation fences are unchanged.
 
 ## Asset handles and delivery
 
@@ -463,6 +463,11 @@ stderr note naming the reference, declared content type and stored-byte count. T
 is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
 Pathless outputs are retained without copying and reclaimed by closing their last descriptor.
 All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
+
+Outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an MP4
+is not a model-readable image. Slack, Discord and the local transport deliver the named file;
+WhatsApp refuses it before upload. Telegram currently tries `sendPhoto` and Telegram's API
+rejects it after upload, rather than Dekopon refusing before upload.
 
 **Attach is not send.** An explicit broker-authorized `asset.send` queues a file for this turn's
 reply. Four newly sent assets are permitted per turn. Sent state persists for the lifetime of the
@@ -660,7 +665,7 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **A file that cannot be shown is named anyway.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so, which the model can answer around instead of denying a screenshot that plainly exists.
 - **Only the media types a model can actually accept are offered.** Images: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Documents: PDF, plain text, Markdown, CSV, HTML, XML, JSON, RTF, and the Word, PowerPoint, and Excel formats. A chat service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal attachment — so the narrow end of that intersection is the one worth enforcing. A spreadsheet is parsed to its first thousand rows per sheet, which is worth knowing before concluding a model ignored the bottom of one.
 - **A route's model has to opt in to images.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. Documents need no modality: a PDF is a parsed attachment to every endpoint that accepts one at all, so gating it on vision would refuse it to a model perfectly able to read it.
-- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
+- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session. With retention smaller than the carried request, a crossing fetch can evict its own file from the conversation before refusing; a later retry cannot recover it.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop and re-attaches the token by hand. Both URLs are checked on one rule, at the single place the token is attached: the URL the event supplied and the `location` after it are parsed rather than prefix-matched, and each must name an allowlisted Slack host over HTTPS on the default port with no credentials in the authority. A refused URL fails the fetch before any request is made.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
 - **Gateway-owned disk LRU, weak references.** Uploads fetch once; descriptor-backed outputs join

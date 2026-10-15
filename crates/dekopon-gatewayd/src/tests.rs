@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::{
     CancelVia,
-    attachment::{ChatAssetSource as _, GeneratedImage},
+    attachment::GeneratedImage,
     prompt::{
         AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
         HistoryLimits, IMPROVEMENT_TOOL_NAME, PromptLimits, SKILL_TOOL_NAME,
@@ -96,6 +96,14 @@ fn generated_image() -> GeneratedImage {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend_from_slice(b"kitty pixels");
     GeneratedImage::from_png(png).expect("generated PNG fixture")
+}
+
+fn generated_video() -> GeneratedImage {
+    GeneratedImage::new(
+        dekopon_model::asset::DiskBlob::from_bytes(b"mp4\0frames").expect("spooled MP4"),
+        "video/mp4".into(),
+        dekopon_broker_protocol::AssetEncoding::Identity,
+    )
 }
 
 fn generated_images(count: usize) -> Vec<GeneratedImage> {
@@ -3182,6 +3190,29 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
             == "[gateway: chat-asset:1 (image/png, 20 stored bytes) attached, not sent]"),
         "the asset note is its own stdout line: {tool}"
     );
+
+    let directory = temporary();
+    let (broker, _observed) = stub_broker_assets(
+        directory.path(),
+        vec![
+            plain_response(probe_listing()),
+            plain_response(upper_proposal("clip")),
+            asset_response(b"mp4\0frames", "video/mp4"),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("probe upper --text clip"), answer("Attached.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        self::runner(broker, Arc::clone(&models), 4),
+        self::route(model_config()),
+        message("make a clip"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["Attached."]);
+    assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
+    assert!(tool_message(&models, 1).contains("(video/mp4, 10 stored bytes) attached, not sent"));
 }
 
 fn longest_base64_run(text: &str) -> usize {
@@ -8977,7 +9008,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
                 channel: "d0123abc".to_owned(),
                 thread_ts: None,
             },
-            OutboundReply::with_images("Two kittens.", generated_images(2)),
+            OutboundReply::with_images("Two kittens.", vec![generated_image(), generated_video()]),
         )
         .await
         .expect("both file shares are accepted");
@@ -8985,9 +9016,11 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
     let calls = api.calls();
     assert_eq!(calls.len(), 6, "three calls per attachment");
     assert!(calls[0].1.contains("filename=asset-1.png"));
-    assert!(calls[3].1.contains("filename=asset-2.png"));
+    assert!(calls[3].1.contains("filename=asset-2.mp4"));
+    assert_eq!(calls[4].1.as_bytes(), b"mp4\0frames");
     let first: Value = serde_json::from_str(&calls[2].1).expect("first completion JSON");
     let second: Value = serde_json::from_str(&calls[5].1).expect("second completion JSON");
+    assert_eq!(second["channel_id"], "d0123abc");
     assert_eq!(first["initial_comment"], "Two kittens.");
     assert!(
         second.get("initial_comment").is_none(),
@@ -9789,46 +9822,6 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn capability_resolution_does_not_change_model_fetch_refusals() {
-    let store = Arc::new(asset_store());
-    let arriving = (0..8)
-        .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
-        .collect();
-    store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        arriving,
-        true,
-        Instant::now(),
-    );
-    let assets = SessionAssets::new(
-        Arc::clone(&store),
-        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
-        None,
-        tokio::runtime::Handle::current(),
-        true,
-        true,
-    );
-
-    let refusals = tokio::task::spawn_blocking(move || {
-        let capability_side = (1..=6)
-            .map(|id| assets.fetch_for_capability(id).expect_err("no fetcher"))
-            .collect::<Vec<_>>();
-        (capability_side, assets.fetch(1).expect_err("no fetcher"))
-    })
-    .await
-    .expect("the blocking task completes");
-
-    let (capability_side, model_side) = refusals;
-    assert!(
-        capability_side
-            .iter()
-            .all(|refusal| *refusal == dekopon_agent::attachment::ChatAssetRefusal::Unavailable),
-        "{capability_side:?}"
-    );
-    assert!(model_side.contains("cannot be opened"), "{model_side}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlist() {
     struct FixedFetcher(Vec<u8>);
 
@@ -10461,7 +10454,7 @@ async fn discord_posts_every_attachment_on_the_first_message() {
             "channel_id": DISCORD_CHANNEL,
             "attachments": [
                 {"id": "555555555555555555", "filename": "asset-1.png"},
-                {"id": "555555555555555556", "filename": "asset-2.png"}
+                {"id": "555555555555555556", "filename": "asset-2.mp4"}
             ]
         })
     });
@@ -10474,7 +10467,7 @@ async fn discord_posts_every_attachment_on_the_first_message() {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
-            OutboundReply::with_images("Two kittens.", generated_images(2)),
+            OutboundReply::with_images("Two kittens.", vec![generated_image(), generated_video()]),
         )
         .await
         .expect("one multipart post carries both attachments");
@@ -10485,7 +10478,8 @@ async fn discord_posts_every_attachment_on_the_first_message() {
     assert!(multipart.contains("name=\"files[0]\""), "{multipart}");
     assert!(multipart.contains("name=\"files[1]\""), "{multipart}");
     assert!(multipart.contains("filename=\"asset-1.png\""));
-    assert!(multipart.contains("filename=\"asset-2.png\""));
+    assert!(multipart.contains("filename=\"asset-2.mp4\""));
+    assert!(multipart.contains("mp4\0frames"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11127,14 +11121,14 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("clip.mov", "video/quicktime", 700 * 1024 * 1024)],
+        vec![pending("clip.mp4", "video/mp4", 1024)],
         true,
         Instant::now(),
     );
     let note = asset::reference_note(&registered, true).expect("a note");
 
     assert!(!registered.fetchable);
-    assert!(note.contains("clip.mov"), "{note}");
+    assert!(note.contains("clip.mp4"), "{note}");
     assert!(!note.contains("chat-asset:"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
@@ -11711,7 +11705,10 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             driver
                 .reply(
                     &target,
-                    OutboundReply::with_images("two local kitties", generated_images(2)),
+                    OutboundReply::with_images(
+                        "two local kitties",
+                        vec![generated_image(), generated_video()],
+                    ),
                 )
                 .await
         }
@@ -11732,7 +11729,14 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         "every attachment reaches the local caller"
     );
     assert_eq!(response["images"][0]["filename"], "asset-1.png");
-    assert_eq!(response["images"][1]["filename"], "asset-2.png");
+    assert_eq!(response["images"][1]["filename"], "asset-2.mp4");
+    assert_eq!(response["images"][1]["mediaType"], "video/mp4");
+    assert_eq!(
+        STANDARD
+            .decode(response["images"][1]["data"].as_str().unwrap())
+            .unwrap(),
+        b"mp4\0frames"
+    );
     assert_eq!(response["images"][0]["mediaType"], "image/png");
     assert_eq!(
         STANDARD
@@ -14432,7 +14436,7 @@ fn recovery_forwards_slack_agent_capabilities_without_rebuilding_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before_reply() {
+async fn queued_mp4_delivers_on_empty_text_but_not_when_the_model_fails_before_reply() {
     for fail in [false, true] {
         let directory = temporary();
         let (broker, _observed) = stub_broker_assets(
@@ -14440,7 +14444,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
             vec![
                 plain_response(probe_listing()),
                 plain_response(upper_proposal("create")),
-                asset_response(b"payload", "text/plain"),
+                asset_response(b"mp4\0frames", "video/mp4"),
                 plain_response(upper_proposal("send")),
                 queued_response(1),
             ],
@@ -14461,7 +14465,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
         .await;
         assert_eq!(
             driver.image_bytes(),
-            if fail { vec![vec![]] } else { vec![vec![7]] }
+            if fail { vec![vec![]] } else { vec![vec![10]] }
         );
     }
 }

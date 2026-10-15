@@ -440,6 +440,28 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- end -}}
 {{- end -}}
 
+{{- if .Values.gateway.proxy.enabled -}}
+{{- if not .Values.gateway.enabled -}}
+{{- fail "gateway.proxy.enabled requires gateway.enabled" -}}
+{{- end -}}
+{{- $port := .Values.gateway.proxy.port -}}
+{{- if or (not (or (kindIs "int" $port) (kindIs "int64" $port) (kindIs "float64" $port))) (not (regexMatch "^[0-9]+$" (toString $port))) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail "gateway.proxy.port must be an integer from 1 through 65535" -}}
+{{- end -}}
+{{- if not .Values.gateway.proxy.tlsSecret -}}
+{{- fail "gateway.proxy.tlsSecret is required when gateway.proxy.enabled" -}}
+{{- end -}}
+{{- if .Values.gateway.config.inline -}}
+{{- $gateway := .Values.gateway.config.inline | fromYaml -}}
+{{- if not (hasKey $gateway "proxy") -}}
+{{- fail "gateway.proxy.enabled requires a proxy: block in gatewayd.yaml" -}}
+{{- end -}}
+{{- $proxy := get $gateway "proxy" -}}
+{{- if or (not (kindIs "map" $proxy)) (not (hasSuffix (printf ":%v" $port) (toString (get $proxy "bind")))) -}}
+{{- fail "gateway.proxy.port must match gatewayd.yaml proxy.bind port" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.gateway.service.enabled (not .Values.gateway.enabled) -}}
 {{- fail "gateway.service.enabled requires gateway.enabled; the broker has no TCP listener" -}}
 {{- end -}}
