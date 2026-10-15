@@ -282,6 +282,26 @@ fn converted_builtin_argv_keeps_clusters_values_and_refusals_local() {
 }
 
 #[test]
+fn head_twenty_and_tail_long_line_options_select_the_requested_counts() {
+    let lines = (1..=25).map(|n| format!("line {n}")).collect::<Vec<_>>();
+    let input = format!("printf '{}\\n'", lines.join("\\n"));
+    let first_twenty = lines[..20].join("\n");
+    for flag in ["-20", "-n 20", "--lines 20", "--lines=20"] {
+        let script = format!("{input} | head {flag}");
+        let result = run(&script);
+        assert_eq!(result.exit_code.get(), 0, "{script}: {result:?}");
+        assert_eq!(result.output, first_twenty, "{script}");
+    }
+    let last_two = lines[23..].join("\n");
+    for flag in ["-2", "-n 2", "--lines 2", "--lines=2"] {
+        let script = format!("{input} | tail {flag}");
+        let result = run(&script);
+        assert_eq!(result.exit_code.get(), 0, "{script}: {result:?}");
+        assert_eq!(result.output, last_two, "{script}");
+    }
+}
+
+#[test]
 fn assigns_and_expands_variables() {
     assert_eq!(output("name=world\necho \"hello $name\""), "hello world");
     assert_eq!(output("x=1\ny=$x\necho ${y}"), "1");
