@@ -33,7 +33,12 @@ tokio.workspace = true
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }
 dekopon-capability.workspace = true
+h2.workspace = true
+http.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
+tokio-rustls.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 tracing-opentelemetry.workspace = true

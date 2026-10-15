@@ -485,18 +485,22 @@ impl ResponseBody {
             match decoder.read(&mut decoded) {
                 Ok(0) => {
                     let pending = decoder.pending();
-                    if pending.chunk.is_empty()
-                        && (pending.ended
-                            || next_chunk(&mut self.response, self.deadline)
-                                .await?
-                                .is_none())
-                    {
-                        return Ok(None);
+                    let mut trailing = pending.chunk.len();
+                    let mut ended = pending.ended;
+                    // HTTP/2 servers commonly close the stream with an empty DATA frame.
+                    while trailing == 0 && !ended {
+                        match next_chunk(&mut self.response, self.deadline).await? {
+                            Some(chunk) => trailing = chunk.len(),
+                            None => ended = true,
+                        }
                     }
-                    return Err(http_error(
-                        ErrorCode::Protocol,
-                        "response carries bytes after its encoded body",
-                    ));
+                    if trailing > 0 {
+                        return Err(http_error(
+                            ErrorCode::Protocol,
+                            "response carries bytes after its encoded body",
+                        ));
+                    }
+                    return Ok(None);
                 }
                 Ok(count) => {
                     decoded.truncate(count);
@@ -1315,5 +1319,114 @@ mod tests {
                 assert!(body.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_empty_frame_after_the_encoded_body_is_not_trailing_data_on_send_and_stream() {
+        let plain = b"plain response text";
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["fixture.example.test".to_owned()]).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let authority = format!("fixture.example.test:{}", address.port());
+        let encoded = Bytes::from(gzip(plain));
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let tls = acceptor.accept(stream).await.unwrap();
+                let encoded = encoded.clone();
+                tokio::spawn(async move {
+                    let mut connection = h2::server::handshake(tls).await.unwrap();
+                    let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+                    let response = http::Response::builder()
+                        .header("content-encoding", "gzip")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(encoded, false).unwrap();
+                    send.send_data(Bytes::new(), true).unwrap();
+                    while let Some(Ok(_)) = connection.accept().await {}
+                });
+            }
+        });
+        for path in [Path::Send, Path::Stream] {
+            let root = tempfile::tempdir().unwrap();
+            let pin = crate::LoopbackHttpsPin::new(
+                &authority,
+                address,
+                certified.cert.pem().into_bytes(),
+            )
+            .unwrap();
+            let mut client = BufferedHttpClient::authorized(
+                HttpConstraints {
+                    allowed_hosts: vec![authority.clone()],
+                    allowed_methods: vec!["GET".to_owned()],
+                    max_requests: 1,
+                    max_request_bytes: 1024,
+                    max_response_bytes: 1024,
+                    allow_plaintext_loopback: false,
+                    propagate_trace: false,
+                    request_templates: Vec::new(),
+                },
+                HttpHostCeilings {
+                    loopback_https_pin: Some(pin),
+                    ..HttpHostCeilings::default()
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let uri = format!("https://{authority}/");
+            let body = match path {
+                Path::Send => {
+                    client
+                        .send(Request {
+                            method: "GET".to_owned(),
+                            uri,
+                            headers: vec![],
+                            body: vec![],
+                        })
+                        .await
+                        .unwrap()
+                        .body
+                }
+                Path::Stream => {
+                    let response = client
+                        .stream(
+                            StreamedRequest {
+                                method: "GET".to_owned(),
+                                uri,
+                                headers: vec![],
+                                body: vec![],
+                            },
+                            &AssetDirectory::new(root.path().to_owned(), 1024),
+                        )
+                        .await
+                        .unwrap();
+                    read_decoded(
+                        response.body.file(),
+                        Representation::Identity,
+                        0,
+                        usize::try_from(response.body.len()).unwrap(),
+                    )
+                    .unwrap()
+                }
+            };
+            assert_eq!(body, plain);
+        }
+        server.await.unwrap();
     }
 }
