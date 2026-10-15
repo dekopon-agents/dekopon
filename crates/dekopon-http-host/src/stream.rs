@@ -8,6 +8,7 @@ use dekopon_capability::HttpConstraints;
 use dekopon_core::base64::{self, Engine as _};
 use flate2::bufread::{GzDecoder, ZlibDecoder};
 use http_body::{Body, Frame, SizeHint};
+use reqwest::{Method, StatusCode};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::VecDeque,
@@ -348,7 +349,7 @@ impl BufferedHttpClient {
         let response = timeout(
             remaining,
             client
-                .request(prepared.method, prepared.url)
+                .request(prepared.method.clone(), prepared.url)
                 .headers(prepared.headers)
                 .header(reqwest::header::CONTENT_LENGTH, lengths.total)
                 .body(reqwest::Body::wrap(body))
@@ -362,7 +363,7 @@ impl BufferedHttpClient {
             headers,
             bytes: mut response_bytes,
             mut body,
-        } = self.accept_head(response, &grant, index)?;
+        } = self.accept_head(&prepared.method, response, &grant, index)?;
         let overlap = self
             .credential
             .as_ref()
@@ -531,6 +532,7 @@ async fn next_chunk(
 impl BufferedHttpClient {
     pub(crate) fn accept_head(
         &mut self,
+        method: &Method,
         response: reqwest::Response,
         grant: &HttpConstraints,
         index: usize,
@@ -539,11 +541,16 @@ impl BufferedHttpClient {
             .headers()
             .get_all(reqwest::header::CONTENT_ENCODING)
             .iter();
+        let bodyless = *method == Method::HEAD
+            || response.status() == StatusCode::NO_CONTENT
+            || response.status() == StatusCode::NOT_MODIFIED
+            || response.content_length() == Some(0);
         let decoder = match (
             codings.next().map(reqwest::header::HeaderValue::as_bytes),
             codings.next(),
         ) {
             (None, _) => None,
+            (Some(_), _) if bodyless => None,
             (Some(coding), None) if coding.eq_ignore_ascii_case(b"gzip") => {
                 Some(Decoder::Gzip(GzDecoder::new(Pending::default())))
             }
@@ -581,8 +588,9 @@ impl BufferedHttpClient {
                 ));
             }
             if !is_forbidden_response_header(name)
-                && name != reqwest::header::CONTENT_ENCODING
-                && (decoder.is_none() || name != reqwest::header::CONTENT_LENGTH)
+                && (decoder.is_none()
+                    || (name != reqwest::header::CONTENT_ENCODING
+                        && name != reqwest::header::CONTENT_LENGTH))
             {
                 headers.push(Header {
                     name: name.as_str().to_owned(),
@@ -662,7 +670,7 @@ mod tests {
         BufferedHttpClient::authorized_with_credential(
             HttpConstraints {
                 allowed_hosts: vec![authority.to_owned()],
-                allowed_methods: vec!["POST".to_owned()],
+                allowed_methods: vec!["POST".to_owned(), "HEAD".to_owned()],
                 max_requests: 1,
                 max_request_bytes: crate::encoded_request_bytes(
                     "POST",
@@ -1142,6 +1150,7 @@ mod tests {
 
     async fn fetch(
         path: Path,
+        method: &str,
         response: &[u8],
         maximum: u64,
         secret: Option<&str>,
@@ -1160,7 +1169,7 @@ mod tests {
         let result = match path {
             Path::Send => client
                 .send(Request {
-                    method: "POST".to_owned(),
+                    method: method.to_owned(),
                     uri: server.url(),
                     headers: vec![],
                     body: vec![],
@@ -1169,7 +1178,10 @@ mod tests {
                 .map(|response| (response.headers, response.body)),
             Path::Stream => client
                 .stream(
-                    request(&server, vec![]),
+                    StreamedRequest {
+                        method: method.to_owned(),
+                        ..request(&server, vec![])
+                    },
                     &AssetDirectory::new(root.path().to_owned(), maximum),
                 )
                 .await
@@ -1233,7 +1245,7 @@ mod tests {
                     Err(ErrorCode::Protocol),
                 ),
             ] {
-                let result = fetch(path, &response, 1024, None).await;
+                let result = fetch(path, "POST", &response, 1024, None).await;
                 if let Ok((headers, _)) = &result {
                     assert!(
                         headers
@@ -1260,7 +1272,9 @@ mod tests {
         );
         for path in [Path::Send, Path::Stream] {
             assert_eq!(
-                fetch(path, &response, 1024, Some(secret)).await.err(),
+                fetch(path, "POST", &response, 1024, Some(secret))
+                    .await
+                    .err(),
                 Some(ErrorCode::Denied)
             );
         }
@@ -1274,9 +1288,32 @@ mod tests {
         let response = encoded("gzip", &bomb);
         for path in [Path::Send, Path::Stream] {
             assert_eq!(
-                fetch(path, &response, maximum, None).await.err(),
+                fetch(path, "POST", &response, maximum, None).await.err(),
                 Some(ErrorCode::ResponseTooLarge)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bodyless_response_with_a_content_encoding_needs_no_decoding_on_send_and_stream() {
+        for path in [Path::Send, Path::Stream] {
+            for (method, response) in [
+                (
+                    "HEAD",
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1234\r\nConnection: close\r\n\r\n".as_slice(),
+                ),
+                (
+                    "POST",
+                    b"HTTP/1.1 204 No Content\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n".as_slice(),
+                ),
+                (
+                    "POST",
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                ),
+            ] {
+                let (_, body) = fetch(path, method, response, 1024, None).await.unwrap();
+                assert!(body.is_empty());
+            }
         }
     }
 }

@@ -1281,7 +1281,7 @@ impl BufferedHttpClient {
         let response = timeout(
             remaining,
             client
-                .request(request.method, request.url)
+                .request(request.method.clone(), request.url)
                 .headers(request.headers)
                 .body(request.body)
                 .send(),
@@ -1295,7 +1295,7 @@ impl BufferedHttpClient {
             headers,
             bytes: mut response_bytes,
             body: mut decoded,
-        } = self.accept_head(response, grant, evidence_index)?;
+        } = self.accept_head(&request.method, response, grant, evidence_index)?;
         let mut body = Vec::new();
         while let Some(chunk) = decoded.next().await? {
             response_bytes = response_bytes
