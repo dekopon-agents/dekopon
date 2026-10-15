@@ -972,7 +972,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     server.join();
 
     let records = audit.records();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(serialized.contains(&authority));
     assert!(serialized.contains("POST"));
@@ -1207,7 +1207,7 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
         server.join();
         let records = audit.records();
         if expected == Succeeded {
-            assert_eq!(records.len(), 3);
+            assert_eq!(records.len(), 4);
         } else {
             assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
             assert_eq!(
@@ -1226,14 +1226,14 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                     .any(|evidence| evidence.kind == "http-calls"),
                 "a failure that dispatched HTTP must return http-call evidence"
             );
-            assert_eq!(records.len(), 2);
+            assert_eq!(records.len(), 3);
             let AuditEvent::Execution {
                 outcome,
                 error,
                 error_detail,
                 http_calls,
                 ..
-            } = &records[1]
+            } = &records[2]
             else {
                 panic!("the terminal record is an execution event");
             };
@@ -1400,7 +1400,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         credential,
         http_calls,
         ..
-    } = &records[1]
+    } = &records[2]
     else {
         panic!("the terminal record is an execution event");
     };
@@ -1625,7 +1625,10 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         assert_eq!(result.result.outcome, expected);
         let decision_events = capture.events_where(
             "dekopon_broker::audit",
-            &[("audit.event", "broker.decision")],
+            &[
+                ("audit.event", "broker.decision"),
+                ("decision.point", "invocation"),
+            ],
         );
         assert_eq!(decision_events.len(), 1);
         let expected_drn = secret_drn();

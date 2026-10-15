@@ -217,8 +217,8 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let records = captured.events_where("dekopon_broker::audit", &[]);
     assert_eq!(
         records.len(),
-        3,
-        "one decision each and one execution, no more and no fewer: {records:?}"
+        4,
+        "invocation and HTTP decisions, execution and refusal: {records:?}"
     );
 
     let decision = only(
@@ -226,6 +226,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         &[
             ("audit.event", "broker.decision"),
             ("invocation.id", "invoke-audited"),
+            ("decision.point", "invocation"),
         ],
     );
     assert_eq!(decision.parent(), Some("broker.execute"), "{decision:?}");
@@ -242,6 +243,16 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         assert_eq!(decision.field(name), Some(value), "{name}: {decision:?}");
     }
     assert!(decision.field("policy.digest").is_some(), "{decision:?}");
+    let request_decision = only(
+        &captured,
+        &[
+            ("audit.event", "broker.decision"),
+            ("invocation.id", "invoke-audited"),
+            ("decision.point", "http.request"),
+        ],
+    );
+    assert_eq!(request_decision.parent(), Some("http.request"));
+    assert_eq!(request_decision.field("decision.allowed"), Some("true"));
 
     let execution = only(&captured, &[("audit.event", "broker.execution")]);
     assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
