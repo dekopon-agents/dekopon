@@ -204,9 +204,10 @@ the broker UID/GID is changed, even with a custom image. Gateway container UID/G
 and the gateway config-check container. The Secret must contain `tls.crt`, `tls.key`, and
 `ca.crt`; daemon `proxy.tls` must name those paths and `proxy.bind` must use the same port
 on a non-loopback address. The chart refuses enablement without a Secret or, for inline daemon
-configuration, without a `proxy:` block. For opaque ConfigMaps the daemon's candidate check
-loads the TLS files and refuses missing or invalid proxy configuration; the chart cannot inspect
-those bytes. The broker never mounts this Secret. No Ingress or external route is created.
+configuration, without a `proxy:` block or with a bind port different from the chart port.
+For opaque ConfigMaps the daemon's candidate check loads the TLS files and validates proxy
+configuration; the chart cannot inspect those bytes. Disabling config-check for opaque config
+skips that validation. The broker never mounts this Secret. No Ingress or external route is created.
 
 ## Paths the chart owns
 

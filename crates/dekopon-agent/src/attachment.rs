@@ -561,22 +561,28 @@ mod tests {
         use dekopon_test_support::CaptureLayer;
         use tracing_subscriber::prelude::*;
 
-        struct Store;
+        struct Store(std::sync::atomic::AtomicUsize);
         impl GeneratedAssetStore for Store {
             fn register(
                 &self,
-                _: OwnedFd,
-                _: &NewAsset,
+                descriptor: OwnedFd,
+                metadata: &NewAsset,
                 _: &str,
                 _: &str,
             ) -> Result<u64, BlobError> {
-                unreachable!()
+                assert_eq!(metadata.content_type, "video/mp4");
+                let file = File::from(descriptor);
+                let mut bytes = [0; 10];
+                file.read_exact_at(&mut bytes, 0).unwrap();
+                assert_eq!(&bytes, b"mp4\0frames");
+                Ok(7)
             }
             fn remove(&self, _: u64) -> Result<(), BlobError> {
                 unreachable!()
             }
             fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError> {
                 assert_eq!(id, 7);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Some(GeneratedImage::new(
                     DiskBlob::from_bytes(b"mp4\0frames")?,
                     "video/mp4".into(),
@@ -590,19 +596,39 @@ mod tests {
             .with(capture.clone())
             .set_default();
         {
-            let queue = ReplyAttachments::new(1, Arc::new(Store), "local".into());
+            let store = Arc::new(Store(std::sync::atomic::AtomicUsize::new(0)));
+            let queue = ReplyAttachments::new(1, store.clone(), "local".into());
+            let blob = DiskBlob::from_bytes(b"mp4\0frames").unwrap();
+            let metadata = NewAsset {
+                descriptor: 0,
+                content_type: "video/mp4".into(),
+                encoding: AssetEncoding::Identity,
+                bytes: 10,
+                sha256: String::new(),
+            };
             assert!(
                 queue
-                    .receive(vec![], vec![], vec![], vec![], "", "")
-                    .is_empty()
+                    .receive(
+                        vec![metadata],
+                        vec![blob.descriptor().unwrap()],
+                        vec![],
+                        vec![],
+                        "",
+                        ""
+                    )
+                    .contains("attached, not sent")
             );
             assert!(queue.take().is_empty(), "attachment alone is not a send");
+            assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 0);
             queue.receive(vec![], vec![], vec![], vec![7], "", "");
             let images = queue.take();
             assert_eq!(images[0].filename(0), "asset-1.mp4");
             assert_eq!(images[0].media_type(), "video/mp4");
             assert_eq!(images[0].bytes().unwrap(), b"mp4\0frames");
             queue.finish(AssetDeliveryDisposition::Delivered);
+            let cancelled = ReplyAttachments::new(1, store, "local".into());
+            cancelled.receive(vec![], vec![], vec![], vec![7], "", "");
+            cancelled.finish(AssetDeliveryDisposition::Abandoned);
         }
         assert_eq!(
             capture
@@ -613,6 +639,15 @@ mod tests {
                         ("transport", "local"),
                         ("dispatched", "true")
                     ]
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.send"), ("dispatched", "false")]
                 )
                 .len(),
             1

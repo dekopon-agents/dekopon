@@ -477,8 +477,10 @@ gateway:
     port: 9080
     annotations: {}
 
-  # Private mTLS listener for VM model traffic. The daemon's proxy.bind must use the same port.
-  # The Secret contains tls.crt, tls.key and ca.crt; it is not projected into the broker.
+  # Private mTLS listener for VM model traffic. Inline gatewayd.yaml must declare proxy.bind
+  # on this port; with opaque config, the chart cannot inspect proxy.bind, so enable configCheck
+  # with a candidate gateway ConfigMap to validate it. Disabling configCheck for opaque config
+  # skips this check. The Secret contains tls.crt, tls.key and ca.crt; the broker never mounts it.
   proxy:
     enabled: false
     port: 9090

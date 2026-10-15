@@ -451,8 +451,15 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- if not .Values.gateway.proxy.tlsSecret -}}
 {{- fail "gateway.proxy.tlsSecret is required when gateway.proxy.enabled" -}}
 {{- end -}}
-{{- if and .Values.gateway.config.inline (not (hasKey (.Values.gateway.config.inline | fromYaml) "proxy")) -}}
+{{- if .Values.gateway.config.inline -}}
+{{- $gateway := .Values.gateway.config.inline | fromYaml -}}
+{{- if not (hasKey $gateway "proxy") -}}
 {{- fail "gateway.proxy.enabled requires a proxy: block in gatewayd.yaml" -}}
+{{- end -}}
+{{- $proxy := get $gateway "proxy" -}}
+{{- if or (not (kindIs "map" $proxy)) (not (hasSuffix (printf ":%v" $port) (toString (get $proxy "bind")))) -}}
+{{- fail "gateway.proxy.port must match gatewayd.yaml proxy.bind port" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.gateway.service.enabled (not .Values.gateway.enabled) -}}

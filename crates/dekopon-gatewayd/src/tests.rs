@@ -3186,6 +3186,29 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
             == "[gateway: chat-asset:1 (image/png, 20 stored bytes) attached, not sent]"),
         "the asset note is its own stdout line: {tool}"
     );
+
+    let directory = temporary();
+    let (broker, _observed) = stub_broker_assets(
+        directory.path(),
+        vec![
+            plain_response(probe_listing()),
+            plain_response(upper_proposal("clip")),
+            asset_response(b"mp4\0frames", "video/mp4"),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("probe upper --text clip"), answer("Attached.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        self::runner(broker, Arc::clone(&models), 4),
+        self::route(model_config()),
+        message("make a clip"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["Attached."]);
+    assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
+    assert!(tool_message(&models, 1).contains("(video/mp4, 10 stored bytes) attached, not sent"));
 }
 
 fn longest_base64_run(text: &str) -> usize {
@@ -8614,6 +8637,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
     assert_eq!(calls[4].1.as_bytes(), b"mp4\0frames");
     let first: Value = serde_json::from_str(&calls[2].1).expect("first completion JSON");
     let second: Value = serde_json::from_str(&calls[5].1).expect("second completion JSON");
+    assert_eq!(second["channel_id"], "d0123abc");
     assert_eq!(first["initial_comment"], "Two kittens.");
     assert!(
         second.get("initial_comment").is_none(),
@@ -14029,7 +14053,7 @@ fn recovery_forwards_slack_agent_capabilities_without_rebuilding_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before_reply() {
+async fn queued_mp4_delivers_on_empty_text_but_not_when_the_model_fails_before_reply() {
     for fail in [false, true] {
         let directory = temporary();
         let (broker, _observed) = stub_broker_assets(
@@ -14037,7 +14061,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
             vec![
                 plain_response(probe_listing()),
                 plain_response(upper_proposal("create")),
-                asset_response(b"payload", "text/plain"),
+                asset_response(b"mp4\0frames", "video/mp4"),
                 plain_response(upper_proposal("send")),
                 queued_response(1),
             ],
@@ -14058,7 +14082,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
         .await;
         assert_eq!(
             driver.image_bytes(),
-            if fail { vec![vec![]] } else { vec![vec![7]] }
+            if fail { vec![vec![]] } else { vec![vec![10]] }
         );
     }
 }

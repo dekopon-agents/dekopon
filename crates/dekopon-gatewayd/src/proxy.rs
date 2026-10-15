@@ -390,6 +390,22 @@ mod tests {
         assert_eq!(agent.as_str(), "gylmar");
         assert_eq!(models.len(), 2);
         assert_eq!(proxy.max_connections, 16);
+
+        let root = tempfile::tempdir().unwrap();
+        let mounted = root.path().join("etc/dekopon-proxy-tls");
+        std::fs::create_dir_all(&mounted).unwrap();
+        for file in ["tls.crt", "tls.key", "ca.crt"] {
+            std::fs::copy(pki.directory.path().join(file), mounted.join(file)).unwrap();
+        }
+        let candidate = resolved(&document(
+            &mounted,
+            "  guests:\n    'dekopon:gylmar-vm': {agent: gylmar, models: [claude-opus]}\n",
+        ))
+        .unwrap();
+        let files = candidate.proxy.unwrap().files;
+        assert_eq!(files.cert, mounted.join("tls.crt"));
+        assert_eq!(files.key, mounted.join("tls.key"));
+        assert_eq!(files.client_ca, mounted.join("ca.crt"));
     }
 
     #[test]
