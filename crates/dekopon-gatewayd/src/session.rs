@@ -1366,6 +1366,7 @@ async fn run_admitted(
             conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
             conversation.turns = tracing::field::Empty,
             conversation.bytes = tracing::field::Empty,
+            conversation.arena_bytes = tracing::field::Empty,
             conversation.recall_source = tracing::field::Empty,
             conversation.recalled_turns = tracing::field::Empty,
             conversation.carried_assets = tracing::field::Empty,
@@ -1638,6 +1639,13 @@ async fn session(
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
+    span.record(
+        "conversation.arena_bytes",
+        runner
+            .conversations
+            .snapshot(&key, &granted)
+            .map_or(0, |arena| arena.bytes()),
+    );
     tracing::info!(
         target: "dekopon_gatewayd::audit",
         {

@@ -16962,6 +16962,36 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
 }
 
 #[test]
+fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
+    let store = ConversationStore::with_arena_limit(4, 90);
+    let allowed = granted(&["cli-probe.upper"]);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let commit = |text: &str| {
+        let seed = store.begin(&key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed(text, "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    };
+    commit("one");
+    let old = store.snapshot(&key, &allowed).unwrap();
+    assert!(store.snapshot(&key, &granted(&["different"])).is_none());
+    commit("two");
+    let new = store.snapshot(&key, &allowed).unwrap();
+    assert_eq!(old.read(1), Some("one"));
+    assert_eq!(new.read(1), Some("one"));
+    assert_eq!(new.read(2), Some("two"));
+    commit("three");
+    assert_eq!(store.snapshot(&key, &allowed).unwrap().read(3), None);
+    assert_eq!(old.read(1), Some("one"));
+    assert_eq!(new.read(2), Some("two"));
+}
+
+#[test]
 fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it() {
     let store = ConversationStore::new(4);
     let allowed = granted(&["cli-probe.upper"]);

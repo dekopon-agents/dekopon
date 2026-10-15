@@ -373,36 +373,32 @@ impl Journal {
     ) -> Result<Recalled, JournalError> {
         let _lock = self.lock.lock();
         self.expire(now)?;
-        let mut lines = match read_lines(&self.path(stem)) {
-            Ok(lines) => lines,
+        let seal_ms = self
+            .read_seal(stem, window.forget_after)?
+            .map(|seal| millis(seal.at));
+        let now_ms = millis(now);
+        let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
+        let age_horizon_ms = now_ms.saturating_sub(duration_millis(self.age_for(stem)));
+        let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
+        let (history, mut last) = match read_window(
+            &self.path(stem),
+            grant,
+            window,
+            seal_ms,
+            horizon_ms,
+            age_horizon_ms,
+        ) {
+            Ok(recalled) => recalled,
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
-            }) => Vec::new(),
+            }) => (History::new(window.limits), None),
             Err(JournalError::Corrupt) => {
                 remove(&self.path(stem));
                 return Err(JournalError::Corrupt);
             }
             Err(error) => return Err(error),
         };
-
-        if let Some(seal) = self.read_seal(stem, window.forget_after)? {
-            lines.retain(|line| line.at_ms > millis(seal.at));
-        }
-        let now_ms = millis(now);
-        let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
-        let age_horizon_ms = now_ms.saturating_sub(duration_millis(self.age_for(stem)));
-        let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
-        // Only the trailing run under this grant is recalled, so a narrowed grant never replays
-        // output produced under a wider one.
-        let current = lines
-            .iter()
-            .rev()
-            .take_while(|line| {
-                line.grant == grant && line.at_ms >= horizon_ms && line.at_ms >= age_horizon_ms
-            })
-            .count();
-        let mut kept = lines.split_off(lines.len() - current);
-        let (assets, next_asset_id) = kept.last_mut().map_or((Vec::new(), 1), |last| {
+        let (assets, next_asset_id) = last.as_mut().map_or((Vec::new(), 1), |last| {
             let assets = std::mem::take(&mut last.assets)
                 .into_iter()
                 .filter(|asset| asset.at_ms >= horizon_ms)
@@ -424,15 +420,6 @@ impl Journal {
                 .collect();
             (assets, last.next_asset_id)
         });
-        let history = History::from_turns(
-            window.limits,
-            kept.into_iter().filter_map(|line| {
-                line.user.map(|user| match line.answer {
-                    Some(answer) => ConversationTurn::completed(user, answer),
-                    None => ConversationTurn::unanswered(user),
-                })
-            }),
-        );
         Ok(Recalled {
             history,
             assets,
@@ -783,6 +770,50 @@ fn millis(at: SystemTime) -> u64 {
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn read_window(
+    path: &Path,
+    grant: &str,
+    window: MemoryWindow,
+    seal_ms: Option<u64>,
+    horizon_ms: u64,
+    age_horizon_ms: u64,
+) -> Result<(History, Option<Line>), JournalError> {
+    let mut history = History::new(window.limits);
+    let mut last = None;
+    let mut previous = None;
+    for item in
+        serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?)).into_iter::<Line>()
+    {
+        let mut line = item.map_err(|_malformed| JournalError::Corrupt)?;
+        if line.version != 2
+            || previous.is_some_and(|id| id != line.record_id)
+            || line.next_record_id != line.record_id.saturating_add(1)
+            || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
+        {
+            return Err(JournalError::Corrupt);
+        }
+        previous = Some(line.next_record_id);
+        if line.grant != grant
+            || line.at_ms < horizon_ms
+            || line.at_ms < age_horizon_ms
+            || seal_ms.is_some_and(|seal| line.at_ms <= seal)
+        {
+            history = History::new(window.limits);
+            last = None;
+            continue;
+        }
+        if let Some(user) = line.user.take() {
+            let turn = match line.answer.take() {
+                Some(answer) => ConversationTurn::completed(user, answer),
+                None => ConversationTurn::unanswered(user),
+            };
+            history.record(turn);
+        }
+        last = Some(line);
+    }
+    Ok((history, last))
 }
 
 fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
@@ -1143,6 +1174,22 @@ mod tests {
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(recalled.history.len(), 2, "two 400-byte turns fit 1 KiB");
         assert_eq!(recalled.assets.len(), 1);
+    }
+
+    #[test]
+    fn cold_recall_streams_the_window_without_discarding_older_disk_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        for index in 0..6 {
+            append(&journal, &stem, now, GRANT, &format!("turn {index}"));
+        }
+        let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
+        assert_eq!(users(&recalled), ["turn 2", "turn 3", "turn 4", "turn 5"]);
+        let persisted = read_lines(&journal.path(&stem)).expect("disk records");
+        assert_eq!(persisted.len(), 6);
+        assert_eq!(persisted[0].user.as_deref(), Some("turn 0"));
     }
 
     #[test]

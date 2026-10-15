@@ -171,7 +171,10 @@ where
         )),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
-        conversations: ConversationStore::new(config.sessions.max_conversations),
+        conversations: ConversationStore::with_arena_limit(
+            config.sessions.max_conversations,
+            config.memory.arena.max_transient_bytes.get() as usize,
+        ),
         follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
         journal,
         assets: Arc::new(AssetStore::with_retention(

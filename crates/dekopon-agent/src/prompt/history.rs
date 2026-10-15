@@ -1,4 +1,12 @@
+use std::{
+    fmt,
+    ops::Range,
+    sync::{Arc, Weak},
+};
+
+use arc_swap::ArcSwap;
 use dekopon_model::model::{AssistantTurn, ModelMessage, assistant_message};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -57,9 +65,120 @@ pub struct Selection {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct ArenaSnapshot {
-    pub records: Vec<u64>,
+    bytes: Vec<u8>,
+    records: Vec<(u64, Range<usize>)>,
+}
+
+impl fmt::Debug for ArenaSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArenaSnapshot")
+            .field("bytes", &self.bytes.len())
+            .field("records", &self.records.len())
+            .finish()
+    }
+}
+
+impl ArenaSnapshot {
+    #[must_use]
+    pub fn read(&self, record_id: u64) -> Option<&str> {
+        let (_, range) = self.records.iter().find(|(id, _)| *id == record_id)?;
+        std::str::from_utf8(&self.bytes[range.clone()]).ok()
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.bytes.capacity().saturating_add(
+            self.records
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, Range<usize>)>()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArenaRefusal {
+    TransientHeadroom,
+    DuplicateRecord,
+}
+
+pub struct PackedArena {
+    current: ArcSwap<ArenaSnapshot>,
+    publication: Mutex<Vec<Weak<ArenaSnapshot>>>,
+    max_transient_bytes: usize,
+}
+
+impl PackedArena {
+    #[must_use]
+    pub fn new(max_transient_bytes: usize) -> Self {
+        Self {
+            current: ArcSwap::from_pointee(ArenaSnapshot::default()),
+            publication: Mutex::new(Vec::new()),
+            max_transient_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ArenaSnapshot> {
+        self.current.load_full()
+    }
+
+    pub fn repack(&self, records: &[(u64, &str)]) -> Result<(), ArenaRefusal> {
+        let mut live = self.publication.lock();
+        live.retain(|snapshot| snapshot.strong_count() != 0);
+        let current = self.current.load_full();
+        let resident = live
+            .iter()
+            .filter_map(Weak::upgrade)
+            .fold(current.allocated_bytes(), |sum, snapshot| {
+                sum.saturating_add(snapshot.allocated_bytes())
+            });
+        let handles_bytes = records
+            .len()
+            .checked_mul(std::mem::size_of::<(u64, Range<usize>)>())
+            .ok_or(ArenaRefusal::TransientHeadroom)?;
+        if handles_bytes > self.max_transient_bytes.saturating_sub(resident) {
+            return Err(ArenaRefusal::TransientHeadroom);
+        }
+        let mut size = 0usize;
+        let mut ids = std::collections::HashSet::new();
+        for (id, text) in records {
+            if !ids.insert(*id) {
+                return Err(ArenaRefusal::DuplicateRecord);
+            }
+            size = size
+                .checked_add(text.len())
+                .ok_or(ArenaRefusal::TransientHeadroom)?;
+        }
+        let allocated = size
+            .checked_add(handles_bytes)
+            .ok_or(ArenaRefusal::TransientHeadroom)?;
+        if allocated > self.max_transient_bytes.saturating_sub(resident) {
+            return Err(ArenaRefusal::TransientHeadroom);
+        }
+        let mut bytes = Vec::with_capacity(size);
+        let mut handles = Vec::with_capacity(records.len());
+        for (id, text) in records {
+            let start = bytes.len();
+            bytes.extend_from_slice(text.as_bytes());
+            handles.push((*id, start..bytes.len()));
+        }
+        let next = Arc::new(ArenaSnapshot {
+            bytes,
+            records: handles,
+        });
+        let previous = self.current.swap(next);
+        if Arc::strong_count(&previous) > 1 {
+            live.push(Arc::downgrade(&previous));
+        }
+        Ok(())
+    }
 }
 
 pub const DEFAULT_MAX_TURNS: usize = 16;
@@ -307,5 +426,44 @@ impl History {
             dropped += 1;
         }
         self.turns.drain(..dropped);
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::{ArenaRefusal, PackedArena};
+
+    #[test]
+    fn a_reader_survives_publication_with_stable_record_handles() {
+        let arena = PackedArena::new(512);
+        arena.repack(&[(11, "one 🟠"), (12, "two")]).unwrap();
+        let old = arena.snapshot();
+        arena.repack(&[(12, "new two"), (13, "three")]).unwrap();
+        let new = arena.snapshot();
+        assert_eq!(old.read(11), Some("one 🟠"));
+        assert_eq!(old.read(12), Some("two"));
+        assert_eq!(new.read(11), None);
+        assert_eq!(new.read(12), Some("new two"));
+        assert_eq!(new.read(13), Some("three"));
+    }
+
+    #[test]
+    fn held_readers_count_against_headroom_and_refusal_does_not_publish() {
+        let arena = PackedArena::new(110);
+        arena.repack(&[(1, "old")]).unwrap();
+        let old = arena.snapshot();
+        arena.repack(&[(2, "next")]).unwrap();
+        let new = arena.snapshot();
+        assert_eq!(
+            arena.repack(&[(3, "a".repeat(35).as_str())]),
+            Err(ArenaRefusal::TransientHeadroom)
+        );
+        assert_eq!(old.read(1), Some("old"));
+        assert_eq!(new.read(2), Some("next"));
+        assert_eq!(arena.snapshot().read(2), Some("next"));
+        drop(old);
+        drop(new);
+        arena.repack(&[(3, "a".repeat(35).as_str())]).unwrap();
+        assert_eq!(arena.snapshot().read(3), Some("a".repeat(35).as_str()));
     }
 }
