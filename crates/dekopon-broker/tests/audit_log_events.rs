@@ -127,6 +127,29 @@ fn only(captured: &CaptureLayer, fields: &[(&str, &str)]) -> Record {
     record
 }
 
+fn assert_loaded_execution(captured: &CaptureLayer, expected_digest: &str) {
+    let execution = only(captured, &[("audit.event", "broker.execution")]);
+    assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
+    assert_eq!(execution.field("output.digest"), None, "{execution:?}");
+    assert_eq!(
+        execution.field("provider.artifact_sha256"),
+        Some(expected_digest)
+    );
+    assert_eq!(execution.field("policy.revision"), None);
+    for (name, value) in [
+        ("invocation.id", "invoke-audited"),
+        ("outcome", "Succeeded"),
+        ("effect", "ReadOnly"),
+        ("risk", "Low"),
+        ("credential", "fetch-token"),
+    ] {
+        assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
+    }
+    let calls: serde_json::Value =
+        serde_json::from_str(execution.field("http.calls").unwrap()).unwrap();
+    assert_eq!(calls[0]["credentialInjected"], true, "{calls}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let captured = CaptureLayer::workspace();
@@ -262,28 +285,9 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     assert_eq!(request_decision.parent(), Some("http.request"));
     assert_eq!(request_decision.field("decision.allowed"), Some("true"));
 
-    let execution = only(&captured, &[("audit.event", "broker.execution")]);
-    assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
-    assert_eq!(execution.field("output.digest"), None, "{execution:?}");
     assert_eq!(artifact_digest, expected_digest);
     assert_eq!(expected_digest.len(), 64);
-    assert_eq!(
-        execution.field("provider.artifact_sha256"),
-        Some(expected_digest.as_str())
-    );
-    assert_eq!(execution.field("policy.revision"), None);
-    for (name, value) in [
-        ("invocation.id", "invoke-audited"),
-        ("outcome", "Succeeded"),
-        ("effect", "ReadOnly"),
-        ("risk", "Low"),
-        ("credential", "fetch-token"),
-    ] {
-        assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
-    }
-    let calls: serde_json::Value =
-        serde_json::from_str(execution.field("http.calls").unwrap()).unwrap();
-    assert_eq!(calls[0]["credentialInjected"], true, "{calls}");
+    assert_loaded_execution(&captured, &expected_digest);
 
     let refusal = only(&captured, &[("invocation.id", "invoke-refused")]);
     assert_eq!(refusal.parent(), Some("broker.authorize"), "{refusal:?}");
