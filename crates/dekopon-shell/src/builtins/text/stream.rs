@@ -452,6 +452,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_grep_does_not_retain_before_context() {
+        let mut reader = PipeReader::from_bytes(b"abc\nabc\nmatch\n".to_vec());
+        let mut budget = Budget::start(Limits {
+            max_value_bytes: 7,
+            ..Limits::default()
+        });
+        let status = TextStream::Grep
+            .run(
+                &["-q".to_owned(), "-B2".to_owned(), "match".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |_| panic!("quiet grep must not emit context"),
+            )
+            .expect("quiet grep needs no retained before window");
+        assert_eq!(status, ExitCode::SUCCESS);
+    }
+
+    #[test]
     fn grep_before_window_retains_charges_and_context_stays_step_bounded() {
         let mut reader = PipeReader::from_bytes(b"abc\nabc\nabc\nmatch\n".to_vec());
         let mut budget = Budget::start(Limits {
