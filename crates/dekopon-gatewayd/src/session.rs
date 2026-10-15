@@ -1885,6 +1885,20 @@ async fn session(
         },
     );
     let leave_request = invoker.leave_request();
+    let capture_limits = route.memory_policy.as_ref().and_then(|policy| {
+        (runner.journal.is_some() && matches!(route.memory, MemoryPolicy::Persistent(_))).then(
+            || {
+                let bound = |limit| match limit {
+                    crate::config::memory::CaptureBound::Bytes(bytes) => Some(bytes.get() as usize),
+                    crate::config::memory::CaptureBound::Word(_) => None,
+                };
+                (
+                    bound(policy.capture.tool_request),
+                    bound(policy.capture.tool_result),
+                )
+            },
+        )
+    });
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -1915,6 +1929,9 @@ async fn session(
             // Withholding the agent-config view here removes the structured dump but not the underlying
             // instructions, which are still the system prompt, so this is not secrecy from a determined
             // user.
+            if let Some((request, result)) = capture_limits {
+                inputs = inputs.with_exchange_capture(request, result);
+            }
             if inspect_agent_config {
                 inputs = inputs.with_agent_config(&agent_config);
             }

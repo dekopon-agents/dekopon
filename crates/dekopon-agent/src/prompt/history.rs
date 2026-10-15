@@ -91,6 +91,41 @@ impl RawAnswer {
     }
 }
 
+impl Representation {
+    #[must_use]
+    pub fn original(text: &str, version: &str) -> Self {
+        Self {
+            routine_id: "original".into(),
+            version: version.into(),
+            source_record_id: 0,
+            part: None,
+            kind: "original".into(),
+            captured_bytes: text.len() as u64,
+            text: Some(text.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn prefix(text: &str, max_bytes: usize, routine_id: &str, version: &str) -> Self {
+        let cut = text.floor_char_boundary(max_bytes.min(text.len()));
+        Self {
+            routine_id: routine_id.into(),
+            version: version.into(),
+            source_record_id: 0,
+            part: None,
+            kind: "prefix".into(),
+            captured_bytes: text.len() as u64,
+            text: Some(text[..cut].into()),
+        }
+    }
+
+    #[must_use]
+    pub fn omitted_bytes(&self) -> u64 {
+        self.captured_bytes
+            .saturating_sub(self.text.as_ref().map_or(0, |text| text.len() as u64))
+    }
+}
+
 impl From<String> for RawAnswer {
     fn from(answer: String) -> Self {
         Self(answer)
@@ -109,6 +144,7 @@ impl From<&str> for RawAnswer {
 pub struct ConversationTurn {
     user: String,
     answer: Option<RawAnswer>,
+    exchanges: Vec<Exchange>,
 }
 
 impl ConversationTurn {
@@ -117,6 +153,7 @@ impl ConversationTurn {
         Self {
             user: user.into(),
             answer: Some(answer.into()),
+            exchanges: Vec::new(),
         }
     }
 
@@ -125,7 +162,19 @@ impl ConversationTurn {
         Self {
             user: user.into(),
             answer: None,
+            exchanges: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_exchanges(mut self, exchanges: Vec<Exchange>) -> Self {
+        self.exchanges = exchanges;
+        self
+    }
+
+    #[must_use]
+    pub fn exchanges(&self) -> &[Exchange] {
+        &self.exchanges
     }
 
     #[must_use]
