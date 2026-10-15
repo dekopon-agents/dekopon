@@ -22,9 +22,9 @@ bytes.workspace = true
 http-body.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-futures-util.workspace = true
+flate2.workspace = true
 percent-encoding.workspace = true
-reqwest = { workspace = true, features = ["gzip", "deflate"] }
+reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -33,7 +33,6 @@ tokio.workspace = true
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }
 dekopon-capability.workspace = true
-flate2.workspace = true
 serde_json.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

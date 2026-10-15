@@ -3,21 +3,21 @@ use super::{
     BoundCredential, BufferedHttpClient, ErrorCode, Header, HttpError, Request, Response,
     http_error, is_forbidden_response_header, map_reqwest_error,
 };
-use bytes::Bytes;
+use bytes::{Buf as _, Bytes};
 use dekopon_capability::HttpConstraints;
 use dekopon_core::base64::{self, Engine as _};
-use futures_util::StreamExt as _;
+use flate2::bufread::{GzDecoder, ZlibDecoder};
 use http_body::{Body, Frame, SizeHint};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{self, Read as _},
+    io::{self, BufRead, Read},
     os::unix::fs::FileExt as _,
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::Instrument as _;
 
 pub const CHUNK_BYTES: usize = dekopon_core::asset::MAX_ASSET_CHUNK_BYTES;
@@ -357,18 +357,18 @@ impl BufferedHttpClient {
         .await
         .map_err(|_elapsed| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
         .map_err(|error| map_reqwest_error(&error))?;
-        let (status, headers, mut response_bytes) = self.accept_head(&response, &grant, index)?;
+        let Head {
+            status,
+            headers,
+            bytes: mut response_bytes,
+            mut body,
+        } = self.accept_head(response, &grant, index)?;
         let overlap = self
             .credential
             .as_ref()
             .map_or(0, BoundCredential::echo_overlap);
         let mut window = Vec::with_capacity(CHUNK_BYTES + overlap);
-        let mut response = response.bytes_stream();
-        while let Some(chunk) = timeout(self.remaining()?, response.next())
-            .await
-            .map_err(|_elapsed| http_error(ErrorCode::Timeout, "response body timed out"))?
-        {
-            let chunk = chunk.map_err(|error| map_reqwest_error(&error))?;
+        while let Some(chunk) = body.next().await? {
             response_bytes = response_bytes
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
@@ -412,24 +412,152 @@ pub(crate) fn echoed() -> HttpError {
     )
 }
 
+#[derive(Default)]
+struct Pending {
+    chunk: Bytes,
+    ended: bool,
+}
+
+impl Read for Pending {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.fill_buf()?.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&self.chunk[..count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+impl BufRead for Pending {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.chunk.is_empty() && !self.ended {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(&self.chunk)
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.chunk.advance(amount);
+    }
+}
+
+enum Decoder {
+    Gzip(GzDecoder<Pending>),
+    Deflate(ZlibDecoder<Pending>),
+}
+
+impl Decoder {
+    fn read(&mut self, decoded: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Gzip(decoder) => decoder.read(decoded),
+            Self::Deflate(decoder) => decoder.read(decoded),
+        }
+    }
+
+    fn pending(&mut self) -> &mut Pending {
+        match self {
+            Self::Gzip(decoder) => decoder.get_mut(),
+            Self::Deflate(decoder) => decoder.get_mut(),
+        }
+    }
+}
+
+pub(crate) struct Head {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<Header>,
+    pub(crate) bytes: u64,
+    pub(crate) body: ResponseBody,
+}
+
+pub(crate) struct ResponseBody {
+    response: reqwest::Response,
+    decoder: Option<Decoder>,
+    deadline: Instant,
+}
+
+impl ResponseBody {
+    pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, HttpError> {
+        let Some(decoder) = &mut self.decoder else {
+            return next_chunk(&mut self.response, self.deadline).await;
+        };
+        let mut decoded = vec![0; CHUNK_BYTES];
+        loop {
+            match decoder.read(&mut decoded) {
+                Ok(0) => {
+                    let pending = decoder.pending();
+                    if pending.chunk.is_empty()
+                        && (pending.ended
+                            || next_chunk(&mut self.response, self.deadline)
+                                .await?
+                                .is_none())
+                    {
+                        return Ok(None);
+                    }
+                    return Err(http_error(
+                        ErrorCode::Protocol,
+                        "response carries bytes after its encoded body",
+                    ));
+                }
+                Ok(count) => {
+                    decoded.truncate(count);
+                    return Ok(Some(decoded.into()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    match next_chunk(&mut self.response, self.deadline).await? {
+                        Some(chunk) => decoder.pending().chunk = chunk,
+                        None => decoder.pending().ended = true,
+                    }
+                }
+                Err(_error) => {
+                    return Err(http_error(
+                        ErrorCode::Protocol,
+                        "encoded response body is corrupt",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn next_chunk(
+    response: &mut reqwest::Response,
+    deadline: Instant,
+) -> Result<Option<Bytes>, HttpError> {
+    timeout_at(deadline, response.chunk())
+        .await
+        .map_err(|_elapsed| http_error(ErrorCode::Timeout, "response body timed out"))?
+        .map_err(|error| map_reqwest_error(&error))
+}
+
 impl BufferedHttpClient {
     pub(crate) fn accept_head(
         &mut self,
-        response: &reqwest::Response,
+        response: reqwest::Response,
         grant: &HttpConstraints,
         index: usize,
-    ) -> Result<(u16, Vec<Header>, u64), HttpError> {
-        // The client strips the header from what it decoded; a body still encoded would reach
-        // the credential echo scan as compressed bytes.
-        if response
+    ) -> Result<Head, HttpError> {
+        let mut codings = response
             .headers()
-            .contains_key(reqwest::header::CONTENT_ENCODING)
-        {
-            return Err(http_error(
-                ErrorCode::Protocol,
-                "response content encoding is not one the host decodes",
-            ));
-        }
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter();
+        let decoder = match (
+            codings.next().map(reqwest::header::HeaderValue::as_bytes),
+            codings.next(),
+        ) {
+            (None, _) => None,
+            (Some(coding), None) if coding.eq_ignore_ascii_case(b"gzip") => {
+                Some(Decoder::Gzip(GzDecoder::new(Pending::default())))
+            }
+            (Some(coding), None) if coding.eq_ignore_ascii_case(b"deflate") => {
+                Some(Decoder::Deflate(ZlibDecoder::new(Pending::default())))
+            }
+            // A body the host does not decode would reach the credential echo scan still encoded.
+            (Some(_), _) => {
+                return Err(http_error(
+                    ErrorCode::Protocol,
+                    "response content encoding is not one the host decodes",
+                ));
+            }
+        };
         let status = response.status().as_u16();
         self.evidence[index].status = Some(status);
         if response.headers().len() > self.ceilings.max_headers {
@@ -452,7 +580,10 @@ impl BufferedHttpClient {
                     "response headers exceed an authorized bound",
                 ));
             }
-            if !is_forbidden_response_header(name) {
+            if !is_forbidden_response_header(name)
+                && name != reqwest::header::CONTENT_ENCODING
+                && (decoder.is_none() || name != reqwest::header::CONTENT_LENGTH)
+            {
                 headers.push(Header {
                     name: name.as_str().to_owned(),
                     value: value.as_bytes().to_vec(),
@@ -472,7 +603,16 @@ impl BufferedHttpClient {
             return Err(echoed());
         }
         self.evidence[index].response_bytes = response_bytes;
-        Ok((status, head.headers, response_bytes))
+        Ok(Head {
+            status,
+            headers: head.headers,
+            bytes: response_bytes,
+            body: ResponseBody {
+                response,
+                decoder,
+                deadline: self.deadline,
+            },
+        })
     }
 
     fn asset_error(&mut self, error: AssetIoError) -> HttpError {
@@ -1044,6 +1184,12 @@ mod tests {
                     (response.headers, body)
                 }),
         };
+        assert!(
+            server
+                .request_text()
+                .to_ascii_lowercase()
+                .contains("accept-encoding: gzip, deflate\r\n")
+        );
         server.join();
         result.map_err(|error| error.code)
     }
@@ -1078,6 +1224,14 @@ mod tests {
                 (encoded("gzip", &gzip(plain)), Ok(plain.to_vec())),
                 (encoded("deflate", &zlib(plain)), Ok(plain.to_vec())),
                 (encoded("br", plain), Err(ErrorCode::Protocol)),
+                (
+                    encoded("gzip\r\nContent-Encoding: gzip", &gzip(&gzip(plain))),
+                    Err(ErrorCode::Protocol),
+                ),
+                (
+                    encoded("gzip", &[gzip(plain), b"trailing".to_vec()].concat()),
+                    Err(ErrorCode::Protocol),
+                ),
             ] {
                 let result = fetch(path, &response, 1024, None).await;
                 if let Ok((headers, _)) = &result {
