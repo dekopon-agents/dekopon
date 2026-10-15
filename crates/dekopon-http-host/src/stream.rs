@@ -413,21 +413,21 @@ pub(crate) fn echoed() -> HttpError {
 }
 
 impl BufferedHttpClient {
-    /// The one response-head path for `stream` and `open`: encoded bodies are refused, the header
-    /// bounds hold and the visible headers are scanned before any body byte is read.
     pub(crate) fn accept_head(
         &mut self,
         response: &reqwest::Response,
         grant: &HttpConstraints,
         index: usize,
     ) -> Result<(u16, Vec<Header>, u64), HttpError> {
+        // The client strips the header from what it decoded; a body still encoded would reach
+        // the credential echo scan as compressed bytes.
         if response
             .headers()
             .contains_key(reqwest::header::CONTENT_ENCODING)
         {
             return Err(http_error(
                 ErrorCode::Protocol,
-                "encoded streamed HTTP responses are refused",
+                "response content encoding is not one the host decodes",
             ));
         }
         let status = response.status().as_u16();
@@ -508,7 +508,11 @@ mod tests {
     use dekopon_capability::HttpConstraints;
     use dekopon_core::Redacted;
     use dekopon_test_support::{LoopbackServer, content_length};
-    use std::time::Duration;
+    use flate2::{
+        Compression,
+        write::{GzEncoder, ZlibEncoder},
+    };
+    use std::{io::Write as _, time::Duration};
 
     fn client(
         authority: &str,
@@ -804,7 +808,7 @@ mod tests {
         for encoding in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let response = if encoding {
-                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice()
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice()
             } else {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice()
             };
@@ -987,6 +991,138 @@ mod tests {
                 assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
             }
             server.join();
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Path {
+        Send,
+        Stream,
+    }
+
+    async fn fetch(
+        path: Path,
+        response: &[u8],
+        maximum: u64,
+        secret: Option<&str>,
+    ) -> Result<(Vec<Header>, Vec<u8>), ErrorCode> {
+        let root = tempfile::tempdir().unwrap();
+        let server = LoopbackServer::once(response);
+        let credential = secret.map(|secret| {
+            BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(secret.to_owned()),
+                vec![server.authority().to_owned()],
+            )
+            .unwrap()
+        });
+        let mut client = client(server.authority(), maximum, credential);
+        let result = match path {
+            Path::Send => client
+                .send(Request {
+                    method: "POST".to_owned(),
+                    uri: server.url(),
+                    headers: vec![],
+                    body: vec![],
+                })
+                .await
+                .map(|response| (response.headers, response.body)),
+            Path::Stream => client
+                .stream(
+                    request(&server, vec![]),
+                    &AssetDirectory::new(root.path().to_owned(), maximum),
+                )
+                .await
+                .map(|response| {
+                    let body = read_decoded(
+                        response.body.file(),
+                        Representation::Identity,
+                        0,
+                        usize::try_from(response.body.len()).unwrap(),
+                    )
+                    .unwrap();
+                    (response.headers, body)
+                }),
+        };
+        server.join();
+        result.map_err(|error| error.code)
+    }
+
+    fn encoded(encoding: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn gzip(plain: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib(plain: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_delivered_body_is_decoded_or_refused_on_send_and_stream() {
+        let plain = b"plain response text";
+        for path in [Path::Send, Path::Stream] {
+            for (response, expected) in [
+                (encoded("gzip", &gzip(plain)), Ok(plain.to_vec())),
+                (encoded("deflate", &zlib(plain)), Ok(plain.to_vec())),
+                (encoded("br", plain), Err(ErrorCode::Protocol)),
+            ] {
+                let result = fetch(path, &response, 1024, None).await;
+                if let Ok((headers, _)) = &result {
+                    assert!(
+                        headers
+                            .iter()
+                            .all(|header| header.name != "content-encoding")
+                    );
+                }
+                assert_eq!(result.map(|(_, body)| body), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_echoed_inside_a_compressed_body_is_refused_on_send_and_stream() {
+        let secret = "secret-with-sixteen-bytes";
+        let response = encoded(
+            "gzip",
+            &gzip(format!("{}Bearer {secret}", "echo ".repeat(64)).as_bytes()),
+        );
+        assert!(
+            !response
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        for path in [Path::Send, Path::Stream] {
+            assert_eq!(
+                fetch(path, &response, 1024, Some(secret)).await.err(),
+                Some(ErrorCode::Denied)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_response_limit_counts_decoded_bytes_on_send_and_stream() {
+        let maximum = 64 * 1024;
+        let bomb = gzip(&vec![0; 1024 * 1024]);
+        assert!((bomb.len() as u64) < maximum / 8);
+        let response = encoded("gzip", &bomb);
+        for path in [Path::Send, Path::Stream] {
+            assert_eq!(
+                fetch(path, &response, maximum, None).await.err(),
+                Some(ErrorCode::ResponseTooLarge)
+            );
         }
     }
 }
