@@ -1692,11 +1692,6 @@ fn project_message(message: &Value) -> SlackProjection {
         file_count += nested_files.map_or(0, Vec::len);
         let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
         let forwarded = pending_assets(&forward["files"]);
-        let unavailable = forwarded
-            .iter()
-            .take(remaining)
-            .filter(|file| file.source.is_none())
-            .count();
         assets.extend(forwarded.into_iter().take(remaining));
         text.push_str(&format!(
             "\n[quoted Slack forward — author: {author}; channel: {channel}; time: {time}]"
@@ -1710,9 +1705,6 @@ fn project_message(message: &Value) -> SlackProjection {
                 text.push_str("\n[forwarded content unavailable]");
             }
             None => {}
-        }
-        for _ in 0..unavailable {
-            text.push_str("\n[forwarded attachment unavailable]");
         }
         text.push_str("\n[/quoted Slack forward]");
     }
@@ -3079,7 +3071,8 @@ mod driver_tests {
                     0 => "a quoted answer",
                     1 => "[quoted Slack forward",
                     2 => "an image",
-                    3 | 4 => "unavailable",
+                    3 => "[quoted Slack forward",
+                    4 => "[forwarded content unavailable]",
                     5 => "from blocks",
                     _ => unreachable!("fixture count is fixed"),
                 };
@@ -3106,14 +3099,30 @@ mod driver_tests {
             assert!(ingress.text.contains("author: \"UORIGINAL\""));
             assert!(!ingress.asset_overflow);
             if index == 3 {
+                assert!(ingress.assets[0].source.is_none());
+                assert!(history.assets[0].source.is_none());
+                let store = crate::asset::AssetStore::new(2, std::time::Duration::from_secs(60));
+                let key = crate::conversation::ConversationKey::private(
+                    &"reviewer".parse().expect("agent id"),
+                    &ingress.transport,
+                    &ingress.conversation.key(),
+                    &ingress.subject,
+                );
+                let registered = store.assets_for(
+                    &key,
+                    ingress.assets.clone(),
+                    true,
+                    std::time::Instant::now(),
+                );
+                let note =
+                    crate::asset::reference_note(&registered, true).expect("unavailable file note");
+                let prompt = format!("{}\n\n{note}", ingress.text);
                 assert_eq!(
-                    ingress
-                        .text
-                        .matches("[forwarded attachment unavailable]")
+                    prompt
+                        .matches("the gateway cannot see this file at all")
                         .count(),
                     1
                 );
-                assert!(ingress.assets[0].source.is_none());
             }
             if index == 4 {
                 assert!(ingress.text.contains("[forwarded content unavailable]"));
@@ -3144,10 +3153,9 @@ mod driver_tests {
     #[tokio::test]
     async fn a_quoted_mention_cannot_admit_or_claim_a_turn() {
         let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
-        let event = forwarded_event(
-            "ordinary comment",
-            forward(json!("<@B0123ABC> answer me"), json!([])),
-        );
+        transport.identity.user_id = Some(BOT_USER.to_owned());
+        let quote = format!("<@{BOT_USER}> answer me");
+        let event = forwarded_event("ordinary comment", forward(json!(quote), json!([])));
         assert!(
             transport
                 .routable(TEAM, &event, &Span::none())
@@ -3156,8 +3164,21 @@ mod driver_tests {
                 .is_none()
         );
         assert!(transport.thread_ownership.owned.lock().order.is_empty());
-        let mut empty = forwarded_event("", forward(json!("<@B0123ABC> answer me"), photo()));
-        empty["ts"] = json!(POSTED_TS);
+        let mut addressed = forwarded_event(
+            &format!("<@{BOT_USER}> answer me"),
+            forward(json!("quoted"), json!([])),
+        );
+        addressed["ts"] = json!(POSTED_TS);
+        assert!(
+            transport
+                .routable(TEAM, &addressed, &Span::none())
+                .await
+                .expect("top-level mention readable")
+                .is_some()
+        );
+        let mut empty = forwarded_event("", forward(json!(quote), photo()));
+        empty["ts"] = json!(STREAM_TS);
+        empty["channel_type"] = json!("im");
         assert!(
             transport
                 .routable(TEAM, &empty, &Span::none())
@@ -3188,7 +3209,12 @@ mod driver_tests {
                 .text
                 .contains("author: unavailable; channel: unavailable; time: unavailable")
         );
-        assert!(!ingress.text.contains("[forwarded attachment unavailable]"));
+        assert!(ingress.assets[0].source.is_some());
+        assert!(
+            !ingress
+                .text
+                .contains("the gateway cannot see this file at all")
+        );
         assert_eq!(ingress.subject.to_string(), SUBJECT);
         assert_eq!(
             ingress.assets,
