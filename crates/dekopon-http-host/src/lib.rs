@@ -1958,10 +1958,14 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local pending-response fixture");
+        let authority = listener.local_addr().expect("bound address").to_string();
         let evaluations = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&evaluations);
         let mut client = BufferedHttpClient::authorized(
-            grant("127.0.0.1:9".to_owned(), "GET"),
+            grant(authority.clone(), "GET"),
             HttpHostCeilings::default(),
             Duration::from_secs(1),
         )
@@ -1974,7 +1978,7 @@ mod tests {
             Duration::ZERO,
             client.send(Request {
                 method: "GET".to_owned(),
-                uri: "http://127.0.0.1:9/reply".to_owned(),
+                uri: format!("http://{authority}/reply"),
                 headers: Vec::new(),
                 body: Vec::new(),
             }),
