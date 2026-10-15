@@ -1,6 +1,11 @@
 name: Wasmtime optimization
 
 on:
+  workflow_call:
+    inputs:
+      runners:
+        type: string
+        required: true
   push:
     branches: [main]
     paths:
@@ -25,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: wasmtime-optimization-${{ github.ref }}
+  group: wasmtime-optimization-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -40,7 +45,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # ci.yml already calls this with the ARM64 runner on every Rust pull request.
+        os: ${{ fromJSON(inputs.runners || (github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]')) }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -48,6 +54,12 @@ jobs:
         run: rustup toolchain install
       - name: Select the optimized dependency lock
         run: cp .cargo/wasmtime-optimization.lock Cargo.lock
+      - name: Cache optimized dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: wasmtime-optimization-v1
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.arch == 'ARM64' }}
       - name: Verify the pinned Wasmtime source
         shell: bash
         run: |

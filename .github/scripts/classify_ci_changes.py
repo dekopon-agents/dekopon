@@ -29,6 +29,7 @@ FULL_CI_INPUTS = {
     ".github/workflows/cache-warm.yml",
     ".github/workflows/container-image.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/wasmtime-optimization.yml",
     ".github/scripts/test_stage_image_context.py",
     "ci/stage-image-context.sh",
     ".github/scripts/classify_ci_changes.py",

@@ -230,6 +230,15 @@ jobs:
       - name: Test broker-host component boundaries
         run: cargo test -p dekopon-broker-host --test host --all-features --locked
 
+  # The RPi runs the Wasmtime-optimized ARM64 image, so pull requests test that flavor on that architecture.
+  wasmtime_optimization:
+    name: Wasmtime optimization
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    uses: ./.github/workflows/wasmtime-optimization.yml
+    with:
+      runners: '["ubuntu-24.04-arm"]'
+
   # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
   # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
   # undocumented audit event. The audit gate reads crates/**/*.rs, which is why every
