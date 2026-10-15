@@ -1197,6 +1197,7 @@ dependencies = [
  "cedar-policy",
  "dekopon-capability",
  "dekopon-core",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",

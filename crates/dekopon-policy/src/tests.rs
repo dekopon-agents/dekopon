@@ -3,8 +3,9 @@ use dekopon_core::{RiskLevel, SecretSinkKind};
 use serde_json::json;
 
 use super::{
-    AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION, UnresolvedKind,
+    AGENT_PROMPT_ACTION, HttpRequestFacts, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext,
+    PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION,
+    UnresolvedKind,
 };
 
 fn world() -> PolicyWorld {
@@ -74,6 +75,134 @@ fn via(name: &str) -> PolicyContext {
 
 fn session() -> PolicyContext {
     via("dekopon-gatewayd")
+}
+
+fn facts(body: Option<&[u8]>) -> HttpRequestFacts {
+    HttpRequestFacts {
+        method: "POST".into(),
+        host: "example.com".into(),
+        path: "/api/send".into(),
+        query: String::new(),
+        headers: vec![],
+        body: body.map(<[u8]>::to_vec),
+        content_type: Some("application/json; charset=utf-8".into()),
+    }
+}
+
+fn request_json(facts: HttpRequestFacts) -> serde_json::Value {
+    facts
+        .context()
+        .expect("valid request facts")
+        .to_json_value()
+        .expect("representable request context")["request"]
+        .clone()
+}
+
+#[test]
+fn request_url_method_and_guest_headers_are_exact_or_absent() {
+    let mut input = facts(None);
+    input.headers = vec![("X-Guest".into(), b"caf\xc3\xa9".to_vec())];
+    let request = request_json(input.clone());
+    assert_eq!(request["method"], "POST");
+    assert_eq!(
+        request["url"],
+        json!({"host":"example.com","path":"/api/send"})
+    );
+    assert_eq!(request["headers"], json!({"x-guest":"café"}));
+    input.query = "a=1".into();
+    assert_eq!(request_json(input.clone())["url"]["query"], "a=1");
+    input.headers.push(("x-GUEST".into(), b"other".to_vec()));
+    assert!(request_json(input.clone()).get("headers").is_none());
+    input.headers = vec![("Other".into(), vec![0xff])];
+    assert!(request_json(input.clone()).get("headers").is_none());
+    input.headers = vec![(
+        "__entity".into(),
+        b"Dekopon::Principal::\"cpetersen\"".to_vec(),
+    )];
+    assert!(request_json(input).get("headers").is_none());
+}
+
+#[test]
+fn only_entire_representable_json_records_enter_request_context() {
+    let body = br#"{"channel":"C0123","nested":{"ok":true,"count":-5,"values":["a",2]}}"#;
+    let mut input = facts(Some(body));
+    let exposed = request_json(input.clone());
+    assert_eq!(exposed["body"]["channel"], "C0123");
+    assert_eq!(exposed["body"]["nested"]["ok"], true);
+    assert_eq!(exposed["body"]["nested"]["count"], -5);
+    assert_eq!(
+        exposed["body"]["nested"]["values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    input.content_type = Some("application/problem+json".into());
+    assert!(request_json(input.clone()).get("body").is_none());
+    input.content_type = Some("application/json".into());
+    let at_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(16 * 1024 - 8));
+    input.body = Some(at_limit.as_bytes().to_vec());
+    assert!(request_json(input.clone()).get("body").is_some());
+    input.body.as_mut().unwrap().insert(7, b'a');
+    assert!(request_json(input.clone()).get("body").is_none());
+    for bad in [
+        "",
+        "oops",
+        "[]",
+        "null",
+        "{\"x\":null}",
+        "{\"x\":1.5}",
+        "{\"x\":9223372036854775808}",
+        "{\"x\":1,\"x\":2}",
+        "{\"nested\":{\"x\":1,\"x\":2}}",
+        "{\"x\":{\"__entity\":\"A::\\\"b\\\"\"}}",
+        "{\"x\":[{\"__extn\":{}}]}",
+    ] {
+        input.body = Some(bad.as_bytes().to_vec());
+        assert!(request_json(input.clone()).get("body").is_none(), "{bad}");
+    }
+    input.body = Some(body.to_vec());
+    for media in [
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+        "text/json",
+    ] {
+        input.content_type = Some(media.into());
+        assert!(request_json(input.clone()).get("body").is_none());
+    }
+    input.content_type = None;
+    assert!(request_json(input.clone()).get("body").is_none());
+    input.body = None;
+    assert!(request_json(input).get("body").is_none());
+}
+
+#[test]
+fn guarded_forbid_is_inert_without_request_but_sees_request_facts() {
+    let engine = PolicyEngine::new(
+        r#"
+        @id("allow") permit(principal, action, resource);
+        @id("guard") forbid(principal, action, resource)
+        when { context has request }
+        when { context.request.method == "POST" && context.request.url.host == "example.com" };
+    "#,
+        &world(),
+    )
+    .expect("request guard loads");
+    let invocation = engine.authorize(capability_request(
+        "cpetersen",
+        "cli-probe.upper",
+        session(),
+    ));
+    assert!(invocation.allowed);
+    assert!(!invocation.errors_present);
+    assert!(
+        !engine
+            .authorize_http(
+                capability_request("cpetersen", "cli-probe.upper", session()),
+                facts(None)
+            )
+            .allowed
+    );
 }
 
 #[test]
