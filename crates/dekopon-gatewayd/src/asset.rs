@@ -581,8 +581,6 @@ impl Registered {
 
 const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
 
-const MAX_FETCHES_PER_SESSION: u32 = 4;
-
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Fetch is synchronous because the prompt loop that calls it runs on a blocking task, so blocking
@@ -594,7 +592,6 @@ pub(crate) struct SessionAssets {
     runtime: Handle,
     images_supported: bool,
     available: AtomicBool,
-    spent: Mutex<u32>,
 }
 
 impl SessionAssets {
@@ -617,7 +614,6 @@ impl SessionAssets {
             runtime,
             images_supported,
             available: AtomicBool::new(available),
-            spent: Mutex::new(0),
         }
     }
 }
@@ -637,15 +633,6 @@ impl AssetSource for SessionAssets {
     }
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
-        {
-            let mut spent = self.spent.lock();
-            if *spent >= MAX_FETCHES_PER_SESSION {
-                return Err(format!(
-                    "This session has already opened {MAX_FETCHES_PER_SESSION} attachments, which is the limit. Answer with what you have."
-                ));
-            }
-            *spent += 1;
-        }
         let (asset, data) = self
             .load(
                 id,
@@ -1293,6 +1280,28 @@ mod retention_tests {
             Duration::from_secs(600),
             budget,
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eight_retained_photos_can_be_fetched_in_one_session() {
+        let store = store(64);
+        let access = access("photos");
+        let ids: Vec<_> = (1..=8).map(|_| register(&store, &access)).collect();
+        for (id, value) in ids.iter().zip(1..=8) {
+            drop(store.admit(&access, *id, &[value; 3]).unwrap());
+        }
+        let session = SessionAssets::new(store, access, None, Handle::current(), true, true);
+        tokio::task::spawn_blocking(move || {
+            for (id, value) in ids.iter().zip(1..=8) {
+                assert_eq!(session.fetch(*id).unwrap().data.read().unwrap(), [value; 3]);
+            }
+            assert_eq!(
+                session.fetch(u64::MAX).unwrap_err(),
+                AssetFailure::Unknown.for_model(u64::MAX)
+            );
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

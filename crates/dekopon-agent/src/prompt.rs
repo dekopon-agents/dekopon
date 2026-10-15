@@ -1379,6 +1379,32 @@ fn fetch_asset_into(
             return Ok(());
         }
     };
+    if !is_textual(&asset.mime) {
+        let carried = messages
+            .iter()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .fold(0usize, |bytes, part| match part {
+                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
+                    bytes.saturating_add(data.len())
+                }
+                ContentPart::Text(_) => bytes,
+            });
+        if asset.data.len()
+            > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(carried)
+        {
+            let reason = format!(
+                "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Answer with the images already shown."
+            );
+            tracing::info!(
+                target: "dekopon_agent::audit",
+                { audit.event = "agent.asset.refused", asset.id = id, reason = reason.as_str() },
+                "chat asset refused"
+            );
+            messages.push(ModelMessage::tool(call.id.clone(), reason));
+            return Ok(());
+        }
+    }
     let text = if is_textual(&asset.mime) {
         match asset.data.read() {
             Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
@@ -3954,6 +3980,128 @@ mod tests {
             }],
             None,
         )
+    }
+
+    #[test]
+    fn eight_distinct_photos_reach_one_model_request() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let photos = (1..=8)
+            .map(|id| FetchedAsset {
+                name: format!("photo-{id}.png"),
+                mime: "image/png".into(),
+                data: dekopon_model::asset::DiskBlob::from_bytes(&[id; 32])
+                    .unwrap()
+                    .into(),
+            })
+            .collect();
+        let assets = FixedAssets(photos);
+        let model = ScriptedModel::new((1..=8).map(asset_call).chain([answer("seen")]));
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("look at each photo", limits(10, 32)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let requests = model.observed_messages.lock();
+        let last = requests.last().unwrap();
+        let images: Vec<_> = last
+            .iter()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .filter_map(|part| match part {
+                dekopon_model::model::ContentPart::Image { data, .. } => Some(data.read().unwrap()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, (1..=8).map(|id| vec![id; 32]).collect::<Vec<_>>());
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.fetched")]
+                )
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn crossing_photo_is_named_but_prior_images_stay_in_the_model_request() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let photos = (1..=9)
+            .map(|id| FetchedAsset {
+                name: format!("photo-{id}.png"),
+                mime: "image/png".into(),
+                data: dekopon_model::asset::DiskBlob::from_bytes(&vec![
+                    id;
+                    if id == 9 {
+                        1
+                    } else {
+                        5 * 1024 * 1024
+                    }
+                ])
+                .unwrap()
+                .into(),
+            })
+            .collect();
+        let assets = FixedAssets(photos);
+        let model = ScriptedModel::new((1..=9).map(asset_call).chain([answer("seen")]));
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("look at each photo", limits(11, 32)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let requests = model.observed_messages.lock();
+        let last = requests.last().unwrap();
+        let images: Vec<_> = last
+            .iter()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .filter_map(|part| match part {
+                dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 8);
+        assert_eq!(
+            images.iter().map(|image| image.len()).sum::<usize>(),
+            40 * 1024 * 1024
+        );
+        for (index, image) in images.iter().enumerate() {
+            assert_eq!(image.read().unwrap()[0], (index + 1) as u8);
+        }
+        assert!(last.iter().any(|message| {
+            message.role() == "tool"
+                && message
+                    .content()
+                    .is_some_and(|text| text.contains("chat-asset:9 will not be shown"))
+        }));
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.refused"), ("asset.id", "9")]
+                )
+                .len(),
+            1
+        );
     }
 
     #[test]
