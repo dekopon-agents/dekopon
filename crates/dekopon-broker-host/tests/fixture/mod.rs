@@ -360,7 +360,7 @@ impl FixtureHost {
             self.provider.clone(),
             "testkit-decision".to_owned(),
             "testkit-broker".parse::<PrincipalId>()?,
-            "testkit-policy".to_owned(),
+            "a".repeat(64),
             self.constraints(),
         )?;
 

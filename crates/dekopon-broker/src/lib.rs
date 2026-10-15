@@ -1632,8 +1632,6 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
         decision_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_revision: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1674,12 +1672,12 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
         decision_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_revision: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_artifact_sha256: Option<String>,
         effect: EffectKind,
         risk: RiskLevel,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3162,7 +3160,6 @@ where
             provider: None,
             authorized_by: Some(self.broker_principal.clone()),
             decision_id: decision_id.clone(),
-            policy_revision: Some(self.policy_revision.clone()),
             policy_ids,
             policy_error_ids: Vec::new(),
             policy_errors_present: None,
@@ -3214,15 +3211,20 @@ where
         policy_evidence: Evidence,
         reason: &'static str,
     ) -> Result<InvocationResult, BrokerError> {
+        let artifact = self
+            .registry
+            .loaded_provider_metadata()
+            .find(|metadata| metadata.manifest.id == set.provider)
+            .map(|metadata| metadata.artifact_sha256);
         let event = execution_event(
             context,
             invocation,
             trace,
             capability,
             decision_id,
-            &self.policy_revision,
             policy_ids,
             &self.policy_digest,
+            artifact.as_deref(),
             &self.broker_principal,
             set,
             credential,
@@ -3438,7 +3440,6 @@ where
                     provider: Some(provider.clone()),
                     authorized_by: Some(broker_principal.clone()),
                     decision_id: format!("http-{invocation}-{ordinal}"),
-                    policy_revision: Some(policy_revision.clone()),
                     policy_ids: result.determining_policy_ids,
                     policy_error_ids: result.erroring_policy_ids,
                     policy_errors_present: Some(result.errors_present),
@@ -3471,7 +3472,7 @@ where
                 set.provider.clone(),
                 decision_id.clone(),
                 self.broker_principal.clone(),
-                self.policy_revision.clone(),
+                self.policy_hex_digest().to_owned(),
                 set.constraints.clone(),
             )
             .map_err(|source| BrokerError::Authorization { source })?;
@@ -3510,7 +3511,6 @@ where
             provider: Some(set.provider.clone()),
             authorized_by: Some(self.broker_principal.clone()),
             decision_id: decision_id.clone(),
-            policy_revision: Some(self.policy_revision.clone()),
             policy_ids: policy_ids.clone(),
             policy_error_ids: Vec::new(),
             policy_errors_present: None,
@@ -3684,6 +3684,11 @@ where
                 },
             }
         };
+        let provider_artifact_sha256 = self
+            .registry
+            .loaded_provider_metadata()
+            .find(|metadata| metadata.manifest.id == set.provider)
+            .map(|metadata| metadata.artifact_sha256);
         let started = Instant::now();
         let execution = self
             .registry
@@ -3729,9 +3734,9 @@ where
                     trace,
                     &capability,
                     &decision_id,
-                    &self.policy_revision,
                     &policy_ids,
                     &self.policy_digest,
+                    provider_artifact_sha256.as_deref(),
                     &self.broker_principal,
                     &set,
                     audit_credential,
@@ -3787,9 +3792,9 @@ where
                     trace,
                     &capability,
                     &decision_id,
-                    &self.policy_revision,
                     &policy_ids,
                     &self.policy_digest,
+                    provider_artifact_sha256.as_deref(),
                     &self.broker_principal,
                     &set,
                     audit_credential,
@@ -3850,11 +3855,17 @@ where
         self.audit.append(event).await
     }
 
+    fn policy_hex_digest(&self) -> &str {
+        self.policy_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&self.policy_digest)
+    }
+
     fn decision_reference(&self, decision_id: &str) -> DecisionReference {
         DecisionReference {
             decision_id: decision_id.to_owned(),
             authorized_by: self.broker_principal.clone(),
-            policy_revision: self.policy_revision.clone(),
+            policy_digest: self.policy_hex_digest().to_owned(),
         }
     }
 }
@@ -4341,7 +4352,6 @@ fn emit_audit_event(event: &AuditEvent) {
             provider,
             authorized_by,
             decision_id,
-            policy_revision,
             policy_ids,
             policy_error_ids,
             policy_errors_present,
@@ -4369,7 +4379,6 @@ fn emit_audit_event(event: &AuditEvent) {
                 subject = attested_subject.as_ref().map(ToString::to_string),
                 provider = provider.as_ref().map(ToString::to_string),
                 authorized.by = authorized_by.as_ref().map(ToString::to_string),
-                policy.revision = policy_revision.as_deref(),
                 policy.ids = joined(policy_ids),
                 policy.error_ids = joined(policy_error_ids),
                 policy.errors_present = policy_errors_present,
@@ -4396,9 +4405,9 @@ fn emit_audit_event(event: &AuditEvent) {
             provider,
             authorized_by,
             decision_id,
-            policy_revision,
             policy_ids,
             policy_digest,
+            provider_artifact_sha256,
             effect,
             risk,
             credential,
@@ -4424,9 +4433,9 @@ fn emit_audit_event(event: &AuditEvent) {
                 subject = attested_subject.as_ref().map(ToString::to_string),
                 provider = provider.as_ref().map(ToString::to_string),
                 authorized.by = authorized_by.as_ref().map(ToString::to_string),
-                policy.revision = policy_revision.as_deref(),
                 policy.ids = joined(policy_ids),
                 policy.digest = policy_digest.as_deref(),
+                provider.artifact_sha256 = provider_artifact_sha256.as_deref(),
                 secret = secret.as_ref().map(ToString::to_string),
                 secret.sink = secret_sink.as_ref().map(ToString::to_string),
                 effect = ?effect,
@@ -4492,9 +4501,9 @@ fn execution_event(
     trace: TraceId,
     capability: &CapabilityId,
     decision_id: &str,
-    policy_revision: &str,
     policy_ids: &[String],
     policy_digest: &str,
+    provider_artifact_sha256: Option<&str>,
     authorized_by: &PrincipalId,
     set: &ConstraintSet,
     credential: Option<&str>,
@@ -4527,9 +4536,9 @@ fn execution_event(
         provider: Some(set.provider.clone()),
         authorized_by: Some(authorized_by.clone()),
         decision_id: decision_id.to_owned(),
-        policy_revision: Some(policy_revision.to_owned()),
         policy_ids: policy_ids.to_vec(),
         policy_digest: Some(policy_digest.to_owned()),
+        provider_artifact_sha256: provider_artifact_sha256.map(str::to_owned),
         effect: set.effect,
         risk: set.risk,
         credential: credential.map(str::to_owned),

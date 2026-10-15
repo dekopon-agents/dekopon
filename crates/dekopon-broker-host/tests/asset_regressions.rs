@@ -61,7 +61,7 @@ fn authorized_for(
             "broker-test"
                 .parse::<PrincipalId>()
                 .expect("valid principal fixture"),
-            "policy-test".to_owned(),
+            "a".repeat(64),
             constraints,
         )
         .expect("test broker authorizes bounded fixture")

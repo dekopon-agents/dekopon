@@ -301,7 +301,7 @@ impl<P: Provider> Run<P> {
             P::ID.parse()?,
             "testkit-decision".to_owned(),
             "testkit-broker".parse::<PrincipalId>()?,
-            "testkit-policy".to_owned(),
+            "a".repeat(64),
             ExecutionConstraints {
                 asset: self.assets,
                 timeout_ms: self

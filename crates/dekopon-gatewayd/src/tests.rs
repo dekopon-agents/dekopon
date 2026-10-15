@@ -2500,7 +2500,7 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
         "decision": {
             "decisionId": "record-result-decision",
             "authorizedBy": "broker",
-            "policyRevision": "record-result-policy"
+            "policyDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         },
         "outcome": outcome,
         "error": error,

@@ -110,7 +110,7 @@ fn authorized(provider: &str, capability: CapabilityId, input: Value) -> Authori
             "broker-test"
                 .parse::<PrincipalId>()
                 .expect("valid principal fixture"),
-            "policy-test".to_owned(),
+            "a".repeat(64),
             ExecutionConstraints {
                 asset: None,
                 timeout_ms: 5_000,

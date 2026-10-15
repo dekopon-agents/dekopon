@@ -177,7 +177,7 @@ fn authorized(timeout_ms: u64) -> AuthorizedInvocation {
             "stdio-probe".parse().unwrap(),
             "decision-test".to_owned(),
             "broker-test".parse::<PrincipalId>().unwrap(),
-            "policy-test".to_owned(),
+            "a".repeat(64),
             ExecutionConstraints {
                 timeout_ms,
                 ..ExecutionConstraints::default()
