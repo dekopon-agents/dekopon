@@ -120,6 +120,7 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             .parse::<CapabilityId>()
             .expect("capability"),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse::<ProviderId>().expect("provider"),
             effect: EffectKind::ReadOnly,

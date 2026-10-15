@@ -82,6 +82,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };
 
 fn probe_constraint_set() -> ConstraintSet {
     ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe"
             .parse::<ProviderId>()
@@ -1514,6 +1515,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let catalog = ConstraintCatalog::new([(
         capability.clone(),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider,
             effect: EffectKind::ExternalWrite,

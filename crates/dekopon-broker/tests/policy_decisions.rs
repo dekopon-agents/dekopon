@@ -60,6 +60,7 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
     (
         capability(capability_id),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: provider(),
             effect: EffectKind::ReadOnly,

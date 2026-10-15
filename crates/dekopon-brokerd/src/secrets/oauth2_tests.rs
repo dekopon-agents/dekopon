@@ -33,7 +33,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{
     MapResolver, Projection, ResolvedEntry, SecretMapError, SecretMapFile, SecretSource,
-    validate_map,
+    SourceError, validate_map,
 };
 
 const OLD_REFRESH: &str = "old-refresh-private-sentinel";
@@ -140,7 +140,7 @@ fn source_value(path: &Path, endpoint: &str) -> Value {
 }
 
 fn write_record(path: &Path, expires_at: u64) {
-    fs::write(path, json!({"version":1, "access":"old-access-private-sentinel", "refresh":OLD_REFRESH, "expiresAt":expires_at}).to_string()).expect("record");
+    fs::write(path, json!({"version":2, "state":"live", "access":"old-access-private-sentinel", "refresh":OLD_REFRESH, "expiresAt":expires_at, "lastRefresh":0}).to_string()).expect("record");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private record");
 }
 
@@ -182,6 +182,50 @@ fn success() -> (&'static str, String) {
 
 fn content(request: &str) -> &str {
     request.split_once("\r\n\r\n").expect("request body").1
+}
+
+#[tokio::test]
+async fn sealed_and_malformed_records_refuse_without_affecting_another_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let good = dir.path().join("good.json");
+    write_record(&good, u64::MAX);
+    let api = TokenApi::serving(|_| success());
+    for invalid in [
+        json!({"version": 1, "state": "live", "access": "old", "refresh": OLD_REFRESH, "expiresAt": 100, "lastRefresh": 1}),
+        json!({"version": 2, "state": "live", "access": "old", "refresh": OLD_REFRESH, "expiresAt": 100}),
+        json!({"version": 2, "state": "live", "access": "old", "refresh": OLD_REFRESH, "expiresAt": 100, "lastRefresh": 200}),
+        json!({"version": 2, "state": "live", "access": "old", "refresh": OLD_REFRESH, "expiresAt": 100, "lastRefresh": 1, "adoptedSeedSha256": null}),
+        json!({"version": 2, "state": "live", "access": "old", "refresh": OLD_REFRESH, "expiresAt": 100, "lastRefresh": 1, "extra": true}),
+        json!({"version": 2, "state": "sealed", "since": 1, "cause": "reauthorization-required"}),
+    ] {
+        fs::write(&path, invalid.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = super::oauth2::resolve(
+            &path,
+            &api.endpoint,
+            "public-client-id",
+            1000,
+            rustix::process::geteuid().as_raw(),
+            &reqwest::Client::new(),
+        )
+        .await;
+        if invalid["state"] == "sealed" {
+            assert!(matches!(result, Err(SourceError::ReauthorizationRequired)));
+        } else {
+            assert!(matches!(result, Err(SourceError::Malformed)));
+        }
+        let working = resolver(&good, &api.endpoint, &["good"]);
+        let entry = working.entries.get(&drn("good")).unwrap();
+        assert_eq!(
+            working
+                .resolve_source(&entry.source, &entry.client)
+                .await
+                .unwrap(),
+            b"old-access-private-sentinel"
+        );
+    }
+    assert!(api.requests().is_empty());
 }
 
 #[tokio::test]
@@ -351,6 +395,100 @@ fn map(path: &Path, endpoint: &str, bootstrap: Option<&Path>) -> SecretMapFile {
     serde_json::from_value(json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1","mapRevision":"test","secrets":secrets})).unwrap()
 }
 
+#[tokio::test]
+async fn refresh_modes_parse_strictly_and_semantic_errors_name_each_drn() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.json");
+    let endpoint = "https://example.org/token";
+    for refresh in [None, Some("lazy"), Some("scheduled")] {
+        let mut value = source_value(&record, endpoint);
+        if let Some(refresh) = refresh {
+            value["refresh"] = json!(refresh);
+        }
+        let parsed: SecretSource = serde_json::from_value(value).unwrap();
+        let mut map = map(&record, endpoint, None);
+        map.secrets[0].source = parsed;
+        assert!(
+            validate_map(
+                map,
+                &dir.path().join("map.json"),
+                rustix::process::geteuid().as_raw()
+            )
+            .await
+            .is_ok()
+        );
+    }
+    for (field, value) in [("refresh", json!("unlisted")), ("cycle", json!("22h"))] {
+        let mut source = source_value(&record, endpoint);
+        source[field] = value;
+        assert!(serde_json::from_value::<SecretSource>(source).is_err());
+    }
+    let mut map = map(&record, endpoint, None);
+    for (index, name) in ["one", "two"].into_iter().enumerate() {
+        map.secrets[index].source =
+            serde_json::from_value(source_value(Path::new("relative-record"), endpoint)).unwrap();
+        assert_eq!(map.secrets[index].drn, drn(name));
+    }
+    let Err(SecretMapError::Validation { problems }) = validate_map(
+        map,
+        &dir.path().join("map.json"),
+        rustix::process::geteuid().as_raw(),
+    )
+    .await
+    else {
+        panic!("semantic validation required")
+    };
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains(drn("one").as_str()))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains(drn("two").as_str()))
+    );
+}
+
+#[tokio::test]
+async fn unknown_source_fields_and_variants_fail_whole_map_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("map.json");
+    for (key, value, expected_field) in [
+        ("cycle", json!("22h"), "cycle"),
+        ("kind", json!("unlisted"), "kind"),
+    ] {
+        let mut source = source_value(&dir.path().join("record.json"), "https://example.org/token");
+        source[key] = value;
+        let bytes = serde_json::to_vec(&json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1", "mapRevision":"test", "secrets":[{"drn":drn("one"), "source":source, "bindings":[]}]})).unwrap();
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = super::load(&path, rustix::process::geteuid().as_raw())
+            .await
+            .unwrap_err();
+        let SecretMapError::Decode { diagnostic } = error else {
+            panic!("whole-map parsing must fail")
+        };
+        assert!(diagnostic.contains(expected_field), "{diagnostic}");
+        assert!(!diagnostic.contains("unlisted"));
+        assert!(!diagnostic.contains("22h"));
+    }
+}
+
+#[test]
+fn parse_diagnostics_never_repeat_invalid_values() {
+    let bad = "private-token-shaped-value-sentinel";
+    for field in ["refresh", "timeoutMs"] {
+        let mut source = source_value(Path::new("/tmp/record"), "https://example.org/token");
+        source[field] = json!(bad);
+        let bytes = serde_json::to_vec(&json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1", "mapRevision":"test", "secrets":[{"drn":drn("one"), "source":source, "bindings":[]}]})).unwrap();
+        let error = serde_yaml::from_slice::<SecretMapFile>(&bytes).unwrap_err();
+        let diagnostic = super::sanitized_yaml_diagnostic(&error, &bytes);
+        assert!(!diagnostic.contains(bad));
+        assert!(diagnostic.contains(field), "{diagnostic}");
+    }
+}
+
 fn oauth_policy() -> PolicyEngine {
     let policy = format!(
         r#"@id("allow-fetch")
@@ -442,6 +580,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
     let constraints = ConstraintCatalog::new([(
         "http-probe.fetch".parse().unwrap(),
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "http-probe".parse().unwrap(),
             effect: EffectKind::ReadOnly,
@@ -666,22 +805,16 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
             "bootstrap-reflected"
         );
         let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["access"], OLD_REFRESH);
-        assert_eq!(stored["refresh"], NEW_REFRESH);
-        assert_eq!(stored["expiresAt"], 0);
+        assert_eq!(stored["refresh"], OLD_REFRESH);
+        assert_eq!(stored["expiresAt"], 1);
         assert_eq!(api.requests().len(), 3);
-        assert_eq!(
-            resolver.resolve(&drn("one")).await.unwrap_err().category,
-            "bootstrap-reflected"
-        );
-        assert_eq!(api.requests().len(), 4);
-        assert_eq!(
-            resolver.resolve(&drn("one")).await.unwrap_err().category,
-            "bootstrap-reflected"
-        );
-        let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["access"], NEW_REFRESH);
-        assert_eq!(stored["expiresAt"], 0);
+        for _ in 0..2 {
+            assert_eq!(
+                resolver.resolve(&drn("one")).await.unwrap_err().category,
+                "bootstrap-reflected"
+            );
+        }
+        assert_eq!(api.requests().len(), 5);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
@@ -736,6 +869,27 @@ async fn a_shared_record_with_a_different_endpoint_or_client_is_refused() {
             }),
             "{problems:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_seed_path_must_be_absolute_and_distinct_from_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.json");
+    let map_path = dir.path().join("map.json");
+    for seed in [
+        Path::new("relative-seed"),
+        record.as_path(),
+        map_path.as_path(),
+    ] {
+        let mut file = map(&record, "https://example.org/token", None);
+        let mut source = source_value(&record, "https://example.org/token");
+        source["seedPath"] = json!(seed);
+        file.secrets[0].source = serde_json::from_value(source).unwrap();
+        assert!(matches!(
+            validate_map(file, &map_path, rustix::process::geteuid().as_raw()).await,
+            Err(SecretMapError::Validation { .. })
+        ));
     }
 }
 

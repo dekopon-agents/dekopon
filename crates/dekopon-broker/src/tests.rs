@@ -478,6 +478,7 @@ fn capability_authority_commits_exactly_these_fields() {
     }
 
     let set = ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe".parse().expect("valid provider fixture"),
         effect: dekopon_capability::EffectKind::ReadOnly,
@@ -863,6 +864,7 @@ async fn in_memory_audit_fails_closed_at_its_bound() {
 fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
         ConstraintSet {
+            default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse().expect("provider"),
             effect: dekopon_capability::EffectKind::ReadOnly,
@@ -960,6 +962,7 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
     let named =
         serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
     let unnamed = super::ConstraintSet {
+        default_secret_use: None,
         credential: None,
         ..named.clone()
     };
@@ -1072,6 +1075,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         StorageScope,
     };
     let mut set = ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "probe".parse().unwrap(),
         effect: EffectKind::LocalWrite,
@@ -1130,6 +1134,7 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
     use super::{BrokerBuildError, ConstraintCatalog};
     use dekopon_capability::{EffectKind, StorageRetention};
     let make = |retention| ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "storage-probe".parse().unwrap(),
         effect: EffectKind::ReadOnly,
@@ -1273,6 +1278,7 @@ fn storage_set(
     namespace: Option<&str>,
 ) -> ConstraintSet {
     ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: provider.parse().unwrap(),
         effect: match access {

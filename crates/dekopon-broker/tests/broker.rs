@@ -145,6 +145,7 @@ fn set_with_metadata(
     constraints: ExecutionConstraints,
 ) -> ConstraintSet {
     ConstraintSet {
+        default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: provider
             .parse::<ProviderId>()
@@ -1054,6 +1055,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 credential: Some("chatgpt-fixture".to_owned()),
                 ..set("http-probe", constraints)
@@ -1152,6 +1154,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
         catalog([(
             "http-probe.fetch",
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 credential: Some("chatgpt-fixture".to_owned()),
                 ..set("http-probe", loopback_constraints(&authority))
@@ -1223,6 +1226,138 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
                 Some("chatgpt-fixture"),
                 "a failed invocation still records which credential it would have presented"
             );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_binding_and_cedar() {
+    use dekopon_broker::{DefaultSecretSink, DefaultSecretUse};
+    use dekopon_test_support::CaptureLayer;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use dekopon_capability::InvocationOutcome::{Denied, Succeeded};
+    for (default_present, binding_present, grant_present, explicit, expected) in [
+        (false, true, true, false, Succeeded),
+        (true, true, true, false, Succeeded),
+        (true, true, false, false, Denied),
+        (true, false, true, false, Denied),
+        (true, true, true, true, Succeeded),
+    ] {
+        let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+        let authority = server.authority().to_owned();
+        let secret_policy = if grant_present {
+            r#"@id("caller-secret-use") permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token") when { context.capability == "http-probe.fetch" && context.provider == "http-probe" && context.sink == "httpBearer" };"#
+        } else {
+            ""
+        };
+        let registry = BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut set = set("http-probe", loopback_constraints(&authority));
+        if default_present {
+            set.default_secret_use = Some(DefaultSecretUse {
+                drn: if explicit {
+                    "drn:com.xrl:secret:test:unbound/token".parse().unwrap()
+                } else {
+                    secret_drn()
+                },
+                sink: DefaultSecretSink::HttpBearer,
+            });
+        }
+        let broker = Broker::new(
+            registry,
+            principal("broker-test"),
+            "policy-test".to_owned(),
+            http_probe_secret_engine(&format!(
+                "{}\n{secret_policy}",
+                http_policy("caller", "provider-test", "http-probe.fetch")
+            )),
+            catalog([("http-probe.fetch", set)]),
+            CredentialStore::empty(),
+            callers(["caller"]),
+            Arc::new(InMemoryAuditLog::new(4).unwrap()),
+            BrokerLimits::default(),
+        )
+        .unwrap()
+        .with_secret_catalog(
+            SecretCatalog::new(
+                if binding_present {
+                    vec![SecretUseBinding {
+                        binding_id: "http-probe-token".to_owned(),
+                        secret: secret_drn(),
+                        capability: "http-probe.fetch".parse().unwrap(),
+                        sink: SecretSinkKind::HttpBearer,
+                        basic_username: None,
+                        allowed_hosts: vec![authority.clone()],
+                        allowed_methods: vec!["GET".to_owned()],
+                        allowed_paths: vec![HttpPathRule::Exact {
+                            path: "/api/v1/thing".to_owned(),
+                        }],
+                        allow_query: false,
+                        max_injections: 1,
+                    }]
+                } else {
+                    vec![]
+                },
+                Arc::new(StaticSecretResolver(b"default-private-sentinel")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut proposal = request(
+            "invoke-default-secret",
+            "http-probe.fetch",
+            json!({
+                "uri": format!("http://{authority}/api/v1/thing"), "method": "GET"
+            }),
+        );
+        if explicit {
+            proposal.secret_use = Some(SecretUseProposal::HttpBearer {
+                secret: secret_drn(),
+            });
+        }
+        let capture = CaptureLayer::new();
+        let result = invoke_as(&broker, "caller", "provider-test", proposal)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+        assert_eq!(result.result.outcome, expected);
+        let decision_events = capture.events_where(
+            "dekopon_broker::audit",
+            &[("audit.event", "broker.decision")],
+        );
+        assert_eq!(decision_events.len(), 1);
+        let expected_drn = secret_drn();
+        assert_eq!(
+            decision_events[0].field("secret"),
+            default_present.then_some(expected_drn.as_str())
+        );
+        assert_eq!(
+            decision_events[0].field("secret.sink"),
+            default_present.then_some("httpBearer")
+        );
+        assert_eq!(
+            decision_events[0].field("decision.allowed"),
+            Some(
+                if expected == dekopon_capability::InvocationOutcome::Succeeded {
+                    "true"
+                } else {
+                    "false"
+                }
+            )
+        );
+        if expected == dekopon_capability::InvocationOutcome::Succeeded {
+            let request = server.request_text();
+            assert_eq!(
+                request.contains("authorization: Bearer default-private-sentinel"),
+                default_present
+            );
+            server.join();
         }
     }
 }
@@ -1670,6 +1805,7 @@ async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_i
             catalog([(
                 "http-probe.fetch",
                 ConstraintSet {
+                    default_secret_use: None,
                     route: CapabilityRoute::Generic,
                     credential: credential.map(str::to_owned),
                     ..set("http-probe", loopback_constraints(&authority))
@@ -1844,6 +1980,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let build = |credential: String, constraints: ExecutionConstraints, store: CredentialStore| {
         build_set(
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 credential: Some(credential),
                 ..set("http-probe", constraints)
@@ -1855,6 +1992,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let build_override = |credential: String, constraints: ExecutionConstraints| {
         build_set(
             ConstraintSet {
+                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 credential: Some("fetch-token".to_owned()),
                 ..set("http-probe", constraints)
