@@ -20,7 +20,8 @@ mod config;
 mod conversation;
 mod follow;
 mod jobs;
-mod journal;
+mod memory;
+use memory::journal;
 mod meter_restore;
 mod metering;
 mod probe;
@@ -147,22 +148,7 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
-    let journal = match config.journal.clone() {
-        Some(journal) => Some(Arc::new(
-            tokio::task::spawn_blocking(move || {
-                journal::Journal::open(&journal.dir, journal.retention, journal.seal_retention)
-            })
-            .await
-            .map_err(GatewaydError::TransportTask)?
-            .map_err(|error| GatewaydError::Journal {
-                kind: match error {
-                    journal::JournalError::Io { kind } => kind,
-                    journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
-                },
-            })?,
-        )),
-        None => None,
-    };
+    let journal = open_journal(config.journal.clone(), &config.memory).await?;
     let wakes = match config.wakes.clone() {
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
@@ -257,6 +243,40 @@ where
             Err(GatewaydError::TransportsLost)
         }
     }
+}
+
+async fn open_journal(
+    config: Option<config::ResolvedJournal>,
+    memory: &config::ResolvedSettings,
+) -> Result<Option<Arc<journal::Journal>>, GatewaydError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let max_age = std::time::Duration::from_millis(memory.retention.max_age_ms.get());
+    let agent_ages = memory
+        .agents
+        .iter()
+        .map(|(id, agent)| (id.as_str().to_owned(), agent.max_age))
+        .collect();
+    let journal = tokio::task::spawn_blocking(move || {
+        let mut journal = journal::Journal::open_with_age(
+            &config.dir,
+            max_age,
+            config.retention,
+            config.seal_retention,
+        )?;
+        journal.agent_ages = agent_ages;
+        Ok::<_, journal::JournalError>(journal)
+    })
+    .await
+    .map_err(GatewaydError::TransportTask)?
+    .map_err(|error| GatewaydError::Journal {
+        kind: match error {
+            journal::JournalError::Io { kind } => kind,
+            journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
+        },
+    })?;
+    Ok(Some(Arc::new(journal)))
 }
 
 async fn load_follow_table(

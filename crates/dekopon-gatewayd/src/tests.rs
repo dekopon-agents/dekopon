@@ -17459,7 +17459,10 @@ async fn a_failed_seal_leaves_the_stop_notice_for_the_next_turn() {
     inbound.conversation.kind = ConversationKind::Thread;
     let stem = ConversationKey::shared(&route.agent, &route.transport, &inbound.conversation.key())
         .journal_stem();
-    let marker = journal.path().join(format!("{stem}.sealed"));
+    let marker = journal.path().join(format!(
+        "{}.sealed",
+        stem.split_once('/').expect("agent stem").1
+    ));
     let driver = Arc::new(RecordingDriver::default());
     let (model, session) = begin_parked_turn(
         &mut runner,

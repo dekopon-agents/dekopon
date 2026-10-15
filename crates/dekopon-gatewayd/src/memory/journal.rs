@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -8,7 +8,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use dekopon_agent::prompt::{ConversationTurn, History};
+use dekopon_agent::prompt::{
+    ConversationTurn, Exchange, History, Pin, ReadRef, Representation, Selection,
+};
+use dekopon_core::AgentId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -53,11 +56,28 @@ impl JournalError {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Line {
+    version: u8,
     at_ms: u64,
     grant: String,
-    user: String,
+    record_id: u64,
+    next_record_id: u64,
+    source_eligibility: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    representations: Vec<Representation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exchanges: Vec<Exchange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pins: Vec<Pin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reads: Vec<ReadRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selections: Vec<Selection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    availability: Vec<String>,
     // The conversation's whole inventory when the line was written; recall reads only the newest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     assets: Vec<LineAsset>,
@@ -107,22 +127,45 @@ pub(crate) struct Entry<'a> {
 // one lock is what orders appends, compaction and expiry for the whole directory.
 pub(crate) struct Journal {
     dir: PathBuf,
+    max_age: Duration,
+    pub(crate) agent_ages: HashMap<String, Duration>,
     retention: Duration,
     seal_retention: Duration,
     lock: Mutex<()>,
 }
 
 impl Journal {
+    #[cfg(test)]
     pub fn open(
         dir: &Path,
         retention: Duration,
         seal_retention: Duration,
     ) -> Result<Self, JournalError> {
-        Self::open_at(dir, retention, seal_retention, SystemTime::now())
+        Self::open_with_age(dir, retention, retention, seal_retention)
     }
 
+    pub fn open_with_age(
+        dir: &Path,
+        max_age: Duration,
+        retention: Duration,
+        seal_retention: Duration,
+    ) -> Result<Self, JournalError> {
+        Self::open_at_with_age(dir, max_age, retention, seal_retention, SystemTime::now())
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_at(
         dir: &Path,
+        retention: Duration,
+        seal_retention: Duration,
+        now: SystemTime,
+    ) -> Result<Self, JournalError> {
+        Self::open_at_with_age(dir, retention, retention, seal_retention, now)
+    }
+
+    fn open_at_with_age(
+        dir: &Path,
+        max_age: Duration,
         retention: Duration,
         seal_retention: Duration,
         now: SystemTime,
@@ -130,10 +173,13 @@ impl Journal {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let journal = Self {
             dir: dir.to_path_buf(),
+            max_age,
+            agent_ages: HashMap::new(),
             retention,
             seal_retention,
             lock: Mutex::new(()),
         };
+        journal.reset_invalid_files()?;
         journal.expire(now)?;
         Ok(journal)
     }
@@ -267,7 +313,8 @@ impl Journal {
     }
 
     fn seal_path(&self, stem: &str) -> PathBuf {
-        self.dir.join(format!("{stem}.{SEAL_EXTENSION}"))
+        let name = Path::new(stem).file_name().unwrap_or_default();
+        self.dir.join(name).with_extension(SEAL_EXTENSION)
     }
 
     fn read_seal(
@@ -339,13 +386,16 @@ impl Journal {
         }
         let now_ms = millis(now);
         let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
+        let age_horizon_ms = now_ms.saturating_sub(duration_millis(self.age_for(stem)));
         let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
         // Only the trailing run under this grant is recalled, so a narrowed grant never replays
         // output produced under a wider one.
         let current = lines
             .iter()
             .rev()
-            .take_while(|line| line.grant == grant && line.at_ms >= horizon_ms)
+            .take_while(|line| {
+                line.grant == grant && line.at_ms >= horizon_ms && line.at_ms >= age_horizon_ms
+            })
             .count();
         let mut kept = lines.split_off(lines.len() - current);
         let (assets, next_asset_id) = kept.last_mut().map_or((Vec::new(), 1), |last| {
@@ -372,9 +422,11 @@ impl Journal {
         });
         let history = History::from_turns(
             window.limits,
-            kept.into_iter().map(|line| match line.answer {
-                Some(answer) => ConversationTurn::completed(line.user, answer),
-                None => ConversationTurn::unanswered(line.user),
+            kept.into_iter().filter_map(|line| {
+                line.user.map(|user| match line.answer {
+                    Some(answer) => ConversationTurn::completed(user, answer),
+                    None => ConversationTurn::unanswered(user),
+                })
             }),
         );
         Ok(Recalled {
@@ -392,10 +444,27 @@ impl Journal {
     ) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         let path = self.path(stem);
+        let next_record_id = match read_lines(&path) {
+            Ok(lines) => lines.last().map_or(1, |last| last.next_record_id),
+            Err(JournalError::Io {
+                kind: io::ErrorKind::NotFound,
+            }) => 1,
+            Err(error) => return Err(error),
+        };
         let line = Line {
+            version: 2,
             at_ms: millis(entry.at),
+            record_id: next_record_id,
+            next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
+            source_eligibility: true,
+            representations: Vec::new(),
+            exchanges: Vec::new(),
+            pins: Vec::new(),
+            reads: Vec::new(),
+            selections: Vec::new(),
+            availability: vec!["original".to_owned()],
             grant: entry.grant.to_owned(),
-            user: entry.turn.user().to_owned(),
+            user: Some(entry.turn.user().to_owned()),
             answer: entry.turn.answer().map(str::to_owned),
             assets: entry
                 .inventory
@@ -418,6 +487,12 @@ impl Journal {
                 .collect(),
             next_asset_id: entry.next_asset_id,
         };
+        if let Some(parent) = path.parent() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -427,7 +502,7 @@ impl Journal {
         let bytes = file.metadata()?.len();
         drop(file);
         if bytes > compaction_threshold(window) {
-            match compact(&path, window) {
+            match compact(&path, self.age_for(stem), entry.at) {
                 Err(JournalError::Corrupt) => {
                     remove(&path);
                     return Err(JournalError::Corrupt);
@@ -442,21 +517,89 @@ impl Journal {
         self.dir.join(format!("{stem}.{EXTENSION}"))
     }
 
+    fn age_for(&self, stem: &str) -> Duration {
+        stem.split_once('/')
+            .and_then(|(agent, _)| self.agent_ages.get(agent))
+            .copied()
+            .unwrap_or(self.max_age)
+    }
+
+    fn reset_invalid_files(&self) -> Result<(), JournalError> {
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if is_agent_directory(&path) {
+                for file in fs::read_dir(path)? {
+                    let file = file?;
+                    if is_journal_file(&file.path())
+                        && matches!(read_lines(&file.path()), Err(JournalError::Corrupt))
+                    {
+                        remove(&file.path());
+                        tracing::warn!(event = "gateway_journal_reset", reason = "corrupt");
+                    }
+                }
+            } else if is_journal_file(&path) && !path.with_extension(FOLLOW_EXTENSION).exists() {
+                remove(&path);
+                tracing::warn!(event = "gateway_journal_reset", reason = "legacy");
+            }
+        }
+        Ok(())
+    }
+
     // Follow markers expire by their lifecycle deadline, not the journal window's file mtime.
-    fn expire(&self, now: SystemTime) -> io::Result<()> {
+    fn expire(&self, now: SystemTime) -> Result<(), JournalError> {
         let cutoff = now.checked_sub(self.retention);
         let seal_cutoff = now.checked_sub(self.seal_retention);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            let stale = match path.extension() {
-                Some(extension) if extension == EXTENSION || extension == SEAL_EXTENSION => {
-                    let modified = entry.metadata()?.modified()?;
-                    if extension == SEAL_EXTENSION {
-                        seal_cutoff.is_some_and(|limit| modified < limit)
-                    } else {
-                        cutoff.is_some_and(|limit| modified < limit)
+            if is_agent_directory(&path) {
+                for file in fs::read_dir(&path)? {
+                    let file = file?;
+                    if is_journal_file(&file.path()) {
+                        let file_path = file.path();
+                        if cutoff.is_some_and(|limit| {
+                            file.metadata()
+                                .and_then(|m| m.modified())
+                                .is_ok_and(|modified| modified < limit)
+                        }) {
+                            remove(&file_path);
+                            tracing::info!(event = "gateway_journal_expired");
+                        } else {
+                            let age = self.age_for(&format!(
+                                "{}/{}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                                file_path.file_stem().unwrap_or_default().to_string_lossy()
+                            ));
+                            let horizon = millis(now).saturating_sub(duration_millis(age));
+                            match read_lines(&file_path) {
+                                Ok(lines) if lines.iter().any(|line| line.at_ms < horizon) => {
+                                    if lines.iter().all(|line| line.at_ms < horizon) {
+                                        remove(&file_path);
+                                    } else {
+                                        compact(&file_path, age, now)?;
+                                    }
+                                    tracing::info!(event = "gateway_journal_expired");
+                                }
+                                Err(JournalError::Corrupt) => {
+                                    remove(&file_path);
+                                    tracing::warn!(
+                                        event = "gateway_journal_reset",
+                                        reason = "corrupt"
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                                Ok(_) => {}
+                            }
+                        }
                     }
+                }
+                continue;
+            }
+            let stale = match path.extension() {
+                Some(extension) if extension == SEAL_EXTENSION => {
+                    let modified = entry.metadata()?.modified()?;
+                    seal_cutoff.is_some_and(|limit| modified < limit)
                 }
                 Some(extension) if extension == FOLLOW_EXTENSION => {
                     read_follow_marker(&path)?.is_some_and(|marker| marker.until_ms <= millis(now))
@@ -470,6 +613,27 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+fn is_agent_directory(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<AgentId>().is_ok())
+}
+
+fn is_journal_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == EXTENSION)
+        && path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|stem| {
+                stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 fn read_follow_marker(path: &Path) -> io::Result<Option<FollowMarker>> {
@@ -529,33 +693,27 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
     let file = BufReader::new(File::open(path)?);
-    serde_json::Deserializer::from_reader(file)
+    let lines: Vec<Line> = serde_json::Deserializer::from_reader(file)
         .into_iter()
         .collect::<Result<_, _>>()
-        .map_err(|_malformed| JournalError::Corrupt)
+        .map_err(|_malformed| JournalError::Corrupt)?;
+    if lines.iter().any(|line| line.version != 2)
+        || lines
+            .windows(2)
+            .any(|pair| pair[0].next_record_id != pair[1].record_id)
+        || lines.iter().any(|line| {
+            line.next_record_id != line.record_id.saturating_add(1)
+                || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
+        })
+    {
+        return Err(JournalError::Corrupt);
+    }
+    Ok(lines)
 }
 
-// Keeps the newest lines the window could replay; only the newest line's asset snapshot is ever
-// recalled, so the older ones are dropped.
-fn compact(path: &Path, window: MemoryWindow) -> Result<(), JournalError> {
-    let mut lines = read_lines(path)?;
-    let mut kept = 0;
-    let mut bytes = 0usize;
-    for line in lines.iter().rev() {
-        bytes = bytes
-            .saturating_add(line.user.len())
-            .saturating_add(line.answer.as_ref().map_or(0, String::len));
-        if kept > 0 && (kept >= window.limits.max_turns || bytes > window.limits.max_bytes) {
-            break;
-        }
-        kept += 1;
-    }
-    let mut lines = lines.split_off(lines.len() - kept);
-    if let Some((_, older)) = lines.split_last_mut() {
-        for line in older {
-            line.assets.clear();
-        }
-    }
+fn compact(path: &Path, max_age: Duration, now: SystemTime) -> Result<(), JournalError> {
+    let horizon = millis(now).saturating_sub(duration_millis(max_age));
+    let lines = read_lines(path)?;
     let temporary = path.with_extension("compact");
     let mut file = OpenOptions::new()
         .create(true)
@@ -563,9 +721,10 @@ fn compact(path: &Path, window: MemoryWindow) -> Result<(), JournalError> {
         .truncate(true)
         .mode(0o600)
         .open(&temporary)?;
-    for line in &lines {
+    for line in lines.iter().filter(|line| line.at_ms >= horizon) {
         file.write_all(&encode_line(line)?)?;
     }
+    file.sync_all()?;
     drop(file);
     fs::rename(&temporary, path)?;
     Ok(())
@@ -865,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_past_its_threshold_compacts_to_the_window_and_keeps_the_snapshot() {
+    fn a_file_past_its_threshold_keeps_eligible_turns_and_the_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -876,7 +1035,7 @@ mod tests {
             append_with(&journal, &stem, now, GRANT, &filler, &inventory);
         }
         let bytes = fs::metadata(journal.path(&stem)).expect("file").len();
-        assert!(bytes <= compaction_threshold(window()), "{bytes} bytes");
+        assert!(bytes > compaction_threshold(window()), "{bytes} bytes");
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(recalled.history.len(), 2, "two 400-byte turns fit 1 KiB");
         assert_eq!(recalled.assets.len(), 1);
@@ -908,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_from_an_older_format_is_refused_once_and_then_starts_empty() {
+    fn a_file_from_an_older_format_resets_during_sweep() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -917,13 +1076,225 @@ mod tests {
             "{{\"v\":1,\"atMs\":{},\"grant\":\"{GRANT}\",\"user\":\"one\",\"lastAssetId\":3}}\n",
             millis(now)
         );
+        fs::create_dir_all(journal.path(&stem).parent().unwrap()).unwrap();
         fs::write(journal.path(&stem), old).expect("old format");
-        assert!(matches!(
-            journal.recall(&stem, GRANT, window(), now),
-            Err(JournalError::Corrupt)
-        ));
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("reset");
         assert!(recalled.history.is_empty());
+        assert!(!journal.path(&stem).exists());
+    }
+
+    #[test]
+    fn opening_resets_unversioned_root_files_without_touching_follow_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = key().journal_stem();
+        let digest = stem.split_once('/').unwrap().1;
+        let legacy = dir.path().join(format!("{digest}.jsonl"));
+        fs::write(&legacy, b"{\"user\":\"old\"}\n").unwrap();
+        let followed = dir.path().join(format!("{digest}.followed"));
+        fs::write(&followed, b"marker").unwrap();
+        Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        assert!(legacy.exists());
+        assert!(followed.exists());
+        fs::remove_file(&followed).unwrap();
+        let (capture, _guard) = crate::tests::capture_spans();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[("event", "gateway_journal_reset"), ("reason", "legacy")]
+                )
+                .len(),
+            1
+        );
+        assert!(!legacy.exists());
+        assert!(
+            users(
+                &journal
+                    .recall(&stem, GRANT, window(), SystemTime::now())
+                    .unwrap()
+            )
+            .is_empty()
+        );
+        drop(journal);
+    }
+
+    #[test]
+    fn v2_ids_round_trip_and_an_unknown_version_resets_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        append(&journal, &stem, now, GRANT, "first");
+        append(&journal, &stem, now, GRANT, "second");
+        let path = journal.path(&stem);
+        let lines = read_lines(&path).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.version, line.record_id, line.next_record_id))
+                .collect::<Vec<_>>(),
+            [(2, 1, 2), (2, 2, 3)]
+        );
+        drop(journal);
+        let reopened = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        assert_eq!(
+            users(&reopened.recall(&stem, GRANT, window(), now).unwrap()),
+            ["first", "second"]
+        );
+        drop(reopened);
+        let mut lines = read_lines(&path).unwrap();
+        lines[0].version = 3;
+        let mut bytes = Vec::new();
+        for line in &lines {
+            bytes.extend(encode_line(line).unwrap());
+        }
+        fs::write(&path, bytes).unwrap();
+        let (capture, _guard) = crate::tests::capture_spans();
+        let reset = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[("event", "gateway_journal_reset"), ("reason", "corrupt")]
+                )
+                .len(),
+            1
+        );
+        assert!(!path.exists());
+        assert!(users(&reset.recall(&stem, GRANT, window(), now).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn compaction_retains_window_evicted_records_until_memory_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let age = Duration::from_secs(2 * 3600);
+        let journal = Journal::open_with_age(dir.path(), age, age, RETENTION).unwrap();
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let earlier = now - Duration::from_secs(1800);
+        append(&journal, &stem, earlier, GRANT, "earlier");
+        let filler = "x".repeat(400);
+        for _ in 0..200 {
+            append(&journal, &stem, now, GRANT, &filler);
+        }
+        let lines = read_lines(&journal.path(&stem)).unwrap();
+        assert_eq!(lines[0].user.as_deref(), Some("earlier"));
+        assert!(
+            users(&journal.recall(&stem, GRANT, window(), now).unwrap())
+                .iter()
+                .all(|user| *user != "earlier")
+        );
+        compact(&journal.path(&stem), age, now + age).unwrap();
+        assert!(
+            read_lines(&journal.path(&stem))
+                .unwrap()
+                .iter()
+                .all(|line| line.user.as_deref() != Some("earlier"))
+        );
+    }
+
+    #[test]
+    fn agent_directories_keep_independent_record_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let now = SystemTime::now();
+        let other =
+            ConversationKey::shared(&"another".parse().unwrap(), "slack", "same").journal_stem();
+        let first =
+            ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "same").journal_stem();
+        append(&journal, &first, now, GRANT, "first");
+        append(&journal, &other, now, GRANT, "other");
+        assert_eq!(read_lines(&journal.path(&first)).unwrap()[0].record_id, 1);
+        assert_eq!(read_lines(&journal.path(&other)).unwrap()[0].record_id, 1);
+        assert_ne!(journal.path(&first).parent(), journal.path(&other).parent());
+    }
+
+    #[test]
+    fn agent_specific_age_excludes_old_records_without_expiring_a_longer_agents_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = Duration::from_secs(7 * 86400);
+        let short = Duration::from_secs(86400);
+        let now = SystemTime::now();
+        let mut journal = Journal::open_with_age(dir.path(), long, long, long).unwrap();
+        journal.agent_ages.insert("reviewer".into(), short);
+        let stem = key().journal_stem();
+        append(
+            &journal,
+            &stem,
+            now - 2 * short,
+            GRANT,
+            "expired for reviewer",
+        );
+        append(&journal, &stem, now, GRANT, "recent for reviewer");
+        let path = journal.path(&stem);
+        let mut wide = window();
+        wide.forget_after = long;
+        assert_eq!(
+            users(&journal.recall(&stem, GRANT, wide, now).unwrap()),
+            ["recent for reviewer"]
+        );
+        assert!(path.exists());
+        assert_eq!(read_lines(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_original_does_not_reappear_in_v2_or_chat_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "source sentinel");
+        let path = journal.path(&stem);
+        let mut lines = read_lines(&path).unwrap();
+        let record = &mut lines[0];
+        record.user = None;
+        record.answer = None;
+        record.source_eligibility = false;
+        record.availability.clear();
+        record.representations.push(Representation {
+            routine_id: "prefix".into(),
+            version: "resolved-config-digest".into(),
+            source_record_id: record.record_id,
+            part: None,
+            kind: "prefix".into(),
+            captured_bytes: 15,
+            text: Some("summary".into()),
+        });
+        fs::write(&path, encode_line(record).unwrap()).unwrap();
+        let reopened = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"source sentinel".len())
+                .any(|part| part == b"source sentinel")
+        );
+        let record = read_lines(&path).unwrap().pop().unwrap();
+        assert_eq!(record.representations[0].text.as_deref(), Some("summary"));
+        assert!(
+            reopened
+                .recall(&stem, GRANT, window(), now)
+                .unwrap()
+                .history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_rewrite_preserves_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "intact");
+        let path = journal.path(&stem);
+        let before = fs::read(&path).unwrap();
+        fs::create_dir(path.with_extension("compact")).unwrap();
+        assert!(matches!(
+            compact(&path, RETENTION, now),
+            Err(JournalError::Io { .. })
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]
@@ -936,7 +1307,12 @@ mod tests {
         let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&journal.path(&stem)), 0o600);
-        assert!(stem.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(stem.split_once('/').is_some_and(|(agent, digest)| {
+            agent == "reviewer"
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        }));
     }
     #[test]
     fn a_seal_has_private_sibling_storage_and_leaves_the_transcript_unchanged() {
@@ -949,7 +1325,7 @@ mod tests {
         let before = fs::read(journal.path(&stem)).unwrap();
         journal.seal(&stem, now).unwrap();
         assert_eq!(fs::read(journal.path(&stem)).unwrap(), before);
-        let path = dir.path().join(format!("{stem}.sealed"));
+        let path = journal.seal_path(&stem);
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value, serde_json::json!({"atMs": millis(now)}));
         assert_eq!(

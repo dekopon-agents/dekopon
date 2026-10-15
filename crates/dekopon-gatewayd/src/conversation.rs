@@ -75,11 +75,12 @@ impl ConversationKey {
             }
             ConversationAudience::Shared => digest.update([0]),
         }
-        digest
+        let stem: String = digest
             .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect()
+            .collect();
+        format!("{}/{stem}", self.agent.as_str())
     }
 }
 
