@@ -216,8 +216,9 @@ impl Jobs {
         ))
     }
 
-    /// Every ending passes through here exactly once, and the permit is released only after the
-    /// row is final, so a freed slot never finds its predecessor still `running`.
+    /// Every ending passes through here exactly once. The permit is released under the table lock
+    /// once the row is final, so a freed slot never finds its predecessor still `running` and a
+    /// waiter that sees the row finished can start the next job at capacity.
     fn finish(&self, run: &JobRun, ended: Ended, permit: OwnedSemaphorePermit) {
         let id = run.id;
         let mut table = self.table.lock();
@@ -249,6 +250,7 @@ impl Jobs {
                 now.saturating_duration_since(row.started),
             )
         });
+        drop(permit);
         drop(table);
         self.ended.notify_all();
         if let Some((outcome, waited, text, after)) = finished {
@@ -300,7 +302,6 @@ impl Jobs {
                 }
             }
         }
-        drop(permit);
     }
 
     #[cfg(test)]
