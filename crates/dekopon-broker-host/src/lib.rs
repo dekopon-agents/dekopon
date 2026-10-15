@@ -52,9 +52,10 @@ mod stdio;
 mod storage;
 use clock::ClockState;
 pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
+pub use dekopon_http_host::{HttpRequestFacts, RequestAuthorizer};
 pub use http::{
-    BoundCredential, HttpCallEvidence, HttpConfigurationError, NonPublicHttpsAuthority,
-    PlaintextHostError, PlaintextHosts, destinations_cover,
+    BoundCredential, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
+    NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,
 };
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
@@ -1079,6 +1080,7 @@ impl BrokerWasmProvider {
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
         slots: ChatSlotValues,
+        request_authorizer: Option<RequestAuthorizer>,
         storage_transaction: Option<dekopon_storage_host::StorageHandle>,
         mut assets: asset::AssetInputs,
         directory: Option<dekopon_http_host::asset::AssetDirectory>,
@@ -1122,7 +1124,10 @@ impl BrokerWasmProvider {
             constraints.http.clone(),
             constraints.secret_use.clone(),
             credential,
-            slots,
+            HttpInvocation {
+                slots,
+                authorizer: request_authorizer,
+            },
             ceilings,
             operation_timeout,
         ) {
@@ -1730,7 +1735,7 @@ impl BrokerProviderRegistry {
             authorized,
             credential,
             None,
-            ChatSlotValues::default(),
+            HttpInvocation::default(),
             assets,
         )
         .await
@@ -1741,11 +1746,19 @@ impl BrokerProviderRegistry {
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
         storage_grant: Option<StorageGrant>,
-        slots: ChatSlotValues,
+        invocation: HttpInvocation,
         assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_authorized(authorized, credential, storage_grant, slots, assets, None)
-            .await
+        self.invoke_authorized(
+            authorized,
+            credential,
+            storage_grant,
+            invocation.slots,
+            invocation.authorizer,
+            assets,
+            None,
+        )
+        .await
     }
 
     pub async fn invoke_with_test_imports(
@@ -1761,6 +1774,7 @@ impl BrokerProviderRegistry {
             credential,
             storage_grant,
             ChatSlotValues::default(),
+            None,
             assets,
             test_imports,
         )
@@ -1778,6 +1792,7 @@ impl BrokerProviderRegistry {
         credential: Option<BoundCredential>,
         storage_grant: Option<StorageGrant>,
         slots: ChatSlotValues,
+        request_authorizer: Option<RequestAuthorizer>,
         assets: asset::AssetInputs,
         test_imports: Option<&TestImports>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
@@ -1875,6 +1890,7 @@ impl BrokerProviderRegistry {
                 authorized.constraints(),
                 credential,
                 slots,
+                request_authorizer,
                 storage_transaction,
                 assets,
                 test_imports

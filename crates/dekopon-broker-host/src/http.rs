@@ -3,7 +3,7 @@ use std::time::Duration;
 use dekopon_capability::{ChatSlotValues, HttpConstraints, SecretUseGrant};
 use dekopon_http_host::{
     BufferedHttpClient, ConfigurationError, ErrorCode as NativeErrorCode, Header as NativeHeader,
-    HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest,
+    HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest, RequestAuthorizer,
 };
 
 use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Request, Response};
@@ -14,6 +14,12 @@ pub use dekopon_http_host::{
 };
 
 pub(crate) type HttpCeilings = HttpHostCeilings;
+
+#[derive(Default)]
+pub struct HttpInvocation {
+    pub slots: ChatSlotValues,
+    pub authorizer: Option<RequestAuthorizer>,
+}
 
 #[derive(Debug)]
 pub(crate) struct HttpState {
@@ -32,7 +38,7 @@ impl HttpState {
         grant: Option<HttpConstraints>,
         secret_grant: Option<SecretUseGrant>,
         credential: Option<BoundCredential>,
-        slots: ChatSlotValues,
+        invocation: HttpInvocation,
         ceilings: HttpCeilings,
         timeout: Duration,
     ) -> Result<Self, ConfigurationError> {
@@ -52,9 +58,11 @@ impl HttpState {
                 });
             }
         };
-        Ok(Self {
-            client: client.with_chat_slots(slots),
-        })
+        let mut client = client.with_chat_slots(invocation.slots);
+        if let Some(authorizer) = invocation.authorizer {
+            client = client.with_request_authorizer(authorizer);
+        }
+        Ok(Self { client })
     }
 
     pub(crate) fn attempted(&self) -> bool {

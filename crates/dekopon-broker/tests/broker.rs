@@ -599,6 +599,133 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider loads");
+    let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+    let authority = server.authority().to_owned();
+    let mut constraints = loopback_constraints(&authority);
+    constraints
+        .http
+        .as_mut()
+        .expect("HTTP grant")
+        .allowed_methods = vec!["POST".to_owned(), "GET".to_owned()];
+    let policies = format!(
+        "{}\n{}",
+        http_policy("caller", "provider-test", "http-probe.fetch"),
+        r#"@id("reply-only")
+            forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request }
+            unless { context.request.method == "POST"
+                && context.request.url.host == "127.0.0.1"
+                && context.request.url.path == "/reply"
+                && !(context.request.url has query)
+                && context.request has body
+                && context.request.body.channel == "C0123"
+                && context.request.body has thread_ts };"#
+    );
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&policies),
+        catalog([("http-probe.fetch", set("http-probe", constraints))]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("request forbid loads");
+    let denied = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "wrong-channel",
+            "http-probe.fetch",
+            json!({"uri": format!("http://{authority}/reply"), "method": "POST",
+               "headers": [{"name":"content-type", "value":"application/json"}],
+               "body": "{\"channel\":\"OTHER\",\"thread_ts\":\"1\"}"}),
+        ),
+    )
+    .await
+    .expect("denial accounted");
+    assert_ne!(
+        denied.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let wrong_method = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "wrong-method",
+            "http-probe.fetch",
+            json!({
+                "uri": format!("http://{authority}/reply"), "method": "GET"
+            }),
+        ),
+    )
+    .await
+    .expect("grant-admitted method reaches Cedar");
+    assert_ne!(
+        wrong_method.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let allowed = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "thread-reply",
+            "http-probe.fetch",
+            json!({"uri": format!("http://{authority}/reply"), "method": "POST",
+               "headers": [{"name":"content-type", "value":"application/json; charset=utf-8"}],
+               "body": "{\"channel\":\"C0123\",\"thread_ts\":\"1\"}"}),
+        ),
+    )
+    .await
+    .expect("admitted request accounted");
+    assert_eq!(
+        allowed.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded,
+        "{allowed:?}"
+    );
+    let requests = std::iter::once(server.request())
+        .chain(server.recorded())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the real component sends exactly one HTTP request"
+    );
+    let wire = std::str::from_utf8(&requests[0]).expect("fixture request is UTF-8");
+    assert_eq!(wire.lines().next(), Some("POST /reply HTTP/1.1"));
+    let sent_host = wire
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.trim())
+        })
+        .expect("outbound Host header");
+    assert_eq!(
+        format!("http://{sent_host}/reply"),
+        format!("http://{authority}/reply")
+    );
+    assert!(
+        wire.lines()
+            .all(|line| !line.to_ascii_lowercase().starts_with("authorization:")),
+        "guest sent no credential"
+    );
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn http_audit_contains_only_sanitized_call_metadata() {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],

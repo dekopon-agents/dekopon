@@ -248,6 +248,87 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wit_send_and_stream_each_cross_one_pre_dns_decision() {
+    use dekopon_http_host::asset::AssetDirectory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().expect("asset root");
+    let mut registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider loads");
+    registry.set_assets(AssetDirectory::new(root.path().to_owned(), 1024 * 1024));
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let authorizer: dekopon_broker_host::RequestAuthorizer = {
+        let decisions = Arc::clone(&decisions);
+        let observed = Arc::clone(&observed);
+        Arc::new(move |facts| {
+            decisions.fetch_add(1, Ordering::SeqCst);
+            observed.lock().expect("facts").push(facts);
+            false
+        })
+    };
+    for (mode, method) in [("buffered", "POST"), ("stream", "POST")] {
+        let input = if mode == "stream" {
+            json!({"assetMode": "stream", "references": [], "uri": "https://no-such-egress.invalid/reply"})
+        } else {
+            json!({"uri": "https://no-such-egress.invalid/reply", "method": method,
+                   "body": "{\"channel\":\"C0123\",\"thread_ts\":\"1\"}"})
+        };
+        let mut constraints = http_constraints("no-such-egress.invalid".to_owned(), method);
+        if mode == "stream" {
+            constraints.asset = Some(dekopon_capability::AssetConstraints {
+                attach: true,
+                ..Default::default()
+            });
+        }
+        let failure = registry
+            .invoke_with_storage(
+                authorized(
+                    "http-probe.fetch".parse().expect("capability"),
+                    input,
+                    constraints,
+                ),
+                None,
+                None,
+                dekopon_broker_host::HttpInvocation {
+                    slots: Default::default(),
+                    authorizer: Some(Arc::clone(&authorizer)),
+                },
+                Default::default(),
+            )
+            .await
+            .expect_err("request-point refusal precedes DNS and transport");
+        assert!(
+            matches!(
+                failure.error.as_ref(),
+                BrokerHostError::HostCallRejected {
+                    reason: "denied",
+                    ..
+                }
+            ),
+            "{failure:?}"
+        );
+        assert!(failure.http_calls.is_empty());
+    }
+    assert_eq!(decisions.load(Ordering::SeqCst), 2);
+    let observed = observed.lock().expect("facts");
+    assert_eq!(observed.len(), 2);
+    for facts in observed.iter() {
+        assert_eq!(facts.method, "POST");
+        assert_eq!(facts.host, "no-such-egress.invalid");
+        assert_eq!(facts.path, "/reply");
+        assert!(facts.query.is_empty());
+        assert!(facts.headers.is_empty());
+    }
+    assert!(observed[0].body.is_some());
+    assert!(observed[1].body.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fetched_jsonplaceholder_0_3_0_is_refused_at_load() {
     let error = BrokerProviderRegistry::load(
         [provider_fixture("jsonplaceholder-provider.wasm")],
