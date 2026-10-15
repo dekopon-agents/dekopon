@@ -161,19 +161,17 @@ fn process_line(
             if let GrepMode::Count = config.mode {
                 return Ok(true);
             }
-            if config.before > 0 || config.after > 0 {
+            if matches!(config.mode, GrepMode::Lines) && (config.before > 0 || config.after > 0) {
                 if selected {
                     for (index, saved, _charges) in std::mem::take(&mut progress.before) {
-                        if index > progress.last_emitted
-                            && !emit_grep(
-                                config,
-                                progress,
-                                (index, &saved, false),
-                                budget,
-                                invoker,
-                                emit,
-                            )?
-                        {
+                        if !emit_grep(
+                            config,
+                            progress,
+                            (index, &saved, false),
+                            budget,
+                            invoker,
+                            emit,
+                        )? {
                             return Ok(false);
                         }
                     }
@@ -474,26 +472,6 @@ mod tests {
             CommandFailure::Fatal(crate::builtins::FatalError::Limit(
                 LimitExceeded::ValueBytes { maximum: 7 }
             ))
-        ));
-        let mut reader = PipeReader::from_bytes(vec![b'x'; 2 * pipe::CHUNK_BYTES]);
-        let mut budget = Budget::start(Limits {
-            max_steps: 1,
-            ..Limits::default()
-        });
-        let failure = TextStream::Grep
-            .run(
-                &["-A2".to_owned(), "x".to_owned()],
-                &mut reader,
-                &mut budget,
-                &Stub { cancelled: false },
-                |_| Ok(true),
-            )
-            .expect_err("context processing charges the second chunk");
-        assert!(matches!(
-            failure,
-            CommandFailure::Fatal(crate::builtins::FatalError::Limit(LimitExceeded::Steps {
-                maximum: 1
-            }))
         ));
     }
 

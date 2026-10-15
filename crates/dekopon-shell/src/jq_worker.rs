@@ -41,15 +41,29 @@ fn serve() -> Result<(), super::builtins::jq::WorkerFailure> {
     let mut header = String::new();
     std::io::BufRead::read_line(&mut stdin, &mut header)
         .map_err(|error| WorkerFailure::Failed(format!("jq: invalid worker request: {error}")))?;
-    let (filter, slurp): (String, bool) = serde_json::from_str(&header)
-        .map_err(|error| WorkerFailure::Failed(format!("jq: invalid worker request: {error}")))?;
+    let (filter, slurp, bindings): (String, bool, Vec<(String, String)>) =
+        serde_json::from_str(&header).map_err(|error| {
+            WorkerFailure::Failed(format!("jq: invalid worker request: {error}"))
+        })?;
+    if bindings
+        .iter()
+        .any(|(name, _)| !super::builtins::jq::valid_name(name))
+        || bindings
+            .iter()
+            .enumerate()
+            .any(|(i, (name, _))| bindings[..i].iter().any(|(previous, _)| previous == name))
+    {
+        return Err(WorkerFailure::Failed(
+            "jq: invalid worker request: bindings".into(),
+        ));
+    }
     let documents = serde_json::Deserializer::from_reader(stdin).into_iter::<Val>();
     let input: Box<dyn Iterator<Item = Result<Val, serde_json::Error>>> = if slurp {
         Box::new(documents.take(1))
     } else {
         Box::new(documents)
     };
-    super::builtins::jq::run_filter(&filter, input, &mut std::io::stdout().lock())
+    super::builtins::jq::run_filter(&filter, &bindings, input, &mut std::io::stdout().lock())
 }
 
 #[cfg(target_os = "linux")]
