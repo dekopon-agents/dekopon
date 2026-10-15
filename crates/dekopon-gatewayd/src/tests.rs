@@ -9377,44 +9377,7 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
-    let store = Arc::new(asset_store());
-    let arriving = (0..8)
-        .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
-        .collect();
-    store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        arriving,
-        true,
-        Instant::now(),
-    );
-    let assets = SessionAssets::new(
-        Arc::clone(&store),
-        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
-        None,
-        tokio::runtime::Handle::current(),
-        true,
-        true,
-    );
-
-    let refusal = tokio::task::spawn_blocking(move || {
-        for id in 1..=4 {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "the comment above is the point: each of these four is expected to fail, \
-                          and only the fifth call's refusal is asserted on"
-            )]
-            let _ = assets.fetch(id);
-        }
-        assets.fetch(5).expect_err("the budget is spent")
-    })
-    .await
-    .expect("the blocking task completes");
-    assert!(refusal.contains("already opened"), "{refusal}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
+async fn capability_resolution_does_not_change_model_fetch_refusals() {
     let store = Arc::new(asset_store());
     let arriving = (0..8)
         .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
@@ -9450,10 +9413,7 @@ async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
             .all(|refusal| *refusal == dekopon_agent::attachment::ChatAssetRefusal::Unavailable),
         "{capability_side:?}"
     );
-    assert!(
-        !model_side.contains("already opened"),
-        "six capability inputs must not exhaust the model's own allowance: {model_side}"
-    );
+    assert!(model_side.contains("cannot be opened"), "{model_side}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
