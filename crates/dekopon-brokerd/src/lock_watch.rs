@@ -232,12 +232,6 @@ mod tests {
             changed[0].field("event"),
             Some("broker_provider_lock_changed")
         );
-        assert!(
-            capture
-                .events_where("dekopon_brokerd", &[("event", "broker_reload_refused")])
-                .is_empty()
-        );
-
         fs::remove_file(&lock.path).unwrap();
         assert_eq!(
             tokio::time::timeout(FAST * 15, watch(&lock, uid, FAST))

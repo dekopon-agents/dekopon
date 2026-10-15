@@ -251,16 +251,25 @@ struct Candidate {
     limits: ServerLimits,
     storage: Option<dekopon_storage_host::StorageHost>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
+    locked_providers: Option<Vec<dekopon_broker_host::LockedProviderSource>>,
     snapshot: config::ConfigSnapshot,
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
 /// did not is reported as skipped.
+#[expect(
+    clippy::too_many_lines,
+    reason = "independent validation stages aggregate failures before preparing a candidate"
+)]
 async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let uid = current_uid();
     let load_mode = match mode {
-        Mode::Boot | Mode::Reload(_) => LoadMode::Boot,
+        Mode::Boot => LoadMode::Boot,
+        Mode::Reload(active) => LoadMode::Reload {
+            locked_providers: active.locked_providers.as_deref(),
+            provider_lock: active.provider_lock.as_ref(),
+        },
         Mode::Check(_) => LoadMode::Check,
     };
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
@@ -368,11 +377,14 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     };
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
+    let locked_providers = config.locked_providers.clone();
     let storage = runtime.storage.clone();
     let assets = runtime.assets.clone();
     let snapshot = config.snapshot.clone();
     let resident_registry = match residents {
-        Residents::Borrow(active) if restart_categories.is_empty() => {
+        Residents::Borrow(active)
+            if restart_categories.is_empty() || active.locked_providers.is_some() =>
+        {
             Some(active.ready.registry.clone())
         }
         Residents::Open | Residents::Borrow(_) | Residents::Scratch => None,
@@ -395,6 +407,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                 limits,
                 storage,
                 assets,
+                locked_providers,
                 snapshot,
             }),
             report,
@@ -1132,7 +1145,7 @@ pub enum BrokerdError {
     #[error("{}", render_errors(.problems))]
     Startup { problems: Vec<BrokerdError> },
     #[error("broker configuration changed restart-required categories: {categories:?}")]
-    RestartRequired { categories: Vec<&'static str> },
+    RestartRequired { categories: Vec<String> },
     #[error("the configuration names a providerSet; check it with --provider-set and --store")]
     ProviderSetRequired,
     #[error("the configuration names provider paths; --provider-set does not apply to it")]

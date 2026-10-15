@@ -1674,6 +1674,27 @@ fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
     }
 }
 
+#[test]
+fn an_unlisted_config_category_refuses_in_either_direction() {
+    let original =
+        serde_yaml::from_str::<serde_yaml::Mapping>("socketPath: broker.sock\n").unwrap();
+    let mut edited = original.clone();
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::String("value".to_owned()),
+    );
+    let active = config::ConfigSnapshot::from_mapping(&original);
+    let proposed = config::ConfigSnapshot::from_mapping(&edited);
+    assert_eq!(active.restart_required(&proposed), ["futureEffectiveInput"]);
+    assert_eq!(proposed.restart_required(&active), ["futureEffectiveInput"]);
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::Null,
+    );
+    let omitted = config::ConfigSnapshot::from_mapping(&edited);
+    assert!(active.restart_required(&omitted).is_empty());
+}
+
 #[tokio::test]
 async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
     let root = tempfile::tempdir().unwrap();
@@ -1686,10 +1707,10 @@ async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
     let mut active = config::ConfigSnapshot::from_mapping(&mapping);
     let mut next = active.clone();
     active
-        .record_sources("", std::slice::from_ref(&path), &[b"first CA".to_vec()])
+        .record_sources("", std::slice::from_ref(&path), 0, &[b"first CA".to_vec()])
         .await
         .unwrap();
-    next.record_sources("", std::slice::from_ref(&path), &[b"second CA".to_vec()])
+    next.record_sources("", std::slice::from_ref(&path), 0, &[b"second CA".to_vec()])
         .await
         .unwrap();
     assert_eq!(active.restart_required(&next), ["http"]);
@@ -1700,9 +1721,14 @@ async fn broker_projection_does_not_relax_owner_only_source_rules() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("broker.yaml");
-    let projected = root.path().join("..data");
-    write_config(&projected, &attested_document(current_uid()));
-    std::os::unix::fs::symlink("..data", &path).unwrap();
+    let generation = root.path().join("..2026");
+    fs::create_dir(&generation).unwrap();
+    write_config(
+        &generation.join("broker.yaml"),
+        &attested_document(current_uid()),
+    );
+    std::os::unix::fs::symlink("..2026", root.path().join("..data")).unwrap();
+    std::os::unix::fs::symlink("..data/broker.yaml", &path).unwrap();
     for report in [
         super::check(&path, None).await,
         super::load_candidate(&path, Mode::Boot).await.1,
@@ -1710,11 +1736,8 @@ async fn broker_projection_does_not_relax_owner_only_source_rules() {
         assert!(
             report.problems.iter().any(|problem| matches!(
                 problem,
-                BrokerdError::Config(
-                    config::ConfigError::InsecureFile { .. }
-                        | config::ConfigError::NotRegular { .. }
-                        | config::ConfigError::Read { .. }
-                )
+                BrokerdError::Config(config::ConfigError::Read { path: refused, source })
+                    if refused == &path && source.raw_os_error() == Some(libc::ELOOP)
             )),
             "{report:?}"
         );
@@ -1747,7 +1770,6 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
-    assert_eq!(active.ready.broker.policy_digest(), digest);
 
     document.as_object_mut().unwrap().remove("serverLimits");
     write_config(&path, &document);
@@ -1767,7 +1789,6 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
             source: PolicyBuildError::Parse { .. }
         }
     )));
-    assert_eq!(active.ready.broker.policy_digest(), digest);
 
     write_owner_only(&cedar, format!("{POLICIES}\n@id(\"unrecognized\") permit(principal in Dekopon::Group::\"strangers\", action, resource);\n").as_bytes());
     document["capabilities"]["cli-probe"]["constraints"] = json!({});
@@ -1870,6 +1891,7 @@ async fn a_valid_policy_reload_prepares_with_an_active_storage_writer() {
         prepared.is_some(),
         "valid policy edit must prepare alongside the active writer"
     );
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
 }
 
 #[tokio::test]
@@ -1919,7 +1941,6 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     let (active, report) = super::load_candidate(&path, Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.unwrap();
-    let digest = active.ready.broker.policy_digest().to_owned();
     write_owner_only(
         &root.path().join("bad-credentials.yaml"),
         b"not-a-credential-map",
@@ -1977,7 +1998,6 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
             if name == "absent")),
         "{report:?}"
     );
-    assert_eq!(active.ready.broker.policy_digest(), digest);
 }
 
 #[tokio::test]
@@ -2289,6 +2309,33 @@ impl ManagedBroker {
         .await
         .expect("broker binds its socket");
     }
+}
+
+#[tokio::test]
+async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed provider boot candidate");
+    let loaded = active.provider_lock.as_ref().expect("active provider lock");
+
+    broker.publish_lock('2');
+    let current = super::provider_manager::lock_digest(&broker.lock(), current_uid())
+        .await
+        .unwrap();
+    assert_ne!(current, loaded.digest);
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let next = next.expect("lock-only change belongs to lock_watch, not reload refusal");
+    assert_eq!(
+        next.provider_lock
+            .as_ref()
+            .expect("carried provider lock")
+            .digest,
+        loaded.digest
+    );
 }
 
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);

@@ -309,7 +309,7 @@ pub(crate) enum Resident {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ConfigSnapshot(BTreeMap<&'static str, (Disposition, serde_yaml::Value)>);
+pub(crate) struct ConfigSnapshot(BTreeMap<String, (Disposition, serde_yaml::Value)>);
 
 impl ConfigSnapshot {
     fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
@@ -329,37 +329,17 @@ impl ConfigSnapshot {
             "policiesPath",
             "capabilities",
         ];
-        const RESTART: &[&str] = &[
-            "apiVersion",
-            "socketPath",
-            "providers",
-            "providerSet",
-            "compileOnLoad",
-            "providerSettings",
-            "http",
-            "hostLimits",
-            "brokerLimits",
-            "serverLimits",
-            "assets",
-            "storage",
-            "chatMemory",
-            "telemetry",
-        ];
         Self(
-            SWAP.iter()
-                .map(|&key| (key, Disposition::Swap))
-                .chain(RESTART.iter().map(|&key| (key, Disposition::Restart)))
-                .map(|(key, disposition)| {
-                    (
-                        key,
-                        (
-                            disposition,
-                            mapping
-                                .get(serde_yaml::Value::String(key.to_owned()))
-                                .cloned()
-                                .unwrap_or(serde_yaml::Value::Null),
-                        ),
-                    )
+            mapping
+                .iter()
+                .filter_map(|(key, value)| {
+                    let key = key.as_str()?;
+                    let disposition = if SWAP.contains(&key) {
+                        Disposition::Swap
+                    } else {
+                        Disposition::Restart
+                    };
+                    Some((key.to_owned(), (disposition, value.clone())))
                 })
                 .collect(),
         )
@@ -369,6 +349,7 @@ impl ConfigSnapshot {
         &mut self,
         policies: &str,
         providers: &[PathBuf],
+        locked_prefix: usize,
         ca_bundles: &[Vec<u8>],
     ) -> Result<(), ConfigError> {
         use sha2::{Digest as _, Sha256};
@@ -379,11 +360,11 @@ impl ConfigSnapshot {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         self.0.insert(
-            "policies",
+            "policies".to_owned(),
             (Disposition::Swap, serde_yaml::Value::String(policy_hash)),
         );
         let mut digests = Vec::with_capacity(providers.len());
-        for path in providers {
+        for path in providers.iter().skip(locked_prefix) {
             let mut file =
                 tokio::fs::File::open(path)
                     .await
@@ -417,7 +398,7 @@ impl ConfigSnapshot {
             )));
         }
         self.0.insert(
-            "providerArtifacts",
+            "providerArtifacts".to_owned(),
             (Disposition::Restart, serde_yaml::Value::Sequence(digests)),
         );
         let bundles = ca_bundles
@@ -432,7 +413,7 @@ impl ConfigSnapshot {
             })
             .collect();
         self.0.insert(
-            "caBundles",
+            "caBundles".to_owned(),
             (Disposition::Restart, serde_yaml::Value::Sequence(bundles)),
         );
         Ok(())
@@ -446,18 +427,31 @@ impl ConfigSnapshot {
         self.0.get(category).map(|(_, value)| value) == next.0.get(category).map(|(_, value)| value)
     }
 
-    pub(crate) fn restart_required(&self, next: &Self) -> Vec<&'static str> {
+    pub(crate) fn restart_required(&self, next: &Self) -> Vec<String> {
+        let null = serde_yaml::Value::Null;
         self.0
-            .iter()
-            .filter_map(|(&category, (disposition, value))| match disposition {
-                Disposition::Swap => None,
-                Disposition::Restart if value == &next.0[category].1 => None,
-                Disposition::Restart => Some(match category {
-                    "providerArtifacts" => "providers",
-                    "caBundles" => "http",
-                    _ => category,
-                }),
+            .keys()
+            .chain(next.0.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|category| {
+                let current = self.0.get(category.as_str());
+                let proposed = next.0.get(category.as_str());
+                let disposition = current.or(proposed).map(|(disposition, _)| disposition)?;
+                let old = current.map_or(&null, |(_, value)| value);
+                let new = proposed.map_or(&null, |(_, value)| value);
+                match disposition {
+                    Disposition::Swap => None,
+                    Disposition::Restart if old == new => None,
+                    Disposition::Restart => Some(match category.as_str() {
+                        "providerArtifacts" => "providers".to_owned(),
+                        "caBundles" => "http".to_owned(),
+                        _ => category.clone(),
+                    }),
+                }
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 }
@@ -493,20 +487,24 @@ pub struct ResolvedConfig {
 /// `Check` resolves the runtime-only paths (socket, credentials, secret map, storage and assets
 /// roots, the managed provider lock and store, extra CA bundles) without requiring them to exist and
 /// loads no managed provider lock; every other rule is the one boot applies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LoadMode {
+#[derive(Clone, Copy, Debug)]
+pub enum LoadMode<'a> {
     Boot,
+    Reload {
+        locked_providers: Option<&'a [LockedProviderSource]>,
+        provider_lock: Option<&'a LoadedLock>,
+    },
     Check,
 }
 
-impl LoadMode {
+impl LoadMode<'_> {
     fn runtime_path(
         self,
         path: PathBuf,
         boot: impl FnOnce(PathBuf) -> Result<PathBuf, ConfigError>,
     ) -> Result<PathBuf, ConfigError> {
         match self {
-            Self::Boot => boot(path),
+            Self::Boot | Self::Reload { .. } => boot(path),
             Self::Check => Ok(path),
         }
     }
@@ -528,7 +526,7 @@ pub async fn load(
 pub async fn load_in(
     path: impl AsRef<Path>,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<(ResolvedConfig, Option<ConfigError>), ConfigError> {
     let path = absolute(path.as_ref())?;
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
@@ -554,6 +552,7 @@ pub async fn load_in(
         .record_sources(
             &resolved.policies,
             &resolved.providers,
+            resolved.locked_providers.as_ref().map_or(0, Vec::len),
             &resolved.host_options.extra_ca_bundles,
         )
         .await?;
@@ -574,7 +573,7 @@ const POLICY_EXTENSION: &str = "cedar";
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<(ResolvedConfig, Option<ConfigError>), ConfigError> {
     let fragments = fragments::scan_directory(&directory, expected_uid, FRAGMENT_EXTENSION)?;
     let policy_files = fragments::scan_directory(&directory, expected_uid, POLICY_EXTENSION)?;
@@ -597,7 +596,7 @@ async fn load_directory(
     }
     let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
     let refusal = match (refusal, mode) {
-        (Some(refusal), LoadMode::Boot) => return Err(refusal.into()),
+        (Some(refusal), LoadMode::Boot | LoadMode::Reload { .. }) => return Err(refusal.into()),
         (refusal, _) => refusal.map(ConfigError::from),
     };
     // A later refusal is reported as the collision it may well be caused by.
@@ -637,6 +636,7 @@ async fn load_directory(
         .record_sources(
             &resolved.policies,
             &resolved.providers,
+            resolved.locked_providers.as_ref().map_or(0, Vec::len),
             &resolved.host_options.extra_ca_bundles,
         )
         .await?;
@@ -760,7 +760,7 @@ async fn resolve(
     config: BrokerdConfig,
     source: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<ResolvedConfig, ConfigError> {
     if config.provider_set.is_some() && !config.providers.is_empty() {
         return Err(ConfigError::MixedProviderSources);
@@ -773,7 +773,12 @@ async fn resolve(
             maximum: HARD_MAX_PROVIDERS,
         });
     }
-    if config.identities.is_empty() && mode == LoadMode::Boot {
+    if config.identities.is_empty()
+        && match mode {
+            LoadMode::Boot | LoadMode::Reload { .. } => true,
+            LoadMode::Check => false,
+        }
+    {
         return Err(ConfigError::NoIdentities);
     }
     let source_parent = source.parent().ok_or(ConfigError::MissingParent)?;
@@ -801,7 +806,7 @@ async fn resolve(
         .transpose()
     };
     let credentials_path = match mode {
-        LoadMode::Boot => canonical(config.credentials_path)?,
+        LoadMode::Boot | LoadMode::Reload { .. } => canonical(config.credentials_path)?,
         LoadMode::Check => config.credentials_path.map(resolve_path),
     };
     // The final path component is left uncanonicalized so the secret-map loader's O_NOFOLLOW check
@@ -865,6 +870,16 @@ async fn resolve(
         .transpose()?;
     let (locked_providers, provider_lock) = match (&managed_provider_paths, mode) {
         (None, _) | (Some(_), LoadMode::Check) => (None, None),
+        (
+            Some(_),
+            LoadMode::Reload {
+                locked_providers,
+                provider_lock,
+            },
+        ) => (
+            locked_providers.map(<[LockedProviderSource]>::to_vec),
+            provider_lock.cloned(),
+        ),
         (Some((lock_path, store_path)), LoadMode::Boot) => {
             let (sources, digest) =
                 provider_manager::load_locked_digest(lock_path, store_path, expected_uid)
@@ -908,7 +923,11 @@ async fn resolve(
             maximum: HARD_MAX_PROVIDERS,
         });
     }
-    if providers.is_empty() && (mode == LoadMode::Boot || managed_provider_paths.is_none()) {
+    let require_providers = match mode {
+        LoadMode::Boot => true,
+        LoadMode::Reload { .. } | LoadMode::Check => managed_provider_paths.is_none(),
+    };
+    if providers.is_empty() && require_providers {
         return Err(ConfigError::NoProviders);
     }
     let mut reserved = vec![source.clone(), socket_path.clone()];
@@ -1015,8 +1034,9 @@ async fn resolve(
         if !path.is_absolute() {
             return Err(ConfigError::InvalidHttpsConfiguration);
         }
-        if mode == LoadMode::Check {
-            continue;
+        match mode {
+            LoadMode::Check => continue,
+            LoadMode::Boot | LoadMode::Reload { .. } => {}
         }
         let metadata =
             std::fs::metadata(path).map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
@@ -1158,7 +1178,13 @@ async fn resolve(
         host_options: BrokerHostOptions {
             cwasm_dir: managed_provider_paths
                 .as_ref()
-                .filter(|_| !config.compile_on_load && mode == LoadMode::Boot)
+                .filter(|_| {
+                    !config.compile_on_load
+                        && match mode {
+                            LoadMode::Boot | LoadMode::Reload { .. } => true,
+                            LoadMode::Check => false,
+                        }
+                })
                 .map(|(_, store)| store.join("cwasm")),
             compiled_cache_mode: dekopon_broker_host::CompiledCacheMode::Reader,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
