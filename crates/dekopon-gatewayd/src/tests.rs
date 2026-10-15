@@ -4021,7 +4021,13 @@ async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
             .iter()
             .filter_map(|call| match call {
                 DriverCall::Reaction { target, present } => Some((target.as_str(), *present)),
-                _ => None,
+                DriverCall::Reply { .. }
+                | DriverCall::Typing { .. }
+                | DriverCall::Status { .. }
+                | DriverCall::Progress(_)
+                | DriverCall::Stream(_)
+                | DriverCall::Seen { .. }
+                | DriverCall::CancelAck { .. } => None,
             })
             .collect();
         let expected_target = rendered_target(&target);
@@ -4222,7 +4228,13 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
                 .iter()
                 .filter_map(|call| match call {
                     DriverCall::Seen { target } => Some(target.as_str()),
-                    _ => None,
+                    DriverCall::Reply { .. }
+                    | DriverCall::Typing { .. }
+                    | DriverCall::Status { .. }
+                    | DriverCall::Progress(_)
+                    | DriverCall::Stream(_)
+                    | DriverCall::Reaction { .. }
+                    | DriverCall::CancelAck { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             [rendered_target(&target("inbound-2"))],
