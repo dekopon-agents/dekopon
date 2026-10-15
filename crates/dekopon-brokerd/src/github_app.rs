@@ -257,7 +257,7 @@ impl GithubAppCredential {
                 event = "broker_github_app_credential_reauth_required",
                 credential = %self.name,
                 http.response.status_code = status.as_u16(),
-                "GitHub refused the App JWT; the App's private key or installation must be renewed"
+                "GitHub refused the App JWT: a revoked or wrong key, a deleted App, or a clock more than a minute ahead"
             );
             return Err(CredentialRefreshError::ReauthorizationRequired);
         }
