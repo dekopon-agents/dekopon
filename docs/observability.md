@@ -146,7 +146,9 @@ previews are stripped of control characters, have in-scope credentials replaced 
 `[REDACTED]`, then are bounded at 16 KiB; a preview cut mid-credential drops the partial token.
 Parser sources are preserved when safe. Credentials, the prompt cache key and private reasoning
 never enter `model.complete` fields, and `traceparent` is not forwarded to the inference endpoint.
-`agent.model.prompt`, `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
+`agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
+empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
+`agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
 
@@ -227,11 +229,12 @@ therefore inside the caller's trace. Two events carry the whole record:
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.revision`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
-| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.revision`, `policy.ids`, `policy.digest`, `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected`. It carries no request-only decision fields or verdict |
+| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
+| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, optional `provider.artifact_sha256` (the full lowercase SHA-256 of the loaded component), `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected`. It carries no request-only decision fields or verdict |
 
 Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
-record does not carry it, so a present field always means the broker knew it. A storage-routed
+record does not carry it, so a present field always means the broker knew it. The artifact
+field is derived from the loaded registry, never a desired provider pin; unknown artifacts omit it. A storage-routed
 decision carries every field a non-storage one does, plus its scope commitment and evidence.
 
 Four decisions produce a record — a denial, an allow, a failure after authorization but before the

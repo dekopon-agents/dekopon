@@ -14,6 +14,7 @@ use dekopon_core::{
     RiskLevel,
 };
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const SECRET: &str = "audit-log-record-must-never-see-this";
@@ -131,12 +132,19 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
+    let fixture = provider_fixture("http-probe-provider.wasm");
+    let expected_digest = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&fixture).expect("fixture bytes"))
+    );
+    let registry = BrokerProviderRegistry::load([fixture], BrokerHostLimits::default())
+        .await
+        .expect("HTTP provider fixture loads");
+    let artifact_digest = registry
+        .loaded_provider_metadata()
+        .next()
+        .expect("loaded fixture")
+        .artifact_sha256;
     let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
@@ -237,12 +245,12 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         ("actor.kind", "agent"),
         ("actor.id", "provider-test"),
         ("provider", "http-probe"),
-        ("policy.revision", "policy-test"),
         ("policy.ids", "http-fetch"),
     ] {
         assert_eq!(decision.field(name), Some(value), "{name}: {decision:?}");
     }
     assert!(decision.field("policy.digest").is_some(), "{decision:?}");
+    assert_eq!(decision.field("policy.revision"), None);
     let request_decision = only(
         &captured,
         &[
@@ -257,6 +265,13 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let execution = only(&captured, &[("audit.event", "broker.execution")]);
     assert_eq!(execution.parent(), Some("broker.execute"), "{execution:?}");
     assert_eq!(execution.field("output.digest"), None, "{execution:?}");
+    assert_eq!(artifact_digest, expected_digest);
+    assert_eq!(expected_digest.len(), 64);
+    assert_eq!(
+        execution.field("provider.artifact_sha256"),
+        Some(expected_digest.as_str())
+    );
+    assert_eq!(execution.field("policy.revision"), None);
     for (name, value) in [
         ("invocation.id", "invoke-audited"),
         ("outcome", "Succeeded"),

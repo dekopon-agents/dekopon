@@ -614,6 +614,7 @@ where
         );
         let model_entered = model_span.enter();
         let scope = if transcribed == 0 { "full" } else { "delta" };
+        let offered_tools = offered_tool_names(model_tools.iter().map(|tool| tool.name.as_str()));
         tracing::info!(
             target: "dekopon_agent::audit",
             {
@@ -621,6 +622,7 @@ where
                 model.turn = model_turns,
                 transcript.scope = scope,
                 message.count = messages.len(),
+                tools = offered_tools.as_str(),
                 messages = %transcript(&messages[transcribed..]),
             },
             "model turn prompt"
@@ -1467,6 +1469,21 @@ fn fetch_asset_into(
         part,
     ]));
     Ok(())
+}
+
+fn offered_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut offered = names.collect::<Vec<_>>().join(",");
+    const LIMIT: usize = 4096;
+    const MARKER: &str = "[…]";
+    if offered.len() > LIMIT {
+        let mut end = LIMIT - MARKER.len();
+        while !offered.is_char_boundary(end) {
+            end -= 1;
+        }
+        offered.truncate(end);
+        offered.push_str(MARKER);
+    }
+    offered
 }
 
 fn clamp_textual_asset(mut text: String) -> String {
@@ -3987,6 +4004,86 @@ mod tests {
             }],
             None,
         )
+    }
+
+    #[test]
+    fn each_prompt_records_the_tools_offered_to_that_turn() {
+        use dekopon_test_support::CaptureLayer;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing_subscriber::prelude::*;
+
+        struct ChangingAssets(AtomicBool);
+        impl AssetSource for ChangingAssets {
+            fn fetch(&self, _: u64) -> Result<FetchedAsset, String> {
+                Err("not found".into())
+            }
+            fn is_empty(&self) -> bool {
+                !self.0.load(Ordering::Relaxed)
+            }
+        }
+        struct ChangingModel<'a> {
+            scripted: ScriptedModel,
+            assets: &'a ChangingAssets,
+        }
+        impl ChatModel for ChangingModel<'_> {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                tools: &[ModelTool],
+                options: &CompletionOptions,
+                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+            ) -> Result<AssistantTurn, InferenceError> {
+                let turn = self.scripted.complete(messages, tools, options, on_event);
+                self.assets.0.store(true, Ordering::Relaxed);
+                turn
+            }
+        }
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let assets = ChangingAssets(AtomicBool::new(false));
+        let model = ChangingModel {
+            scripted: ScriptedModel::new([asset_call(1), answer("done")]),
+            assets: &assets,
+        };
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("check", limits(2, 2)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let first = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.model.prompt"), ("model.turn", "1")],
+        );
+        let second = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.model.prompt"), ("model.turn", "2")],
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].field("tools"), Some("bash,suggest_improvement"));
+        assert_eq!(
+            second[0].field("tools"),
+            Some("bash,suggest_improvement,fetch_chat_asset")
+        );
+    }
+
+    #[test]
+    fn offered_tool_names_mark_incomplete_lists_and_encode_empty_lists() {
+        assert_eq!(super::offered_tool_names(std::iter::empty()), "");
+        assert_eq!(
+            super::offered_tool_names(["script", "read_asset"].into_iter()),
+            "script,read_asset"
+        );
+        let long = "é".repeat(3000);
+        let bounded = super::offered_tool_names([long.as_str()].into_iter());
+        assert!(bounded.len() <= 4096);
+        assert!(bounded.ends_with("[…]"));
+        assert!(!bounded.contains('�'));
     }
 
     #[test]

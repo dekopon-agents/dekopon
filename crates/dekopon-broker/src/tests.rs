@@ -114,7 +114,7 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
                 .expect("valid principal fixture"),
         ),
         decision_id: format!("decision-{invocation}"),
-        policy_revision: Some("policy-test".to_owned()),
+
         policy_ids: Vec::new(),
         policy_error_ids: Vec::new(),
         policy_errors_present: None,

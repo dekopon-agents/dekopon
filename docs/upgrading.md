@@ -8,6 +8,17 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker audit and receipt consumers (next core release)
+
+Upgrade core before updating consumers of broker invocation results. The required decision
+reference and authorization receipt field `policyRevision` is now `policyDigest`, carrying the
+64-character lowercase policy-set SHA-256 (without the `sha256:` display prefix). Consumers
+that decode the old name must be rebuilt against the new core. Broker decision and execution
+audit records no longer emit `policy.revision`; use their existing `policy.digest` instead.
+`broker.execution` additionally emits the loaded component's full `provider.artifact_sha256`
+when available. Update the console's core dependency pins and its record fixtures together
+with the compatible chart release; an old console may not decode new records.
+
 ## Gateway indicator configuration (next gateway release)
 
 The gateway replaces `transports[].liveness` with layered `indicators`: `sessions.indicators`,
