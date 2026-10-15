@@ -730,6 +730,7 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
             r#"{"channel":"C0123","thread_ts":"1"}"#,
         ),
     ] {
+        let record_start = capture.records().len();
         let outcome = invoke_as(&broker, "caller", "provider-test", request(id, "http-probe.fetch", json!({
             "uri": uri, "method": method,
             "headers": [{"name": "content-type", "value": content_type}, {"name": "x-sentinel", "value": "SENTINEL-HEADER"}],
@@ -746,9 +747,9 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
         );
         assert_eq!(events.len(), 1, "{id} must reach Cedar once");
         assert_eq!(events[0].field("decision.allowed"), Some("false"));
-        let denied_spans = capture
-            .records()
-            .into_iter()
+        let records = capture.records();
+        let request_spans = records[record_start..]
+            .iter()
             .filter(|record| {
                 matches!(
                     record,
@@ -756,23 +757,20 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
                         name: "http.request",
                         ..
                     }
-                ) && record.field("error.code") == Some("Denied")
+                )
             })
             .collect::<Vec<_>>();
         assert!(
-            !denied_spans.is_empty(),
-            "{id}: policy denial must mark the HTTP span"
+            request_spans
+                .iter()
+                .any(|span| span.field("error.code") == Some("Denied")),
+            "{id}: policy denial must mark this invocation's HTTP span"
         );
         assert!(
-            capture.records().iter().any(|record| matches!(
-                record,
-                dekopon_test_support::Record::Span {
-                    name: "http.request",
-                    ..
-                }
-            ) && record.field("error.message")
-                == Some("HTTP request denied by policy")),
-            "{id}: span error is static"
+            request_spans
+                .iter()
+                .any(|span| span.field("error.message") == Some("HTTP request denied by policy")),
+            "{id}: this invocation's HTTP span must carry the static error"
         );
         if id == "wrong-channel" || id == "dm" || id == "wrong-host" || id == "query" {
             assert_eq!(
@@ -821,7 +819,9 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
             "wrong-method",
             "http-probe.fetch",
             json!({
-                "uri": format!("http://{authority}/reply"), "method": "GET"
+                "uri": format!("http://{authority}/reply"), "method": "GET",
+                "headers": [{"name":"content-type", "value":"application/json; charset=utf-8"}],
+                "body": "{\"channel\":\"C0123\",\"thread_ts\":\"1\"}"
             }),
         ),
     )
@@ -832,18 +832,27 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
         wrong_method.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_broker::audit",
-                &[
-                    ("decision.point", "http.request"),
-                    ("invocation.id", "wrong-method")
-                ]
-            )
-            .len(),
-        1
+    let wrong_method_decisions = capture.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("decision.point", "http.request"),
+            ("invocation.id", "wrong-method"),
+        ],
     );
+    assert_eq!(wrong_method_decisions.len(), 1);
+    assert_eq!(
+        wrong_method_decisions[0].field("decision.allowed"),
+        Some("false")
+    );
+    assert_eq!(
+        wrong_method_decisions[0].field("policy.ids"),
+        Some("no-broadcast,reply-only,thread-required")
+    );
+    assert_eq!(
+        wrong_method_decisions[0].field("policy.errors_present"),
+        Some("false")
+    );
+    assert_eq!(wrong_method_decisions[0].field("policy.error_ids"), None);
     let allowed = invoke_as(
         &broker,
         "caller",
