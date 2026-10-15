@@ -15352,8 +15352,12 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
                 );
             }
             BrokerRequest::Capabilities { attestation: None }
-            | BrokerRequest::RunCommand { attestation: None, .. }
-            | BrokerRequest::Invoke { attestation: None, .. }
+            | BrokerRequest::RunCommand {
+                attestation: None, ..
+            }
+            | BrokerRequest::Invoke {
+                attestation: None, ..
+            }
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::UpcallResult { .. } => panic!("unexpected broker request"),
         }
