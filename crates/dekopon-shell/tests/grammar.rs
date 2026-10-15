@@ -746,6 +746,10 @@ fn grep_quiet_context_and_head_bytes_change_pipeline_effects() {
     assert_eq!(output("printf 'a\\nP\\nb\\nc' | grep -A2 -C1 P"), "a\nP\nb");
     assert_eq!(output("printf 'aé' | head -c 2 | base64"), "YcM=");
     assert_eq!(
+        output("printf 'aé' | head -c 2 > buf; cat buf | base64"),
+        "YcM="
+    );
+    assert_eq!(
         output("printf 'aé' > buf; cat buf | head --bytes=2 | base64"),
         "YcM="
     );
