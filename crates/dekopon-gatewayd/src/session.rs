@@ -400,13 +400,13 @@ impl SessionGate {
             if message.subject == running.subject
                 && match message.message_id {
                     MessageId::Native(_) | MessageId::Job { .. } => true,
-                    MessageId::Wake { .. } => false,
+                    MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
                 let interrupts = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
-                    MessageId::Job { .. } => false,
+                    MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
                 record_admission(&message, "steered", depth + 1, None);
                 running.steers.push_back(message);
@@ -554,7 +554,7 @@ impl SessionAdmission {
             while let Some(mut message) = running.steers.pop_front() {
                 let folds = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
-                    MessageId::Job { .. } => false,
+                    MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
                 if folds {
                     let mut grouped = Vec::new();
@@ -563,7 +563,9 @@ impl SessionAdmission {
                         .front()
                         .is_some_and(|steer| match steer.message_id {
                             MessageId::Native(_) => true,
-                            MessageId::Wake { .. } | MessageId::Job { .. } => false,
+                            MessageId::Wake { .. }
+                            | MessageId::Job { .. }
+                            | MessageId::Follow(_) => false,
                         })
                     {
                         if let Some(next) = running.steers.pop_front() {
@@ -788,10 +790,6 @@ pub(crate) struct SessionRunner {
     pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
     pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
-    #[allow(
-        dead_code,
-        reason = "follow dispatch lands in the subsequent S3b change"
-    )]
     pub follow: Option<Arc<crate::follow::FollowTable>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -969,7 +967,7 @@ impl Recall<'_> {
             .saturating_mul(2)
             .min(PLATFORM_RECALL_MAX_MESSAGES);
         let before = match &self.message.message_id {
-            MessageId::Native(id) => Some(id.as_str()),
+            MessageId::Native(id) | MessageId::Follow(id) => Some(id.as_str()),
             MessageId::Wake { .. } | MessageId::Job { .. } => None,
         };
         let read = tokio::time::timeout_at(
@@ -1284,7 +1282,7 @@ async fn execute(
     let message_kind = message.conversation.kind;
     let is_unattended = match message.message_id {
         MessageId::Native(_) => false,
-        MessageId::Wake { .. } | MessageId::Job { .. } => true,
+        MessageId::Wake { .. } | MessageId::Job { .. } | MessageId::Follow(_) => true,
     };
     let notice = crate::jobs::Notice::of(&message);
     match runner.gate.admit(route, message, receipts) {
@@ -1318,7 +1316,8 @@ async fn execute(
                 notice.record("dropped");
             }
             tracing::info!(event = "gateway_session_rejected", reason = "busy");
-            if notice.is_none()
+            if !matches!(message.message_id, MessageId::Follow(_))
+                && notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
             {
@@ -1400,7 +1399,7 @@ impl SteerSource for SessionSteers {
                 match &steer.message_id {
                     MessageId::Job { .. } => return Steer::Notice(steer.text),
                     MessageId::Native(id) => self.taken.lock().push(id.clone()),
-                    MessageId::Wake { .. } => {}
+                    MessageId::Wake { .. } | MessageId::Follow(_) => {}
                 }
                 let seconds = steer
                     .received_at
@@ -1460,15 +1459,37 @@ async fn session(
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
     let key = conversation_key(route, message);
+    let is_follow = matches!(message.message_id, MessageId::Follow(_));
+    if is_follow {
+        let ticket = runner.follow.as_ref().map(|table| {
+            let follow_key = crate::follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &message.conversation.key(),
+            );
+            table.ticket(&follow_key, SystemTime::now())
+        });
+        if !matches!(ticket, Some(crate::follow::FollowTicket::Active { .. })) {
+            tracing::info!(
+                audit.event = "gateway.follow",
+                operation = "refused",
+                route = route.route_index,
+                reason = "inactive"
+            );
+            return "follow-inactive";
+        }
+    }
     let sealed = sealed_conversation(runner, &key).await;
     match message.conversation.kind {
         ConversationKind::Thread if sealed.is_some() => {
             revoke_thread_ownership(runner, message);
             tracing::info!(event = "gateway_session_rejected", reason = "sealed");
-            if !message
-                .thread_continuation
-                .as_ref()
-                .is_some_and(|continuation| continuation.inherited)
+            if !is_follow
+                && !message
+                    .thread_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.inherited)
             {
                 answer(driver, message, SEALED_THREAD_REPLY).await;
             }
@@ -1489,7 +1510,9 @@ async fn session(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
             );
-            answer(driver, message, UNAUTHORIZED_REPLY).await;
+            if !is_follow {
+                answer(driver, message, UNAUTHORIZED_REPLY).await;
+            }
             return "unauthorized";
         }
         Err(error) => {
@@ -1498,7 +1521,9 @@ async fn session(
                 category = error.category(),
                 error = %error
             );
-            answer(driver, message, FAILURE_REPLY).await;
+            if !is_follow {
+                answer(driver, message, FAILURE_REPLY).await;
+            }
             return "failed";
         }
     };
@@ -1513,7 +1538,9 @@ async fn session(
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(event = "gateway_session_rejected", reason = "unauthorized");
-        answer(driver, message, UNAUTHORIZED_REPLY).await;
+        if !is_follow {
+            answer(driver, message, UNAUTHORIZED_REPLY).await;
+        }
         return "unauthorized";
     }
     // A chat thread becomes a continuation surface only after this exact sender's fresh broker
@@ -1542,7 +1569,7 @@ async fn session(
         sealed_at: sealed.map(|seal| seal.at),
     };
     let mut newest_seen = match &message.message_id {
-        MessageId::Native(id) => Some(id.clone()),
+        MessageId::Native(id) | MessageId::Follow(id) => Some(id.clone()),
         MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
     let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
@@ -1675,8 +1702,16 @@ async fn session(
         Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
         None => text,
     };
-    let text = frame(text);
-    let recorded = frame(recorded);
+    let text = if is_follow {
+        attributed_prompt(principal.as_ref(), &text)
+    } else {
+        frame(text)
+    };
+    let recorded = if is_follow {
+        attributed_prompt(principal.as_ref(), &recorded)
+    } else {
+        frame(recorded)
+    };
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access.clone(),
@@ -1724,7 +1759,10 @@ async fn session(
         .with_chat_asset_inputs(ChatAssetInputs::new(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
-    let (settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
+    let (mut settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
+    if is_follow {
+        settings.mode = crate::config::LivenessMode::Off;
+    }
     // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
     // wake ahead of the terminal reply being sent.
     let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
@@ -1739,6 +1777,7 @@ async fn session(
         keep_alive,
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
+        silent_until_success: is_follow,
     });
     sink.emit(ProgressEvent::Started {
         agent: route.agent.to_string(),
@@ -1748,10 +1787,11 @@ async fn session(
     // on a runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
     let prompt_cancellation = cancellation.clone();
-    let reply_optional = message
-        .thread_continuation
-        .as_ref()
-        .is_some_and(|continuation| continuation.inherited);
+    let reply_optional = is_follow
+        || message
+            .thread_continuation
+            .as_ref()
+            .is_some_and(|continuation| continuation.inherited);
     let skills = Arc::clone(&route.skills);
     let agent = route.agent.to_string();
     let agent_id = route.agent.clone();
@@ -1823,6 +1863,18 @@ async fn session(
             })
         })
         .flatten();
+    let invoker = crate::follow::FollowInvoker::new(
+        leg,
+        if matches!(
+            message.message_id,
+            MessageId::Native(_) | MessageId::Follow(_)
+        ) {
+            follow_ticket
+        } else {
+            None
+        },
+    );
+    let leave_request = invoker.leave_request();
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -1834,7 +1886,7 @@ async fn session(
                 Err(error) => return (Err(error), None, Vec::new()),
             };
             let runtime = ShellRuntime {
-                invoker: crate::follow::FollowInvoker::new(leg, follow_ticket),
+                invoker,
                 limits: shell,
                 calls,
             };
@@ -2021,6 +2073,11 @@ async fn session(
             (terminal, "failed", None)
         }
     };
+    let terminal = if is_follow && completed_outcome != "answered" {
+        Terminal::Silent
+    } else {
+        terminal
+    };
     let delivered = progress.terminal(terminal).await;
     attachments.finish(match (&outcome, delivered) {
         (Ok(_), true) => AssetDeliveryDisposition::Delivered,
@@ -2028,6 +2085,61 @@ async fn session(
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
+        if completed_outcome == "answered"
+            && leave_request.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(table) = runner.follow.as_ref()
+        {
+            let table = Arc::clone(table);
+            let follow_key = crate::follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &message.conversation.key(),
+            );
+            let index = route.route_index;
+            match tokio::task::spawn_blocking(move || table.leave(&follow_key)).await {
+                Ok(Ok(())) => tracing::info!(
+                    audit.event = "gateway.follow",
+                    operation = "self-left",
+                    route = index
+                ),
+                _ => tracing::warn!(
+                    audit.event = "gateway.follow",
+                    operation = "refused",
+                    route = index,
+                    reason = "persistence"
+                ),
+            }
+        }
+        if is_follow
+            && completed_outcome == "answered"
+            && !leave_request.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(table) = runner.follow.as_ref()
+        {
+            let table = Arc::clone(table);
+            let follow_key = crate::follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &message.conversation.key(),
+            );
+            let index = route.route_index;
+            match tokio::task::spawn_blocking(move || table.refresh(&follow_key, SystemTime::now()))
+                .await
+            {
+                Ok(Ok(())) => tracing::info!(
+                    audit.event = "gateway.follow",
+                    operation = "refreshed",
+                    route = index
+                ),
+                _ => tracing::warn!(
+                    audit.event = "gateway.follow",
+                    operation = "refused",
+                    route = index,
+                    reason = "persistence"
+                ),
+            }
+        }
         if memory_surface.is_some()
             && let Some(answer) = delivered_answer
             && let Some(claim) = chat_claim

@@ -1,7 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,16 +16,110 @@ use dekopon_shell::{
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::journal::{FollowMarker, Journal, JournalError};
+use crate::{
+    journal::{FollowMarker, Journal, JournalError},
+    transport::{InboundMessage, MAX_INBOUND_TEXT_BYTES, MessageId},
+};
 
 const LAPSE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TICKETS: usize = 1024;
+const QUIET: Duration = Duration::from_secs(30);
+const MAX_WAIT: Duration = Duration::from_secs(120);
+
+struct Pending {
+    message: InboundMessage,
+    first: tokio::time::Instant,
+    latest: tokio::time::Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct Debounce {
+    pending: HashMap<String, Pending>,
+}
+
+impl Debounce {
+    pub(crate) fn offer(
+        &mut self,
+        key: String,
+        message: InboundMessage,
+        now: tokio::time::Instant,
+    ) -> bool {
+        if let Some(pending) = self.pending.get_mut(&key) {
+            if pending.message.subject == message.subject {
+                let combined = format!("{}\n\n{}", pending.message.text, message.text);
+                pending.message = message;
+                let end = combined
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= MAX_INBOUND_TEXT_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                pending.message.text = if combined.len() <= MAX_INBOUND_TEXT_BYTES {
+                    combined
+                } else {
+                    combined[..end].to_owned()
+                };
+            } else {
+                pending.message = message;
+            }
+            pending.latest = now;
+            return true;
+        }
+        if self.pending.len() == MAX_TICKETS {
+            return false;
+        }
+        self.pending.insert(
+            key,
+            Pending {
+                message,
+                first: now,
+                latest: now,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn cancel(&mut self, key: &str, subject: &dekopon_core::ExternalSubject) {
+        if self
+            .pending
+            .get(key)
+            .is_some_and(|pending| &pending.message.subject == subject)
+        {
+            self.pending.remove(key);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.pending.remove(key);
+    }
+
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending
+            .values()
+            .map(|pending| (pending.latest + QUIET).min(pending.first + MAX_WAIT))
+            .min()
+    }
+
+    pub(crate) fn due(&mut self, now: tokio::time::Instant) -> Vec<InboundMessage> {
+        let keys: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| (pending.latest + QUIET).min(pending.first + MAX_WAIT) <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.pending.remove(&key))
+            .map(|mut pending| {
+                if let MessageId::Native(id) = pending.message.message_id {
+                    pending.message.message_id = MessageId::Follow(id);
+                }
+                pending.message
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "follow dispatch lands in the subsequent S3b change"
-)]
 pub(crate) enum FollowTicket {
     Active { until_ms: u64 },
     Lapsed,
@@ -32,22 +129,20 @@ pub(crate) enum FollowTicket {
 pub(crate) struct FollowTable {
     journal: Arc<Journal>,
     resident: Mutex<HashMap<String, FollowMarker>>,
-    writer: Mutex<()>,
+    writer: Mutex<HashSet<String>>,
+    disk: Mutex<()>,
 }
 
 impl FollowTable {
     pub(crate) fn load(journal: Arc<Journal>) -> Result<Self, JournalError> {
         Ok(Self {
-            resident: Mutex::new(journal.load_follow()?.into_iter().collect()),
-            writer: Mutex::new(()),
+            resident: Mutex::new(journal.load_follow(MAX_TICKETS)?.into_iter().collect()),
+            writer: Mutex::new(HashSet::new()),
+            disk: Mutex::new(()),
             journal,
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "follow dispatch lands in the subsequent S3b change"
-    )]
     pub(crate) fn ticket(&self, key: &str, now: SystemTime) -> FollowTicket {
         match self.resident.lock().get(key) {
             Some(marker) if millis(now) < marker.until_ms => FollowTicket::Active {
@@ -59,13 +154,22 @@ impl FollowTable {
     }
 
     pub(crate) fn stay(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
+        let _disk = self.disk.lock();
+        if self.writer.lock().contains(key) {
+            return Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+            });
+        }
+        self.persist(key, now)
+    }
+
+    fn persist(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
         let at_ms = millis(now);
         let until_ms = at_ms
             .checked_add(LAPSE.as_millis() as u64)
             .ok_or(JournalError::Io {
                 kind: io::ErrorKind::InvalidInput,
             })?;
-        let _writer = self.writer.lock();
         let lapsed = self
             .resident
             .lock()
@@ -77,24 +181,57 @@ impl FollowTable {
             self.journal.remove_follow(&old)?;
             self.resident.lock().remove(&old);
         }
-        let resident = self.resident.lock();
-        if !resident.contains_key(key) && resident.len() == MAX_TICKETS {
+        {
+            let writer = self.writer.lock();
+            let resident = self.resident.lock();
+            if !resident.contains_key(key) && resident.len() + writer.len() >= MAX_TICKETS {
+                return Err(JournalError::Io {
+                    kind: io::ErrorKind::OutOfMemory,
+                });
+            }
+        }
+        let marker = FollowMarker { at_ms, until_ms };
+        if let Err(error) = self.journal.write_follow(key, marker) {
+            self.resident.lock().remove(key);
+            return Err(error);
+        }
+        let writer = self.writer.lock();
+        if writer.contains(key) {
             return Err(JournalError::Io {
-                kind: io::ErrorKind::OutOfMemory,
+                kind: io::ErrorKind::PermissionDenied,
             });
         }
-        drop(resident);
-        let marker = FollowMarker { at_ms, until_ms };
-        self.journal.write_follow(key, marker)?;
         self.resident.lock().insert(key.to_owned(), marker);
         Ok(())
     }
 
+    pub(crate) fn refresh(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
+        let _disk = self.disk.lock();
+        if self.writer.lock().contains(key)
+            || !matches!(self.ticket(key, now), FollowTicket::Active { .. })
+        {
+            return Err(JournalError::Io {
+                kind: io::ErrorKind::NotFound,
+            });
+        }
+        self.persist(key, now)
+    }
+
     pub(crate) fn leave(&self, key: &str) -> Result<(), JournalError> {
-        let _writer = self.writer.lock();
+        self.suspend(key);
+        let _disk = self.disk.lock();
         self.journal.remove_follow(key)?;
+        let mut writer = self.writer.lock();
+        writer.remove(key);
         self.resident.lock().remove(key);
         Ok(())
+    }
+
+    pub(crate) fn suspend(&self, key: &str) {
+        let mut writer = self.writer.lock();
+        if self.resident.lock().remove(key).is_some() {
+            writer.insert(key.to_owned());
+        }
     }
 }
 
@@ -105,14 +242,7 @@ fn millis(time: SystemTime) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-// Length-delimited fields prevent a delimiter inside an operator-authored selector from aliasing a different route.
-pub(crate) fn follow_key(
-    transport: &str,
-    agent: &str,
-    selector: &ConversationMatch,
-    conversation: &str,
-) -> String {
-    let mut digest = Sha256::new();
+fn route_identity(transport: &str, agent: &str, selector: &ConversationMatch) -> Vec<u8> {
     let mut kinds = match &selector.kind {
         dekopon_broker_protocol::ConversationKindMatch::Any => vec!["any"],
         dekopon_broker_protocol::ConversationKindMatch::Kinds(kinds) => {
@@ -122,18 +252,36 @@ pub(crate) fn follow_key(
     kinds.sort_unstable();
     let mut ids = selector.ids.clone().unwrap_or_default();
     ids.sort_unstable();
-    let fields = [
-        transport.to_owned(),
-        agent.to_owned(),
-        kinds.join(","),
-        selector.container.clone().unwrap_or_default(),
-        ids.join(","),
-        conversation.to_owned(),
-    ];
-    for field in fields {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
+    let mut identity = Vec::new();
+    for field in [
+        transport,
+        agent,
+        &kinds.join(","),
+        selector.container.as_deref().unwrap_or_default(),
+    ] {
+        append_field(&mut identity, field);
     }
+    for id in ids {
+        append_field(&mut identity, &id);
+    }
+    identity
+}
+
+fn append_field(bytes: &mut Vec<u8>, field: &str) {
+    bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(field.as_bytes());
+}
+
+pub(crate) fn follow_key(
+    transport: &str,
+    agent: &str,
+    selector: &ConversationMatch,
+    conversation: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(route_identity(transport, agent, selector));
+    digest.update((conversation.len() as u64).to_be_bytes());
+    digest.update(conversation.as_bytes());
     digest
         .finalize()
         .iter()
@@ -144,11 +292,20 @@ pub(crate) fn follow_key(
 pub(crate) struct FollowInvoker<I> {
     inner: I,
     ticket: Option<(Arc<FollowTable>, String, usize)>,
+    leave: Arc<AtomicBool>,
 }
 
 impl<I> FollowInvoker<I> {
     pub(crate) fn new(inner: I, ticket: Option<(Arc<FollowTable>, String, usize)>) -> Self {
-        Self { inner, ticket }
+        Self {
+            inner,
+            ticket,
+            leave: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn leave_request(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.leave)
     }
 }
 
@@ -195,13 +352,35 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
         streams: Streams,
         tree: &TreeContext,
     ) -> CapabilityCallResult {
+        let follow_capability = proposal.capability.starts_with("dekopon-provider-follow.");
+        if follow_capability && self.ticket.is_none() {
+            return CapabilityCallResult::Failed {
+                error: "follow is not enabled on this route".to_owned(),
+                detail: None,
+            };
+        }
         let stay = proposal.capability == "dekopon-provider-follow.stay"
             && proposal.secret_use.is_none()
             && proposal
                 .input
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty);
+        let leave = proposal.capability == "dekopon-provider-follow.leave"
+            && proposal.secret_use.is_none()
+            && proposal
+                .input
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty);
         let result = self.inner.invoke(proposal, streams, tree);
+        if leave
+            && matches!(
+                result,
+                CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_)
+            )
+            && self.ticket.is_some()
+        {
+            self.leave.store(true, Ordering::Release);
+        }
         if stay
             && matches!(
                 result,
@@ -228,6 +407,13 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+impl FollowTable {
+    pub(crate) fn writing_for_test(&self) -> bool {
+        self.disk.try_lock().is_none()
     }
 }
 
@@ -428,6 +614,155 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_racing_a_banish_cannot_reinsert_its_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
+        let key = "c".repeat(64);
+        table.stay(&key, SystemTime::now()).unwrap();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+        let held = Arc::clone(&journal);
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _lock = held.hold_io_for_test();
+            locked.send(()).unwrap();
+            unblock
+                .recv_timeout(Duration::from_secs(8))
+                .expect("release");
+        });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let writing = Arc::clone(&table);
+        let writing_key = key.clone();
+        let refresh =
+            tokio::task::spawn_blocking(move || writing.refresh(&writing_key, SystemTime::now()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !table.writing_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh entered disk stage");
+        table.suspend(&key);
+        assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), refresh)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied
+            })
+        ));
+        assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        table.leave(&key).unwrap();
+        assert!(!dir.path().join(format!("{key}.followed")).exists());
+    }
+
+    #[test]
+    fn a_banished_ticket_cannot_be_reinvited_before_marker_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = FollowTable::load(journal).unwrap();
+        let now = SystemTime::now();
+        let key = "c".repeat(64);
+        table.stay(&key, now).unwrap();
+        table.suspend(&key);
+        assert_eq!(table.ticket(&key, now), FollowTicket::Absent);
+        assert!(matches!(
+            table.stay(&key, now),
+            Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied
+            })
+        ));
+        table.leave(&key).unwrap();
+        assert!(table.stay(&key, now).is_ok());
+    }
+
+    #[test]
+    fn a_failed_refresh_removes_the_resident_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = FollowTable::load(journal).unwrap();
+        let key = "d".repeat(64);
+        let now = SystemTime::now();
+        table.stay(&key, now).unwrap();
+        std::fs::remove_file(dir.path().join(format!("{key}.followed"))).unwrap();
+        std::fs::create_dir(dir.path().join(format!("{key}.followed"))).unwrap();
+        assert!(matches!(
+            table.refresh(&key, now),
+            Err(JournalError::Io { .. })
+        ));
+        assert_eq!(table.ticket(&key, now), FollowTicket::Absent);
+    }
+
+    #[test]
+    fn a_successful_leave_waits_for_delivery_before_expiring_its_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = Arc::new(FollowTable::load(journal).unwrap());
+        let key = "a".repeat(64);
+        let other = "b".repeat(64);
+        table.stay(&key, SystemTime::now()).unwrap();
+        table.stay(&other, SystemTime::now()).unwrap();
+        let success = FollowInvoker::new(
+            ResultLeg(CapabilityCallResult::Succeeded),
+            Some((Arc::clone(&table), key.clone(), 0)),
+        );
+        assert!(matches!(
+            call(&success, "dekopon-provider-follow.leave", json!({})),
+            CapabilityCallResult::Succeeded
+        ));
+        assert!(success.leave_request().load(Ordering::Acquire));
+        assert!(matches!(
+            table.ticket(&key, SystemTime::now()),
+            FollowTicket::Active { .. }
+        ));
+        table.leave(&key).unwrap();
+        assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        assert!(matches!(
+            table.ticket(&other, SystemTime::now()),
+            FollowTicket::Active { .. }
+        ));
+        let failed = FollowInvoker::new(
+            ResultLeg(CapabilityCallResult::Denied {
+                reason: "policy".into(),
+            }),
+            Some((Arc::clone(&table), other.clone(), 0)),
+        );
+        assert!(matches!(
+            call(&failed, "dekopon-provider-follow.leave", json!({})),
+            CapabilityCallResult::Denied { .. }
+        ));
+        assert!(!failed.leave_request().load(Ordering::Acquire));
+        let invalid = FollowInvoker::new(
+            ResultLeg(CapabilityCallResult::Succeeded),
+            Some((Arc::clone(&table), other.clone(), 0)),
+        );
+        assert!(matches!(
+            call(
+                &invalid,
+                "dekopon-provider-follow.leave",
+                json!({"claim": "forged"})
+            ),
+            CapabilityCallResult::Succeeded
+        ));
+        assert!(!invalid.leave_request().load(Ordering::Acquire));
+        let unavailable = FollowInvoker::new(ResultLeg(CapabilityCallResult::Succeeded), None);
+        assert!(matches!(
+            call(&unavailable, "dekopon-provider-follow.stay", json!({})),
+            CapabilityCallResult::Failed { .. }
+        ));
+    }
+
     #[test]
     fn a_failed_marker_write_never_activates_a_ticket() {
         let dir = tempfile::tempdir().unwrap();
@@ -468,6 +803,14 @@ mod tests {
         assert_eq!(key, follow_key("discord", "agent", &reordered, "channel"));
         assert_ne!(key, follow_key("discord", "other", &selector, "channel"));
         assert_ne!(key, follow_key("discord", "agent", &selector, "another"));
+        let with_delimiter = ConversationMatch {
+            ids: Some(vec!["a,b".into()]),
+            ..selector.clone()
+        };
+        assert_ne!(
+            follow_key("discord", "agent", &with_delimiter, "channel"),
+            follow_key("discord", "agent", &selector, "channel")
+        );
     }
 
     #[test]
@@ -564,6 +907,49 @@ mod tests {
             FollowTicket::Absent
         );
         assert!(!dir.path().join(format!("{key}.followed")).exists());
+    }
+
+    #[test]
+    fn boot_keeps_latest_deadlines_and_removes_one_excess_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let now = SystemTime::now();
+        for index in 0..=MAX_TICKETS {
+            let key = format!("{index:064x}");
+            journal
+                .write_follow(
+                    &key,
+                    FollowMarker {
+                        at_ms: millis(now),
+                        until_ms: millis(now)
+                            + 500_000
+                            + if index == MAX_TICKETS / 2 {
+                                0
+                            } else {
+                                index as u64 + 1
+                            },
+                    },
+                )
+                .unwrap();
+        }
+        let (capture, _guard) = crate::tests::capture_spans();
+        let table = FollowTable::load(journal).expect("valid overflow must not refuse boot");
+        assert_eq!(table.resident.lock().len(), MAX_TICKETS);
+        let earliest = format!("{:064x}", MAX_TICKETS / 2);
+        let latest = format!("{:064x}", MAX_TICKETS);
+        assert_eq!(table.ticket(&earliest, now), FollowTicket::Absent);
+        assert!(matches!(
+            table.ticket(&latest, now),
+            FollowTicket::Active { .. }
+        ));
+        assert!(!dir.path().join(format!("{earliest}.followed")).exists());
+        let events = capture.events_where(
+            "dekopon_gatewayd",
+            &[("event", "gateway_follow"), ("reason", "over-capacity")],
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].field("count"), Some("1"));
+        assert!(events[0].field("subject").is_none());
     }
 
     #[test]

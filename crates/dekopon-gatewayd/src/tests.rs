@@ -4983,6 +4983,95 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     assert_eq!(models.requests(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saturated_follow_does_not_post_the_busy_reply() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let models = ModelScript::forbidden();
+    let runner = runner(broker, Arc::clone(&models), 1);
+    let _held = runner
+        .gate
+        .admit_probe(("other".to_owned(), "other".to_owned()))
+        .expect("the first session is admitted");
+    let driver = Arc::new(RecordingDriver::default());
+    let mut followed = message("ambient");
+    followed.message_id = MessageId::Follow("native-id".into());
+
+    run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        followed,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert!(
+        driver.replies().is_empty(),
+        "follow admission is silent even with reply_on_busy enabled"
+    );
+    assert_eq!(models.requests(), 0);
+}
+
+#[test]
+fn a_fired_follow_from_the_running_speaker_queues_without_interruption() {
+    let gate = SessionGate::new(2);
+    let route = route(model_config());
+    let first = gate.admit(
+        &route,
+        message("addressed"),
+        crate::collection::Dispositions(vec![]),
+    );
+    let crate::session::Admit::Admitted(admission, _, _) = first else {
+        panic!("first turn admitted")
+    };
+    let mut follow = message("ambient");
+    follow.message_id = MessageId::Follow("next".into());
+    assert!(matches!(
+        gate.admit(&route, follow, crate::collection::Dispositions(vec![])),
+        crate::session::Admit::Queued
+    ));
+    assert!(
+        gate.take_steers(&("dev".into(), "dev".into())).is_empty(),
+        "follow never joins the active turn's steer queue"
+    );
+    drop(admission);
+}
+
+#[test]
+fn follow_debounce_keeps_the_newest_speaker_and_both_time_bounds() {
+    let mut pending = crate::follow::Debounce::default();
+    let first = tokio::time::Instant::now();
+    let mut earlier = message("first");
+    earlier.subject = ExternalSubject::discord("123456789012345678").unwrap();
+    let later = message("newest");
+    assert!(pending.offer("key".into(), earlier, first));
+    assert!(pending.offer("key".into(), later.clone(), first + Duration::from_secs(20)));
+    assert!(pending.due(first + Duration::from_secs(49)).is_empty());
+    let [fired] = pending
+        .due(first + Duration::from_secs(50))
+        .try_into()
+        .unwrap();
+    assert_eq!(fired.subject, later.subject);
+    assert_eq!(fired.text, "newest");
+    assert!(pending.offer("key".into(), later.clone(), first));
+    for second in [29, 58, 87, 116] {
+        assert!(pending.offer(
+            "key".into(),
+            later.clone(),
+            first + Duration::from_secs(second)
+        ));
+    }
+    assert_eq!(pending.due(first + Duration::from_secs(119)).len(), 0);
+    assert_eq!(pending.due(first + Duration::from_secs(120)).len(), 1);
+    assert!(pending.offer("key".into(), later.clone(), first));
+    pending.cancel("key", &later.subject);
+    assert!(pending.deadline().is_none());
+    for index in 0..1024 {
+        assert!(pending.offer(index.to_string(), later.clone(), first));
+    }
+    assert!(!pending.offer("overflow".into(), later, first));
+}
+
 #[tokio::test]
 async fn one_conversation_runs_one_session_at_a_time() {
     let gate = SessionGate::new(8);
@@ -6969,6 +7058,310 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the one dispatch fixture exercises ticket admission, cancellation and banishment across the same route"
+)]
+async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["transports"][0] = json!({"name": "discord", "kind": "discordGateway", "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN", "messageContent": true});
+    document["routes"][0]["transport"] = json!("discord");
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
+    document["routes"][0]["follow"] = json!(true);
+    document["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let route = &config.routes[0];
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        "c0123abc",
+    );
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(604800),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let runner = Arc::new(runner);
+    let mut pending = crate::follow::Debounce::default();
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut collector = crate::collection::Collector::new(&[], 4);
+    let mut incoming = message("first");
+    incoming.transport = "discord".into();
+    incoming.conversation.kind = ConversationKind::Channel;
+    incoming.conversation.id = "c0123abc".into();
+    incoming.addressed = Some(false);
+    incoming.transport_kind = dekopon_broker_protocol::ChatTransportKind::Discord;
+    incoming.reply = ReplyTarget::Discord {
+        channel_id: "c0123abc".into(),
+        reply_to: None,
+    };
+    let identities = BTreeMap::new();
+    let drivers = BTreeMap::new();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        NO_STOP_WORDS,
+        &mut sessions,
+        &mut collector,
+        &mut pending,
+        incoming.clone(),
+    );
+    assert!(
+        pending.deadline().is_none(),
+        "without a ticket the not-addressed filter drops it"
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    std::fs::remove_file(
+        directory
+            .path()
+            .join("journal")
+            .join(format!("{key}.followed")),
+    )
+    .unwrap();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        NO_STOP_WORDS,
+        &mut sessions,
+        &mut collector,
+        &mut pending,
+        incoming.clone(),
+    );
+    assert!(
+        pending.deadline().is_some(),
+        "dispatch consults resident memory, not disk"
+    );
+    let fired = pending.due(tokio::time::Instant::now() + Duration::from_secs(30));
+    assert!(matches!(fired[0].message_id, MessageId::Follow(_)));
+    assert!(
+        sessions.is_empty(),
+        "follow waits for the debounce deadline"
+    );
+    let mut other = incoming.clone();
+    other.subject = ExternalSubject::discord("123456789012345678").unwrap();
+    other.text = "newest".into();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        NO_STOP_WORDS,
+        &mut sessions,
+        &mut collector,
+        &mut pending,
+        other.clone(),
+    );
+    let mut addressed = other.clone();
+    addressed.addressed = Some(true);
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        NO_STOP_WORDS,
+        &mut sessions,
+        &mut collector,
+        &mut pending,
+        addressed,
+    );
+    assert!(
+        pending.deadline().is_none(),
+        "an addressed message cancels only that speaker's pending follow"
+    );
+    let active = runner.gate.admit(
+        routes.route(&incoming).unwrap(),
+        incoming.clone(),
+        crate::collection::Dispositions(vec![]),
+    );
+    let crate::session::Admit::Admitted(admission, _, _) = active else {
+        panic!("active session admitted")
+    };
+    other.text = "stop".into();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &["stop".into()],
+        &mut sessions,
+        &mut collector,
+        &mut pending,
+        other,
+    );
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    ));
+    let own_stop = crate::transport::CancelRequest {
+        transport: "discord".into(),
+        conversation_id: incoming.conversation.key(),
+        subject: incoming.subject.canonical(),
+        via: dekopon_agent::CancelVia::StopReply,
+    };
+    assert!(matches!(
+        runner.gate.cancel(&own_stop).running,
+        crate::session::CancelOutcome::Cancelled
+    ));
+    drop(admission);
+    while sessions.join_next().await.is_some() {}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["transports"][0] = json!({"name": "discord", "kind": "discordGateway", "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN", "messageContent": true});
+    config["routes"][0]["transport"] = json!("discord");
+    config["routes"][0]["conversation"] = json!({"kind": ["channel"]});
+    config["routes"][0]["follow"] = json!(true);
+    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    let config = resolved(directory.path(), &config).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(604800),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let (broker, _) = stub_broker(directory.path(), Vec::new()).await;
+    let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let runner = Arc::new(runner);
+    let mut stop = message("stop");
+    stop.transport = "discord".into();
+    stop.transport_kind = dekopon_broker_protocol::ChatTransportKind::Discord;
+    stop.conversation.kind = ConversationKind::Channel;
+    stop.conversation.id = "c0123abc".into();
+    stop.addressed = Some(false);
+    stop.reply = ReplyTarget::Discord {
+        channel_id: "c0123abc".into(),
+        reply_to: None,
+    };
+    let route = routes.route(&stop).unwrap();
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &stop.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    let path = directory
+        .path()
+        .join("journal")
+        .join(format!("{key}.followed"));
+
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held_journal = Arc::clone(&journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _held = held_journal.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(8))
+            .expect("journal lock released");
+    });
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .expect("lock held")
+        .unwrap();
+    let writing = Arc::clone(&table);
+    let writing_key = key.clone();
+    let refresh =
+        tokio::task::spawn_blocking(move || writing.refresh(&writing_key, SystemTime::now()));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !table.writing_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refresh entered the disk stage");
+
+    let dispatch_runner = Arc::clone(&runner);
+    let dispatch_routes = Arc::clone(&routes);
+    let dispatch_table = Arc::clone(&table);
+    let dispatch_key = key.clone();
+    let mut dispatch = tokio::task::spawn_blocking(move || {
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut collector = crate::collection::Collector::new(&[], 4);
+        let mut pending = crate::follow::Debounce::default();
+        crate::dispatch(
+            &dispatch_runner,
+            &dispatch_routes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &["stop".into()],
+            &mut sessions,
+            &mut collector,
+            &mut pending,
+            stop,
+        );
+        let absent = matches!(
+            dispatch_table.ticket(&dispatch_key, SystemTime::now()),
+            crate::follow::FollowTicket::Absent
+        );
+        (sessions, absent)
+    });
+    let dispatched = tokio::time::timeout(Duration::from_secs(2), &mut dispatch).await;
+    let returned_without_disk = dispatched.is_ok();
+    release.send(()).expect("release blocked writer");
+    tokio::time::timeout(Duration::from_secs(3), blocker)
+        .await
+        .expect("blocker ends")
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), refresh)
+        .await
+        .expect("refresh completes")
+        .unwrap();
+    let (mut sessions, absent) = match dispatched {
+        Ok(result) => result.expect("dispatch completes"),
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), dispatch)
+            .await
+            .expect("dispatch completes after disk release")
+            .expect("dispatch task succeeds"),
+    };
+    assert!(
+        returned_without_disk,
+        "dispatch must not wait on the writer's disk lock"
+    );
+    assert!(absent, "banish hides the resident ticket immediately");
+    assert!(matches!(
+        result,
+        Err(crate::journal::JournalError::Io {
+            kind: std::io::ErrorKind::PermissionDenied
+        })
+    ));
+    while let Some(done) = tokio::time::timeout(Duration::from_secs(3), sessions.join_next())
+        .await
+        .expect("leave finishes")
+    {
+        done.unwrap();
+    }
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    ));
+    assert!(
+        !path.exists(),
+        "the spawned leave removes the marker after the stalled write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -7009,6 +7402,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         ambient,
     );
     assert_eq!(
@@ -7033,6 +7427,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         structurally_unaddressed,
     );
     assert_eq!(sessions.len(), 0, "structured addressing must win");
@@ -7052,6 +7447,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         elsewhere,
     );
     assert_eq!(
@@ -7075,6 +7471,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "an addressed message starts one session");
@@ -7123,6 +7520,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         continuation,
     );
     assert_eq!(
@@ -7176,6 +7574,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         ambient,
     );
     assert_eq!(
@@ -7200,6 +7599,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "and being summoned in one is");
@@ -7268,6 +7668,7 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
         NO_STOP_WORDS,
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         message,
     );
 
@@ -8406,6 +8807,7 @@ async fn slack_auto_posts_only_the_answer_and_uses_same_session_native_refusal_f
             liveness,
             cancellation: crate::session::SessionCancellation::new(),
             max_duration: None,
+            silent_until_success: false,
         });
         sink.emit(ProgressEvent::Started {
             agent: "tester".to_owned(),
@@ -12229,6 +12631,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
             &[],
             &mut sessions,
             &mut collector,
+            &mut crate::follow::Debounce::default(),
             input,
         );
     }
@@ -12512,6 +12915,34 @@ async fn parked_broker(
         reached,
         release,
     )
+}
+
+struct FailingStreamModel(Arc<dekopon_test_support::ScriptedStreamModel>);
+
+impl ChatModel for FailingStreamModel {
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        self.0.complete(messages, tools, options, on_event)?;
+        Err(InferenceError::Protocol(
+            dekopon_model::error::ProtocolFailure::NoChoices,
+        ))
+    }
+}
+
+impl ModelFactory for Arc<FailingStreamModel> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Ok(Arc::clone(self) as SharedModel)
+    }
 }
 
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
@@ -12830,6 +13261,97 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
             "a stop before turn 1 must not buy a model turn: {origin:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let first_delta = dekopon_model::events_from_transcript(
+        dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+    )
+    .expect("model fixture parses")
+    .into_iter()
+    .find(|event| matches!(event, TurnEvent::TextDelta(_)))
+    .expect("fixture emits a text delta");
+    let stream = Arc::new(dekopon_test_support::ScriptedStreamModel::scripted(
+        vec![first_delta],
+        answer("ignored"),
+    ));
+    let model = Arc::new(FailingStreamModel(Arc::clone(&stream)));
+    let mut runner = Arc::into_inner(runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    ))
+    .expect("one runner owner");
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message("ambient");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    inbound.liveness = Some(LivenessTarget::Discord {
+        channel_id: "200000000000000001".into(),
+        message_id: "300000000000000002".into(),
+        conversation_id: inbound.conversation.key(),
+    });
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(table);
+    let driver = Arc::new(
+        RecordingDriver::default()
+            .with_stream(2_000, Duration::from_millis(10))
+            .with_progress(2_000, Duration::from_millis(10)),
+    );
+    let task = tokio::spawn(run_session(
+        Arc::new(runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    stream.release_next();
+    tokio::time::timeout(Duration::from_secs(5), stream.wait_for_event())
+        .await
+        .expect("delta emitted");
+    let surface = driver.stream_object().expect("streaming driver");
+    let posted_before_failure =
+        tokio::time::timeout(Duration::from_millis(200), surface.wait_for_calls(1))
+            .await
+            .is_ok();
+    stream.release_next();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("turn ended")
+        .expect("task joined");
+    assert_eq!(stream.emitted(), 1, "the failing model emitted a delta");
+    assert!(
+        !posted_before_failure,
+        "a streamed partial must not reach the surface"
+    );
+    assert!(
+        driver.calls().is_empty(),
+        "no partial, status, progress, or failure post is sent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -13633,6 +14155,7 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
                 &[],
                 &mut sessions,
                 &mut crate::collection::Collector::new(&[], 4),
+                &mut crate::follow::Debounce::default(),
                 inbound,
             );
             assert!(sessions.is_empty());
@@ -13953,6 +14476,7 @@ async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting
         &stop_words,
         &mut sessions,
         &mut collector,
+        &mut crate::follow::Debounce::default(),
         burst_photo(""),
     );
     assert!(collector.deadline().is_some());
@@ -13967,6 +14491,7 @@ async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting
         &stop_words,
         &mut sessions,
         &mut collector,
+        &mut crate::follow::Debounce::default(),
         stop,
     );
     assert!(collector.deadline().is_none());
@@ -14042,6 +14567,7 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
                 &["stop".into()],
                 &mut sessions,
                 &mut collector,
+                &mut crate::follow::Debounce::default(),
                 input,
             );
         }
@@ -14191,6 +14717,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         &[],
         &mut sessions,
         &mut collector,
+        &mut crate::follow::Debounce::default(),
         member.clone(),
     );
     assert!(collector.deadline().is_none());
@@ -14204,6 +14731,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         &[],
         &mut sessions,
         &mut collector,
+        &mut crate::follow::Debounce::default(),
         lead,
     );
     assert!(collector.deadline().is_some());
@@ -14227,6 +14755,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             &[],
             &mut sessions,
             &mut collector,
+            &mut crate::follow::Debounce::default(),
             outsider,
         );
     }
@@ -14245,6 +14774,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             &[],
             &mut sessions,
             &mut collector,
+            &mut crate::follow::Debounce::default(),
             member.clone(),
         );
     }
@@ -14721,6 +15251,123 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             .unwrap()
             .ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
+    ));
+}
+
+struct FarewellOrderDriver {
+    table: Arc<crate::follow::FollowTable>,
+    key: String,
+    delivered: Mutex<Vec<(String, crate::follow::FollowTicket)>>,
+}
+
+#[async_trait]
+impl ChatDriver for FarewellOrderDriver {
+    async fn reply(
+        &self,
+        _target: &ReplyTarget,
+        reply: OutboundReply,
+    ) -> Result<(), TransportError> {
+        self.delivered
+            .lock()
+            .push((reply.text, self.table.ticket(&self.key, SystemTime::now())));
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivered() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+        ResponseEnvelope::capabilities(vec![leaving], vec!["follow".into()], BTreeMap::new()),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({
+            "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+        })).unwrap()),
+        ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+    ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("follow leave"), answer("Farewell.")]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let mut inbound = message("leaving");
+    inbound.message_id = MessageId::Follow("native-id".into());
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &inbound.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let driver = Arc::new(FarewellOrderDriver {
+        table: Arc::clone(&table),
+        key: key.clone(),
+        delivered: Mutex::new(Vec::new()),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("farewell session completes");
+    {
+        let delivered = driver.delivered.lock();
+        assert!(
+            matches!(delivered.as_slice(), [(text, crate::follow::FollowTicket::Active { .. })] if text == "Farewell."),
+            "transport sees the farewell while the ticket still exists: {delivered:?}"
+        );
+    }
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    assert!(!journal_dir.path().join(format!("{key}.followed")).exists());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::RunCommand { .. }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .request,
+        BrokerRequest::Invoke { .. }
     ));
 }
 

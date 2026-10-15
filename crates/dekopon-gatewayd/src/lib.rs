@@ -529,6 +529,10 @@ enum ServeOutcome {
     clippy::too_many_arguments,
     reason = "reshaped by the unit that next rewrites this"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one serving loop owns the bounded wake, collection and follow deadlines"
+)]
 async fn serve<F>(
     runner: Arc<SessionRunner>,
     routes: Arc<RoutingTable>,
@@ -544,6 +548,7 @@ where
     F: Future<Output = ()> + Send,
 {
     let mut sessions = JoinSet::new();
+    let mut follow_pending = follow::Debounce::default();
     let mut ticks = JoinSet::new();
     let mut wakes = runner.wakes.clone();
     let mut notices = runner.jobs.take_notices();
@@ -555,6 +560,7 @@ where
             observe_session(result);
         }
         let deadline = collector.deadline();
+        let follow_deadline = follow_pending.deadline();
         let wake_deadline = wakes.as_ref().and_then(|store| store.next_at()).map(|at| {
             tokio::time::Instant::now() + at.duration_since(SystemTime::now()).unwrap_or_default()
         });
@@ -594,6 +600,23 @@ where
                     Ok(Some(fired)) => start_wake(&runner, &routes, &drivers, &mut sessions, fired),
                     Ok(None) => {}
                     Err(_) => tracing::error!(event = "gateway_wake_task_failed"),
+                }
+            },
+            () = async {
+                match follow_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                for message in follow_pending.due(tokio::time::Instant::now()) {
+                    if let Some(route) = routes.route(&message)
+                        && let Some(table) = runner.follow.as_ref()
+                    {
+                        let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
+                        if matches!(table.ticket(&key, SystemTime::now()), follow::FollowTicket::Active { .. }) {
+                            start_session(&runner, &routes, &drivers, &mut sessions, message);
+                        }
+                    }
                 }
             },
             () = async {
@@ -639,6 +662,7 @@ where
                                 &stop_words,
                                 &mut sessions,
                                 &mut collector,
+                                &mut follow_pending,
                                 *message,
                             );
                         });
@@ -656,6 +680,7 @@ where
 
     drop(notices);
     collector.shutdown();
+    drop(follow_pending);
     runner.jobs.seal();
 
     // A tick that fires here has already retired its row, so its wake must still start.
@@ -691,7 +716,8 @@ fn observe_session(result: Result<(), tokio::task::JoinError>) {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "reshaped by the unit that next rewrites this"
+    clippy::too_many_lines,
+    reason = "one dispatch entry owns stop handling, addressing, and bounded collection"
 )]
 fn dispatch(
     runner: &Arc<SessionRunner>,
@@ -701,6 +727,7 @@ fn dispatch(
     stop_words: &[String],
     sessions: &mut JoinSet<()>,
     collector: &mut collection::Collector,
+    follow_pending: &mut follow::Debounce,
     message: InboundMessage,
 ) {
     // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
@@ -711,6 +738,43 @@ fn dispatch(
         &message.text,
         stop_words,
     ) {
+        let mut banished = false;
+        if let Some(route) = routes.route(&message)
+            && route.follow
+            && let Some(table) = runner.follow.as_ref()
+        {
+            let key = follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &message.conversation.key(),
+            );
+            follow_pending.remove(&key);
+            if matches!(
+                table.ticket(&key, SystemTime::now()),
+                follow::FollowTicket::Active { .. }
+            ) {
+                table.suspend(&key);
+                banished = true;
+                let table = Arc::clone(table);
+                let index = route.route_index;
+                sessions.spawn(async move {
+                    match tokio::task::spawn_blocking(move || table.leave(&key)).await {
+                        Ok(Ok(())) => tracing::info!(
+                            audit.event = "gateway.follow",
+                            operation = "banished",
+                            route = index
+                        ),
+                        _ => tracing::warn!(
+                            audit.event = "gateway.follow",
+                            operation = "refused",
+                            route = index,
+                            reason = "persistence"
+                        ),
+                    }
+                });
+            }
+        }
         let request = CancelRequest {
             transport: message.transport.clone(),
             conversation_id: message.conversation.key(),
@@ -773,6 +837,9 @@ fn dispatch(
             }
             return;
         }
+        if banished {
+            return;
+        }
     }
     let Some((route_id, _)) = routes.route_index(&message) else {
         tracing::debug!(
@@ -793,11 +860,48 @@ fn dispatch(
         .thread_continuation
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
+    if addressed
+        && let Some(route) = routes.route(&message)
+        && route.follow
+    {
+        let key = follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            &message.conversation.key(),
+        );
+        follow_pending.cancel(&key, &message.subject);
+    }
     if message.conversation.kind != ConversationKind::DirectMessage
         && !addressed
         && !inherited_thread
         && !collector.is_native_continuation(route_id, &message)
     {
+        if let Some(route) = routes.route(&message)
+            && route.follow
+            && let Some(table) = runner.follow.as_ref()
+        {
+            let key = follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &message.conversation.key(),
+            );
+            if matches!(
+                table.ticket(&key, SystemTime::now()),
+                follow::FollowTicket::Active { .. }
+            ) {
+                if !follow_pending.offer(key, message, tokio::time::Instant::now()) {
+                    tracing::info!(
+                        audit.event = "gateway.follow",
+                        operation = "refused",
+                        route = route_id,
+                        reason = "capacity"
+                    );
+                }
+                return;
+            }
+        }
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
