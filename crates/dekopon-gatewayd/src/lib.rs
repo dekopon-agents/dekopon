@@ -18,6 +18,7 @@ mod cache_key;
 mod collection;
 mod config;
 mod conversation;
+mod follow;
 mod jobs;
 mod journal;
 mod meter_restore;
@@ -185,6 +186,7 @@ where
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
+        follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
         journal,
         assets: Arc::new(AssetStore::with_retention(
             config.sessions.max_conversations,
@@ -255,6 +257,28 @@ where
             Err(GatewaydError::TransportsLost)
         }
     }
+}
+
+async fn load_follow_table(
+    journal: &Option<Arc<journal::Journal>>,
+    enabled: bool,
+) -> Result<Option<Arc<follow::FollowTable>>, GatewaydError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
+        kind: std::io::ErrorKind::InvalidInput,
+    })?);
+    let table = tokio::task::spawn_blocking(move || follow::FollowTable::load(journal))
+        .await
+        .map_err(GatewaydError::TransportTask)?
+        .map_err(|error| GatewaydError::Journal {
+            kind: match error {
+                journal::JournalError::Io { kind } => kind,
+                journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
+            },
+        })?;
+    Ok(Some(Arc::new(table)))
 }
 
 /// The restore task and the guest model proxy listener, owned by the gateway and aborted at

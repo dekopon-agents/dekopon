@@ -16,8 +16,13 @@ use crate::{
     wake::Anchor,
 };
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "bound route carries independent validated route switches"
+)]
 #[derive(Clone, Debug)]
 pub(crate) struct BoundRoute {
+    pub route_index: usize,
     pub transport: String,
     pub conversation: ConversationMatch,
     pub subjects: Option<Vec<ExternalSubject>>,
@@ -38,6 +43,7 @@ pub(crate) struct BoundRoute {
     pub memory: MemoryPolicy,
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
+    pub follow: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
     /// across the route's traffic, and grants nothing: every new session opens its own attested
     /// broker leg.
@@ -61,7 +67,7 @@ impl RoutingTable {
             .collect::<Vec<_>>();
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut problems = Vec::new();
-        for route in &config.routes {
+        for (route_index, route) in config.routes.iter().enumerate() {
             let Some(agent) = catalog.agent(&route.agent) else {
                 problems.push(RouteProblem::UnknownAgent {
                     agent: route.agent.to_string(),
@@ -102,6 +108,7 @@ impl RoutingTable {
                 }
             };
             routes.push(BoundRoute {
+                route_index,
                 transport: route.transport.clone(),
                 conversation: route.conversation.clone(),
                 subjects: route.subjects.clone(),
@@ -125,6 +132,7 @@ impl RoutingTable {
                 memory: route.memory,
                 indicators: route.indicators.clone(),
                 wakes: route.wakes,
+                follow: route.follow,
                 cache_key: cache_key::for_route(),
             });
         }
