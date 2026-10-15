@@ -8,9 +8,10 @@ use std::{
 };
 
 use dekopon_core::AgentId;
+use dekopon_test_support::CaptureLayer;
 use parking_lot::Mutex;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::{Layer, layer::SubscriberExt as _};
+use tracing_subscriber::{Layer, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use crate::{
     Budget, Call, Estimate, HistoryRow, InputHint, Meter, MeterKind, MeterSpec, Metering,
@@ -531,6 +532,23 @@ fn an_unsettled_drop_charges_the_estimate() {
     assert_eq!(records.len(), 1);
     assert_eq!(records.field(0, "outcome"), "cancelled");
     assert_eq!(records.field(0, "usage.source"), "estimated");
+}
+
+#[test]
+fn a_dropped_admission_has_no_returned_error_kind() {
+    let capture = CaptureLayer::new();
+    let _guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .set_default();
+    let (metering, _) = metering(1_000);
+    drop(metering.admit(call("astra"), estimate(100)).unwrap());
+    let charges = capture.events_where("meter", &[("message", "model call charged")]);
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].field("error.kind"), None);
+    assert_eq!(charges[0].field("outcome"), Some("cancelled"));
+    assert_eq!(charges[0].field("usage.source"), Some("estimated"));
+    assert_eq!(charges[0].field("usage.input_tokens"), Some("100"));
+    assert_eq!(charges[0].field("usage.output_tokens"), Some("0"));
 }
 
 #[test]

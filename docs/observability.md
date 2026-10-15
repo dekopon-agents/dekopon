@@ -67,13 +67,34 @@ and is the one that fills. The trace filter does not include `meter`.
 | `usage.source` | string | `reported`, `estimated`, or `partial` |
 | `meter.estimate.input_tokens` | i64 | the admission estimate, kept to measure the estimator |
 | `outcome` | string | `succeeded`, `failed`, `cancelled`, or `refused` |
+| `error.kind` | string, optional | Typed model error on a returned failed or cancelled call; absent on success, pre-admission refusal and an admission dropped without a returned error |
 
 The record holds raw usage and no budget name, so a changed budget re-applies to history rather than
 invalidating it. A `refused` record carries zeros, and a call that was never sent is `failed` with
-zeros; restore skips both. Every number is recorded as an integer, so neither OpenObserve nor
-Quickwit sees it as a string. The boot restore that reads these records logs one `meter.restore`
+zeros; restore skips both. A post-admission `NotSent` is `failed` and carries its returned error
+kind; only pre-admission budget refusal is `refused`. Every number is recorded as an integer, so
+neither OpenObserve nor Quickwit sees it as a string. The boot restore that reads these records logs one `meter.restore`
 record on the same target: at info with the row count when it applies, at warn with `error.kind`
 when it keeps the live meters ([best effort](gatewayd.md#restoring-token-windows-at-boot-is-best-effort)).
+
+### Counting exported accounting
+
+| Count separately | Meaning |
+|---|---|
+| `gateway.message` spans | Routed messages that start a session (including queued follow-ups); excludes unrouted, unaddressed and collection-refused drops before session start; not all received messages or model calls |
+| `gateway.session` spans | Admitted sessions; one session can make several model calls |
+| `model.complete` spans | Model attempts observed in exported traces, including failures; sampling/retention can omit them |
+| Exported `meter` charges | Model charges visible in the log store, including refused and cancelled calls; export is best effort |
+| `shell.script` spans | Script executions, not model attempts or charges |
+| `broker.invocation` spans | Broker invocations, not model charges |
+| Route and `service.version` | Partition each count by serving route and executable version when available; neither is another charge |
+
+Keep these denominators separate, never add them together. Compare attempt spans with exported
+charges over the same scope and window; missing exported charges are **unknown usage**, not zero
+spend or proof of complete spend. Among 75 attempts in an owner-retained study, one estimated
+charge was missing from export. Split `usage.source=estimated` and `partial` from `reported`:
+estimates are charged tokens, not verified provider usage or actual dollar costs. No price or
+perfect-export claim follows from this table.
 
 A proxied call also opens one `model.proxy.call` span on the `model` target, from its headers to
 the end of its response body; the proxy's `meter` record is emitted inside it. Its fields:

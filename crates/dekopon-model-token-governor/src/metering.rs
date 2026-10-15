@@ -186,7 +186,7 @@ impl Metering {
                         Ok(reservation) => Some(reservation),
                         Err(refusal) => {
                             drop(budget);
-                            record(&call, estimate, &Charge::refused());
+                            record(&call, estimate, &Charge::refused(), None);
                             return Err(refusal);
                         }
                     }
@@ -276,10 +276,14 @@ impl Admission {
     }
 
     pub fn settle(mut self, outcome: Outcome) {
-        self.finish(outcome);
+        self.finish(outcome, None);
     }
 
-    fn finish(&mut self, outcome: Outcome) {
+    pub fn settle_with_kind(mut self, outcome: Outcome, error_kind: &'static str) {
+        self.finish(outcome, Some(error_kind));
+    }
+
+    fn finish(&mut self, outcome: Outcome, error_kind: Option<&'static str>) {
         if self.settled {
             return;
         }
@@ -295,13 +299,13 @@ impl Admission {
                 Tokens(charge.input.saturating_add(charge.output)),
             );
         }
-        record(&self.call, self.estimate, &charge);
+        record(&self.call, self.estimate, &charge, error_kind);
     }
 }
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.finish(Outcome::Cancelled);
+        self.finish(Outcome::Cancelled, None);
     }
 }
 
@@ -361,7 +365,7 @@ fn int(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn record(call: &Call, estimate: Estimate, charge: &Charge) {
+fn record(call: &Call, estimate: Estimate, charge: &Charge, error_kind: Option<&str>) {
     tracing::info!(
         target: "meter",
         {
@@ -378,6 +382,7 @@ fn record(call: &Call, estimate: Estimate, charge: &Charge) {
         usage.source = charge.source,
         meter.estimate.input_tokens = int(estimate.input.0),
         outcome = charge.outcome,
+        error.kind = error_kind,
         },
         "model call charged"
     );
