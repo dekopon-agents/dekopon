@@ -580,6 +580,7 @@ where
     let mut capability_invocations = 0_u32;
     let mut tool_calls = 0_u32;
     let mut transcribed = 0_usize;
+    let mut asset_bytes = 0_usize;
     let mut agent_config_shown = false;
     let mut rejection_fed_back = false;
     let mut skill_reads = SkillReads::default();
@@ -924,7 +925,14 @@ where
             if call.function.name == ASSET_TOOL_NAME
                 && let Some(source) = assets
             {
-                fetch_asset_into(&mut messages, source, &call, model_turns, tool_call_index)?;
+                fetch_asset_into(
+                    &mut messages,
+                    source,
+                    &call,
+                    model_turns,
+                    tool_call_index,
+                    &mut asset_bytes,
+                )?;
                 continue;
             }
             // The model-selected tool name is excluded from telemetry because it is untrusted model
@@ -1352,6 +1360,7 @@ fn fetch_asset_into(
     call: &ModelToolCall,
     model_turn: u32,
     tool_call_index: usize,
+    asset_bytes: &mut usize,
 ) -> Result<(), PromptError> {
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
@@ -1367,7 +1376,19 @@ fn fetch_asset_into(
         asset.id = id,
     );
     let _entered = span.enter();
-    let asset = match source.fetch(id) {
+    // Carried assets stay pinned across the fetch so its admission cannot evict them.
+    let carried: Vec<_> = messages
+        .iter()
+        .filter_map(ModelMessage::parts)
+        .flatten()
+        .filter_map(|part| match part {
+            ContentPart::Image { data, .. } | ContentPart::File { data, .. } => data.pin().ok(),
+            ContentPart::Text(_) => None,
+        })
+        .collect();
+    let fetched = source.fetch(id);
+    drop(carried);
+    let asset = match fetched {
         Ok(asset) => asset,
         Err(reason) => {
             tracing::info!(
@@ -1393,6 +1414,21 @@ fn fetch_asset_into(
     let truncated = text
         .as_ref()
         .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
+    let text = text.map(clamp_textual_asset);
+    let bytes = text.as_ref().map_or(asset.data.len(), String::len);
+    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(*asset_bytes) {
+        let reason = format!(
+            "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Answer with the assets already shown."
+        );
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            { audit.event = "agent.asset.refused", asset.id = id, reason = reason.as_str() },
+            "chat asset refused"
+        );
+        messages.push(ModelMessage::tool(call.id.clone(), reason));
+        return Ok(());
+    }
+    *asset_bytes += bytes;
     // Only size and media type are logged, never the bytes or the sender's file name, since the
     // file name is untrusted.
     tracing::info!(
@@ -1407,10 +1443,7 @@ fn fetch_asset_into(
         "chat asset fetched"
     );
     if let Some(text) = text {
-        messages.push(ModelMessage::tool(
-            call.id.clone(),
-            clamp_textual_asset(text),
-        ));
+        messages.push(ModelMessage::tool(call.id.clone(), text));
         return Ok(());
     }
     messages.push(ModelMessage::tool(
@@ -3954,6 +3987,139 @@ mod tests {
             }],
             None,
         )
+    }
+
+    #[test]
+    fn eight_distinct_photos_reach_one_model_request() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let photos = (1..=8)
+            .map(|id| FetchedAsset {
+                name: format!("photo-{id}.png"),
+                mime: "image/png".into(),
+                data: dekopon_model::asset::DiskBlob::from_bytes(&[id; 32])
+                    .unwrap()
+                    .into(),
+            })
+            .collect();
+        let assets = FixedAssets(photos);
+        let model = ScriptedModel::new((1..=8).map(asset_call).chain([answer("seen")]));
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("look at each photo", limits(10, 32)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let requests = model.observed_messages.lock();
+        let last = requests.last().unwrap();
+        let images: Vec<_> = last
+            .iter()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .filter_map(|part| match part {
+                dekopon_model::model::ContentPart::Image { data, .. } => Some(data.read().unwrap()),
+                dekopon_model::model::ContentPart::Text(_)
+                | dekopon_model::model::ContentPart::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(images, (1..=8).map(|id| vec![id; 32]).collect::<Vec<_>>());
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.fetched"), ("asset.id", "8")]
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.fetched")]
+                )
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn crossing_photo_is_named_but_prior_images_stay_in_the_model_request() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let photos = (1..=9)
+            .map(|id| FetchedAsset {
+                name: format!("photo-{id}.png"),
+                mime: "image/png".into(),
+                data: dekopon_model::asset::DiskBlob::from_bytes(&vec![
+                    id;
+                    if id == 9 {
+                        1
+                    } else {
+                        5 * 1024 * 1024
+                    }
+                ])
+                .unwrap()
+                .into(),
+            })
+            .collect();
+        let assets = FixedAssets(photos);
+        let model = ScriptedModel::new((1..=9).map(asset_call).chain([answer("seen")]));
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("look at each photo", limits(11, 32)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let requests = model.observed_messages.lock();
+        let last = requests.last().unwrap();
+        let images: Vec<_> = last
+            .iter()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .filter_map(|part| match part {
+                dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                dekopon_model::model::ContentPart::Text(_)
+                | dekopon_model::model::ContentPart::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 8);
+        assert_eq!(
+            images.iter().map(|image| image.len()).sum::<usize>(),
+            40 * 1024 * 1024
+        );
+        for (index, image) in images.iter().enumerate() {
+            assert_eq!(image.read().unwrap()[0], (index + 1) as u8);
+        }
+        assert!(last.iter().any(|message| {
+            message.role() == "tool"
+                && message
+                    .content()
+                    .is_some_and(|text| text.contains("chat-asset:9 will not be shown"))
+        }));
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.refused"), ("asset.id", "9")]
+                )
+                .len(),
+            1
+        );
     }
 
     #[test]

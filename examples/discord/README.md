@@ -130,8 +130,8 @@ expansion.
 
 A Discord attachment contributes its untrusted filename, media type, and reported size to the
 conversation inventory. The gateway bounds apply: supported image/document media types
-only, 8 MiB streamed maximum per fetch, four fetches per session, and 32 retained
-references per conversation. A route's model needs `modalities: [image]` before photos are offered; documents
+only, 8 MiB streamed maximum per fetch, 40 MiB decoded assets per model request,
+and 32 retained references per conversation. A route's model needs `modalities: [image]` before photos are offered; documents
 do not require image support.
 
 Downloads accept only HTTPS Discord CDN/media hosts in production, never carry the bot token, do
