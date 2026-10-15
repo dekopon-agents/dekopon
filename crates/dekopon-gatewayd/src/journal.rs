@@ -286,7 +286,6 @@ impl Journal {
             .checked_sub(forget_after)
             .is_some_and(|cutoff| modified < cutoff)
         {
-            remove(&path);
             return Ok(None);
         }
         let mut bytes = Vec::new();
@@ -1079,6 +1078,23 @@ mod tests {
             file_path.exists(),
             "memory age still protects the journal file"
         );
+    }
+
+    #[test]
+    fn a_short_route_does_not_erase_a_long_routes_eligible_seal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let long = Duration::from_secs(7 * 86400);
+        let short = Duration::from_secs(86400);
+        let journal = Journal::open(dir.path(), long, long).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        journal.seal(&stem, now - 2 * short).expect("seal");
+        File::open(journal.seal_path(&stem))
+            .expect("seal file")
+            .set_modified(now - 2 * short)
+            .expect("age seal");
+        assert!(journal.sealed(&stem, short).expect("short route").is_none());
+        assert!(journal.sealed(&stem, long).expect("long route").is_some());
     }
 
     #[test]
