@@ -1240,7 +1240,7 @@ impl GatewaySources {
             return Ok(false);
         }
         for (path, bytes) in &self.catalog.0 {
-            if read_config_file(path.clone(), uid).await? != *bytes {
+            if read_source_entry(path.clone(), uid).await? != *bytes {
                 return Ok(false);
             }
         }
@@ -1424,9 +1424,18 @@ pub(crate) async fn source_snapshot(
                 .map_err(|_invalid| ConfigError::InvalidCatalogAgent)?;
             for skill in catalog.agent_skills(&id) {
                 let root = skill.source();
+                paths.push(root.to_path_buf());
                 paths.push(root.join("SKILL.md"));
                 for resource in skill.resources() {
-                    paths.push(root.join(&resource.path));
+                    let file = root.join(&resource.path);
+                    for directory in file
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|directory| directory.starts_with(root))
+                    {
+                        paths.push(directory.to_path_buf());
+                    }
+                    paths.push(file);
                 }
             }
         }
@@ -1435,9 +1444,63 @@ pub(crate) async fn source_snapshot(
     paths.dedup();
     let mut entries = BTreeMap::new();
     for path in paths {
-        entries.insert(path.clone(), read_config_file(path, expected_uid).await?);
+        entries.insert(path.clone(), read_source_entry(path, expected_uid).await?);
     }
     Ok(SourceSnapshot(entries))
+}
+
+async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::{
+        ffi::OsStrExt as _,
+        fs::{MetadataExt as _, PermissionsExt as _},
+    };
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| ConfigError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return read_config_file(path, expected_uid).await;
+    }
+    let read_only = rustix::fs::statvfs(&path)
+        .map_err(|source| ConfigError::Read {
+            path: path.clone(),
+            source: source.into(),
+        })?
+        .f_flag
+        .contains(rustix::fs::StatVfsMountFlags::RDONLY);
+    if metadata.uid() != expected_uid && (metadata.uid() != 0 || !read_only)
+        || metadata.permissions().mode() & 0o022 != 0 && !read_only
+    {
+        return Err(ConfigError::InsecureProjection { path });
+    }
+    let mut names = std::fs::read_dir(&path)
+        .map_err(|source| ConfigError::Read {
+            path: path.clone(),
+            source,
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|source| ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.len() > 1024 {
+        return Err(ConfigError::InsecureProjection { path });
+    }
+    names.sort();
+    let mut bytes = Vec::new();
+    for name in names {
+        let name = name.as_bytes();
+        if bytes.len().saturating_add(name.len()).saturating_add(4) > HARD_MAX_CONFIG_BYTES {
+            return Err(ConfigError::InsecureProjection { path });
+        }
+        bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(name);
+    }
+    Ok(bytes)
 }
 
 fn read_gateway_projection(path: &Path, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {

@@ -352,6 +352,11 @@ async fn catalog_snapshot_includes_skill_resource_membership() {
     );
     let added = skill.source().join("references/more.md");
     fs::write(&added, "new reference").unwrap();
+    assert!(
+        !old.still_current(&path, &catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
     let new = gateway_sources(&active).await;
     assert!(new.catalog.0.contains_key(&added));
     assert_eq!(old.changes(&new).unwrap().swap, ["catalog"]);
