@@ -1952,6 +1952,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_at_the_hook_leaves_no_later_decision_work() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&evaluations);
+        let mut client = BufferedHttpClient::authorized(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("client")
+        .with_request_authorizer(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let timed = tokio::time::timeout(
+            Duration::ZERO,
+            client.send(Request {
+                method: "GET".to_owned(),
+                uri: "http://127.0.0.1:9/reply".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "the invocation stops at the asynchronous egress boundary"
+        );
+        assert_eq!(
+            evaluations.load(Ordering::SeqCst),
+            1,
+            "the hook ran in the cancelled poll"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            evaluations.load(Ordering::SeqCst),
+            1,
+            "no detached evaluation may run later"
+        );
+    }
+
+    #[tokio::test]
     async fn unmatched_template_and_lowercase_method_never_call_request_hook() {
         use std::sync::{
             Arc,
@@ -3003,6 +3049,62 @@ mod tests {
             assert_eq!(error.code, ErrorCode::Denied, "{query}");
             assert!(!error.message.contains("C0123ABC"), "{}", error.message);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_sees_template_rendered_path_and_pinned_query() {
+        use std::sync::{Arc, Mutex};
+
+        let server = LoopbackServer::once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let authority = server.authority().to_owned();
+        let grant = templated(
+            &authority,
+            serde_json::json!({
+                "method": "GET",
+                "path": "/channels/{conversation.apiChannel}/messages",
+                "query": {
+                    "pinned": {"channel": "conversation.id"},
+                    "allowed": ["limit"]
+                }
+            }),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let facts = Arc::clone(&seen);
+        let mut client = BufferedHttpClient::authorized(
+            grant,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("template grant")
+        .with_chat_slots(slots(&[
+            (ChatSlot::ConversationApiChannel, "1122334455"),
+            (ChatSlot::ConversationId, "C0123ABC"),
+        ]))
+        .with_request_authorizer(Arc::new(move |request| {
+            facts.lock().expect("facts").push(request);
+            true
+        }));
+        client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!(
+                    "http://{authority}/channels/%7Bconversation.apiChannel%7D/messages?limit=10"
+                ),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect("rendered request admitted");
+        let facts = seen.lock().expect("facts");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].path, "/channels/1122334455/messages");
+        assert_eq!(facts[0].query, "limit=10&channel=C0123ABC");
+        assert!(server.request().starts_with(
+            b"GET /channels/1122334455/messages?limit=10&channel=C0123ABC HTTP/1.1\r\n"
+        ));
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]

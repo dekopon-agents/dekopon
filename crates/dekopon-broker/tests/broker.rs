@@ -695,7 +695,33 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
         dekopon_capability::InvocationOutcome::Succeeded,
         "{allowed:?}"
     );
-    assert!(server.request().starts_with(b"POST /reply HTTP/1.1"));
+    let requests = std::iter::once(server.request())
+        .chain(server.recorded())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the real component sends exactly one HTTP request"
+    );
+    let wire = std::str::from_utf8(&requests[0]).expect("fixture request is UTF-8");
+    assert_eq!(wire.lines().next(), Some("POST /reply HTTP/1.1"));
+    let sent_host = wire
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.trim())
+        })
+        .expect("outbound Host header");
+    assert_eq!(
+        format!("http://{sent_host}/reply"),
+        format!("http://{authority}/reply")
+    );
+    assert!(
+        wire.lines()
+            .all(|line| !line.to_ascii_lowercase().starts_with("authorization:")),
+        "guest sent no credential"
+    );
     server.join();
 }
 

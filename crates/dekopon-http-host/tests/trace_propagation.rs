@@ -1,6 +1,12 @@
 #![allow(clippy::unwrap_used)]
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use dekopon_capability::HttpConstraints;
 use dekopon_http_host::{
@@ -106,7 +112,16 @@ async fn only_opted_in_requests_send_the_egress_parent_outside_accounted_bytes()
     let mut opted_in = grant(server.authority());
     opted_in.propagate_trace = true;
     opted_in.max_request_bytes = accounted;
-    let mut opted_in = client(opted_in);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let facts = Arc::clone(&seen);
+    let mut opted_in = client(opted_in).with_request_authorizer(Arc::new(move |request| {
+        assert!(
+            request.headers.is_empty(),
+            "injected traceparent is never a guest header fact"
+        );
+        facts.fetch_add(1, Ordering::SeqCst);
+        true
+    }));
     for _ in 0..2 {
         opted_in
             .send(request(server.url()))
@@ -118,6 +133,7 @@ async fn only_opted_in_requests_send_the_egress_parent_outside_accounted_bytes()
     for evidence in opted_in.into_evidence() {
         assert_eq!(evidence.request_bytes, accounted);
     }
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
     server.join();
 }
 
