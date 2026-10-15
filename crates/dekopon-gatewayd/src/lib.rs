@@ -99,20 +99,29 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
+async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> {
+    let (candidate, report) = load_candidate(config_path, None, config::LoadMode::Boot, None).await;
+    let candidate = candidate.ok_or_else(|| GatewaydError::from_problems(report.problems))?;
+    if !candidate
+        .sources
+        .still_current(config_path, &candidate.config.catalog_path, current_uid())
+        .await?
+    {
+        return Err(config::ConfigError::ChangedDuringLoad.into());
+    }
+    Ok(candidate)
+}
+
 pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
-    let (candidate, report) =
-        load_candidate(config_path.as_ref(), None, config::LoadMode::Boot, None).await;
-    let Some(Candidate {
+    let Candidate {
         config,
         routes,
         transports: built_transports,
-    }) = candidate
-    else {
-        return Err(GatewaydError::from_problems(report.problems));
-    };
+        sources: _,
+    } = boot_candidate(config_path.as_ref()).await?;
     let routes = Arc::new(routes);
 
     let broker_client = BrokerClient::new(
@@ -373,6 +382,7 @@ pub async fn check(
 }
 
 pub(crate) struct Candidate {
+    pub(crate) sources: config::GatewaySources,
     pub(crate) config: ResolvedConfig,
     pub(crate) routes: RoutingTable,
     pub(crate) transports: Vec<Box<dyn ChatTransport>>,
@@ -386,21 +396,30 @@ pub(crate) async fn load_candidate(
     mode: config::LoadMode,
     probe: Option<(&ProbeScope, &probe::Vendor)>,
 ) -> (Option<Candidate>, CheckReport) {
+    load_candidate_against(config_path, catalog_path, mode, probe, None).await
+}
+
+pub(crate) async fn load_candidate_against(
+    config_path: &Path,
+    catalog_path: Option<&Path>,
+    mode: config::LoadMode,
+    probe: Option<(&ProbeScope, &probe::Vendor)>,
+    active: Option<(&ResolvedConfig, &config::GatewaySources)>,
+) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
-    let config = match config::load_in(config_path, current_uid(), mode).await {
-        Ok((config, refusals)) => {
-            report
-                .problems
-                .extend(refusals.into_iter().map(GatewaydError::from));
-            Some(config)
+    let before_config = config::source_snapshot(config_path, None, current_uid()).await;
+    let (config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
+    report
+        .problems
+        .extend(refusals.into_iter().map(GatewaydError::from));
+    let catalog_path = catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()));
+    let before_catalog = match catalog_path {
+        Some(path) if config.is_some() => {
+            Some(config::source_snapshot(path, None, current_uid()).await)
         }
-        Err(error) => {
-            report.problems.push(error.into());
-            None
-        }
+        _ => None,
     };
-    let catalog = match catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()))
-    {
+    let catalog = match catalog_path {
         Some(path) => match LocalCatalog::load(path) {
             Ok(catalog) => Some(catalog),
             Err(error) => {
@@ -433,19 +452,78 @@ pub(crate) async fn load_candidate(
             Vec::new()
         }
     };
+    let reload_scope = ProbeScope::Every;
+    let probe = probe.or_else(|| active.map(|_| (&reload_scope, &probe::Vendor::LIVE)));
     match (probe, &config) {
         (Some((scope, vendor)), Some(config)) => {
-            probe::probe(config, routes.as_ref(), scope, vendor, &mut report).await;
+            probe::probe(
+                config,
+                routes.as_ref(),
+                scope,
+                active.map(|(config, _)| config.models.as_slice()),
+                vendor,
+                &mut report,
+            )
+            .await;
         }
         (Some(_), None) => report.skipped(Stage::Probe),
         (None, _) => {}
     }
-    let candidate = match (config, routes) {
-        (Some(config), Some(routes)) if report.problems.is_empty() => Some(Candidate {
-            config,
-            routes,
-            transports,
-        }),
+    let candidate = match (config, routes, catalog) {
+        (Some(config), Some(routes), Some(catalog)) if report.problems.is_empty() => {
+            let after_config = config::source_snapshot(config_path, None, current_uid()).await;
+            let after_catalog =
+                config::source_snapshot(catalog.source(), Some(&catalog), current_uid()).await;
+            match (before_config, after_config, before_catalog, after_catalog) {
+                (Ok(before), Ok(after), Some(Ok(catalog_before)), Ok(catalog_after))
+                    if before == after
+                        && catalog_before
+                            .0
+                            .iter()
+                            .all(|(path, bytes)| catalog_after.0.get(path) == Some(bytes)) =>
+                {
+                    let sources = config::GatewaySources {
+                        config: after,
+                        catalog: catalog_after,
+                    };
+                    let changes = active.map(|(_, old)| old.changes(&sources)).transpose();
+                    match changes {
+                        Ok(Some(changes)) if !changes.restart_required.is_empty() => {
+                            report.problems.push(
+                                config::ConfigError::RestartRequired {
+                                    categories: changes.restart_required,
+                                }
+                                .into(),
+                            );
+                            None
+                        }
+                        Ok(_) => Some(Candidate {
+                            sources,
+                            config,
+                            routes,
+                            transports,
+                        }),
+                        Err(error) => {
+                            report.problems.push(error.into());
+                            None
+                        }
+                    }
+                }
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Some(Err(error)), _)
+                | (_, _, _, Err(error)) => {
+                    report.problems.push(error.into());
+                    None
+                }
+                _ => {
+                    report
+                        .problems
+                        .push(config::ConfigError::ChangedDuringLoad.into());
+                    None
+                }
+            }
+        }
         _ => None,
     };
     (candidate, report)

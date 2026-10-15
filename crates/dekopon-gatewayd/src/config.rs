@@ -1008,18 +1008,50 @@ pub async fn load_in(
     expected_uid: u32,
     mode: LoadMode,
 ) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
-    let path = absolute(path.as_ref())?;
+    let (resolved, mut refusals) = load_reporting(path.as_ref(), expected_uid, mode).await;
+    match (resolved, mode, refusals.is_empty()) {
+        (Some(resolved), LoadMode::Check, _) | (Some(resolved), LoadMode::Boot, true) => {
+            Ok((resolved, refusals))
+        }
+        _ => Err(refusals.remove(0)),
+    }
+}
+
+pub(crate) async fn load_reporting(
+    path: &Path,
+    expected_uid: u32,
+    mode: LoadMode,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    let path = match absolute(path) {
+        Ok(path) => path,
+        Err(error) => return (None, vec![error]),
+    };
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return load_directory(path, expected_uid, mode).await;
     }
-    let config = decode(&read_config_file(path.clone(), expected_uid).await?)?;
-    let resolved = resolve(
-        config,
-        path,
-        &BrokerSocketDiscovery::from_process(None),
-        expected_uid,
-    )?;
-    Ok((resolved, Vec::new()))
+    let resolved = async {
+        let config =
+            decode(&read_config_file(path.clone(), expected_uid).await?).map_err(|error| {
+                match error {
+                    ConfigError::Decode { source, .. } => ConfigError::Decode {
+                        path: Some(path.clone()),
+                        source,
+                    },
+                    other => other,
+                }
+            })?;
+        resolve(
+            config,
+            path,
+            &BrokerSocketDiscovery::from_process(None),
+            expected_uid,
+        )
+    }
+    .await;
+    match resolved {
+        Ok(resolved) => (Some(resolved), Vec::new()),
+        Err(error) => (None, vec![error]),
+    }
 }
 
 const MERGE_RULES: MergeRules = MergeRules {
@@ -1032,27 +1064,31 @@ const MERGE_RULES: MergeRules = MergeRules {
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
-) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
-    let paths = fragments::scan_directory(&directory, expected_uid, "yaml")?;
-    let first = paths
-        .first()
-        .cloned()
-        .ok_or_else(|| ConfigError::EmptyConfigDirectory {
-            path: directory.clone(),
-        })?;
+    _mode: LoadMode,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    let paths = match scan_gateway_directory(&directory, expected_uid) {
+        Ok(paths) => paths,
+        Err(error) => return (None, vec![error.into()]),
+    };
+    let Some(first) = paths.first().cloned() else {
+        return (
+            None,
+            vec![ConfigError::EmptyConfigDirectory { path: directory }],
+        );
+    };
     let mut parsed = Vec::with_capacity(paths.len());
     let mut defined = BTreeMap::<String, PathBuf>::new();
     let mut referenced = Vec::<(PathBuf, String)>::new();
     let mut model_files = BTreeMap::<String, PathBuf>::new();
     for path in paths {
-        let bytes = read_config_file(path.clone(), expected_uid).await?;
-        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
-            ConfigError::DecodeFragment {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let bytes = match read_config_file(path.clone(), expected_uid).await {
+            Ok(bytes) => bytes,
+            Err(error) => return (None, vec![error]),
+        };
+        let mapping = match serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes) {
+            Ok(mapping) => mapping,
+            Err(source) => return (None, vec![ConfigError::DecodeFragment { path, source }]),
+        };
         for transport in names_under(&mapping, "transports", "name") {
             defined.insert(transport, path.clone());
         }
@@ -1072,25 +1108,22 @@ async fn load_directory(
     let mut refusals = Vec::new();
     if !stray.is_empty() {
         let refusal = ConfigError::RouteOutsideTransportFragment { routes: stray };
-        if mode == LoadMode::Boot {
-            return Err(refusal);
-        }
         refusals.push(refusal);
     }
     let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
     if let Some(refusal) = refusal {
-        if mode == LoadMode::Boot {
-            return Err(refusal.into());
-        }
         refusals.push(refusal.into());
     }
-    // A later refusal is reported as the fragment refusal it may well be caused by.
-    let later =
-        |error: ConfigError, mut refusals: Vec<ConfigError>| refusals.pop().unwrap_or(error);
     let config = match serde_yaml::from_value::<GatewaydConfig>(serde_yaml::Value::Mapping(merged))
     {
         Ok(config) => config,
-        Err(source) => return Err(later(ConfigError::Decode { source }, refusals)),
+        Err(source) => {
+            refusals.push(ConfigError::Decode {
+                path: Some(directory),
+                source,
+            });
+            return (None, refusals);
+        }
     };
     match resolve(
         config,
@@ -1100,15 +1133,18 @@ async fn load_directory(
     ) {
         Ok(mut resolved) => {
             resolved.model_files.extend(model_files);
-            Ok((resolved, refusals))
+            (Some(resolved), refusals)
         }
-        Err(error) => Err(later(error, refusals)),
+        Err(error) => {
+            refusals.push(error);
+            (None, refusals)
+        }
     }
 }
 
 fn decode(document: &[u8]) -> Result<GatewaydConfig, ConfigError> {
     serde_yaml::from_slice::<GatewaydConfig>(document)
-        .map_err(|source| ConfigError::Decode { source })
+        .map_err(|source| ConfigError::Decode { path: None, source })
 }
 
 fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<String> {
@@ -1121,6 +1157,368 @@ fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<St
         .collect()
 }
 
+fn scan_gateway_directory(
+    directory: &Path,
+    expected_uid: u32,
+) -> Result<Vec<PathBuf>, FragmentError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|source| FragmentError::Read {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    use std::os::unix::fs::MetadataExt as _;
+    let projected = std::fs::symlink_metadata(directory.join("..data"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if projected {
+        let read_only = rustix::fs::statvfs(directory)
+            .is_ok_and(|stat| stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY));
+        if !metadata.is_dir() || !read_only || metadata.uid() != 0 && metadata.uid() != expected_uid
+        {
+            return Err(FragmentError::InsecureDirectory {
+                path: directory.to_path_buf(),
+            });
+        }
+        let mut paths = std::fs::read_dir(directory)
+            .map_err(|source| FragmentError::Read {
+                path: directory.to_path_buf(),
+                source,
+            })?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| FragmentError::Read {
+                        path: directory.to_path_buf(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.retain(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "yaml")
+        });
+        paths.sort();
+        Ok(paths)
+    } else {
+        fragments::scan_directory(directory, expected_uid, "yaml")
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SourceSnapshot(pub(crate) BTreeMap<PathBuf, Vec<u8>>);
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct GatewaySources {
+    pub(crate) config: SourceSnapshot,
+    pub(crate) catalog: SourceSnapshot,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct GatewayChanges {
+    pub(crate) swap: Vec<&'static str>,
+    pub(crate) restart_required: Vec<&'static str>,
+}
+
+impl GatewaySources {
+    pub(crate) async fn still_current(
+        &self,
+        config_path: &Path,
+        catalog_path: &Path,
+        uid: u32,
+    ) -> Result<bool, ConfigError> {
+        if self.config != source_snapshot(config_path, None, uid).await? {
+            return Ok(false);
+        }
+        let catalog = source_snapshot(catalog_path, None, uid).await?;
+        if !catalog
+            .0
+            .iter()
+            .all(|(path, bytes)| self.catalog.0.get(path) == Some(bytes))
+        {
+            return Ok(false);
+        }
+        for (path, bytes) in &self.catalog.0 {
+            if read_config_file(path.clone(), uid).await? != *bytes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn changes(&self, next: &Self) -> Result<GatewayChanges, ConfigError> {
+        let old = merged_mapping(&self.config)?;
+        let new = merged_mapping(&next.config)?;
+        let classified = [
+            ("models", "models"),
+            ("routes", "routes"),
+            ("stopWords", "stopWords"),
+            ("catalogPath", "catalog"),
+            ("broker", "broker"),
+            ("transports", "transports"),
+            ("sessions", "sessions"),
+            ("shutdownGraceMs", "shutdownGraceMs"),
+            ("telemetry", "telemetry"),
+            ("metering", "metering"),
+            ("proxy", "proxy"),
+            ("apiVersion", "apiVersion"),
+        ];
+        if old.keys().chain(new.keys()).any(|key| {
+            !key.as_str()
+                .is_some_and(|key| classified.iter().any(|(known, _)| known == &key))
+        }) {
+            return Err(ConfigError::UnclassifiedSource);
+        }
+        let mut changes = GatewayChanges::default();
+        for (key, category) in classified {
+            let before = effective_value(&old, key);
+            let after = effective_value(&new, key);
+            if before == after
+                || ["broker", "sessions", "metering"].contains(&key)
+                    && before.is_none_or(|value| {
+                        value
+                            .as_mapping()
+                            .is_some_and(serde_yaml::Mapping::is_empty)
+                    })
+                    && after.is_none_or(|value| {
+                        value
+                            .as_mapping()
+                            .is_some_and(serde_yaml::Mapping::is_empty)
+                    })
+            {
+                continue;
+            }
+            match category {
+                "models" | "routes" | "stopWords" | "catalog" => changes.swap.push(category),
+                "transports" | "sessions" => {
+                    let (resident_before, indicators_before) = split_indicators(before, category);
+                    let (resident_after, indicators_after) = split_indicators(after, category);
+                    if resident_before != resident_after {
+                        changes.restart_required.push(category);
+                    }
+                    if indicators_before != indicators_after {
+                        changes.swap.push("indicators");
+                    }
+                }
+                "broker" | "shutdownGraceMs" | "telemetry" | "metering" | "proxy" => {
+                    changes.restart_required.push(category);
+                }
+                "apiVersion" => return Err(ConfigError::UnclassifiedSource),
+                _ => return Err(ConfigError::UnclassifiedSource),
+            }
+        }
+        if self.catalog != next.catalog && !changes.swap.contains(&"catalog") {
+            changes.swap.push("catalog");
+        }
+        Ok(changes)
+    }
+}
+
+fn effective_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(key).filter(|value| !value.is_null())
+}
+
+fn split_indicators(
+    value: Option<&serde_yaml::Value>,
+    category: &str,
+) -> (Option<serde_yaml::Value>, Option<serde_yaml::Value>) {
+    let Some(value) = value else {
+        return if category == "sessions" {
+            (
+                Some(serde_yaml::Value::Mapping(serde_yaml::Mapping::new())),
+                None,
+            )
+        } else {
+            (None, None)
+        };
+    };
+    if category == "sessions" {
+        let Some(mapping) = value.as_mapping() else {
+            return (Some(value.clone()), None);
+        };
+        let mut resident = mapping.clone();
+        let indicators = resident
+            .remove("indicators")
+            .filter(|value| !value.is_null());
+        return (Some(serde_yaml::Value::Mapping(resident)), indicators);
+    }
+    let Some(items) = value.as_sequence() else {
+        return (Some(value.clone()), None);
+    };
+    let mut resident = items.clone();
+    let mut indicators = Vec::new();
+    for item in &mut resident {
+        if let Some(mapping) = item.as_mapping_mut() {
+            indicators.push(
+                mapping
+                    .remove("indicators")
+                    .unwrap_or(serde_yaml::Value::Null),
+            );
+        }
+    }
+    (
+        Some(serde_yaml::Value::Sequence(resident)),
+        Some(serde_yaml::Value::Sequence(indicators)),
+    )
+}
+
+fn merged_mapping(snapshot: &SourceSnapshot) -> Result<serde_yaml::Mapping, ConfigError> {
+    let parsed = snapshot
+        .0
+        .iter()
+        .map(|(path, bytes)| {
+            serde_yaml::from_slice::<serde_yaml::Mapping>(bytes)
+                .map(|mapping| (path.clone(), mapping))
+                .map_err(|source| ConfigError::DecodeFragment {
+                    path: path.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
+    match refusal {
+        Some(refusal) => Err(refusal.into()),
+        None => Ok(merged),
+    }
+}
+
+pub(crate) async fn source_snapshot(
+    source: &Path,
+    catalog: Option<&dekopon_config::LocalCatalog>,
+    expected_uid: u32,
+) -> Result<SourceSnapshot, ConfigError> {
+    let mut paths = Vec::new();
+    if source.is_dir() {
+        paths.extend(scan_gateway_directory(source, expected_uid)?);
+    } else {
+        paths.push(source.to_path_buf());
+    }
+    if let Some(catalog) = catalog {
+        let root = catalog.source();
+        if root.is_dir() {
+            paths.extend(scan_gateway_directory(root, expected_uid)?);
+        } else {
+            paths.push(root.to_path_buf());
+        }
+        let base = if root.is_dir() {
+            root
+        } else {
+            root.parent().ok_or(ConfigError::MissingParent)?
+        };
+        for agent in catalog.agents() {
+            if let Some(instructions) = &agent.spec.instructions_file {
+                paths.push(if instructions.is_absolute() {
+                    instructions.clone()
+                } else {
+                    base.join(instructions)
+                });
+            }
+            let id = agent
+                .metadata
+                .name
+                .parse()
+                .map_err(|_invalid| ConfigError::InvalidCatalogAgent)?;
+            for skill in catalog.agent_skills(&id) {
+                let root = skill.source();
+                paths.push(root.join("SKILL.md"));
+                for resource in skill.resources() {
+                    paths.push(root.join(&resource.path));
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let mut entries = BTreeMap::new();
+    for path in paths {
+        entries.insert(path.clone(), read_config_file(path, expected_uid).await?);
+    }
+    Ok(SourceSnapshot(entries))
+}
+
+fn read_gateway_projection(path: &Path, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+    let root = path.parent().ok_or(ConfigError::MissingParent)?;
+    let read_only = rustix::fs::statvfs(root)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: source.into(),
+        })?
+        .f_flag
+        .contains(rustix::fs::StatVfsMountFlags::RDONLY);
+    read_gateway_projection_at(path, expected_uid, read_only)
+}
+
+pub(crate) fn read_gateway_projection_at(
+    path: &Path,
+    expected_uid: u32,
+    read_only: bool,
+) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let insecure = || ConfigError::InsecureProjection {
+        path: path.to_path_buf(),
+    };
+    let read_error = |source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let root = path.parent().ok_or_else(insecure)?;
+    let root_metadata = std::fs::symlink_metadata(root).map_err(read_error)?;
+    if !read_only
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != 0 && root_metadata.uid() != expected_uid
+    {
+        return Err(insecure());
+    }
+    let link = std::fs::symlink_metadata(path).map_err(read_error)?;
+    let data_link = std::fs::symlink_metadata(root.join("..data")).map_err(read_error)?;
+    if !link.file_type().is_symlink()
+        || !data_link.file_type().is_symlink()
+        || link.uid() != 0 && link.uid() != expected_uid
+        || data_link.uid() != 0 && data_link.uid() != expected_uid
+        || std::fs::read_link(path).map_err(read_error)?
+            != Path::new("..data").join(path.file_name().ok_or_else(insecure)?)
+    {
+        return Err(insecure());
+    }
+    let generation = std::fs::read_link(root.join("..data")).map_err(read_error)?;
+    if !matches!(
+        generation.components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    ) {
+        return Err(insecure());
+    }
+    let directory = root.join(&generation);
+    let metadata = std::fs::symlink_metadata(&directory).map_err(read_error)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0 && metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(insecure());
+    }
+    let target = directory.join(path.file_name().ok_or_else(insecure)?);
+    let owner = std::fs::symlink_metadata(&target)
+        .map_err(read_error)?
+        .uid();
+    if owner != 0 && owner != expected_uid {
+        return Err(insecure());
+    }
+    let bytes = read_trusted_file(
+        &target,
+        owner,
+        FileTier::NotWorldWritable,
+        HARD_MAX_CONFIG_BYTES,
+    )
+    .map_err(|source| ConfigError::InsecureFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if std::fs::read_link(root.join("..data")).map_err(read_error)? != generation {
+        return Err(insecure());
+    }
+    Ok(bytes)
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
@@ -1129,6 +1527,16 @@ async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, C
     // This file isn't a secret, since credentials live in the environment and transport credential
     // files, so the bar here is only that nobody else can rewrite it.
     let owned = path.clone();
+    let projection =
+        std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if projection {
+        return tokio::task::spawn_blocking(move || read_gateway_projection(&owned, expected_uid))
+            .await
+            .map_err(|join| ConfigError::Read {
+                path,
+                source: io::Error::other(join),
+            })?;
+    }
     tokio::task::spawn_blocking(move || {
         read_trusted_file(
             &owned,
@@ -2090,6 +2498,8 @@ pub enum ConfigError {
     },
     #[error("gateway configuration path is not a regular non-symlink file: {path}")]
     NotRegular { path: PathBuf },
+    #[error("gateway projection is not a trusted read-only source: {path}")]
+    InsecureProjection { path: PathBuf },
     #[error(
         "gateway configuration must be single-link, owned by the daemon UID, and not group/world writable: {path}"
     )]
@@ -2100,8 +2510,9 @@ pub enum ConfigError {
     },
     #[error("gateway configuration is {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
-    #[error("gateway configuration is not strict valid YAML/JSON")]
+    #[error("gateway configuration {} is not strict valid YAML/JSON", path.as_ref().map_or_else(|| "document".to_owned(), |path| path.display().to_string()))]
     Decode {
+        path: Option<PathBuf>,
         #[source]
         source: serde_yaml::Error,
     },
@@ -2122,6 +2533,14 @@ pub enum ConfigError {
     RouteOutsideTransportFragment { routes: Vec<String> },
     #[error("configured path has no parent")]
     MissingParent,
+    #[error("loaded catalog has an invalid agent identity")]
+    InvalidCatalogAgent,
+    #[error("gateway source changed during candidate validation")]
+    ChangedDuringLoad,
+    #[error("gateway source change has no classified live disposition")]
+    UnclassifiedSource,
+    #[error("gateway changes require restart: {}", categories.join(", "))]
+    RestartRequired { categories: Vec<&'static str> },
     #[error("{path}: {}", render_problems(.problems))]
     Invalid {
         path: PathBuf,

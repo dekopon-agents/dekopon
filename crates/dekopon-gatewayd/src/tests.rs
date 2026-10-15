@@ -184,6 +184,290 @@ fn temporary() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_snapshot() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let old_sources = gateway_sources(&active).await;
+    let mut edited = document(root.path());
+    edited["broker"]["serverUid"] = json!(502);
+    edited["sessions"] = json!({"maxConcurrent": 7});
+    write_config(root.path(), &edited);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &old_sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Config(ConfigError::RestartRequired { categories })
+                if categories == &["broker", "sessions"]
+        )),
+        "{report:?}"
+    );
+    assert_eq!(
+        old_sources.config.0.get(&path),
+        Some(&serde_json::to_vec(&document(root.path())).unwrap())
+    );
+    write_config(root.path(), &document(root.path()));
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &old_sources)),
+    )
+    .await;
+    assert!(candidate.is_some(), "{report:?}");
+}
+
+#[tokio::test]
+async fn snapshot_classifies_resident_changes_separately_from_models_and_indicators() {
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    let before = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let mut edited = document(root.path());
+    edited["broker"]["serverUid"] = json!(502);
+    edited["sessions"] = json!({"maxConcurrent": 7, "indicators": {"mode": "off"}});
+    edited["models"][0]["model"] = json!("changed-qwen");
+    edited["telemetry"] = serde_json::Value::Null;
+    write_config(root.path(), &edited);
+    let after = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let changes = before.changes(&after).unwrap();
+    assert_eq!(changes.restart_required, ["broker", "sessions"]);
+    assert_eq!(changes.swap, ["models", "indicators"]);
+    edited = document(root.path());
+    edited["metering"] = json!({});
+    edited["sessions"] = json!({});
+    edited["telemetry"] = serde_json::Value::Null;
+    write_config(root.path(), &edited);
+    let equivalent = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert_eq!(
+        before.changes(&equivalent).unwrap(),
+        config::GatewayChanges::default()
+    );
+    edited["futureLive"] = json!(true);
+    write_config(root.path(), &edited);
+    let unknown = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert!(matches!(
+        before.changes(&unknown),
+        Err(ConfigError::UnclassifiedSource)
+    ));
+    edited = document(root.path());
+    edited["transports"][0]["indicators"] = json!({"mode": "off"});
+    write_config(root.path(), &edited);
+    config::load(&path, crate::current_uid())
+        .await
+        .expect("05 indicator schema resolves");
+    let indicators = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let changes = before.changes(&indicators).unwrap();
+    assert!(changes.restart_required.is_empty());
+    assert_eq!(changes.swap, ["indicators"]);
+}
+
+#[tokio::test]
+async fn instruction_source_change_is_part_of_the_prepared_catalog_snapshot() {
+    let root = temporary();
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        catalog_text(true, Some("reasoning")).replace(
+            "instructions: Answer briefly and never claim authority.",
+            "instructionsFile: instructions.txt",
+        ),
+    )
+    .unwrap();
+    let instructions = root.path().join("instructions.txt");
+    fs::write(&instructions, "use current evidence").unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let snapshot = gateway_sources(&active).await;
+    assert_eq!(
+        snapshot.catalog.0.get(&instructions).map(Vec::as_slice),
+        Some(b"use current evidence".as_slice())
+    );
+    fs::write(&instructions, "use older evidence").unwrap();
+    assert!(
+        !snapshot
+            .still_current(&path, &catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn catalog_snapshot_includes_skill_resource_membership() {
+    let root = temporary();
+    let skill = mounted_skill(&root.path().join("skills"), "counting");
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}  skills:\n    - skills/counting\n",
+            catalog_text(true, Some("reasoning"))
+        ),
+    )
+    .unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let old = gateway_sources(&active).await;
+    let resource = skill.source().join("references/table.md");
+    assert_eq!(
+        old.catalog.0.get(&resource).map(Vec::as_slice),
+        Some(b"one two three\n".as_slice())
+    );
+    let added = skill.source().join("references/more.md");
+    fs::write(&added, "new reference").unwrap();
+    let new = gateway_sources(&active).await;
+    assert!(new.catalog.0.contains_key(&added));
+    assert_eq!(old.changes(&new).unwrap().swap, ["catalog"]);
+}
+
+#[tokio::test]
+async fn gateway_source_snapshot_changes_for_bytes_and_directory_membership() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let first = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    let path = directory.join("host.yaml");
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = b' ';
+    fs::write(&path, bytes).unwrap();
+    fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    let second = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+    let added = directory.join("more.yaml");
+    fs::write(&added, b"apiVersion: dekopon/v1\n").unwrap();
+    let third = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_ne!(second, third);
+    fs::remove_file(added).unwrap();
+    assert_eq!(
+        second,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_changed_gateway_source_permission_or_missing_file_cannot_prepare() {
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        config::source_snapshot(&path, None, crate::current_uid()).await,
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::InsecureMode { .. },
+            ..
+        })
+    ));
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        config::source_snapshot(&path, None, crate::current_uid()).await,
+        Err(ConfigError::Read { .. })
+    ));
+}
+
+#[test]
+fn a_read_only_projection_follows_the_replaced_data_generation() {
+    let root = temporary();
+    for (generation, contents) in [
+        ("..old", b"first".as_slice()),
+        ("..new", b"second".as_slice()),
+    ] {
+        let directory = root.path().join(generation);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("gateway.yaml"), contents).unwrap();
+    }
+    let data = root.path().join("..data");
+    let key = root.path().join("gateway.yaml");
+    std::os::unix::fs::symlink("..old", &data).unwrap();
+    std::os::unix::fs::symlink("..data/gateway.yaml", &key).unwrap();
+    assert_eq!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
+        b"first"
+    );
+    std::os::unix::fs::symlink("..new", root.path().join("..next")).unwrap();
+    fs::rename(root.path().join("..next"), &data).unwrap();
+    assert_eq!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
+        b"second"
+    );
+    fs::set_permissions(
+        root.path().join("..new/gateway.yaml"),
+        fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    assert!(matches!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true),
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::InsecureMode { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_writable_projection_is_refused_even_when_its_target_is_valid() {
+    let root = temporary();
+    let generation = root.path().join("..2026_10_15");
+    fs::create_dir(&generation).expect("generation");
+    fs::write(
+        generation.join("gateway.yaml"),
+        serde_json::to_vec(&document(root.path())).unwrap(),
+    )
+    .expect("projection contents");
+    std::os::unix::fs::symlink("..2026_10_15", root.path().join("..data")).expect("data link");
+    std::os::unix::fs::symlink("..data/gateway.yaml", root.path().join("gateway.yaml"))
+        .expect("key link");
+    let error = config::load(root.path().join("gateway.yaml"), crate::current_uid())
+        .await
+        .expect_err("writable projection cannot be trusted");
+    assert!(matches!(error, ConfigError::InsecureProjection { .. }));
+}
+
+#[tokio::test]
 async fn a_complete_configuration_resolves_with_documented_defaults() {
     let directory = temporary();
     let resolved = load(directory.path(), &document(directory.path()))
@@ -348,7 +632,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
         let error = load(directory.path(), &document)
             .await
             .expect_err("retired key");
-        let ConfigError::Decode { source } = error else {
+        let ConfigError::Decode { source, .. } = error else {
             panic!("decode refusal")
         };
         assert!(source.to_string().contains(key));
@@ -677,7 +961,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         let error = load(directory.path(), &mutate(&patch))
             .await
             .expect_err("retired key");
-        assert!(matches!(error, ConfigError::Decode { source }
+        assert!(matches!(error, ConfigError::Decode { source, .. }
             if source.to_string().contains("imageGenerator")));
     }
 
@@ -16900,14 +17184,16 @@ fn spawn_fake_vendor() -> FakeVendor {
                         .expect("probe names its model")
                         .to_owned();
                 recorded.lock().push(model.clone());
-                let (status, content_type, response) = if model == "vendor/refused" {
+                let (status, content_type, response) = if model == "vendor/refused"
+                    || model == "vendor/outage"
+                {
                     let authorization = headers
                         .lines()
                         .find(|line| line.to_ascii_lowercase().starts_with("authorization"))
                         .unwrap_or_default()
                         .to_owned();
                     (
-                        "400 Bad Request",
+                        if model == "vendor/outage" { "503 Service Unavailable" } else { "400 Bad Request" },
                         "application/json",
                         json!({ "error": { "message": format!("no endpoints for this model; you sent {authorization}") } })
                             .to_string(),
@@ -17023,6 +17309,249 @@ async fn check_reports_a_collision_an_unknown_agent_and_a_refused_model_together
     {
         assert!(!line.contains(PROBE_KEY), "{line}");
     }
+}
+
+#[tokio::test]
+async fn malformed_single_file_names_the_file_without_model_or_route_diagnostics() {
+    let root = temporary();
+    let path = root.path().join("gateway.yaml");
+    fs::write(&path, "models: [\n").unwrap();
+    let report = crate::check(&path, None, Some(&crate::ProbeScope::Every)).await;
+    assert!(
+        matches!(report.problems.as_slice(), [crate::GatewaydError::Config(
+        ConfigError::Decode { path: Some(failed), .. }
+    )] if failed == &path)
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::Skipped {
+            stage: crate::Stage::Routes
+        }
+    )));
+}
+
+#[tokio::test]
+async fn a_fragment_conflict_and_resolve_refusal_are_both_reported() {
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "reviewer",
+        &[(
+            "collision.yaml",
+            json!({"apiVersion": config::CONFIG_API_VERSION, "catalogPath": "/elsewhere.yaml", "models": [{"name": "", "kind": "openaiCompatible", "endpoint": "http://127.0.0.1:11434/v1", "model": "qwen3", "timeoutMs": 120_000}]}),
+        )],
+    );
+    let report = crate::check(&directory, None, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Fragments(
+            dekopon_core::fragments::FragmentError::Conflicts { .. }
+        ))
+    )));
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|problem| matches!(problem, ConfigProblem::UnnamedModel))
+    )));
+}
+
+#[tokio::test]
+async fn malformed_fragment_reports_only_its_file_without_inventing_model_or_route_ids() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("broken.yaml");
+    fs::write(&path, "models: [\n").expect("malformed fragment");
+    let report = crate::check(&directory, None, Some(&crate::ProbeScope::Every)).await;
+    assert!(
+        matches!(report.problems.as_slice(), [crate::GatewaydError::Config(
+        ConfigError::DecodeFragment { path: failed, .. }
+    )] if failed == &path)
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::Skipped {
+            stage: crate::Stage::Routes
+        }
+    )));
+    let bad = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_eq!(
+        bad,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(
+        &path,
+        format!("apiVersion: {}\n", config::CONFIG_API_VERSION),
+    )
+    .unwrap();
+    assert_ne!(
+        bad,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    let repaired = crate::check(&directory, None, None).await;
+    assert!(repaired.problems.is_empty(), "{repaired:?}");
+}
+
+async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
+    let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
+    config::GatewaySources {
+        config: config::source_snapshot(&config.source, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::source_snapshot(
+            &config.catalog_path,
+            Some(&catalog),
+            crate::current_uid(),
+        )
+        .await
+        .unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/kept", 5_000));
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let sources = gateway_sources(&active).await;
+    document["models"][1]["model"] = json!("vendor/refused");
+    write_config(root.path(), &document);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        crate::GatewaydError::Probe(problem) if problem.model == "router"
+    )));
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
+}
+
+#[tokio::test]
+async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_repair_does() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let live_path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&live_path, crate::current_uid())
+        .await
+        .unwrap();
+    let sources = gateway_sources(&active).await;
+    let mut candidate = document(root.path());
+    for (model, status) in [("vendor/refused", 400), ("vendor/outage", 503)] {
+        candidate["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(openrouter_model("router", model, 5_000));
+        let path = write_config(root.path(), &candidate);
+        let (prepared, report) = crate::load_candidate_against(
+            &path,
+            None,
+            config::LoadMode::Boot,
+            Some((&crate::ProbeScope::Every, &environment)),
+            Some((&active, &sources)),
+        )
+        .await;
+        assert!(prepared.is_none());
+        assert!(report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Probe(problem)
+                if matches!(&problem.source, crate::ProbeError::Vendor(InferenceError::Provider(failure))
+                    if failure.status == Some(status))
+        )), "{report:?}");
+        candidate["models"].as_array_mut().unwrap().pop();
+    }
+    candidate["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/accepted", 5_000));
+    candidate["models"].as_array_mut().unwrap().push(json!({
+        "kind": "chatgptSubscription", "name": "subscription", "model": "gpt-test", "timeoutMs": 5_000
+    }));
+    let path = write_config(root.path(), &candidate);
+    let (prepared, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources)),
+    )
+    .await;
+    let prepared = prepared.expect("repair prepares a full candidate");
+    assert!(prepared.sources.config.0.contains_key(&path));
+    assert!(
+        prepared
+            .sources
+            .catalog
+            .0
+            .contains_key(&root.path().join("dekopon.yaml"))
+    );
+    assert!(
+        prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(root.path().join("dekopon.yaml"), "changed while preparing").unwrap();
+    assert!(
+        !prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    assert!(
+        prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(warning,
+        crate::CheckWarning::NotProbed { model, reason: crate::NotProbed::SubscriptionAuth }
+            if model == "subscription"
+    )));
+    assert_eq!(
+        vendor.asked.lock().as_slice(),
+        ["vendor/refused", "vendor/outage", "vendor/accepted"]
+    );
 }
 
 #[tokio::test]
