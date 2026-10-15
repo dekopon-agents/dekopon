@@ -654,9 +654,22 @@ fn secret_raw_path_is_ambiguous(uri: &str) -> bool {
             .any(|segment| matches!(segment, "." | ".."))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpRequestFacts {
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Option<Vec<u8>>,
+    pub content_type: Option<String>,
+}
+
+pub type RequestAuthorizer = std::sync::Arc<dyn Fn(HttpRequestFacts) -> bool + Send + Sync>;
+
 pub struct BufferedHttpClient {
     grant: Option<HttpConstraints>,
+    request_authorizer: Option<RequestAuthorizer>,
     secret_grant: Option<SecretUseGrant>,
     credential: Option<BoundCredential>,
     slots: ChatSlotValues,
@@ -671,6 +684,12 @@ pub struct BufferedHttpClient {
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
+}
+
+impl std::fmt::Debug for BufferedHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferedHttpClient").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -753,6 +772,7 @@ impl BufferedHttpClient {
             .ok_or(ConfigurationError::TimeoutOverflow)?;
         Ok(Self {
             grant,
+            request_authorizer: None,
             secret_grant,
             credential,
             slots: ChatSlotValues::default(),
@@ -773,6 +793,11 @@ impl BufferedHttpClient {
     #[must_use]
     pub fn with_chat_slots(mut self, slots: ChatSlotValues) -> Self {
         self.slots = slots;
+        self
+    }
+
+    pub fn with_request_authorizer(mut self, authorizer: RequestAuthorizer) -> Self {
+        self.request_authorizer = Some(authorizer);
         self
     }
 
@@ -1035,6 +1060,16 @@ impl BufferedHttpClient {
         let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| {
             http_error(ErrorCode::InvalidMethod, "method is not a valid HTTP token")
         })?;
+        if !request
+            .method
+            .bytes()
+            .all(|byte| !byte.is_ascii_lowercase())
+        {
+            return Err(http_error(
+                ErrorCode::Denied,
+                "HTTP method must be uppercase",
+            ));
+        }
         if !grant
             .allowed_methods
             .iter()
@@ -1133,6 +1168,7 @@ impl BufferedHttpClient {
             .and_then(BoundCredential::companion_name)
             .cloned();
         let mut headers = HeaderMap::new();
+        let mut guest_headers = Vec::with_capacity(request.headers.len());
         let mut header_bytes = 0_u64;
         for header in request.headers {
             header_bytes = header_bytes
@@ -1170,6 +1206,7 @@ impl BufferedHttpClient {
             let value = HeaderValue::from_bytes(&header.value).map_err(|_| {
                 http_error(ErrorCode::InvalidHeader, "request header value is invalid")
             })?;
+            guest_headers.push((name.as_str().to_owned(), header.value));
             headers.append(name, value);
         }
 
@@ -1185,6 +1222,38 @@ impl BufferedHttpClient {
                 ErrorCode::RequestTooLarge,
                 "request exceeds the authorized byte limit",
             ));
+        }
+
+        if let Some(authorize) = &self.request_authorizer {
+            let content_types = headers.get_all(reqwest::header::CONTENT_TYPE);
+            let mut types = content_types.iter();
+            let content_type = types.next().and_then(|value| {
+                types
+                    .next()
+                    .is_none()
+                    .then(|| value.to_str().ok())
+                    .flatten()
+            });
+            let facts = HttpRequestFacts {
+                method: method.as_str().to_owned(),
+                host: host.clone(),
+                path: url.path().to_owned(),
+                query: url.query().unwrap_or_default().to_owned(),
+                headers: guest_headers,
+                body: (streamed.is_none()).then_some(request.body.clone()),
+                content_type: content_type.map(str::to_owned),
+            };
+            // Wasmtime's guest stack may have less than Cedar's 100-KiB evaluation reserve.
+            let authorize = std::sync::Arc::clone(authorize);
+            if !tokio::task::spawn_blocking(move || authorize(facts))
+                .await
+                .unwrap_or(false)
+            {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    "HTTP request denied by policy",
+                ));
+            }
         }
 
         // DNS resolution is cached for this context's lifetime, but every cached address is still
@@ -1808,6 +1877,143 @@ mod tests {
             propagate_trace: false,
             request_templates: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn request_hook_sees_effective_guest_facts_and_denial_precedes_resolution() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |facts: super::HttpRequestFacts| {
+                seen.lock().expect("facts").push(facts);
+                false
+            }) as super::RequestAuthorizer
+        };
+        let mut client = BufferedHttpClient::authorized(
+            grant("no-such-egress.invalid".to_owned(), "POST"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("client")
+        .with_request_authorizer(capture);
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: "https://NO-SUCH-EGRESS.INVALID/reply?".to_owned(),
+                headers: vec![Header {
+                    name: "Content-Type".to_owned(),
+                    value: b"application/json; charset=utf-8".to_vec(),
+                }],
+                body: br#"{"channel":"C0123","thread_ts":"1"}"#.to_vec(),
+            })
+            .await
+            .expect_err("policy refusal, not DNS failure");
+        assert_eq!(error.code, ErrorCode::Denied);
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: "https://no-such-egress.invalid/reply".to_owned(),
+                headers: vec![
+                    Header {
+                        name: "CONTENT-TYPE".to_owned(),
+                        value: b"application/json".to_vec(),
+                    },
+                    Header {
+                        name: "content-type".to_owned(),
+                        value: b"application/problem+json".to_vec(),
+                    },
+                ],
+                body: br#"{"channel":"C0123"}"#.to_vec(),
+            })
+            .await
+            .expect_err("policy refusal with duplicate content type");
+        assert_eq!(error.code, ErrorCode::Denied);
+        let seen = seen.lock().expect("facts");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].content_type, None);
+        assert_eq!(seen[1].headers.len(), 2);
+        let facts = &seen[0];
+        assert_eq!(facts.method, "POST");
+        assert_eq!(facts.host, "no-such-egress.invalid");
+        assert_eq!(facts.path, "/reply");
+        assert_eq!(facts.query, "");
+        assert_eq!(
+            facts.headers,
+            vec![(
+                "content-type".to_owned(),
+                b"application/json; charset=utf-8".to_vec()
+            )]
+        );
+        assert_eq!(
+            facts.content_type.as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            facts.body.as_deref(),
+            Some(br#"{"channel":"C0123","thread_ts":"1"}"#.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_template_and_lowercase_method_never_call_request_hook() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                false
+            }) as super::RequestAuthorizer
+        };
+        let mut client = BufferedHttpClient::authorized(
+            slack_replies("127.0.0.1:9"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("client")
+        .with_request_authorizer(hook);
+        let result = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: "http://127.0.0.1:9/api/conversations.replies".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::HttpError {
+                code: ErrorCode::Denied,
+                ..
+            })
+        ));
+        let lower_calls = std::sync::Arc::clone(&calls);
+        let mut lowercase = BufferedHttpClient::authorized(
+            grant("127.0.0.1:9".to_owned(), "get"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("lowercase grant admits the token")
+        .with_request_authorizer(std::sync::Arc::new(move |_| {
+            lower_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        let error = lowercase
+            .send(Request {
+                method: "get".to_owned(),
+                uri: "http://127.0.0.1:9/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("lowercase admitted token cannot reach Cedar or the wire");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     fn address(ip: &str, port: u16) -> SocketAddr {
@@ -2512,13 +2718,19 @@ mod tests {
             .await
             .expect("uncredentialed request succeeds");
 
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let facts = std::sync::Arc::clone(&seen);
         let mut credentialed = BufferedHttpClient::authorized_with_credential(
             grant(authority.clone(), "GET"),
             Some(credential_for(&authority)),
             HttpHostCeilings::default(),
             Duration::from_secs(5),
         )
-        .expect("valid fixture authorization");
+        .expect("valid fixture authorization")
+        .with_request_authorizer(std::sync::Arc::new(move |request| {
+            facts.lock().expect("facts").push(request);
+            true
+        }));
         credentialed
             .send(request_to(&authority))
             .await
@@ -2536,6 +2748,12 @@ mod tests {
             "{request}"
         );
 
+        let seen = seen.lock().expect("facts");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].headers,
+            vec![("x-probe".to_owned(), b"one".to_vec())]
+        );
         let plain_evidence = plain.into_evidence();
         let evidence = credentialed.into_evidence();
         assert!(!plain_evidence[0].credential_injected);

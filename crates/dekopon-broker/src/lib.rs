@@ -1767,7 +1767,7 @@ impl AuditError {
 #[derive(Debug)]
 pub struct Broker<A> {
     registry: BrokerProviderRegistry,
-    policy: PolicyEngine,
+    policy: Arc<PolicyEngine>,
     policy_revision: String,
     policy_digest: String,
     constraints: ConstraintCatalog,
@@ -1877,7 +1877,7 @@ where
             Self {
                 registry,
                 policy_digest: policy.digest().to_owned(),
-                policy,
+                policy: Arc::new(policy),
                 policy_revision,
                 constraints,
                 credentials,
@@ -1995,8 +1995,9 @@ where
         context: &AuthenticatedContext,
         capability: &CapabilityId,
         set: &ConstraintSet,
+        facts: Option<dekopon_policy::HttpRequestFacts>,
     ) -> PolicyDecision {
-        self.policy.authorize(PolicyRequest {
+        let request = PolicyRequest {
             principal: context.principal().clone(),
             target: PolicyTarget::Capability {
                 capability: capability.clone(),
@@ -2005,7 +2006,19 @@ where
                 risk: set.risk,
             },
             context: policy_context(context),
-        })
+        };
+        Self::decide_capability(&self.policy, request, facts)
+    }
+
+    fn decide_capability(
+        policy: &PolicyEngine,
+        request: PolicyRequest,
+        facts: Option<dekopon_policy::HttpRequestFacts>,
+    ) -> PolicyDecision {
+        match facts {
+            Some(facts) => policy.authorize_http(request, facts),
+            None => policy.authorize(request),
+        }
     }
 
     fn authorize_secret_use(
@@ -2057,7 +2070,9 @@ where
                     && render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
                         .is_ok()
                     && probe_permits(context, set.effect)
-                    && self.authorize_capability(context, capability, set).allowed
+                    && self
+                        .authorize_capability(context, capability, set, None)
+                        .allowed
             })
             .collect()
     }
@@ -2588,7 +2603,10 @@ where
         }
         for route in CapabilityRoute::CHAT_MEMORY {
             let (capability, set) = self.constraints.routed(route)?;
-            if !self.authorize_capability(context, capability, set).allowed {
+            if !self
+                .authorize_capability(context, capability, set, None)
+                .allowed
+            {
                 return None;
             }
         }
@@ -2652,7 +2670,9 @@ where
             .iter()
             .filter(|(capability, set)| {
                 (set.route.is_generic() || effective_memory_surface)
-                    && self.authorize_capability(context, capability, set).allowed
+                    && self
+                        .authorize_capability(context, capability, set, None)
+                        .allowed
             })
             .collect::<Vec<_>>();
         let effective_capabilities = effective
@@ -2957,7 +2977,7 @@ where
                         .map(ControlFlow::Break);
                 }
             };
-            let decision = self.authorize_capability(context, &request.capability, &set);
+            let decision = self.authorize_capability(context, &request.capability, &set, None);
             // A policy error denies exactly like a non-match; this is recorded as a flag rather
             // than the error text so denial explanations can't become a per-request channel leaking
             // policy source or entity data.
@@ -3318,6 +3338,37 @@ where
             request.input,
         )
         .with_secret_use(secret_use);
+        let request_authorizer = set.constraints.http.as_ref().map(|_| {
+            let policy = Arc::clone(&self.policy);
+            let principal = context.principal().clone();
+            let target = PolicyTarget::Capability {
+                capability: capability.clone(),
+                provider: set.provider.clone(),
+                effect: set.effect,
+                risk: set.risk,
+            };
+            let context = policy_context(context);
+            Arc::new(move |facts: dekopon_broker_host::HttpRequestFacts| {
+                let decision = Self::decide_capability(
+                    &policy,
+                    PolicyRequest {
+                        principal: principal.clone(),
+                        target: target.clone(),
+                        context: context.clone(),
+                    },
+                    Some(dekopon_policy::HttpRequestFacts {
+                        method: facts.method,
+                        host: facts.host,
+                        path: facts.path,
+                        query: facts.query,
+                        headers: facts.headers,
+                        body: facts.body,
+                        content_type: facts.content_type,
+                    }),
+                );
+                decision.allowed
+            }) as dekopon_broker_host::RequestAuthorizer
+        });
         let authorized = self
             .gate
             .authorize(
@@ -3538,7 +3589,16 @@ where
         let started = Instant::now();
         let execution = self
             .registry
-            .invoke_with_storage(authorized, credential, storage_grant, slots, assets)
+            .invoke_with_storage(
+                authorized,
+                credential,
+                storage_grant,
+                dekopon_broker_host::HttpInvocation {
+                    slots,
+                    authorizer: request_authorizer,
+                },
+                assets,
+            )
             .await;
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
