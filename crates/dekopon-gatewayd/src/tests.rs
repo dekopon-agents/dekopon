@@ -15328,40 +15328,48 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
             .iter()
             .any(|name| name.contains("memory"))
     );
-    for request in [
-        broker.request().await,
-        broker.request().await,
-        broker.request().await,
-    ] {
-        match request.request {
-            BrokerRequest::Capabilities {
-                attestation: Some(claim),
-            }
-            | BrokerRequest::RunCommand {
-                attestation: Some(claim),
-                ..
-            }
-            | BrokerRequest::Invoke {
-                attestation: Some(claim),
-                ..
-            } => {
-                assert_eq!(claim.subject, inbound.subject);
-                assert_eq!(
-                    claim.scope.as_ref().unwrap().trigger,
-                    dekopon_broker_protocol::Trigger::Message
-                );
-            }
-            BrokerRequest::Capabilities { attestation: None }
-            | BrokerRequest::RunCommand {
-                attestation: None, ..
-            }
-            | BrokerRequest::Invoke {
-                attestation: None, ..
-            }
-            | BrokerRequest::RecordDeliveredTurn { .. }
-            | BrokerRequest::UpcallResult { .. } => panic!("unexpected broker request"),
-        }
-    }
+    let capabilities = broker.request().await;
+    let BrokerRequest::Capabilities {
+        attestation: Some(claim),
+    } = capabilities.request
+    else {
+        panic!("first request must open the speaker's leg: {capabilities:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(
+        claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
+    let command = broker.request().await;
+    let BrokerRequest::RunCommand {
+        attestation: Some(claim),
+        word,
+        argv,
+        ..
+    } = command.request
+    else {
+        panic!("second request must resolve the named command: {command:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(word, "probe");
+    assert_eq!(argv, ["upper", "--text", "hello"]);
+    let invocation = broker.request().await;
+    let BrokerRequest::Invoke {
+        attestation: Some(claim),
+        invocation,
+        ..
+    } = invocation.request
+    else {
+        panic!("third request must invoke the named capability: {invocation:?}");
+    };
+    assert_eq!(claim.subject, inbound.subject);
+    assert!(claim.binds(&invocation.id));
+    assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
+    assert_eq!(invocation.input, json!({"text": "hello"}));
+    assert!(
+        broker.recorded().is_empty(),
+        "one capabilities request and one invocation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
