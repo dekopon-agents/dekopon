@@ -2,8 +2,8 @@ use std::{thread, time::Duration};
 
 use serde_json::Value;
 
-use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
-use crate::{ExitCode, ast::DEV_NULL, limits::LimitExceeded, value::to_lines};
+use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
+use crate::{ExitCode, limits::LimitExceeded};
 
 const ECHO_HELP: &str = "-n -e -E";
 
@@ -478,47 +478,11 @@ impl Builtin for Cat {
 
     fn run(
         &self,
-        context: &mut BuiltinContext<'_>,
-        arguments: &[String],
+        _context: &mut BuiltinContext<'_>,
+        _arguments: &[String],
         input: Option<Value>,
     ) -> Result<CommandResult, CommandFailure> {
-        for argument in arguments {
-            if argument.starts_with('-') && argument.len() > 1 {
-                return Err(unsupported_flag("cat", argument, ""));
-            }
-        }
-
-        if arguments.is_empty() {
-            return Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline());
-        }
-
-        let mut values = Vec::new();
-        for name in arguments {
-            if name == DEV_NULL {
-                values.push(Value::Null);
-                continue;
-            }
-            let Some(value) = context.buffers.get(name) else {
-                return Err(CommandFailure::failed(format!(
-                    "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                )));
-            };
-            let text = std::str::from_utf8(value).map_err(|_invalid| {
-                CommandFailure::failed("standard input is not valid UTF-8 text")
-            })?;
-            values.push(Value::String(text.to_owned()));
-        }
-
-        if let [single] = values.as_slice()
-            && !single.is_array()
-        {
-            return Ok(CommandResult::value(
-                values.into_iter().next().unwrap_or(Value::Null),
-            ));
-        }
-        Ok(CommandResult::lines(
-            values.iter().flat_map(to_lines).collect(),
-        ))
+        Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
     }
 }
 
@@ -786,24 +750,15 @@ mod tests {
     }
 
     #[test]
-    fn cat_reads_only_named_in_memory_buffers() {
-        let mut buffers = std::collections::BTreeMap::new();
-        buffers.insert("buf".to_owned(), b"hi".to_vec());
-        let result = run_builtin_with(&Cat, &["buf"], None, Limits::default(), &mut buffers)
-            .expect("cat runs");
-        assert_eq!(result.value, json!("hi"));
-
-        let failure = run_builtin_with(
+    fn cat_without_arguments_preserves_input() {
+        let result = run_builtin_with(
             &Cat,
-            &["/etc/passwd"],
-            None,
+            &[],
+            Some(json!("hi")),
             Limits::default(),
-            &mut buffers,
+            &mut Default::default(),
         )
-        .expect_err("real paths are not buffers");
-        let CommandFailure::Status { message, .. } = failure else {
-            panic!("a missing buffer must stay recoverable");
-        };
-        assert!(message.contains("no such buffer"), "{message}");
+        .expect("cat runs");
+        assert_eq!(result.value, json!("hi"));
     }
 }

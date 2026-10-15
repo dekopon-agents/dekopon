@@ -106,17 +106,26 @@ enum ParsedStream {
 }
 
 impl StreamCommand {
-    fn parse(self, arguments: &[String]) -> Result<ParsedStream, CommandFailure> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Lines(cmd) => cmd.name(),
+            Self::Text(cmd) => cmd.name(),
+            Self::Extra(cmd) => cmd.name(),
+            Self::Jq => "jq",
+        }
+    }
+
+    fn parse(self, arguments: &[String]) -> Result<(ParsedStream, Option<String>), CommandFailure> {
         match self {
             Self::Lines(cmd) => cmd
                 .selection(arguments)
-                .map(|args| ParsedStream::Lines(cmd, args)),
+                .map(|(args, input)| (ParsedStream::Lines(cmd, args), input)),
             Self::Text(cmd) => cmd
                 .parse(arguments)
-                .map(|args| ParsedStream::Text(cmd, args)),
+                .map(|(args, input)| (ParsedStream::Text(cmd, args), input)),
             Self::Extra(cmd) => builtins::text::extra::Operation::parse(cmd, arguments)
-                .map(|args| ParsedStream::Extra(cmd, args)),
-            Self::Jq => builtins::jq::options(arguments).map(ParsedStream::Jq),
+                .map(|(args, input)| (ParsedStream::Extra(cmd, args), input)),
+            Self::Jq => builtins::jq::options(arguments).map(|args| (ParsedStream::Jq(args), None)),
         }
     }
 }
@@ -2406,6 +2415,34 @@ impl<'a> Evaluator<'a> {
         }))
     }
 
+    fn stream_input(
+        &mut self,
+        command: &str,
+        operand: Option<&str>,
+        input: StageInput,
+    ) -> Result<(PipeReader, Option<crate::RetainedBytes>), CommandFailure> {
+        if let Some(name) = operand.filter(|name| *name != "-") {
+            let bytes = self.buffers.get(name).ok_or_else(|| {
+                CommandFailure::failed(format!(
+                    "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
+                ))
+            })?;
+            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
+            return Ok((PipeReader::from_bytes(bytes.clone()), Some(charge)));
+        }
+        Ok((
+            match input {
+                StageInput::Piped(reader) => reader,
+                StageInput::Inherited => self
+                    .stdin
+                    .last_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default(),
+            },
+            None,
+        ))
+    }
+
     fn run_lines(
         &mut self,
         command: StreamCommand,
@@ -2417,8 +2454,8 @@ impl<'a> Evaluator<'a> {
         if literal_help {
             return Ok(Executed::Result(stream_help(command)));
         }
-        let parsed = command.parse(arguments);
-        let parsed = match parsed {
+        let name = command.name();
+        let (parsed, operand) = match command.parse(arguments) {
             Ok(parsed) => parsed,
             Err(failure) => {
                 return Ok(Executed::Result(CommandResult::status(
@@ -2430,13 +2467,13 @@ impl<'a> Evaluator<'a> {
         let mut redirected_bytes = Vec::new();
         let mut redirect_charges = Vec::new();
         let mut utf8_pending = Vec::new();
-        let mut reader = match input {
-            StageInput::Piped(reader) => reader,
-            StageInput::Inherited => self
-                .stdin
-                .last_mut()
-                .map(std::mem::take)
-                .unwrap_or_default(),
+        let (mut reader, _input_charge) = match self.stream_input(name, operand.as_deref(), input) {
+            Ok(selected) => selected,
+            Err(failure) => {
+                return Ok(Executed::Result(CommandResult::status(
+                    self.absorb(failure)?,
+                )));
+            }
         };
         let discard = self.output_discarded();
         let diagnostics = self.diagnostics_redirected();
@@ -2734,7 +2771,6 @@ impl<'a> Evaluator<'a> {
             let mut context = BuiltinContext {
                 invoker: self.invoker,
                 budget: &mut self.budget,
-                buffers: &self.buffers,
                 started_jobs: &self.jobs.started,
             };
             builtin.run(&mut context, arguments, None)

@@ -108,6 +108,15 @@ fn head_closing_a_provider_pipeline_exits_141_upstream_and_eof_reaches_every_sta
 }
 
 #[test]
+fn named_operand_leaves_provider_pipe_unread() {
+    let outcome = Interpreter::new(Limits::default()).run(
+        "printf 'one\\ntwo\\n' > buf; flood | wc -l buf; echo ${PIPESTATUS[@]}",
+        &Processes::default(),
+    );
+    assert_eq!(outcome.output, "2\n141 0", "{outcome:?}");
+}
+
+#[test]
 fn quiet_grep_drops_the_flood_reader_after_the_first_match() {
     let outcome = Interpreter::new(Limits::default()).run(
         "flood | grep -q 'line 0'; echo ${PIPESTATUS[@]}",

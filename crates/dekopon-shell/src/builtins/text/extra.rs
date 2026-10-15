@@ -48,7 +48,7 @@ impl ExtraStream {
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
         self.run_parsed(
-            Operation::parse(self, arguments)?,
+            Operation::parse(self, arguments)?.0,
             reader,
             budget,
             invoker,
@@ -132,7 +132,10 @@ pub(crate) enum CutMode {
 }
 
 impl Operation {
-    pub(crate) fn parse(command: ExtraStream, args: &[String]) -> Result<Self, CommandFailure> {
+    pub(crate) fn parse(
+        command: ExtraStream,
+        args: &[String],
+    ) -> Result<(Self, Option<String>), CommandFailure> {
         let flags: &[(&str, char, &str, bool)] = match command {
             ExtraStream::Cut => &[
                 ("delimiter", 'd', "delimiter", true),
@@ -165,69 +168,79 @@ impl Operation {
             };
             grammar = grammar.arg(arg);
         }
-        let matches = parse_flags(grammar, args, command.name(), command.help())?;
+        let matches = parse_flags(
+            grammar.arg(Arg::new("input")),
+            args,
+            command.name(),
+            command.help(),
+        )?;
         let value = |id| matches.get_one::<String>(id).map(String::as_str);
         let flag = |id| matches.get_flag(id);
-        Ok(match command {
-            ExtraStream::Cut => {
-                let delimiter = match value("delimiter") {
-                    None => '\t',
-                    Some(text) => {
-                        let mut chars = text.chars();
-                        let ch = chars
-                            .next()
-                            .ok_or_else(|| CommandFailure::usage("cut: -d requires a delimiter"))?;
-                        if chars.next().is_some() {
+        Ok((
+            match command {
+                ExtraStream::Cut => {
+                    let delimiter = match value("delimiter") {
+                        None => '\t',
+                        Some(text) => {
+                            let mut chars = text.chars();
+                            let ch = chars.next().ok_or_else(|| {
+                                CommandFailure::usage("cut: -d requires a delimiter")
+                            })?;
+                            if chars.next().is_some() {
+                                return Err(CommandFailure::usage(
+                                    "cut: -d accepts exactly one delimiter character",
+                                ));
+                            }
+                            ch
+                        }
+                    };
+                    let fields = value("fields")
+                        .map(|v| Selection::parse("cut", v))
+                        .transpose()?;
+                    let characters = value("characters")
+                        .map(|v| Selection::parse("cut", v))
+                        .transpose()?;
+                    let mode = match (fields, characters) {
+                        (Some(_), Some(_)) => {
                             return Err(CommandFailure::usage(
-                                "cut: -d accepts exactly one delimiter character",
+                                "cut: -f and -c are mutually exclusive",
                             ));
                         }
-                        ch
-                    }
-                };
-                let fields = value("fields")
-                    .map(|v| Selection::parse("cut", v))
-                    .transpose()?;
-                let characters = value("characters")
-                    .map(|v| Selection::parse("cut", v))
-                    .transpose()?;
-                let mode = match (fields, characters) {
-                    (Some(_), Some(_)) => {
+                        (Some(fields), None) => CutMode::Fields(fields),
+                        (None, Some(characters)) => CutMode::Characters(characters),
+                        (None, None) => {
+                            return Err(CommandFailure::usage("cut: -f or -c is required"));
+                        }
+                    };
+                    Self::Cut { delimiter, mode }
+                }
+                ExtraStream::Uniq => {
+                    let (count, duplicates, unique) =
+                        (flag("count"), flag("duplicates"), flag("unique"));
+                    if duplicates && unique {
                         return Err(CommandFailure::usage(
-                            "cut: -f and -c are mutually exclusive",
+                            "uniq: -d and -u are mutually exclusive",
                         ));
                     }
-                    (Some(fields), None) => CutMode::Fields(fields),
-                    (None, Some(characters)) => CutMode::Characters(characters),
-                    (None, None) => return Err(CommandFailure::usage("cut: -f or -c is required")),
-                };
-                Self::Cut { delimiter, mode }
-            }
-            ExtraStream::Uniq => {
-                let (count, duplicates, unique) =
-                    (flag("count"), flag("duplicates"), flag("unique"));
-                if duplicates && unique {
-                    return Err(CommandFailure::usage(
-                        "uniq: -d and -u are mutually exclusive",
-                    ));
+                    Self::Uniq {
+                        count,
+                        duplicates,
+                        unique,
+                    }
                 }
-                Self::Uniq {
-                    count,
-                    duplicates,
-                    unique,
-                }
-            }
-            ExtraStream::Wc => Self::Wc {
-                lines: flag("lines"),
-                words: flag("words"),
-                bytes: flag("bytes"),
+                ExtraStream::Wc => Self::Wc {
+                    lines: flag("lines"),
+                    words: flag("words"),
+                    bytes: flag("bytes"),
+                },
+                ExtraStream::Sort => Self::Sort {
+                    reverse: flag("reverse"),
+                    numeric: flag("numeric"),
+                    unique: flag("unique"),
+                },
             },
-            ExtraStream::Sort => Self::Sort {
-                reverse: flag("reverse"),
-                numeric: flag("numeric"),
-                unique: flag("unique"),
-            },
-        })
+            matches.get_one::<String>("input").cloned(),
+        ))
     }
 }
 

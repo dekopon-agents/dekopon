@@ -21,7 +21,7 @@ pub(crate) struct GrepConfig {
 }
 
 impl GrepConfig {
-    pub(crate) fn parse(arguments: &[String]) -> Result<Self, CommandFailure> {
+    pub(crate) fn parse(arguments: &[String]) -> Result<(Self, Option<String>), CommandFailure> {
         let mut grammar = Command::new("grep");
         for (id, short, long) in [
             ("invert", 'v', "invert-match"),
@@ -46,7 +46,9 @@ impl GrepConfig {
             grammar = grammar.arg(Arg::new(id).short(short).long(long).num_args(1));
         }
         let matches = parse_flags(
-            grammar.arg(Arg::new("pattern").required(true)),
+            grammar
+                .arg(Arg::new("pattern").required(true))
+                .arg(Arg::new("input")),
             arguments,
             "grep",
             super::stream::TextStream::Grep.help(),
@@ -69,23 +71,26 @@ impl GrepConfig {
                 context
             })
         };
-        Ok(Self {
-            mode: match (matches.get_flag("quiet"), matches.get_flag("count")) {
-                (true, _) => GrepMode::Quiet,
-                (false, true) => GrepMode::Count,
-                (false, false) => GrepMode::Lines,
+        Ok((
+            Self {
+                mode: match (matches.get_flag("quiet"), matches.get_flag("count")) {
+                    (true, _) => GrepMode::Quiet,
+                    (false, true) => GrepMode::Count,
+                    (false, false) => GrepMode::Lines,
+                },
+                before: side("before")?,
+                after: side("after")?,
+                invert: matches.get_flag("invert"),
+                number: matches.get_flag("number"),
+                pattern: Pattern::compile(
+                    "grep",
+                    pattern,
+                    matches.get_flag("ignore"),
+                    matches.get_flag("extended"),
+                )?,
             },
-            before: side("before")?,
-            after: side("after")?,
-            invert: matches.get_flag("invert"),
-            number: matches.get_flag("number"),
-            pattern: Pattern::compile(
-                "grep",
-                pattern,
-                matches.get_flag("ignore"),
-                matches.get_flag("extended"),
-            )?,
-        })
+            matches.get_one::<String>("input").cloned(),
+        ))
     }
 
     pub(crate) fn selects(

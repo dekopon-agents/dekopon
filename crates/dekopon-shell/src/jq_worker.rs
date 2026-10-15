@@ -45,18 +45,6 @@ fn serve() -> Result<(), super::builtins::jq::WorkerFailure> {
         serde_json::from_str(&header).map_err(|error| {
             WorkerFailure::Failed(format!("jq: invalid worker request: {error}"))
         })?;
-    if bindings
-        .iter()
-        .any(|(name, _)| !super::builtins::jq::valid_name(name))
-        || bindings
-            .iter()
-            .enumerate()
-            .any(|(i, (name, _))| bindings[..i].iter().any(|(previous, _)| previous == name))
-    {
-        return Err(WorkerFailure::Failed(
-            "jq: invalid worker request: bindings".into(),
-        ));
-    }
     let documents = serde_json::Deserializer::from_reader(stdin).into_iter::<Val>();
     let input: Box<dyn Iterator<Item = Result<Val, serde_json::Error>>> = if slurp {
         Box::new(documents.take(1))

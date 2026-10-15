@@ -49,6 +49,7 @@ fn request_header(
         .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
     let charge = budget.charge_value_bytes(header.len() as u64)?;
     drop(std::mem::take(&mut opts.bindings));
+    drop(std::mem::take(&mut opts.filter));
     Ok((header, charge))
 }
 
@@ -85,7 +86,9 @@ pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
     if let Some(values) = matches.get_many::<String>("arg") {
         for (name, value) in values.clone().zip(values.skip(1)).step_by(2) {
             if !valid_name(name) {
-                return Err(CommandFailure::usage("jq: invalid --arg name"));
+                return Err(CommandFailure::usage(format!(
+                    "jq: invalid --arg name {name:?}"
+                )));
             }
             bindings.retain(|(old, _)| old != name);
             bindings.push((name.clone(), value.clone()));
