@@ -1345,6 +1345,13 @@ fn split_indicators(
         let indicators = resident
             .remove("indicators")
             .filter(|value| !value.is_null());
+        if resident
+            .get("maxConcurrent")
+            .and_then(serde_yaml::Value::as_u64)
+            == u64::try_from(SessionsConfig::default().max_concurrent).ok()
+        {
+            resident.remove("maxConcurrent");
+        }
         return (Some(serde_yaml::Value::Mapping(resident)), indicators);
     }
     let Some(items) = value.as_sequence() else {

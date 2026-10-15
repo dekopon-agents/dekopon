@@ -270,6 +270,18 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
         before.changes(&equivalent).unwrap(),
         config::GatewayChanges::default()
     );
+    edited["sessions"]["maxConcurrent"] = json!(config::SessionsConfig::default().max_concurrent);
+    write_config(root.path(), &edited);
+    let explicit_default = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert_eq!(
+        before.changes(&explicit_default).unwrap(),
+        config::GatewayChanges::default()
+    );
     edited["futureLive"] = json!(true);
     write_config(root.path(), &edited);
     let unknown = config::GatewaySources {
@@ -327,6 +339,83 @@ async fn instruction_source_change_is_part_of_the_prepared_catalog_snapshot() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn catalog_snapshot_refuses_sources_changed_after_catalog_load() {
+    for changed in [
+        "instructions",
+        "skill",
+        "resource",
+        "new resource",
+        "new catalog file",
+    ] {
+        let root = temporary();
+        let directory = root.path().join("catalog");
+        fs::create_dir(&directory).unwrap();
+        let skill = mounted_skill(&directory.join("skills"), "counting");
+        let text = catalog_text(true, Some("reasoning")).replace(
+            "instructions: Answer briefly and never claim authority.",
+            "instructionsFile: instructions.txt",
+        );
+        fs::write(
+            directory.join("agent.yaml"),
+            format!("{text}  skills:\n    - skills/counting\n"),
+        )
+        .unwrap();
+        let instructions = directory.join("instructions.txt");
+        fs::write(&instructions, "original instructions").unwrap();
+        let catalog = LocalCatalog::load(&directory).unwrap();
+        match changed {
+            "instructions" => fs::write(&instructions, "new instructions").unwrap(),
+            "skill" => fs::write(
+                skill.source().join("SKILL.md"),
+                format!(
+                    "{}\nNew body.\n",
+                    fs::read_to_string(skill.source().join("SKILL.md")).unwrap()
+                ),
+            )
+            .unwrap(),
+            "resource" => fs::write(
+                skill.source().join("references/table.md"),
+                "changed resource",
+            )
+            .unwrap(),
+            "new resource" => fs::write(
+                skill.source().join("references/more.md"),
+                "another resource",
+            )
+            .unwrap(),
+            "new catalog file" => fs::write(
+                directory.join("second.yaml"),
+                text.replace("name: reviewer", "name: second"),
+            )
+            .unwrap(),
+            _ => unreachable!("test cases are closed"),
+        }
+        assert!(
+            matches!(
+                config::source_snapshot(&directory, Some(&catalog), crate::current_uid()).await,
+                Err(ConfigError::ChangedDuringLoad)
+            ),
+            "{changed}"
+        );
+        let repaired = LocalCatalog::load(&directory).unwrap();
+        let snapshot = config::source_snapshot(&directory, Some(&repaired), crate::current_uid())
+            .await
+            .unwrap();
+        let id = "reviewer".parse().unwrap();
+        assert_eq!(
+            snapshot.0.get(&instructions).map(Vec::as_slice),
+            repaired
+                .agent(&id)
+                .unwrap()
+                .spec
+                .instructions
+                .as_ref()
+                .map(String::as_bytes)
+        );
+    }
 }
 
 #[tokio::test]
