@@ -504,34 +504,41 @@ async fn a_changed_gateway_source_permission_or_missing_file_cannot_prepare() {
 }
 
 #[tokio::test]
-async fn regular_gateway_sources_allow_root_only_on_read_only_mounts() {
-    let uid = crate::current_uid();
-    assert_eq!(config::gateway_regular_owner(0, 65533, true), 0);
-    assert_eq!(config::gateway_regular_owner(0, 65533, false), 65533);
-    assert_eq!(config::gateway_regular_owner(65533, 65533, false), 65533);
-
+async fn regular_gateway_source_read_checks_injected_root_and_mount_ownership() {
     let root = temporary();
     let path = write_config(root.path(), &document(root.path()));
-    assert!(
-        !config::read_config_file(path.clone(), uid)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let bytes = fs::read(&path).unwrap();
+    let uid = crate::current_uid();
+    let read_as = |owner, read_only| {
+        config::read_gateway_regular_file_at(
+            &path,
+            65533,
+            owner,
+            read_only,
+            |file, accepted_uid, tier, maximum| {
+                assert_eq!(accepted_uid, owner);
+                dekopon_core::read_trusted_file(file, uid, tier, maximum)
+            },
+        )
+    };
+    assert_eq!(read_as(0, true).unwrap(), bytes);
     assert!(matches!(
-        config::read_config_file(path.clone(), uid + 1).await,
-        Err(ConfigError::InsecureFile {
-            source: dekopon_core::FileHygieneError::WrongOwner { .. },
+        read_as(0, false),
+        Err(dekopon_core::FileHygieneError::WrongOwner {
+            owner: 0,
+            expected: 65533,
             ..
         })
     ));
+    assert_eq!(read_as(65533, false).unwrap(), bytes);
+    assert_eq!(
+        config::read_config_file(path.clone(), uid).await.unwrap(),
+        bytes
+    );
     fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
     assert!(matches!(
-        config::read_config_file(path, uid).await,
-        Err(ConfigError::InsecureFile {
-            source: dekopon_core::FileHygieneError::InsecureMode { .. },
-            ..
-        })
+        read_as(0, true),
+        Err(dekopon_core::FileHygieneError::InsecureMode { .. })
     ));
 }
 

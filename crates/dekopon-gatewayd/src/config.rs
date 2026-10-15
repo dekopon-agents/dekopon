@@ -1647,12 +1647,31 @@ pub(crate) fn read_gateway_projection_with(
     Ok(bytes)
 }
 
-pub(crate) fn gateway_regular_owner(observed: u32, expected_uid: u32, read_only: bool) -> u32 {
-    if observed == 0 && read_only {
+pub(crate) fn read_gateway_regular_file_at(
+    path: &Path,
+    expected_uid: u32,
+    observed: u32,
+    read_only: bool,
+    read: impl FnOnce(&Path, u32, FileTier, usize) -> Result<Vec<u8>, FileHygieneError>,
+) -> Result<Vec<u8>, FileHygieneError> {
+    let owner = if observed == 0 && read_only {
         0
     } else {
         expected_uid
+    };
+    if owner != observed {
+        return Err(FileHygieneError::WrongOwner {
+            path: path.to_path_buf(),
+            owner: observed,
+            expected: expected_uid,
+        });
     }
+    read(
+        path,
+        owner,
+        FileTier::NotWorldWritable,
+        HARD_MAX_CONFIG_BYTES,
+    )
 }
 
 #[expect(
@@ -1699,12 +1718,7 @@ pub(crate) async fn read_config_file(
         } else {
             false
         };
-        read_trusted_file(
-            &owned,
-            gateway_regular_owner(observed, expected_uid, read_only),
-            FileTier::NotWorldWritable,
-            HARD_MAX_CONFIG_BYTES,
-        )
+        read_gateway_regular_file_at(&owned, expected_uid, observed, read_only, read_trusted_file)
     })
     .await
     .map_err(|join| ConfigError::Read {
