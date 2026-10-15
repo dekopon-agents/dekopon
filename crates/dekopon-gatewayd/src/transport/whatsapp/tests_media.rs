@@ -493,7 +493,7 @@ async fn identity_and_base64_outputs_at_the_decoded_ceiling_upload_identical_byt
 }
 
 #[tokio::test]
-async fn identity_and_base64_outputs_one_decoded_byte_over_refuse_before_any_upload_or_text() {
+async fn oversized_images_and_mp4_refuse_before_any_whatsapp_upload_or_text() {
     use dekopon_broker_protocol::AssetEncoding;
     let mut bytes = PNG.to_vec();
     bytes.resize(media::MAX_IMAGE_BYTES + 1, 0);
@@ -513,6 +513,22 @@ async fn identity_and_base64_outputs_one_decoded_byte_over_refuse_before_any_upl
             matches!(error, TransportError::Service { ref code } if code == "image-too-large"),
             "{error:?}"
         );
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
+
+    {
+        let peer = MediaPeer::new(|_, _| panic!("MP4 must not reach Meta")).await;
+        let image = GeneratedImage::new(
+            dekopon_model::asset::DiskBlob::from_bytes(b"mp4\0frames").unwrap(),
+            "video/mp4".into(),
+            dekopon_broker_protocol::AssetEncoding::Identity,
+        );
+        let error = driver(&peer.origin)
+            .reply(&target(), OutboundReply::with_images("clip", vec![image]))
+            .await
+            .expect_err("photo-only adapter refuses MP4");
+        assert!(matches!(error, TransportError::AssetType { .. }));
         assert!(peer.requests.lock().is_empty());
         peer.finish().await;
     }

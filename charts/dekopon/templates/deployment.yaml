@@ -431,10 +431,18 @@ spec:
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+{{- if .Values.gateway.proxy.enabled }}
+          ports:
+            - name: vm-proxy
+              containerPort: {{ .Values.gateway.proxy.port }}
+              protocol: TCP
+{{- end }}
 {{- if .Values.gateway.service.enabled }}
           # The chart cannot parse an existing gatewayd.yaml. Keep this port equal to the
           # WhatsApp transport's non-loopback bind port or the readiness probe fails closed.
+{{- if not .Values.gateway.proxy.enabled }}
           ports:
+{{- end }}
             - name: webhook
               containerPort: {{ .Values.gateway.service.port }}
               protocol: TCP
@@ -482,6 +490,11 @@ spec:
             - name: state
               mountPath: {{ .Values.gateway.wakes.mountPath }}
               subPath: {{ .Values.gateway.wakes.subdir }}
+{{- end }}
+{{- if .Values.gateway.proxy.enabled }}
+            - name: proxy-tls
+              mountPath: /etc/dekopon-proxy-tls
+              readOnly: true
 {{- end }}
             - name: gateway-tmp
               mountPath: /tmp
@@ -581,6 +594,11 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.config }}
+{{- if .Values.gateway.proxy.enabled }}
+        - name: proxy-tls
+          secret:
+            secretName: {{ .Values.gateway.proxy.tlsSecret }}
+{{- end }}
         # Chat payload leases use private scratch files, not pod memory.
         - name: gateway-tmp
           emptyDir:

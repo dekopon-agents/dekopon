@@ -43,6 +43,7 @@ impl GeneratedImage {
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
             "image/gif" => "gif",
+            "video/mp4" => "mp4",
             "text/plain" => "txt",
             "application/pdf" => "pdf",
             _ => "bin",
@@ -552,6 +553,69 @@ mod tests {
         assert_eq!(
             input_total(usize::MAX, 1),
             Err(ChatAssetRefusal::ByteBudget)
+        );
+    }
+
+    #[test]
+    fn an_authorized_mp4_send_keeps_its_name_and_bytes() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        struct Store;
+        impl GeneratedAssetStore for Store {
+            fn register(
+                &self,
+                _: OwnedFd,
+                _: &NewAsset,
+                _: &str,
+                _: &str,
+            ) -> Result<u64, BlobError> {
+                unreachable!()
+            }
+            fn remove(&self, _: u64) -> Result<(), BlobError> {
+                unreachable!()
+            }
+            fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError> {
+                assert_eq!(id, 7);
+                Ok(Some(GeneratedImage::new(
+                    DiskBlob::from_bytes(b"mp4\0frames")?,
+                    "video/mp4".into(),
+                    AssetEncoding::Identity,
+                )))
+            }
+            fn delivery_failed(&self) {}
+        }
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        {
+            let queue = ReplyAttachments::new(1, Arc::new(Store), "local".into());
+            assert!(
+                queue
+                    .receive(vec![], vec![], vec![], vec![], "", "")
+                    .is_empty()
+            );
+            assert!(queue.take().is_empty(), "attachment alone is not a send");
+            queue.receive(vec![], vec![], vec![], vec![7], "", "");
+            let images = queue.take();
+            assert_eq!(images[0].filename(0), "asset-1.mp4");
+            assert_eq!(images[0].media_type(), "video/mp4");
+            assert_eq!(images[0].bytes().unwrap(), b"mp4\0frames");
+            queue.finish(AssetDeliveryDisposition::Delivered);
+        }
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[
+                        ("audit.event", "agent.asset.send"),
+                        ("transport", "local"),
+                        ("dispatched", "true")
+                    ]
+                )
+                .len(),
+            1
         );
     }
 

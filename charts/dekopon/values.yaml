@@ -477,6 +477,13 @@ gateway:
     port: 9080
     annotations: {}
 
+  # Private mTLS listener for VM model traffic. The daemon's proxy.bind must use the same port.
+  # The Secret contains tls.crt, tls.key and ca.crt; it is not projected into the broker.
+  proxy:
+    enabled: false
+    port: 9090
+    tlsSecret: ""
+
 # ---------------------------------------------------------------------------------------------
 # Configuration check
 # ---------------------------------------------------------------------------------------------

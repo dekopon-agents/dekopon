@@ -197,6 +197,17 @@ UID and `validate_owned_file` compares a provider's owner against the broker's o
 value makes every provider fail to load, which fails startup. The chart refuses to render when
 the broker UID/GID is changed, even with a custom image. Gateway container UID/GID is pinned separately; shared `securityContext` cannot override either identity.
 
+### Private VM proxy Service
+
+`gateway.proxy.enabled: true` adds a private ClusterIP port (`gateway.proxy.port`, default
+9090) and mounts `gateway.proxy.tlsSecret` read-only at `/etc/dekopon-proxy-tls` in the gateway
+and the gateway config-check container. The Secret must contain `tls.crt`, `tls.key`, and
+`ca.crt`; daemon `proxy.tls` must name those paths and `proxy.bind` must use the same port
+on a non-loopback address. The chart refuses enablement without a Secret or, for inline daemon
+configuration, without a `proxy:` block. For opaque ConfigMaps the daemon's candidate check
+loads the TLS files and refuses missing or invalid proxy configuration; the chart cannot inspect
+those bytes. The broker never mounts this Secret. No Ingress or external route is created.
+
 ## Paths the chart owns
 
 Your `broker.yaml` and `gatewayd.yaml` must name files inside these directories. The chart places

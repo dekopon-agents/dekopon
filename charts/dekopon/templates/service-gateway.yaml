@@ -1,5 +1,5 @@
 {{- include "dekopon.validate" . -}}
-{{- if .Values.gateway.service.enabled }}
+{{- if or .Values.gateway.service.enabled .Values.gateway.proxy.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -15,9 +15,18 @@ spec:
   selector:
     {{- include "dekopon.selectorLabels" . | nindent 4 }}
   ports:
+{{- if .Values.gateway.service.enabled }}
     - name: webhook
       port: {{ .Values.gateway.service.port }}
       targetPort: webhook
       protocol: TCP
       appProtocol: http
+{{- end }}
+{{- if .Values.gateway.proxy.enabled }}
+    - name: vm-proxy
+      port: {{ .Values.gateway.proxy.port }}
+      targetPort: vm-proxy
+      protocol: TCP
+      appProtocol: https
+{{- end }}
 {{- end }}

@@ -205,6 +205,11 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+{{- if .Values.gateway.proxy.enabled }}
+            - name: proxy-tls
+              mountPath: /etc/dekopon-proxy-tls
+              readOnly: true
+{{- end }}
 {{- if $skills }}
             - name: skills
               mountPath: {{ .Values.paths.skillsDir }}
@@ -212,6 +217,11 @@ spec:
 {{- end }}
 {{- end }}
       volumes:
+{{- if and $check.gateway.configMap .Values.gateway.proxy.enabled }}
+        - name: proxy-tls
+          secret:
+            secretName: {{ .Values.gateway.proxy.tlsSecret }}
+{{- end }}
         - name: check
           emptyDir:
             medium: Memory
