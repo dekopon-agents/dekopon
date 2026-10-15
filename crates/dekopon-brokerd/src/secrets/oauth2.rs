@@ -1,11 +1,13 @@
 use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use dekopon_core::{
-    FileHygieneError, FileTier, Redacted, private_file::PrivateFileLock, read_trusted_file,
+    FileHygieneError, FileTier, Redacted, SecretDrn, private_file::PrivateFileLock,
+    read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -76,16 +78,19 @@ impl OAuth2Record {
 
 struct OpenedRecord {
     lock: PrivateFileLock,
-    record: OAuth2Record,
+    record: Option<OAuth2Record>,
 }
 
-struct RefreshInputs {
-    path: PathBuf,
-    endpoint: String,
-    client_id: String,
-    timeout: Duration,
-    uid: u32,
-    client: reqwest::Client,
+pub(super) struct RefreshInputs {
+    pub(super) credential: Option<SecretDrn>,
+    pub(super) path: PathBuf,
+    pub(super) seed_path: Option<PathBuf>,
+    pub(super) endpoint: String,
+    pub(super) client_id: String,
+    pub(super) timeout: Duration,
+    pub(super) uid: u32,
+    pub(super) client: reqwest::Client,
+    pub(super) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,14 +174,42 @@ impl RefreshResult {
     }
 }
 
-pub(super) async fn resolve(
-    path: &Path,
-    endpoint: &str,
-    client_id: &str,
-    timeout_ms: u64,
+pub(super) struct OAuth2Source<'a> {
+    pub(super) path: &'a Path,
+    pub(super) seed_path: Option<&'a Path>,
+    pub(super) endpoint: &'a str,
+    pub(super) client_id: &'a str,
+    pub(super) timeout_ms: u64,
+}
+
+pub(super) async fn resolve_for(
+    credential: Option<&SecretDrn>,
+    source: OAuth2Source<'_>,
     uid: u32,
     client: &reqwest::Client,
 ) -> Result<Vec<u8>, SourceError> {
+    let OAuth2Source {
+        path,
+        seed_path,
+        endpoint,
+        client_id,
+        timeout_ms,
+    } = source;
+    resolve_with_clock(RefreshInputs {
+        credential: credential.cloned(),
+        path: path.to_path_buf(),
+        seed_path: seed_path.map(Path::to_path_buf),
+        endpoint: endpoint.to_owned(),
+        client_id: client_id.to_owned(),
+        timeout: Duration::from_millis(timeout_ms),
+        uid,
+        client: client.clone(),
+        clock: Arc::new(now_seconds),
+    })
+    .await
+}
+
+pub(super) async fn resolve_with_clock(inputs: RefreshInputs) -> Result<Vec<u8>, SourceError> {
     let span = tracing::Span::current();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     #[expect(
@@ -184,19 +217,9 @@ pub(super) async fn resolve(
         reason = "owner: the broker request awaits the handle; bound: one refresh per authorized resolution, with a bounded HTTP deadline; the task must persist a spent rotation even if the caller drops"
     )]
     let task = tokio::task::spawn(
-        run(
-            RefreshInputs {
-                path: path.to_path_buf(),
-                endpoint: endpoint.to_owned(),
-                client_id: client_id.to_owned(),
-                timeout: Duration::from_millis(timeout_ms),
-                uid,
-                client: client.clone(),
-            },
-            span.clone(),
-        )
-        .instrument(span)
-        .with_subscriber(dispatch),
+        run(inputs, span.clone())
+            .instrument(span)
+            .with_subscriber(dispatch),
     );
     task.await
         .map_err(|source| classified(SourceError::Internal, &source))?
@@ -205,7 +228,16 @@ pub(super) async fn resolve(
 fn read_locked(path: PathBuf, uid: u32) -> Result<OpenedRecord, SourceError> {
     let lock = PrivateFileLock::acquire(&path)
         .map_err(|error| classified(SourceError::Io, &error.source))?;
-    let record = read_record(&path, uid)?;
+    let record = match read_record(&path, uid) {
+        Ok(record) => Some(record),
+        Err(SourceError::Io)
+            if std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
     Ok(OpenedRecord { lock, record })
 }
 
@@ -269,16 +301,9 @@ fn read_record(path: &Path, uid: u32) -> Result<OAuth2Record, SourceError> {
 }
 
 async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, SourceError> {
-    let RefreshInputs {
-        path,
-        endpoint,
-        client_id,
-        timeout,
-        uid,
-        client,
-    } = inputs;
     let started = std::time::Instant::now();
-    let locked_path = path.clone();
+    let locked_path = inputs.path.clone();
+    let uid = inputs.uid;
     let read_span = span.clone();
     let read_dispatch = tracing::dispatcher::get_default(Clone::clone);
     let outcome = match tokio::task::spawn_blocking(move || {
@@ -288,7 +313,7 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
     })
     .await
     {
-        Ok(Ok(opened)) => refresh(opened, path, endpoint, client_id, timeout, client)
+        Ok(Ok(opened)) => refresh(opened, inputs)
             .await
             .and_then(RefreshResult::checked),
         Ok(Err(error)) => Err(error),
@@ -337,41 +362,126 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
 
 async fn refresh(
     opened: OpenedRecord,
-    path: PathBuf,
-    endpoint: String,
-    client_id: String,
-    timeout: Duration,
-    client: reqwest::Client,
+    inputs: RefreshInputs,
 ) -> Result<RefreshResult, SourceError> {
-    let OAuth2Record::Live {
-        access,
-        refresh: predecessor,
-        expires_at,
-        last_refresh,
-        adopted_seed_sha256,
-        ..
-    } = opened.record
-    else {
-        return Err(SourceError::ReauthorizationRequired);
+    let RefreshInputs {
+        credential,
+        path,
+        seed_path,
+        endpoint,
+        client_id,
+        timeout,
+        uid,
+        client,
+        clock,
+    } = inputs;
+    let seed = match seed_path {
+        Some(seed_path) => match tokio::fs::symlink_metadata(&seed_path).await {
+            Ok(_) => Some(super::read_token(&seed_path, uid).await?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(classified(SourceError::Io, &error)),
+        },
+        None => None,
     };
-    if now_seconds() < expires_at.saturating_sub(60) {
-        return Ok(RefreshResult::NotDue(OAuth2Record::Live {
-            version: 2,
-            access,
-            refresh: predecessor,
-            expires_at,
-            last_refresh,
+    let digest = seed
+        .as_ref()
+        .map(|value| super::hex_sha256(value.expose().as_bytes()));
+    let previous_digest = opened.record.as_ref().and_then(|record| match record {
+        OAuth2Record::Live {
             adopted_seed_sha256,
-        }));
-    }
-    let sent_at = now_seconds();
-    let replacement = post(&client, &endpoint, &client_id, &predecessor, timeout).await?;
-    let next_refresh = replacement.refresh_token.as_ref().unwrap_or(&predecessor);
-    let reflected = super::bootstrap_reflected(
+            ..
+        }
+        | OAuth2Record::Sealed {
+            adopted_seed_sha256,
+            ..
+        } => adopted_seed_sha256.as_ref(),
+    });
+    let adopt = seed.is_some() && digest.as_ref() != previous_digest;
+    let (predecessor, adopted_seed_sha256) = if adopt {
+        (seed.as_ref().ok_or(SourceError::Missing)?, digest)
+    } else {
+        let Some(OAuth2Record::Live {
+            access,
+            refresh,
+            expires_at,
+            ..
+        }) = opened.record.as_ref()
+        else {
+            return Err(if opened.record.is_some() {
+                SourceError::ReauthorizationRequired
+            } else {
+                SourceError::Missing
+            });
+        };
+        if clock() < expires_at.saturating_sub(60) {
+            if super::bootstrap_reflected(
+                access.expose().as_bytes(),
+                &[
+                    refresh.expose(),
+                    seed.as_ref().map_or("", |value| value.expose()),
+                ],
+            ) {
+                save_record(
+                    &path,
+                    opened.lock,
+                    &OAuth2Record::Sealed {
+                        version: 2,
+                        since: clock(),
+                        cause: SealCause::BootstrapReflected,
+                        adopted_seed_sha256: previous_digest.cloned(),
+                    },
+                )
+                .await?;
+                tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = clock(), cause = "bootstrap-reflected", instruction = "provide a new seed" }, "OAuth refresh sealed");
+                return Err(SourceError::BootstrapReflected);
+            }
+            return Ok(RefreshResult::NotDue(
+                opened.record.ok_or(SourceError::Missing)?,
+            ));
+        }
+        (refresh, previous_digest.cloned())
+    };
+    let sent_at = clock();
+    let replacement = match post(&client, &endpoint, &client_id, predecessor, timeout).await {
+        Ok(value) => value,
+        Err(SourceError::ReauthorizationRequired) => {
+            save_record(
+                &path,
+                opened.lock,
+                &OAuth2Record::Sealed {
+                    version: 2,
+                    since: sent_at,
+                    cause: SealCause::ReauthorizationRequired,
+                    adopted_seed_sha256,
+                },
+            )
+            .await?;
+            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "reauthorization-required", instruction = "provide a new seed" }, "OAuth refresh sealed");
+            return Err(SourceError::ReauthorizationRequired);
+        }
+        Err(error) => return Err(error),
+    };
+    let next_refresh = replacement.refresh_token.as_ref().unwrap_or(predecessor);
+    if super::bootstrap_reflected(
         replacement.access_token.expose().as_bytes(),
-        &[predecessor.expose(), next_refresh.expose()],
-    );
-    if reflected {
+        &[
+            predecessor.expose(),
+            next_refresh.expose(),
+            seed.as_ref().map_or("", |value| value.expose()),
+        ],
+    ) {
+        save_record(
+            &path,
+            opened.lock,
+            &OAuth2Record::Sealed {
+                version: 2,
+                since: sent_at,
+                cause: SealCause::BootstrapReflected,
+                adopted_seed_sha256,
+            },
+        )
+        .await?;
+        tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "bootstrap-reflected", instruction = "provide a new seed" }, "OAuth refresh sealed");
         return Err(SourceError::BootstrapReflected);
     }
     let expires_at = sent_at
@@ -392,36 +502,37 @@ async fn refresh(
     if bytes.len() > RECORD_BYTES {
         return Err(SourceError::Malformed);
     }
-    let record_path = path.clone();
-    let save_span = tracing::Span::current();
-    let save_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    save_bytes(&path, opened.lock, bytes).await?;
+    Ok(RefreshResult::Refreshed(record))
+}
+
+async fn save_record(
+    path: &Path,
+    lock: PrivateFileLock,
+    record: &OAuth2Record,
+) -> Result<(), SourceError> {
+    let bytes = serde_json::to_vec(record).map_err(|_source| SourceError::Malformed)?;
+    save_bytes(path, lock, bytes).await
+}
+
+async fn save_bytes(path: &Path, lock: PrivateFileLock, bytes: Vec<u8>) -> Result<(), SourceError> {
+    if bytes.len() > RECORD_BYTES {
+        return Err(SourceError::Malformed);
+    }
+    let path = path.to_path_buf();
     let saved = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&save_dispatch, || {
-            save_span.in_scope(|| {
-                let _lock = opened.lock;
-                drop(dekopon_core::private_file::sweep_stale_temporaries(
-                    &path, None,
-                ));
-                dekopon_core::private_file::replace_private_file(&path, &bytes)
-            })
-        })
+        let _lock = lock;
+        drop(dekopon_core::private_file::sweep_stale_temporaries(
+            &path, None,
+        ));
+        dekopon_core::private_file::replace_private_file(&path, &bytes)
     })
     .await
-    .map_err(|source| classified(SourceError::Internal, &source))?;
-    match saved {
-        Ok(()) => Ok(RefreshResult::Refreshed(record)),
-        Err(error) => {
-            tracing::error!(
-                name: "broker.credential.refresh_save_failed",
-                target: "credential",
-                record_path = %record_path.display(),
-                failed_path = %error.path.display(),
-                error = %error.source,
-                "OAuth refresh succeeded but the record could not be saved"
-            );
-            Ok(RefreshResult::Refreshed(record))
-        }
-    }
+    .map_err(|_source| SourceError::Internal)?;
+    saved.map_err(|_source| {
+        tracing::error!(name: "broker.credential.refresh_save_failed", target: "credential", event = "broker.credential.refresh_save_failed", "OAuth refresh record could not be saved");
+        SourceError::Io
+    })
 }
 
 async fn post(
@@ -474,9 +585,10 @@ async fn post(
                 .map_err(|source| classified(SourceError::Malformed, &source))?;
             ValidatedTokenResponse::try_from(parsed)
         } else if status.is_client_error() {
-            let response: ErrorResponse = serde_json::from_slice(&body)
-                .map_err(|source| classified(SourceError::Malformed, &source))?;
-            if crate::credentials::REAUTHORIZATION_CODES.contains(&response.error.as_str()) {
+            let response: Option<ErrorResponse> = serde_json::from_slice(&body).ok();
+            if response.as_ref().is_some_and(|value| {
+                crate::credentials::REAUTHORIZATION_CODES.contains(&value.error.as_str())
+            }) {
                 Err(SourceError::ReauthorizationRequired)
             } else {
                 Err(SourceError::Rejected)
