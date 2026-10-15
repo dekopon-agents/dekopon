@@ -739,13 +739,7 @@ mod tests {
             &'static str,
             &'static str,
         );
-        let cases: [FailureCase; 3] = [
-            (
-                || InferenceError::DeadlineExceeded,
-                "deadline-exceeded",
-                "failed",
-                "estimated",
-            ),
+        let cases: [FailureCase; 2] = [
             (
                 || InferenceError::Cancelled,
                 "cancelled",
@@ -793,6 +787,49 @@ mod tests {
             assert_eq!(charge.field("usage.input_tokens"), Some(input.as_str()));
             assert_eq!(charge.field("usage.output_tokens"), Some("0"));
         }
+    }
+
+    struct TimedOutModel;
+
+    impl ChatModel for TimedOutModel {
+        fn complete(
+            &self,
+            _: &[ModelMessage],
+            _: &[ModelTool],
+            _: &CompletionOptions,
+            _: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
+            let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    Err(InferenceError::DeadlineExceeded)
+                }
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    unreachable!("sender remains held until return")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_timed_out_model_call_charges_its_deadline_kind() {
+        let capture = CaptureLayer::new();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let metering = metering(LIMIT);
+        let error = ask(&governed(Arc::new(TimedOutModel), &metering)).unwrap_err();
+        assert!(matches!(error, InferenceError::DeadlineExceeded));
+        let charges = capture.events_where("meter", &[("message", "model call charged")]);
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0].field("error.kind"), Some("deadline-exceeded"));
+        assert_eq!(charges[0].field("outcome"), Some("failed"));
+        assert_eq!(charges[0].field("usage.source"), Some("estimated"));
+        assert_eq!(
+            charges[0].field("usage.input_tokens"),
+            Some(used(&metering).to_string().as_str())
+        );
+        assert_eq!(charges[0].field("usage.output_tokens"), Some("0"));
     }
 
     #[test]
