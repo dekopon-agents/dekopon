@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.46.3] - 2026-10-15
+
+### Fixed
+
+- Compressed HTTP/2 provider responses no longer fail with "response carries bytes after its encoded body" when the server ends the stream with an empty DATA frame.
+
 ## [0.46.2] - 2026-10-15
 
 ### Changed
