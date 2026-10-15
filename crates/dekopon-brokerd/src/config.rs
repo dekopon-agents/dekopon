@@ -302,6 +302,12 @@ enum Disposition {
     Restart,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Resident {
+    Storage,
+    Assets,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConfigSnapshot(BTreeMap<&'static str, (Disposition, serde_yaml::Value)>);
 
@@ -430,6 +436,14 @@ impl ConfigSnapshot {
             (Disposition::Restart, serde_yaml::Value::Sequence(bundles)),
         );
         Ok(())
+    }
+
+    pub(crate) fn keeps(&self, next: &Self, resident: Resident) -> bool {
+        let category = match resident {
+            Resident::Storage => "storage",
+            Resident::Assets => "assets",
+        };
+        self.0.get(category).map(|(_, value)| value) == next.0.get(category).map(|(_, value)| value)
     }
 
     pub(crate) fn restart_required(&self, next: &Self) -> Vec<&'static str> {

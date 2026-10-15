@@ -1743,7 +1743,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
 
     document["serverLimits"] = json!({"maxConnections": 12});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active)).await;
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
@@ -1752,14 +1752,14 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     document.as_object_mut().unwrap().remove("serverLimits");
     write_config(&path, &document);
     write_owner_only(&root.path().join("cli-probe.wasm"), b"not a component");
-    let (rejected, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active)).await;
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::RestartRequired { categories } if categories == &["providers"])));
     write_owner_only(&root.path().join("cli-probe.wasm"), &component);
 
     write_owner_only(&cedar, b"not cedar");
-    let (rejected, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active)).await;
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -1772,7 +1772,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     write_owner_only(&cedar, format!("{POLICIES}\n@id(\"unrecognized\") permit(principal in Dekopon::Group::\"strangers\", action, resource);\n").as_bytes());
     document["capabilities"]["cli-probe"]["constraints"] = json!({});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active)).await;
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } } if group == "strangers")));
@@ -1783,7 +1783,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     document["capabilities"] = probe_capabilities();
     document["identities"][0]["attestor"] = json!({"namespaces": []});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active)).await;
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -1802,7 +1802,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
     let capture = dekopon_test_support::CaptureLayer::new();
-    let (next, report) = super::load_candidate_with(&path, Mode::Boot, Some(&active))
+    let (next, report) = super::load_candidate(&path, Mode::Reload(&active))
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     assert!(report.problems.is_empty(), "{report:?}");
@@ -1841,9 +1841,7 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     assert!(checked.problems.is_empty(), "{checked:?}");
     for report in [
         super::load_candidate(&path, Mode::Boot).await.1,
-        super::load_candidate_with(&path, Mode::Boot, Some(&active))
-            .await
-            .1,
+        super::load_candidate(&path, Mode::Reload(&active)).await.1,
     ] {
         assert!(
             report
