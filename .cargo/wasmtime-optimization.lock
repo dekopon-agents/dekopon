@@ -1308,9 +1308,11 @@ name = "dekopon-test-support"
 version = "0.46.1"
 dependencies = [
  "dekopon-agent",
+ "dekopon-broker-protocol",
  "dekopon-model",
  "dekopon-shell",
  "parking_lot",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
