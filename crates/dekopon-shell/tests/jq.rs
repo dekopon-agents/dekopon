@@ -268,7 +268,7 @@ fn worker_emits_the_first_document_before_stdin_ends() {
             .expect("send second line");
     });
     stdin
-        .write_all(b"[\". + 1\",false]\n1\n")
+        .write_all(b"[\". + 1\",false,[]]\n1\n")
         .expect("send first document");
     stdin.flush().expect("flush first document");
     let first = receiver.recv_timeout(Duration::from_secs(5));
@@ -280,6 +280,73 @@ fn worker_emits_the_first_document_before_stdin_ends() {
     reader.join().expect("join output reader");
     assert_eq!(first.expect("first output before end of input"), "2");
     assert_eq!(second.expect("second output after second input"), "3");
+}
+
+#[test]
+fn arg_bindings_are_exact_strings_with_last_wins_order() {
+    worker();
+    for (value, expected) in [("''", "\"\""), ("'a b'", "\"a b\""), ("'-x'", "\"-x\"")] {
+        let outcome = Interpreter::new(Limits::default())
+            .run(&format!("jq -n --arg s {value} '$s'"), &Invoker);
+        assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
+        assert_eq!(outcome.output, expected);
+    }
+    let outcome = Interpreter::new(Limits::default()).run(
+        "jq -n --arg s first --arg t two --arg s last '[$t,$s]'",
+        &Invoker,
+    );
+    assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
+    assert_eq!(outcome.output, "[\"two\",\"last\"]");
+    for args in ["--arg 1bad x", "--arg '' x", "--arg s", "--argjson s 1"] {
+        let outcome =
+            Interpreter::new(Limits::default()).run(&format!("jq -n {args} '$s'"), &Invoker);
+        assert_eq!(outcome.exit_code.get(), 2, "{args}: {outcome:?}");
+    }
+}
+
+#[test]
+fn old_and_malformed_worker_headers_are_refused() {
+    for header in [
+        "[\".\",false]",
+        "[\".\",false,[[\"bad-name\",\"x\"]]",
+        "[\".\",false,[[\"s\",\"x\"],[\"s\",\"y\"]]",
+        "not json",
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dekopon-shell-jq-worker"))
+            .env_clear()
+            .env("DEKOPON_SHELL_JQ_WORKER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start worker");
+        writeln!(child.stdin.take().expect("worker stdin"), "{header}").expect("send header");
+        let result = child.wait_with_output().expect("wait for refusal");
+        assert!(!result.status.success(), "{header}");
+        assert!(result.stdout.is_empty(), "{header}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("invalid worker request"),
+            "{header}"
+        );
+    }
+}
+
+#[test]
+fn binding_header_is_charged_before_worker_input() {
+    worker();
+    let outcome = Interpreter::new(Limits {
+        max_value_bytes: 118,
+        ..Limits::default()
+    })
+    .run(
+        &format!("jq -n --arg s '{}' '1'", "\u{1}".repeat(16)),
+        &Invoker,
+    );
+    assert_eq!(outcome.exit_code.get(), 2, "{outcome:?}");
+    assert!(
+        outcome.output.contains("more than 118 bytes"),
+        "{outcome:?}"
+    );
 }
 
 #[test]

@@ -258,10 +258,17 @@ fn converted_builtin_argv_keeps_clusters_values_and_refusals_local() {
         "xargs -n +1 echo",
         "grep -o a",
         "head -n",
-        "jq --arg s v .",
+        "jq --argjson s 1 .",
     ] {
         assert_eq!(code(script), 2, "{script}");
     }
+    let wc = run("printf a | wc -l /tmp/x");
+    assert_eq!(wc.exit_code.get(), 2, "{wc:?}");
+    assert!(
+        wc.output
+            .contains("wc: unexpected argument \"/tmp/x\"; input arrives through a pipe"),
+        "{wc:?}"
+    );
     assert_eq!(output("printf 'a\\nb\\n' | grep -- -"), "");
     assert_eq!(output("echo -x | grep -- -x"), "-x");
     let result = run("grep --bogus; echo after");

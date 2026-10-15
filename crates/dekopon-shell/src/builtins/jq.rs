@@ -25,14 +25,31 @@ use crate::{
 /// any other way in this crate, so both are excluded from the filter set.
 const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 
-pub(crate) const HELP: &str = "-r -c -n -s";
+pub(crate) const HELP: &str = "-r -c -n -s --arg NAME VALUE";
 
-#[derive(Default)]
+pub(crate) fn valid_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    matches!(chars.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
 pub(crate) struct Options {
-    filter: Option<String>,
+    filter: String,
+    bindings: Vec<(String, String)>,
     raw: bool,
     null_input: bool,
     slurp: bool,
+}
+
+fn request_header(
+    opts: &mut Options,
+    budget: &Budget,
+) -> Result<(Vec<u8>, crate::RetainedBytes), CommandFailure> {
+    let header = serde_json::to_vec(&(&opts.filter, opts.slurp, &opts.bindings))
+        .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
+    let charge = budget.charge_value_bytes(header.len() as u64)?;
+    drop(std::mem::take(&mut opts.bindings));
+    Ok((header, charge))
 }
 
 pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
@@ -51,13 +68,35 @@ pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
         );
     }
     let matches = parse_flags(
-        grammar.arg(Arg::new("filter").required(true)),
+        grammar
+            .arg(
+                Arg::new("arg")
+                    .long("arg")
+                    .num_args(2)
+                    .allow_hyphen_values(true)
+                    .action(ArgAction::Append),
+            )
+            .arg(Arg::new("filter").required(true)),
         arguments,
         "jq",
         HELP,
     )?;
+    let mut bindings: Vec<(String, String)> = Vec::new();
+    if let Some(values) = matches.get_many::<String>("arg") {
+        for (name, value) in values.clone().zip(values.skip(1)).step_by(2) {
+            if !valid_name(name) {
+                return Err(CommandFailure::usage("jq: invalid --arg name"));
+            }
+            bindings.retain(|(old, _)| old != name);
+            bindings.push((name.clone(), value.clone()));
+        }
+    }
     Ok(Options {
-        filter: matches.get_one::<String>("filter").cloned(),
+        filter: matches
+            .get_one::<String>("filter")
+            .cloned()
+            .unwrap_or_default(),
+        bindings,
         raw: matches.get_flag("raw"),
         null_input: matches.get_flag("null"),
         slurp: matches.get_flag("slurp"),
@@ -186,12 +225,13 @@ fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailu
 const STDERR_BYTES: u64 = 4096;
 
 fn evaluate(
-    opts: Options,
+    mut opts: Options,
     input: &mut PipeReader,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
+    let (header, _header_charge) = request_header(&mut opts, budget)?;
     let path =
         executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
     let child = Command::new(path)
@@ -223,11 +263,7 @@ fn evaluate(
         let writer = scope.spawn(
             move || -> Result<Vec<crate::RetainedBytes>, CommandFailure> {
                 let mut stdin = io::BufWriter::new(stdin);
-                serde_json::to_writer(
-                    &mut stdin,
-                    &(opts.filter.as_deref().unwrap_or_default(), opts.slurp),
-                )
-                .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
+                stdin.write_all(&header).map_err(input_error)?;
                 stdin.write_all(b"\n").map_err(input_error)?;
                 if opts.null_input {
                     stdin.write_all(b"null\n").map_err(input_error)?;
@@ -417,6 +453,7 @@ impl std::fmt::Display for WorkerFailure {
 
 pub(crate) fn run_filter(
     filter: &str,
+    bindings: &[(String, String)],
     inputs: impl Iterator<Item = Result<Val, serde_json::Error>>,
     output: &mut impl io::Write,
 ) -> Result<(), WorkerFailure> {
@@ -443,8 +480,13 @@ pub(crate) fn run_filter(
                 describe_load_errors(&errors)
             ))
         })?;
+    let names: Vec<_> = bindings
+        .iter()
+        .map(|(name, _)| format!("${name}"))
+        .collect();
     let compiled = Compiler::default()
         .with_funs(functions)
+        .with_global_vars(names.iter().map(String::as_str))
         .compile(modules)
         .map_err(|errors| {
             WorkerFailure::Failed(format!(
@@ -457,7 +499,10 @@ pub(crate) fn run_filter(
         let input = input.map_err(|error| {
             WorkerFailure::InvalidInput(format!("jq: invalid JSON input: {error}"))
         })?;
-        let context = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
+        let context = Ctx::<data::JustLut<Val>>::new(
+            &compiled.lut,
+            Vars::new(bindings.iter().map(|(_, value)| Val::from(value.clone()))),
+        );
         for result in compiled.id.run((context, input)) {
             let produced = result
                 .map_err(describe_exception)
@@ -616,6 +661,41 @@ fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_header_releases_binding_copies_and_orders_last_appearances() {
+        let mut opts = options(
+            &[
+                "--arg", "s", "first", "--arg", "t", "two", "--arg", "s", "last", "$s",
+            ]
+            .map(str::to_owned),
+        )
+        .expect("valid bindings");
+        let expected = serde_json::to_vec(&("$s", false, [("t", "two"), ("s", "last")]))
+            .expect("expected header");
+        let binding_bytes: usize = opts
+            .bindings
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let limit = expected.len() + 1;
+        assert!(binding_bytes > 1);
+        assert!(expected.len() + binding_bytes > limit);
+        let budget = Budget::start(crate::Limits {
+            max_value_bytes: limit as u64,
+            ..crate::Limits::default()
+        });
+        let (header, charge) =
+            request_header(&mut opts, &budget).expect("one retained header fits");
+        assert_eq!(header, expected);
+        assert!(
+            opts.bindings.is_empty(),
+            "bindings must not coexist with the charged header"
+        );
+        assert_eq!(budget.value_bytes(), header.len() as u64);
+        drop(charge);
+        assert_eq!(budget.value_bytes(), 0);
+    }
 
     #[test]
     fn slurp_refuses_an_oversized_document_before_finishing_its_parse() {

@@ -161,19 +161,17 @@ fn process_line(
             if let GrepMode::Count = config.mode {
                 return Ok(true);
             }
-            if config.before > 0 || config.after > 0 {
+            if matches!(config.mode, GrepMode::Lines) && (config.before > 0 || config.after > 0) {
                 if selected {
                     for (index, saved, _charges) in std::mem::take(&mut progress.before) {
-                        if index > progress.last_emitted
-                            && !emit_grep(
-                                config,
-                                progress,
-                                (index, &saved, false),
-                                budget,
-                                invoker,
-                                emit,
-                            )?
-                        {
+                        if !emit_grep(
+                            config,
+                            progress,
+                            (index, &saved, false),
+                            budget,
+                            invoker,
+                            emit,
+                        )? {
                             return Ok(false);
                         }
                     }
@@ -454,7 +452,26 @@ mod tests {
     }
 
     #[test]
-    fn grep_before_window_retains_charges_and_context_stays_step_bounded() {
+    fn quiet_grep_does_not_retain_before_context() {
+        let mut reader = PipeReader::from_bytes(b"abc\nabc\nmatch\n".to_vec());
+        let mut budget = Budget::start(Limits {
+            max_value_bytes: 7,
+            ..Limits::default()
+        });
+        let status = TextStream::Grep
+            .run(
+                &["-q".to_owned(), "-B2".to_owned(), "match".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |_| panic!("quiet grep must not emit context"),
+            )
+            .expect("quiet grep needs no retained before window");
+        assert_eq!(status, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn grep_before_window_retains_charges() {
         let mut reader = PipeReader::from_bytes(b"abc\nabc\nabc\nmatch\n".to_vec());
         let mut budget = Budget::start(Limits {
             max_value_bytes: 7,
@@ -475,24 +492,35 @@ mod tests {
                 LimitExceeded::ValueBytes { maximum: 7 }
             ))
         ));
-        let mut reader = PipeReader::from_bytes(vec![b'x'; 2 * pipe::CHUNK_BYTES]);
+    }
+
+    #[test]
+    fn grep_after_context_emits_before_exhausting_the_next_chunk_step() {
+        let mut bytes = b"match\nctx\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 2 * pipe::CHUNK_BYTES));
+        let mut reader = PipeReader::from_bytes(bytes);
         let mut budget = Budget::start(Limits {
-            max_steps: 1,
+            max_steps: 3,
             ..Limits::default()
         });
+        let mut emitted = Vec::new();
         let failure = TextStream::Grep
             .run(
-                &["-A2".to_owned(), "x".to_owned()],
+                &["-A2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
                 &Stub { cancelled: false },
-                |_| Ok(true),
+                |part| {
+                    emitted.extend_from_slice(part);
+                    Ok(true)
+                },
             )
-            .expect_err("context processing charges the second chunk");
+            .expect_err("context processing charges the next chunk");
+        assert_eq!(emitted, b"match\nctx\n");
         assert!(matches!(
             failure,
             CommandFailure::Fatal(crate::builtins::FatalError::Limit(LimitExceeded::Steps {
-                maximum: 1
+                maximum: 3
             }))
         ));
     }

@@ -215,7 +215,7 @@ This is a native tree-walking evaluator, so there is no engine fuel meter to fal
 
 Parsing has its own fixed nesting ceiling of 64 levels, applied before any budget exists, because the parser and the arithmetic evaluator are recursive and run on the native stack: deeply nested `$( $( ... ) )`, or a `$(( ))` whose operators nest deeper than that (`!!!…1`, or a `1+1+…` chain), is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
 
-The variable namespace is seeded only from the script's own assignments; the host process environment is never read. That includes `jq`: jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
+The variable namespace is seeded only from the script's own assignments; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 
 Each `jq` stage runs in a worker executable supplied by the embedder. On Linux its address space is limited to its startup size plus 256 MiB; at the deadline or on cancel the worker is killed and waited on. A crashed worker fails the stage, and the script can continue. jaq's value type is a JSON superset, so outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused, and output nesting keeps the JSON parser's 128-container ceiling.
 
