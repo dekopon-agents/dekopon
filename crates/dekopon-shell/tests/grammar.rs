@@ -1261,6 +1261,9 @@ fn text_operands_read_exact_named_buffers_without_host_paths() {
         "/w=="
     );
     assert_eq!(code("jq -n . buf"), 2);
+    let invalid = run("jq -n --arg 1bad value '$s'");
+    assert_eq!(invalid.exit_code.get(), 2, "{invalid:?}");
+    assert!(invalid.output.contains("1bad"), "{invalid:?}");
 }
 
 #[test]
