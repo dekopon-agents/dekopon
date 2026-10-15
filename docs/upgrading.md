@@ -18,7 +18,7 @@ The gateway replaces `transports[].liveness` with layered `indicators`: `session
 `reaction.working: auto` (not a default-on reaction). `reaction.working: on` adds a working reaction alongside available status or typing;
 `auto` falls back only when neither is active. Discord, Telegram and local transports
 reacted implicitly under `mode: native`; that reaction also disappears unless the
-fragment sets `reaction.working: auto`. WhatsApp rejects `working: on` and `auto`
+fragment sets `reaction.working: on` (`auto` reacts only when typing is unavailable). WhatsApp rejects `working: on` and `auto`
 until a verified Cloud API clear is supported. Set `reaction.seen: on` on a route only if the
 operator wants the persistent steer/queue 👀; otherwise **the former automatic steer 👀
 disappears**. Neither the old `liveness` nor `classicFallback` key is accepted.
