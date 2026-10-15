@@ -124,7 +124,7 @@ where
                 () = &mut shutdown => break,
                 // Without this branch, a finished connection's outcome is only logged once the next
                 // connection arrives, delaying the failure an operator must act on.
-                Some(result) = tasks.join_next(), if !tasks.is_empty() => observe_task(result)?,
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => observe_task(result),
                 accepted = listener.accept() => {
                     let stream = match accepted {
                         Ok((stream, _)) => {
@@ -155,21 +155,13 @@ where
         self.admit_backlog(listener, &semaphore, &refusal, &mut tasks);
 
         let drain = async {
-            let mut task_failed = false;
             while let Some(result) = tasks.join_next().await {
-                if observe_task(result).is_err() {
-                    task_failed = true;
-                }
-            }
-            if task_failed {
-                Err(ServerError::ConnectionTask)
-            } else {
-                Ok(())
+                observe_task(result);
             }
         };
         match timeout_at(deadline, drain).await {
-            Ok(result) if Instant::now() < deadline => result,
-            Ok(_) => Err(ServerError::ShutdownTimeout),
+            Ok(()) if Instant::now() < deadline => Ok(()),
+            Ok(()) => Err(ServerError::ShutdownTimeout),
             Err(_) => {
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
@@ -254,11 +246,9 @@ fn refuse_over_capacity(stream: UnixStream, frame: &[u8]) -> bool {
         .is_ok_and(|written| written == frame.len())
 }
 
-fn observe_task(
-    result: Result<Result<(), ConnectionError>, tokio::task::JoinError>,
-) -> Result<(), ServerError> {
+fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinError>) {
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let cause = dekopon_core::error_chain(&error);
             match error.unaudited_outcome() {
@@ -279,15 +269,17 @@ fn observe_task(
                     error = %cause,
                 ),
             }
-            Ok(())
         }
-        Err(_) => {
-            tracing::error!(
-                event = "broker_connection_failed",
-                category = "task-failure"
-            );
-            Err(ServerError::ConnectionTask)
-        }
+        // A panic payload is arbitrary text that may quote credential material, so only its class
+        // is recorded; the default panic hook has already written it to stderr.
+        Err(error) => tracing::error!(
+            event = "broker_connection_failed",
+            category = if error.is_panic() {
+                "task-panicked"
+            } else {
+                "task-cancelled"
+            },
+        ),
     }
 }
 
@@ -882,8 +874,6 @@ pub enum ServerError {
         #[source]
         source: io::Error,
     },
-    #[error("a broker connection task failed internally")]
-    ConnectionTask,
     #[error("broker connections did not finish within the shutdown grace period")]
     ShutdownTimeout,
 }

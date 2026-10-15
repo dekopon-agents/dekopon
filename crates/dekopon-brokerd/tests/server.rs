@@ -12,9 +12,10 @@ use std::{
 
 use dekopon_agent::BrokerLeg;
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerBuildError, BrokerLimits, CapabilityRoute,
-    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    InvocationRequest, PolicyEngine, PolicyWorld,
+    AttestorGrant, AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker,
+    BrokerBuildError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -200,14 +201,18 @@ async fn broker_with(
     policies: &str,
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+    let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
+    (broker_over(policies, Arc::clone(&audit)).await, audit)
+}
+
+async fn broker_over<A: AuditLog>(policies: &str, audit: Arc<A>) -> Arc<Broker<A>> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("load cli-probe fixture");
-    let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
-    let broker = Arc::new(
+    Arc::new(
         Broker::new(
             registry,
             "broker-test"
@@ -218,12 +223,11 @@ async fn broker_with(
             probe_catalog(),
             CredentialStore::empty(),
             identities(),
-            Arc::clone(&audit),
+            audit,
             BrokerLimits::default(),
         )
         .expect("broker starts"),
-    );
-    (broker, audit)
+    )
 }
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -852,6 +856,56 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     task.await
         .expect("server task exits")
         .expect("server shuts down");
+}
+
+struct PanickingAudit;
+
+impl AuditLog for PanickingAudit {
+    async fn append(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        panic!("the audit sink panicked")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_connection_leaves_the_broker_serving_the_next() {
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = bind_fixture(&socket_path);
+    let broker = broker_over(POLICY, Arc::new(PanickingAudit)).await;
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(attestor_grant()),
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
+    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
+
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
+    client
+        .invoke(
+            Some(session()),
+            request("invoke-audit-panics"),
+            Default::default(),
+            async |_upcall| unreachable!(),
+        )
+        .await
+        .expect_err("a panicked connection ends without a reply");
+    let surface = client
+        .session_surface(Some(session()))
+        .await
+        .expect("the next connection is served");
+    assert_eq!(surface.capabilities.len(), 1);
+
+    shutdown_send.send(()).expect("signal clean shutdown");
+    task.await
+        .expect("server task exits")
+        .expect("a panicked connection does not fail the drain");
 }
 
 #[tokio::test(flavor = "multi_thread")]
