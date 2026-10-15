@@ -130,8 +130,11 @@ one-shot input stream; provider commands do not inherit that stream.
 
 Pipeline stages exchange bytes; `xargs` runs one input line at a time and emits each command's
 output before reading the next line. Named redirection buffers append exact bytes, including invalid
-UTF-8, and `cat` copies those bytes to another pipe or buffer. Expanding buffer bytes into text or
-passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
+UTF-8, and `cat` copies those bytes to another pipe or buffer. `grep`, `sort`, `uniq`, `wc`,
+`cut`, `head`, and `tail` read an exact named buffer as an optional input operand (`-` means stdin),
+without looking up host files. The cloned input is charged to retained-value budget and can fatally
+fail when the remaining budget is smaller than the buffer; `cat NAME | cmd` streams instead.
+Expanding buffer bytes into text or passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
 a whole assignment from JSON object or array text retains its structure, while unquoted text
 substitutions split on newlines rather than spaces.
 
@@ -201,7 +204,7 @@ inside a script; what a caller receives is the transcript a terminal would have 
 
 `jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
 
-`head` and `tail` select lines from standard input (10 by default): `-n N`, `--lines N`, or `-N` selects a count, and `tail -n +N` starts at line N. `head -c N`/`--bytes N` selects raw bytes; zero closes input without reading. Neither accepts file operands or `-f`.
+`head` and `tail` select lines from standard input (10 by default): `-n N`, `--lines N`, or `-N` selects a count, and `tail -n +N` starts at line N. `head -c N`/`--bytes N` selects raw bytes; zero closes input without reading. Both accept one named-buffer operand or `-` for stdin, not host files; neither accepts `-f`.
 
 Every builtin answers `--help` on stdout at exit 0, naming the flags it accepts (`true`, `false`, `sleep`, `cat`, and `printf` take none, so theirs reads `no flags`); the interpreter intercepts `--help` before the builtin's own argument parsing ever runs, so it wins even over a call that is otherwise malformed, such as `[ --help` with no closing `]`. The same accepted-subset text `--help` prints is what `unsupported_flag` appends to a refusal: `grep: option not yet supported: -o (supported: -v -i -c -n -E -q -A N -B N -C N)`.
 

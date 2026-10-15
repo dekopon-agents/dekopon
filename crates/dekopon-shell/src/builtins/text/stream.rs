@@ -46,10 +46,18 @@ impl TextStream {
         }
     }
 
-    pub(crate) fn parse(self, arguments: &[String]) -> Result<Operation, CommandFailure> {
+    pub(crate) fn parse(
+        self,
+        arguments: &[String],
+    ) -> Result<(Operation, Option<String>), CommandFailure> {
         match self {
-            Self::Grep => Ok(Operation::Grep(GrepConfig::parse(arguments)?)),
-            Self::Sed => Ok(Operation::Sed(super::sed::parse_arguments(arguments)?)),
+            Self::Grep => {
+                GrepConfig::parse(arguments).map(|(config, input)| (Operation::Grep(config), input))
+            }
+            Self::Sed => Ok((
+                Operation::Sed(super::sed::parse_arguments(arguments)?),
+                None,
+            )),
         }
     }
 
@@ -62,7 +70,7 @@ impl TextStream {
         invoker: &dyn CapabilityInvoker,
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
-        self.run_parsed(self.parse(arguments)?, reader, budget, invoker, emit)
+        self.run_parsed(self.parse(arguments)?.0, reader, budget, invoker, emit)
     }
 
     pub(crate) fn run_parsed(
@@ -279,7 +287,7 @@ pub(crate) fn run_test(
             .collect::<Vec<_>>(),
     )?;
     let status = command.run_parsed(
-        operation,
+        operation.0,
         &mut reader,
         &mut budget,
         &NoCapabilities,

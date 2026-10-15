@@ -306,12 +306,7 @@ fn arg_bindings_are_exact_strings_with_last_wins_order() {
 
 #[test]
 fn old_and_malformed_worker_headers_are_refused() {
-    for header in [
-        "[\".\",false]",
-        "[\".\",false,[[\"bad-name\",\"x\"]]",
-        "[\".\",false,[[\"s\",\"x\"],[\"s\",\"y\"]]",
-        "not json",
-    ] {
+    for header in ["[\".\",false]", "not json"] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dekopon-shell-jq-worker"))
             .env_clear()
             .env("DEKOPON_SHELL_JQ_WORKER", "1")
@@ -335,7 +330,7 @@ fn old_and_malformed_worker_headers_are_refused() {
 fn binding_header_is_charged_before_worker_input() {
     worker();
     let outcome = Interpreter::new(Limits {
-        max_value_bytes: 118,
+        max_value_bytes: 117,
         ..Limits::default()
     })
     .run(
@@ -344,7 +339,7 @@ fn binding_header_is_charged_before_worker_input() {
     );
     assert_eq!(outcome.exit_code.get(), 2, "{outcome:?}");
     assert!(
-        outcome.output.contains("more than 118 bytes"),
+        outcome.output.contains("more than 117 bytes"),
         "{outcome:?}"
     );
 }

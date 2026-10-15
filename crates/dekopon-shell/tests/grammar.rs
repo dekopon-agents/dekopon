@@ -263,12 +263,8 @@ fn converted_builtin_argv_keeps_clusters_values_and_refusals_local() {
         assert_eq!(code(script), 2, "{script}");
     }
     let wc = run("printf a | wc -l /tmp/x");
-    assert_eq!(wc.exit_code.get(), 2, "{wc:?}");
-    assert!(
-        wc.output
-            .contains("wc: unexpected argument \"/tmp/x\"; input arrives through a pipe"),
-        "{wc:?}"
-    );
+    assert_eq!(wc.exit_code.get(), 1, "{wc:?}");
+    assert!(wc.output.contains("wc: /tmp/x: no such buffer"), "{wc:?}");
     assert_eq!(output("printf 'a\\nb\\n' | grep -- -"), "");
     assert_eq!(output("echo -x | grep -- -x"), "-x");
     let result = run("grep --bogus; echo after");
@@ -873,7 +869,7 @@ fn head_and_tail_select_fragmented_and_unterminated_lines() {
     assert_eq!(code("echo a | head -x"), 2);
     assert_eq!(code("echo a | tail -f"), 2);
     assert_eq!(code("echo a | tail -+2"), 2);
-    assert_eq!(code("echo a | head file"), 2);
+    assert_eq!(code("echo a | head file"), 1);
 }
 
 #[test]
@@ -1222,6 +1218,63 @@ fn redirection_writes_and_cat_reads_named_buffers() {
         "{}",
         outcome.output
     );
+}
+
+#[test]
+fn text_operands_read_exact_named_buffers_without_host_paths() {
+    assert_eq!(
+        output("printf 'a\\nb\\n' > /tmp/epic.txt; wc -l /tmp/epic.txt"),
+        "2"
+    );
+    for (script, expected) in [
+        ("printf 'a\\nb\\n' > buf; grep b buf", "b"),
+        ("printf 'b\\na\\n' > buf; sort buf", "a\nb"),
+        ("printf 'a\\na\\n' > buf; uniq buf", "a"),
+        ("printf 'a,b\\n' > buf; cut -d, -f 2 buf", "b"),
+        ("printf 'a\\nb\\n' > buf; head -1 buf", "a"),
+        ("printf 'a\\nb\\n' > buf; tail -1 buf", "b"),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+    assert_eq!(output("printf 'a\\nb\\n' | wc -l -"), "2");
+    assert_eq!(output("printf 'a\\nb\\n' > buf; head -5 buf"), "a\nb");
+    assert_eq!(code("printf a > buf; tail +5 buf"), 2);
+    let missing = run("wc -l /tmp/epic.txt");
+    assert_eq!(missing.exit_code.get(), 1, "{missing:?}");
+    assert!(
+        missing.output.contains("wc: /tmp/epic.txt: no such buffer"),
+        "{missing:?}"
+    );
+    for command in [
+        "grep a", "sort", "uniq", "wc -l", "cut -f 1", "head", "tail",
+    ] {
+        let outcome = run(&format!("echo a | {command} first second"));
+        assert_eq!(outcome.exit_code.get(), 2, "{command}: {outcome:?}");
+    }
+    assert_eq!(
+        output("printf '/w==' | base64 -d > buf; head -c 1 buf | base64"),
+        "/w=="
+    );
+    assert_eq!(output("printf '/w==' | base64 -d > buf; wc -c buf"), "1");
+    assert_eq!(
+        output("printf '/w==' | base64 -d > buf; cat buf | base64"),
+        "/w=="
+    );
+    assert_eq!(code("jq -n . buf"), 2);
+}
+
+#[test]
+fn a_named_operand_clone_obeys_the_retained_value_budget() {
+    let outcome = run_with(
+        "printf 123456789012 > buf; wc -c buf; echo should-not-run",
+        Limits {
+            max_value_bytes: 20,
+            ..Limits::default()
+        },
+    );
+    assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+    assert!(!outcome.output.contains("should-not-run"), "{outcome:?}");
 }
 
 #[test]

@@ -56,7 +56,10 @@ impl LineCommand {
         }
     }
 
-    pub(crate) fn selection(self, arguments: &[String]) -> Result<Selection, CommandFailure> {
+    pub(crate) fn selection(
+        self,
+        arguments: &[String],
+    ) -> Result<(Selection, Option<String>), CommandFailure> {
         let name = self.name();
         if let Some(first) = arguments.first()
             && first.starts_with('+')
@@ -81,7 +84,13 @@ impl LineCommand {
         if let Self::Head = self {
             grammar = grammar.arg(Arg::new("bytes").short('c').long("bytes").num_args(1));
         }
-        let matches = parse_flags(grammar, &rewritten, name, self.help())?;
+        let matches = parse_flags(
+            grammar.arg(Arg::new("input")),
+            &rewritten,
+            name,
+            self.help(),
+        )?;
+        let input = matches.get_one::<String>("input").cloned();
         if let Some(bytes) = if let Self::Head = self {
             matches.get_one::<String>("bytes")
         } else {
@@ -91,7 +100,7 @@ impl LineCommand {
             if matches.contains_id("lines") {
                 return Err(CommandFailure::usage("head: -c and -n cannot be combined"));
             }
-            return Ok(Selection::FirstBytes(count));
+            return Ok((Selection::FirstBytes(count), input));
         }
         let number = matches
             .get_one::<String>("lines")
@@ -102,11 +111,14 @@ impl LineCommand {
             _ => (false, number),
         };
         let count = parse_count(name, digits)?;
-        match (self, from) {
-            (Self::Head, _) => Ok(Selection::First(count)),
-            (Self::Tail, true) => Ok(Selection::From(count.max(1))),
-            (Self::Tail, false) => Ok(Selection::Last(count)),
-        }
+        Ok((
+            match (self, from) {
+                (Self::Head, _) => Selection::First(count),
+                (Self::Tail, true) => Selection::From(count.max(1)),
+                (Self::Tail, false) => Selection::Last(count),
+            },
+            input,
+        ))
     }
 
     pub(crate) fn run(

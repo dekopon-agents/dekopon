@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde_json::Value;
 
 use crate::{
@@ -102,9 +100,6 @@ pub(crate) enum FatalError {
 pub(crate) struct BuiltinContext<'a> {
     pub invoker: &'a dyn CapabilityInvoker,
     pub budget: &'a mut Budget,
-    /// These are named in-memory buffers only, written by redirects; a lookup here must never touch
-    /// a real filesystem path.
-    pub buffers: &'a BTreeMap<String, Vec<u8>>,
     pub started_jobs: &'a [crate::JobId],
 }
 
@@ -385,11 +380,9 @@ pub(crate) mod test_support {
         invoker: &dyn CapabilityInvoker,
     ) -> Result<CommandResult, CommandFailure> {
         let mut budget = Budget::start(Limits::default());
-        let mut buffers = BTreeMap::new();
         let mut context = BuiltinContext {
             invoker,
             budget: &mut budget,
-            buffers: &mut buffers,
             started_jobs: &[],
         };
         let arguments = arguments
@@ -404,14 +397,13 @@ pub(crate) mod test_support {
         arguments: &[&str],
         input: Option<Value>,
         limits: Limits,
-        buffers: &mut BTreeMap<String, Vec<u8>>,
+        _buffers: &mut BTreeMap<String, Vec<u8>>,
     ) -> Result<CommandResult, CommandFailure> {
         let invoker = NoCapabilities;
         let mut budget = Budget::start(limits);
         let mut context = BuiltinContext {
             invoker: &invoker,
             budget: &mut budget,
-            buffers,
             started_jobs: &[],
         };
         let arguments = arguments
