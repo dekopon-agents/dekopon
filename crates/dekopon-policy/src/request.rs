@@ -1,4 +1,4 @@
-use cedar_policy::Context;
+use cedar_policy::{Context, RestrictedExpression};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
@@ -17,25 +17,42 @@ pub struct HttpRequestFacts {
 
 impl HttpRequestFacts {
     pub(super) fn context(self) -> Result<Context, super::RequestError> {
-        let mut url = json!({"host": self.host, "path": self.path});
+        let mut url = vec![
+            (
+                "host".to_owned(),
+                RestrictedExpression::new_string(self.host),
+            ),
+            (
+                "path".to_owned(),
+                RestrictedExpression::new_string(self.path),
+            ),
+        ];
         if !self.query.is_empty() {
-            url["query"] = json!(self.query);
+            url.push((
+                "query".to_owned(),
+                RestrictedExpression::new_string(self.query),
+            ));
         }
-        let mut facts = json!({"request": {"method": self.method, "url": url}});
+        let mut request = vec![
+            (
+                "method".to_owned(),
+                RestrictedExpression::new_string(self.method),
+            ),
+            ("url".to_owned(), record(url)?),
+        ];
         let mut headers = BTreeMap::new();
         let mut valid = true;
         for (name, value) in self.headers {
-            let name = name.to_ascii_lowercase();
-            if name == "__entity" || name == "__extn" {
-                valid = false;
-            } else if let Ok(value) = String::from_utf8(value) {
-                valid &= headers.insert(name, value).is_none();
-            } else {
-                valid = false;
+            match String::from_utf8(value) {
+                Ok(value) => {
+                    let value = RestrictedExpression::new_string(value);
+                    valid &= headers.insert(name.to_ascii_lowercase(), value).is_none();
+                }
+                Err(_) => valid = false,
             }
         }
         if valid {
-            facts["request"]["headers"] = json!(headers);
+            request.push(("headers".to_owned(), record(headers)?));
         }
         if let (Some(body), Some(media)) = (self.body, self.content_type)
             && body.len() <= 16 * 1024
@@ -44,15 +61,24 @@ impl HttpRequestFacts {
                 .next()
                 .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
             && let Ok(Unique(value @ Value::Object(_))) = serde_json::from_slice::<Unique>(&body)
-            // Cedar must validate the entire body before any of its attributes are exposed.
-            && Context::from_json_value(json!({"body": value}), None).is_ok()
+            && let Ok(body) = Context::from_json_value(json!({"body": value}), None)
         {
-            facts["request"]["body"] = value;
+            request.extend(body);
         }
-        Context::from_json_value(facts, None).map_err(|source| super::RequestError::Context {
-            message: source.to_string(),
+        Context::from_pairs([("request".to_owned(), record(request)?)]).map_err(|source| {
+            super::RequestError::Context {
+                message: source.to_string(),
+            }
         })
     }
+}
+
+fn record(
+    fields: impl IntoIterator<Item = (String, RestrictedExpression)>,
+) -> Result<RestrictedExpression, super::RequestError> {
+    RestrictedExpression::new_record(fields).map_err(|source| super::RequestError::Context {
+        message: source.to_string(),
+    })
 }
 
 struct Unique(Value);
