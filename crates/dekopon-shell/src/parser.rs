@@ -1416,7 +1416,7 @@ fn parse_arithmetic(source: &str, line: usize, depth: u32) -> Result<ArithExpr, 
         line,
         depth,
     };
-    let expression = parser.parse_or()?;
+    let (expression, _) = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
         return Err(ParseError::syntax(
             line,
@@ -1442,33 +1442,46 @@ impl ArithParser {
         false
     }
 
+    fn deeper(&self, height: u32) -> Result<u32, ParseError> {
+        if height >= MAX_NESTING_DEPTH {
+            return Err(ParseError::syntax(
+                self.line,
+                format!(
+                    "an arithmetic expansion may nest at most {MAX_NESTING_DEPTH} operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments"
+                ),
+            ));
+        }
+        Ok(height + 1)
+    }
+
     fn parse_binary_level(
         &mut self,
         operators: &[(&str, ArithBinaryOp)],
-        next: fn(&mut Self) -> Result<ArithExpr, ParseError>,
-    ) -> Result<ArithExpr, ParseError> {
-        let mut left = next(self)?;
+        next: fn(&mut Self) -> Result<(ArithExpr, u32), ParseError>,
+    ) -> Result<(ArithExpr, u32), ParseError> {
+        let (mut left, mut height) = next(self)?;
         while let Some(symbol) = self.peek_symbol() {
             let Some((_, operator)) = operators.iter().find(|(text, _)| *text == symbol) else {
                 break;
             };
             let operator = *operator;
             self.position += 1;
-            let right = next(self)?;
+            let (right, right_height) = next(self)?;
+            height = self.deeper(height.max(right_height))?;
             left = ArithExpr::Binary(operator, Box::new(left), Box::new(right));
         }
-        Ok(left)
+        Ok((left, height))
     }
 
-    fn parse_or(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_or(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(&[("||", ArithBinaryOp::Or)], Self::parse_and)
     }
 
-    fn parse_and(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_and(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(&[("&&", ArithBinaryOp::And)], Self::parse_equality)
     }
 
-    fn parse_equality(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_equality(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(
             &[
                 ("==", ArithBinaryOp::Equal),
@@ -1478,7 +1491,7 @@ impl ArithParser {
         )
     }
 
-    fn parse_relational(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_relational(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(
             &[
                 ("<=", ArithBinaryOp::LessOrEqual),
@@ -1490,14 +1503,14 @@ impl ArithParser {
         )
     }
 
-    fn parse_additive(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_additive(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(
             &[("+", ArithBinaryOp::Add), ("-", ArithBinaryOp::Subtract)],
             Self::parse_multiplicative,
         )
     }
 
-    fn parse_multiplicative(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_multiplicative(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         self.parse_binary_level(
             &[
                 ("*", ArithBinaryOp::Multiply),
@@ -1508,39 +1521,39 @@ impl ArithParser {
         )
     }
 
-    fn parse_unary(&mut self) -> Result<ArithExpr, ParseError> {
-        if self.eat_symbol("-") {
-            return Ok(ArithExpr::Unary(
-                ArithUnaryOp::Negate,
-                Box::new(self.parse_unary()?),
-            ));
+    fn parse_unary(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+        let mut operators = Vec::new();
+        loop {
+            if self.eat_symbol("-") {
+                operators.push(ArithUnaryOp::Negate);
+            } else if self.eat_symbol("!") {
+                operators.push(ArithUnaryOp::Not);
+            } else if !self.eat_symbol("+") {
+                break;
+            }
         }
-        if self.eat_symbol("+") {
-            return self.parse_unary();
+        let (mut operand, mut height) = self.parse_primary()?;
+        for operator in operators.into_iter().rev() {
+            height = self.deeper(height)?;
+            operand = ArithExpr::Unary(operator, Box::new(operand));
         }
-        if self.eat_symbol("!") {
-            return Ok(ArithExpr::Unary(
-                ArithUnaryOp::Not,
-                Box::new(self.parse_unary()?),
-            ));
-        }
-        self.parse_primary()
+        Ok((operand, height))
     }
 
-    fn parse_primary(&mut self) -> Result<ArithExpr, ParseError> {
+    fn parse_primary(&mut self) -> Result<(ArithExpr, u32), ParseError> {
         let line = self.line;
         match self.tokens.get(self.position).cloned() {
             Some(ArithToken::Integer(value)) => {
                 self.position += 1;
-                Ok(ArithExpr::Integer(value))
+                Ok((ArithExpr::Integer(value), 0))
             }
             Some(ArithToken::Float(value)) => {
                 self.position += 1;
-                Ok(ArithExpr::Float(value))
+                Ok((ArithExpr::Float(value), 0))
             }
             Some(ArithToken::Name(name)) => {
                 self.position += 1;
-                Ok(ArithExpr::Variable(name))
+                Ok((ArithExpr::Variable(name), 0))
             }
             Some(ArithToken::Symbol("(")) => {
                 if self.depth >= MAX_NESTING_DEPTH {
