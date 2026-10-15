@@ -733,7 +733,13 @@ mod tests {
 
     #[test]
     fn returned_model_failures_charge_one_typed_meter_record() {
-        let cases: [(fn() -> InferenceError, &str, &str, &str); 3] = [
+        type FailureCase = (
+            fn() -> InferenceError,
+            &'static str,
+            &'static str,
+            &'static str,
+        );
+        let cases: [FailureCase; 3] = [
             (
                 || InferenceError::DeadlineExceeded,
                 "deadline-exceeded",
