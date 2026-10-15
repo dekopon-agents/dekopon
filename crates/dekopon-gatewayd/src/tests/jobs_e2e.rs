@@ -1206,6 +1206,7 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
         &["stop".to_owned()],
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         inbound,
     );
     assert!(signal.is_cancelled());
@@ -1387,6 +1388,7 @@ async fn a_stop_word_from_an_unrouted_conversation_still_cancels_its_persons_job
         &["stop".to_owned()],
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         inbound,
     );
     assert!(signal.is_cancelled());
@@ -1435,6 +1437,7 @@ async fn one_stop_word_ends_its_persons_running_turn_and_job_but_not_anothers_jo
         &["stop".to_owned()],
         &mut sessions,
         &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
         from("a", "stop"),
     );
     tokio::time::timeout(Duration::from_secs(2), a_turn)
@@ -1920,6 +1923,7 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
             &["stop".to_owned()],
             &mut sessions,
             &mut collector,
+            &mut crate::follow::Debounce::default(),
             inbound.clone(),
         );
     }
@@ -1934,6 +1938,7 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
         &["stop".to_owned()],
         &mut sessions,
         &mut collector,
+        &mut crate::follow::Debounce::default(),
         inbound,
     );
     while sessions.join_next().await.is_some() {}

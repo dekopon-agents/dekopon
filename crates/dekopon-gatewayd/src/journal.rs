@@ -22,7 +22,6 @@ const EXTENSION: &str = "jsonl";
 const SEAL_EXTENSION: &str = "sealed";
 const FOLLOW_EXTENSION: &str = "followed";
 const MAX_FOLLOW_BYTES: u64 = 4096;
-const MAX_FOLLOW_MARKERS: usize = 1024;
 const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
@@ -148,15 +147,10 @@ impl Journal {
         self.read_seal(stem)
     }
 
-    #[allow(dead_code, reason = "follow effects land in the subsequent S3b change")]
     fn follow_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.{FOLLOW_EXTENSION}"))
     }
 
-    #[allow(
-        dead_code,
-        reason = "follow invitation lands in the subsequent S3b change"
-    )]
     pub(crate) fn write_follow(&self, key: &str, marker: FollowMarker) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         let mut file = OpenOptions::new()
@@ -170,7 +164,6 @@ impl Journal {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "follow leave lands in the subsequent S3b change")]
     pub(crate) fn remove_follow(&self, key: &str) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         match fs::remove_file(self.follow_path(key)) {
@@ -209,11 +202,6 @@ impl Journal {
                     reason = "corrupt"
                 );
                 continue;
-            }
-            if markers.len() == MAX_FOLLOW_MARKERS {
-                return Err(JournalError::Io {
-                    kind: io::ErrorKind::OutOfMemory,
-                });
             }
             match read_follow_marker(&path)? {
                 Some(marker) => markers.push((key.to_owned(), marker)),

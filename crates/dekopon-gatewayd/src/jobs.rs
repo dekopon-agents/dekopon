@@ -429,7 +429,7 @@ impl Notice {
                 agent: agent.clone(),
                 owner: JobOwner::of(message),
             }),
-            MessageId::Native(_) | MessageId::Wake { .. } => None,
+            MessageId::Native(_) | MessageId::Follow(_) | MessageId::Wake { .. } => None,
         }
     }
 

@@ -76,6 +76,7 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
+    Follow(String),
     Wake {
         id: WakeId,
         notice: String,
@@ -89,7 +90,7 @@ pub(crate) enum MessageId {
 impl MessageId {
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
-            Self::Native(_) => Trigger::Message,
+            Self::Native(_) | Self::Follow(_) => Trigger::Message,
             Self::Wake { .. } => Trigger::Wake,
             Self::Job { .. } => Trigger::Job,
         }
@@ -99,7 +100,7 @@ impl MessageId {
 impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Native(id) => formatter.write_str(id),
+            Self::Native(id) | Self::Follow(id) => formatter.write_str(id),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
             Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }
