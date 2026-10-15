@@ -77,6 +77,75 @@ fn session() -> PolicyContext {
 }
 
 #[test]
+fn request_shape_refuses_every_parsed_violation_in_both_loading_modes() {
+    let source = r#"
+        @id("wrong-permit")
+        permit(principal == Dekopon::Principal::"cpetersen", action, resource)
+        when { context.request.method == "POST" };
+        @id("missing-guard")
+        forbid(principal == Dekopon::Principal::"direct-caller", action, resource)
+        when { context.request has body };
+        @id("late-guard")
+        forbid(principal, action, resource)
+        when { context.via == "gateway" }
+        when { context has request }
+        unless { context.request.method == "POST" };
+    "#;
+    for error in [
+        PolicyEngine::new(source, &world()).expect_err("strict rejects all invalid shapes"),
+        PolicyEngine::new_lenient(source, &world())
+            .expect_err("lenient rejects all invalid shapes"),
+    ] {
+        assert!(
+            matches!(error, PolicyBuildError::InvalidRequestShapes { policies }
+            if policies == ["late-guard", "missing-guard", "wrong-permit"])
+        );
+    }
+}
+
+#[test]
+fn a_guarded_request_forbid_with_unless_loads_without_weakening_ordinary_validation() {
+    let guarded = r#"
+        @id("request-fence")
+        forbid(principal, action, resource)
+        when { context has request }
+        unless { context.request.method == "POST" };
+    "#;
+    for engine in [
+        PolicyEngine::new(guarded, &world()).expect("strict accepts request guard"),
+        PolicyEngine::new_lenient(guarded, &world())
+            .expect("lenient accepts request guard")
+            .0,
+    ] {
+        assert_eq!(engine.policy_count(), 1);
+    }
+    let invalid_ordinary = format!(
+        r#"{guarded}
+        @id("ordinary-invalid")
+        permit(principal, action, resource)
+        when {{ context.nonexistent == "value" }};
+    "#
+    );
+    assert!(matches!(
+        PolicyEngine::new(&invalid_ordinary, &world())
+            .expect_err("ordinary policy still gets strict schema validation"),
+        PolicyBuildError::Validation { .. }
+    ));
+}
+
+#[test]
+fn a_parse_failure_has_a_cedar_diagnostic_and_no_invented_policy_ids() {
+    let malformed = r#"@id("looks-valid") forbid(principal, action, resource) when {"#;
+    for error in [
+        PolicyEngine::new(malformed, &world()).expect_err("strict parse fails"),
+        PolicyEngine::new_lenient(malformed, &world()).expect_err("lenient parse fails"),
+    ] {
+        assert!(matches!(error, PolicyBuildError::Parse { message }
+            if !message.is_empty() && !message.contains("policy0") && !message.contains("InvalidRequestShapes")));
+    }
+}
+
+#[test]
 fn empty_policy_text_is_valid_and_permits_nothing() {
     for source in ["", "   \n\t  "] {
         let engine = PolicyEngine::new(source, &world()).expect("empty policy text is valid");

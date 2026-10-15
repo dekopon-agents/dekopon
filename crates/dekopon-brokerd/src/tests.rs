@@ -1602,6 +1602,46 @@ fn example_path(name: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test]
+async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
+    use super::{BrokerdError, Mode};
+    use dekopon_broker::PolicyBuildError;
+
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+        .expect("private configuration directory");
+    let config_path = root.path().join("broker.yaml");
+    let mut document = attested_document(current_uid());
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+        .expect("checked cli-probe component");
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    write_owner_only(
+        &root.path().join("policies.cedar"),
+        br#"@id("request-permit") permit(principal, action, resource)
+            when { context.request.method == "POST" };
+            @id("request-forbid") forbid(principal, action, resource)
+            when { context.request has body };"#,
+    );
+    for strict in [true, false] {
+        document["strict"] = json!(strict);
+        write_config(&config_path, &document);
+        for report in [
+            super::check(&config_path, None).await,
+            super::load_candidate(&config_path, Mode::Boot).await.1,
+        ] {
+            assert!(
+                report.problems.iter().any(|problem| matches!(
+                    problem,
+                    BrokerdError::Policy {
+                        source: PolicyBuildError::InvalidRequestShapes { policies }
+                    } if policies == &["request-forbid", "request-permit"]
+                )),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn check_passes_the_conditional_write_example_in_place() {
     let report = super::check(example_path("examples/conditional-write/broker.yaml"), None).await;
     assert!(
