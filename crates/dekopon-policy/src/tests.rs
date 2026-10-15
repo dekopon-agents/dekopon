@@ -109,7 +109,9 @@ fn request_url_method_and_guest_headers_are_exact_or_absent() {
         json!({"host":"example.com","path":"/api/send"})
     );
     assert_eq!(request["headers"], json!({"x-guest":"café"}));
+    input.method = "PATCH".into();
     input.query = "a=1".into();
+    assert_eq!(request_json(input.clone())["method"], "PATCH");
     assert_eq!(request_json(input.clone())["url"]["query"], "a=1");
     input.headers.push(("x-GUEST".into(), b"other".to_vec()));
     assert!(request_json(input.clone()).get("headers").is_none());
@@ -130,13 +132,9 @@ fn only_entire_representable_json_records_enter_request_context() {
     assert_eq!(exposed["body"]["channel"], "C0123");
     assert_eq!(exposed["body"]["nested"]["ok"], true);
     assert_eq!(exposed["body"]["nested"]["count"], -5);
-    assert_eq!(
-        exposed["body"]["nested"]["values"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
+    let set = exposed["body"]["nested"]["values"].as_array().unwrap();
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&json!("a")) && set.contains(&json!(2)));
     input.content_type = Some("application/problem+json".into());
     assert!(request_json(input.clone()).get("body").is_none());
     input.content_type = Some("application/json".into());
