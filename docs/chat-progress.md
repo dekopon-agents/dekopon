@@ -335,9 +335,9 @@ partial successful turn is manufactured from the text already displayed.
 transports:
   - kind: discordGateway
     name: example
-    liveness:
-      mode: native                 # off | native   (typing, status, reaction)
-      classicFallback: reaction    # Slack classic only
+    indicators:
+      mode: native                 # off | native
+      reaction: { working: auto, seen: off }
       progress: auto               # auto (default) | off | message
       stream: true                 # default false
       cancelButton: true           # default false
@@ -353,7 +353,7 @@ routes:
     limits: { maxSteps: 12, maxCapabilityCalls: 16, maxDurationMs: 300000 }
 ```
 
-Absent/master-Off liveness stays disabled even though progress defaults to Auto.
+Absent or master-Off indicators stay disabled even though progress defaults to Auto.
 Validation refuses `progress: message`, `stream: true`, or `cancelButton: true` with `mode: off`; `stream` or
 `cancelButton` on a transport with no edit surface; a cancel button on a transport whose service
 already owns a stop control; an unknown template placeholder; and a zero `maxDurationMs`, like every
@@ -364,12 +364,11 @@ over every prose choice and does not start a synthetic working message.
 Auto without a message delivers a fresh complete reply. Explicit Message retains in-place
 finalization. Neither implies exactly one notification: a message's creation may notify when its
 final edit does not. Discord's existing typing cooldown may return success without sending, so
-Auto can temporarily suppress fallback prose without visible typing. WhatsApp still offers only
-typing/read receipt; no editable progress, stream, reaction, or button is added here.
+Auto can temporarily suppress fallback prose without visible typing. WhatsApp offers typing/read receipt and an opt-in steer 👀, but no working reaction,
+editable progress, stream, or button.
 
-The block this replaces was renamed rather than extended, and nothing reads the old spelling:
-writing it is a startup refusal naming `liveness:` — no alias, no migration read, no
-warning-and-continue. [`upgrading.md`](upgrading.md) records the rename and the name it replaced.
+`indicators` replaces `liveness` rather than extending it. The old spelling is a startup
+refusal naming `liveness:` — no alias, no migration read, no warning-and-continue. [`upgrading.md`](upgrading.md) records the rename and the name it replaced.
 
 ## Telemetry
 

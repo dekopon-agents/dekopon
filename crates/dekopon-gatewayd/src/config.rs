@@ -2620,6 +2620,23 @@ routes:
     }
 
     #[test]
+    fn invalid_keep_alive_and_template_are_reported_together() {
+        let error = resolved("transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\nroutes:\n  - transport: dev\n    conversation: { kind: [directMessage] }\n    agent: reviewer\n    indicators: { mode: native, keepAlive: { everySeconds: 0 }, templates: { working: '{word}' } }\n").unwrap_err();
+        let ConfigError::Invalid { problems, .. } = error else {
+            panic!("expected semantic refusals")
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| matches!(problem, super::ConfigProblem::InvalidKeepAlive { .. }))
+        );
+        assert!(problems.iter().any(|problem| matches!(
+            problem,
+            super::ConfigProblem::InvalidLivenessTemplate { .. }
+        )));
+    }
+
+    #[test]
     fn status_text_rejects_each_message_surface_after_resolving_overrides() {
         for block in [
             "progress: message".to_owned(),

@@ -17,7 +17,8 @@ use dekopon_model::ModelText;
 
 use crate::{
     config::{
-        LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness, TemplateOverrides,
+        IndicatorSurface, LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness,
+        TemplateOverrides, WorkingReaction,
     },
     progress::{
         KeepAlive, ProgressDetail, ProgressInputs, ProgressPolicy, Templates, Terminal,
@@ -922,6 +923,50 @@ async fn a_stop_after_handover_clears_status_text_before_the_stopped_reply() {
 }
 
 #[tokio::test]
+async fn status_off_suppresses_native_writes_during_note_handover_and_restore() {
+    let note = note_event("waiting", None).await;
+    tokio::time::pause();
+    let mut config = liveness_with(false, KeepAlive::default());
+    let settings = &mut Arc::get_mut(&mut config).expect("fresh fixture").settings;
+    settings.progress = ProgressSurface::Off;
+    settings.status_text = true;
+    settings.status = IndicatorSurface::Off;
+    settings.typing = IndicatorSurface::Off;
+    settings.working = WorkingReaction::Off;
+    let mut harness = start(
+        Offers {
+            status_text: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Plain,
+        config,
+    );
+    harness
+        .recorder
+        .refuse_status_text
+        .store(2, Ordering::Relaxed);
+    harness.sink.emit(started());
+    harness.sink.emit(note);
+    settle().await;
+    advance(Duration::from_secs(16)).await;
+    assert_eq!(
+        harness.recorder.calls(),
+        [
+            Call::StatusText("waiting…".to_owned()),
+            Call::StatusText("waiting…".to_owned()),
+        ]
+    );
+    harness.policy.terminal(Terminal::Silent).await;
+    assert!(
+        harness
+            .recorder
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, Call::Status(_)))
+    );
+}
+
+#[tokio::test]
 async fn two_status_text_failures_restore_native_working_once_and_stop_showing() {
     let note = note_event("waiting", None).await;
     let (capture, _guard) = capture();
@@ -1338,7 +1383,7 @@ async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
             Call::Typing,
             Call::Status(Status::Working)
         ],
-        "the cheapest signal first, then the lease, then the durable state"
+        "additive reaction accompanies status and typing"
     );
 
     harness.sink.emit(answered_with_tool(1));

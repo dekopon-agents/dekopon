@@ -92,7 +92,7 @@ state that accepted set; invalid labels are refused. See
 
 ## Configure in-flight indicators
 
-Session indicators are opt-in and starts after fresh broker authorization. A same-sender steer joins
+Session indicators are opt-in and start after fresh broker authorization. A same-sender steer joins
 the running leg; a queued sender opens a fresh leg when their turn starts. Accepted steers and
 queued non-wake messages get best-effort `eyes` only when their resolved route opts in with
 `reaction.seen: on`, subject to reaction-scope availability. This admission acknowledgment can precede a later
@@ -164,7 +164,7 @@ Explicit mentions and DMs always require replies.
 Liveness failures never delay or fail the terminal reply. `feature_disabled`, `missing_scope`, and
 other permanent Agent installation failures trip a per-transport breaker, and two consecutive
 failures on any one surface stop it for that session. Reaction cleanup removes only a reaction this
-session successfully added; a failed cleanup may leave a harmless `:tangerine:` marker.
+session attempted; a failed cleanup may leave a harmless `:tangerine:` marker.
 
 ### Export the credentials
 

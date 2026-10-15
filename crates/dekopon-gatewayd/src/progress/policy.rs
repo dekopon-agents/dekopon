@@ -16,7 +16,10 @@ use tokio::{
 };
 
 use crate::{
-    config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
+    config::{
+        IndicatorSurface, LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness,
+        WorkingReaction,
+    },
     progress::{
         KeepAlive, StopCause,
         adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, QueuedEvent, record},
@@ -25,8 +28,8 @@ use crate::{
     },
     session::SessionCancellation,
     transport::{
-        ChatDriver, LivenessTarget, MessageRef, OutboundReply, ReplyTarget, Status, StreamedText,
-        TransportError,
+        ChatDriver, LivenessTarget, MessageRef, NativeStatus, OutboundReply, ReplyTarget, Status,
+        StreamedText, TransportError,
     },
 };
 
@@ -400,6 +403,7 @@ struct Live {
     breakers: Breakers,
     indicator_active: bool,
     status_attempted: bool,
+    status_active: bool,
     status_text: StatusTextState,
     reaction_attempted: bool,
 }
@@ -439,6 +443,7 @@ impl Live {
             breakers: Breakers::default(),
             indicator_active: false,
             status_attempted: false,
+            status_active: false,
             status_text: StatusTextState::Waiting,
             reaction_attempted: false,
         }
@@ -548,30 +553,29 @@ impl Live {
         };
         let driver = Arc::clone(&self.driver);
         let auto = self.settings.progress == ProgressSurface::Auto;
-        if !auto {
+        if self.settings.working == WorkingReaction::On {
             self.open_reaction().await;
+        }
+        if !auto && self.settings.typing == IndicatorSurface::Auto {
             self.renew_typing().await;
         }
-        if let Some(status) = driver.status() {
+        if let Some(status) = native_status(&*driver, &self.settings) {
             self.status_attempted = true;
             let outcome = bounded(status.set(&target, Status::Working)).await;
-            self.indicator_active = outcome.is_ok();
+            self.status_active = outcome.is_ok();
+            self.indicator_active |= self.status_active;
             self.observe(outcome, "status");
-            if auto && self.indicator_active {
-                return;
-            }
         }
-        if auto && driver.typing().is_some() {
+        if auto && self.settings.typing == IndicatorSurface::Auto && !self.status_active {
             self.renew_typing().await;
-            return;
         }
-        if !self.reaction_attempted {
+        if self.settings.working == WorkingReaction::Auto && !self.indicator_active {
             self.open_reaction().await;
         }
     }
 
     async fn open_reaction(&mut self) {
-        if self.settings.working == crate::config::WorkingReaction::Off {
+        if self.settings.working == WorkingReaction::Off || self.reaction_attempted {
             return;
         }
         let Some(target) = self.target.clone() else {
@@ -643,13 +647,13 @@ impl Live {
             return;
         };
         let outcome = bounded(typing.renew(&target)).await;
-        if self.settings.progress == ProgressSurface::Auto && outcome.is_ok() {
-            self.indicator_active = true;
-        }
+        self.indicator_active |= outcome.is_ok();
         self.observe(outcome, "typing");
-        if self.settings.progress == ProgressSurface::Auto && !self.breakers.typing.allows() {
-            self.indicator_active = false;
-            self.open_reaction().await;
+        if !self.breakers.typing.allows() {
+            self.indicator_active = self.status_active;
+            if self.settings.working == WorkingReaction::Auto && !self.indicator_active {
+                self.open_reaction().await;
+            }
         }
         if self.breakers.typing.allows() {
             self.typing.arm(Instant::now(), typing.renew_every(), ());
@@ -747,7 +751,7 @@ impl Live {
         let outcome = if let Some(status_text) = status_text {
             if self.status_text == StatusTextState::Waiting {
                 self.status_text = StatusTextState::HandedOver;
-                if let Some(status) = driver.status() {
+                if let Some(status) = native_status(&*driver, &self.settings) {
                     self.status_attempted = true;
                     let outcome = bounded(status.set(&target, Status::Idle)).await;
                     self.observe(outcome, "status");
@@ -809,7 +813,9 @@ impl Live {
         }
         self.status_text = StatusTextState::RestoreAttempted;
         let driver = Arc::clone(&self.driver);
-        if let (Some(target), Some(status)) = (&self.target, driver.status()) {
+        if let (Some(target), Some(status)) =
+            (&self.target, native_status(&*driver, &self.settings))
+        {
             self.status_attempted = true;
             let outcome = bounded(status.set(target, Status::Working)).await;
             self.observe(outcome, "status");
@@ -1074,7 +1080,7 @@ impl Live {
         };
         let driver = Arc::clone(&self.driver);
         if self.status_attempted
-            && let Some(status) = driver.status()
+            && let Some(status) = native_status(&*driver, &self.settings)
         {
             let outcome = bounded(status.set(&target, Status::Idle)).await;
             self.observe(outcome, "status");
@@ -1107,6 +1113,16 @@ impl Live {
             }
             Err(category) => breaker.failed(&self.transport, primitive, category),
         }
+    }
+}
+
+fn native_status<'a>(
+    driver: &'a dyn ChatDriver,
+    settings: &LivenessSettings,
+) -> Option<&'a dyn NativeStatus> {
+    match settings.status {
+        IndicatorSurface::Auto => driver.status(),
+        IndicatorSurface::Off => None,
     }
 }
 

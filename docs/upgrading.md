@@ -15,10 +15,11 @@ The gateway replaces `transports[].liveness` with layered `indicators`: `session
 `routes[].indicators`, in that order. The last authored leaf wins; absent or `null` inherits.
 `mode: off` suppresses every indicator. In `mode: native`, reaction defaults are
 `reaction: { working: off, seen: off }`. Migrate `classicFallback: reaction` to
-`reaction.working: auto` (not a default-on reaction). Additive `reaction.working: on` and
-`status`/`typing: off` evaluation remain pending the following S2 gateway step; do not rely
-on them in an S1-only binary. WhatsApp rejects `working: on` and `auto` until a
-verified Cloud API clear is supported. Set `reaction.seen: on` on a route only if the
+`reaction.working: auto` (not a default-on reaction). `reaction.working: on` adds a working reaction alongside available status or typing;
+`auto` falls back only when neither is active. Discord, Telegram and local transports
+reacted implicitly under `mode: native`; that reaction also disappears unless the
+fragment sets `reaction.working: on` (`auto` reacts only when typing is unavailable). WhatsApp rejects `working: on` and `auto`
+until a verified Cloud API clear is supported. Set `reaction.seen: on` on a route only if the
 operator wants the persistent steer/queue 👀; otherwise **the former automatic steer 👀
 disappears**. Neither the old `liveness` nor `classicFallback` key is accepted.
 
@@ -29,7 +30,7 @@ explicitly sets `reaction.seen: off`; do not add WhatsApp working reactions. Thi
 configuration migration note, **not** an edit to those manifests. Ship the reviewed core
 pin first and the manifest migration immediately after it in a separate PR; both old and
 new binaries reject the other's keys, so an incompatible-key crash loop is expected
-between those changes. Do not promise zero downtime or opt in a live route in this step.
+between those changes. Do not promise zero downtime or opt in a live route during migration.
 
 ## Stopped turns, progress and session seals (0.46.0)
 

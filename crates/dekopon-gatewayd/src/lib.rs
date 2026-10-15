@@ -1073,7 +1073,6 @@ fn build_transport(
             .any(|resolved| resolved.settings.mode == LivenessMode::Native)
         {
             settings.mode = LivenessMode::Native;
-            settings.working = WorkingReaction::Auto;
         }
         settings
     };
@@ -1083,7 +1082,6 @@ fn build_transport(
             app_token_env,
             bot_token_env,
             experience,
-            liveness,
             endpoint,
             ..
         } => Box::new(SlackTransport::new(
@@ -1094,7 +1092,6 @@ fn build_transport(
             transport::read_credential(app_token_env)?,
             transport::read_credential(bot_token_env)?,
             *experience,
-            surface(liveness),
         )?),
         TransportConfig::DiscordGateway {
             name,

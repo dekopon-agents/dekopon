@@ -26,7 +26,7 @@ use tracing::{Instrument as _, Span};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
-    config::{LivenessSettings, SLACK_ENDPOINT, SlackExperience, WorkingReaction},
+    config::{SLACK_ENDPOINT, SlackExperience},
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
@@ -87,7 +87,6 @@ impl SlackTransport {
         app_token: String,
         bot_token: String,
         experience: SlackExperience,
-        liveness: LivenessSettings,
     ) -> Result<Self, TransportError> {
         let http = credential_client(SLACK_REQUEST_TIMEOUT)
             .build()
@@ -103,7 +102,6 @@ impl SlackTransport {
                 bot_token: Redacted::new(bot_token),
                 http,
                 experience,
-                classic_reaction: liveness.working != WorkingReaction::Off,
                 agent_status_available: AtomicBool::new(true),
                 assistant_status_available: AtomicBool::new(true),
                 reaction_available: AtomicBool::new(true),
@@ -677,7 +675,6 @@ pub(crate) struct SlackReplier {
     bot_token: Redacted<String>,
     http: reqwest::Client,
     experience: SlackExperience,
-    classic_reaction: bool,
     agent_status_available: AtomicBool,
     assistant_status_available: AtomicBool,
     reaction_available: AtomicBool,
@@ -771,12 +768,9 @@ impl ChatDriver for SlackReplier {
     }
 
     fn reaction(&self) -> Option<&dyn InboundReaction> {
-        let without_native_status = self.experience == SlackExperience::Classic
-            || !self.agent_status_available.load(Ordering::Acquire);
-        (self.classic_reaction
-            && without_native_status
-            && self.reaction_available.load(Ordering::Acquire))
-        .then_some(self as &dyn InboundReaction)
+        self.reaction_available
+            .load(Ordering::Acquire)
+            .then_some(self as &dyn InboundReaction)
     }
 
     fn steer_ack(&self) -> Option<&dyn SteerAck> {
@@ -1936,7 +1930,7 @@ mod driver_tests {
         SlackTransport, Tracked,
     };
     use crate::{
-        config::{LivenessSettings, SlackExperience, TemplateOverrides, WorkingReaction},
+        config::{SlackExperience, TemplateOverrides},
         progress::{ProgressDetail, ProgressText, Templates},
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
@@ -1976,14 +1970,10 @@ mod driver_tests {
     }
 
     fn replier(endpoint: &str, experience: SlackExperience) -> SlackReplier {
-        replier_with(endpoint, experience, true)
+        replier_with(endpoint, experience)
     }
 
-    fn replier_with(
-        endpoint: &str,
-        experience: SlackExperience,
-        classic_reaction: bool,
-    ) -> SlackReplier {
+    fn replier_with(endpoint: &str, experience: SlackExperience) -> SlackReplier {
         SlackReplier {
             endpoint: endpoint.to_owned(),
             bot_token: Redacted::new("xoxb-test-bot-token".to_owned()),
@@ -1991,7 +1981,6 @@ mod driver_tests {
                 .build()
                 .expect("credential client builds"),
             experience,
-            classic_reaction,
             agent_status_available: AtomicBool::new(true),
             assistant_status_available: AtomicBool::new(true),
             reaction_available: AtomicBool::new(true),
@@ -2008,10 +1997,6 @@ mod driver_tests {
             "xapp-test-app-token".to_owned(),
             "xoxb-test-bot-token".to_owned(),
             experience,
-            LivenessSettings {
-                working: WorkingReaction::Auto,
-                ..LivenessSettings::default()
-            },
         )
         .expect("slack transport builds")
     }
@@ -2186,16 +2171,8 @@ mod driver_tests {
     async fn the_agent_experience_owns_stop_while_the_classic_one_is_given_a_button() {
         let agent = replier(UNREACHABLE, SlackExperience::Agent);
         assert!(ChatDriver::status(&agent).is_some());
-        assert!(
-            ChatDriver::reaction(&agent).is_none(),
-            "the fallback is offered only where the native status is not: an Agent session Slack \
-             still accepts the status for carries the spinner alone, never a reaction beside it"
-        );
-        assert!(
-            ChatDriver::reaction(&replier_with(UNREACHABLE, SlackExperience::Classic, false))
-                .is_none(),
-            "and nothing marks an inbound message when no fallback was configured"
-        );
+        assert!(ChatDriver::reaction(&agent).is_some());
+        assert!(ChatDriver::reaction(&replier(UNREACHABLE, SlackExperience::Classic)).is_some());
         assert!(
             ChatDriver::cancel_button(&agent).is_none(),
             "Slack renders its own Stop control beside an Agent session"
@@ -2314,8 +2291,8 @@ mod driver_tests {
             "an Agent installation is asked for its own status first"
         );
         assert!(
-            ChatDriver::reaction(&replier).is_none(),
-            "and while that status is live the fallback is not offered beside it"
+            ChatDriver::reaction(&replier).is_some(),
+            "selection belongs to the policy"
         );
 
         let error = NativeStatus::set(&replier, &target(), Status::Working)
@@ -2337,9 +2314,9 @@ mod driver_tests {
     }
 
     #[tokio::test]
-    async fn steering_ack_ignores_classic_fallback_and_is_not_removed_as_progress() {
+    async fn steering_ack_is_not_removed_as_progress() {
         let mock = spawn_slack_mock(accepting);
-        let replier = replier_with(&mock.base, SlackExperience::Agent, false);
+        let replier = replier(&mock.base, SlackExperience::Agent);
         assert!(ChatDriver::steer_ack(&replier).is_some());
         SteerAck::seen(&replier, &target())
             .await
@@ -2359,7 +2336,7 @@ mod driver_tests {
     #[tokio::test]
     async fn missing_reaction_scope_disables_further_steering_acks() {
         let mock = spawn_slack_mock(|_, _| (200, json!({"ok": false, "error": "missing_scope"})));
-        let replier = replier_with(&mock.base, SlackExperience::Agent, false);
+        let replier = replier(&mock.base, SlackExperience::Agent);
         assert!(matches!(SteerAck::seen(&replier, &target()).await,
             Err(TransportError::Service { code }) if code == "missing_scope"));
         assert!(SteerAck::seen(&replier, &target()).await.is_err());
