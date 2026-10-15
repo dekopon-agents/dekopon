@@ -1,13 +1,22 @@
 use clap::{Arg, ArgAction, Command};
 
-use crate::builtins::{CommandFailure, parse_flags};
+use crate::builtins::{CommandFailure, parse_flags, text::lines::parse_count};
 
 use super::Pattern;
 
+#[derive(Clone, Copy)]
+pub(crate) enum GrepMode {
+    Lines,
+    Count,
+    Quiet,
+}
+
 pub(crate) struct GrepConfig {
     invert: bool,
-    count_only: bool,
     number: bool,
+    pub(crate) mode: GrepMode,
+    pub(crate) before: usize,
+    pub(crate) after: usize,
     pattern: Pattern,
 }
 
@@ -20,6 +29,7 @@ impl GrepConfig {
             ("count", 'c', "count"),
             ("number", 'n', "line-number"),
             ("extended", 'E', "extended-regexp"),
+            ("quiet", 'q', "quiet"),
         ] {
             grammar = grammar.arg(
                 Arg::new(id)
@@ -27,6 +37,13 @@ impl GrepConfig {
                     .long(long)
                     .action(ArgAction::SetTrue),
             );
+        }
+        for (id, short, long) in [
+            ("after", 'A', "after-context"),
+            ("before", 'B', "before-context"),
+            ("context", 'C', "context"),
+        ] {
+            grammar = grammar.arg(Arg::new(id).short(short).long(long).num_args(1));
         }
         let matches = parse_flags(
             grammar.arg(Arg::new("pattern").required(true)),
@@ -36,10 +53,31 @@ impl GrepConfig {
         )?;
         let pattern = matches
             .get_one::<String>("pattern")
-            .expect("required by clap");
+            .ok_or_else(|| CommandFailure::usage("grep: a pattern is required"))?;
+        let count = |id: &'static str| {
+            matches
+                .get_one::<String>(id)
+                .map(|n| parse_count("grep", n))
+                .transpose()
+        };
+        let context = count("context")?.unwrap_or(0);
+        let common = matches.index_of("context");
+        let side = |id: &'static str| -> Result<usize, CommandFailure> {
+            Ok(if matches.index_of(id) > common {
+                count(id)?.unwrap_or(0)
+            } else {
+                context
+            })
+        };
         Ok(Self {
+            mode: match (matches.get_flag("quiet"), matches.get_flag("count")) {
+                (true, _) => GrepMode::Quiet,
+                (false, true) => GrepMode::Count,
+                (false, false) => GrepMode::Lines,
+            },
+            before: side("before")?,
+            after: side("after")?,
             invert: matches.get_flag("invert"),
-            count_only: matches.get_flag("count"),
             number: matches.get_flag("number"),
             pattern: Pattern::compile(
                 "grep",
@@ -48,10 +86,6 @@ impl GrepConfig {
                 matches.get_flag("extended"),
             )?,
         })
-    }
-
-    pub(crate) fn count_only(&self) -> bool {
-        self.count_only
     }
 
     pub(crate) fn selects(

@@ -17,6 +17,7 @@ pub(crate) enum LineCommand {
 
 pub(crate) enum Selection {
     First(usize),
+    FirstBytes(usize),
     Last(usize),
     From(usize),
 }
@@ -50,8 +51,8 @@ impl LineCommand {
 
     pub(crate) fn help(self) -> &'static str {
         match self {
-            Self::Head => "-n N -N",
-            Self::Tail => "-n N -N -n +N",
+            Self::Head => "-n N --lines N -N -c N --bytes N",
+            Self::Tail => "-n N --lines N -N -n +N",
         }
     }
 
@@ -70,18 +71,28 @@ impl LineCommand {
         {
             rewritten.splice(..1, ["-n".to_owned(), first[1..].to_owned()]);
         }
-        let matches = parse_flags(
-            Command::new(name).arg(
-                Arg::new("lines")
-                    .short('n')
-                    .long("lines")
-                    .num_args(1)
-                    .allow_hyphen_values(true),
-            ),
-            &rewritten,
-            name,
-            self.help(),
-        )?;
+        let mut grammar = Command::new(name).arg(
+            Arg::new("lines")
+                .short('n')
+                .long("lines")
+                .num_args(1)
+                .allow_hyphen_values(true),
+        );
+        if let Self::Head = self {
+            grammar = grammar.arg(Arg::new("bytes").short('c').long("bytes").num_args(1));
+        }
+        let matches = parse_flags(grammar, &rewritten, name, self.help())?;
+        if let Some(bytes) = if let Self::Head = self {
+            matches.get_one::<String>("bytes")
+        } else {
+            None
+        } {
+            let count = parse_count(name, bytes)?;
+            if matches.contains_id("lines") {
+                return Err(CommandFailure::usage("head: -c and -n cannot be combined"));
+            }
+            return Ok(Selection::FirstBytes(count));
+        }
         let number = matches
             .get_one::<String>("lines")
             .map(String::as_str)
@@ -92,8 +103,7 @@ impl LineCommand {
         };
         let count = parse_count(name, digits)?;
         match (self, from) {
-            (Self::Head, true) => Err(unsupported_flag(name, &format!("-n {number}"), self.help())),
-            (Self::Head, false) => Ok(Selection::First(count)),
+            (Self::Head, _) => Ok(Selection::First(count)),
             (Self::Tail, true) => Ok(Selection::From(count.max(1))),
             (Self::Tail, false) => Ok(Selection::Last(count)),
         }
@@ -107,7 +117,21 @@ impl LineCommand {
         invoker: &dyn CapabilityInvoker,
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<(), CommandFailure> {
-        if matches!(selection, Selection::First(0) | Selection::Last(0)) {
+        if matches!(
+            selection,
+            Selection::First(0) | Selection::FirstBytes(0) | Selection::Last(0)
+        ) {
+            return Ok(());
+        }
+        if let Selection::FirstBytes(mut remaining) = selection {
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
+                budget.charge_step_with(invoker)?;
+                let n = remaining.min(chunk.len());
+                if !emit(&chunk[..n])? || n == remaining {
+                    return Ok(());
+                }
+                remaining -= n;
+            }
             return Ok(());
         }
         let mut pending = Vec::new();
@@ -159,7 +183,7 @@ impl LineCommand {
                                 }
                             }
                         }
-                        Selection::From(_) => {}
+                        Selection::From(_) | Selection::FirstBytes(_) => {}
                     }
                     pending.clear();
                     pending_charges.clear();
@@ -177,7 +201,7 @@ impl LineCommand {
                         kept.pop_front();
                     }
                 }
-                Selection::From(_) | Selection::Last(_) => {}
+                Selection::From(_) | Selection::Last(_) | Selection::FirstBytes(_) => {}
             }
         }
         for (line, _charge) in kept {

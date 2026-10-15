@@ -2,7 +2,10 @@ use crate::{
     CapabilityInvoker, ExitCode, RetainedBytes,
     builtins::{
         CommandFailure,
-        text::{grep::GrepConfig, sed::Substitution},
+        text::{
+            grep::{GrepConfig, GrepMode},
+            sed::Substitution,
+        },
     },
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
@@ -23,6 +26,9 @@ pub(crate) enum Operation {
 struct LineProgress {
     index: usize,
     matches: usize,
+    last_emitted: usize,
+    after_until: usize,
+    before: std::collections::VecDeque<(usize, Vec<u8>, Vec<RetainedBytes>)>,
 }
 
 impl TextStream {
@@ -35,7 +41,7 @@ impl TextStream {
 
     pub(crate) fn help(self) -> &'static str {
         match self {
-            Self::Grep => "-v -i -c -n -E",
+            Self::Grep => "-v -i -c -n -E -q -A N -B N -C N",
             Self::Sed => "-e -E",
         }
     }
@@ -83,7 +89,7 @@ impl TextStream {
                     progress.index += 1;
                     if !process_line(
                         &operation,
-                        &pending,
+                        (&pending, &mut charges),
                         &mut progress,
                         budget,
                         invoker,
@@ -100,7 +106,7 @@ impl TextStream {
             progress.index += 1;
             if !process_line(
                 &operation,
-                &pending,
+                (&pending, &mut charges),
                 &mut progress,
                 budget,
                 invoker,
@@ -110,7 +116,7 @@ impl TextStream {
             }
         }
         if let Operation::Grep(config) = &operation {
-            if config.count_only()
+            if let GrepMode::Count = config.mode
                 && !super::sed::emit_chunks(
                     format!("{}\n", progress.matches).as_bytes(),
                     budget,
@@ -132,23 +138,71 @@ impl TextStream {
 
 fn process_line(
     operation: &Operation,
-    bytes: &[u8],
+    line_bytes: (&[u8], &mut Vec<RetainedBytes>),
     progress: &mut LineProgress,
     budget: &mut Budget,
     invoker: &dyn CapabilityInvoker,
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
+    let (bytes, charges) = line_bytes;
     let terminated = bytes.ends_with(b"\n");
     let line = std::str::from_utf8(bytes.strip_suffix(b"\n").unwrap_or(bytes)).map_err(
         |_invalid_utf8| CommandFailure::failed("standard input is not valid UTF-8 text"),
     )?;
     let emitted = match operation {
         Operation::Grep(config) => {
-            if !config.selects(line, budget)? {
+            let selected = config.selects(line, budget)?;
+            if selected {
+                progress.matches += 1;
+                if let GrepMode::Quiet = config.mode {
+                    return Ok(false);
+                }
+            }
+            if let GrepMode::Count = config.mode {
                 return Ok(true);
             }
-            progress.matches += 1;
-            if config.count_only() {
+            if config.before > 0 || config.after > 0 {
+                if selected {
+                    for (index, saved, _charges) in std::mem::take(&mut progress.before) {
+                        if index > progress.last_emitted
+                            && !emit_grep(
+                                config,
+                                progress,
+                                (index, &saved, false),
+                                budget,
+                                invoker,
+                                emit,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    progress.after_until = progress.index.saturating_add(config.after);
+                }
+                if selected || progress.index <= progress.after_until {
+                    if !emit_grep(
+                        config,
+                        progress,
+                        (progress.index, bytes, selected),
+                        budget,
+                        invoker,
+                        emit,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if config.before > 0 {
+                    progress.before.push_back((
+                        progress.index,
+                        bytes.to_vec(),
+                        std::mem::take(charges),
+                    ));
+                    if progress.before.len() > config.before {
+                        progress.before.pop_front();
+                    }
+                }
+                return Ok(true);
+            }
+            if !selected {
                 return Ok(true);
             }
             if config.number()
@@ -173,6 +227,31 @@ fn process_line(
     } else {
         Ok(true)
     }
+}
+
+fn emit_grep(
+    config: &GrepConfig,
+    progress: &mut LineProgress,
+    line: (usize, &[u8], bool),
+    budget: &mut Budget,
+    invoker: &dyn CapabilityInvoker,
+    emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<bool, CommandFailure> {
+    let (index, bytes, selected) = line;
+    if progress.last_emitted > 0
+        && index > progress.last_emitted.saturating_add(1)
+        && !super::sed::emit_chunks(b"--\n", budget, invoker, emit)?
+    {
+        return Ok(false);
+    }
+    progress.last_emitted = index;
+    if config.number() {
+        let marker = if selected { ':' } else { '-' };
+        if !super::sed::emit_chunks(format!("{index}{marker}").as_bytes(), budget, invoker, emit)? {
+            return Ok(false);
+        }
+    }
+    super::sed::emit_chunks(bytes, budget, invoker, emit)
 }
 
 #[cfg(test)]
@@ -338,6 +417,84 @@ mod tests {
             ));
             assert_eq!(invoker.0.load(Ordering::SeqCst), 2);
         }
+    }
+
+    #[test]
+    fn context_across_chunks_emits_one_numbered_unterminated_tail() {
+        let mut input = b"x\n".repeat(pipe::CHUNK_BYTES / 2 - 1);
+        input.extend_from_slice(b"P\nx\nP\ntail");
+        let mut reader = PipeReader::from_bytes(input);
+        let mut budget = Budget::start(Limits::default());
+        let mut output = Vec::new();
+        let status = TextStream::Grep
+            .run(
+                &["-nB1".to_owned(), "-A1".to_owned(), "P".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |bytes| {
+                    output.extend_from_slice(bytes);
+                    Ok(true)
+                },
+            )
+            .expect("context across the chunk boundary");
+        assert_eq!(status, ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            format!(
+                "{}-x\n{}:P\n{}-x\n{}:P\n{}-tail",
+                pipe::CHUNK_BYTES / 2 - 1,
+                pipe::CHUNK_BYTES / 2,
+                pipe::CHUNK_BYTES / 2 + 1,
+                pipe::CHUNK_BYTES / 2 + 2,
+                pipe::CHUNK_BYTES / 2 + 3
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn grep_before_window_retains_charges_and_context_stays_step_bounded() {
+        let mut reader = PipeReader::from_bytes(b"abc\nabc\nabc\nmatch\n".to_vec());
+        let mut budget = Budget::start(Limits {
+            max_value_bytes: 7,
+            ..Limits::default()
+        });
+        let failure = TextStream::Grep
+            .run(
+                &["-B2".to_owned(), "match".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |_| Ok(true),
+            )
+            .expect_err("two retained context lines exceed the budget");
+        assert!(matches!(
+            failure,
+            CommandFailure::Fatal(crate::builtins::FatalError::Limit(
+                LimitExceeded::ValueBytes { maximum: 7 }
+            ))
+        ));
+        let mut reader = PipeReader::from_bytes(vec![b'x'; 2 * pipe::CHUNK_BYTES]);
+        let mut budget = Budget::start(Limits {
+            max_steps: 1,
+            ..Limits::default()
+        });
+        let failure = TextStream::Grep
+            .run(
+                &["-A2".to_owned(), "x".to_owned()],
+                &mut reader,
+                &mut budget,
+                &Stub { cancelled: false },
+                |_| Ok(true),
+            )
+            .expect_err("context processing charges the second chunk");
+        assert!(matches!(
+            failure,
+            CommandFailure::Fatal(crate::builtins::FatalError::Limit(LimitExceeded::Steps {
+                maximum: 1
+            }))
+        ));
     }
 
     #[test]

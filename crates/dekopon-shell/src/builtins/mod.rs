@@ -229,10 +229,16 @@ pub(crate) fn parse_flags(
             if error.kind() == ErrorKind::UnknownArgument
                 && let Some(ContextValue::String(word)) = error.get(ContextKind::InvalidArg)
             {
-                return unsupported_flag(name, word, help);
+                return if word.starts_with('-') {
+                    unsupported_flag(name, word, help)
+                } else {
+                    CommandFailure::usage(format!(
+                        "{name}: unexpected argument {word:?}; input arrives through a pipe"
+                    ))
+                };
             }
             error = error.format(&mut grammar);
-            CommandFailure::usage(format!("{name}: {}", error.render()))
+            CommandFailure::usage(format!("{name}: {}", error.render().to_string().trim_end()))
         })
 }
 
@@ -477,7 +483,10 @@ mod tests {
     fn help_names_the_exact_flags_a_few_representative_builtins_accept() {
         let run = |script: &str| Interpreter::new(Limits::default()).run(script, &NoCapabilities);
 
-        assert_eq!(run("grep --help").output, "grep: -v -i -c -n -E");
+        assert_eq!(
+            run("grep --help").output,
+            "grep: -v -i -c -n -E -q -A N -B N -C N"
+        );
         assert_eq!(run("true --help").output, "true: no flags");
         assert_eq!(run("cat --help").output, "cat: no flags");
         assert_eq!(run("progress --help").output, "progress: --eta");
@@ -494,12 +503,12 @@ mod tests {
     #[test]
     fn unsupported_flag_names_the_accepted_subset() {
         let result =
-            Interpreter::new(Limits::default()).run("grep -q a <<EOF\na\nEOF", &NoCapabilities);
+            Interpreter::new(Limits::default()).run("grep -o a <<EOF\na\nEOF", &NoCapabilities);
         assert_eq!(result.exit_code, ExitCode::SYNTAX);
         assert!(
-            result
-                .output
-                .contains("grep: option not yet supported: -q (supported: -v -i -c -n -E)"),
+            result.output.contains(
+                "grep: option not yet supported: -o (supported: -v -i -c -n -E -q -A N -B N -C N)"
+            ),
             "{result:?}"
         );
     }

@@ -23,7 +23,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Template, CommandFailure> {
             )
             .arg(Arg::new("count").short('n').num_args(1))
             .arg(
-                Arg::new("child")
+                Arg::new("command")
                     .required(true)
                     .num_args(1..)
                     .trailing_var_arg(true),
@@ -46,8 +46,8 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Template, CommandFailure> {
         ));
     }
     let words = matches
-        .get_many::<String>("child")
-        .expect("required by clap")
+        .get_many::<String>("command")
+        .ok_or_else(|| CommandFailure::usage("xargs: a command is required"))?
         .cloned()
         .collect::<Vec<_>>();
     if let Some(command) = words.first()
