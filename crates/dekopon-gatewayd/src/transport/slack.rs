@@ -3121,7 +3121,12 @@ mod driver_tests {
                     prompt
                         .matches("the gateway cannot see this file at all")
                         .count(),
-                    1
+                    1,
+                    "the asset inventory reports this unavailable file once"
+                );
+                assert!(
+                    !prompt.contains("[forwarded attachment unavailable]"),
+                    "an ingress notice would report the same unavailable file twice"
                 );
             }
             if index == 4 {
