@@ -113,13 +113,21 @@ pub(crate) struct Journal {
 
 impl Journal {
     pub fn open(dir: &Path, retention: Duration) -> Result<Self, JournalError> {
+        Self::open_at(dir, retention, SystemTime::now())
+    }
+
+    pub(crate) fn open_at(
+        dir: &Path,
+        retention: Duration,
+        now: SystemTime,
+    ) -> Result<Self, JournalError> {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let journal = Self {
             dir: dir.to_path_buf(),
             retention,
             lock: Mutex::new(()),
         };
-        journal.expire(SystemTime::now())?;
+        journal.expire(now)?;
         Ok(journal)
     }
 
@@ -207,18 +215,7 @@ impl Journal {
                     kind: io::ErrorKind::OutOfMemory,
                 });
             }
-            let mut bytes = Vec::new();
-            File::open(&path)?
-                .take(MAX_FOLLOW_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            let marker = if bytes.len() as u64 > MAX_FOLLOW_BYTES {
-                None
-            } else {
-                serde_json::from_slice::<FollowMarker>(&bytes)
-                    .ok()
-                    .filter(|marker| marker.at_ms < marker.until_ms)
-            };
-            match marker {
+            match read_follow_marker(&path)? {
                 Some(marker) => markers.push((key.to_owned(), marker)),
                 None => {
                     remove(&path);
@@ -405,23 +402,19 @@ impl Journal {
         self.dir.join(format!("{stem}.{EXTENSION}"))
     }
 
-    // No route recalls a line older than the longest `forgetAfter`, so a file untouched for that
-    // long holds nothing recallable.
+    // Follow markers expire by their lifecycle deadline, not the journal window's file mtime.
     fn expire(&self, now: SystemTime) -> io::Result<()> {
-        let Some(cutoff) = now.checked_sub(self.retention) else {
-            return Ok(());
-        };
+        let cutoff = now.checked_sub(self.retention);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            let follow_cutoff = now.checked_sub(Duration::from_secs(24 * 60 * 60));
             let stale = match path.extension() {
                 Some(extension) if extension == EXTENSION || extension == SEAL_EXTENSION => {
-                    entry.metadata()?.modified()? < cutoff
+                    let modified = entry.metadata()?.modified()?;
+                    cutoff.is_some_and(|limit| modified < limit)
                 }
                 Some(extension) if extension == FOLLOW_EXTENSION => {
-                    let modified = entry.metadata()?.modified()?;
-                    follow_cutoff.is_some_and(|limit| modified < limit)
+                    read_follow_marker(&path)?.is_some_and(|marker| marker.until_ms <= millis(now))
                 }
                 _ => false,
             };
@@ -432,6 +425,19 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+fn read_follow_marker(path: &Path) -> io::Result<Option<FollowMarker>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_FOLLOW_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FOLLOW_BYTES {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice::<FollowMarker>(&bytes)
+        .ok()
+        .filter(|marker| marker.at_ms < marker.until_ms))
 }
 
 fn remove(path: &Path) {

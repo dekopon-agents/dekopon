@@ -66,6 +66,17 @@ impl FollowTable {
                 kind: io::ErrorKind::InvalidInput,
             })?;
         let _writer = self.writer.lock();
+        let lapsed = self
+            .resident
+            .lock()
+            .iter()
+            .filter(|(_, marker)| marker.until_ms <= at_ms)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for old in lapsed {
+            self.journal.remove_follow(&old)?;
+            self.resident.lock().remove(&old);
+        }
         let resident = self.resident.lock();
         if !resident.contains_key(key) && resident.len() == MAX_TICKETS {
             return Err(JournalError::Io {
@@ -460,12 +471,88 @@ mod tests {
     }
 
     #[test]
+    fn a_live_marker_with_an_old_mtime_survives_journal_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = SystemTime::now();
+        let key = "f".repeat(64);
+        let journal = Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap();
+        journal
+            .write_follow(
+                &key,
+                FollowMarker {
+                    at_ms: millis(at),
+                    until_ms: millis(at + LAPSE),
+                },
+            )
+            .unwrap();
+        let path = dir.path().join(format!("{key}.followed"));
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(at - Duration::from_secs(2 * 86400))
+            .unwrap();
+        let restarted =
+            Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        assert!(matches!(
+            FollowTable::load(restarted).unwrap().ticket(&key, at),
+            FollowTicket::Active { .. }
+        ));
+        assert!(path.exists());
+        let later = Arc::new(
+            Journal::open_at(dir.path(), Duration::from_secs(7 * 86400), at + LAPSE).unwrap(),
+        );
+        assert_eq!(
+            FollowTable::load(later).unwrap().ticket(&key, at + LAPSE),
+            FollowTicket::Absent
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn elapsed_resident_tickets_release_capacity_for_a_new_invitation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let table = FollowTable::load(Arc::clone(&journal)).unwrap();
+        let now = SystemTime::now();
+        for index in 0..MAX_TICKETS {
+            table.resident.lock().insert(
+                format!("{index:064x}"),
+                FollowMarker {
+                    at_ms: millis(now) - 2,
+                    until_ms: millis(now) - 1,
+                },
+            );
+        }
+        let first = format!("{:064x}", 0);
+        journal
+            .write_follow(
+                &first,
+                FollowMarker {
+                    at_ms: millis(now) - 2,
+                    until_ms: millis(now) - 1,
+                },
+            )
+            .unwrap();
+        let fresh = "f".repeat(64);
+        table.stay(&fresh, now).unwrap();
+        assert!(matches!(
+            table.ticket(&fresh, now),
+            FollowTicket::Active { .. }
+        ));
+        assert!(!dir.path().join(format!("{first}.followed")).exists());
+    }
+
+    #[test]
     fn corrupt_marker_is_removed_and_missing_marker_stays_absent() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
         let key = "b".repeat(64);
         std::fs::write(dir.path().join(format!("{key}.followed")), b"{broken").unwrap();
+        let (capture, _guard) = crate::tests::capture_spans();
         let table = FollowTable::load(journal).unwrap();
+        let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_follow")]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].field("reason"), Some("corrupt"));
+        assert!(events[0].field("subject").is_none());
         assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
         assert!(!dir.path().join(format!("{key}.followed")).exists());
         std::fs::write(dir.path().join(format!("{key}.followed")), vec![b'x'; 4097]).unwrap();
