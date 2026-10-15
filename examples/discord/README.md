@@ -61,7 +61,7 @@ transports:
     kind: discordGateway
     botTokenEnv: DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN
     # optional; absent means off, which preserves reply-only behavior
-    liveness: { mode: native, progress: message, cancelButton: true }
+    indicators: { mode: native, progress: message, cancelButton: true }
 
 routes:
   - transport: community-discord
@@ -86,7 +86,7 @@ In guild channels, Discord's structured `mentions` array, or the bot's managed r
 Ambient messages never start a model session. Direct messages are addressed by definition. Bot,
 webhook, self-authored, and system messages are dropped.
 
-With `liveness.mode: native`, an authorized session triggers Discord's channel typing indicator and
+With `indicators.mode: native`, an authorized session triggers Discord's channel typing indicator and
 renews it around every eight seconds inside Discord's ten-second lease. It starts only after fresh
 broker authorization, never holds the final-message REST lock, and stops renewing before the reply.
 Discord has no explicit clear endpoint; the final message clears it sooner. These calls and rate

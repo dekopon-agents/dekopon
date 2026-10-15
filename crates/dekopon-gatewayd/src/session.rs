@@ -48,7 +48,7 @@ use crate::{
     collection::Dispositions,
     config::{
         MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, RecallSource, ResolvedBroker,
-        ResolvedLiveness, Steering,
+        SeenReaction, Steering,
     },
     conversation::{
         ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
@@ -790,7 +790,6 @@ pub(crate) struct SessionRunner {
     pub journal: Option<Arc<Journal>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
-    pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
     pub jobs: Arc<crate::jobs::Jobs>,
@@ -1277,6 +1276,7 @@ async fn execute(
         crate::collection::record_received(&message);
     }
     let liveness = message.liveness.clone();
+    let message_kind = message.conversation.kind;
     let is_unattended = match message.message_id {
         MessageId::Native(_) => false,
         MessageId::Wake { .. } | MessageId::Job { .. } => true,
@@ -1295,7 +1295,7 @@ async fn execute(
             }
             tracing::Span::current().record("outcome", "steered");
             receipts.finish("steered");
-            acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
+            acknowledge_steer(driver.as_ref(), liveness.as_ref(), route, message_kind).await;
             None
         }
         Admit::Queued => {
@@ -1304,7 +1304,7 @@ async fn execute(
             }
             tracing::Span::current().record("outcome", "queued");
             if !is_unattended {
-                acknowledge_steer(driver.as_ref(), liveness.as_ref(), &route.transport).await;
+                acknowledge_steer(driver.as_ref(), liveness.as_ref(), route, message_kind).await;
             }
             None
         }
@@ -1329,12 +1329,16 @@ async fn execute(
 async fn acknowledge_steer(
     driver: &dyn ChatDriver,
     target: Option<&crate::transport::LivenessTarget>,
-    transport: &str,
+    route: &BoundRoute,
+    kind: dekopon_broker_protocol::ConversationKind,
 ) {
-    if let (Some(ack), Some(target)) = (driver.steer_ack(), target)
+    if route.indicators.get(&kind).is_some_and(|resolved| {
+        resolved.settings.mode == crate::config::LivenessMode::Native
+            && resolved.settings.seen == SeenReaction::On
+    }) && let (Some(ack), Some(target)) = (driver.steer_ack(), target)
         && let Err(error) = crate::progress::bounded(ack.seen(target)).await
     {
-        tracing::debug!(event = "gateway_steer_ack_failed", transport, error = %error);
+        tracing::debug!(event = "gateway_steer_ack_failed", transport = %route.transport, error = %error);
     }
 }
 
@@ -1699,9 +1703,9 @@ async fn session(
     // key never gets baked in from the first conversation and silently mislabels every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
 
-    let liveness = runner
-        .liveness
-        .get(&message.transport)
+    let liveness = route
+        .indicators
+        .get(&message.conversation.kind)
         .cloned()
         .unwrap_or_default();
     let leg = leg.with_cancel_signal(cancellation.signal());
@@ -1715,7 +1719,7 @@ async fn session(
         .with_chat_asset_inputs(ChatAssetInputs::new(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
-    let (settings, keep_alive) = liveness.for_kind(message.conversation.kind);
+    let (settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
     // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
     // wake ahead of the terminal reply being sent.
     let _cancel_on_drop = CancellationOnDrop(cancellation.clone());

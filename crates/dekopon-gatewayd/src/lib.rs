@@ -48,11 +48,12 @@ use tracing::Instrument as _;
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
-    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, GatewaydConfig, HARD_MAX_CONFIG_BYTES, JournalConfig,
-    KeepAliveConfig, LivenessConfig, LivenessMode, LivenessOverride, LivenessSettings,
-    MemoryConfig, MemoryPolicy, MemoryScope, MemoryWindow, ProgressSurface, RecallSource,
-    ResolvedConfig, ResolvedJournal, ResolvedRoute, ResolvedTelemetry, SlackExperience,
-    SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
+    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, GatewaydConfig, HARD_MAX_CONFIG_BYTES,
+    IndicatorSurface, JournalConfig, KeepAliveConfig, LivenessConfig, LivenessMode,
+    LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope, MemoryWindow,
+    ProgressSurface, ReactionConfig, RecallSource, ResolvedConfig, ResolvedJournal, ResolvedRoute,
+    ResolvedTelemetry, SeenReaction, SlackExperience, TelemetryConfig, TemplateOverrides,
+    TransportConfig, WorkingReaction,
 };
 pub use probe::{NotProbed, ProbeError, ProbeProblem, ProbeScope};
 pub use routes::{RouteError, RouteProblem};
@@ -191,7 +192,6 @@ where
             config.sessions.asset_retention_bytes,
         )),
         asset_fetchers,
-        liveness: config.liveness.clone(),
         thread_ownership,
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
@@ -1040,7 +1040,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
-        match build_transport(spec) {
+        match build_transport(spec, config) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -1059,7 +1059,24 @@ struct Prepared {
     transports: Vec<Box<dyn ChatTransport>>,
 }
 
-fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, TransportError> {
+fn build_transport(
+    spec: &TransportConfig,
+    config: &ResolvedConfig,
+) -> Result<Box<dyn ChatTransport>, TransportError> {
+    let surface = |liveness: &LivenessConfig| {
+        let mut settings = liveness.settings();
+        if config
+            .routes
+            .iter()
+            .filter(|route| route.transport == spec.name())
+            .flat_map(|route| route.indicators.values())
+            .any(|resolved| resolved.settings.mode == LivenessMode::Native)
+        {
+            settings.mode = LivenessMode::Native;
+            settings.working = WorkingReaction::Auto;
+        }
+        settings
+    };
     Ok(match spec {
         TransportConfig::SlackSocketMode {
             name,
@@ -1077,7 +1094,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             transport::read_credential(app_token_env)?,
             transport::read_credential(bot_token_env)?,
             *experience,
-            liveness.settings(),
+            surface(liveness),
         )?),
         TransportConfig::DiscordGateway {
             name,
@@ -1096,7 +1113,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             } else {
                 MessageContent::Withheld
             },
-            liveness.settings(),
+            surface(liveness),
         )?),
         TransportConfig::WhatsappCloudApi {
             name,
@@ -1124,7 +1141,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             transport::read_credential(app_secret_env)?,
             transport::read_credential(verify_token_env)?,
             transport::read_credential(access_token_env)?,
-            liveness.settings(),
+            surface(liveness),
         )?),
         TransportConfig::TelegramLongPoll {
             name,
@@ -1138,7 +1155,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
                 .clone()
                 .unwrap_or_else(|| config::TELEGRAM_ENDPOINT.to_owned()),
             transport::read_credential(bot_token_env)?,
-            liveness.settings(),
+            surface(liveness),
         )?),
         TransportConfig::Local {
             name,
@@ -1147,7 +1164,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
         } => Box::new(LocalTransport::new(
             name.clone(),
             socket_path.clone(),
-            liveness.settings(),
+            surface(liveness),
         )),
     })
 }

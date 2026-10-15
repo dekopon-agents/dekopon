@@ -1,14 +1,16 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use dekopon_agent::prompt::PromptLimits;
-use dekopon_broker_protocol::{Conversation, ConversationMatch};
+use dekopon_broker_protocol::{Conversation, ConversationKind, ConversationMatch};
 use dekopon_config::{LocalCatalog, Skill};
 use dekopon_core::{AgentId, ExternalSubject};
 use thiserror::Error;
 
 use crate::{
     cache_key,
-    config::{MemoryPolicy, ModelConfig, ResolvedConfig, Steering, render_problems},
+    config::{
+        MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, Steering, render_problems,
+    },
     progress::ProgressDetail,
     transport::InboundMessage,
     wake::Anchor,
@@ -34,6 +36,7 @@ pub(crate) struct BoundRoute {
     pub steering: Steering,
     pub progress_notes: bool,
     pub memory: MemoryPolicy,
+    pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
     /// across the route's traffic, and grants nothing: every new session opens its own attested
@@ -120,6 +123,7 @@ impl RoutingTable {
                 steering: route.steering,
                 progress_notes: route.progress_notes,
                 memory: route.memory,
+                indicators: route.indicators.clone(),
                 wakes: route.wakes,
                 cache_key: cache_key::for_route(),
             });

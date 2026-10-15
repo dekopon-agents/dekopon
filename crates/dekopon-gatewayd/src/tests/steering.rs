@@ -158,7 +158,13 @@ fn a_followup_gets_fresh_cancellation_and_is_stopped_as_its_own_subject() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() {
-    for (subject, connection) in [(SUBJECT, Some(2)), ("tel.999", Some(3)), (SUBJECT, None)] {
+    for (seen, master_off, subject, connection) in [
+        (true, false, SUBJECT, Some(2)),
+        (true, false, "tel.999", Some(3)),
+        (true, false, SUBJECT, None),
+        (false, false, SUBJECT, Some(2)),
+        (true, true, SUBJECT, Some(2)),
+    ] {
         let directory = temporary();
         let listings = if subject == SUBJECT { 1 } else { 2 };
         let (broker, _observed) = stub_broker(
@@ -176,9 +182,41 @@ async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() 
         .await;
         let model = BlockedModel::new("finished");
         let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 4);
-        let driver = Arc::new(RecordingDriver::default().with_steer_ack());
+        let driver = Arc::new(if seen && !master_off {
+            RecordingDriver::default().with_steer_ack()
+        } else {
+            RecordingDriver::default().with_steer_ack().with_reaction()
+        });
         let mut route = route(model_config());
         route.steering = Steering::Boundary;
+        if !seen {
+            let config = load(directory.path(), &document(directory.path()))
+                .await
+                .expect("default gateway config resolves");
+            let routes = RoutingTable::bind(&config, &catalog(true, Some("reasoning")))
+                .expect("default route binds");
+            route = routes
+                .route(&message("first"))
+                .expect("default route matches")
+                .clone();
+            route.steering = Steering::Boundary;
+            let defaults = &route.indicators[&ConversationKind::DirectMessage].settings;
+            assert_eq!(defaults.mode, LivenessMode::Off);
+            assert_eq!(defaults.working, WorkingReaction::Off);
+            assert_eq!(defaults.seen, SeenReaction::Off);
+        }
+        if master_off {
+            let indicators = route
+                .indicators
+                .get_mut(&ConversationKind::DirectMessage)
+                .expect("native fixture");
+            let mut settings = indicators.settings;
+            settings.mode = LivenessMode::Off;
+            *indicators = Arc::new(ResolvedLiveness {
+                settings,
+                ..ResolvedLiveness::default()
+            });
+        }
         let mut first = message("first");
         first.liveness = Some(LivenessTarget::Local { connection: 1 });
         let held = tokio::spawn(run_session(
@@ -198,6 +236,7 @@ async fn steers_and_queued_senders_are_acknowledged_only_on_their_own_targets() 
         )
         .await;
         let expected = connection
+            .filter(|_| seen && !master_off)
             .map(|connection| dekopon_test_support::DriverCall::Seen {
                 target: format!("local:{connection}"),
             })

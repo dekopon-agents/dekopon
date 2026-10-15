@@ -10,14 +10,14 @@
 # Home is not itself a prompt, so dekopon-gatewayd safely acknowledges and ignores that event.
 #
 # If Agent status returns `feature_disabled` or another permanent installation error, dekopon-gatewayd
-# degrades to the fixed `:tangerine:` reaction requested by `classicFallback: reaction`, and then
+# uses the fixed `:tangerine:` reaction when `indicators.reaction.working: auto` opts in, and then
 # to nothing at all if reactions are unavailable. Final replies are independent of every one of
 # these APIs.
 #
 # The bot scope split is:
 # - `assistant:write`: declares the installed app as an Agent.
 # - `chat:write`: posts replies and manages Agent session status.
-# - `reactions:write`: optional free/classic fallback; pair `classicFallback: none` with removing it.
+# - `reactions:write`: optional working/seen reactions; leave both off when removing it.
 # - `message.im`/`im:history`: direct-message prompts.
 # - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
 # - `channels:read`, `groups:read`, `im:read`, `mpim:read`: `conversations.info`, which is the only

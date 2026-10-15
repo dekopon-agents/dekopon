@@ -571,6 +571,9 @@ impl Live {
     }
 
     async fn open_reaction(&mut self) {
+        if self.settings.working == crate::config::WorkingReaction::Off {
+            return;
+        }
         let Some(target) = self.target.clone() else {
             return;
         };

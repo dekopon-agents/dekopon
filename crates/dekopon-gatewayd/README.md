@@ -35,13 +35,16 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
   notices. Slack/Discord/local accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
   WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gatewayd.md#asset-handles-and-delivery).
-- **Liveness** — disabled unless opted in, and only after fresh authorization. Default `progress: auto`
-  prefers native status, then typing/reaction, avoiding redundant progress messages; explicit
+- **Indicators** — layered `sessions`/transport/conversation-kind/route settings default off;
+  after fresh authorization, `progress: auto` prefers native status, then typing. Working
+  and steer reactions default off. The schema accepts `working: on|auto` and
+  `status`/`typing: off`, but additive `on` and status/typing-off evaluation are pending S2;
+  do not rely on those opt-ins in an S1-only binary. WhatsApp refuses working reactions
+  until a verified clear exists. Explicit
   `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits
   that surface for an explicit Stop button or when no indicator works. `progressDetail` controls
-  prose only: explicitly requested `stream` remains independent of progress/detail Off. WhatsApp
-  session progress stays typing-only. Separate best-effort 👀 acknowledgments cover accepted steers and queued
-  non-wake messages with liveness targets, independent of Slack's classic fallback.
+  prose only: explicitly requested `stream` remains independent of progress/detail Off.
+  Best-effort steer/queue 👀 is separate and requires `reaction.seen: on`; it defaults off.
   See [presentation limits](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
   A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.

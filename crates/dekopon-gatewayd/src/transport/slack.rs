@@ -26,7 +26,7 @@ use tracing::{Instrument as _, Span};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
-    config::{LivenessSettings, SLACK_ENDPOINT, SlackExperience, SlackLivenessFallback},
+    config::{LivenessSettings, SLACK_ENDPOINT, SlackExperience, WorkingReaction},
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
@@ -103,7 +103,7 @@ impl SlackTransport {
                 bot_token: Redacted::new(bot_token),
                 http,
                 experience,
-                classic_reaction: liveness.classic_fallback == SlackLivenessFallback::Reaction,
+                classic_reaction: liveness.working != WorkingReaction::Off,
                 agent_status_available: AtomicBool::new(true),
                 assistant_status_available: AtomicBool::new(true),
                 reaction_available: AtomicBool::new(true),
@@ -1936,7 +1936,7 @@ mod driver_tests {
         SlackTransport, Tracked,
     };
     use crate::{
-        config::{LivenessSettings, SlackExperience, SlackLivenessFallback, TemplateOverrides},
+        config::{LivenessSettings, SlackExperience, TemplateOverrides, WorkingReaction},
         progress::{ProgressDetail, ProgressText, Templates},
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
@@ -2009,7 +2009,7 @@ mod driver_tests {
             "xoxb-test-bot-token".to_owned(),
             experience,
             LivenessSettings {
-                classic_fallback: SlackLivenessFallback::Reaction,
+                working: WorkingReaction::Auto,
                 ..LivenessSettings::default()
             },
         )
