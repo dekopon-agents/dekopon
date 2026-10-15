@@ -4027,6 +4027,15 @@ mod tests {
             capture
                 .events_where(
                     "dekopon_agent::audit",
+                    &[("audit.event", "agent.asset.fetched"), ("asset.id", "8")]
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
                     &[("audit.event", "agent.asset.fetched")]
                 )
                 .len(),
