@@ -18352,6 +18352,50 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_chat() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([script_call("true"), answer("done")]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    route.memory_policy = Some(crate::config::ResolvedPolicy::default());
+    let inbound = message("do the work");
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    );
+    let driver = HistoryDriver::new(Ok(Vec::new()));
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        inbound,
+        driver as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let remembered = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        route.memory.window().expect("persistent window"),
+        None,
+        Instant::now(),
+    );
+    let turn = remembered.history.turns().first().expect("committed turn");
+    let exchange = turn.exchanges().first().expect("script exchange captured");
+    assert_eq!(exchange.request[0].text.as_deref(), Some("true"));
+    assert_eq!(exchange.result[0].text.as_deref(), Some(""));
+    assert_eq!(turn.user(), "do the work");
+    assert_eq!(turn.answer(), Some("done"));
+    assert!(
+        !journal_dir.path().join(route.agent.as_str()).exists(),
+        "platform chat remains supplied by the platform, not duplicated in the journal"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     let directory = temporary();

@@ -268,8 +268,6 @@ impl History {
             .fold(0, usize::saturating_add)
     }
 
-    /// Only the prompt and answer are kept, not the tool calls between them, so trimming can never
-    /// orphan half of a remembered exchange.
     pub fn record(&mut self, mut turn: ConversationTurn) {
         const MARKER: &str = "[…]";
         if turn.bytes() > self.limits.max_bytes

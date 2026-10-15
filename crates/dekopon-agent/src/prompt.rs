@@ -3056,6 +3056,10 @@ mod tests {
             ]
         );
         assert!(next.tool_messages().is_empty());
+        let retained = &history.turns()[0].exchanges()[0];
+        assert_eq!(retained.request[0].text.as_deref(), Some("echo 🦀"));
+        assert_eq!(retained.result[0].text.as_deref(), Some("failure: 🦀"));
+        assert_eq!(retained.exit_status, Some(1));
     }
 
     #[test]
