@@ -8185,6 +8185,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
             inaccessible.transport.clone(),
             Arc::new(ForwardImage(Arc::clone(&failed_fetches), true)) as Arc<dyn AssetFetcher>,
         );
+    let gated_forward = inaccessible.clone();
     let driver = Arc::new(RecordingDriver::default());
     let mut failed_model = model_config();
     if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut failed_model {
@@ -8208,6 +8209,53 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         "{prompt:?}"
     );
     assert!(tool_message(&models, 1).contains("could not be read (response)"));
+
+    for (index, broker) in [
+        {
+            let directory = temporary();
+            let (broker, _observed) = stub_broker(
+                directory.path(),
+                vec![ResponseEnvelope::capabilities(
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                )],
+            )
+            .await;
+            (directory, broker)
+        },
+        {
+            let directory = temporary();
+            let broker = ResolvedBroker {
+                socket_path: directory.path().join("absent.sock"),
+                server_uid: crate::current_uid(),
+                frame: FrameLimits::default(),
+            };
+            (directory, broker)
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let models = ModelScript::forbidden();
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            self::runner(broker.1, Arc::clone(&models), 4),
+            persistent_route(model_config(), window()),
+            gated_forward.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(
+            driver.replies(),
+            [if index == 0 {
+                UNAUTHORIZED_REPLY
+            } else {
+                FAILURE_REPLY
+            }]
+        );
+        assert_eq!(models.requests(), 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
