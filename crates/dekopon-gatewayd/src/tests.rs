@@ -4983,6 +4983,35 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     assert_eq!(models.requests(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saturated_follow_does_not_post_the_busy_reply() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let models = ModelScript::forbidden();
+    let runner = runner(broker, Arc::clone(&models), 1);
+    let _held = runner
+        .gate
+        .admit_probe(("other".to_owned(), "other".to_owned()))
+        .expect("the first session is admitted");
+    let driver = Arc::new(RecordingDriver::default());
+    let mut followed = message("ambient");
+    followed.message_id = MessageId::Follow("native-id".into());
+
+    run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        followed,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert!(
+        driver.replies().is_empty(),
+        "follow admission is silent even with reply_on_busy enabled"
+    );
+    assert_eq!(models.requests(), 0);
+}
+
 #[test]
 fn a_fired_follow_from_the_running_speaker_queues_without_interruption() {
     let gate = SessionGate::new(2);

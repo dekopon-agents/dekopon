@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::{
+    collections::{BTreeMap, HashSet},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -173,9 +174,13 @@ impl Journal {
         }
     }
 
-    pub(crate) fn load_follow(&self) -> Result<Vec<(String, FollowMarker)>, JournalError> {
+    pub(crate) fn load_follow(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, FollowMarker)>, JournalError> {
         let _lock = self.lock.lock();
-        let mut markers = Vec::new();
+        let mut markers = BTreeMap::new();
+        let mut overflow = 0usize;
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -204,7 +209,13 @@ impl Journal {
                 continue;
             }
             match read_follow_marker(&path)? {
-                Some(marker) => markers.push((key.to_owned(), marker)),
+                Some(marker) => {
+                    markers.insert((marker.until_ms, key.to_owned()), marker);
+                    if markers.len() > limit {
+                        markers.pop_first();
+                        overflow += 1;
+                    }
+                }
                 None => {
                     remove(&path);
                     tracing::warn!(
@@ -215,7 +226,33 @@ impl Journal {
                 }
             }
         }
-        Ok(markers)
+        if overflow != 0 {
+            let retained: HashSet<_> = markers.keys().map(|(_, key)| key.as_str()).collect();
+            for entry in fs::read_dir(&self.dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == FOLLOW_EXTENSION)
+                    && let Some(key) = path.file_stem().and_then(|name| name.to_str())
+                    && key.len() == 64
+                    && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && !retained.contains(key)
+                {
+                    fs::remove_file(path)?;
+                }
+            }
+            tracing::warn!(
+                event = "gateway_follow",
+                operation = "refused",
+                reason = "over-capacity",
+                count = overflow
+            );
+        }
+        Ok(markers
+            .into_iter()
+            .map(|((_, key), marker)| (key, marker))
+            .collect())
     }
 
     fn seal_path(&self, stem: &str) -> PathBuf {

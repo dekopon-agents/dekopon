@@ -671,7 +671,7 @@ so a mention of the bot's managed role in that message did not address it; `caus
 `rest-cooldown`, `request`, `status`, `timeout`, `body`, or `role-shape`, with the same fields.
 
 
-`gateway.follow` records an invited, refreshed, banished, self-left or sealed follow marker, or a refused persistence operation, with a route index and low-cardinality operation/reason only. It carries no subject, conversation coordinate, grant, message, or principal. Corrupt markers discovered at boot use the category-only `gateway_follow` diagnostic because the saved digest cannot safely be mapped back to a route. Broker decisions remain the authority record for the actual provider invocation.
+`gateway.follow` records an invited, refreshed, banished, self-left or sealed follow marker, or a refused persistence operation, with a route index and low-cardinality operation/reason only. It carries no subject, conversation coordinate, grant, message, or principal. Corrupt markers discovered at boot use the category-only `gateway_follow` diagnostic because the saved digest cannot safely be mapped back to a route. Excess live markers emit one `gateway_follow` record with `reason=over-capacity` and the removed count, without marker keys. Broker decisions remain the authority record for the actual provider invocation.
 
 A conversation seal read failure uses `gateway_recall_failed` with `source="seal"` and reason
 `io`, `corrupt`, or `task`. A seal write failure uses `gateway_journal_seal_failed` with the same

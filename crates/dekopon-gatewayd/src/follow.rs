@@ -135,7 +135,7 @@ pub(crate) struct FollowTable {
 impl FollowTable {
     pub(crate) fn load(journal: Arc<Journal>) -> Result<Self, JournalError> {
         Ok(Self {
-            resident: Mutex::new(journal.load_follow()?.into_iter().collect()),
+            resident: Mutex::new(journal.load_follow(MAX_TICKETS)?.into_iter().collect()),
             writer: Mutex::new(HashSet::new()),
             journal,
         })
@@ -833,6 +833,49 @@ mod tests {
             FollowTicket::Absent
         );
         assert!(!dir.path().join(format!("{key}.followed")).exists());
+    }
+
+    #[test]
+    fn boot_keeps_latest_deadlines_and_removes_one_excess_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let now = SystemTime::now();
+        for index in 0..=MAX_TICKETS {
+            let key = format!("{index:064x}");
+            journal
+                .write_follow(
+                    &key,
+                    FollowMarker {
+                        at_ms: millis(now),
+                        until_ms: millis(now)
+                            + 500_000
+                            + if index == MAX_TICKETS / 2 {
+                                0
+                            } else {
+                                index as u64 + 1
+                            },
+                    },
+                )
+                .unwrap();
+        }
+        let (capture, _guard) = crate::tests::capture_spans();
+        let table = FollowTable::load(journal).expect("valid overflow must not refuse boot");
+        assert_eq!(table.resident.lock().len(), MAX_TICKETS);
+        let earliest = format!("{:064x}", MAX_TICKETS / 2);
+        let latest = format!("{:064x}", MAX_TICKETS);
+        assert_eq!(table.ticket(&earliest, now), FollowTicket::Absent);
+        assert!(matches!(
+            table.ticket(&latest, now),
+            FollowTicket::Active { .. }
+        ));
+        assert!(!dir.path().join(format!("{earliest}.followed")).exists());
+        let events = capture.events_where(
+            "dekopon_gatewayd",
+            &[("event", "gateway_follow"), ("reason", "over-capacity")],
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].field("count"), Some("1"));
+        assert!(events[0].field("subject").is_none());
     }
 
     #[test]

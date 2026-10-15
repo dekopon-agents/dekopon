@@ -1316,7 +1316,8 @@ async fn execute(
                 notice.record("dropped");
             }
             tracing::info!(event = "gateway_session_rejected", reason = "busy");
-            if notice.is_none()
+            if !matches!(message.message_id, MessageId::Follow(_))
+                && notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
             {
