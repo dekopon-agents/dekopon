@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -2566,6 +2566,7 @@ async fn stub_broker_assets(
 
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
+        route_index: 0,
         transport: "dev".to_owned(),
         conversation: ConversationMatch {
             kind: ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]),
@@ -2593,6 +2594,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         memory: MemoryPolicy::OneShot,
         indicators: fixture_liveness(),
         wakes: false,
+        follow: false,
         cache_key: cache_key::for_route(),
     }
 }
@@ -2855,6 +2857,7 @@ fn runner_tracking(
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
         journal: None,
+        follow: None,
         assets: Arc::new(AssetStore::new(
             max_conversations,
             Duration::from_secs(60 * 60),
@@ -14607,6 +14610,7 @@ fn journaled_runner(
         journal: Some(Arc::new(
             crate::journal::Journal::open(journal, Duration::from_secs(3600)).expect("journal"),
         )),
+        follow: None,
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
@@ -14614,6 +14618,53 @@ fn journaled_runner(
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
     })
+}
+
+#[tokio::test]
+async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let broker = ResolvedBroker {
+        socket_path: directory.path().join("unused.sock"),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let mut runner = journaled_runner(
+        broker,
+        Arc::new(ModelScript::new([answer("unused")])),
+        journal_dir.path(),
+    );
+    let journal = Arc::clone(runner.journal.as_ref().unwrap());
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    Arc::get_mut(&mut runner).unwrap().follow = Some(Arc::clone(&table));
+    let mut route = route(model_config());
+    route.follow = true;
+    let first = message("hello");
+    let mut second = message("hello from another speaker");
+    second.subject = "tel.16034700183".parse().unwrap();
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &first.conversation.key(),
+    );
+    table.stay(&key, SystemTime::now()).unwrap();
+    assert!(matches!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
+    let private_key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &second.conversation.key(),
+        &second.subject,
+    );
+    assert!(crate::session::seal_conversation(&runner, &route, &second, &private_key).await);
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    assert!(!journal_dir.path().join(format!("{key}.followed")).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -15564,6 +15615,33 @@ async fn invalid_indicators_have_the_same_check_and_boot_refusal() {
         &boot,
         crate::GatewaydError::Config(ConfigError::Invalid { .. })
     ));
+    assert_eq!(
+        dekopon_core::error_chain(&boot),
+        dekopon_core::error_chain(problem)
+    );
+}
+
+#[tokio::test]
+async fn unsupported_and_non_durable_follow_refuses_check_and_boot() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("chat.yaml");
+    let mut chat: Value =
+        serde_json::from_slice(&fs::read(&path).expect("chat fragment")).expect("json fragment");
+    chat["routes"][0]["follow"] = json!(true);
+    fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
+    let report = crate::check(&directory, None, None).await;
+    let boot = crate::run(&directory, std::future::pending())
+        .await
+        .expect_err("invalid follow refuses boot");
+    let [problem] = report.problems.as_slice() else {
+        panic!("expected one config refusal: {:?}", report.problems);
+    };
+    assert!(
+        matches!(problem, crate::GatewaydError::Config(ConfigError::Invalid { problems, .. })
+        if problems.iter().any(|p| matches!(p, ConfigProblem::FollowWithoutJournal { route: 0 }))
+        && problems.iter().any(|p| matches!(p, ConfigProblem::UnsupportedFollowRoute { route: 0 })))
+    );
     assert_eq!(
         dekopon_core::error_chain(&boot),
         dekopon_core::error_chain(problem)

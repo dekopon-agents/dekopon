@@ -20,6 +20,9 @@ use crate::{
 
 const EXTENSION: &str = "jsonl";
 const SEAL_EXTENSION: &str = "sealed";
+const FOLLOW_EXTENSION: &str = "followed";
+const MAX_FOLLOW_BYTES: u64 = 4096;
+const MAX_FOLLOW_MARKERS: usize = 1024;
 const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LINE_SLACK_BYTES: u64 = 64 * 1024;
@@ -79,6 +82,13 @@ struct Seal {
     at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct FollowMarker {
+    pub at_ms: u64,
+    pub until_ms: u64,
+}
+
 pub(crate) struct Recalled {
     pub history: History,
     pub assets: Vec<RecalledAsset>,
@@ -128,6 +138,99 @@ impl Journal {
     pub fn sealed(&self, stem: &str) -> Result<Option<SealedConversation>, JournalError> {
         let _lock = self.lock.lock();
         self.read_seal(stem)
+    }
+
+    #[allow(dead_code, reason = "follow effects land in the subsequent S3b change")]
+    fn follow_path(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{key}.{FOLLOW_EXTENSION}"))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "follow invitation lands in the subsequent S3b change"
+    )]
+    pub(crate) fn write_follow(&self, key: &str, marker: FollowMarker) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.follow_path(key))?;
+        serde_json::to_writer(&mut file, &marker).map_err(io::Error::from)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "follow leave lands in the subsequent S3b change")]
+    pub(crate) fn remove_follow(&self, key: &str) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        match fs::remove_file(self.follow_path(key)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn load_follow(&self) -> Result<Vec<(String, FollowMarker)>, JournalError> {
+        let _lock = self.lock.lock();
+        let mut markers = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != FOLLOW_EXTENSION)
+            {
+                continue;
+            }
+            let Some(key) = path.file_stem().and_then(|name| name.to_str()) else {
+                remove(&path);
+                tracing::warn!(
+                    event = "gateway_follow",
+                    operation = "refused",
+                    reason = "corrupt"
+                );
+                continue;
+            };
+            if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                remove(&path);
+                tracing::warn!(
+                    event = "gateway_follow",
+                    operation = "refused",
+                    reason = "corrupt"
+                );
+                continue;
+            }
+            if markers.len() == MAX_FOLLOW_MARKERS {
+                return Err(JournalError::Io {
+                    kind: io::ErrorKind::OutOfMemory,
+                });
+            }
+            let mut bytes = Vec::new();
+            File::open(&path)?
+                .take(MAX_FOLLOW_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            let marker = if bytes.len() as u64 > MAX_FOLLOW_BYTES {
+                None
+            } else {
+                serde_json::from_slice::<FollowMarker>(&bytes)
+                    .ok()
+                    .filter(|marker| marker.at_ms < marker.until_ms)
+            };
+            match marker {
+                Some(marker) => markers.push((key.to_owned(), marker)),
+                None => {
+                    remove(&path);
+                    tracing::warn!(
+                        event = "gateway_follow",
+                        operation = "refused",
+                        reason = "corrupt"
+                    );
+                }
+            }
+        }
+        Ok(markers)
     }
 
     fn seal_path(&self, stem: &str) -> PathBuf {
@@ -311,11 +414,18 @@ impl Journal {
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == EXTENSION || extension == SEAL_EXTENSION)
-                && entry.metadata()?.modified()? < cutoff
-            {
+            let follow_cutoff = now.checked_sub(Duration::from_secs(24 * 60 * 60));
+            let stale = match path.extension() {
+                Some(extension) if extension == EXTENSION || extension == SEAL_EXTENSION => {
+                    entry.metadata()?.modified()? < cutoff
+                }
+                Some(extension) if extension == FOLLOW_EXTENSION => {
+                    let modified = entry.metadata()?.modified()?;
+                    follow_cutoff.is_some_and(|limit| modified < limit)
+                }
+                _ => false,
+            };
+            if stale {
                 remove(&path);
                 tracing::info!(event = "gateway_journal_expired");
             }

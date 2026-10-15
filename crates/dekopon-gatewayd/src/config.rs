@@ -731,6 +731,10 @@ const fn default_conversation_max_bytes() -> usize {
 // One week matches how long WhatsApp keeps an inbound media id, so recalled photos stay fetchable.
 pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent authored route switches are optional and retain their wire booleans"
+)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteConfig {
@@ -775,6 +779,8 @@ pub struct RouteConfig {
     pub indicators: LivenessOverride,
     #[serde(default)]
     pub wakes: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub follow: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -802,6 +808,10 @@ impl MemoryPolicy {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "resolved route preserves independent authored switches"
+)]
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub transport: String,
@@ -817,6 +827,7 @@ pub struct ResolvedRoute {
     pub memory: MemoryPolicy,
     pub(crate) indicators: BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
+    pub follow: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1492,6 +1503,19 @@ pub(crate) fn resolve(
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
+        if route.follow {
+            if config.sessions.journal.is_none() {
+                problems.push(ConfigProblem::FollowWithoutJournal { route: index });
+            }
+            let supported = transports.iter().any(|transport| {
+                matches!(transport, TransportConfig::DiscordGateway { name, message_content: true, .. } if name == &route.transport)
+            });
+            if !supported
+                || !matches!(&conversation.kind, ConversationKindMatch::Kinds(kinds) if !kinds.is_empty() && kinds.iter().all(|kind| matches!(kind, ConversationKind::Channel | ConversationKind::Thread)))
+            {
+                problems.push(ConfigProblem::UnsupportedFollowRoute { route: index });
+            }
+        }
         let direct_message_only = conversation.kind
             == ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]);
         if route.subjects.is_some() && !direct_message_only {
@@ -1666,6 +1690,7 @@ pub(crate) fn resolve(
             memory,
             indicators,
             wakes: route.wakes,
+            follow: route.follow,
         });
     }
 
@@ -1849,19 +1874,23 @@ fn resolve_liveness(
             templates.overlay(value);
         }
     }
-    if keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0) {
+    if (keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0))
+        && !problems.iter().any(|problem| matches!(problem, ConfigProblem::InvalidKeepAlive { route, .. } if *route == index))
+    {
         problems.push(ConfigProblem::InvalidKeepAlive {
-            transport: transport.name().to_owned(),
+            transport: transport.name().to_owned(), route: index,
         });
     }
     let (templates, template_problems) =
         Templates::resolve(&templates, STOPPED_REPLY, FAILURE_REPLY);
     for problem in template_problems {
-        problems.push(ConfigProblem::InvalidLivenessTemplate {
-            transport: transport.name().to_owned(),
-            field: problem.field.key(),
-            placeholder: problem.placeholder,
-        });
+        if !problems.iter().any(|existing| matches!(existing, ConfigProblem::InvalidLivenessTemplate { route, field, placeholder, .. } if *route == index && *field == problem.field.key() && *placeholder == problem.placeholder)) {
+            problems.push(ConfigProblem::InvalidLivenessTemplate {
+                transport: transport.name().to_owned(), route: index,
+                field: problem.field.key(),
+                placeholder: problem.placeholder,
+            });
+        }
     }
     let mut unsupported = |surface, reason| {
         problems.push(ConfigProblem::UnsupportedRouteIndicator {
@@ -2136,17 +2165,24 @@ pub enum ConfigProblem {
         reason: &'static str,
     },
     #[error(
-        "transport {transport:?} has an indicators.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
+        "routes[{route}] transport {transport:?} has an indicators.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
     )]
-    InvalidKeepAlive { transport: String },
+    InvalidKeepAlive { transport: String, route: usize },
     #[error(
-        "transport {transport:?} indicators template {field} uses {{{placeholder}}}, which it cannot render"
+        "routes[{route}] transport {transport:?} indicators template {field} uses {{{placeholder}}}, which it cannot render"
     )]
     InvalidLivenessTemplate {
+        route: usize,
         transport: String,
         field: &'static str,
         placeholder: String,
     },
+    #[error("routes[{route}]: follow needs sessions.journal")]
+    FollowWithoutJournal { route: usize },
+    #[error(
+        "routes[{route}]: follow requires a Discord channel/thread route with messageContent enabled"
+    )]
+    UnsupportedFollowRoute { route: usize },
     #[error(
         "stopWords must not be empty and no word may be blank; omit the key to keep the default list"
     )]
@@ -2625,15 +2661,67 @@ routes:
         let ConfigError::Invalid { problems, .. } = error else {
             panic!("expected semantic refusals")
         };
-        assert!(
-            problems
-                .iter()
-                .any(|problem| matches!(problem, super::ConfigProblem::InvalidKeepAlive { .. }))
-        );
         assert!(problems.iter().any(|problem| matches!(
             problem,
-            super::ConfigProblem::InvalidLivenessTemplate { .. }
+            super::ConfigProblem::InvalidKeepAlive { route: 0, .. }
         )));
+        assert!(problems.iter().any(|problem| matches!(
+            problem,
+            super::ConfigProblem::InvalidLivenessTemplate { route: 0, .. }
+        )));
+    }
+
+    #[test]
+    fn repeated_indicator_errors_name_the_route_once_per_field() {
+        let error = resolved("transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n    experience: agent\nroutes:\n  - transport: slack\n    conversation: { kind: [channel, thread] }\n    agent: reviewer\n    indicators: { keepAlive: { everySeconds: 0 }, templates: { working: '{word}' } }\n").unwrap_err();
+        let ConfigError::Invalid { problems, .. } = error else {
+            panic!("semantic errors")
+        };
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| matches!(
+                    problem,
+                    super::ConfigProblem::InvalidKeepAlive { route: 0, .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| matches!(
+                    problem,
+                    super::ConfigProblem::InvalidLivenessTemplate { route: 0, .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn follow_requires_a_durable_discord_channel_with_message_content() {
+        let route = "routes:\n  - transport: discord\n    conversation: { kind: [channel] }\n    agent: reviewer\n    follow: true\n";
+        let discord = "transports:\n  - name: discord\n    kind: discordGateway\n    botTokenEnv: BOT\n    messageContent: true\n";
+        let error = resolved(&format!("{discord}{route}")).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(|p| matches!(p, super::ConfigProblem::FollowWithoutJournal { route: 0 })))
+        );
+        let with_journal = "sessions:\n  journal: { path: journal }\n";
+        let config = resolved(&format!("{with_journal}{discord}{route}")).unwrap();
+        assert!(config.routes[0].follow);
+        let disabled = route.replace("follow: true", "follow: null");
+        assert!(
+            !resolved(&format!("{with_journal}{discord}{disabled}"))
+                .unwrap()
+                .routes[0]
+                .follow
+        );
+        let dm = route.replace("channel", "directMessage");
+        let error = resolved(&format!("{with_journal}{discord}{dm}")).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedFollowRoute { route: 0 })))
+        );
     }
 
     #[test]

@@ -586,6 +586,8 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 
 ### Discord Gateway
 
+A route may declare `follow: true` only for Discord channel/thread kinds when its transport sets `messageContent: true` and `sessions.journal` is configured. Absent, `null`, and `false` leave it disabled; other route kinds and transports refuse at configuration load. The gateway prepares a bounded resident ticket table from private `.followed` journal-root markers at boot; this preparatory stage does not yet invite agents or admit unmentioned messages. No route should be opted in until the follow dispatch and provider effects ship.
+
 Discord Gateway v10 is another outbound WebSocket transport. The daemon discovers the service URL through authenticated `GET /api/v10/gateway/bot`, requests the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents, adds the privileged `MESSAGE_CONTENT` intent when the transport sets `messageContent: true`, and identifies after Hello. It jitters the first heartbeat, requires each heartbeat ACK, tracks dispatch sequence, resumes a live session after reconnect, honors Invalid Session and identify/session-start limits, and treats Discord's fatal close codes as terminal transport failures; close 4014 (disallowed intents) stops the transport with an error naming the Developer Portal toggle. No public endpoint is required. Without `messageContent`, Discord exposes content and attachments only in DMs and in guild messages whose structured `mentions` array names the bot; with it, every message the bot can see arrives with its text, and addressing still decides which ones wake a session.
 
 - Bots, webhooks, the bot's own posts, and message types other than ordinary messages and replies are dropped.

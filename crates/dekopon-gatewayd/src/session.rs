@@ -788,6 +788,11 @@ pub(crate) struct SessionRunner {
     pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
     pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
+    #[allow(
+        dead_code,
+        reason = "follow dispatch lands in the subsequent S3b change"
+    )]
+    pub follow: Option<Arc<crate::follow::FollowTable>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
@@ -1801,6 +1806,23 @@ async fn session(
                 }),
             )
         });
+    let follow_ticket = route
+        .follow
+        .then(|| {
+            runner.follow.as_ref().map(|table| {
+                (
+                    Arc::clone(table),
+                    crate::follow::follow_key(
+                        &route.transport,
+                        route.agent.as_str(),
+                        &route.conversation,
+                        &message.conversation.key(),
+                    ),
+                    route.route_index,
+                )
+            })
+        })
+        .flatten();
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -1812,7 +1834,7 @@ async fn session(
                 Err(error) => return (Err(error), None, Vec::new()),
             };
             let runtime = ShellRuntime {
-                invoker: leg,
+                invoker: crate::follow::FollowInvoker::new(leg, follow_ticket),
                 limits: shell,
                 calls,
             };
@@ -1863,7 +1885,7 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                return stopped(runner, &key, message, &mut progress, &cancellation).await;
+                return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
             }
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
@@ -1878,7 +1900,7 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        return stopped(runner, &key, message, &mut progress, &cancellation).await;
+        return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
     }
 
     progress.seal();
@@ -2044,7 +2066,43 @@ async fn sealed_conversation(
     None
 }
 
-async fn seal_conversation(runner: &SessionRunner, key: &ConversationKey) -> bool {
+pub(crate) async fn seal_conversation(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    message: &InboundMessage,
+    key: &ConversationKey,
+) -> bool {
+    if route.follow
+        && let Some(table) = runner.follow.as_ref()
+    {
+        let table = Arc::clone(table);
+        let follow_key = crate::follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            &message.conversation.key(),
+        );
+        let left = tokio::task::spawn_blocking(move || table.leave(&follow_key)).await;
+        match left {
+            Ok(Ok(())) => tracing::info!(
+                audit.event = "gateway.follow",
+                operation = "sealed",
+                route = route.route_index
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                audit.event = "gateway.follow",
+                operation = "refused",
+                route = route.route_index,
+                reason = error.label()
+            ),
+            Err(_) => tracing::warn!(
+                audit.event = "gateway.follow",
+                operation = "refused",
+                route = route.route_index,
+                reason = "task"
+            ),
+        }
+    }
     let seal = SealedConversation {
         at: SystemTime::now(),
     };
@@ -2074,6 +2132,7 @@ fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause
 
 async fn stopped(
     runner: &SessionRunner,
+    route: &BoundRoute,
     key: &ConversationKey,
     message: &InboundMessage,
     progress: &mut ProgressPolicy,
@@ -2085,7 +2144,7 @@ async fn stopped(
         CancelSource::Budget {
             limit: BudgetLimit::WallClock,
         } => {
-            let sealed = seal_conversation(runner, key).await;
+            let sealed = seal_conversation(runner, route, message, key).await;
             runner.conversations.remove(key, EvictionReason::Sealed);
             sealed
         }
