@@ -1856,6 +1856,35 @@ mod retention_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_download_refuses_at_the_fetch_deadline() {
+        let store = store(8);
+        let access = access("deadline");
+        let id = register(&store, &access);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stalled = SessionAssets::new(
+            store,
+            access,
+            Some(Arc::new(Stalled {
+                entered: Arc::clone(&entered),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            }) as Arc<dyn AssetFetcher>),
+            Handle::current(),
+            true,
+            true,
+        );
+        let fetch = tokio::task::spawn_blocking(move || stalled.fetch(id));
+        entered.notified().await;
+        tokio::time::advance(ASSET_FETCH_TIMEOUT).await;
+        assert_eq!(
+            fetch.await.unwrap().unwrap_err(),
+            AssetFailure::Transport {
+                category: "fetch-timeout"
+            }
+            .for_model(id)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stalled_download_does_not_hold_up_another_conversations_retained_attachment() {
         let store = store(8);
