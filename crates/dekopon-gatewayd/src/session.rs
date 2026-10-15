@@ -2025,7 +2025,11 @@ async fn session(
                 category = "unreported-capability-work"
             );
             (
-                Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned()),
+                if is_follow {
+                    Terminal::Answered(OutboundReply::text(UNREPORTED_WORK_REPLY.to_owned()))
+                } else {
+                    Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())
+                },
                 "failed",
                 None,
             )
@@ -2087,11 +2091,6 @@ async fn session(
             };
             (terminal, "failed", None)
         }
-    };
-    let terminal = if is_follow && completed_outcome != "answered" {
-        Terminal::Silent
-    } else {
-        terminal
     };
     let delivered = progress.terminal(terminal).await;
     attachments.finish(match (&outcome, delivered) {
