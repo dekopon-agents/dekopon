@@ -365,8 +365,8 @@ impl SlackTransport {
         let root_ts = thread_ts.clone().unwrap_or_else(|| ts.to_owned());
         // Keep the mention-text fallback: the plain message event can win Slack's dedup race before
         // the authoritative app_mention event arrives.
-        let explicitly_addressed =
-            event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(top_text);
+        let explicitly_addressed = event["type"].as_str() == Some("app_mention")
+            || self.identity.is_addressed(&bound_inbound(top_text));
         if !self.seen.insert(format!("{channel}:{ts}")) {
             return Ok(None);
         }
@@ -2036,8 +2036,8 @@ mod driver_tests {
 
     use super::{
         CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
-        MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier,
-        SlackTransport, Tracked, past_message,
+        MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS,
+        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, past_message,
     };
     use crate::{
         config::{SlackExperience, TemplateOverrides},
@@ -3071,6 +3071,36 @@ mod driver_tests {
             let history = past_message(&event, TEAM, BOT_USER).expect("history");
             assert_eq!(ingress.text, history.text);
             assert_eq!(ingress.assets, history.assets);
+            for (text, assets) in [
+                (&ingress.text, &ingress.assets),
+                (&history.text, &history.assets),
+            ] {
+                let expected = match index {
+                    0 => "a quoted answer",
+                    1 => "[quoted Slack forward",
+                    2 => "an image",
+                    3 | 4 => "unavailable",
+                    5 => "from blocks",
+                    _ => unreachable!("fixture count is fixed"),
+                };
+                assert!(text.contains(expected), "case {index}: {text}");
+                if index <= 2 {
+                    assert!(!text.contains("[forwarded content unavailable]"));
+                }
+                if index == 1 || index == 2 {
+                    assert_eq!(assets.len(), 1);
+                    assert_eq!(assets[0].name, "cat.png");
+                    assert_eq!(assets[0].mime, "image/png");
+                    assert!(matches!(
+                        &assets[0].source,
+                        Some(crate::asset::AssetSourceRef::Slack { file_id, url })
+                            if file_id == "F0PHOTO" && url == "http://127.0.0.1:1/files/cat.png"
+                    ));
+                }
+                if index == 0 {
+                    assert!(assets.is_empty());
+                }
+            }
             assert_eq!(ingress.subject, history.subject);
             assert_eq!(history.author, USER);
             assert!(ingress.text.contains("author: \"UORIGINAL\""));
@@ -3092,6 +3122,23 @@ mod driver_tests {
                 assert!(ingress.text.contains("from blocks"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_bot_mention_after_the_top_level_budget_does_not_address_a_message() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        transport.identity.user_id = Some(BOT_USER.to_owned());
+        let top = format!("{}<@{BOT_USER}>", "x".repeat(MAX_INBOUND_TEXT_BYTES));
+        let event = forwarded_event(&top, forward(json!("quoted"), json!([])));
+        assert!(
+            transport
+                .routable(TEAM, &event, &Span::none())
+                .await
+                .expect("readable")
+                .is_none(),
+            "a mention excluded from delivered text cannot address the bot"
+        );
+        assert!(transport.thread_ownership.owned.lock().order.is_empty());
     }
 
     #[tokio::test]
