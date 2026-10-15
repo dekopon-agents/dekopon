@@ -1243,12 +1243,7 @@ impl BufferedHttpClient {
                 body: (streamed.is_none()).then_some(request.body.clone()),
                 content_type: content_type.map(str::to_owned),
             };
-            // Wasmtime's guest stack may have less than Cedar's 100-KiB evaluation reserve.
-            let authorize = std::sync::Arc::clone(authorize);
-            if !tokio::task::spawn_blocking(move || authorize(facts))
-                .await
-                .unwrap_or(false)
-            {
+            if !authorize(facts) {
                 return Err(http_error(
                     ErrorCode::Denied,
                     "HTTP request denied by policy",

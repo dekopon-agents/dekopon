@@ -81,6 +81,7 @@ use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
+const POLICY_STACK_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SECRET_BINDINGS: usize = 1024;
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
@@ -3349,24 +3350,25 @@ where
             };
             let context = policy_context(context);
             Arc::new(move |facts: dekopon_broker_host::HttpRequestFacts| {
-                let decision = Self::decide_capability(
-                    &policy,
-                    PolicyRequest {
-                        principal: principal.clone(),
-                        target: target.clone(),
-                        context: context.clone(),
-                    },
-                    Some(dekopon_policy::HttpRequestFacts {
-                        method: facts.method,
-                        host: facts.host,
-                        path: facts.path,
-                        query: facts.query,
-                        headers: facts.headers,
-                        body: facts.body,
-                        content_type: facts.content_type,
-                    }),
-                );
-                decision.allowed
+                let request = PolicyRequest {
+                    principal: principal.clone(),
+                    target: target.clone(),
+                    context: context.clone(),
+                };
+                let facts = dekopon_policy::HttpRequestFacts {
+                    method: facts.method,
+                    host: facts.host,
+                    path: facts.path,
+                    query: facts.query,
+                    headers: facts.headers,
+                    body: facts.body,
+                    content_type: facts.content_type,
+                };
+                // Cedar measures its recursion reserve against stacker's thread bounds, which a
+                // Wasmtime fiber stack falls outside, so it evaluates on a segment stacker tracks.
+                stacker::grow(POLICY_STACK_BYTES, || {
+                    Self::decide_capability(&policy, request, Some(facts)).allowed
+                })
             }) as dekopon_broker_host::RequestAuthorizer
         });
         let authorized = self
