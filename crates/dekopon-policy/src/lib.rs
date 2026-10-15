@@ -100,8 +100,8 @@ use std::{
 };
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid, PolicyId,
-    PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
+    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
+    PolicyId, PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use dekopon_capability::EffectKind;
 use dekopon_core::{
@@ -587,6 +587,12 @@ impl PolicyEngine {
             });
         }
         let policies = apply_annotated_ids(&policies)?;
+        let (ordinary_policies, invalid_request_shapes) = inspect_request_shapes(&policies)?;
+        if !invalid_request_shapes.is_empty() {
+            return Err(PolicyBuildError::InvalidRequestShapes {
+                policies: invalid_request_shapes,
+            });
+        }
 
         // Classification must run before schema generation; a tolerated name needs to already be in
         // the schema before Cedar's strict validator runs.
@@ -598,7 +604,8 @@ impl PolicyEngine {
                 message: source.to_string(),
             }
         })?;
-        let validation = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
+        let validation =
+            Validator::new(schema.clone()).validate(&ordinary_policies, ValidationMode::Strict);
         if !validation.validation_passed() {
             let mut messages = validation
                 .validation_errors()
@@ -808,6 +815,59 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
             })?;
     }
     Ok(renamed)
+}
+
+fn inspect_request_shapes(
+    policies: &PolicySet,
+) -> Result<(PolicySet, Vec<String>), PolicyBuildError> {
+    let mut ordinary = PolicySet::new();
+    let mut invalid = Vec::new();
+    for policy in policies.policies() {
+        let est = policy
+            .to_json()
+            .map_err(|source| PolicyBuildError::ShapeInspection {
+                policy: policy.id().to_string(),
+                message: source.to_string(),
+            })?;
+        if !references_request(&est) {
+            ordinary
+                .add(policy.clone())
+                .map_err(|source| PolicyBuildError::ShapeInspection {
+                    policy: policy.id().to_string(),
+                    message: source.to_string(),
+                })?;
+            continue;
+        }
+        let guard = json!({"kind": "when", "body": {"has": {
+            "left": {"Var": "context"}, "attr": "request"
+        }}});
+        if policy.effect() != Effect::Forbid || est["conditions"][0] != guard {
+            invalid.push(policy.id().to_string());
+        }
+    }
+    invalid.sort();
+    Ok((ordinary, invalid))
+}
+
+fn references_request(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let refers = [".", "has"].into_iter().any(|op| {
+                fields.get(op).is_some_and(|expr| {
+                    expr.get("left") == Some(&json!({"Var": "context"}))
+                        && (expr.get("attr") == Some(&json!("request"))
+                            || expr
+                                .get("attr")
+                                .and_then(serde_json::Value::as_array)
+                                .and_then(|path| path.first())
+                                == Some(&json!("request")))
+                })
+            });
+            refers || fields.values().any(references_request)
+        }
+        serde_json::Value::Array(values) => values.iter().any(references_request),
+        _ => false,
+    }
 }
 
 fn entity_type_name(type_name: &str) -> Result<EntityTypeName, PolicyBuildError> {
@@ -1136,6 +1196,10 @@ pub enum PolicyBuildError {
     Schema { message: String },
     #[error("policy set failed strict validation: {}", messages.join("; "))]
     Validation { messages: Vec<String> },
+    #[error("request policy shape invalid for IDs: {}", policies.join(", "))]
+    InvalidRequestShapes { policies: Vec<String> },
+    #[error("policy {policy} could not be inspected: {message}")]
+    ShapeInspection { policy: String, message: String },
     #[error("policy {policy} names undeclared principal {principal:?}")]
     UnknownPrincipal { policy: String, principal: String },
     #[error("policy {policy} names malformed principal {principal:?}")]
