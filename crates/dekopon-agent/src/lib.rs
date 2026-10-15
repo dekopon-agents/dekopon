@@ -1545,7 +1545,7 @@ mod tests {
                 decision: DecisionReference {
                     decision_id: "decision-stub".to_owned(),
                     authorized_by: "broker-stub".parse().expect("valid principal fixture"),
-                    policy_revision: "policy-stub".to_owned(),
+                    policy_digest: "a".repeat(64),
                 },
                 outcome,
                 exit_status: None,

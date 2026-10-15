@@ -424,7 +424,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(result.result.decision.decision_id, "allow-invoke-once");
-    assert_eq!(result.result.decision.policy_revision, "policy-test");
+    assert_eq!(result.result.decision.policy_digest.len(), 64);
     assert_eq!(result.result.evidence.len(), 1);
 
     let records = audit.records();
@@ -3352,7 +3352,10 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     .await
     .expect("the allowed invocation is accounted");
     assert_eq!(result.result.decision.decision_id, "allow-invoke-explained");
-    assert_eq!(result.result.decision.policy_revision, "policy-test");
+    assert_eq!(
+        result.result.decision.policy_digest,
+        digest["sha256:".len()..]
+    );
     let result = invoke_as(
         &broker,
         "other-caller",
@@ -3369,7 +3372,10 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
         result.result.decision.decision_id,
         "deny-invoke-unexplained"
     );
-    assert_eq!(result.result.decision.policy_revision, "policy-test");
+    assert_eq!(
+        result.result.decision.policy_digest,
+        digest["sha256:".len()..]
+    );
 
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");

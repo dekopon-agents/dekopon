@@ -21,6 +21,102 @@ use super::{
 };
 
 #[tokio::test]
+async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
+    use dekopon_broker_host::{BrokerProviderRegistry, LockedProviderSource};
+    use dekopon_capability::{EffectKind, InvocationOutcome};
+    use dekopon_core::RiskLevel;
+    use dekopon_test_support::{CaptureLayer, provider_fixture};
+    use sha2::{Digest, Sha256};
+    use tracing_subscriber::prelude::*;
+
+    let fixture = provider_fixture("cli-probe-provider.wasm");
+    let bytes = std::fs::read(&fixture).expect("real component bytes");
+    let pin = LockedProviderSource::new(
+        fixture,
+        bytes.len() as u64,
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "cli-probe".parse().expect("provider"),
+    )
+    .expect("valid desired pin for the real component");
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("a different real component loads");
+    let artifact = registry
+        .loaded_provider_metadata()
+        .find(|loaded| loaded.manifest.id == *pin.provider_id())
+        .map(|loaded| loaded.artifact_sha256);
+    assert!(
+        artifact.is_none(),
+        "a desired pin does not load an artifact"
+    );
+
+    let captured = CaptureLayer::workspace();
+    let _subscriber = tracing_subscriber::registry()
+        .with(captured.clone())
+        .set_default();
+    let broker: PrincipalId = "broker".parse().expect("principal");
+    let context = AuthenticatedContext::new(
+        broker.clone(),
+        Actor::Service {
+            principal: broker.clone(),
+        },
+    )
+    .expect("authenticated service");
+    let capability = "cli-probe.upper".parse().expect("capability");
+    let world = PolicyWorld::new([broker.clone()], []).expect("world");
+    let policy = PolicyEngine::new("", &world).expect("policy");
+    let set = ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: pin.provider_id().clone(),
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints::default(),
+    };
+    super::emit_audit_event(&super::execution_event(
+        &context,
+        &"invoke-unloaded".parse().expect("invocation"),
+        "0000000000000000000000000000f1c7".parse().expect("trace"),
+        &capability,
+        "decision-unloaded",
+        &[],
+        policy.digest(),
+        artifact.as_deref(),
+        &broker,
+        &set,
+        None,
+        InvocationOutcome::Failed,
+        0,
+        None,
+        None,
+        Vec::new(),
+        None,
+        None,
+    ));
+    let records = captured.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.execution"),
+            ("invocation.id", "invoke-unloaded"),
+        ],
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].field("provider.artifact_sha256"),
+        None,
+        "a desired pin {} is not serving evidence",
+        pin.artifact_sha256()
+    );
+}
+
+#[tokio::test]
 async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
     async fn broker() -> Broker<InMemoryAuditLog> {
         let registry = dekopon_broker_host::BrokerProviderRegistry::load(
@@ -114,7 +210,7 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
                 .expect("valid principal fixture"),
         ),
         decision_id: format!("decision-{invocation}"),
-        policy_revision: Some("policy-test".to_owned()),
+
         policy_ids: Vec::new(),
         policy_error_ids: Vec::new(),
         policy_errors_present: None,
