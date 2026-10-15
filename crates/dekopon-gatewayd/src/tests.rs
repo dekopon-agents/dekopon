@@ -4077,10 +4077,11 @@ async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_failed_working_reaction_is_cleared_without_losing_the_reply() {
     use dekopon_test_support::{DriverCall, FailureKind};
 
+    let (capture, _guard) = capture_spans();
     let directory = temporary();
     let (broker, _) = stub_broker(
         directory.path(),
@@ -4096,7 +4097,7 @@ async fn a_failed_working_reaction_is_cleared_without_losing_the_reply() {
             .with_reaction()
             .configure_reaction(|reaction| reaction.failing_call(0, FailureKind::Response)),
     );
-    let model = BlockedModel::new("still delivered");
+    let model = InterruptibleModel::new([answer("still delivered")]);
     let mut route = route(model_config());
     route.indicators.insert(
         ConversationKind::DirectMessage,
@@ -4134,6 +4135,21 @@ async fn a_failed_working_reaction_is_cleared_without_losing_the_reply() {
         .expect("reaction")
         .wait_for_calls(2)
         .await;
+    let failures = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_progress_rendered"),
+            ("primitive", "reaction"),
+            ("outcome", "error"),
+        ],
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "injected set failure must be observed: {:?}",
+        capture.events_text()
+    );
+    assert_eq!(failures[0].field("category"), Some("response"));
     let calls = driver.calls();
     assert!(matches!(
         &calls[0],
@@ -4171,13 +4187,22 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
             Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
             4,
         );
-        let driver = Arc::new(RecordingDriver::default().with_steer_ack());
+        let driver = Arc::new(if transport == "discord" {
+            RecordingDriver::default().with_steer_ack().with_reaction()
+        } else {
+            RecordingDriver::default().with_steer_ack()
+        });
         let mut route = route(model_config());
         route.indicators.insert(
             ConversationKind::DirectMessage,
             Arc::new(ResolvedLiveness {
                 settings: LivenessSettings {
                     mode: LivenessMode::Native,
+                    working: if transport == "discord" {
+                        WorkingReaction::On
+                    } else {
+                        WorkingReaction::Off
+                    },
                     seen: SeenReaction::On,
                     ..LivenessSettings::default()
                 },
@@ -4240,14 +4265,50 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
             [rendered_target(&target("inbound-2"))],
             "{transport}"
         );
-        assert!(
-            !driver
-                .calls()
-                .iter()
-                .any(|call| matches!(call, DriverCall::Reaction { .. }))
-        );
+        if transport == "discord" {
+            assert!(driver.calls().iter().any(|call| matches!(call, DriverCall::Reaction { target: reaction_target, present: true } if reaction_target == &rendered_target(&target("inbound-1")))));
+        } else {
+            assert!(
+                !driver
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, DriverCall::Reaction { .. }))
+            );
+        }
         model.release();
         running.await.expect("first turn finishes");
+        if transport == "discord" {
+            driver
+                .reaction_object()
+                .expect("working reaction")
+                .wait_for_calls(2)
+                .await;
+            let calls = driver.calls();
+            let first_target = rendered_target(&target("inbound-1"));
+            let second_target = rendered_target(&target("inbound-2"));
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter_map(|call| match call {
+                        DriverCall::Reaction { target, present } =>
+                            Some((target.as_str(), *present)),
+                        DriverCall::Reply { .. }
+                        | DriverCall::Typing { .. }
+                        | DriverCall::Status { .. }
+                        | DriverCall::Progress(_)
+                        | DriverCall::Stream(_)
+                        | DriverCall::Seen { .. }
+                        | DriverCall::CancelAck { .. } => None,
+                    })
+                    .collect::<Vec<_>>(),
+                [
+                    (first_target.as_str(), true),
+                    (first_target.as_str(), false)
+                ]
+            );
+            assert_eq!(calls.iter().filter(|call| matches!(call, DriverCall::Seen { target } if target == &second_target)).count(), 1, "working cleanup never clears seen");
+            assert!(!calls.iter().any(|call| matches!(call, DriverCall::Reaction { target, .. } if target == &second_target)));
+        }
     }
 }
 

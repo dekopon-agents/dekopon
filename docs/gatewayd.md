@@ -902,8 +902,9 @@ presentation. Both `reaction.working` and `reaction.seen` default to `off`. With
 then typing. `reaction.working: on` adds a reaction beside those surfaces, while `auto`
 falls back only when neither is active; `status: off` and `typing: off` disable their
 respective surfaces. Healthy Slack Agent status or Telegram/Discord typing
-therefore needs no placeholder message; the complete answer is a fresh reply. WhatsApp remains
-typing-only. Slack's definitive native-status refusal exposes its configured reaction fallback in
+therefore needs no placeholder message; the complete answer is a fresh reply. WhatsApp's
+working indicator is typing-only; its independently opted-in seen acknowledgement is 👀.
+Slack's definitive native-status refusal exposes its configured reaction fallback in
 the same session without changing the configured conversation experience. Transient errors do not
 disable native status for future sessions.
 
