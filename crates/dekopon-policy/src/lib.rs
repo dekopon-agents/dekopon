@@ -112,6 +112,9 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+mod request;
+pub use request::HttpRequestFacts;
+
 pub const NAMESPACE: &str = "Dekopon";
 pub const AGENT_PROMPT_ACTION: &str = "agent.prompt";
 pub const SECRET_USE_ACTION: &str = "secret.use";
@@ -635,7 +638,24 @@ impl PolicyEngine {
 
     #[must_use]
     pub fn authorize(&self, request: PolicyRequest) -> PolicyDecision {
-        let cedar_request = match self.build_request(request) {
+        self.authorize_with_facts(request, None)
+    }
+
+    #[must_use]
+    pub fn authorize_http(
+        &self,
+        request: PolicyRequest,
+        facts: HttpRequestFacts,
+    ) -> PolicyDecision {
+        self.authorize_with_facts(request, Some(facts))
+    }
+
+    fn authorize_with_facts(
+        &self,
+        request: PolicyRequest,
+        facts: Option<HttpRequestFacts>,
+    ) -> PolicyDecision {
+        let cedar_request = match self.build_request(request, facts) {
             Ok(cedar_request) => cedar_request,
             Err(error) => return PolicyDecision::refused(&error),
         };
@@ -672,12 +692,17 @@ impl PolicyEngine {
         &self.digest
     }
 
-    fn build_request(&self, request: PolicyRequest) -> Result<cedar_policy::Request, RequestError> {
+    fn build_request(
+        &self,
+        request: PolicyRequest,
+        request_facts: Option<HttpRequestFacts>,
+    ) -> Result<cedar_policy::Request, RequestError> {
         let PolicyRequest {
             principal,
             target,
             context,
         } = request;
+        let has_request = request_facts.is_some();
         let action = entity_uid(&self.entity_types.action, target.action());
         let principal = entity_uid(&self.entity_types.principal, principal.as_str());
         let (resource, mut pairs) = match target {
@@ -762,10 +787,25 @@ impl PolicyEngine {
         let context = Context::from_pairs(pairs).map_err(|source| RequestError::Context {
             message: source.to_string(),
         })?;
-        cedar_policy::Request::new(principal, action, resource, context, Some(&self.schema))
-            .map_err(|source| RequestError::Schema {
+        let context = if let Some(facts) = request_facts {
+            context
+                .merge(facts.context()?)
+                .map_err(|source| RequestError::Context {
+                    message: source.to_string(),
+                })?
+        } else {
+            context
+        };
+        let schema = if has_request {
+            None
+        } else {
+            Some(&self.schema)
+        };
+        cedar_policy::Request::new(principal, action, resource, context, schema).map_err(|source| {
+            RequestError::Schema {
                 message: source.to_string(),
-            })
+            }
+        })
     }
 }
 
@@ -823,17 +863,13 @@ fn inspect_request_shapes(
     let mut ordinary = PolicySet::new();
     let mut invalid = Vec::new();
     for policy in policies.policies() {
-        let est = policy
-            .to_json()
-            .map_err(|source| PolicyBuildError::ShapeInspection {
-                policy: policy.id().to_string(),
-                message: source.to_string(),
-            })?;
+        let est = policy.to_json().map_err(|source| PolicyBuildError::Parse {
+            message: source.to_string(),
+        })?;
         if !references_request(&est) {
             ordinary
                 .add(policy.clone())
-                .map_err(|source| PolicyBuildError::ShapeInspection {
-                    policy: policy.id().to_string(),
+                .map_err(|source| PolicyBuildError::Parse {
                     message: source.to_string(),
                 })?;
             continue;
@@ -1201,8 +1237,6 @@ pub enum PolicyBuildError {
     Validation { messages: Vec<String> },
     #[error("request policy shape invalid for IDs: {}", policies.join(", "))]
     InvalidRequestShapes { policies: Vec<String> },
-    #[error("policy {policy} could not be inspected: {message}")]
-    ShapeInspection { policy: String, message: String },
     #[error("policy {policy} names undeclared principal {principal:?}")]
     UnknownPrincipal { policy: String, principal: String },
     #[error("policy {policy} names malformed principal {principal:?}")]
