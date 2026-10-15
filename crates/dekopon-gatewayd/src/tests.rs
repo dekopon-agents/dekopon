@@ -15360,6 +15360,10 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         panic!("owner turn must open its own leg: {previous:?}");
     };
     assert_eq!(owner_claim.subject, owner.subject);
+    assert_eq!(
+        owner_claim.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Message
+    );
     let capabilities = broker.request().await;
     let BrokerRequest::Capabilities {
         attestation: Some(claim),
