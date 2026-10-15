@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::{
     cache_key,
     config::{
-        MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, Steering, render_problems,
+        MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy, Steering,
+        render_problems,
     },
     progress::ProgressDetail,
     transport::InboundMessage,
@@ -41,6 +42,11 @@ pub(crate) struct BoundRoute {
     pub steering: Steering,
     pub progress_notes: bool,
     pub memory: MemoryPolicy,
+    #[allow(
+        dead_code,
+        reason = "resolved policy is consumed by later memory integration"
+    )]
+    pub memory_policy: Option<ResolvedPolicy>,
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
@@ -56,6 +62,12 @@ pub(crate) struct RoutingTable {
 }
 
 impl RoutingTable {
+    pub(crate) fn has_persistent_memory(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.memory.window().is_some())
+    }
+
     /// Every route is checked before any is refused, so a config with several broken routes gets
     /// one error naming all of them instead of one restart per fix.
     pub fn bind(config: &ResolvedConfig, catalog: &LocalCatalog) -> Result<Self, RouteError> {
@@ -130,6 +142,7 @@ impl RoutingTable {
                 steering: route.steering,
                 progress_notes: route.progress_notes,
                 memory: route.memory,
+                memory_policy: route.memory_policy.clone(),
                 indicators: route.indicators.clone(),
                 wakes: route.wakes,
                 follow: route.follow,

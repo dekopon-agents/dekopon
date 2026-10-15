@@ -324,6 +324,8 @@ pub enum CheckWarning {
     TransportCredential { transport: String, variable: String },
     #[error("model {model} reads {variable} from the environment at boot")]
     ModelCredential { model: String, variable: String },
+    #[error("persistent memory has no journal: window-only, memory tools unavailable")]
+    MemoryWithoutJournal,
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
     #[error("model {model} not probed: {reason}")]
@@ -427,7 +429,15 @@ pub(crate) async fn load_candidate(
         }
     };
     let transports = match (&config, &routes) {
-        (Some(config), Some(routes)) => credentials(config, routes, mode, &mut report),
+        (Some(config), Some(routes)) => {
+            if mode == config::LoadMode::Check
+                && config.journal.is_none()
+                && routes.has_persistent_memory()
+            {
+                report.warnings.push(CheckWarning::MemoryWithoutJournal);
+            }
+            credentials(config, routes, mode, &mut report)
+        }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
             Vec::new()

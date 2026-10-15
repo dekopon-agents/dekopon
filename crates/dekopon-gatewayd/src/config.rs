@@ -25,6 +25,10 @@ use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
 
+pub(crate) mod memory;
+pub use memory::{MemorySettings, ResolvedPolicy, ResolvedSettings};
+use memory::{PolicyConfig, PolicyProblem, resolve_policy, resolve_settings};
+
 use crate::{
     progress::{KeepAlive, ProgressDetail, Templates},
     session::{FAILURE_REPLY, STOPPED_REPLY},
@@ -670,7 +674,7 @@ pub enum MemoryScope {
     SharedConversation,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(
     tag = "mode",
     deny_unknown_fields,
@@ -692,6 +696,8 @@ pub enum MemoryConfig {
         recall: Option<RecallSource>,
         #[serde(default)]
         forget_after_ms: Option<u64>,
+        #[serde(default)]
+        policy: Option<Box<PolicyConfig>>,
     },
 }
 
@@ -712,6 +718,7 @@ impl Default for MemoryConfig {
             max_bytes: default_conversation_max_bytes(),
             recall: None,
             forget_after_ms: None,
+            policy: None,
         }
     }
 }
@@ -825,6 +832,7 @@ pub struct ResolvedRoute {
     pub(crate) steering: Steering,
     pub(crate) progress_notes: bool,
     pub memory: MemoryPolicy,
+    pub memory_policy: Option<ResolvedPolicy>,
     pub(crate) indicators: BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
@@ -897,6 +905,8 @@ pub struct SessionsConfig {
     #[serde(default)]
     pub journal: Option<JournalConfig>,
     #[serde(default)]
+    pub memory: MemorySettings,
+    #[serde(default)]
     pub wakes: Option<WakesConfig>,
 }
 
@@ -910,6 +920,7 @@ impl Default for SessionsConfig {
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
             max_jobs: DEFAULT_MAX_JOBS,
             journal: None,
+            memory: MemorySettings::default(),
             wakes: None,
         }
     }
@@ -979,6 +990,7 @@ pub struct ResolvedConfig {
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub journal: Option<ResolvedJournal>,
+    pub memory: ResolvedSettings,
     pub wakes: Option<ResolvedWakes>,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
@@ -1445,6 +1457,18 @@ pub(crate) fn resolve(
         check_env_name(auth_env, &mut problems);
     }
 
+    let agent_ids = config
+        .routes
+        .iter()
+        .map(|route| route.agent.clone())
+        .collect();
+    let memory_settings = resolve_settings(&config.sessions.memory, &agent_ids);
+    if let Err(problem) = &memory_settings {
+        problems.push(ConfigProblem::MemoryPolicy {
+            route: None,
+            problem: problem.clone(),
+        });
+    }
     let mut routes = Vec::with_capacity(config.routes.len());
     for (index, route) in config.routes.into_iter().enumerate() {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
@@ -1530,7 +1554,7 @@ pub(crate) fn resolve(
         }
         if direct_message_only
             && matches!(
-                route.memory,
+                &route.memory,
                 MemoryConfig::Persistent {
                     scope: MemoryScope::SharedConversation,
                     ..
@@ -1597,6 +1621,28 @@ pub(crate) fn resolve(
                 max_duration_ms,
             });
         }
+        let agent_memory = config.sessions.memory.agents.get(&route.agent);
+        let policy_config = match &route.memory {
+            MemoryConfig::Persistent { policy, .. } => policy
+                .as_deref()
+                .or_else(|| agent_memory.and_then(|entry| entry.policy.as_ref())),
+            MemoryConfig::OneShot {} => agent_memory.and_then(|entry| entry.policy.as_ref()),
+        };
+        let memory_policy = match resolve_policy(
+            policy_config,
+            agent_memory.and_then(|entry| entry.routine.as_deref()),
+            &model_names,
+            &proxy_only,
+        ) {
+            Ok(policy) => Some(policy),
+            Err(problem) => {
+                problems.push(ConfigProblem::MemoryPolicy {
+                    route: Some(index),
+                    problem,
+                });
+                None
+            }
+        };
         let memory = match route.memory {
             MemoryConfig::OneShot {} => MemoryPolicy::OneShot,
             MemoryConfig::Persistent {
@@ -1606,6 +1652,7 @@ pub(crate) fn resolve(
                 max_bytes,
                 recall,
                 forget_after_ms,
+                policy: _,
             } => {
                 if idle_timeout_ms == 0
                     || max_turns == 0
@@ -1688,6 +1735,11 @@ pub(crate) fn resolve(
             steering: route.steering,
             progress_notes: route.progress_notes,
             memory,
+            memory_policy: if config.sessions.journal.is_some() && memory.window().is_some() {
+                memory_policy
+            } else {
+                None
+            },
             indicators,
             wakes: route.wakes,
             follow: route.follow,
@@ -1746,7 +1798,10 @@ pub(crate) fn resolve(
                     _ => None,
                 })
                 .max()
-                .unwrap_or(DEFAULT_FORGET_AFTER),
+                .unwrap_or(DEFAULT_FORGET_AFTER)
+                .max(Duration::from_millis(
+                    config.sessions.memory.retention.max_age_ms.get(),
+                )),
         });
     let shutdown_grace = match config.shutdown_grace_ms {
         Some(0) => {
@@ -1826,6 +1881,7 @@ pub(crate) fn resolve(
                 stop_words,
                 sessions: config.sessions,
                 journal,
+                memory: memory_settings.expect("memory settings validated before resolution"),
                 wakes,
                 shutdown_grace,
                 telemetry,
@@ -2131,6 +2187,11 @@ pub enum ConfigError {
 
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error("memory policy for route {route:?}: {problem}")]
+    MemoryPolicy {
+        route: Option<usize>,
+        problem: PolicyProblem,
+    },
     #[error(transparent)]
     Metering(crate::metering::MeteringProblem),
     #[error(transparent)]

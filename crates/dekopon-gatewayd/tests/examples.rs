@@ -62,8 +62,8 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     assert_eq!(route.transport, transport.name());
     assert_eq!(route.limits.max_steps, 8);
     assert_eq!(route.limits.max_capability_calls, 16);
-    assert_eq!(
-        route.memory,
+    assert!(matches!(
+        &route.memory,
         dekopon_gatewayd::MemoryConfig::Persistent {
             scope: dekopon_gatewayd::MemoryScope::PrivateConversation,
             idle_timeout_ms: 900_000,
@@ -71,8 +71,9 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             max_bytes: 65_536,
             recall: None,
             forget_after_ms: None,
+            policy: None,
         }
-    );
+    ));
     assert_eq!(config.sessions.max_conversations, 1024);
 
     let catalog = LocalCatalog::load(example("dekopon.yaml")).expect("the example catalog loads");

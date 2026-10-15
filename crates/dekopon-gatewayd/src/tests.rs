@@ -327,6 +327,164 @@ async fn persistent_memory_defaults_and_explicit_scopes_survive_route_binding() 
 }
 
 #[tokio::test]
+async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    let second_route = input["routes"][0].clone();
+    input["routes"]
+        .as_array_mut()
+        .expect("routes fixture")
+        .push(second_route);
+    let resolved = load(directory.path(), &input)
+        .await
+        .expect("window-only configuration");
+    assert!(
+        resolved
+            .routes
+            .iter()
+            .all(|route| route.memory_policy.is_none())
+    );
+    let catalog_path = directory.path().join("dekopon.yaml");
+    fs::write(&catalog_path, catalog_text(true, Some("reasoning"))).expect("catalog fixture");
+    fs::set_permissions(&catalog_path, fs::Permissions::from_mode(0o600)).expect("private catalog");
+    let report = crate::check(write_config(directory.path(), &input), None, None).await;
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, crate::CheckWarning::MemoryWithoutJournal))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_binding() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"journal": {"path": "journal"}, "memory": {
+        "agents": {"reviewer": {"routine": "prefix", "policy": {
+            "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+            "routines": [{"id": "prefix", "kind": "prefix", "maxBytes": 1024}],
+            "retain": ["prefix"], "selection": {"mode": "agentPreference", "routine": "prefix"}
+        }}}
+    }});
+    let config = load(directory.path(), &input)
+        .await
+        .expect("agent policy resolves");
+    assert_eq!(
+        config.routes[0]
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .preferred_routine
+            .as_deref(),
+        Some("prefix")
+    );
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "original", "kind": "original"}], "retain": ["original"],
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original"}
+    }});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown agent preference is refused");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy { .. }
+    )));
+    input["sessions"]["memory"]["agents"]["reviewer"]["routine"] = json!("original");
+    let config = load(directory.path(), &input)
+        .await
+        .expect("route decider takes precedence");
+    assert!(matches!(
+        config.routes[0]
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .selection
+            .mode,
+        crate::config::memory::SelectionMode::Decider
+    ));
+    let routes =
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("bound policy");
+    assert!(matches!(
+        routes
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+            .expect("route")
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .selection
+            .mode,
+        crate::config::memory::SelectionMode::Decider
+    ));
+}
+
+#[tokio::test]
+async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "summary", "kind": "progressiveOneShot", "model": "missing",
+            "parts": [{"id": "short", "maxBytes": 100}, {"id": "long", "maxBytes": 200}]}],
+        "retain": ["summary"], "selection": {"mode": "fixed", "routine": "summary"}
+    }});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown model");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::UnknownModel(_),
+            ..
+        }
+    )));
+    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("local-qwen");
+    assert!(
+        load(directory.path(), &input).await.is_ok(),
+        "known direct model resolves"
+    );
+    input["routes"][0]["memory"]["policy"]["routines"][0]["parts"][1]["maxBytes"] = json!(100);
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("non-increasing cumulative budgets");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("progressive parts"),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"memory": {"agents": {"nobody": {}}}});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown agent");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy { .. }
+    )));
+    input["sessions"] = json!({"memory": {"retention": {"maxAgeMs": 0}}});
+    assert!(matches!(
+        load(directory.path(), &input).await,
+        Err(ConfigError::Decode { .. })
+    ));
+    input["sessions"] = json!({"memory": {"arena": {"sweepIntervalMs": 1000}}});
+    assert!(matches!(
+        load(directory.path(), &input).await,
+        Err(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
 async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
     let directory = temporary();
     for (key, value, replacement) in [
@@ -621,8 +779,17 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
     let window = resolved.routes[0].memory.window().expect("persistent");
     assert_eq!(window.recall, RecallSource::Journal);
     let journal = resolved.journal.expect("journal");
-    assert_eq!(journal.retention, Duration::from_secs(86_400));
+    assert_eq!(journal.retention, Duration::from_secs(7 * 86_400));
     assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
+    let policy = resolved.routes[0]
+        .memory_policy
+        .as_ref()
+        .expect("original-only default");
+    assert_eq!(policy.retain, ["original"]);
+    assert!(matches!(
+        policy.selection.mode,
+        crate::config::memory::SelectionMode::Fixed
+    ));
 }
 
 #[tokio::test]
@@ -2600,6 +2767,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         steering: crate::config::Steering::Abort,
         progress_notes: false,
         memory: MemoryPolicy::OneShot,
+        memory_policy: None,
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
