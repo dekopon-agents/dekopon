@@ -1686,10 +1686,10 @@ async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
     let mut active = config::ConfigSnapshot::from_mapping(&mapping);
     let mut next = active.clone();
     active
-        .record_sources("", &[path.clone()], &[b"first CA".to_vec()])
+        .record_sources("", std::slice::from_ref(&path), &[b"first CA".to_vec()])
         .await
         .unwrap();
-    next.record_sources("", &[path], &[b"second CA".to_vec()])
+    next.record_sources("", std::slice::from_ref(&path), &[b"second CA".to_vec()])
         .await
         .unwrap();
     assert_eq!(active.restart_required(&next), ["http"]);
