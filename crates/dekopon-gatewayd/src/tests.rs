@@ -8035,6 +8035,12 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         .await
         .expect("connected Slack transport");
     let inbound = next_message(&mut transport).await;
+    let transport_name = inbound.transport.clone();
+    let slack_route = move |model, memory| {
+        let mut route = persistent_route(model, memory);
+        route.transport = transport_name.clone();
+        route
+    };
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(6, &["cli-probe.upper"])).await;
@@ -8073,7 +8079,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
         *modalities = vec![crate::config::Modality::Image];
     }
-    let route = persistent_route(model, window());
+    let route = slack_route(model, window());
     let driver = Arc::new(RecordingDriver::default());
     let inaccessible = inbound.clone();
     let shared_first = inbound.clone();
@@ -8177,7 +8183,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut shared_model {
         *modalities = vec![crate::config::Modality::Image];
     }
-    let shared_route = persistent_route(shared_model, shared_window());
+    let shared_route = slack_route(shared_model, shared_window());
     let shared_driver = Arc::new(RecordingDriver::default());
     for inbound in [shared_first, shared_second] {
         tokio::time::timeout(
@@ -8221,7 +8227,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     }
     run_session(
         failed_runner,
-        persistent_route(failed_model, window()),
+        slack_route(failed_model, window()),
         inaccessible,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
@@ -8269,7 +8275,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         let driver = Arc::new(RecordingDriver::default());
         run_session(
             self::runner(broker.1, Arc::clone(&models), 4),
-            persistent_route(model_config(), window()),
+            slack_route(model_config(), window()),
             gated_forward.clone(),
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
@@ -8284,6 +8290,36 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         );
         assert_eq!(models.requests(), 0);
     }
+
+    let mut sealed_forward = gated_forward;
+    sealed_forward.conversation.kind = ConversationKind::Thread;
+    sealed_forward.conversation.thread = Some("1700000000.000001".to_owned());
+    let route = slack_route(model_config(), window());
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &sealed_forward.conversation.key(),
+        &sealed_forward.subject,
+    );
+    let directory = temporary();
+    let broker = ResolvedBroker {
+        socket_path: directory.path().join("absent.sock"),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let models = ModelScript::forbidden();
+    let runner = self::runner(broker, Arc::clone(&models), 4);
+    assert!(crate::session::seal_conversation(&runner, &route, &sealed_forward, &key).await);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        sealed_forward,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [crate::session::SEALED_THREAD_REPLY]);
+    assert_eq!(models.requests(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
