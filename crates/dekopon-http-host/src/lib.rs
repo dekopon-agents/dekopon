@@ -1951,54 +1951,48 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cancelling_at_the_hook_leaves_no_later_decision_work() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("local pending-response fixture");
-        let authority = listener.local_addr().expect("bound address").to_string();
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&evaluations);
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_decision_completes_on_the_invocation_thread() {
+        let invocation_thread = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let mut client = BufferedHttpClient::authorized(
-            grant(authority.clone(), "GET"),
+            grant("no-such-egress.invalid".to_owned(), "GET"),
             HttpHostCeilings::default(),
             Duration::from_secs(1),
         )
         .expect("client")
-        .with_request_authorizer(Arc::new(move |_| {
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
+        .with_request_authorizer(std::sync::Arc::new(move |_| {
+            sender
+                .send(std::thread::current().id())
+                .expect("decision observation");
+            false
         }));
-        let timed = tokio::time::timeout(
-            Duration::ZERO,
-            client.send(Request {
+        let result = client
+            .send(Request {
                 method: "GET".to_owned(),
-                uri: format!("http://{authority}/reply"),
+                uri: "https://no-such-egress.invalid/reply".to_owned(),
                 headers: Vec::new(),
                 body: Vec::new(),
-            }),
-        )
-        .await;
-        assert!(
-            timed.is_err(),
-            "the invocation stops at the asynchronous egress boundary"
-        );
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::HttpError {
+                code: ErrorCode::Denied,
+                ..
+            })
+        ));
         assert_eq!(
-            evaluations.load(Ordering::SeqCst),
-            1,
-            "the hook ran in the cancelled poll"
+            receiver
+                .try_recv()
+                .expect("decision completed before the host call returned"),
+            invocation_thread,
+            "request decision must run inside the calling thread's poll"
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(
-            evaluations.load(Ordering::SeqCst),
-            1,
-            "no detached evaluation may run later"
-        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
