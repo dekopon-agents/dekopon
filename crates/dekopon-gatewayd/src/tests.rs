@@ -15261,6 +15261,10 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one follow witness spans two speakers and their ordered broker requests"
+)]
 async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     let directory = temporary();
     let journal_dir = temporary();
