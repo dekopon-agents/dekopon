@@ -269,7 +269,7 @@ Privileged broker path:
 
 - `BufferedHttpClient` accepts a broker-produced `HttpConstraints` grant but performs no authorization transition itself.
 - Grants can narrow but never widen native ceilings for HTTP call count, request bytes, response bytes, and headers.
-- Native HTTP disables redirects, ambient proxies, and decompression; DNS results are checked and pinned before connection.
+- Native HTTP disables redirects and ambient proxies, decodes gzip/deflate responses before byte limits and the credential echo scan, and refuses other content encodings; DNS results are checked and pinned before connection.
 - `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation. The `provider.describe`, `provider.run_command`, and `provider.invoke` spans record `stores` and `instantiations`, which is where the one-store-one-instance shape of an operation is read.
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.

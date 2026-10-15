@@ -111,7 +111,9 @@ The host:
 - permits plaintext HTTP only when the authorization explicitly enables it and every resolved
   address is loopback;
 - resolves and checks every destination address, then pins those addresses into the request client;
-- disables environment proxies, redirects, and automatic content decompression;
+- disables environment proxies and redirects;
+- decodes gzip and deflate response bodies before byte limits and the credential echo scan, and
+  refuses any other content encoding;
 - rejects guest-controlled authority, framing, hop-by-hop, cookie, and authorization headers;
 - strips hop-by-hop and credential-bearing response headers;
 - preserves other ordered duplicate headers and body bytes;

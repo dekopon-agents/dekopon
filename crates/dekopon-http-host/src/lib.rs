@@ -793,12 +793,6 @@ impl BufferedHttpClient {
         self.evidence
     }
 
-    /// An opened body's failure is the invocation's failure too: a late echo stays a policy
-    /// violation even when the guest ignores the error.
-    pub fn record_body_failure(&mut self, error: &HttpError) {
-        self.policy_violation = violation_label(error.code).or(self.policy_violation);
-    }
-
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
         let span = tracing::info_span!(
             "http.request",
@@ -1013,27 +1007,15 @@ impl BufferedHttpClient {
 
     async fn send_checked(&mut self, request: Request) -> Result<Response, HttpError> {
         let (prepared, grant, evidence_index) = self.authorize_request(request, None).await?;
-        let executed = self.execute(prepared, &grant).await;
-        if let Ok((response, response_bytes)) = &executed {
-            let evidence = &mut self.evidence[evidence_index];
-            evidence.status = Some(response.status);
-            evidence.response_bytes = *response_bytes;
+        let response = self.execute(prepared, &grant, evidence_index).await?;
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(|credential| credential.echoes_credential(&response))
+        {
+            return Err(stream::echoed());
         }
-        let result = executed.and_then(|(response, bytes)| {
-            if self
-                .credential
-                .as_ref()
-                .is_some_and(|credential| credential.echoes_credential(&response))
-            {
-                Err(http_error(
-                    ErrorCode::Denied,
-                    "credentialed response echoed the credential",
-                ))
-            } else {
-                Ok((response, bytes))
-            }
-        });
-        result.map(|(response, _bytes)| response)
+        Ok(response)
     }
 
     #[expect(
@@ -1287,7 +1269,8 @@ impl BufferedHttpClient {
         &mut self,
         request: PreparedRequest,
         grant: &HttpConstraints,
-    ) -> Result<(Response, u64), HttpError> {
+        evidence_index: usize,
+    ) -> Result<Response, HttpError> {
         let remaining = self.remaining()?;
         let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
 
@@ -1308,39 +1291,8 @@ impl BufferedHttpClient {
         .map_err(|_| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
         .map_err(|error| map_reqwest_error(&error))?;
 
-        let status = response.status().as_u16();
-        let mut headers = Vec::with_capacity(response.headers().len());
-        let mut response_bytes = 16_u64;
-        if response.headers().len() > self.ceilings.max_headers {
-            return Err(http_error(
-                ErrorCode::ResponseTooLarge,
-                "response has too many headers",
-            ));
-        }
-        for (name, value) in response.headers() {
-            response_bytes = response_bytes
-                .checked_add(name.as_str().len() as u64)
-                .and_then(|size| size.checked_add(value.as_bytes().len() as u64))
-                .and_then(|size| size.checked_add(4))
-                .ok_or_else(|| {
-                    http_error(ErrorCode::ResponseTooLarge, "response size overflowed")
-                })?;
-            if response_bytes > self.ceilings.max_header_bytes as u64
-                || response_bytes > grant.max_response_bytes
-            {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
-                    "response headers exceed an authorized bound",
-                ));
-            }
-            if !is_forbidden_response_header(name) {
-                headers.push(Header {
-                    name: name.as_str().to_owned(),
-                    value: value.as_bytes().to_vec(),
-                });
-            }
-        }
-
+        let (status, headers, mut response_bytes) =
+            self.accept_head(&response, grant, evidence_index)?;
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         loop {
@@ -1362,6 +1314,7 @@ impl BufferedHttpClient {
                 .ok_or_else(|| {
                     http_error(ErrorCode::ResponseTooLarge, "response size overflowed")
                 })?;
+            self.evidence[evidence_index].response_bytes = response_bytes;
             if response_bytes > grant.max_response_bytes {
                 return Err(http_error(
                     ErrorCode::ResponseTooLarge,
@@ -1371,14 +1324,11 @@ impl BufferedHttpClient {
             body.extend_from_slice(&chunk);
         }
 
-        Ok((
-            Response {
-                status,
-                headers,
-                body,
-            },
-            response_bytes,
-        ))
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
     }
 
     fn pinned_client(
