@@ -1,3 +1,5 @@
+mod selection;
+pub(crate) use selection::{Projection, decide};
 mod tools;
 pub(crate) use tools::JournalMemoryTools;
 
@@ -65,6 +67,8 @@ struct Line {
     record_id: u64,
     next_record_id: u64,
     source_eligibility: bool,
+    #[serde(default)]
+    original_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +456,7 @@ impl Journal {
             record_id: next_record_id,
             next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
             source_eligibility: entry.prepared.is_none_or(|prepared| prepared.original),
+            original_bytes: selection::original_envelope_bytes(entry.turn),
             representations: entry
                 .prepared
                 .map_or_else(Vec::new, |prepared| prepared.representations.clone()),

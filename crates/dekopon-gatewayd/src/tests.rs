@@ -15678,6 +15678,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 mod generation;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/selection.rs"]
+mod selection;
 #[path = "tests/steering.rs"]
 mod steering;
 #[path = "tests/steering_e2e.rs"]

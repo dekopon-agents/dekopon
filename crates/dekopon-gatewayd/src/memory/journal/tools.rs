@@ -93,7 +93,10 @@ impl JournalMemoryTools<'_> {
         })?;
         Ok(found)
     }
-    fn mutate(&self, mut update: impl FnMut(&mut Line) -> bool) -> Result<bool, JournalError> {
+    pub(super) fn mutate(
+        &self,
+        mut update: impl FnMut(&mut Line) -> bool,
+    ) -> Result<bool, JournalError> {
         let path = self.journal.path(&self.stem);
         let temporary = path.with_extension("memory-update");
         let result = (|| {

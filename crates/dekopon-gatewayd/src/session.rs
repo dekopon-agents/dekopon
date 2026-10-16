@@ -1889,6 +1889,9 @@ async fn session(
             )
         })
         .collect();
+    let selection_policy = route.memory_policy.clone().unwrap_or_default();
+    let selection_seal = sealed.map(|seal| seal.at);
+    let selection_window = window.filter(|window| window.recall == RecallSource::Journal);
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -1905,6 +1908,37 @@ async fn session(
                 calls,
             };
             let mut history = seeded;
+            if let (Some(journal), Some(window)) = (memory_journal.as_ref(), selection_window) {
+                let policy = &selection_policy;
+                match journal.project(
+                    journal::Projection {
+                        stem: &memory_stem,
+                        grant: &memory_grant,
+                        window,
+                        sealed_at: selection_seal,
+                        policy,
+                    },
+                    |available, evidence| {
+                        let capability = policy
+                            .selection
+                            .decision_capability
+                            .as_deref()
+                            .unwrap_or("");
+                        journal::decide(&runtime, capability, available, evidence)
+                    },
+                ) {
+                    Ok(projected)
+                        if projected.is_empty()
+                            && !history.is_empty()
+                            && selection_seal.is_none() => {}
+                    Ok(projected) => history = projected,
+                    Err(error) => tracing::warn!(
+                        event = "gateway_recall_failed",
+                        source = "journal",
+                        reason = error.label()
+                    ),
+                }
+            }
             let mut inputs = SessionInputs::new(&text, limits)
                 .with_recorded_prompt(&recorded)
                 .with_system(Some(&instructions))

@@ -477,6 +477,15 @@ impl History {
             .fold(0, usize::saturating_add)
     }
 
+    pub fn record_projected(&mut self, turn: ConversationTurn) -> bool {
+        if turn.bytes() > self.limits.max_bytes {
+            return false;
+        }
+        self.turns.push(turn);
+        self.trim();
+        true
+    }
+
     pub fn record(&mut self, mut turn: ConversationTurn) {
         const MARKER: &str = "[…]";
         if turn.bytes() > self.limits.max_bytes
@@ -516,6 +525,32 @@ impl History {
             dropped += 1;
         }
         self.turns.drain(..dropped);
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::{ConversationTurn, History, HistoryLimits};
+
+    #[test]
+    fn fitting_drops_oldest_whole_turns_without_truncating_or_downgrading() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 3,
+            max_bytes: 10,
+        });
+        assert!(history.record_projected(ConversationTurn::unanswered("11111")));
+        assert!(history.record_projected(ConversationTurn::unanswered("22222")));
+        assert!(!history.record_projected(ConversationTurn::unanswered("oversized original")));
+        assert!(history.record_projected(ConversationTurn::unanswered("33333")));
+        assert_eq!(
+            history
+                .turns()
+                .iter()
+                .map(ConversationTurn::user)
+                .collect::<Vec<_>>(),
+            ["22222", "33333"]
+        );
+        assert_eq!(history.bytes(), 10);
     }
 }
 
