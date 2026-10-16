@@ -227,9 +227,40 @@ fn checks_recipe_waits_on_pending_fires_with_one_word_and_stops_on_errors() {
             output: String::new()
         }
     );
-    assert!(
-        matches!(probe.tick(&ChecksStatus(2), limits), Verdict::Failed { exit, .. } if exit.get() == 2)
-    );
+    let directory = temporary();
+    let store = wake_store(directory.path());
+    let now = SystemTime::now();
+    store
+        .register(
+            anchor(),
+            "check the PR".to_owned(),
+            now,
+            Schedule::Watch {
+                probe,
+                every: Duration::from_secs(60),
+                until: Duration::from_secs(600),
+            },
+        )
+        .expect("registered");
+    let due = now + Duration::from_secs(61);
+    let tick = store
+        .take_due(due)
+        .expect("readable")
+        .ticks
+        .pop()
+        .expect("due");
+    let verdict = tick.run(&ChecksStatus(2), limits);
+    assert!(matches!(&verdict, Verdict::Failed { exit, .. } if exit.get() == 2));
+    let Resolved::Fired(fired) = tick.resolve(&store, verdict, due).expect("resolved") else {
+        panic!("a failed check must retire the watch")
+    };
+    let inbound = fired.into_inbound();
+    assert!(inbound.text.contains("stopped because its probe exited 2"));
+    assert!(matches!(&inbound.message_id, MessageId::Wake { notice, .. }
+        if notice.starts_with("check the PR") && !notice.ends_with("\n\npass") && !notice.ends_with("\n\nfail")));
+    assert!(!inbound.text.contains("[gateway: the probe printed:]\npass"));
+    assert!(!inbound.text.contains("[gateway: the probe printed:]\nfail"));
+    assert!(store.list(anchor().subject(), due).is_empty());
 }
 
 #[test]
@@ -437,6 +468,8 @@ fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
     let inbound = fired.into_inbound();
     assert_eq!(inbound.transport, anchor().transport().to_string());
     assert_eq!(inbound.subject, anchor().subject().clone());
+    assert_eq!(inbound.conversation, anchor().conversation().clone());
+    assert_eq!(inbound.reply, slack_message("anchor").reply);
     assert!(inbound.text.contains("pass"));
 }
 
