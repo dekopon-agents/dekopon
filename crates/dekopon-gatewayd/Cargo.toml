@@ -15,6 +15,7 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 parking_lot.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true

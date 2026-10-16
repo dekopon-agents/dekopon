@@ -1062,6 +1062,7 @@ dependencies = [
 name = "dekopon-gatewayd"
 version = "0.47.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",

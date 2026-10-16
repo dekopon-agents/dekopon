@@ -20,6 +20,7 @@ use dekopon_core::{FileHygieneError, FileTier, Redacted, error_chain, read_trust
 use dekopon_http_host::ConfigurationError;
 use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -116,7 +117,13 @@ pub(crate) async fn load(
 ) -> Result<CredentialStore, CredentialsError> {
     load_with_bytes(path, expected_uid)
         .await
-        .map(|(store, _)| store)
+        .map(|loaded| loaded.store)
+}
+
+pub(crate) struct LoadedCredentials {
+    pub(crate) store: CredentialStore,
+    pub(crate) references: serde_yaml::Value,
+    pub(crate) file_digest: [u8; 32],
 }
 
 #[expect(
@@ -126,7 +133,7 @@ pub(crate) async fn load(
 pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
-) -> Result<(CredentialStore, serde_yaml::Value), CredentialsError> {
+) -> Result<LoadedCredentials, CredentialsError> {
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
         let result = read_trusted_file(
@@ -155,6 +162,7 @@ pub(crate) async fn load_with_bytes(
             source: insecure,
         },
     })?;
+    let file_digest = Sha256::digest(&bytes).into();
     let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes).map_err(|source| {
         let location = source
             .location()
@@ -190,7 +198,11 @@ pub(crate) async fn load_with_bytes(
             path: path.to_path_buf(),
             source: std::io::Error::other(join),
         })??;
-    Ok((resolved, references))
+    Ok(LoadedCredentials {
+        store: resolved,
+        references,
+        file_digest,
+    })
 }
 
 #[cfg(test)]
@@ -863,7 +875,7 @@ credentials:
             VALID.replace("fixture-secret-value", "fixture-secret-bbbb-0002"),
         ] {
             write_credentials(directory.path(), &document, 0o600).await;
-            let (_, references) = super::load_with_bytes(&path, uid())
+            let super::LoadedCredentials { references, .. } = super::load_with_bytes(&path, uid())
                 .await
                 .expect("typed file boots");
             let mut snapshot = crate::config::ConfigSnapshot::default();

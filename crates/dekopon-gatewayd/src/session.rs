@@ -544,7 +544,15 @@ impl SessionAdmission {
         self.cancellation.clone()
     }
 
-    pub(crate) fn next_or_release(mut self) -> Option<(Self, FollowUp)> {
+    #[cfg(test)]
+    pub(crate) fn next_or_release(self) -> Option<(Self, FollowUp)> {
+        self.next_or_release_resolving(|_, queued| Some(queued.clone()))
+    }
+
+    pub(crate) fn next_or_release_resolving(
+        mut self,
+        resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute>,
+    ) -> Option<(Self, FollowUp)> {
         let next = {
             let mut entries = self.in_flight.lock();
             let Some(Holder::Session(running)) = entries.get_mut(&self.key) else {
@@ -591,7 +599,13 @@ impl SessionAdmission {
                     message,
                 });
             }
-            if let Some(next) = running.follow_ups.pop_front() {
+            let mut found = None;
+            while let Some(mut next) = running.follow_ups.pop_front() {
+                let Some(route) = resolve(&next.message, &next.route) else {
+                    next.receipts.finish("route-lost");
+                    continue;
+                };
+                next.route = route;
                 running.subject = next.message.subject.clone();
                 running.cancellation = SessionCancellation::new();
                 running.steering = next.route.steering;
@@ -599,11 +613,13 @@ impl SessionAdmission {
                 running.received_at = next.message.received_at;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
-                Some(next)
-            } else {
-                entries.remove(&self.key);
-                None
+                found = Some(next);
+                break;
             }
+            if found.is_none() {
+                entries.remove(&self.key);
+            }
+            found
         };
         next.map(|next| (self, next))
     }
@@ -1200,11 +1216,24 @@ fn message_span(
     span
 }
 
+#[cfg(test)]
 pub(crate) fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
+) -> impl std::future::Future<Output = ()> + Send {
+    run_session_resolving(runner, route, message, driver, |_, queued| {
+        Some(queued.clone())
+    })
+}
+
+pub(crate) fn run_session_resolving(
+    runner: Arc<SessionRunner>,
+    route: BoundRoute,
+    message: InboundMessage,
+    driver: Arc<dyn ChatDriver>,
+    resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
     let receipts = Dispositions(message.constituents.clone());
     async move {
@@ -1212,7 +1241,9 @@ pub(crate) fn run_session(
         let mut admission = execute(&runner, &route, message, &driver, receipts)
             .instrument(span)
             .await;
-        while let Some((next, followup)) = admission.and_then(SessionAdmission::next_or_release) {
+        while let Some((next, followup)) =
+            admission.and_then(|admission| admission.next_or_release_resolving(&resolve))
+        {
             let span = message_span(&followup.route, &followup.message, &followup.receipts);
             admission = Some(
                 run_admitted(

@@ -1411,7 +1411,9 @@ fn split_indicators(
     )
 }
 
-fn merged_mapping(snapshot: &SourceSnapshot) -> Result<serde_yaml::Mapping, ConfigError> {
+pub(crate) fn merged_mapping(
+    snapshot: &SourceSnapshot,
+) -> Result<serde_yaml::Mapping, ConfigError> {
     let parsed = snapshot
         .0
         .iter()

@@ -277,6 +277,78 @@ fn leftover_steers_never_become_another_subjects_input() {
 }
 
 #[test]
+fn running_turn_keeps_its_old_steering_after_route_publication() {
+    let gate = SessionGate::new(1);
+    let mut old = route(model_config());
+    old.steering = Steering::Boundary;
+    let admission = held(&gate, &old);
+    let mut new_route = old.clone();
+    new_route.steering = Steering::Abort;
+    assert!(matches!(
+        admit(&gate, &new_route, message("steer")),
+        Admit::Steered(_)
+    ));
+    assert!(
+        !*admission.cancellation().model_watch().borrow(),
+        "the old turn keeps boundary steering"
+    );
+    let key = (message("").transport, message("").conversation.key());
+    assert_eq!(gate.take_steers(&key)[0].text, "steer");
+}
+
+#[test]
+fn dequeued_speaker_uses_the_current_route_and_not_the_queued_route() {
+    let gate = SessionGate::new(1);
+    let old = route(model_config());
+    let admission = held(&gate, &old);
+    assert!(matches!(
+        admit(&gate, &old, message_from("tel.999", "next")),
+        Admit::Queued
+    ));
+    let mut changed = old.clone();
+    changed.steering = Steering::Abort;
+    changed.route_index += 1;
+    let (admission, followup) = admission
+        .next_or_release_resolving(|_, _queued| Some(changed.clone()))
+        .expect("queued turn is admitted under the new route");
+    assert_eq!(followup.route.route_index, changed.route_index);
+    assert_eq!(followup.route.steering, Steering::Abort);
+    assert!(matches!(
+        admit(&gate, &changed, message_from("tel.999", "steer")),
+        Admit::Steered(_)
+    ));
+    assert!(*admission.cancellation().model_watch().borrow());
+}
+
+#[test]
+fn a_deleted_queued_route_disposes_its_receipt_without_starting_a_turn() {
+    let (capture, _guard) = capture_spans();
+    let gate = SessionGate::new(1);
+    let old = route(model_config());
+    let admission = held(&gate, &old);
+    let mut queued = message_from("tel.999", "orphan");
+    queued.constituents.push(queued.receive_span.clone());
+    assert!(matches!(admit(&gate, &old, queued), Admit::Queued));
+    assert!(
+        admission
+            .next_or_release_resolving(|_, _queued| None)
+            .is_none()
+    );
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_input_disposition"),
+                    ("outcome", "route-lost")
+                ]
+            )
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn folded_leftover_steers_carry_every_grouped_message_id() {
     let gate = SessionGate::new(1);
     let route = route(model_config());
