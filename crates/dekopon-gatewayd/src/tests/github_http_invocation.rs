@@ -8,10 +8,6 @@ use dekopon_test_support::{BrokerFixture, CaptureLayer};
 use tracing_subscriber::prelude::*;
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one signed ingress fixture crosses route, admission, broker and model boundaries"
-)]
 async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_turn() {
     let directory = temporary();
     fs::write(
