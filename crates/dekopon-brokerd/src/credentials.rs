@@ -553,12 +553,8 @@ fn open_auth_file(
 
 #[cfg(unix)]
 fn safe_chatgpt_diagnostic(error: &ChatGptError) -> String {
-    if let ChatGptError::ParseAuth { source, .. } = error {
-        format!(
-            "invalid JSON at line {}, column {}",
-            source.line(),
-            source.column()
-        )
+    if let ChatGptError::ParseAuth { line, column, .. } = error {
+        format!("invalid JSON at line {line}, column {column}")
     } else {
         "credential status unavailable".to_owned()
     }

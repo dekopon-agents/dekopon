@@ -50,33 +50,6 @@ fn write_output(output: &str) -> io::Result<()> {
 }
 
 fn report_error(error: &AppError, verbosity: u8) {
-    // Serde's derived Display and Debug can reflect arbitrary credential values, so this typed
-    // failure is matched and projected out before any part of its error tree is formatted.
-    if let AppError::Auth(AuthError::ChatGpt(dekopon_model::chatgpt::ChatGptError::ParseAuth {
-        path,
-        source,
-    })) = error
-    {
-        eprintln!(
-            "error: could not parse ChatGPT credentials at {}",
-            path.display()
-        );
-        if verbosity > 0 {
-            eprintln!(
-                "  caused by: credential JSON {:?} at line {} column {}",
-                source.classify(),
-                source.line(),
-                source.column()
-            );
-            if let Some(kind) = source.io_error_kind() {
-                eprintln!("  I/O kind: {kind:?}");
-            }
-        }
-        if verbosity > 1 {
-            eprintln!("  debug: ChatGpt::ParseAuth (credential values withheld)");
-        }
-        return;
-    }
     eprintln!("error: {error}");
 
     if verbosity > 0 {
