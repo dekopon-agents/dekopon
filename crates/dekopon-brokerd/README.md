@@ -989,7 +989,7 @@ python:
       scope: agent
       namespace: turso
   capabilities:
-    python.eval: {}
+    python.sqlite-eval: {}
 ```
 
 Absent, the namespace is the invoking provider, so existing configuration keeps its directory.
