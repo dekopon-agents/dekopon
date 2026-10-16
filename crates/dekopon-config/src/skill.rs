@@ -808,6 +808,15 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_refuses_an_atomic_writer_layout_on_a_writable_mount() {
+        let (_root, entry) = atomic_writer_mount();
+        assert!(matches!(
+            load_skill(&entry),
+            Err(SkillError::InsecureProjection { path }) if path == entry
+        ));
+    }
+
+    #[test]
     fn a_projection_owned_by_another_uid_is_refused() {
         let (_root, entry) = atomic_writer_mount();
         let foreign = uid().wrapping_add(1);
