@@ -17,7 +17,7 @@ use tracing::Instrument as _;
 
 use crate::{
     Candidate, GatewaydError, ServeOutcome, cancel_session,
-    collection::{self, CollectionRoute as _},
+    collection::{self, RouteIdentity},
     config::{self, GithubEvent},
     follow, jobs, observe_session,
     routes::RoutingTable,
@@ -435,7 +435,7 @@ impl Gateway {
                     for (identity, message) in collector.take_due_routed(tokio::time::Instant::now()) {
                         let generation = self.active.load();
                         let enqueued = generation.routes.route(&message)
-                            .is_some_and(|route| route.identity(&message) == identity);
+                            .is_some_and(|route| RouteIdentity::of(route, &message) == identity);
                         if enqueued {
                             self.start_session(&mut sessions, &generation, message);
                         } else {
@@ -678,7 +678,7 @@ impl Gateway {
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
             && !inherited_thread
-            && !collector.is_native_continuation(route, &message)
+            && !collector.is_native_continuation(&RouteIdentity::of(route, &message), &message)
         {
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -712,7 +712,7 @@ impl Gateway {
             );
             return;
         }
-        match collector.offer(route, message) {
+        match collector.offer(RouteIdentity::of(route, &message), message) {
             collection::Offered::Pending => {}
             collection::Offered::Immediate(message) => {
                 self.start_session(sessions, &generation, message);
@@ -766,7 +766,7 @@ impl Gateway {
                 let generation = active.load();
                 let route = generation.routes.route(message)?;
                 (message.constituents.is_empty()
-                    || route.identity(message) == queued.identity(message))
+                    || RouteIdentity::of(route, message) == RouteIdentity::of(queued, message))
                 .then(|| (route.clone(), generation._digest.clone()))
             },
         ));

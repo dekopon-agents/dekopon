@@ -34,38 +34,16 @@ struct Batch {
 }
 
 #[derive(Clone, PartialEq)]
-pub(crate) enum RouteIdentity {
-    Bound(String),
-    #[cfg(test)]
-    Index(usize),
-}
+pub(crate) struct RouteIdentity(String);
 
-pub(crate) trait CollectionRoute {
-    fn identity(&self, message: &InboundMessage) -> RouteIdentity;
-}
-
-impl CollectionRoute for &BoundRoute {
-    fn identity(&self, message: &InboundMessage) -> RouteIdentity {
-        RouteIdentity::Bound(follow::follow_key(
-            &self.transport,
-            self.agent.as_str(),
-            &self.conversation,
+impl RouteIdentity {
+    pub(crate) fn of(route: &BoundRoute, message: &InboundMessage) -> Self {
+        Self(follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
             &message.conversation.key(),
         ))
-    }
-}
-
-#[cfg(test)]
-impl CollectionRoute for RouteIdentity {
-    fn identity(&self, _message: &InboundMessage) -> RouteIdentity {
-        self.clone()
-    }
-}
-
-#[cfg(test)]
-impl CollectionRoute for usize {
-    fn identity(&self, _message: &InboundMessage) -> RouteIdentity {
-        RouteIdentity::Index(*self)
     }
 }
 
@@ -111,14 +89,13 @@ impl Collector {
 
     pub(crate) fn is_native_continuation(
         &self,
-        route: impl CollectionRoute,
+        route: &RouteIdentity,
         message: &InboundMessage,
     ) -> bool {
-        let route = route.identity(message);
         message.transport_kind == ChatTransportKind::Telegram
             && message.native_group.is_some()
             && self.pending.iter().any(|batch| {
-                batch.route == route
+                batch.route == *route
                     && batch.deadline > Instant::now()
                     && compatible(&batch.members[0], message)
                     && batch.members[0].native_group == message.native_group
@@ -129,12 +106,7 @@ impl Collector {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    pub(crate) fn offer(
-        &mut self,
-        route: impl CollectionRoute,
-        message: InboundMessage,
-    ) -> Offered {
-        let route = route.identity(&message);
+    pub(crate) fn offer(&mut self, route: RouteIdentity, message: InboundMessage) -> Offered {
         if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_CONVERSATION {
             message.receive_span.in_scope(|| record_received(&message));
             return Offered::Refused(message, "input-limit");
@@ -357,13 +329,22 @@ pub(crate) fn disposition(receipt: &tracing::Span, outcome: &'static str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         asset::PendingAsset,
         transport::{MessageId, receive_span},
     };
     use dekopon_broker_protocol::{Conversation, ConversationKind};
+
+    pub(crate) fn route(agent: &str) -> RouteIdentity {
+        RouteIdentity(follow::follow_key(
+            "wa",
+            agent,
+            &serde_yaml::from_str("kind: [directMessage]").unwrap(),
+            &message(0, "").conversation.key(),
+        ))
+    }
 
     fn message(photos: usize, text: &str) -> InboundMessage {
         InboundMessage {
@@ -403,14 +384,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn collection_reorder_joins_the_same_agent_without_reassigning_another_agent() {
         let mut collector = collector(30, 3);
-        let route = |agent: &str| {
-            RouteIdentity::Bound(follow::follow_key(
-                "wa",
-                agent,
-                &serde_yaml::from_str("kind: [directMessage]").unwrap(),
-                &message(1, "").conversation.key(),
-            ))
-        };
         assert!(matches!(
             collector.offer(route("first"), message(1, "one")),
             Offered::Pending
@@ -450,23 +423,23 @@ mod tests {
         for millis in [3000, 900] {
             let mut collector = collector(millis, 4);
             assert!(matches!(
-                collector.offer(0, message(0, "text first")),
+                collector.offer(route("a"), message(0, "text first")),
                 Offered::Immediate(_)
             ));
             let start = Instant::now();
             assert!(matches!(
-                collector.offer(0, message(1, "caption")),
+                collector.offer(route("a"), message(1, "caption")),
                 Offered::Pending
             ));
             tokio::time::advance(Duration::from_millis(millis - 1)).await;
             for _ in 0..2 {
                 assert!(matches!(
-                    collector.offer(0, message(1, "")),
+                    collector.offer(route("a"), message(1, "")),
                     Offered::Pending
                 ));
             }
             assert!(matches!(
-                collector.offer(0, message(0, "edit these")),
+                collector.offer(route("a"), message(0, "edit these")),
                 Offered::Pending
             ));
             assert_eq!(
@@ -492,14 +465,14 @@ mod tests {
             collector.windows.get_mut("wa").unwrap().max_wait = Duration::from_millis(maximum);
             let start = Instant::now();
             assert!(matches!(
-                collector.offer(0, message(1, "")),
+                collector.offer(route("a"), message(1, "")),
                 Offered::Pending
             ));
             for _ in 0..3 {
                 tokio::time::advance(Duration::from_millis(quiet - 1)).await;
                 assert!(collector.take_due(Instant::now()).is_empty());
                 assert!(matches!(
-                    collector.offer(0, message(1, "")),
+                    collector.offer(route("a"), message(1, "")),
                     Offered::Pending
                 ));
                 if Instant::now() + Duration::from_millis(quiet)
@@ -529,17 +502,20 @@ mod tests {
         let mut collector = collector(5000, 4);
         let start = Instant::now();
         assert!(matches!(
-            collector.offer(0, message(32, "")),
+            collector.offer(route("a"), message(32, "")),
             Offered::Pending
         ));
         tokio::time::advance(Duration::from_secs(4)).await;
         assert!(matches!(
-            collector.offer(0, message(1, "")),
+            collector.offer(route("a"), message(1, "")),
             Offered::Refused(_, "batch-limit")
         ));
         let mut other = message(1, "");
         other.subject = "whatsapp.15557654321".parse().unwrap();
-        assert!(matches!(collector.offer(0, other), Offered::Pending));
+        assert!(matches!(
+            collector.offer(route("a"), other),
+            Offered::Pending
+        ));
         assert_eq!(collector.deadline(), Some(start + Duration::from_secs(5)));
         assert_eq!(
             collector.take_due(start + Duration::from_secs(5))[0]
@@ -554,7 +530,7 @@ mod tests {
     async fn zero_bypasses_collection_and_native_transport_policies_are_independent() {
         for millis in [0, 3000, 8000] {
             let mut collector = collector(millis, 4);
-            let result = collector.offer(0, message(1, ""));
+            let result = collector.offer(route("a"), message(1, ""));
             assert_eq!(matches!(result, Offered::Immediate(_)), millis == 0);
             for kind in [
                 ChatTransportKind::Slack,
@@ -565,7 +541,7 @@ mod tests {
                 let mut incoming = message(3, "native array");
                 incoming.transport_kind = kind;
                 assert!(
-                    matches!(collector.offer(1, incoming), Offered::Immediate(message) if message.assets.len() == 3)
+                    matches!(collector.offer(route("b"), incoming), Offered::Immediate(message) if message.assets.len() == 3)
                 );
             }
             let mut group = message(1, "caption");
@@ -573,16 +549,16 @@ mod tests {
             group.native_group = Some("album".into());
             let start = Instant::now();
             assert!(matches!(
-                collector.offer(2, group.clone()),
+                collector.offer(route("c"), group.clone()),
                 Offered::Pending
             ));
             assert!(matches!(
-                collector.offer(2, group.clone()),
+                collector.offer(route("c"), group.clone()),
                 Offered::Pending
             ));
             group.native_group = Some("other".into());
             assert!(matches!(
-                collector.offer(2, group),
+                collector.offer(route("c"), group),
                 Offered::Refused(_, "incompatible-group")
             ));
             let ready = collector.take_due(start + TELEGRAM_GROUP_WINDOW);
@@ -611,24 +587,24 @@ mod tests {
                 let mut input = message(0, &text);
                 input.transport_kind = kind;
                 assert!(matches!(
-                    collector.offer(0, input.clone()),
+                    collector.offer(route("a"), input.clone()),
                     Offered::Immediate(message) if message.text == text
                 ));
                 input.assets = message(3, "").assets;
                 if kind != ChatTransportKind::Whatsapp || millis == 0 {
                     assert!(matches!(
-                        collector.offer(0, input.clone()),
+                        collector.offer(route("a"), input.clone()),
                         Offered::Immediate(message) if message.text == text && message.assets.len() == 3
                     ));
                 } else {
                     assert!(matches!(
-                        collector.offer(0, input.clone()),
+                        collector.offer(route("a"), input.clone()),
                         Offered::Refused(_, "input-limit")
                     ));
                 }
                 input.asset_overflow = true;
                 assert!(matches!(
-                    collector.offer(0, input),
+                    collector.offer(route("a"), input),
                     Offered::Refused(_, "input-limit")
                 ));
                 assert!(collector.deadline().is_none());
@@ -636,11 +612,11 @@ mod tests {
         }
         let mut collector = collector(3000, 4);
         assert!(matches!(
-            collector.offer(0, message(1, "")),
+            collector.offer(route("a"), message(1, "")),
             Offered::Pending
         ));
         assert!(matches!(
-            collector.offer(0, message(0, &text)),
+            collector.offer(route("a"), message(0, &text)),
             Offered::Refused(_, "batch-limit")
         ));
         let ready = collector.take_due(collector.deadline().unwrap());
@@ -662,7 +638,7 @@ mod tests {
             message_thread_id: Some(45),
         };
         assert!(matches!(
-            collector.offer(0, member.clone()),
+            collector.offer(route("a"), member.clone()),
             Offered::Pending
         ));
         member.reply = ReplyTarget::Telegram {
@@ -671,15 +647,21 @@ mod tests {
             message_thread_id: Some(45),
         };
         assert!(matches!(
-            collector.offer(0, member.clone()),
+            collector.offer(route("a"), member.clone()),
             Offered::Pending
         ));
         let mut text = member.clone();
         text.assets.clear();
         text.native_group = None;
-        assert!(matches!(collector.offer(0, text), Offered::Immediate(_)));
+        assert!(matches!(
+            collector.offer(route("a"), text),
+            Offered::Immediate(_)
+        ));
         member.subject = "telegram.654321".parse().unwrap();
-        assert!(matches!(collector.offer(0, member), Offered::Pending));
+        assert!(matches!(
+            collector.offer(route("a"), member),
+            Offered::Pending
+        ));
         assert_eq!(collector.pending.len(), 2);
         assert_eq!(collector.pending[0].members.len(), 2);
     }
@@ -689,23 +671,26 @@ mod tests {
         let mut envelopes = collector(3000, 1);
         for _ in 0..8 {
             assert!(matches!(
-                envelopes.offer(0, message(1, "")),
+                envelopes.offer(route("a"), message(1, "")),
                 Offered::Pending
             ));
         }
         assert!(matches!(
-            envelopes.offer(0, message(1, "")),
+            envelopes.offer(route("a"), message(1, "")),
             Offered::Refused(_, "batch-limit")
         ));
         assert_eq!(envelopes.pending[0].members.len(), 8);
         let mut assets = collector(3000, 1);
-        assert!(matches!(assets.offer(0, message(32, "")), Offered::Pending));
         assert!(matches!(
-            assets.offer(0, message(1, "")),
+            assets.offer(route("a"), message(32, "")),
+            Offered::Pending
+        ));
+        assert!(matches!(
+            assets.offer(route("a"), message(1, "")),
             Offered::Refused(_, "batch-limit")
         ));
         assert!(matches!(
-            assets.offer(0, message(33, "")),
+            assets.offer(route("a"), message(33, "")),
             Offered::Refused(_, "input-limit")
         ));
         let mut text = collector(3000, 1);
@@ -717,13 +702,13 @@ mod tests {
             "é".repeat((MAX_INBOUND_TEXT_BYTES - overhead) / 2),
             "x".repeat((MAX_INBOUND_TEXT_BYTES - overhead) % 2)
         );
-        assert!(matches!(text.offer(0, first), Offered::Pending));
+        assert!(matches!(text.offer(route("a"), first), Offered::Pending));
         assert!(matches!(
-            text.offer(0, message(0, &exact)),
+            text.offer(route("a"), message(0, &exact)),
             Offered::Pending
         ));
         assert!(matches!(
-            text.offer(0, message(0, "x")),
+            text.offer(route("a"), message(0, "x")),
             Offered::Refused(_, "batch-limit")
         ));
         let batch = text.pending.remove(0).assemble();
@@ -736,14 +721,14 @@ mod tests {
         for axis in 0..7 {
             let mut collector = collector(3000, 8);
             assert!(matches!(
-                collector.offer(0, first.clone()),
+                collector.offer(route("a"), first.clone()),
                 Offered::Pending
             ));
             let mut other = first.clone();
-            let mut route = 0;
+            let mut agent = "a";
             match axis {
                 0 => other.subject = "whatsapp.15557654321".parse().unwrap(),
-                1 => route = 1,
+                1 => agent = "b",
                 2 => {
                     other.transport = "wa-other".into();
                     collector.windows.insert(
@@ -763,7 +748,10 @@ mod tests {
                     }
                 }
             }
-            assert!(matches!(collector.offer(route, other), Offered::Pending));
+            assert!(matches!(
+                collector.offer(route(agent), other),
+                Offered::Pending
+            ));
             assert_eq!(collector.pending.len(), 2);
         }
     }
@@ -773,11 +761,11 @@ mod tests {
         let mut collector = collector(3000, 1);
         let first = message(1, "");
         assert!(matches!(
-            collector.offer(0, first.clone()),
+            collector.offer(route("a"), first.clone()),
             Offered::Pending
         ));
         assert!(matches!(
-            collector.offer(1, first.clone()),
+            collector.offer(route("b"), first.clone()),
             Offered::Refused(_, "collection-full")
         ));
         let mut request = CancelRequest {
@@ -790,7 +778,10 @@ mod tests {
         request.subject = first.subject.canonical();
         assert!(collector.cancel(&request));
         assert_eq!(collector.deadline(), None);
-        assert!(matches!(collector.offer(0, first), Offered::Pending));
+        assert!(matches!(
+            collector.offer(route("a"), first),
+            Offered::Pending
+        ));
         collector.shutdown();
         assert!(
             collector

@@ -186,7 +186,10 @@ async fn six_staggered_signed_photos_form_one_lazy_batch_after_the_quiet_interva
         let mut delivery = receiver.try_recv().unwrap();
         let message = delivery.messages.pop_front().unwrap();
         assert_eq!(message.assets[0].size, None);
-        assert!(matches!(collector.offer(0, message), Offered::Pending));
+        assert!(matches!(
+            collector.offer(crate::collection::tests::route("a"), message),
+            Offered::Pending
+        ));
     }
     let deadline = start + Duration::from_millis(9320);
     assert_eq!(collector.deadline(), Some(deadline));

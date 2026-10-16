@@ -16411,7 +16411,7 @@ fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_five_seconds() {
         let mut collector = burst_collector(configured);
         let photo = burst_photo("");
         let start = photo.received_at;
-        let result = collector.offer(0, photo);
+        let result = collector.offer(crate::collection::tests::route("a"), photo);
         if expected == 0 {
             assert!(matches!(result, Offered::Immediate(_)));
             assert!(collector.deadline().is_none());
@@ -16458,14 +16458,14 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
         let mut photo = burst_photo(caption);
         photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
         assert!(matches!(
-            collector.offer(0, photo),
+            collector.offer(crate::collection::tests::route("a"), photo),
             crate::collection::Offered::Pending
         ));
     }
     let mut prompt = burst_photo("edit these three together");
     prompt.assets.clear();
     assert!(matches!(
-        collector.offer(0, prompt),
+        collector.offer(crate::collection::tests::route("a"), prompt),
         crate::collection::Offered::Pending
     ));
     assert_eq!(models.requests(), 0);
@@ -16522,7 +16522,7 @@ async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refus
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut collector = burst_collector(None);
     assert!(matches!(
-        collector.offer(0, burst_photo("edit")),
+        collector.offer(crate::collection::tests::route("a"), burst_photo("edit")),
         crate::collection::Offered::Pending
     ));
     assert!(observed.try_recv().is_err());
@@ -16800,7 +16800,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         slack.connect().await.unwrap();
         let message = next_message(&mut slack).await;
         let mut collector = burst_collector(None);
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Slack native array was split or queued"),
@@ -16831,7 +16831,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         .unwrap();
         discord.connect().await.unwrap();
         let message = next_message(&mut discord).await;
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Discord native array was split or queued"),
@@ -16904,8 +16904,16 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         lead,
     );
     assert!(collector.deadline().is_some());
+    let route = routes.route(&member).expect("bound topic route").clone();
+    let identity = |message: &InboundMessage| crate::collection::RouteIdentity::of(&route, message);
+    assert!(collector.is_native_continuation(&identity(&member), &member));
+    let mut other = route.clone();
+    other.agent = "other".parse().unwrap();
     assert!(
-        !collector.is_native_continuation(1, &member),
+        !collector.is_native_continuation(
+            &crate::collection::RouteIdentity::of(&other, &member),
+            &member
+        ),
         "different bound route"
     );
     for axis in 0..3 {
@@ -16915,7 +16923,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             1 => outsider.native_group = Some("other-group".into()),
             _ => outsider.conversation.thread = Some("43".into()),
         }
-        assert!(!collector.is_native_continuation(0, &outsider));
+        assert!(!collector.is_native_continuation(&identity(&outsider), &outsider));
         crate::dispatch(
             &runner,
             &routes,
@@ -16961,7 +16969,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         }
     );
     assert!(
-        !collector.is_native_continuation(0, &member),
+        !collector.is_native_continuation(&identity(&member), &member),
         "sealed group cannot lend addressing"
     );
 }
