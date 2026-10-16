@@ -32,37 +32,35 @@ impl JournalMemoryTools<'_> {
                     && rep.routine_id == id
                     && self.versions.get(id) == Some(&rep.version)
             })
+            && (line.user.is_some() || !line.exchanges.is_empty())
         {
-            if line.user.is_some() || !line.exchanges.is_empty() {
-                let mut text = line.user.clone().unwrap_or_default();
-                if let Some(answer) = &line.answer {
-                    text.push('\n');
-                    text.push_str(answer);
-                }
-                for exchange in &line.exchanges {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&format!(
-                        "[tool: {}, outcome: {}, exit: {:?}]",
-                        exchange.tool, exchange.outcome, exchange.exit_status
-                    ));
-                    for (label, parts) in
-                        [("request", &exchange.request), ("result", &exchange.result)]
-                    {
-                        if let Some(part) = parts.iter().find(|rep| {
-                            rep.kind == "original"
-                                && rep.routine_id == id
-                                && self.versions.get(id) == Some(&rep.version)
-                                && rep.text.is_some()
-                        }) {
-                            text.push_str(&format!("\n[{label}] "));
-                            text.push_str(part.text.as_deref().unwrap_or_default());
-                        }
-                    }
-                }
-                return Some(Cow::Owned(text));
+            let mut text = line.user.clone().unwrap_or_default();
+            if let Some(answer) = &line.answer {
+                text.push('\n');
+                text.push_str(answer);
             }
+            for exchange in &line.exchanges {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!(
+                    "[tool: {}, outcome: {}, exit: {:?}]",
+                    exchange.tool, exchange.outcome, exchange.exit_status
+                ));
+                for (label, parts) in [("request", &exchange.request), ("result", &exchange.result)]
+                {
+                    if let Some(part) = parts.iter().find(|rep| {
+                        rep.kind == "original"
+                            && rep.routine_id == id
+                            && self.versions.get(id) == Some(&rep.version)
+                            && rep.text.is_some()
+                    }) {
+                        text.push_str(&format!("\n[{label}] "));
+                        text.push_str(part.text.as_deref().unwrap_or_default());
+                    }
+                }
+            }
+            return Some(Cow::Owned(text));
         }
         line.representations
             .iter()
