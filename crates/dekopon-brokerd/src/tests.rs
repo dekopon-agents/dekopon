@@ -2098,6 +2098,75 @@ async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_
 }
 
 #[tokio::test]
+async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let record = broker
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("record.json");
+    write_owner_only(&record, b"{\"state\":");
+    let bindings = broker.directory.path().join("bindings.yaml");
+    let map = |revision: &str| {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:com.xrl:secret:test:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            record.display()
+        )
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    write_owner_only(&bindings, map("one").as_bytes());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let reported = || {
+        capture
+            .events_where(
+                "dekopon_brokerd",
+                &[("event", "broker_credential_record_invalid")],
+            )
+            .len()
+    };
+    async {
+        let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert_eq!(reported(), 1, "boot reports the record");
+        let owner = super::Coordination::new(broker.config(), active.unwrap());
+        let digest = owner.active().digest.clone();
+        let uid = current_uid();
+        for _ in 0..2 {
+            assert_eq!(
+                owner.prepare(&digest, uid).await,
+                (digest.clone(), GenerationOutcome::Active)
+            );
+        }
+        assert_eq!(reported(), 1, "an unchanged poll does not inspect");
+        write_owner_only(&bindings, map("two").as_bytes());
+        let (next, outcome) = owner.prepare(&digest, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&next, uid).await,
+            (next.clone(), GenerationOutcome::Active)
+        );
+        assert_eq!(reported(), 2, "a committed change reports once");
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+}
+
+#[tokio::test]
 async fn unchanged_poll_reads_the_private_file_once_before_answering_active() {
     use dekopon_broker_protocol::GenerationOutcome;
 

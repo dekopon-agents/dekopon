@@ -231,7 +231,7 @@ async fn a_malformed_scheduled_record_is_not_reported_on_each_tick() {
 }
 
 #[tokio::test]
-async fn loaded_map_inspects_all_sealed_and_malformed_records_without_http() {
+async fn inspecting_a_loaded_map_reports_all_sealed_and_malformed_records_without_http() {
     let dir = tempfile::tempdir().unwrap();
     let api = TokenApi::serving(|_| success());
     let sentinel = "malformed-record-private-sentinel";
@@ -258,10 +258,16 @@ async fn loaded_map_inspects_all_sealed_and_malformed_records_without_http() {
     fs::set_permissions(&map_path, fs::Permissions::from_mode(0o600)).unwrap();
     let capture = CaptureLayer::new();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
-    let catalog = super::super::super::load(&map_path, rustix::process::geteuid().as_raw())
-        .with_subscriber(subscriber)
-        .await
-        .expect("load valid map with unavailable records");
+    let catalog = async {
+        let (catalog, _, scheduled) =
+            super::super::super::load_with_bytes(&map_path, rustix::process::geteuid().as_raw())
+                .await
+                .expect("load valid map with unavailable records");
+        scheduled.inspect_records().await;
+        catalog
+    }
+    .with_subscriber(subscriber)
+    .await;
     assert_eq!(catalog.drns().count(), 3);
     for name in ["one", "two"] {
         assert_eq!(

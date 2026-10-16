@@ -339,26 +339,30 @@ impl Coordination {
             );
             return (active.digest.clone(), GenerationOutcome::Refused);
         };
-        let mut state = self.state.lock();
-        if !Arc::ptr_eq(&state.active, &active)
-            || !state.owned_by(uid)
-            || state
-                .prepared
-                .as_ref()
-                .is_some_and(|(owner, _, _)| *owner != uid)
-        {
-            return (state.active.digest.clone(), GenerationOutcome::Refused);
-        }
-        if next.digest == state.active.digest
-            && next.fingerprint.is_some()
-            && next.fingerprint == state.active.fingerprint
-        {
-            state.prepared = None;
-            return (next.digest.clone(), GenerationOutcome::Active);
-        }
-        let digest = next.digest.clone();
-        state.prepared = Some((uid, active, Arc::new(next)));
-        (digest, GenerationOutcome::Prepared)
+        let next = {
+            let mut state = self.state.lock();
+            if !Arc::ptr_eq(&state.active, &active)
+                || !state.owned_by(uid)
+                || state
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(owner, _, _)| *owner != uid)
+            {
+                return (state.active.digest.clone(), GenerationOutcome::Refused);
+            }
+            if next.digest == state.active.digest
+                && next.fingerprint.is_some()
+                && next.fingerprint == state.active.fingerprint
+            {
+                state.prepared = None;
+                return (next.digest.clone(), GenerationOutcome::Active);
+            }
+            let next = Arc::new(next);
+            state.prepared = Some((uid, active, Arc::clone(&next)));
+            next
+        };
+        next.ready.scheduled.inspect_records().await;
+        (next.digest.clone(), GenerationOutcome::Prepared)
     }
 
     fn commit(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
@@ -586,6 +590,9 @@ async fn boot_runtime(
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
     let private = private_inputs(config, uid, problems).await;
+    if let Some(private) = &private {
+        private.scheduled.inspect_records().await;
+    }
     let storage = keep(
         problems,
         config
