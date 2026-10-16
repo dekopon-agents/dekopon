@@ -640,6 +640,11 @@ async fn reload_runtime(
     })
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static AFTER_PRIVATE_READ: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
 async fn private_inputs(
     config: &mut ResolvedConfig,
     uid: u32,
@@ -696,6 +701,8 @@ async fn private_inputs(
         ),
         None => Some((dekopon_broker::SecretCatalog::empty(), None)),
     };
+    #[cfg(test)]
+    let _ = AFTER_PRIVATE_READ.try_with(|hook| hook());
     if let (Some((_, credential_bytes)), Some((_, secret_map_bytes))) = (&credentials, &secrets)
         && let Err(error) = config
             .snapshot

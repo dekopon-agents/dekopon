@@ -1860,6 +1860,10 @@ struct ResidentFixture {
 
 impl ResidentFixture {
     async fn boot() -> Self {
+        Self::boot_with(|_, _| {}).await
+    }
+
+    async fn boot_with(configure: impl FnOnce(&Path, &mut serde_json::Value)) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.path().join("broker.yaml");
@@ -1880,6 +1884,7 @@ impl ResidentFixture {
         storage["rootPath"] = json!("provider-storage");
         document["storage"] = storage;
         document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 1_048_576});
+        configure(root.path(), &mut document);
         write_config(&path, &document);
         let (active, report) = super::load_candidate(&path, super::Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
@@ -1954,6 +1959,180 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
     assert_eq!(
         applied[0].field("generation.digest"),
         Some(next_digest.as_str())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reaper_sweeps_with_the_committed_generation_retention() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
+    use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest};
+    use tokio::sync::oneshot;
+
+    let mut fixture = ResidentFixture::boot_with(|root, document| {
+        write_owner_only(
+            &root.join("storage-probe.wasm"),
+            &fs::read(example_path(
+                "examples/providers/storage-probe-provider.wasm",
+            ))
+            .unwrap(),
+        );
+        document["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("storage-probe.wasm"));
+        document["capabilities"]["storage-probe"] = json!({
+            "constraints": {
+                "timeoutMs": 30_000,
+                "storage": {"interface": "durable-files", "access": "read-write", "scope": "agent"}
+            },
+            "capabilities": {"storage-probe.run": {}}
+        });
+    })
+    .await;
+    let host = fixture.active.storage.as_ref().unwrap().clone();
+    let request = StorageGrantRequest::new(
+        "reaper-invocation".parse().unwrap(),
+        "storage-probe.run".parse().unwrap(),
+        "storage-probe".parse().unwrap(),
+        StorageInterface::DurableFiles,
+        StorageAccess::ReadWrite,
+        StorageScope::Agent,
+        "chat-agent".parse().unwrap(),
+        dekopon_core::ExternalSubject::slack("T123", "U123").unwrap(),
+        "slack",
+        "work",
+        "c123",
+        "c123:123.456",
+        ContinuityPolicy::Stable,
+        vec![],
+    );
+    drop(host.grant(request).unwrap());
+    let namespace = fixture.root.path().join("provider-storage/namespaces");
+    let resource = fs::read_dir(&namespace)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::File::options()
+        .write(true)
+        .open(resource.join("last-used"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    let owner = std::sync::Arc::new(super::Coordination::new(
+        fixture.path.clone(),
+        fixture.active,
+    ));
+    let old = owner.active().digest.clone();
+    let (stop, stopped) = oneshot::channel();
+    let (first, sampled) = oneshot::channel();
+    let first = std::sync::Mutex::new(Some(first));
+    let reaper_owner = std::sync::Arc::clone(&owner);
+    let task = tokio::spawn(super::reaper::serve(
+        async {
+            stopped.await.unwrap();
+            Ok(())
+        },
+        Some(host),
+        move || {
+            if let Some(first) = first.lock().unwrap().take() {
+                let _ = first.send(());
+            }
+            reaper_owner
+                .active()
+                .ready
+                .broker
+                .storage_retention_policies()
+        },
+        super::ShutdownDeadline::default(),
+    ));
+    sampled.await.unwrap();
+    assert!(resource.exists(), "boot retention keeps expired storage");
+    fixture.document["capabilities"]["storage-probe"]["constraints"]["storage"]["retention"] =
+        json!({"mode": "idle-ttl", "idleTtlMs": 60_000});
+    write_config(&fixture.path, &fixture.document);
+    let (next, outcome) = owner.prepare(&old, current_uid()).await;
+    assert_eq!(outcome, GenerationOutcome::Prepared);
+    assert_eq!(
+        owner.commit(&next, current_uid()),
+        GenerationOutcome::Applied
+    );
+    tokio::time::advance(std::time::Duration::from_secs(12 * 60 * 60)).await;
+    for _ in 0..10_000 {
+        if !resource.exists() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !resource.exists(),
+        "the next sweep must use the committed retention"
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credentials = broker.directory.path().join("credentials.yaml");
+    let bindings = broker.directory.path().join("bindings.yaml");
+    let secret = broker.directory.path().join("token");
+    write_owner_only(&secret, b"fixture-token");
+    let credential = |host: &str| {
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [{host}]\n    secret: fixture-value-long-enough\n"
+        )
+    };
+    let map = |host: &str| {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [{host}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            secret.display()
+        )
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test", "b.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    write_owner_only(&credentials, credential("a.example.test").as_bytes());
+    write_owner_only(&bindings, map("a.example.test").as_bytes());
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let owner = super::Coordination::new(broker.config(), active.unwrap());
+    let old = owner.active().digest.clone();
+    write_owner_only(&credentials, credential("b.example.test").as_bytes());
+    write_owner_only(&bindings, map("b.example.test").as_bytes());
+    let uid = current_uid();
+    let (digest, outcome) = owner.prepare(&old, uid).await;
+    assert_eq!(outcome, GenerationOutcome::Prepared);
+    assert_ne!(digest, old);
+    assert_eq!(owner.abort(&digest, uid), GenerationOutcome::Aborted);
+    let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        write_owner_only(&credentials, b"not-a-credential-map");
+        write_owner_only(&bindings, b"not-a-secret-map");
+    });
+    let (prepared, outcome) = super::AFTER_PRIVATE_READ
+        .scope(hook, owner.prepare(&old, uid))
+        .await;
+    assert_eq!(
+        (prepared.clone(), outcome),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(owner.commit(&prepared, uid), GenerationOutcome::Applied);
+    assert_eq!(owner.active().digest, digest);
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest, GenerationOutcome::Refused)
     );
 }
 
