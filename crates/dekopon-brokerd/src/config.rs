@@ -511,7 +511,7 @@ impl ConfigSnapshot {
             .collect::<BTreeMap<_, _>>();
         let canonical = sources
             .into_iter()
-            .map(|(key, value)| Ok((key, serde_json::to_value(value)?)))
+            .map(|(key, value)| Ok((key, canonical_value(value)?)))
             .collect::<Result<BTreeMap<_, serde_json::Value>, serde_json::Error>>()?;
         let encoded = serde_json::to_vec(&canonical)?;
         Ok(Sha256::digest(encoded)
@@ -556,6 +556,33 @@ impl ConfigSnapshot {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+fn canonical_value(value: &serde_yaml::Value) -> Result<serde_json::Value, serde_json::Error> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let fields = mapping
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or(serde_json::to_string(key)?),
+                        canonical_value(value)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+            serde_json::to_value(fields)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            let values = values
+                .iter()
+                .map(canonical_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            serde_json::to_value(values)
+        }
+        _ => serde_json::to_value(value),
     }
 }
 
