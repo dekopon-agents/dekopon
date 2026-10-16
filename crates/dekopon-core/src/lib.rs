@@ -35,7 +35,7 @@ use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, bounded_display};
-pub use diagnostics::error_chain;
+pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};

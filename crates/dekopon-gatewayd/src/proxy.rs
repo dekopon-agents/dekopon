@@ -57,10 +57,10 @@ pub struct GuestConfig {
 
 #[derive(Debug, Error)]
 pub enum ProxyProblem {
-    #[error("proxy guest {subject:?} names agent {agent:?}, which no route serves")]
-    UnknownAgent { subject: String, agent: String },
-    #[error("proxy guest {subject:?} names unknown model {model:?}")]
-    UnknownModel { subject: String, model: String },
+    #[error("proxy guest {subject:?} names an agent which no route serves")]
+    UnknownAgent { subject: String },
+    #[error("proxy guest {subject:?} models[{position}] names an unknown model")]
+    UnknownModel { subject: String, position: usize },
     #[error(
         "proxy guest {subject:?} names model {model:?}, whose kind openaiCompatible the proxy cannot serve"
     )]
@@ -119,14 +119,13 @@ pub(crate) fn resolve(
         if agent.is_none() {
             problems.push(ProxyProblem::UnknownAgent {
                 subject: subject.clone(),
-                agent: guest.agent.clone(),
             });
         }
-        for name in &guest.models {
+        for (position, name) in guest.models.iter().enumerate() {
             match models.iter().find(|model| model.name() == name) {
                 None => problems.push(ProxyProblem::UnknownModel {
                     subject: subject.clone(),
-                    model: name.clone(),
+                    position,
                 }),
                 Some(ModelConfig::OpenaiCompatible { .. }) => {
                     problems.push(ProxyProblem::UnservableModel {
@@ -443,8 +442,8 @@ mod tests {
         };
         let rendered = problems.iter().map(ToString::to_string).collect::<Vec<_>>();
         for expected in [
-            "names agent \"ghost\"",
-            "unknown model \"nope\"",
+            "names an agent which no route serves",
+            "models[0] names an unknown model",
             "model \"local\", whose kind openaiCompatible",
             "TLS files are unusable",
             "served only through the guest model proxy",

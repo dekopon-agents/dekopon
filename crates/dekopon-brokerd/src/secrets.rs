@@ -15,7 +15,7 @@ use dekopon_broker::{
     BrokerBuildError, MAX_SECRET_BINDINGS, SecretCatalog, SecretMaterial, SecretResolutionError,
     SecretResolver, SecretUseBinding,
 };
-use dekopon_capability::HttpPathRule;
+use dekopon_capability::{HttpPathRule, SecretUseGrantError};
 use dekopon_core::{
     CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind,
     read_trusted_file,
@@ -1587,7 +1587,7 @@ async fn validate_map(
         {
             problems.push(format!("{} uses an invalid RFC 6901 pointer", entry.drn));
         }
-        for binding in entry.bindings {
+        for (position, binding) in entry.bindings.into_iter().enumerate() {
             let resolved = SecretUseBinding {
                 binding_id: binding.id,
                 secret: entry.drn.clone(),
@@ -1602,8 +1602,9 @@ async fn validate_map(
             };
             if !binding_ids.insert(resolved.binding_id.clone()) {
                 problems.push(format!(
-                    "duplicate secret binding identifier {:?}",
-                    resolved.binding_id
+                    "{} binding #{} repeats an earlier binding identifier",
+                    resolved.secret,
+                    position + 1
                 ));
             }
             if !binding_keys.insert((
@@ -1618,9 +1619,16 @@ async fn validate_map(
                 ));
             }
             if let Err(error) = resolved.validate() {
+                let reason = match error {
+                    SecretUseGrantError::InvalidPath { .. } => {
+                        "secret path is not canonical".to_owned()
+                    }
+                    other => other.to_string(),
+                };
                 problems.push(format!(
-                    "secret binding {:?} is invalid: {error}",
-                    resolved.binding_id
+                    "{} binding #{} is invalid: {reason}",
+                    resolved.secret,
+                    position + 1
                 ));
             }
             bindings.push(resolved);

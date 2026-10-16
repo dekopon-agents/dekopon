@@ -1247,6 +1247,56 @@ fn scan_gateway_directory(
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SourceSnapshot(pub(crate) BTreeMap<PathBuf, Vec<u8>>);
 
+/// In memory only, never logged or published: it covers source bytes and exists to tell one raw
+/// candidate from another.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct RawCandidate([u8; 32]);
+
+impl std::fmt::Debug for RawCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RawCandidate")
+    }
+}
+
+impl RawCandidate {
+    pub(crate) fn of(
+        config: Result<&SourceSnapshot, &ConfigError>,
+        catalog: Option<Result<&SourceSnapshot, &ConfigError>>,
+    ) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        for source in [Some(config), catalog] {
+            let parts = match source {
+                Some(Ok(snapshot)) => snapshot
+                    .0
+                    .iter()
+                    .flat_map(|(path, bytes)| [path.as_os_str().as_encoded_bytes(), bytes])
+                    .map(Cow::Borrowed)
+                    .collect(),
+                Some(Err(error)) => vec![Cow::Owned(dekopon_core::error_chain(error).into_bytes())],
+                None => Vec::new(),
+            };
+            hasher.update(parts.len().to_le_bytes());
+            for part in parts {
+                hasher.update(part.len().to_le_bytes());
+                hasher.update(part);
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub(crate) fn refusing(self, refusal: &str) -> Self {
+        use sha2::{Digest as _, Sha256};
+        Self(
+            Sha256::new()
+                .chain_update(self.0)
+                .chain_update(refusal)
+                .finalize()
+                .into(),
+        )
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct GatewaySources {
     pub(crate) config: SourceSnapshot,
@@ -2140,9 +2190,7 @@ pub(crate) fn resolve(
     let mut routes = Vec::with_capacity(config.routes.len());
     for (index, route) in config.routes.into_iter().enumerate() {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
-            problems.push(ConfigProblem::UnknownRouteTransport {
-                transport: route.transport.clone(),
-            });
+            problems.push(ConfigProblem::UnknownRouteTransport { route: index });
         }
         let conversation = route.conversation.selector();
         if let Some(chat_kind) = transport_kinds.get(&route.transport) {
@@ -2251,9 +2299,7 @@ pub(crate) fn resolve(
             && !models_incomplete
             && !model_names.contains(model)
         {
-            problems.push(ConfigProblem::UnknownRouteModel {
-                model: model.clone(),
-            });
+            problems.push(ConfigProblem::UnknownRouteModel { route: index });
         }
         if let Some(model) = &route.model
             && proxy_only.contains(model)
@@ -2741,7 +2787,7 @@ fn checked_endpoint(
     }
 }
 
-/// Validates a variable name only, never a secret, so it is safe to echo in error messages; the
+/// A rejected name may be a pasted secret, so the refusal never echoes it; the
 /// grammar is narrower than the OS's, rejecting a stray space that would otherwise fail cryptically
 /// at connect time.
 fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
@@ -2755,9 +2801,7 @@ fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     if valid {
         Ok(())
     } else {
-        Err(ConfigProblem::InvalidEnvironmentName {
-            name: name.to_owned(),
-        })
+        Err(ConfigProblem::InvalidEnvironmentName)
     }
 }
 
@@ -2778,7 +2822,6 @@ fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<Strin
         return Ok(trimmed.to_owned());
     }
     Err(ConfigProblem::UnsupportedEndpoint {
-        endpoint,
         production: production.to_owned(),
     })
 }
@@ -3015,10 +3058,10 @@ pub enum ConfigProblem {
         "WhatsApp transport {name} requires debounceMaxWaitMs >= debounceMs when collection is enabled"
     )]
     InvalidWhatsappDebounce { name: String },
-    #[error("route names unknown transport {transport:?}")]
-    UnknownRouteTransport { transport: String },
-    #[error("route names unknown model {model:?}")]
-    UnknownRouteModel { model: String },
+    #[error("routes[{route}] names an unknown transport")]
+    UnknownRouteTransport { route: usize },
+    #[error("routes[{route}] names an unknown model")]
+    UnknownRouteModel { route: usize },
     #[error(
         "route names model {model:?}, whose kind anthropic is served only through the guest model proxy"
     )]
@@ -3099,14 +3142,11 @@ pub enum ConfigProblem {
     )]
     ForgetAfterWithoutRecall { route: usize },
     #[error(
-        "{name:?} is not a valid environment variable name; transports and models name variables, never secrets"
+        "an environment variable name is not valid; transports and models name variables, never secrets"
     )]
-    InvalidEnvironmentName { name: String },
-    #[error("endpoint {endpoint:?} must be {production} or a literal loopback http:// URL")]
-    UnsupportedEndpoint {
-        endpoint: String,
-        production: String,
-    },
+    InvalidEnvironmentName,
+    #[error("an endpoint must be {production} or a literal loopback http:// URL")]
+    UnsupportedEndpoint { production: String },
     #[error("broker frame bounds are invalid")]
     BrokerLimits {
         #[source]

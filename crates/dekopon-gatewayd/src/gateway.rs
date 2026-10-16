@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
-use dekopon_core::{ExternalSubject, error_chain};
+use dekopon_core::{ExternalSubject, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -99,6 +99,12 @@ struct ReloadState {
     credentials: Arc<session::ConfiguredModels>,
     metering: Arc<Metering>,
     pending: Option<(String, String)>,
+    unsettled: Option<config::RawCandidate>,
+}
+
+enum Unsettled {
+    Monitor,
+    Refused(&'static str),
 }
 
 fn canonical_yaml(value: &serde_yaml::Value) -> Result<Vec<u8>, serde_json::Error> {
@@ -262,6 +268,7 @@ impl Gateway {
             credentials: owners.credentials,
             metering: owners.metering,
             pending: None,
+            unsettled: None,
         });
         Ok(self)
     }
@@ -817,6 +824,35 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
     }
 }
 
+fn reload_problem(problem: &GatewaydError) -> String {
+    match problem {
+        GatewaydError::Config(
+            error @ (config::ConfigError::Decode { .. }
+            | config::ConfigError::DecodeFragment { .. }),
+        ) => format!("{problem}: {error}"),
+        GatewaydError::Catalog(_) => problem.to_string(),
+        GatewaydError::Probe(probe) => format!(
+            "{probe} ({})",
+            match &probe.source {
+                crate::probe::ProbeError::Credential(_) => "credential",
+                crate::probe::ProbeError::Vendor(error) => error.kind().as_str(),
+            }
+        ),
+        GatewaydError::Config(_)
+        | GatewaydError::Route(_)
+        | GatewaydError::Startup { .. }
+        | GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Problems { .. } => error_chain(problem),
+    }
+}
+
 impl ReloadState {
     async fn run(mut self) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -838,36 +874,42 @@ impl ReloadState {
         )
         .await;
         let Some(candidate) = candidate else {
-            let reasons = report
-                .problems
-                .iter()
-                .take(8)
-                .map(reload_reason)
-                .collect::<Vec<_>>();
-            let error = report
-                .problems
-                .iter()
-                .take(8)
-                .map(|problem| {
-                    if let GatewaydError::Config(config::ConfigError::RestartRequired { .. }) =
-                        problem
-                    {
-                        error_chain(problem)
-                    } else {
-                        reload_reason(problem).to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                problems = report.problems.len(),
-                categories = %reasons.join(","),
-                error = %error
-            );
+            let error = bounded_problems(report.problems.iter().map(reload_problem));
+            if self.unreported(report.raw.refusing(&error)) {
+                let categories = report
+                    .problems
+                    .iter()
+                    .take(MAX_RENDERED_PROBLEMS)
+                    .map(reload_reason)
+                    .collect::<Vec<_>>();
+                tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    problems = report.problems.len(),
+                    categories = %categories.join(","),
+                    error = %error
+                );
+            }
             return;
         };
+        let raw = report.raw.refusing("");
+        if let Err(unsettled) = self.activate(candidate).await
+            && self.unreported(raw)
+        {
+            match unsettled {
+                Unsettled::Monitor => tracing::warn!(event = "gateway_reload_monitor_failed"),
+                Unsettled::Refused(reason) => {
+                    tracing::warn!(event = "gateway_reload_refused", applied = false, reason);
+                }
+            }
+        }
+    }
+
+    fn unreported(&mut self, raw: config::RawCandidate) -> bool {
+        self.unsettled.replace(raw) != Some(raw)
+    }
+
+    async fn activate(&mut self, candidate: Candidate) -> Result<(), Unsettled> {
         let refreshed_proxy = if candidate.config.models != self.config.models {
             match (
                 self.active.load().proxy.is_some(),
@@ -880,14 +922,7 @@ impl ReloadState {
                     &self.metering,
                 ) {
                     Ok(proxy) => Some(proxy),
-                    Err(_) => {
-                        tracing::warn!(
-                            event = "gateway_reload_refused",
-                            applied = false,
-                            reason = "proxy-model"
-                        );
-                        return;
-                    }
+                    Err(_) => return Err(Unsettled::Refused("proxy-model")),
                 },
                 _ => None,
             }
@@ -897,27 +932,22 @@ impl ReloadState {
         let broker = &candidate.config.broker;
         let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
         else {
-            tracing::warn!(event = "gateway_reload_monitor_failed");
-            return;
+            return Err(Unsettled::Monitor);
         };
         if let Some((pending_broker, pending_gateway)) = self.pending.clone() {
             let (observed, outcome) = match client.observe_generation().await {
                 Ok(observation) => observation,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
+                Err(_) => return Err(Unsettled::Monitor),
             };
             if outcome != GenerationOutcome::Active {
-                tracing::warn!(event = "gateway_reload_monitor_failed");
-                return;
+                return Err(Unsettled::Monitor);
             }
             let Ok(digest) = serving_digest(&candidate, &pending_broker) else {
-                return;
+                return Ok(());
             };
             if observed == pending_broker && digest == pending_gateway {
                 self.settle(candidate, observed, digest, refreshed_proxy);
-                return;
+                return Ok(());
             }
             self.broker_digest = observed;
             self.pending = None;
@@ -926,36 +956,23 @@ impl ReloadState {
         let (broker_digest, outcome) =
             match client.prepare_generation(expected_broker.clone()).await {
                 Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
+                Err(_) => return Err(Unsettled::Monitor),
             };
         let Ok(digest) = serving_digest(&candidate, &broker_digest) else {
-            return;
+            return Ok(());
         };
         match outcome {
             GenerationOutcome::Active if broker_digest == expected_broker => {
                 self.settle(candidate, broker_digest, digest, refreshed_proxy);
-                return;
+                return Ok(());
             }
             GenerationOutcome::Prepared => {}
             GenerationOutcome::Refused => {
                 self.broker_digest = broker_digest;
-                tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "broker-prepare"
-                );
-                return;
+                return Err(Unsettled::Refused("broker-prepare"));
             }
             GenerationOutcome::Active | GenerationOutcome::Applied | GenerationOutcome::Aborted => {
-                tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "broker-prepare"
-                );
-                return;
+                return Err(Unsettled::Refused("broker-prepare"));
             }
         }
         let confirmed = match client.commit_generation(broker_digest.clone()).await {
@@ -966,14 +983,10 @@ impl ReloadState {
         };
         if !confirmed {
             self.pending = Some((broker_digest, digest));
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                reason = "broker-confirmation"
-            );
-            return;
+            return Err(Unsettled::Refused("broker-confirmation"));
         }
         self.settle(candidate, broker_digest, digest, refreshed_proxy);
+        Ok(())
     }
 
     fn settle(
@@ -984,8 +997,17 @@ impl ReloadState {
         refreshed_proxy: Option<Arc<ModelProxy>>,
     ) {
         self.pending = None;
+        let repaired = self.unsettled.take().is_some();
         if digest == self.gateway_digest {
             self.broker_digest = broker_digest;
+            if repaired {
+                tracing::info!(
+                    event = "gateway_reload_applied",
+                    generation.digest = %digest,
+                    category.count = 0,
+                    categories = ""
+                );
+            }
             return;
         }
         let categories = self
