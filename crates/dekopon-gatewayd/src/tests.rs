@@ -19549,6 +19549,10 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one reload fixture carries two generations and all resident owners"
+)]
 async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route() {
     use dekopon_broker_protocol::{
         BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
@@ -19619,6 +19623,25 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     .with_reload(path.clone(), candidate, "b".repeat(64))
     .unwrap();
     let first = gateway.route_for_test(&message("first")).unwrap();
+    let job_capacity = runner.jobs.free_permits();
+    let owner = crate::jobs::JobOwner::of(&message("job"));
+    let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
+    let (running_job, _signal) = runner
+        .jobs
+        .admit(owner.clone(), anchor, None, Arc::from("still running"))
+        .unwrap();
+    let asset_seed = runner
+        .conversations
+        .begin(&private, &grant, window(), None, now);
+    let access = asset_seed.assets.clone();
+    let arriving = runner.assets.assets_for_access(
+        &access,
+        vec![pending("kept.png", "image/png", 10)],
+        true,
+        now,
+    );
+    assert_eq!(arriving.arrived, [1]);
+    drop(asset_seed);
     let old_generation = gateway.generation_for_test();
     let other = old_generation.routes_for_test();
     let old_model = Arc::clone(&first.model);
@@ -19669,6 +19692,15 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
             runner.wakes.as_ref().unwrap()
         ));
         assert_eq!(gateway.runner_for_test().conversations.tracked(), 2);
+        assert_eq!(runner.jobs.list(&owner).len(), 1);
+        assert_eq!(
+            runner
+                .assets
+                .assets_for_access(&access, Vec::new(), true, now)
+                .inventory[0]
+                .name,
+            "kept.png"
+        );
         for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
             let history = runner
                 .conversations
@@ -19687,6 +19719,260 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
                 .as_str(),
             "other"
         );
+    }
+    drop(running_job);
+    assert_eq!(runner.jobs.free_permits(), job_capacity);
+}
+
+#[tokio::test]
+async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_old_owner() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let first_path = root.path().join("first-auth.json");
+    let next_path = root.path().join("next-auth.json");
+    let fixture = serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"});
+    for path in [&first_path, &next_path] {
+        fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    }
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["models"][0] = json!({"name":"codex","kind":"chatgptSubscription","model":"first","authFile":first_path,"timeoutMs":2000,"classes":["reasoning"]});
+    let path = write_config(root.path(), &document);
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload_owners(
+        path.clone(),
+        candidate,
+        "b".repeat(64),
+        crate::gateway::ResidentModels {
+            credentials: Arc::clone(&configured),
+            metering: Arc::new(dekopon_model_token_governor::Metering::new(
+                Vec::new(),
+                dekopon_model_token_governor::Metering::system_clock(),
+            )),
+            proxy: None,
+        },
+    )
+    .unwrap();
+    let first = configured
+        .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+        .unwrap();
+    let old = Arc::downgrade(&first);
+    document["models"][0]["model"] = json!("second");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["models"][0]["authFile"] = json!(next_path);
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    let next = configured
+        .chatgpt_credential(Some(&next_path), Duration::from_secs(2))
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &next));
+    drop(first);
+    configured.retire();
+    assert!(old.upgrade().is_none());
+    assert_eq!(configured.credential_owners_for_test(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn collected_media_never_crosses_a_removed_or_replaced_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    for scenario in ["removed", "replaced", "reordered"] {
+        let root = temporary();
+        let catalog = root.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        fs::write(
+            catalog.join("reviewer.yaml"),
+            catalog_text(true, Some("reasoning")),
+        )
+        .unwrap();
+        fs::write(
+            catalog.join("other.yaml"),
+            catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other"),
+        )
+        .unwrap();
+        let mut document = document(root.path());
+        document["catalogPath"] = json!(catalog);
+        document["broker"]["serverUid"] = json!(crate::current_uid());
+        let path = write_config(root.path(), &document);
+        let candidate = crate::boot_candidate(&path).await.unwrap();
+        let mut responses = vec![ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }];
+        if scenario == "reordered" {
+            responses.push(ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            ));
+        }
+        let mut broker = BrokerFixture::answering(root.path(), responses);
+        let model = ModelScript::forbidden();
+        let runner = runner(candidate.config.broker.clone(), Arc::clone(&model), 4);
+        let driver = Arc::new(RecordingDriver::default());
+        let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+        drivers.insert("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
+        let gateway = crate::gateway::Gateway::new(
+            runner,
+            Arc::new(candidate.routes.clone()),
+            Arc::new(BTreeMap::new()),
+            Arc::new(drivers),
+            Arc::new(Vec::new()),
+        )
+        .with_reload(path.clone(), candidate, "b".repeat(64))
+        .unwrap();
+        let (capture, _guard) = capture_spans();
+        let (tx, rx) = mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(gateway.serve(
+            rx,
+            async move {
+                stopped.await.expect("shutdown sender stays alive");
+            },
+            Duration::from_secs(1),
+            crate::collection::Collector::new(&[], 4),
+        ));
+        for text in ["first", "second"] {
+            let mut inbound = message(text);
+            inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+            inbound.native_group = Some("group".into());
+            tx.send(TransportEvent::Message(Box::new(inbound)))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        let mut new_route = document["routes"][0].clone();
+        new_route["agent"] = json!("other");
+        match scenario {
+            "replaced" => document["routes"][0] = new_route,
+            "removed" => {
+                document["routes"].as_array_mut().unwrap().remove(0);
+                document["routes"].as_array_mut().unwrap().push(new_route);
+            }
+            "reordered" => {
+                new_route["conversation"]["ids"] = json!(["other"]);
+                document["routes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, new_route);
+            }
+            _ => unreachable!(),
+        }
+        write_config(root.path(), &document);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        for _ in 0..50 {
+            if !capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .len(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        if scenario == "reordered" {
+            assert!(matches!(
+                broker.request().await.request,
+                BrokerRequest::Capabilities { .. }
+            ));
+        } else {
+            assert!(
+                broker.recorded().is_empty(),
+                "no broker session on the replacement route"
+            );
+            assert_eq!(model.requests(), 0);
+            assert!(driver.replies().is_empty());
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_gatewayd",
+                        &[
+                            ("event", "gateway_input_disposition"),
+                            ("outcome", "route-lost")
+                        ]
+                    )
+                    .len(),
+                2
+            );
+        }
+        stop.send(()).unwrap();
+        assert!(matches!(
+            serving.await.unwrap(),
+            crate::ServeOutcome::Shutdown
+        ));
     }
 }
 

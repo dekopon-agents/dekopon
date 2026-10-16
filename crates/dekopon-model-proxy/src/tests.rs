@@ -373,6 +373,7 @@ async fn resident_router_resolves_each_request_against_the_current_model() {
         let response = client
             .post(format!("{url}/v1/chat/completions"))
             .header(SUBJECT_HEADER, SUBJECT)
+            .header("authorization", "Bearer guest-sentinel")
             .header("content-type", "application/json")
             .body(CHAT_CALL)
             .send()
@@ -383,8 +384,16 @@ async fn resident_router_resolves_each_request_against_the_current_model() {
     }
     assert_eq!(first.requests.lock().len(), 1);
     assert_eq!(second.requests.lock().len(), 1);
-    assert!(first.request().contains("z-ai/glm-4.5-air"));
-    assert!(second.request().contains("z-ai/glm-4.5-air"));
+    for upstream in [&first, &second] {
+        let request = upstream.request();
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer sk-or-proxy\r\n"));
+        assert!(!request.contains("guest-sentinel"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(upstream.body().as_str()).unwrap()["model"],
+            "z-ai/glm-4.5-air"
+        );
+    }
     task.abort();
 }
 

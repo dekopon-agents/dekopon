@@ -203,6 +203,9 @@ impl Gateway {
         owners: ResidentModels,
     ) -> Result<Self, config::ConfigError> {
         let gateway_digest = serving_digest(&candidate, &broker_digest)?;
+        owners
+            .credentials
+            .set_active_models(&candidate.config.models);
         let sources = Arc::new(candidate.sources);
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
@@ -914,11 +917,110 @@ impl ReloadState {
             _digest: digest.clone(),
             _broker_digest: broker_digest.clone(),
         }));
+        self.credentials.set_active_models(&candidate.config.models);
         self.config = candidate.config;
         self.sources = sources;
         self.broker_digest = broker_digest;
         tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
         self.gateway_digest = digest;
         self.credentials.retire();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use dekopon_core::Redacted;
+    use dekopon_model_proxy::{Grant, ProxyModel, Upstream};
+    use dekopon_model_token_governor::Tokens;
+    use dekopon_test_support::LoopbackServer;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[tokio::test]
+    async fn one_published_snapshot_selects_the_proxy_for_each_request() {
+        let answer = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let first = LoopbackServer::once(answer);
+        let second = LoopbackServer::once(answer);
+        let meter = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
+        let build = |server: &LoopbackServer| {
+            Arc::new(
+                ModelProxy::new(
+                    vec![ProxyModel {
+                        name: "fixture".into(),
+                        wire_model: "upstream".into(),
+                        backend: "openrouter",
+                        reserve: Tokens(0),
+                        upstream: Upstream::OpenRouter {
+                            endpoint: server.url(),
+                            api_key: Redacted::new("synthetic-key".into()),
+                        },
+                    }],
+                    HashMap::from([(
+                        "vm".into(),
+                        Grant {
+                            agent: "reviewer".parse().unwrap(),
+                            models: BTreeSet::from(["fixture".into()]),
+                        },
+                    )]),
+                    Arc::clone(&meter),
+                )
+                .unwrap(),
+            )
+        };
+        let old_proxy = build(&first);
+        let active = Arc::new(ArcSwap::from_pointee(ServingGeneration {
+            routes: Arc::new(RoutingTable::default()),
+            stop_words: Arc::new(Vec::new()),
+            proxy: Some(Arc::clone(&old_proxy)),
+            _sources: None,
+            _digest: "old".into(),
+            _broker_digest: "old".into(),
+        }));
+        let previous = active.load_full();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let routed = Arc::clone(&active);
+        let serving = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                ModelProxy::router_current(CurrentGeneration(routed)),
+            )
+            .await
+            .unwrap()
+        });
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("http://{address}/v1/chat/completions"))
+                .header("x-dekopon-vm-subject", "vm")
+                .header("content-type", "application/json")
+                .body(r#"{"model":"fixture","messages":[],"stream":false}"#)
+        };
+        assert_eq!(send().send().await.unwrap().status(), 200);
+        assert!(Arc::ptr_eq(previous.proxy.as_ref().unwrap(), &old_proxy));
+        let next = build(&second);
+        active.store(Arc::new(ServingGeneration {
+            routes: Arc::clone(&previous.routes),
+            stop_words: Arc::clone(&previous.stop_words),
+            proxy: Some(Arc::clone(&next)),
+            _sources: None,
+            _digest: "new".into(),
+            _broker_digest: "new".into(),
+        }));
+        assert_eq!(active.load()._digest, "new");
+        assert!(Arc::ptr_eq(previous.proxy.as_ref().unwrap(), &old_proxy));
+        assert!(Arc::ptr_eq(active.load().proxy.as_ref().unwrap(), &next));
+        assert_eq!(send().send().await.unwrap().status(), 200);
+        assert!(
+            first
+                .request_text()
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
+        assert!(
+            second
+                .request_text()
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
+        serving.abort();
     }
 }
