@@ -621,6 +621,8 @@ pub enum TransportError {
     EmptyCredential { name: String },
     #[error("credential environment variable {name} is not UTF-8")]
     NonUtf8Credential { name: String },
+    #[error("transport {transport:?} is not mountable in this build")]
+    NotMountableInThisBuild { transport: String },
     #[error("chat service request failed")]
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
@@ -665,6 +667,7 @@ impl TransportError {
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
+            Self::NotMountableInThisBuild { .. } => "not-mountable-in-this-build",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::DisallowedIntents => "disallowed-intents",

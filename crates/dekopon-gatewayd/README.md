@@ -61,6 +61,13 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   journal-backed routes may override the agent policy with `routes[].memory.policy`. A `decider`
   selection also names the decision provider's `backend`, `model` and `requireProbabilities`.
   Without a journal, persistent routes remain window-only and config-check warns once.
+  `githubWebhook` configuration requires `name`, `bind` and `secretEnv` (the name of a nonblank
+  environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set
+  nonempty, unique `githubEvents` from `pull_request` and `workflow_run`, a canonical
+  `conversation` thread selector and `memory: { mode: oneShot }`. Non-GitHub routes cannot set
+  `githubEvents`. First route match precedes event filtering. **This S2 build does not mount
+  GitHub:** check warns about the credential, and boot requires it but then refuses that named
+  transport as not mountable until the verified ingress step ships. See [gateway configuration](../../docs/gatewayd.md).
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share

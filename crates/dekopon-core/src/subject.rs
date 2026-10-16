@@ -16,6 +16,7 @@ pub enum SubjectService {
     Telegram,
     Whatsapp,
     Tel,
+    Github,
 }
 
 impl SubjectService {
@@ -27,11 +28,53 @@ impl SubjectService {
             Self::Telegram => "telegram",
             Self::Whatsapp => "whatsapp",
             Self::Tel => "tel",
+            Self::Github => "github",
         }
     }
 
-    const fn requires_tenant(self) -> bool {
-        matches!(self, Self::Slack)
+    #[must_use]
+    pub const fn requires_tenant(self) -> bool {
+        matches!(self, Self::Slack | Self::Github)
+    }
+
+    #[must_use]
+    pub fn admits_segment(self, segment: SubjectSegment, value: &str) -> bool {
+        match self {
+            Self::Github => {
+                let maximum = match segment {
+                    SubjectSegment::Tenant => 39,
+                    SubjectSegment::Subject => 100,
+                };
+                !value.is_empty()
+                    && value.len() <= maximum
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-')
+                    })
+            }
+            Self::Slack | Self::Discord | Self::Telegram | Self::Whatsapp | Self::Tel => {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubjectSegment {
+    Tenant,
+    Subject,
+}
+
+impl SubjectSegment {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Subject => "subject",
+        }
     }
 }
 
@@ -45,6 +88,7 @@ impl FromStr for SubjectService {
             "telegram" => Ok(Self::Telegram),
             "whatsapp" => Ok(Self::Whatsapp),
             "tel" => Ok(Self::Tel),
+            "github" => Ok(Self::Github),
             _ => Err(SubjectError::UnknownService {
                 service: value.to_owned(),
             }),
@@ -61,8 +105,8 @@ pub struct ExternalSubject {
 
 impl ExternalSubject {
     pub fn slack(team: &str, user: &str) -> Result<Self, SubjectError> {
-        let tenant = normalize_segment(team, "tenant")?;
-        let subject = normalize_segment(user, "subject")?;
+        let tenant = normalize_segment(SubjectService::Slack, SubjectSegment::Tenant, team)?;
+        let subject = normalize_segment(SubjectService::Slack, SubjectSegment::Subject, user)?;
         Self::build(SubjectService::Slack, Some(tenant), subject)
     }
 
@@ -89,6 +133,12 @@ impl ExternalSubject {
             });
         }
         Self::build(SubjectService::Whatsapp, None, wa_id.to_owned())
+    }
+
+    pub fn github(owner: &str, repo: &str) -> Result<Self, SubjectError> {
+        let tenant = normalize_segment(SubjectService::Github, SubjectSegment::Tenant, owner)?;
+        let subject = normalize_segment(SubjectService::Github, SubjectSegment::Subject, repo)?;
+        Self::build(SubjectService::Github, Some(tenant), subject)
     }
 
     pub fn telephone(number: &str) -> Result<Self, SubjectError> {
@@ -197,9 +247,9 @@ impl FromStr for ExternalSubject {
             (None, second)
         };
         let tenant = tenant
-            .map(|tenant| require_canonical_segment(tenant, "tenant"))
+            .map(|tenant| require_canonical_segment(service, SubjectSegment::Tenant, tenant))
             .transpose()?;
-        let subject = require_canonical_segment(subject, "subject")?;
+        let subject = require_canonical_segment(service, SubjectSegment::Subject, subject)?;
         let numeric = match service {
             SubjectService::Discord => is_discord_snowflake(&subject),
             SubjectService::Whatsapp => {
@@ -208,7 +258,7 @@ impl FromStr for ExternalSubject {
             SubjectService::Telegram | SubjectService::Tel => {
                 subject.bytes().all(|byte| byte.is_ascii_digit())
             }
-            SubjectService::Slack => true,
+            SubjectService::Slack | SubjectService::Github => true,
         };
         if !numeric {
             return Err(SubjectError::InvalidSegment {
@@ -234,9 +284,12 @@ impl<'de> Deserialize<'de> for ExternalSubject {
     }
 }
 
-fn normalize_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
-    let normalized = value.to_ascii_lowercase();
-    require_canonical_segment(&normalized, segment)
+fn normalize_segment(
+    service: SubjectService,
+    segment: SubjectSegment,
+    value: &str,
+) -> Result<String, SubjectError> {
+    require_canonical_segment(service, segment, value.to_ascii_lowercase())
 }
 
 fn digits_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
@@ -266,16 +319,16 @@ fn is_discord_snowflake(value: &str) -> bool {
 }
 
 fn require_canonical_segment(
+    service: SubjectService,
+    segment: SubjectSegment,
     value: impl Into<String>,
-    segment: &'static str,
 ) -> Result<String, SubjectError> {
     let value = value.into();
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    {
-        return Err(SubjectError::InvalidSegment { segment, value });
+    if !service.admits_segment(segment, &value) {
+        return Err(SubjectError::InvalidSegment {
+            segment: segment.as_str(),
+            value,
+        });
     }
     Ok(value)
 }
@@ -302,6 +355,38 @@ pub enum SubjectError {
 #[cfg(test)]
 mod tests {
     use super::{ExternalSubject, SubjectError, SubjectService};
+
+    #[test]
+    fn github_owner_and_repo_are_bounded_canonical_segments() {
+        let subject = ExternalSubject::github("Owner", "Repo_Name").expect("signed identifiers");
+        assert_eq!(subject.canonical(), "github.owner.repo_name");
+        assert_eq!(
+            subject.canonical().parse::<ExternalSubject>(),
+            Ok(subject.clone())
+        );
+        assert!(subject.in_namespace("github.owner"));
+        assert!(!subject.in_namespace("github.other"));
+        assert!(!ExternalSubject::github("owner", "repo.extra").is_ok());
+        assert!(
+            "github.owner.repo.extra"
+                .parse::<ExternalSubject>()
+                .is_err()
+        );
+        assert!(
+            "github.owner.repo-extra"
+                .parse::<ExternalSubject>()
+                .unwrap()
+                .in_namespace("github.owner")
+        );
+        assert!(
+            !"github.owner.repo-extra"
+                .parse::<ExternalSubject>()
+                .unwrap()
+                .in_namespace("github.owner.repo")
+        );
+        assert!(ExternalSubject::github(&"x".repeat(40), "repo").is_err());
+        assert!(ExternalSubject::github("owner", &"x".repeat(101)).is_err());
+    }
 
     #[test]
     fn raw_transport_identifiers_normalize_into_canonical_form() {

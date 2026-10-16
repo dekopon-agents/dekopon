@@ -412,6 +412,11 @@ pub enum TransportConfig {
         #[serde(default)]
         graph_endpoint: Option<String>,
     },
+    GithubWebhook {
+        name: String,
+        bind: SocketAddr,
+        secret_env: String,
+    },
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
@@ -458,6 +463,7 @@ impl TransportConfig {
             Self::SlackSocketMode { name, .. }
             | Self::DiscordGateway { name, .. }
             | Self::WhatsappCloudApi { name, .. }
+            | Self::GithubWebhook { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
         }
@@ -469,6 +475,7 @@ impl TransportConfig {
             Self::SlackSocketMode { .. } => ChatTransportKind::Slack,
             Self::DiscordGateway { .. } => ChatTransportKind::Discord,
             Self::WhatsappCloudApi { .. } => ChatTransportKind::Whatsapp,
+            Self::GithubWebhook { .. } => ChatTransportKind::Github,
             Self::TelegramLongPoll { .. } => ChatTransportKind::Telegram,
             Self::Local { .. } => ChatTransportKind::Local,
         }
@@ -480,6 +487,7 @@ impl TransportConfig {
             Self::SlackSocketMode { .. } => "slackSocketMode",
             Self::DiscordGateway { .. } => "discordGateway",
             Self::WhatsappCloudApi { .. } => "whatsappCloudApi",
+            Self::GithubWebhook { .. } => "githubWebhook",
             Self::TelegramLongPoll { .. } => "telegramLongPoll",
             Self::Local { .. } => "local",
         }
@@ -748,6 +756,8 @@ pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 pub struct RouteConfig {
     pub transport: String,
     pub conversation: ConversationMatchConfig,
+    #[serde(default, deserialize_with = "github_events_present")]
+    pub github_events: Option<Vec<GithubEvent>>,
     /// Subjects only routes which agent hears a message; authority stays with Cedar and the
     /// broker's subject mapping, and it is restricted to direct-message routes since a channel
     /// version would read as an access list.
@@ -791,6 +801,19 @@ pub struct RouteConfig {
     pub follow: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubEvent {
+    PullRequest,
+    WorkflowRun,
+}
+
+fn github_events_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<GithubEvent>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryWindow {
     pub scope: MemoryScope,
@@ -823,6 +846,7 @@ impl MemoryPolicy {
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub transport: String,
+    pub github_events: Option<Vec<GithubEvent>>,
     pub conversation: ConversationMatch,
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
@@ -1799,6 +1823,9 @@ pub(crate) fn resolve(
     let mut transport_names = BTreeSet::new();
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
+    let mut webhook_mounts = BTreeSet::new();
+    let mut whatsapp_binds = BTreeSet::new();
+    let mut github_binds = Vec::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
@@ -1811,16 +1838,40 @@ pub(crate) fn resolve(
             continue;
         }
         transport_kinds.insert(name.clone(), transport.chat_kind());
+        let mount = match &transport {
+            TransportConfig::WhatsappCloudApi {
+                bind,
+                callback_path,
+                ..
+            } => {
+                whatsapp_binds.insert(*bind);
+                Some((*bind, callback_path.as_str()))
+            }
+            TransportConfig::GithubWebhook { bind, .. } => {
+                github_binds.push((name.clone(), *bind));
+                Some((*bind, "/webhooks/github"))
+            }
+            TransportConfig::SlackSocketMode { .. }
+            | TransportConfig::DiscordGateway { .. }
+            | TransportConfig::TelegramLongPoll { .. }
+            | TransportConfig::Local { .. } => None,
+        };
+        if let Some((bind, path)) = mount
+            && !webhook_mounts.insert((bind, path.to_owned()))
+        {
+            problems.push(ConfigProblem::ConflictingWebhookMount { name: name.clone() });
+        }
         let indicators = match &transport {
             TransportConfig::SlackSocketMode { liveness, .. }
             | TransportConfig::DiscordGateway { liveness, .. }
             | TransportConfig::TelegramLongPoll { liveness, .. }
             | TransportConfig::WhatsappCloudApi { liveness, .. }
-            | TransportConfig::Local { liveness, .. } => liveness,
+            | TransportConfig::Local { liveness, .. } => Some(liveness),
+            TransportConfig::GithubWebhook { .. } => None,
         };
         for kind in indicators
-            .conversations
-            .keys()
+            .into_iter()
+            .flat_map(|liveness| liveness.conversations.keys())
             .filter(|kind| !transport.chat_kind().produces(**kind))
         {
             problems.push(ConfigProblem::ImpossibleLivenessConversation {
@@ -1829,6 +1880,21 @@ pub(crate) fn resolve(
             });
         }
         transports.push(match transport {
+            TransportConfig::GithubWebhook {
+                name,
+                bind,
+                secret_env,
+            } => {
+                check_env_name(&secret_env, &mut problems);
+                if bind.port() == 0 {
+                    problems.push(ConfigProblem::InvalidGithubBind { name: name.clone() });
+                }
+                TransportConfig::GithubWebhook {
+                    name,
+                    bind,
+                    secret_env,
+                }
+            }
             TransportConfig::SlackSocketMode {
                 name,
                 app_token_env,
@@ -1945,6 +2011,14 @@ pub(crate) fn resolve(
                 liveness,
             },
         });
+    }
+    if !whatsapp_binds.is_empty() {
+        for (name, _) in github_binds
+            .into_iter()
+            .filter(|(_, bind)| !whatsapp_binds.contains(bind))
+        {
+            problems.push(ConfigProblem::ConflictingWebhookMount { name });
+        }
     }
 
     let mut models_incomplete = config.models.is_empty();
@@ -2068,6 +2142,22 @@ pub(crate) fn resolve(
                     problem,
                 });
             }
+        }
+        let github_route =
+            transport_kinds.get(&route.transport) == Some(&ChatTransportKind::Github);
+        match (&route.github_events, github_route) {
+            (Some(events), true)
+                if !events.is_empty()
+                    && events.len() <= 2
+                    && events
+                        .iter()
+                        .enumerate()
+                        .all(|(index, event)| !events[..index].contains(event)) => {}
+            (None, false) => {}
+            _ => problems.push(ConfigProblem::InvalidGithubEvents { route: index }),
+        }
+        if github_route && !matches!(route.memory, MemoryConfig::OneShot { .. }) {
+            problems.push(ConfigProblem::GithubRequiresOneShot { route: index });
         }
         if route.progress_notes && route.progress_detail == ProgressDetail::Off {
             problems.push(ConfigProblem::ProgressNotesWithoutDetail { route: index });
@@ -2323,6 +2413,7 @@ pub(crate) fn resolve(
         }
         routes.push(ResolvedRoute {
             transport: route.transport,
+            github_events: route.github_events,
             conversation,
             subjects: route.subjects,
             agent: route.agent,
@@ -2513,6 +2604,7 @@ fn resolve_liveness(
         | TransportConfig::TelegramLongPoll { liveness, .. }
         | TransportConfig::WhatsappCloudApi { liveness, .. }
         | TransportConfig::Local { liveness, .. } => liveness,
+        TransportConfig::GithubWebhook { .. } => return ResolvedLiveness::default(),
     };
     let mut settings = LivenessSettings::default();
     let mut keep_alive = KeepAliveConfig::default();
@@ -2882,6 +2974,14 @@ pub enum ConfigProblem {
         script_timeout_ms: u64,
         max_duration_ms: u64,
     },
+    #[error("GitHub transport {name:?} must bind an explicit nonzero port")]
+    InvalidGithubBind { name: String },
+    #[error("webhook transport {name:?} conflicts with another listener bind or callback path")]
+    ConflictingWebhookMount { name: String },
+    #[error("routes[{route}]: githubEvents must be nonempty, unique and GitHub-only")]
+    InvalidGithubEvents { route: usize },
+    #[error("routes[{route}]: GitHub requires memory.mode: oneShot")]
+    GithubRequiresOneShot { route: usize },
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]

@@ -251,6 +251,7 @@ pub enum ChatTransportKind {
     Discord,
     Telegram,
     Whatsapp,
+    Github,
     Local,
 }
 
@@ -261,6 +262,7 @@ impl fmt::Display for ChatTransportKind {
             Self::Discord => "discord",
             Self::Telegram => "telegram",
             Self::Whatsapp => "whatsapp",
+            Self::Github => "github",
             Self::Local => "local",
         })
     }

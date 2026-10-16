@@ -39,7 +39,7 @@ pub use diagnostics::error_chain;
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
-pub use subject::{ExternalSubject, SubjectError, SubjectService};
+pub use subject::{ExternalSubject, SubjectError, SubjectSegment, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{
