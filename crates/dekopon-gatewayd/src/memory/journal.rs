@@ -928,6 +928,8 @@ fn read_window(
 ) -> Result<(History, Option<Line>), JournalError> {
     let mut lines = Backward::open(path)?;
     let mut turns = Vec::new();
+    let mut bytes = 0_usize;
+    let mut records = 0_usize;
     let mut last = None;
     while let Some(mut line) = lines.next_line()? {
         #[cfg(test)]
@@ -939,15 +941,23 @@ fn read_window(
         {
             break;
         }
-        if let Some(user) = line.user.take() {
-            let turn = match line.answer.take() {
+        records += 1;
+        let turn = line.user.take().map(|user| {
+            match line.answer.take() {
                 Some(answer) => ConversationTurn::completed(user, answer),
                 None => ConversationTurn::unanswered(user),
-            };
-            turns.push(turn.with_memory_id(line.turn_id));
-        }
+            }
+            .with_memory_id(line.turn_id)
+        });
         last.get_or_insert(line);
-        if turns.len() >= window.limits.max_turns {
+        if let Some(turn) = turn {
+            bytes = bytes.saturating_add(turn.bytes());
+            if bytes > window.limits.max_bytes {
+                break;
+            }
+            turns.push(turn);
+        }
+        if records >= window.limits.max_turns {
             break;
         }
     }
