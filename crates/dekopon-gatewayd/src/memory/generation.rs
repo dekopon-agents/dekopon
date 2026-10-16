@@ -21,7 +21,7 @@ pub(crate) struct Prepared {
     pub failed_routines: Vec<String>,
 }
 
-fn version(routine: &Routine) -> String {
+pub(crate) fn version(routine: &Routine) -> String {
     let bytes = serde_json::to_vec(routine).expect("validated routine serializes");
     Sha256::digest(bytes)
         .iter()
@@ -155,11 +155,13 @@ pub(crate) fn prepare(
     })
     .to_string();
     let source_rep = Representation::original(&source, "");
-    if !original {
-        let mut metadata = source_rep.clone();
-        metadata.text = None;
-        representations.push(metadata);
+    let mut metadata = source_rep.clone();
+    metadata.text = None;
+    if let Some(routine) = retained_original {
+        metadata.routine_id.clone_from(&routine.id);
+        metadata.version = version(routine);
     }
+    representations.push(metadata);
     for routine in routines {
         match routine.kind {
             RoutineKind::Original => availability.push(routine.id.clone()),
@@ -286,7 +288,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
         return;
     };
     let journal = Arc::clone(journal);
-    let policy = route.memory_policy.clone();
+    let policy = route.memory_policy.clone().unwrap_or_default();
     let models = Arc::clone(&runner.models);
     let metering = Arc::clone(&runner.metering);
     let agent = route.agent.clone();
@@ -305,17 +307,15 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     let generated = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&generation_subscriber, || {
             let _entered = generation_span.enter();
-            generation_policy.as_ref().map(|policy| {
-                prepare(&generation_turn, policy, |name| {
-                    let config = policy.models.get(name)?;
-                    let client = models
-                        .client(config, runtime.clone(), cancel.clone())
-                        .ok()?;
-                    Some(crate::metering::ChatProviderGovernor::wrap(
-                        client, &metering, &agent, config,
-                    ))
-                })
-            })
+            Some(prepare(&generation_turn, &generation_policy, |name| {
+                let config = generation_policy.models.get(name)?;
+                let client = models
+                    .client(config, runtime.clone(), cancel.clone())
+                    .ok()?;
+                Some(crate::metering::ChatProviderGovernor::wrap(
+                    client, &metering, &agent, config,
+                ))
+            }))
         })
     })
     .await;
@@ -326,9 +326,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
                 event = "gateway_memory_deviation",
                 reason = "generation-task"
             );
-            policy
-                .as_ref()
-                .map(|policy| prepare(&turn, policy, |_| None))
+            Some(prepare(&turn, &policy, |_| None))
         }
     };
     if let Some(prepared) = &prepared {

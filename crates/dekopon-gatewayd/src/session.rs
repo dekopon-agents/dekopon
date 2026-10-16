@@ -1869,6 +1869,26 @@ async fn session(
             },
         )
     });
+    let memory_journal = runner
+        .journal
+        .as_ref()
+        .filter(|_| matches!(route.memory, MemoryPolicy::Persistent(_)))
+        .cloned();
+    let memory_stem = key.journal_stem();
+    let memory_grant = journal::grant_digest(&granted);
+    let memory_versions: std::collections::HashMap<_, _> = route
+        .memory_policy
+        .clone()
+        .unwrap_or_default()
+        .routines
+        .iter()
+        .map(|routine| {
+            (
+                routine.id.clone(),
+                crate::memory::generation::version(routine),
+            )
+        })
+        .collect();
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -1899,6 +1919,17 @@ async fn session(
             // Withholding the agent-config view here removes the structured dump but not the underlying
             // instructions, which are still the system prompt, so this is not secrecy from a determined
             // user.
+            let memory_tools = memory_journal
+                .as_ref()
+                .map(|journal| journal::JournalMemoryTools {
+                    journal,
+                    stem: memory_stem,
+                    grant: memory_grant,
+                    versions: memory_versions,
+                });
+            if let Some(tools) = memory_tools.as_ref() {
+                inputs = inputs.with_memory_tools(tools);
+            }
             if let Some((request, result)) = capture_limits {
                 inputs = inputs.with_exchange_capture(request, result);
             }

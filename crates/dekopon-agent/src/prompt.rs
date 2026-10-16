@@ -235,6 +235,7 @@ pub struct SessionInputs<'a> {
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
     capture_exchanges: Option<(Option<usize>, Option<usize>)>,
+    memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -259,7 +260,17 @@ impl<'a> SessionInputs<'a> {
             progress_notes: false,
             wakes: None,
             capture_exchanges: None,
+            memory_tools: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_memory_tools(
+        mut self,
+        tools: &'a dyn crate::memory_tools::MemoryTools,
+    ) -> Self {
+        self.memory_tools = Some(tools);
+        self
     }
 
     #[must_use]
@@ -382,6 +393,7 @@ struct SessionExtensions<'a> {
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
     capture_exchanges: Option<(Option<usize>, Option<usize>)>,
+    memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
 }
 
 pub fn run_prompt_session<M, R>(
@@ -413,6 +425,7 @@ where
         progress_notes,
         wakes,
         capture_exchanges,
+        memory_tools,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -447,6 +460,7 @@ where
         SessionExtensions {
             exchanges: &mut exchanges,
             capture_exchanges,
+            memory_tools,
             options,
             assets,
             reply_assets,
@@ -578,6 +592,7 @@ where
         progress_notes,
         wakes,
         capture_exchanges,
+        memory_tools,
     } = extensions;
     let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
@@ -595,6 +610,9 @@ where
     }
     if wakes.is_some() {
         model_tools.push(wake::wake_tool());
+    }
+    if memory_tools.is_some() {
+        model_tools.extend(crate::memory_tools::tools());
     }
 
     let session_span = tracing::info_span!(
@@ -938,6 +956,11 @@ where
                     model_turns,
                     tool_call_index,
                 )?;
+                continue;
+            }
+            if let Some(memory) = memory_tools
+                && crate::memory_tools::dispatch(&mut messages, memory, &call)?
+            {
                 continue;
             }
             if call.function.name == WAKE_TOOL_NAME
@@ -5229,6 +5252,70 @@ mod tests {
         assert_eq!(roles.len(), 2, "no listing was added: {roles:?}");
         let tools = model.observed_tools.lock();
         assert!(tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME));
+    }
+
+    #[test]
+    fn one_shot_offers_no_memory_tools_and_journal_session_dispatches_reads() {
+        struct LocalMemory;
+        impl crate::memory_tools::MemoryTools for LocalMemory {
+            fn read(&self, id: u64, representation: &str, range: Option<(u64, u64)>) -> String {
+                assert_eq!((id, representation, range), (7, "summary", Some((0, 4))));
+                "text".into()
+            }
+            fn set_pin(&self, _: u64, _: &str) -> String {
+                "pinned".into()
+            }
+            fn clear_pin(&self, _: Option<u64>) -> String {
+                "cleared".into()
+            }
+        }
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+        let one_shot = ScriptedModel::new([
+            tool_call(
+                "read-1",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+            tool_call(
+                "read-2",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+        ]);
+        let error = run_prompt_session(
+            &one_shot,
+            &runtime,
+            SessionInputs::new("hi", limits(2, 2)),
+            &mut history,
+        )
+        .expect_err("not offered");
+        assert!(matches!(error, PromptError::UnknownTool(name) if name == "read_memory_record"));
+        assert!(one_shot.observed_tools.lock()[0].iter().all(|tool| {
+            !tool.name.ends_with("memory_record") && !tool.name.ends_with("memory_pin")
+        }));
+
+        let model = ScriptedModel::new([
+            tool_call(
+                "read",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+            answer("done"),
+        ]);
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("hi", limits(2, 2)).with_memory_tools(&LocalMemory),
+            &mut History::default(),
+        )
+        .expect("read");
+        assert_eq!(last_tool_results(&model), vec!["text"]);
+        assert!(
+            model.observed_tools.lock()[0]
+                .iter()
+                .any(|tool| tool.name == "read_memory_record")
+        );
     }
 
     #[test]

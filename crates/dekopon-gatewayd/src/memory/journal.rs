@@ -1,3 +1,6 @@
+mod tools;
+pub(crate) use tools::JournalMemoryTools;
+
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -676,15 +679,8 @@ impl Journal {
                                 file_path.file_stem().unwrap_or_default().to_string_lossy()
                             ));
                             let horizon = millis(now).saturating_sub(duration_millis(age));
-                            match read_lines(&file_path) {
-                                Ok(lines) if lines.iter().any(|line| line.at_ms < horizon) => {
-                                    if lines.iter().all(|line| line.at_ms < horizon) {
-                                        remove(&file_path);
-                                    } else {
-                                        compact(&file_path, age, now)?;
-                                    }
-                                    tracing::info!(event = "gateway_journal_expired");
-                                }
+                            match sweep_file(&file_path, horizon) {
+                                Ok(true) => tracing::info!(event = "gateway_journal_expired"),
                                 Err(JournalError::Corrupt) => {
                                     remove(&file_path);
                                     tracing::warn!(
@@ -693,7 +689,7 @@ impl Journal {
                                     );
                                 }
                                 Err(error) => return Err(error),
-                                Ok(_) => {}
+                                Ok(false) => {}
                             }
                         }
                     }
@@ -810,6 +806,8 @@ fn read_window(
         serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?)).into_iter::<Line>()
     {
         let mut line = item.map_err(|_malformed| JournalError::Corrupt)?;
+        #[cfg(test)]
+        observe_live_decoded(1);
         if line.version != 2
             || previous.is_some_and(|id| id != line.record_id)
             || line.next_record_id != line.record_id.saturating_add(1)
@@ -839,12 +837,24 @@ fn read_window(
     Ok((history, last))
 }
 
+#[cfg(test)]
+thread_local! {
+    static PEAK_LIVE_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn observe_live_decoded(count: usize) {
+    PEAK_LIVE_DECODED.with(|peak| peak.set(peak.get().max(count)));
+}
+
 fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
     let file = BufReader::new(File::open(path)?);
     let lines: Vec<Line> = serde_json::Deserializer::from_reader(file)
         .into_iter()
         .collect::<Result<_, _>>()
         .map_err(|_malformed| JournalError::Corrupt)?;
+    #[cfg(test)]
+    observe_live_decoded(lines.len());
     if lines.iter().any(|line| line.version != 2)
         || lines
             .windows(2)
@@ -861,14 +871,80 @@ fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
 
 fn compact(path: &Path, max_age: Duration, now: SystemTime) -> Result<(), JournalError> {
     let horizon = millis(now).saturating_sub(duration_millis(max_age));
-    let lines = read_lines(path)?;
-    rewrite(
-        path,
-        &lines
-            .into_iter()
-            .filter(|line| line.at_ms >= horizon)
-            .collect::<Vec<_>>(),
-    )
+    rewrite_eligible(path, horizon)
+}
+
+fn validated_lines(
+    path: &Path,
+    mut visit: impl FnMut(Line) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
+    let file = BufReader::new(File::open(path)?);
+    let mut previous = None;
+    for item in serde_json::Deserializer::from_reader(file).into_iter::<Line>() {
+        let line = item.map_err(|_malformed| JournalError::Corrupt)?;
+        if line.version != 2
+            || previous.is_some_and(|id| id != line.record_id)
+            || line.next_record_id != line.record_id.saturating_add(1)
+            || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
+        {
+            return Err(JournalError::Corrupt);
+        }
+        previous = Some(line.next_record_id);
+        #[cfg(test)]
+        observe_live_decoded(1);
+        visit(line)?;
+    }
+    Ok(())
+}
+
+fn sweep_file(path: &Path, horizon: u64) -> Result<bool, JournalError> {
+    let first = serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?))
+        .into_iter::<Line>()
+        .next()
+        .transpose()
+        .map_err(|_malformed| JournalError::Corrupt)?;
+    let Some(first) = first else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    observe_live_decoded(1);
+    if first.version != 2 || first.next_record_id != first.record_id.saturating_add(1) {
+        return Err(JournalError::Corrupt);
+    }
+    if first.at_ms >= horizon {
+        return Ok(false);
+    }
+    rewrite_eligible(path, horizon)?;
+    if fs::metadata(path)?.len() == 0 {
+        remove(path);
+    }
+    Ok(true)
+}
+
+fn rewrite_eligible(path: &Path, horizon: u64) -> Result<(), JournalError> {
+    let temporary = path.with_extension("compact");
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        validated_lines(path, |line| {
+            if line.at_ms >= horizon {
+                file.write_all(&encode_line(&line)?)?;
+            }
+            Ok(())
+        })?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        remove(&temporary);
+    }
+    result
 }
 
 fn rewrite(path: &Path, lines: &[Line]) -> Result<(), JournalError> {
@@ -1020,6 +1096,279 @@ mod tests {
             .iter()
             .map(ConversationTurn::user)
             .collect()
+    }
+
+    #[test]
+    fn cold_recall_sweep_decodes_at_most_one_record_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let journal = Journal::open_with_age(
+            dir.path(),
+            Duration::from_secs(3600),
+            Duration::from_secs(7200),
+            RETENTION,
+        )
+        .expect("open");
+        append(
+            &journal,
+            &stem,
+            now - Duration::from_secs(5400),
+            GRANT,
+            "expired",
+        );
+        append_versioned(&journal, &stem, now - Duration::from_secs(20), "turn-0");
+        for index in 1..100 {
+            append(
+                &journal,
+                &stem,
+                now - Duration::from_secs(20),
+                GRANT,
+                &format!("turn-{index}"),
+            );
+        }
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
+        let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
+        assert_eq!(users(&recalled).last().copied(), Some("turn-99"));
+        use dekopon_agent::memory_tools::MemoryTools;
+        let tools = JournalMemoryTools {
+            journal: &journal,
+            stem: stem.clone(),
+            grant: GRANT.into(),
+            versions: [("original".into(), "v1".into())].into(),
+        };
+        assert!(tools.read(2, "original", None).starts_with("turn-0"));
+        PEAK_LIVE_DECODED
+            .with(|peak| assert!(peak.get() <= 1, "peak decoded records: {}", peak.get()));
+    }
+
+    fn append_versioned(journal: &Journal, stem: &str, now: SystemTime, user: &str) {
+        append(journal, stem, now, GRANT, user);
+        let mut lines = read_lines(&journal.path(stem)).expect("lines");
+        let last = lines.last_mut().expect("appended");
+        last.representations.push(Representation {
+            routine_id: "original".into(),
+            version: "v1".into(),
+            source_record_id: last.record_id,
+            part: None,
+            kind: "original".into(),
+            captured_bytes: user.len() as u64,
+            text: None,
+        });
+        rewrite(&journal.path(stem), &lines).expect("version");
+    }
+
+    #[test]
+    fn memory_tools_read_references_and_pins_survive_restart_without_copying_text() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        {
+            let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+            append_versioned(&journal, &stem, now, "read-line-sentinel");
+            append_versioned(&journal, &stem, now, "second");
+            let tools = JournalMemoryTools {
+                journal: &journal,
+                stem: stem.clone(),
+                grant: GRANT.into(),
+                versions: [("original".into(), "v1".into())].into(),
+            };
+            assert_eq!(tools.read(1, "original", Some((0, 4))), "read");
+            assert_eq!(
+                tools.set_pin(1, "original"),
+                "pinned record 1 to original; pinned text bytes: 41"
+            );
+            assert_eq!(
+                read_lines(&journal.path(&stem)).expect("lines")[0].reads[0].range,
+                Some((0, 4))
+            );
+        }
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("reopen");
+        let lines = read_lines(&journal.path(&stem)).expect("lines");
+        assert_eq!(lines[0].pins[0].record_id, 1);
+        assert_eq!(lines[0].reads[0].outcome, "read");
+        assert!(
+            !serde_json::to_string(&lines[0].reads)
+                .expect("references")
+                .contains("read-line-sentinel")
+        );
+        let tools = JournalMemoryTools {
+            journal: &journal,
+            stem,
+            grant: GRANT.into(),
+            versions: [("original".into(), "v1".into())].into(),
+        };
+        assert!(tools.set_pin(2, "original").starts_with("pinned record 2"));
+        assert_eq!(tools.clear_pin(Some(1)), "pin cleared");
+        let lines = read_lines(&journal.path(&tools.stem)).expect("lines");
+        assert!(lines[0].pins.is_empty());
+        assert_eq!(lines[1].pins[0].record_id, 2);
+        assert_eq!(
+            tools.set_pin(1, "original"),
+            "pinned record 1 to original; pinned text bytes: 41"
+        );
+        assert_eq!(tools.clear_pin(None), "pin cleared");
+        assert!(
+            read_lines(&journal.path(&tools.stem))
+                .expect("lines")
+                .iter()
+                .all(|line| line.pins.is_empty())
+        );
+    }
+
+    #[test]
+    fn memory_tools_refuse_changed_grants_expiry_missing_versions_and_invalid_ranges() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let stem = key().journal_stem();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        append_versioned(&journal, &stem, now, "canary");
+        let mut tools = JournalMemoryTools {
+            journal: &journal,
+            stem: stem.clone(),
+            grant: GRANT.into(),
+            versions: [("original".into(), "v1".into())].into(),
+        };
+        assert!(
+            tools
+                .read(1, "original", Some((4, 2)))
+                .starts_with("range unavailable")
+        );
+        assert_eq!(
+            read_lines(&journal.path(&stem)).expect("lines")[0].reads[0].outcome,
+            "invalid-range"
+        );
+        tools.versions.clear();
+        assert!(
+            tools
+                .read(1, "original", None)
+                .starts_with("representation unavailable")
+        );
+        tools.grant = "different".into();
+        assert!(
+            tools
+                .read(1, "original", None)
+                .starts_with("record unavailable")
+        );
+        assert!(
+            tools
+                .set_pin(1, "original")
+                .starts_with("record unavailable")
+        );
+        tools.grant = GRANT.into();
+        assert!(
+            tools
+                .read(999, "original", None)
+                .starts_with("record unavailable")
+        );
+        journal
+            .expire(now + Duration::from_secs(7201))
+            .expect("expire");
+        assert!(
+            tools
+                .read(1, "original", None)
+                .starts_with("record unavailable")
+        );
+    }
+
+    #[test]
+    fn a_summary_only_record_reads_without_resurrecting_its_original() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let stem = key().journal_stem();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        append(&journal, &stem, now, GRANT, "disposed-source-sentinel");
+        let mut lines = read_lines(&journal.path(&stem)).expect("lines");
+        let line = &mut lines[0];
+        line.user = None;
+        line.answer = None;
+        line.source_eligibility = false;
+        line.availability = vec!["summary".into()];
+        line.representations.push(Representation {
+            routine_id: "summary".into(),
+            version: "v1".into(),
+            source_record_id: 1,
+            part: None,
+            kind: "prefix".into(),
+            captured_bytes: 100,
+            text: Some("retained summary".into()),
+        });
+        rewrite(&journal.path(&stem), &lines).expect("rewrite");
+        let tools = JournalMemoryTools {
+            journal: &journal,
+            stem: stem.clone(),
+            grant: GRANT.into(),
+            versions: [
+                ("summary".into(), "v1".into()),
+                ("original".into(), "v1".into()),
+            ]
+            .into(),
+        };
+        assert_eq!(tools.read(1, "summary", None), "retained summary");
+        assert_eq!(
+            tools.set_pin(1, "summary"),
+            "pinned record 1 to summary; pinned text bytes: 16"
+        );
+        assert!(
+            tools
+                .read(1, "original", None)
+                .starts_with("representation unavailable")
+        );
+        assert!(
+            !fs::read_to_string(journal.path(&stem))
+                .expect("disk")
+                .contains("disposed-source-sentinel")
+        );
+        assert_eq!(
+            read_lines(&journal.path(&stem)).expect("lines")[0].reads[0].source_record_id,
+            1
+        );
+    }
+
+    #[test]
+    fn memory_tools_are_scoped_to_full_shared_or_private_conversation_keys() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let agent = "reviewer".parse().expect("agent");
+        let shared = ConversationKey::shared(&agent, "whatsapp-test", "chat").journal_stem();
+        let private = ConversationKey::private(
+            &agent,
+            "whatsapp-test",
+            "chat",
+            &"tel.16034700182".parse().expect("subject"),
+        )
+        .journal_stem();
+        append_versioned(&journal, &shared, SystemTime::now(), "shared-record");
+        let make = |stem| JournalMemoryTools {
+            journal: &journal,
+            stem,
+            grant: GRANT.into(),
+            versions: [("original".into(), "v1".into())].into(),
+        };
+        assert!(
+            make(private)
+                .read(1, "original", None)
+                .starts_with("record unavailable")
+        );
+        let shared_reader = make(shared.clone());
+        assert!(
+            shared_reader
+                .set_pin(1, "original")
+                .starts_with("pinned record")
+        );
+        assert!(
+            make(shared)
+                .read(1, "original", None)
+                .starts_with("shared-record")
+        );
+        assert_eq!(
+            read_lines(&journal.path(&shared_reader.stem)).expect("lines")[0].pins[0].record_id,
+            1
+        );
     }
 
     #[test]
