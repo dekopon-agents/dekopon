@@ -208,12 +208,20 @@ impl FromStr for ExternalSubject {
         let tenant = tenant
             .map(|tenant| match service {
                 SubjectService::Github => github_segment(tenant, "tenant", 39),
-                _ => require_canonical_segment(tenant, "tenant"),
+                SubjectService::Slack
+                | SubjectService::Discord
+                | SubjectService::Telegram
+                | SubjectService::Whatsapp
+                | SubjectService::Tel => require_canonical_segment(tenant, "tenant"),
             })
             .transpose()?;
         let subject = match service {
             SubjectService::Github => github_segment(subject, "subject", 100)?,
-            _ => require_canonical_segment(subject, "subject")?,
+            SubjectService::Slack
+            | SubjectService::Discord
+            | SubjectService::Telegram
+            | SubjectService::Whatsapp
+            | SubjectService::Tel => require_canonical_segment(subject, "subject")?,
         };
         let numeric = match service {
             SubjectService::Discord => is_discord_snowflake(&subject),
