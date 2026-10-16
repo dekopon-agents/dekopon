@@ -262,14 +262,14 @@ fn parse(
         }
         "workflow_run" => {
             let action = field(root, "/action", 64)?;
-            if action != "completed" {
-                return Some((subject, conversation, GithubEvent::WorkflowRun, None));
-            }
             let run = root
                 .pointer("/workflow_run/id")
                 .and_then(Value::as_u64)
                 .filter(|n| *n > 0)?;
             let sha = field(root, "/workflow_run/head_sha", 128)?;
+            if action != "completed" {
+                return Some((subject, conversation, GithubEvent::WorkflowRun, None));
+            }
             let conclusion = field(root, "/workflow_run/conclusion", 64)?;
             let association = root
                 .pointer("/workflow_run/pull_requests")
@@ -557,6 +557,64 @@ mod tests {
                 .expect("ignored signed run")
                 .3
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_run_identity_is_malformed_even_for_an_ignored_action() {
+        let (state, mut receiver) = state();
+        let mut body = json!({"repository":{"owner":{"login":"Owner"},"name":"Repo"},
+            "action":"requested"});
+        let missing = serde_json::to_vec(&body).expect("signed JSON");
+        assert_eq!(
+            process(
+                &state,
+                signed(&missing, b"secret", "no-run", "workflow_run"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        body["workflow_run"] = json!({"head_sha":"abc", "conclusion":null});
+        let missing_id = serde_json::to_vec(&body).expect("signed JSON");
+        assert_eq!(
+            process(
+                &state,
+                signed(&missing_id, b"secret", "no-id", "workflow_run"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        body["workflow_run"] = json!({"id":5, "conclusion":null});
+        let missing_sha = serde_json::to_vec(&body).expect("signed JSON");
+        assert_eq!(
+            process(
+                &state,
+                signed(&missing_sha, b"secret", "no-sha", "workflow_run"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        body["workflow_run"]["head_sha"] = json!("abc");
+        let pending = serde_json::to_vec(&body).expect("signed JSON");
+        assert_eq!(
+            process(
+                &state,
+                signed(&pending, b"secret", "pending", "workflow_run"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "no unselected run starts a turn"
         );
     }
 
