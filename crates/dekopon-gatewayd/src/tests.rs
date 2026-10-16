@@ -18630,7 +18630,7 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     assert!(read.contains("[request] printf result-sentinel"), "{read}");
     assert!(read.contains("[result]"), "{read}");
     assert!(read.contains("result-sentinel"), "{read}");
-    assert!(read.contains("outcome: success"), "{read}");
+    assert!(read.contains("outcome: success, exit: Some(0)"), "{read}");
     assert!(!read.contains("do the work"));
     assert!(!read.contains("done"));
     assert!(line["user"].is_null());
