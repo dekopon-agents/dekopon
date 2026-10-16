@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Render the live gateway projection and broker-only restart boundaries."""
 import json
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 CHART = Path(__file__).resolve().parents[1]
@@ -30,12 +32,27 @@ def render(*args):
 
 
 def notes(*args):
-    result = subprocess.run(
-        ["helm", "install", "dekopon", str(CHART), "--dry-run=client", "--debug", *args],
-        text=True, capture_output=True, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout.split("\nNOTES:\n", 1)[1]
+    with tempfile.TemporaryDirectory(prefix="dekopon-notes-") as temporary:
+        chart = Path(temporary) / "chart"
+        shutil.copytree(CHART, chart)
+        templates = chart / "templates"
+        text = (templates / "NOTES.txt").read_text()
+        (templates / "notes-probe.yaml").write_text(
+            '{{- define "dekopon.testNotes" -}}\n' + text + '\n{{- end }}\n'
+            'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-probe\ndata:\n'
+            '  notes: {{ include "dekopon.testNotes" . | quote }}\n'
+        )
+        result = subprocess.run(
+            ["helm", "template", "dekopon", str(chart), "--show-only", "templates/notes-probe.yaml", *args],
+            text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = subprocess.run(
+            ["yq", "-o=json", "-I=0", "."], input=result.stdout,
+            text=True, capture_output=True, check=False,
+        )
+        assert parsed.returncode == 0, parsed.stderr
+        return json.loads(parsed.stdout)["data"]["notes"]
 
 
 def mounts(container):
