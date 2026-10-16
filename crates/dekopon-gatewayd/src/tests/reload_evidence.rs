@@ -497,3 +497,102 @@ async fn gateway_refusal_identifies_each_unknown_route_without_echoing_its_value
     assert!(!reason.contains("unknown-first-sentinel"));
     assert!(!reason.contains("unknown-second-sentinel"));
 }
+
+#[tokio::test]
+async fn a_refused_proxy_rebuild_names_the_model_and_variable_it_lacks() {
+    use crate::proxy::tests::{JAIL, pki};
+    use dekopon_model_token_governor::Metering;
+    let pki = pki();
+    let tls = pki.directory.path();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["models"].as_array_mut().unwrap().push(json!({
+        "name": "claude",
+        "kind": "anthropic",
+        "model": "claude-opus-4-1",
+        "apiKeyEnv": "DEKOPON_RELOAD_WITNESS_FIRST_KEY"
+    }));
+    config["proxy"] = json!({
+        "bind": "127.0.0.1:0",
+        "tls": {
+            "certFile": tls.join("tls.crt"),
+            "keyFile": tls.join("tls.key"),
+            "clientCaFile": tls.join("ca.crt")
+        },
+        "jailIdentity": JAIL,
+        "guests": {"dekopon:reviewer-vm": {"agent": "reviewer", "models": ["claude"]}}
+    });
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let metering = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
+    let proxy = dekopon_model_proxy::ModelProxy::new(
+        Vec::new(),
+        std::collections::HashMap::new(),
+        Arc::clone(&metering),
+    )
+    .unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload_owners(
+        path,
+        candidate,
+        "b".repeat(64),
+        crate::gateway::ResidentModels {
+            credentials: Arc::new(crate::session::ConfiguredModels::default()),
+            metering,
+            proxy: Some(Arc::new(proxy)),
+        },
+    )
+    .unwrap();
+    let old_digest = gateway.digest_for_test();
+    config["models"][1]["apiKeyEnv"] = json!("DEKOPON_RELOAD_WITNESS_SECOND_KEY");
+    write_config(root.path(), &config);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("reason"), Some("proxy-model"));
+    let error = refused[0]
+        .field("error")
+        .expect("the refusal names its reason");
+    assert!(error.contains("\"claude\""), "{error}");
+    assert!(
+        error.contains("DEKOPON_RELOAD_WITNESS_SECOND_KEY"),
+        "{error}"
+    );
+    const SENTINEL: &str = "auth-file-secret-sentinel";
+    let auth = root.path().join("auth.json");
+    fs::write(&auth, format!("{{\"version\":\"{SENTINEL}\"}}")).unwrap();
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+    config["models"][1] = json!({
+        "name": "claude",
+        "kind": "chatgptSubscription",
+        "model": "gpt",
+        "authFile": auth,
+        "timeoutMs": 2000
+    });
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 2);
+    assert_eq!(refused[1].field("reason"), Some("proxy-model"));
+    let error = refused[1].field("error").unwrap();
+    assert!(
+        error.contains("\"claude\" credential could not be opened"),
+        "{error}"
+    );
+    assert!(!format!("{refused:?}").contains(SENTINEL), "{error}");
+    assert_eq!(gateway.digest_for_test(), old_digest);
+}

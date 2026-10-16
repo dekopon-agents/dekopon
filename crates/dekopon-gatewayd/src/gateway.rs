@@ -105,6 +105,7 @@ struct ReloadState {
 enum Unsettled {
     Monitor,
     Refused(&'static str),
+    Proxy(crate::proxy::ProxyStartError),
 }
 
 fn canonical_yaml(value: &serde_yaml::Value) -> Result<Vec<u8>, serde_json::Error> {
@@ -831,6 +832,10 @@ fn reload_problem(problem: &GatewaydError) -> String {
             | config::ConfigError::DecodeFragment { .. }),
         ) => format!("{problem}: {error}"),
         GatewaydError::Catalog(_) => problem.to_string(),
+        GatewaydError::Proxy(crate::proxy::ProxyStartError::Codex { model, source }) => format!(
+            "proxy model {model:?} credential could not be opened ({})",
+            source.kind().as_str()
+        ),
         GatewaydError::Probe(probe) => format!(
             "model {} probe failed ({})",
             probe.model,
@@ -928,6 +933,7 @@ impl ReloadState {
             let identity = match &unsettled {
                 Unsettled::Monitor => "monitor",
                 Unsettled::Refused(reason) => reason,
+                Unsettled::Proxy(_) => "proxy-model",
             };
             if !self.unreported(raw.refusing(identity)) {
                 return;
@@ -937,6 +943,12 @@ impl ReloadState {
                 Unsettled::Refused(reason) => {
                     tracing::warn!(event = "gateway_reload_refused", applied = false, reason);
                 }
+                Unsettled::Proxy(error) => tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    reason = "proxy-model",
+                    error = %reload_problem(&GatewaydError::Proxy(error))
+                ),
             }
         }
     }
@@ -958,7 +970,7 @@ impl ReloadState {
                     &self.metering,
                 ) {
                     Ok(proxy) => Some(proxy),
-                    Err(_) => return Err(Unsettled::Refused("proxy-model")),
+                    Err(error) => return Err(Unsettled::Proxy(error)),
                 },
                 _ => None,
             }
