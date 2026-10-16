@@ -501,6 +501,11 @@ impl ConversationStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn generation_for_test(&self, key: &ConversationKey) -> Option<u64> {
+        self.state.lock().slots.get(key).map(|slot| slot.generation)
+    }
+
     pub(crate) fn publication_eligible(
         &self,
         key: &ConversationKey,

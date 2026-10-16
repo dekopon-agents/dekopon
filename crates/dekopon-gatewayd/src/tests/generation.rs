@@ -308,8 +308,10 @@ impl ChatModel for SlowModel {
         _options: &CompletionOptions,
         _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
-        if self.0.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Ok(answer("delivered before summary"));
+        match self.0.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => return Ok(answer("delivered before summary")),
+            1 => {}
+            _ => return Ok(answer("second delivered")),
         }
         if let Some(sender) = self.0.notified.lock().take() {
             sender.send(()).expect("session receives generation start");
@@ -323,6 +325,115 @@ impl ChatModel for SlowModel {
             dekopon_model::error::ProtocolFailure::NoChoices,
         ))
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_remains_held_until_generation_and_append_finish() {
+    let directory = temporary();
+    let journal = temporary();
+    let responses = listings(1, &["cli-probe.upper"])
+        .into_iter()
+        .chain(listings(1, &["cli-probe.lower"]));
+    let (broker, mut observed) = stub_broker(directory.path(), responses.collect()).await;
+    let (notified, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let model = Arc::new(SlowSummary {
+        notified: Mutex::new(Some(notified)),
+        release: Mutex::new(released),
+        calls: AtomicUsize::new(0),
+    });
+    let runner = journaled_runner(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        journal.path(),
+    );
+    let mut first_route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    first_route.memory_policy = Some(policy("progressiveOneShot", &["summary"]));
+    let second_route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let first_message = message("one");
+    let key = ConversationKey::private(
+        &first_route.agent,
+        &first_route.transport,
+        &first_message.conversation.key(),
+        &first_message.subject,
+    );
+    let driver = Arc::new(RecordingDriver::default());
+    let first = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        first_route,
+        first_message,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .expect("generation started")
+        .unwrap();
+    assert_eq!(driver.replies(), ["delivered before summary"]);
+    let generation = runner
+        .conversations
+        .generation_for_test(&key)
+        .expect("first grant committed");
+    let mut second_message = message("two");
+    second_message.message_id = MessageId::Native("0123456789abcdef0123456789abcdef-1-2".into());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        run_session(
+            Arc::clone(&runner),
+            second_route,
+            second_message,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("same-conversation message queued instead of starting a second session");
+    assert_eq!(
+        capability_listings(&mut observed),
+        1,
+        "the second grant was not requested yet"
+    );
+    assert!(
+        runner
+            .conversations
+            .publication_eligible(&key, &granted(&["cli-probe.upper"]), generation),
+        "the grant-B begin cannot run during the first generation"
+    );
+    release.send(()).expect("release generation");
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("both admitted turns finish")
+        .unwrap();
+    assert_eq!(
+        capability_listings(&mut observed),
+        1,
+        "the queued turn requested grant B"
+    );
+    assert_eq!(
+        driver.replies(),
+        ["delivered before summary", "second delivered"]
+    );
+    let stem = key.journal_stem();
+    let bytes = fs::read_to_string(journal.path().join(&stem).with_extension("jsonl"))
+        .expect("both turns on disk");
+    let last: Value = serde_json::from_str(bytes.lines().last().expect("second record")).unwrap();
+    assert_eq!(
+        last["grant"],
+        crate::journal::grant_digest(&granted(&["cli-probe.lower"]))
+    );
+    let recall = runner
+        .journal
+        .as_ref()
+        .unwrap()
+        .recall(
+            &stem,
+            &crate::journal::grant_digest(&granted(&["cli-probe.lower"])),
+            recall_window(RecallSource::Journal),
+            SystemTime::now(),
+        )
+        .expect("grant-B recall");
+    assert_eq!(
+        recall.history.turns().last().map(ConversationTurn::user),
+        Some("two")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
