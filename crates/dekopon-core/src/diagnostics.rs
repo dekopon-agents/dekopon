@@ -44,11 +44,26 @@ pub fn bounded_problems(problems: impl ExactSizeIterator<Item = String>) -> Stri
 mod tests {
     use std::io;
 
-    use super::error_chain;
+    use super::{MAX_PROBLEM_BYTES, bounded_problems, error_chain};
 
     #[derive(Debug, thiserror::Error)]
     #[error("accepting a connection failed")]
     struct Wrapper(#[source] io::Error);
+
+    #[test]
+    fn refusal_renders_eight_bounded_problems_and_the_remaining_count() {
+        let long = "界".repeat(300);
+        let problems = std::iter::once(long)
+            .chain((1..10).map(|index| format!("problem #{index}")))
+            .collect::<Vec<_>>();
+        let rendered = bounded_problems(problems.into_iter());
+        let parts = rendered.split("; ").collect::<Vec<_>>();
+        assert_eq!(parts.len(), 9);
+        assert!(parts[0].len() <= MAX_PROBLEM_BYTES);
+        assert!(parts[0].ends_with("…[truncated]"));
+        assert_eq!(parts[7], "problem #7");
+        assert_eq!(parts[8], "and 2 more");
+    }
 
     #[test]
     fn renders_the_wrapper_and_its_cause() {

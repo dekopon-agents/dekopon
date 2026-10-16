@@ -154,4 +154,118 @@ async fn unsafe_reload_refusal_and_monitor_failure_are_not_activation() {
             .is_empty()
     );
     assert_eq!(gateway.digest_for_test(), old_digest);
+    gateway.reconcile().await;
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_reload_monitor_failed")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let active = gateway.digest_for_test();
+    let (capture, _guard) = capture_spans();
+    config["routes"][0]["agent"] = json!("unknown-first");
+    write_config(root.path(), &config);
+    for _ in 0..3 {
+        gateway.reconcile().await;
+    }
+    let refused =
+        || capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused().len(), 1);
+    config["routes"][0]["agent"] = json!("unknown-second");
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert_eq!(refused().len(), 2);
+    config["routes"][0]["agent"] = json!("reviewer");
+    write_config(root.path(), &config);
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    let applied = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].field("category.count"), Some("0"));
+    assert_eq!(applied[0].field("generation.digest"), Some(active.as_str()));
+    config["routes"][0]["agent"] = json!("unknown-second");
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert_eq!(refused().len(), 3);
+    assert_eq!(gateway.digest_for_test(), active);
+}
+
+#[tokio::test]
+async fn gateway_refusal_identifies_each_unknown_route_without_echoing_its_value() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let mut second = config["routes"][0].clone();
+    second["agent"] = json!("unknown-second-sentinel");
+    config["routes"][0]["agent"] = json!("unknown-first-sentinel");
+    config["routes"].as_array_mut().unwrap().push(second);
+    write_config(root.path(), &config);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let reason = refused[0].field("error").unwrap();
+    assert!(reason.contains("routes[0]"), "{reason}");
+    assert!(reason.contains("routes[1]"), "{reason}");
+    assert!(!reason.contains("unknown-first-sentinel"));
+    assert!(!reason.contains("unknown-second-sentinel"));
 }
