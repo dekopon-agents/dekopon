@@ -21,6 +21,8 @@ mod failure;
 pub mod fragments;
 #[cfg(unix)]
 pub mod private_file;
+#[cfg(unix)]
+mod projection;
 mod redaction;
 mod skill;
 mod subject;
@@ -37,6 +39,8 @@ pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_erro
 pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, bounded_display};
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
+#[cfg(unix)]
+pub use projection::{Projection, ProjectionError, effective_uid};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectSegment, SubjectService};

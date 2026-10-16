@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dekopon_core::{SkillId, SkillIdError};
+use dekopon_core::{Projection, ProjectionError, SkillId, SkillIdError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -136,30 +136,98 @@ struct FrontMatter {
 }
 
 pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
-    let directory = directory.as_ref();
+    load_skill_with(directory.as_ref(), |entry| {
+        Projection::resolve(entry, dekopon_core::effective_uid())
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Tree<'a> {
+    Plain,
+    Projected(&'a Projection),
+}
+
+impl Tree<'_> {
+    fn admit(self, path: &Path, metadata: &fs::Metadata) -> Result<(), SkillError> {
+        match self {
+            Self::Plain => Ok(()),
+            Self::Projected(projection) if projection.admits(metadata) => Ok(()),
+            Self::Projected(_) => Err(SkillError::InsecureProjection {
+                path: path.to_path_buf(),
+            }),
+        }
+    }
+}
+
+fn load_skill_with(
+    directory: &Path,
+    trust: impl FnOnce(&Path) -> Result<Projection, ProjectionError>,
+) -> Result<Skill, SkillError> {
     let metadata = fs::symlink_metadata(directory).map_err(|source| SkillError::Read {
         path: directory.to_path_buf(),
         source,
     })?;
-    if metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_symlink() {
+        return load_tree(directory, directory, Tree::Plain);
+    }
+    if !Projection::is_claimed(directory) {
         return Err(SkillError::Symlink {
             path: directory.to_path_buf(),
         });
     }
+    let refusal = |error| match error {
+        ProjectionError::Untrusted { .. } => SkillError::InsecureProjection {
+            path: directory.to_path_buf(),
+        },
+        ProjectionError::Switched { .. } => SkillError::ChangedDuringLoad {
+            path: directory.to_path_buf(),
+        },
+        ProjectionError::Io { path, source } => SkillError::Read { path, source },
+    };
+    let projection = trust(directory).map_err(refusal)?;
+    let mut skill = load_tree(directory, projection.target(), Tree::Projected(&projection))?;
+    skill.directories = skill
+        .directories
+        .into_iter()
+        .map(|(path, names)| {
+            let relative = path.strip_prefix(projection.target()).map_err(|source| {
+                SkillError::OutsideRoot {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            Ok((
+                directory
+                    .components()
+                    .chain(relative.components())
+                    .collect(),
+                names,
+            ))
+        })
+        .collect::<Result<_, SkillError>>()?;
+    projection.confirm().map_err(refusal)?;
+    Ok(skill)
+}
+
+fn load_tree(declared: &Path, directory: &Path, tree: Tree<'_>) -> Result<Skill, SkillError> {
+    let metadata = fs::symlink_metadata(directory).map_err(|source| SkillError::Read {
+        path: directory.to_path_buf(),
+        source,
+    })?;
     if !metadata.is_dir() {
         return Err(SkillError::NotADirectory {
             path: directory.to_path_buf(),
         });
     }
-    let directory_name = directory
+    let directory_name = declared
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| SkillError::NotADirectory {
-            path: directory.to_path_buf(),
+            path: declared.to_path_buf(),
         })?;
 
     let skill_file = directory.join(SKILL_FILE_NAME);
-    let text = read_bounded_text(&skill_file, MAX_SKILL_FILE_BYTES)?;
+    let text = read_bounded_text(&skill_file, MAX_SKILL_FILE_BYTES, tree)?;
     let (front_matter, body) = split_front_matter(&text, &skill_file)?;
     let front_matter = serde_yaml::from_str::<FrontMatter>(front_matter).map_err(|source| {
         SkillError::FrontMatter {
@@ -219,7 +287,7 @@ pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
     let mut total_bytes = 0_usize;
     let mut directories = BTreeMap::new();
     collect_resources(
-        directory,
+        (directory, tree),
         directory,
         0,
         &mut resources,
@@ -243,7 +311,7 @@ pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
             .filter(|value| !value.trim().is_empty()),
         body: body.trim().to_owned(),
         resources,
-        source: directory.to_path_buf(),
+        source: declared.to_path_buf(),
         file: text,
         directories,
     })
@@ -278,7 +346,7 @@ fn split_front_matter<'a>(text: &'a str, path: &Path) -> Result<(&'a str, &'a st
 /// Symlinks are refused rather than followed, since a link is how content would escape the
 /// directory that was reviewed.
 fn collect_resources(
-    root: &Path,
+    (root, tree): (&Path, Tree<'_>),
     directory: &Path,
     depth: usize,
     resources: &mut Vec<SkillResource>,
@@ -317,13 +385,21 @@ fn collect_resources(
             return Err(SkillError::Symlink { path });
         }
         if metadata.is_dir() {
+            tree.admit(&path, &metadata)?;
             if depth + 1 > MAX_SKILL_RESOURCE_DEPTH {
                 return Err(SkillError::TooDeep {
                     path,
                     maximum: MAX_SKILL_RESOURCE_DEPTH,
                 });
             }
-            collect_resources(root, &path, depth + 1, resources, total_bytes, directories)?;
+            collect_resources(
+                (root, tree),
+                &path,
+                depth + 1,
+                resources,
+                total_bytes,
+                directories,
+            )?;
             continue;
         }
         if !metadata.is_file() {
@@ -338,7 +414,7 @@ fn collect_resources(
                 maximum: MAX_SKILL_RESOURCES,
             });
         }
-        let text = read_bounded_text(&path, MAX_SKILL_RESOURCE_BYTES)?;
+        let text = read_bounded_text(&path, MAX_SKILL_RESOURCE_BYTES, tree)?;
         *total_bytes = total_bytes.saturating_add(text.len());
         if *total_bytes > MAX_SKILL_TOTAL_BYTES {
             return Err(SkillError::ResourcesTooLarge {
@@ -364,7 +440,7 @@ fn collect_resources(
     Ok(())
 }
 
-fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> {
+fn read_bounded_text(path: &Path, maximum: usize, tree: Tree<'_>) -> Result<String, SkillError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| SkillError::Read {
         path: path.to_path_buf(),
         source,
@@ -374,6 +450,7 @@ fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> 
             path: path.to_path_buf(),
         });
     }
+    tree.admit(path, &metadata)?;
     if !metadata.is_file() {
         return Err(SkillError::NotRegular {
             path: path.to_path_buf(),
@@ -438,6 +515,10 @@ pub enum SkillError {
     },
     #[error("skill path {path} is a symbolic link, which a skill directory may not contain")]
     Symlink { path: PathBuf },
+    #[error("skill path {path} is not a trusted read-only projection")]
+    InsecureProjection { path: PathBuf },
+    #[error("skill projection {path} switched generations while it was read")]
+    ChangedDuringLoad { path: PathBuf },
     #[error("skill path {path} is neither a regular file nor a directory")]
     NotRegular { path: PathBuf },
     #[error("skill directory {path} is nested deeper than {maximum} levels")]
@@ -484,9 +565,13 @@ pub enum SkillError {
 mod tests {
     use std::{fs, path::Path};
 
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    use dekopon_core::Projection;
+
     use super::{
         MAX_SKILL_DESCRIPTION_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_RESOURCES, SKILL_FILE_NAME,
-        SkillError, load_skill,
+        SkillError, load_skill, load_skill_with,
     };
 
     const SKILL: &str = "---\nname: pull-request-review\ndescription: Use when reviewing a pull request; covers what to read and how to comment.\nlicense: MIT\nmetadata:\n  author: dekopon\n  version: 2\n---\n\n# Pull request review\n\nRead the diff before commenting.\n";
@@ -542,6 +627,201 @@ mod tests {
         );
         assert!(skill.resource(".hidden").is_none());
         assert_eq!(skill.source(), directory);
+        assert_eq!(
+            skill.directories().keys().collect::<Vec<_>>(),
+            [&directory, &directory.join("references")]
+        );
+    }
+
+    const PROJECTED: &str =
+        "---\nname: pull-request-review\ndescription: Use when reviewing a pull request.\n---\n";
+
+    fn generation(root: &Path, name: &str, body: &str, resources: &[(&str, &str)]) {
+        let directory = root.join(name).join("pull-request-review");
+        fs::create_dir_all(&directory).expect("generation directory");
+        fs::write(
+            directory.join(SKILL_FILE_NAME),
+            format!("{PROJECTED}{body}\n"),
+        )
+        .expect("projected skill file");
+        for (path, text) in resources {
+            let path = directory.join(path);
+            fs::create_dir_all(path.parent().expect("resource parent")).expect("resource parent");
+            fs::write(path, text).expect("projected resource");
+        }
+    }
+
+    fn publish(root: &Path, name: &str) {
+        symlink(name, root.join("..data_tmp")).expect("next data link");
+        fs::rename(root.join("..data_tmp"), root.join("..data")).expect("atomic data swap");
+    }
+
+    fn atomic_writer_mount() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        generation(
+            root.path(),
+            "..2026_10_16_20_00_00.1",
+            "first",
+            &[("references/checklist.md", "- read the tests\n")],
+        );
+        publish(root.path(), "..2026_10_16_20_00_00.1");
+        let entry = root.path().join("pull-request-review");
+        symlink("..data/pull-request-review", &entry).expect("entry link");
+        (root, entry)
+    }
+
+    fn load_projected(entry: &Path, uid: u32, read_only: bool) -> Result<super::Skill, SkillError> {
+        load_skill_with(entry, |entry| Projection::verify(entry, uid, read_only))
+    }
+
+    #[test]
+    fn an_atomic_writer_projection_loads_through_its_data_generation() {
+        let (_root, entry) = atomic_writer_mount();
+
+        let skill = load_projected(&entry, dekopon_core::effective_uid(), true)
+            .expect("a read-only projection owned by this uid loads");
+
+        assert_eq!(skill.name().as_str(), "pull-request-review");
+        assert_eq!(skill.body(), "first");
+        assert_eq!(
+            skill
+                .resource("references/checklist.md")
+                .map(|resource| resource.text.as_str()),
+            Some("- read the tests\n")
+        );
+        assert_eq!(skill.source(), entry);
+        assert_eq!(
+            skill.directories().keys().collect::<Vec<_>>(),
+            [&entry, &entry.join("references")]
+        );
+    }
+
+    #[test]
+    fn a_live_skill_edit_loads_the_next_generation_and_a_mid_read_switch_refuses() {
+        let (root, entry) = atomic_writer_mount();
+        let uid = dekopon_core::effective_uid();
+        assert_eq!(
+            load_projected(&entry, uid, true).expect("first").body(),
+            "first"
+        );
+
+        generation(
+            root.path(),
+            "..2026_10_16_20_05_00.2",
+            "second",
+            &[("references/new.md", "added\n")],
+        );
+        publish(root.path(), "..2026_10_16_20_05_00.2");
+        let skill = load_projected(&entry, uid, true).expect("second generation loads");
+        assert_eq!(skill.body(), "second");
+        assert_eq!(
+            skill
+                .resources()
+                .iter()
+                .map(|resource| resource.path.as_str())
+                .collect::<Vec<_>>(),
+            ["references/new.md"]
+        );
+
+        generation(root.path(), "..2026_10_16_20_10_00.3", "third", &[]);
+        let error = load_skill_with(&entry, |entry| {
+            let projection = Projection::verify(entry, uid, true);
+            publish(root.path(), "..2026_10_16_20_10_00.3");
+            projection
+        })
+        .expect_err("a generation switch during the read is not one skill");
+        assert!(
+            matches!(&error, SkillError::ChangedDuringLoad { path } if *path == entry),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_projection_link_that_leaves_the_mount_is_refused() {
+        let (root, entry) = atomic_writer_mount();
+        let uid = dekopon_core::effective_uid();
+        let outside = tempfile::tempdir().expect("outside directory");
+        generation(outside.path(), "skills", "outside", &[]);
+
+        fs::remove_file(&entry).expect("entry link");
+        symlink(outside.path().join("skills/pull-request-review"), &entry).expect("escape");
+        assert!(matches!(
+            load_projected(&entry, uid, true),
+            Err(SkillError::InsecureProjection { .. })
+        ));
+
+        fs::remove_file(&entry).expect("escape link");
+        symlink("..data/pull-request-review", &entry).expect("entry link");
+        fs::remove_file(root.path().join("..data")).expect("data link");
+        symlink(outside.path().join("skills"), root.path().join("..data")).expect("data escape");
+        assert!(matches!(
+            load_projected(&entry, uid, true),
+            Err(SkillError::InsecureProjection { .. })
+        ));
+
+        publish(root.path(), "..2026_10_16_20_00_00.1");
+        let leak = root
+            .path()
+            .join("..2026_10_16_20_00_00.1/pull-request-review/references/leak.md");
+        symlink(
+            outside.path().join("skills/pull-request-review/SKILL.md"),
+            &leak,
+        )
+        .expect("nested link");
+        assert!(matches!(
+            load_projected(&entry, uid, true),
+            Err(SkillError::Symlink { path }) if path.ends_with("references/leak.md")
+        ));
+    }
+
+    #[test]
+    fn a_writable_projection_is_refused() {
+        let (root, entry) = atomic_writer_mount();
+        let uid = dekopon_core::effective_uid();
+        assert!(matches!(
+            load_projected(&entry, uid, false),
+            Err(SkillError::InsecureProjection { .. })
+        ));
+
+        let resource = root
+            .path()
+            .join("..2026_10_16_20_00_00.1/pull-request-review/references/checklist.md");
+        fs::set_permissions(&resource, fs::Permissions::from_mode(0o666)).expect("writable file");
+        assert!(matches!(
+            load_projected(&entry, uid, true),
+            Err(SkillError::InsecureProjection { path }) if path == resource
+        ));
+        fs::set_permissions(&resource, fs::Permissions::from_mode(0o444)).expect("read-only file");
+
+        let generation = root.path().join("..2026_10_16_20_00_00.1");
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o777))
+            .expect("writable generation");
+        assert!(matches!(
+            load_projected(&entry, uid, true),
+            Err(SkillError::InsecureProjection { .. })
+        ));
+    }
+
+    #[test]
+    fn a_projection_owned_by_another_uid_is_refused() {
+        let (_root, entry) = atomic_writer_mount();
+        let foreign = dekopon_core::effective_uid().wrapping_add(1);
+        assert!(matches!(
+            load_projected(&entry, foreign, true),
+            Err(SkillError::InsecureProjection { .. })
+        ));
+    }
+
+    #[test]
+    fn a_symlinked_skill_directory_outside_a_projection_is_refused() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let real = write_skill(root.path(), "real", SKILL);
+        let linked = root.path().join("pull-request-review");
+        symlink(&real, &linked).expect("directory link");
+        assert!(matches!(
+            load_skill(&linked),
+            Err(SkillError::Symlink { path }) if path == linked
+        ));
     }
 
     #[test]

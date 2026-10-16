@@ -648,6 +648,12 @@ async fn regular_gateway_source_read_checks_injected_root_and_mount_ownership() 
     ));
 }
 
+fn read_projection(path: &Path, after_read: impl FnOnce()) -> Result<Vec<u8>, ConfigError> {
+    let projection = dekopon_core::Projection::verify(path, crate::current_uid(), true)
+        .map_err(config::projection_refusal)?;
+    config::read_projected_file(path, &projection, after_read)
+}
+
 #[test]
 fn a_projection_switch_during_read_is_a_changed_candidate() {
     let root = temporary();
@@ -661,7 +667,7 @@ fn a_projection_switch_during_read_is_a_changed_candidate() {
     std::os::unix::fs::symlink("..old", &data).unwrap();
     std::os::unix::fs::symlink("..data/gateway.yaml", &path).unwrap();
     assert!(matches!(
-        config::read_gateway_projection_with(&path, crate::current_uid(), true, || {
+        read_projection(&path, || {
             let next = root.path().join("..next");
             std::os::unix::fs::symlink("..new", &next).unwrap();
             fs::rename(next, &data).unwrap();
@@ -685,27 +691,46 @@ fn a_read_only_projection_follows_the_replaced_data_generation() {
     let key = root.path().join("gateway.yaml");
     std::os::unix::fs::symlink("..old", &data).unwrap();
     std::os::unix::fs::symlink("..data/gateway.yaml", &key).unwrap();
-    assert_eq!(
-        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
-        b"first"
-    );
+    assert_eq!(read_projection(&key, || {}).unwrap(), b"first");
     std::os::unix::fs::symlink("..new", root.path().join("..next")).unwrap();
     fs::rename(root.path().join("..next"), &data).unwrap();
-    assert_eq!(
-        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
-        b"second"
-    );
+    assert_eq!(read_projection(&key, || {}).unwrap(), b"second");
     fs::set_permissions(
         root.path().join("..new/gateway.yaml"),
         fs::Permissions::from_mode(0o666),
     )
     .unwrap();
     assert!(matches!(
-        config::read_gateway_projection_at(&key, crate::current_uid(), true),
-        Err(ConfigError::InsecureFile {
-            source: dekopon_core::FileHygieneError::InsecureMode { .. },
-            ..
-        })
+        read_projection(&key, || {}),
+        Err(ConfigError::InsecureProjection { .. })
+    ));
+}
+
+#[test]
+fn a_projected_skill_directory_snapshots_the_listing_of_its_data_generation() {
+    let root = temporary();
+    let skill = root.path().join("..2026_10_16/pull-request-review");
+    fs::create_dir_all(skill.join("references")).unwrap();
+    fs::write(skill.join("SKILL.md"), b"skill").unwrap();
+    std::os::unix::fs::symlink("..2026_10_16", root.path().join("..data")).unwrap();
+    let entry = root.path().join("pull-request-review");
+    std::os::unix::fs::symlink("..data/pull-request-review", &entry).unwrap();
+    let projection = dekopon_core::Projection::verify(&entry, crate::current_uid(), true).unwrap();
+    let mut expected = Vec::new();
+    for name in ["SKILL.md", "references"] {
+        expected.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
+        expected.extend_from_slice(name.as_bytes());
+    }
+    assert_eq!(
+        config::read_projected_listing(&entry, &projection).unwrap(),
+        expected
+    );
+    fs::create_dir(root.path().join("..2026_10_17")).unwrap();
+    std::os::unix::fs::symlink("..2026_10_17", root.path().join("..next")).unwrap();
+    fs::rename(root.path().join("..next"), root.path().join("..data")).unwrap();
+    assert!(matches!(
+        config::read_projected_listing(&entry, &projection),
+        Err(ConfigError::ChangedDuringLoad)
     ));
 }
 
