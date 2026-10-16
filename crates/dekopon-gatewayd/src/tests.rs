@@ -1334,6 +1334,10 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one config fixture checks structure and boot credential outcomes"
+)]
 async fn github_config_checks_structure_before_boot_secret_and_mount() {
     let directory = temporary();
     fs::write(
@@ -1607,6 +1611,10 @@ async fn authorize_github_fixture(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one mounted socket exercises queue saturation, eviction and restart in order"
+)]
 async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
     use crate::transport::{
         ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
