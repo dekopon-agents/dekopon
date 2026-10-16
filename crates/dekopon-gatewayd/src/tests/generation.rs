@@ -445,6 +445,11 @@ async fn admission_remains_held_until_generation_and_append_finish() {
         )
         .expect("grant-B recall");
     assert_eq!(
+        recall.history.turns().len(),
+        1,
+        "grant A is not recalled under grant B"
+    );
+    assert_eq!(
         recall.history.turns().last().map(ConversationTurn::user),
         Some("two")
     );
