@@ -107,7 +107,7 @@ see [Draining takes both graces, in sequence](#draining-takes-both-graces-in-seq
 Kubernetes 1.29 or newer, and `Chart.yaml` declares `kubeVersion: ">=1.29.0-0"` so an older cluster
 refuses the install instead of deadlocking on an init container that never exits.
 
-## Why an init container, and not a volume mount
+## Why the broker still needs an init container
 
 `dekopon-brokerd` validates every path it touches, in tiers, and refuses to serve when one is
 wrong:
@@ -115,20 +115,20 @@ wrong:
 | Tier | Applies to | Rule |
 |---|---|---|
 | A | `broker-credentials.yaml`, `secret-map.yaml` | rejected if `mode & 0o077 != 0` |
-| B | `broker.yaml`, `policies.cedar`, `gatewayd.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
+| B | `broker.yaml`, `policies.cedar`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
 | C | `providerSet.storePath` (the parent of generated `cwasm`) and the parent of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
-| E | `catalogPath` | no checks at all |
+| E | gateway config, catalog and skills | root or daemon UID, no group/world write; projected symlinks only on a trusted read-only mount |
 
 Broker IPC instead uses the exact owner/group/mode checks in the [current boundary](security-model.md#current-local-process-boundary); local chat remains private.
 
 Tier A and B additionally require `uid == geteuid()`, `nlink == 1`, and an open with `O_NOFOLLOW`.
 
-No Kubernetes volume can present a file that satisfies A or B:
+No Kubernetes volume can present a broker file that satisfies A or B:
 
 | Mount shape | What the daemon sees | Result |
 |---|---|---|
-| `secret` / `configMap` volume | `key -> ..data/key -> ..2026_…/key` | `O_NOFOLLOW` returns `ELOOP` before any mode is examined |
+| `secret` / `configMap` volume | `key -> ..data/key -> ..2026_…/key` | broker's `O_NOFOLLOW` returns `ELOOP` before any mode is examined |
 | the same with `subPath` | a real file, `root:root`, `0644` | owner is not the daemon's euid; A also fails on `0o044` |
 | any of the above plus `fsGroup` | `65532:2000`, `0640` | passes B, fails A — `0o040` is exactly what `mode & 0o077` rejects |
 
@@ -136,17 +136,20 @@ No Kubernetes volume can present a file that satisfies A or B:
 volume" and here it is the thing that breaks the credentials file specifically. It is absent from
 `podSecurityContext`, and adding it is a chart render refusal.
 
-So the chart mounts nothing the daemons read. A `projected` volume gathers every source into
-`/dekopon-source`, visible only to the init container, and the init container copies:
+The chart gathers broker copy sources in `/dekopon-source`, visible only to init, and copies:
 
 ```sh
 install -m 0600 -o 65532 -g 65532 /dekopon-source/broker.yaml /etc/dekopon/broker.yaml
 ```
 
 which produces a fresh regular file, one link, mode `0600`, owned by `65532` — a shape that
-satisfies A and B at once. Losing update propagation costs nothing: each of these files is read
-once, at startup, and the chart's `checksum/config` annotation rolls the pod when an inline value
-changes. It cannot see into an `existingSecret`, so roll the pod yourself after editing one.
+satisfies A and B at once. Broker copies are read at startup: `checksum/config` rolls the pod
+when inline broker configuration changes. An external broker Secret or a broker `host.yaml`
+fragment still needs an operator-managed restart (for example, Reloader) when edited. Gateway
+configuration instead mounts a distinct read-only Secret or ConfigMap directory directly at
+`paths.gatewayConfigDir`, with no `subPath`: the gateway trusts only a root- or daemon-owned,
+non-group/world-writable projection on a read-only mount and reconciles its updated contents.
+Neither broker policy nor credential projections are visible in the gateway container.
 
 The init container is the only thing in the chart that runs as root, and it holds `CHOWN` and
 `FOWNER` and nothing else. `CHOWN` is what lets it hand a directory to `65532`; `FOWNER` is what
@@ -164,21 +167,15 @@ file rather than a broker that starts and then refuses to serve.
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters
   `broker.yaml`. A receiver on a private CA needs `otlp.caBundle` (a ConfigMap and key of PEM
   roots), which both daemons read as `OTEL_EXPORTER_OTLP_CERTIFICATE`.
-- **The agent catalog.** Tier E. `dekopon-gatewayd` reads `catalogPath` with a plain `read_to_string`, so a
-  ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
-  for the catalog files alone. For agents declaring `spec.skills`, use `gateway.skills.configMap`
-  and `gateway.skills.items` to map flat ConfigMap keys to nested paths such as
-  `pull-request-review/SKILL.md` and `pull-request-review/references/review.md`. The init container
-  dereferences the projection into fresh regular files in a memory-backed emptyDir, bounded by
-  `volumeSizes.config`. Public skill text is root-owned, with 0755 directories and 0644 files;
-  the gateway and console mount it read-only at `paths.skillsDir` (default `/etc/dekopon-skills`).
-  Neither the broker nor either runtime container mounts the symlinked source. Credentials must
-  never be placed in this ConfigMap. An Agent can mount `/etc/dekopon-skills/pull-request-review`
-  without changing its existing catalog mount or widening any broker grant. `dekopon-gatewayd` still
-  refuses unreadable, invalid or symlinked skill resources at startup.
-  Like other externally supplied startup files, skill changes need a pod rollout; configure
-  your existing ConfigMap reloader or roll the pod explicitly. The chart cannot checksum an
-  external ConfigMap.
+- **Agent catalog and skills.** The catalog ConfigMap mounts directly at `paths.catalogDir`.
+  For agents declaring `spec.skills`, use `gateway.skills.configMap` and `gateway.skills.items`
+  to map flat keys to nested paths such as `pull-request-review/SKILL.md`. The gateway and
+  console mount the ConfigMap directly and read-only at `paths.skillsDir`; the broker has no
+  mount. The skill loader accepts only the root-owned, read-only AtomicWriter `..data` chain
+  inside that projection; arbitrary or escaping symlinks, writable files and untrusted owners
+  refuse. Do not add `fsGroup` or a group/world-writable `defaultMode`. Skills are public model
+  text, never credentials. Edits become available on successful gateway reconciliation without
+  an init copy or pod roll. The chart adds no gateway-only checksum trigger.
 - **Provider components.** The image already bakes `/opt/dekopon/providers/*.wasm` owned by
   `65532:65532` under a `65532`-owned `0755` directory, which is what Tier B wants.
 - **The ChatGPT credentials**, for the opposite reason from all of these. `load_credentials` is a
@@ -214,9 +211,10 @@ skips that validation. The broker never mounts this Secret. No Ingress or extern
 Your `broker.yaml` and `gatewayd.yaml` must name files inside these directories. The chart places
 files; it does not rewrite configuration.
 
-Both containers use `paths.configDir` at runtime, but these are **different tmpfs volumes**.
-Init mounts the gateway volume at `paths.gatewayConfigDir` (default `/etc/dekopon-gateway`)
-only to copy its `gatewayd.yaml` as UID 65533. Broker copies remain UID 65532.
+The broker's `paths.configDir` is a private tmpfs populated by init as UID 65532.
+The gateway alone mounts its separate read-only source at `paths.gatewayConfigDir`
+(default `/etc/dekopon-gateway`); init does not copy its config. A single Secret key is
+projected as `gatewayd.yaml`, or the ConfigMap fragment directory is mounted intact.
 The state claim root stays root-owned `0700` and neither daemon mounts it. With `broker.chatgpt`
 enabled the broker mounts only its own credential subdirectory, and the gateway mounts only the
 configured ChatGPT subdirectory. Neither daemon can rename the other's directory.
@@ -247,10 +245,10 @@ action performed by this chart.
 | `broker-credentials.yaml` | `/etc/dekopon/broker-credentials.yaml` | A | init container |
 | private `secret-map.yaml` | `/etc/dekopon/secret-map.yaml` | A | init container; broker only |
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
-| `gatewayd.yaml` | `/etc/dekopon/gatewayd.yaml` | B | init container |
+| `gatewayd.yaml` | `/etc/dekopon-gateway/gatewayd.yaml` | gateway projection | read-only Secret mount, gateway only |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
 | broker assets | `/var/lib/dekopon-assets` (`brokerAssets.rootPath`) | owned `0700` dir, broker-only disk `emptyDir` | init sets ownership; broker writes spools and outputs; match `brokerAssets` in operator inline `assets` config |
-| agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
+| agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | read-only ConfigMap mount |
 | gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopon-gatewayd` owns it |
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
@@ -867,12 +865,15 @@ the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespac
 [<console.subject>]` when the console is enabled with a subject. A ConfigMap key named
 `peers.yaml` fails the init container while this is on.
 
-`gateway.configDirectory.configMap` does the same for dekopon-gatewayd: every `*.yaml` key lands in
-`gatewayd.d`, owned by `65533`, and `gateway.config` must be empty.
-
-The chart cannot hash a ConfigMap it did not render, so Reloader is the restart path: annotate the
-ConfigMap `reloader.stakater.com/match: "true"` and put `reloader.stakater.com/search: "true"` in
-`deploymentAnnotations`.
+`gateway.configDirectory.configMap` mounts the ConfigMap directly at `paths.gatewayConfigDir`;
+`--config` points to that directory, and `gateway.config` must be empty. A projected key is
+root-owned and non-group/world-writable. No `subPath` or init copy pins its contents. Gateway
+catalog, config and skills updates are reconciled, not rolled. The chart cannot hash an external
+broker ConfigMap: keep broker fragments (including `host.yaml`) on the operator's restart path.
+For Reloader, annotate that broker ConfigMap `reloader.stakater.com/match: "true"` and set
+`reloader.stakater.com/search: "true"` in `deploymentAnnotations`; do not include gateway-only
+ConfigMaps on the shared-pod Reloader list. Secret material still requires its established
+restart/credential lifecycle.
 
 `broker.secretBootstrapFiles` copies operator-managed Secret keys through the existing root init
 boundary into `<paths.configDir>/<file>` as broker-UID-owned `0600` files, which is how token/session

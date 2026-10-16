@@ -87,7 +87,7 @@ initSecurityContext:
 #   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
 #   <configDir>/policies.cedar            0600 65532  (Tier B)
 #   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
-#   <configDir>/gatewayd.yaml             0600 65533  (gateway-only volume)
+#   <gatewayConfigDir>/gatewayd.yaml      root-owned read-only Secret projection (gateway only)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
 #   <catalogDir>/<catalog key>            root or gateway UID, no group/world write; root requires a read-only mount
@@ -373,8 +373,9 @@ gateway:
     existingSecret: ""
     existingSecretKey: gatewayd.yaml
 
-  # The alternative to config: a ConfigMap whose every *.yaml key becomes a fragment in
-  # gatewayd.d, and dekopon-gatewayd starts with --config on that directory. gateway.config must be empty.
+  # The alternative to config: mount a ConfigMap of *.yaml fragments directly at
+  # paths.gatewayConfigDir, and start dekopon-gatewayd with --config on that directory.
+  # gateway.config must be empty; avoid subPath so AtomicWriter replacements remain visible.
   configDirectory:
     configMap: ""
 
@@ -389,9 +390,9 @@ gateway:
     # Filename the catalog is mounted as, and therefore the leaf your catalogPath must name.
     fileName: dekopon.yaml
 
-  # Project nested skill paths, then copy to regular files before the gateway starts.
-  # ConfigMap symlinks are not accepted by the skill loader. These are public model text,
-  # never credentials; mount read-only at paths.skillsDir in gateway and console, not broker.
+  # Project nested skill paths directly at paths.skillsDir. The gateway accepts only trusted
+  # read-only AtomicWriter links under that root; do not enable fsGroup or group/world write.
+  # These are public model text, never credentials; gateway and console mount them, not broker.
   skills:
     configMap: ""
     items: []

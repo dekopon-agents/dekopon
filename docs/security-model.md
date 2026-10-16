@@ -66,10 +66,11 @@ and live server credentials. Unmapped peers are refused.
 
 Broker configuration, provider credentials and private storage are broker-owned and
 unreachable through gateway mounts; gateway configuration and model credentials are
-gateway-owned and absent from broker mounts. Private files remain **0600**, private
-directories **0700**; `fsGroup` is not used to widen them. The init container alone
-sees projected sources, and separate claim subdirectories and temporary volumes keep
-one daemon from replacing the other's private files. See the
+absent from broker mounts. Private broker files remain **0600** and private directories
+**0700**; `fsGroup` is not used to widen them. The gateway mounts only its own
+read-only root-owned configuration, catalog and skill projections; the init container
+alone sees broker copy sources. Separate claim subdirectories and temporary volumes
+keep one daemon from replacing the other's private files. See the
 [chart layout](kubernetes.md#paths-the-chart-owns).
 
 Attestor namespaces and `via` policy constrain a distinct gateway peer rather than a

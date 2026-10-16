@@ -17,9 +17,6 @@
 {{- if .Values.broker.configDirectory.configMap -}}
 {{- $configDirs = append $configDirs (dict "dest" (printf "%s/broker.d" $cfg) "src" "/dekopon-broker-d-source" "volume" "broker-config-directory" "configMap" .Values.broker.configDirectory.configMap "owner" "$uid" "group" "$gid" "globs" "*.yaml *.cedar" "peers" .Values.broker.configDirectory.peers) -}}
 {{- end -}}
-{{- if and .Values.gateway.enabled .Values.gateway.configDirectory.configMap -}}
-{{- $configDirs = append $configDirs (dict "dest" (printf "%s/gatewayd.d" $gcfg) "src" "/dekopon-gateway-d-source" "volume" "gateway-config-directory" "configMap" .Values.gateway.configDirectory.configMap "owner" "$gateway_uid" "group" "$gateway_gid" "globs" "*.yaml" "peers" false) -}}
-{{- end -}}
 {{- $sources := concat $files $seed $private -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -46,18 +43,13 @@ spec:
   template:
     metadata:
       annotations:
-        # The init container copies configuration once, at start. Nothing propagates into a
-        # running pod, so a configuration change has to roll the pod, and that is what this does.
-        # It cannot see into an existingSecret / existingConfigMap: roll the pod yourself after
-        # editing one.
+        # Broker files still pass through init and need a roll when their inline source changes.
+        # Gateway sources are mounted directly and reconciled without a chart checksum.
         {{- if include "dekopon.hasInlineConfig" . }}
         checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
         {{- end }}
         {{- if .Values.broker.credentials.inline }}
         checksum/credentials: {{ include (print $.Template.BasePath "/secret-credentials.yaml") . | sha256sum }}
-        {{- end }}
-        {{- if and .Values.gateway.enabled .Values.gateway.catalog.inline }}
-        checksum/catalog: {{ include (print $.Template.BasePath "/configmap-catalog.yaml") . | sha256sum }}
         {{- end }}
         {{- /*
           There is deliberately no checksum for either ChatGPT credential Secret. Every other
@@ -87,18 +79,8 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
-        # Turn projected-volume entries into files dekopon-brokerd and dekopon-gatewayd will accept.
-        #
-        # A Secret or ConfigMap volume is a symlink farm — key -> ..data/key -> ..timestamp/key —
-        # and both daemons open configuration with O_NOFOLLOW, so a mounted key fails with ELOOP
-        # before any mode is examined. subPath defeats the symlink but hands back a root-owned
-        # 0644 file, which fails the owner check (uid must equal the daemon's euid) and, for the
-        # credentials file, the mode check as well. fsGroup makes it worse: it adds group access,
-        # and 0o040 is exactly what `mode & 0o077 != 0` rejects.
-        #
-        # `install` writes a fresh regular file, one link, mode 0600, owned by its daemon —
-        # 65532 for broker files, 65533 for gateway files. Losing update propagation costs nothing: each of these files is read
-        # once, at startup.
+        # Broker policy and credentials still require owner-only regular files. Gateway
+        # configuration, catalog and skills use separate read-only projections instead.
         - name: prepare-files
           image: {{ include "dekopon.initImage" . }}
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
@@ -119,7 +101,7 @@ spec:
               # in-place pod restart, and after a previous run these are 0700 and owned by $uid,
               # which root without CAP_DAC_OVERRIDE can neither enter nor write. Reclaiming them
               # keeps the capability set at CHOWN plus FOWNER instead of adding DAC_OVERRIDE.
-              for d in {{ $cfg }} {{ $gcfg }} {{ $run }} {{ $state }} {{ $assetsRoot }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
+              for d in {{ $cfg }} {{ $run }} {{ $state }} {{ $assetsRoot }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
                 chown 0:0 "$d"
                 chmod 0700 "$d"
               done
@@ -137,29 +119,13 @@ spec:
                 rm -rf "{{ $cfg }}/private"
               fi
 {{- end }}
-              rm -f {{ $cfg }}/* {{ $gcfg }}/*
-{{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
-
-              # Only visible entries: do not copy the projection's ..data/timestamp aliases.
-              mkdir -p {{ .Values.paths.skillsDir }}
-              rm -rf {{ .Values.paths.skillsDir }}/*
-              for entry in /dekopon-skills-source/*; do
-                [ -e "$entry" ] || continue
-                cp -RL "$entry" {{ .Values.paths.skillsDir }}/
-              done
-              find {{ .Values.paths.skillsDir }} -type d -exec chmod 0755 {} +
-              find {{ .Values.paths.skillsDir }} -type f -exec chmod 0644 {} +
-{{- end }}
+              rm -f {{ $cfg }}/*
 
               # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
               # 0600, owner $uid — no symlink for O_NOFOLLOW to reject, no root ownership for the
               # euid comparison to reject, no group bits for `mode & 0o077` to reject.
               {{- range $files }}
-              {{- if eq .file "gatewayd.yaml" }}
-              install -m 0600 -o "$gateway_uid" -g "$gateway_gid" "{{ $src }}/{{ .file }}" "{{ $gcfg }}/{{ .file }}"
-              {{- else }}
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
-              {{- end }}
               {{- end }}
 
 {{- if $private }}
@@ -184,10 +150,8 @@ spec:
               # 0700 and owned by $uid, root without CAP_DAC_OVERRIDE can no longer descend into
               # it, which is exactly the property being established.
               {{- range $files }}
-              {{- $dest := $cfg }}
-              {{- if eq .file "gatewayd.yaml" }}{{ $dest = $gcfg }}{{- end }}
-              expected={{ if eq .file "gatewayd.yaml" }}"$gateway_uid:$gateway_gid"{{ else }}"$uid:$gid"{{ end }}
-              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $dest }}/{{ .file }}")
+              expected="$uid:$gid"
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $cfg }}/{{ .file }}")
               if [ "$got" != "$expected:600:1:regular file" ]; then
                 echo "{{ .file }}: got $got, want $expected:600:1:regular file" >&2
                 rc=1
@@ -359,8 +323,6 @@ spec:
                   rc=1
                 fi
               done
-              chmod 0700 "{{ $gcfg }}"
-              chown "$gateway_uid:$gateway_gid" "{{ $gcfg }}"
               # Only IPC is group reachable; neither daemon owns the claim root.
               chmod 0710 "{{ $run }}"
               chown "$uid:65534" "{{ $run }}"
@@ -380,13 +342,6 @@ spec:
               mountPath: {{ $src }}
               readOnly: true
 {{- end }}
-{{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
-            - name: skills-source
-              mountPath: /dekopon-skills-source
-              readOnly: true
-            - name: skills
-              mountPath: {{ .Values.paths.skillsDir }}
-{{- end }}
 {{- range $configDirs }}
             - name: {{ .volume }}
               mountPath: {{ .src }}
@@ -394,8 +349,6 @@ spec:
 {{- end }}
             - name: config
               mountPath: {{ $cfg }}
-            - name: gateway-config
-              mountPath: {{ $gcfg }}
             - name: runtime
               mountPath: {{ $run }}
             - name: state
@@ -435,7 +388,7 @@ spec:
           image: {{ include "dekopon.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["dekopon-gatewayd"]
-          args: ["--config", "{{ $cfg }}/{{ if .Values.gateway.configDirectory.configMap }}gatewayd.d{{ else }}gatewayd.yaml{{ end }}"]
+          args: ["--config", "{{ $gcfg }}{{ if not .Values.gateway.configDirectory.configMap }}/gatewayd.yaml{{ end }}"]
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65533 "runAsGroup" 65533)) | nindent 12 }}
           env:
@@ -493,7 +446,7 @@ spec:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
           volumeMounts:
             - name: gateway-config
-              mountPath: {{ $cfg }}
+              mountPath: {{ $gcfg }}
               readOnly: true
             - name: runtime
               mountPath: {{ $run }}
@@ -581,7 +534,7 @@ spec:
         {{- end }}
       volumes:
 {{- if $sources }}
-        # Read-only symlink farm. Only the init container ever sees it.
+        # Broker-only copy source. Neither runtime container mounts it.
         - name: config-source
           projected:
             # Octal. Only the root init container reads these, and it reads them once.
@@ -599,16 +552,12 @@ spec:
               {{- end }}
 {{- end }}
 {{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
-        - name: skills-source
+        - name: skills
           configMap:
             name: {{ .Values.gateway.skills.configMap }}
-            defaultMode: 0400
+            defaultMode: 292
             items:
               {{- toYaml .Values.gateway.skills.items | nindent 14 }}
-        - name: skills
-          emptyDir:
-            medium: Memory
-            sizeLimit: {{ .Values.volumeSizes.config }}
 {{- end }}
 {{- range $configDirs }}
         - name: {{ .volume }}
@@ -621,10 +570,21 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.config }}
+{{- if .Values.gateway.enabled }}
         - name: gateway-config
-          emptyDir:
-            medium: Memory
-            sizeLimit: {{ .Values.volumeSizes.config }}
+{{- if .Values.gateway.configDirectory.configMap }}
+          configMap:
+            name: {{ .Values.gateway.configDirectory.configMap }}
+            defaultMode: 292
+{{- else }}
+          secret:
+            secretName: {{ default (include "dekopon.gatewayConfigSecretName" .) .Values.gateway.config.existingSecret }}
+            defaultMode: 292
+            items:
+              - key: {{ if .Values.gateway.config.existingSecret }}{{ .Values.gateway.config.existingSecretKey }}{{ else }}gatewayd.yaml{{ end }}
+                path: gatewayd.yaml
+{{- end }}
+{{- end }}
 {{- if .Values.gateway.proxy.enabled }}
         - name: proxy-tls
           secret:
