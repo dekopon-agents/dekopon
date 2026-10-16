@@ -164,8 +164,25 @@ def test_existing_gateway_secret_and_broker_restart_sources():
     assert volumes["config-source"]["projected"]["defaultMode"] == 400
 
 
+def test_retired_source_names_and_paths_are_not_reserved():
+    retired = [
+        {"name": "skills-source", "mountPath": "/dekopon-skills-source", "volume": {"secret": {"secretName": "a"}}},
+        {"name": "gateway-config-directory", "mountPath": "/dekopon-gateway-d-source", "volume": {"secret": {"secretName": "b"}}},
+    ]
+    _, _, _, volumes, gateway, broker, init = render(
+        "-f", str(DIRECTORY), "--set-json", "broker.secretSourceVolumes=" + json.dumps(retired),
+    )
+    for source in retired:
+        assert volumes[source["name"]]["secret"] == source["volume"]["secret"]
+        assert mounts(broker)[source["name"]]["mountPath"] == source["mountPath"]
+        assert source["name"] not in mounts(gateway) and source["name"] not in mounts(init)
+    render("-f", str(DIRECTORY), "--set", "providerStorage.enabled=true", "--set", "providerStorage.rootPath=/dekopon-skills-source")
+    render("-f", str(DIRECTORY), "--set", "providerStorage.enabled=true", "--set", "providerStorage.rootPath=/dekopon-gateway-d-source")
+
+
 if __name__ == "__main__":
     test_live_gateway_directory_and_nested_skills()
     test_inline_gateway_source_changes_without_broker_roll()
     test_restart_notice_names_only_broker_secret_sources()
     test_existing_gateway_secret_and_broker_restart_sources()
+    test_retired_source_names_and_paths_are_not_reserved()

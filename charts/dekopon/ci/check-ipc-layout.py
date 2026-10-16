@@ -13,11 +13,11 @@ import struct
 import time
 
 
-def denied(operation, label):
+def denied(operation, label, errnos=(errno.EACCES, errno.EPERM)):
     try:
         operation()
     except OSError as error:
-        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), (label, error)
+        assert error.errno in errnos, (label, error)
         print("PASS denied " + label, flush=True)
     else:
         raise AssertionError("unexpected access: " + label)
@@ -108,7 +108,8 @@ def gateway():
     assert os.path.islink("/etc/dekopon-gateway/..data")
     assert os.stat("/etc/dekopon-gateway/gatewayd.yaml").st_uid == 0
     read("/etc/dekopon-gateway/gatewayd.yaml")
-    denied(lambda: write("/etc/dekopon-gateway/gatewayd.yaml"), "gateway writing projection")
+    denied(lambda: write("/etc/dekopon-gateway/gatewayd.yaml"), "gateway writing projection",
+           (errno.EACCES, errno.EPERM, errno.EROFS))
     owned_file("/gateway-state/chatgpt-auth.json", 0o077)
     for file in ("/etc/dekopon/broker.yaml", "/etc/dekopon/policies.cedar",
                  "/etc/dekopon/broker-credentials.yaml",
