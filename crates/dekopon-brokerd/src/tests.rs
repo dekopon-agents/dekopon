@@ -1986,7 +1986,10 @@ async fn abandoned_preparation_cannot_claim_an_activation() {
     );
 }
 
-fn generation_invocation(id: &str, piped: bool) -> dekopon_broker_protocol::InvocationRequest {
+pub(super) fn generation_invocation(
+    id: &str,
+    piped: bool,
+) -> dekopon_broker_protocol::InvocationRequest {
     use dekopon_broker_protocol::InvocationRequest;
     InvocationRequest {
         id: id.parse().unwrap(),

@@ -1051,6 +1051,95 @@ mod generation_tests {
         response
     }
 
+    async fn held_exchange(
+        coordination: &Coordination,
+        pinned: &Arc<crate::Candidate>,
+        (mut client, server): (UnixStream, UnixStream),
+        request: BrokerRequest,
+    ) -> BrokerResponse {
+        let limits = FrameLimits::default();
+        let serve = handle(
+            server,
+            &pinned.ready.broker,
+            &pinned.ready.identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            write_frame(
+                &mut client,
+                &RequestEnvelope {
+                    api_version: ProtocolVersion::V1Alpha3,
+                    request,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+            read_frame::<_, ResponseEnvelope>(&mut client, limits)
+                .await
+                .unwrap()
+                .response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        response
+    }
+
+    async fn held_invocation(
+        coordination: &Coordination,
+        pinned: &Arc<crate::Candidate>,
+        (client, server): (UnixStream, UnixStream),
+    ) {
+        use dekopon_broker_protocol::{Attestation, InvocationOutcome, StreamDescriptors};
+        use std::os::fd::AsFd as _;
+
+        let limits = FrameLimits::default();
+        let (stdout, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = DescriptorStream::new(client);
+        let request = crate::tests::generation_invocation("held-before-revocation", false);
+        let claim = Attestation::for_subject(
+            "slack.t0123abc.u9xyz".parse().unwrap(),
+            "chat-agent".parse().unwrap(),
+        )
+        .bound_to(request.id.clone());
+        let serve = handle(
+            server,
+            &pinned.ready.broker,
+            &pinned.ready.identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            client
+                .write_frame(
+                    &RequestEnvelope::invoke(
+                        Some(claim),
+                        request,
+                        vec![],
+                        0,
+                        Some(StreamDescriptors { stdin: false }),
+                    ),
+                    &[stdout.as_fd()],
+                    limits,
+                )
+                .await
+                .unwrap();
+            drop(stdout);
+            let (response, descriptors) =
+                client.read_frame::<ResponseEnvelope>(limits).await.unwrap();
+            assert!(descriptors.is_empty());
+            response.response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        assert!(matches!(response, BrokerResponse::Invocation { result, .. }
+            if result.outcome == InvocationOutcome::Succeeded));
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut receiver, &mut output).unwrap();
+        assert_eq!(output, b"{\"text\":\"HELLO\"}\n");
+    }
+
     fn unauthenticated(response: BrokerResponse) {
         assert!(
             matches!(response, BrokerResponse::Error { code, .. } if code == ERROR_UNAUTHENTICATED)
@@ -1135,5 +1224,114 @@ mod generation_tests {
                 Some(crate::current_uid().to_string().as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn held_owner_sockets_lose_coordination_but_keep_captured_invocation() {
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let pinned = coordination.active();
+        let old_digest = pinned.digest.clone();
+        let uid = crate::current_uid();
+        let sockets = (0..5)
+            .map(|_| UnixStream::pair().unwrap())
+            .collect::<Vec<_>>();
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.config()).unwrap()).unwrap();
+        document["identities"][0]["principal"] = serde_json::json!("caller");
+        document["identities"][0]["actor"] =
+            serde_json::json!({"type": "agent", "agent": "brokerd-test"});
+        document["identities"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("attestor");
+        crate::tests::write_config(&fixture.config(), &document);
+        write_owner_only(
+            &fixture.directory.path().join("policies.cedar"),
+            POLICIES
+                .split("@id(\"chat-agent-upper\")")
+                .next()
+                .unwrap()
+                .replace(
+                    "context.via == \"gateway\"",
+                    "context.via == \"dekopon-gatewayd\"",
+                )
+                .as_bytes(),
+        );
+        let (candidate, report) =
+            crate::load_candidate(&fixture.config(), Mode::Reload(&pinned)).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let next = candidate.unwrap().digest;
+        let owner = pinned.ready.identities[&uid].clone();
+        let stranger = peer("caller", None);
+        assert!(
+            matches!(exchange(&coordination, owner.clone(), stranger.clone(),
+            BrokerRequest::PrepareGeneration { digest: old_digest }).await,
+            BrokerResponse::Generation { digest, outcome: GenerationOutcome::Prepared } if digest == next)
+        );
+        assert!(matches!(
+            exchange(
+                &coordination,
+                owner,
+                stranger,
+                BrokerRequest::CommitGeneration {
+                    digest: next.clone()
+                }
+            )
+            .await,
+            BrokerResponse::Generation {
+                outcome: GenerationOutcome::Applied,
+                ..
+            }
+        ));
+        let committed = coordination.active();
+        assert_eq!(committed.digest, next);
+        assert!(!committed.ready.identities[&uid].is_reconciliation_owner());
+
+        let capture = dekopon_test_support::CaptureLayer::new();
+        async {
+            let mut held = sockets.into_iter();
+            for request in [
+                BrokerRequest::PrepareGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::CommitGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::AbortGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::ObserveGeneration,
+            ] {
+                unauthenticated(
+                    held_exchange(&coordination, &pinned, held.next().unwrap(), request).await,
+                );
+            }
+            held_invocation(&coordination, &pinned, held.next().unwrap()).await;
+        }
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+        let refused = capture.events_where(
+            "dekopon_brokerd::server",
+            &[("event", "broker_generation_refused")],
+        );
+        assert_eq!(refused.len(), 4);
+        for record in refused {
+            assert_eq!(record.field("reason"), Some("not-reconciliation-owner"));
+            assert_eq!(record.field("peer.uid"), Some(uid.to_string().as_str()));
+        }
+        assert_eq!(coordination.commit(&next, uid), GenerationOutcome::Refused);
+        assert_eq!(coordination.abort(&next, uid), GenerationOutcome::Refused);
+        assert_eq!(
+            coordination.prepare(&next, uid).await,
+            (next, GenerationOutcome::Refused)
+        );
+        let state = coordination.state.lock();
+        assert!(Arc::ptr_eq(&state.active, &committed));
+        assert!(state.prepared.is_none());
     }
 }
