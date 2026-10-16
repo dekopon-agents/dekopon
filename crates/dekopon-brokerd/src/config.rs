@@ -484,6 +484,26 @@ impl ConfigSnapshot {
             .collect())
     }
 
+    pub(crate) fn changed_categories(&self, next: &Self) -> Vec<String> {
+        let null = serde_yaml::Value::Null;
+        self.0
+            .keys()
+            .chain(next.0.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|category| {
+                self.0
+                    .get(category.as_str())
+                    .map_or(&null, |(_, value)| value)
+                    != next
+                        .0
+                        .get(category.as_str())
+                        .map_or(&null, |(_, value)| value)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn keeps(&self, next: &Self, resident: Resident) -> bool {
         let category = match resident {
             Resident::Storage => "storage",

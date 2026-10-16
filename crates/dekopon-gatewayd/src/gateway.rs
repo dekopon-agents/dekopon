@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
-use dekopon_core::ExternalSubject;
+use dekopon_core::{ExternalSubject, error_chain};
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tracing::Instrument as _;
 
 use crate::{
-    Candidate, ServeOutcome, cancel_session,
+    Candidate, GatewaydError, ServeOutcome, cancel_session,
     collection::{self, CollectionRoute as _},
     config::{self, GithubEvent},
     follow, jobs, observe_session,
@@ -754,12 +754,13 @@ impl Gateway {
             route.clone(),
             message,
             driver,
+            generation._digest.clone(),
             move |message, queued| {
                 let generation = active.load();
                 let route = generation.routes.route(message)?;
                 (message.constituents.is_empty()
                     || route.identity(message) == queued.identity(message))
-                .then(|| route.clone())
+                .then(|| (route.clone(), generation._digest.clone()))
             },
         ));
     }
@@ -796,6 +797,26 @@ impl Gateway {
     }
 }
 
+fn reload_reason(problem: &GatewaydError) -> &'static str {
+    match problem {
+        GatewaydError::Config(config::ConfigError::RestartRequired { .. }) => "restart-required",
+        GatewaydError::Config(_) => "configuration",
+        GatewaydError::Catalog(_) => "catalog",
+        GatewaydError::Route(_) => "route",
+        GatewaydError::Probe(_) => "vendor-probe",
+        GatewaydError::Startup { .. } => "credential-or-transport",
+        GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Problems { .. } => "preparation",
+    }
+}
+
 impl ReloadState {
     async fn run(mut self) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -817,10 +838,33 @@ impl ReloadState {
         )
         .await;
         let Some(candidate) = candidate else {
+            let reasons = report
+                .problems
+                .iter()
+                .take(8)
+                .map(reload_reason)
+                .collect::<Vec<_>>();
+            let error = report
+                .problems
+                .iter()
+                .take(8)
+                .map(|problem| {
+                    if let GatewaydError::Config(config::ConfigError::RestartRequired { .. }) =
+                        problem
+                    {
+                        error_chain(problem)
+                    } else {
+                        reload_reason(problem).to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             tracing::warn!(
                 event = "gateway_reload_refused",
                 applied = false,
-                problems = report.problems.len()
+                problems = report.problems.len(),
+                categories = %reasons.join(","),
+                error = %error
             );
             return;
         };
@@ -944,6 +988,11 @@ impl ReloadState {
             self.broker_digest = broker_digest;
             return;
         }
+        let categories = self
+            .sources
+            .changes(&candidate.sources)
+            .map(|changes| changes.swap)
+            .unwrap_or_default();
         let sources = Arc::new(candidate.sources);
         let proxy = refreshed_proxy.or_else(|| self.active.load().proxy.clone());
         self.active.store(Arc::new(ServingGeneration {
@@ -958,7 +1007,12 @@ impl ReloadState {
         self.config = candidate.config;
         self.sources = sources;
         self.broker_digest = broker_digest;
-        tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
+        tracing::info!(
+            event = "gateway_reload_applied",
+            generation.digest = %digest,
+            category.count = categories.len(),
+            categories = %categories.join(",")
+        );
         self.gateway_digest = digest;
         self.credentials.retire();
     }

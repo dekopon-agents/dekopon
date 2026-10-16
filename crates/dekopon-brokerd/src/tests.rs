@@ -1960,6 +1960,49 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
         applied[0].field("generation.digest"),
         Some(next_digest.as_str())
     );
+    assert_eq!(applied[0].field("category.count"), Some("1"));
+    assert_eq!(applied[0].field("categories"), Some("policies"));
+    assert!(
+        capture
+            .events_where(
+                "dekopon_broker::audit",
+                &[("audit.event", "broker_reload_applied")]
+            )
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unreadable_reload_source_reports_monitor_failure_not_activation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old_digest = fixture.active.digest.clone();
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    fs::remove_file(&fixture.path).unwrap();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old_digest, current_uid()).await,
+            (old_digest.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, old_digest);
+    let failed = capture.events_where(
+        "dekopon_brokerd",
+        &[("event", "broker_reload_monitor_failed")],
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].field("applied"), Some("false"));
+    assert!(
+        capture
+            .events_where("dekopon_brokerd", &[("event", "broker_reload_applied")])
+            .is_empty()
+    );
 }
 
 async fn generation_with_private_credential()

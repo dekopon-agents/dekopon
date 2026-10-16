@@ -17286,6 +17286,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 mod generation;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/reload_evidence.rs"]
+mod reload_evidence;
 #[path = "tests/selection.rs"]
 mod selection;
 #[path = "tests/steering.rs"]
@@ -19536,7 +19538,8 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         message("first"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        move |_, _queued| Some((*selected.load_full()).clone()),
+        String::new(),
+        move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
     ));
     model.wait_until_entered().await;
     let queued = message_from("tel.999", "next");
@@ -19545,6 +19548,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         queued,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        String::new(),
         move |_, _queued| None,
     );
     second.await;
@@ -19705,6 +19709,10 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
                 capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
             assert_eq!(applied.len(), 1);
             assert_eq!(applied[0].field("generation.digest").unwrap().len(), 64);
+            if gateway_edit {
+                assert_eq!(applied[0].field("category.count"), Some("2"));
+                assert_eq!(applied[0].field("categories"), Some("routes,stopWords"));
+            }
         }
         assert!(matches!(
             broker.request().await.request,

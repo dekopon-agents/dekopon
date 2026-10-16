@@ -332,12 +332,21 @@ impl Coordination {
         };
         let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
         let Some(next) = next else {
-            tracing::warn!(
-                event = "broker_reload_refused",
-                applied = false,
-                problems = report.problems.len(),
-                error = %error_chain(&BrokerdError::from_problems(report.problems))
-            );
+            if report.problems.iter().any(|problem| {
+                matches!(
+                    problem,
+                    BrokerdError::Config(config::ConfigError::Read { .. })
+                )
+            }) {
+                tracing::warn!(event = "broker_reload_monitor_failed", applied = false);
+            } else {
+                tracing::warn!(
+                    event = "broker_reload_refused",
+                    applied = false,
+                    problems = report.problems.len(),
+                    error = %error_chain(&BrokerdError::from_problems(report.problems))
+                );
+            }
             return (active.digest.clone(), GenerationOutcome::Refused);
         };
         let next = {
@@ -379,8 +388,14 @@ impl Coordination {
             state.prepared = Some((owner, base, next));
             return GenerationOutcome::Refused;
         }
+        let categories = state.active.snapshot.changed_categories(&next.snapshot);
         state.active = next;
-        tracing::info!(event = "broker_reload_applied", generation.digest = digest);
+        tracing::info!(
+            event = "broker_reload_applied",
+            generation.digest = digest,
+            category.count = categories.len(),
+            categories = %categories.join(",")
+        );
         GenerationOutcome::Applied
     }
 

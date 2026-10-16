@@ -708,6 +708,12 @@ pub(crate) struct SessionAdmission {
     route: Box<BoundRoute>,
 }
 
+struct ResolvedFollowUp<T> {
+    admission: SessionAdmission,
+    followup: FollowUp,
+    evidence: T,
+}
+
 impl SessionAdmission {
     pub(crate) fn cancellation(&self) -> SessionCancellation {
         self.cancellation.clone()
@@ -718,10 +724,21 @@ impl SessionAdmission {
         self.next_or_release_resolving(|_, queued| Some(queued.clone()))
     }
 
+    #[cfg(test)]
     pub(crate) fn next_or_release_resolving(
-        mut self,
+        self,
         resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute>,
     ) -> Option<(Self, FollowUp)> {
+        self.next_or_release_with(&|message, queued| {
+            resolve(message, queued).map(|route| (route, ()))
+        })
+        .map(|resolved| (resolved.admission, resolved.followup))
+    }
+
+    fn next_or_release_with<T>(
+        mut self,
+        resolve: &impl Fn(&InboundMessage, &BoundRoute) -> Option<(BoundRoute, T)>,
+    ) -> Option<ResolvedFollowUp<T>> {
         let next = {
             let mut entries = self.in_flight.lock();
             let Some(Holder::Session(running)) = entries.get_mut(&self.key) else {
@@ -770,7 +787,7 @@ impl SessionAdmission {
             }
             let mut found = None;
             while let Some(mut next) = running.follow_ups.pop_front() {
-                let Some(route) = resolve(&next.message, &next.route) else {
+                let Some((route, evidence)) = resolve(&next.message, &next.route) else {
                     next.receipts.finish("route-lost");
                     continue;
                 };
@@ -782,7 +799,7 @@ impl SessionAdmission {
                 running.received_at = next.message.received_at;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
-                found = Some(next);
+                found = Some((next, evidence));
                 break;
             }
             if found.is_none() {
@@ -790,7 +807,11 @@ impl SessionAdmission {
             }
             found
         };
-        next.map(|next| (self, next))
+        next.map(|(followup, evidence)| ResolvedFollowUp {
+            admission: self,
+            followup,
+            evidence,
+        })
     }
 }
 
@@ -1392,9 +1413,14 @@ pub(crate) fn run_session(
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
 ) -> impl std::future::Future<Output = ()> + Send {
-    run_session_resolving(runner, route, message, driver, |_, queued| {
-        Some(queued.clone())
-    })
+    run_session_resolving(
+        runner,
+        route,
+        message,
+        driver,
+        String::new(),
+        |_, queued| Some((queued.clone(), String::new())),
+    )
 }
 
 pub(crate) fn run_session_resolving(
@@ -1402,17 +1428,23 @@ pub(crate) fn run_session_resolving(
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute> + Send + 'static,
+    digest: String,
+    resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<(BoundRoute, String)> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
     let receipts = Dispositions(message.constituents.clone());
     async move {
         let span = message_span(&route, &message, &receipts);
-        let mut admission = execute(&runner, &route, message, &driver, receipts)
+        let mut admission = execute(&runner, &route, message, &driver, receipts, &digest)
             .instrument(span)
             .await;
-        while let Some((next, followup)) =
-            admission.and_then(|admission| admission.next_or_release_resolving(&resolve))
+        while let Some(resolved) =
+            admission.and_then(|admission| admission.next_or_release_with(&resolve))
         {
+            let ResolvedFollowUp {
+                admission: next,
+                followup,
+                evidence: digest,
+            } = resolved;
             let span = message_span(&followup.route, &followup.message, &followup.receipts);
             admission = Some(
                 run_admitted(
@@ -1421,7 +1453,7 @@ pub(crate) fn run_session_resolving(
                     followup.message,
                     &driver,
                     followup.receipts,
-                    next,
+                    (next, &digest),
                 )
                 .instrument(span)
                 .await,
@@ -1438,6 +1470,7 @@ async fn execute(
     message: InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     receipts: Dispositions,
+    digest: &str,
 ) -> Option<SessionAdmission> {
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
@@ -1454,7 +1487,17 @@ async fn execute(
             if let Some(notice) = &notice {
                 notice.record("new-turn");
             }
-            Some(run_admitted(runner, route, message, driver, receipts, admission).await)
+            Some(
+                run_admitted(
+                    runner,
+                    route,
+                    message,
+                    driver,
+                    receipts,
+                    (admission, digest),
+                )
+                .await,
+            )
         }
         Admit::Steered(receipts) => {
             if let Some(notice) = &notice {
@@ -1516,11 +1559,12 @@ async fn run_admitted(
     message: InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     receipts: Dispositions,
-    admission: SessionAdmission,
+    (admission, digest): (SessionAdmission, &str),
 ) -> SessionAdmission {
     let outcome = session(runner, route, &message, driver, admission.cancellation())
         .instrument(tracing::info_span!(
             "gateway.session",
+            generation.digest = digest,
             agent = %route.agent,
             gen_ai.agent.name = %route.agent,
             gen_ai.operation.name = "invoke_agent",
