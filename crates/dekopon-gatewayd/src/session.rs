@@ -2028,14 +2028,18 @@ async fn session(
         && let Some(turn) = turn
         && let Some(lease) = conversation_lease
     {
-        let journaled = runner.journal.as_ref().map(|_| turn.clone());
         let taken = TakenIn {
             newest: newest_seen,
             steers: std::mem::take(&mut *steers.taken.lock()),
             recalled: delta,
         };
-        if lease.commit(window, turn, taken, &cache_key, Instant::now())
-            && let Some(turn) = journaled
+        if lease.commit(
+            window,
+            turn.without_exchanges(),
+            taken,
+            &cache_key,
+            Instant::now(),
+        ) && runner.journal.is_some()
         {
             pending_journal = Some((turn, window));
         }

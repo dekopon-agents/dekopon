@@ -385,6 +385,16 @@ impl ConversationTurn {
     }
 
     #[must_use]
+    pub fn without_exchanges(&self) -> Self {
+        Self {
+            user: self.user.clone(),
+            answer: self.answer.clone(),
+            exchanges: Vec::new(),
+            memory_id: self.memory_id,
+        }
+    }
+
+    #[must_use]
     pub fn with_memory_id(mut self, id: u64) -> Self {
         self.memory_id = Some(id);
         self
