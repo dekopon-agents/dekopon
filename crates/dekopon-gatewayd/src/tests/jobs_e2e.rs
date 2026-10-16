@@ -1561,7 +1561,11 @@ fn attested(
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
-            | BrokerRequest::UpcallResult { .. } => {}
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => {}
         }
     }
     (surfaces, invocations)
