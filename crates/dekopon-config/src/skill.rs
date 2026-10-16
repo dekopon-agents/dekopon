@@ -165,6 +165,8 @@ fn load_skill_with(
     directory: &Path,
     trust: impl FnOnce(&Path) -> Result<Projection, ProjectionError>,
 ) -> Result<Skill, SkillError> {
+    // A trailing separator makes symlink_metadata follow a projected entry past every check.
+    let directory = directory.components().as_path();
     let metadata = fs::symlink_metadata(directory).map_err(|source| SkillError::Read {
         path: directory.to_path_buf(),
         source,
@@ -814,6 +816,27 @@ mod tests {
             load_skill(&entry),
             Err(SkillError::InsecureProjection { path }) if path == entry
         ));
+    }
+
+    #[test]
+    fn a_trailing_separator_takes_the_projection_path() {
+        let (_root, entry) = atomic_writer_mount();
+        for suffix in ["/", "/."] {
+            let mut spelled = entry.clone().into_os_string();
+            spelled.push(suffix);
+            let spelled = std::path::PathBuf::from(spelled);
+
+            assert!(matches!(
+                load_skill(&spelled),
+                Err(SkillError::InsecureProjection { path }) if path == entry
+            ));
+            let skill = load_projected(&spelled, uid(), true).expect("read-only projection loads");
+            assert_eq!(skill.source(), entry);
+            assert_eq!(
+                skill.directories().keys().collect::<Vec<_>>(),
+                [&entry, &entry.join("references")]
+            );
+        }
     }
 
     #[test]
