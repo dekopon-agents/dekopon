@@ -17320,6 +17320,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/generation.rs"]
 mod generation;
+#[path = "tests/github_http_invocation.rs"]
+mod github_http_invocation;
 #[path = "tests/github_invocation.rs"]
 mod github_invocation;
 #[path = "tests/jobs_e2e.rs"]
