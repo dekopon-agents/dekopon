@@ -262,6 +262,9 @@ fn parse(
         }
         "workflow_run" => {
             let action = field(root, "/action", 64)?;
+            if action != "completed" {
+                return Some((subject, conversation, GithubEvent::WorkflowRun, None));
+            }
             let run = root
                 .pointer("/workflow_run/id")
                 .and_then(Value::as_u64)
@@ -275,7 +278,7 @@ fn parse(
                 .and_then(|pr| pr.get("number"))
                 .and_then(Value::as_u64)
                 .filter(|n| *n > 0);
-            let text = (action == "completed" && matches!(conclusion, "success" | "failure"))
+            let text = matches!(conclusion, "success" | "failure")
                 .then(|| format!("[gateway: unverified GitHub workflow_run claim] repository {owner}/{}; run {run}; head {sha}; conclusion {conclusion}; associated PR {association:?}; delivery {delivery}. No associated PR means report only; read current checks through a broker-granted capability before acting.", subject.subject()));
             (GithubEvent::WorkflowRun, text)
         }
@@ -545,6 +548,15 @@ mod tests {
                 .3
                 .expect("eligible")
                 .contains("associated PR None")
+        );
+        let mut pending = run;
+        pending["action"] = json!("requested");
+        pending["workflow_run"]["conclusion"] = Value::Null;
+        assert!(
+            parse(&pending, "workflow_run", "guid")
+                .expect("ignored signed run")
+                .3
+                .is_none()
         );
     }
 

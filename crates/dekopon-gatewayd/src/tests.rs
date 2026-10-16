@@ -1579,10 +1579,17 @@ async fn signed_github_request(
 
 async fn authorize_github_fixture(
     inbound: Box<crate::transport::InboundMessage>,
+    route: &crate::routes::BoundRoute,
+    gate: &SessionGate,
     broker: &mut dekopon_test_support::BrokerFixture,
 ) {
     use dekopon_broker_protocol::{
         Attestation, BrokerClient, ChatScopeClaim, FrameLimits, RequestEnvelope,
+    };
+    let crate::session::Admit::Admitted(admission, inbound, _) =
+        gate.admit(route, *inbound, crate::collection::Dispositions(vec![]))
+    else {
+        panic!("the delivery must start a new authorized session, not steer or queue");
     };
     let claim = Attestation::for_chat(
         inbound.subject,
@@ -1603,11 +1610,17 @@ async fn authorize_github_fixture(
     let leg = dekopon_agent::BrokerLeg::connect(client, Some(claim.clone()))
         .await
         .unwrap();
+    assert_eq!(
+        leg.effective_capabilities().len(),
+        1,
+        "the fresh leg has a broker-granted surface"
+    );
     drop(leg);
     assert_eq!(
         broker.request().await,
         RequestEnvelope::capabilities(Some(claim))
     );
+    drop(admission);
 }
 
 #[tokio::test]
@@ -1676,14 +1689,14 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         directory.path(),
         [
             dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
-                Vec::new(),
+                vec![capability("repo.read")],
                 Vec::new(),
                 BTreeMap::new(),
                 None,
                 Some("repo-principal".parse().unwrap()),
             ),
             dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
-                Vec::new(),
+                vec![capability("repo.read")],
                 Vec::new(),
                 BTreeMap::new(),
                 None,
@@ -1692,7 +1705,9 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         ],
     );
     let first_subject = message.subject.clone();
-    authorize_github_fixture(message, &mut broker).await;
+    let route = routes.route(&message).expect("routed repo").clone();
+    let gate = SessionGate::new(1);
+    authorize_github_fixture(message, &route, &gate, &mut broker).await;
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
             .await
@@ -1744,6 +1759,29 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         .await
         .unwrap();
     assert_eq!(run_status.status(), reqwest::StatusCode::OK);
+    let pending_run = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"requested", "workflow_run":{"id":6,"head_sha":"abc","conclusion":null}}),
+    )
+    .unwrap();
+    let pending_signature: String = hmac_sha256(b"secret", &pending_run)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pending_status = client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={pending_signature}"))
+        .header("x-github-delivery", "pending-run-guid")
+        .header("x-github-event", "workflow_run")
+        .body(pending_run)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_status.status(),
+        reqwest::StatusCode::OK,
+        "a signed in-progress run with a null conclusion is ignored, not malformed"
+    );
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
             .await
@@ -1834,7 +1872,7 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         panic!("restart accepts second turn")
     };
     assert_eq!(second.subject, first_subject);
-    authorize_github_fixture(second, &mut broker).await;
+    authorize_github_fixture(second, &route, &gate, &mut broker).await;
 }
 
 #[tokio::test]
@@ -1860,13 +1898,37 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
         crate::LivenessSettings::default(),
     )
     .unwrap();
-    let mut combined = GithubTransport::new(
+    let combined = GithubTransport::new(
         "github".into(),
         address,
         "gh-secret".into(),
         std::sync::Arc::new(crate::routes::RoutingTable::default()),
         Some(wa),
     );
+    let mut drivers = BTreeMap::new();
+    let mut fetchers = HashMap::new();
+    let mut owners = HashMap::new();
+    let mut combined =
+        crate::register_transport(Box::new(combined), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("github") && drivers.contains_key("wa"));
+    assert!(fetchers.contains_key("wa"));
+    assert!(!fetchers.contains_key("github"));
+    let lone = WhatsappTransport::new(
+        "wa-alone".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "wa-secret".into(),
+        "verify".into(),
+        "access".into(),
+        crate::LivenessSettings::default(),
+    )
+    .unwrap();
+    let _lone = crate::register_transport(Box::new(lone), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("wa-alone") && fetchers.contains_key("wa-alone"));
     combined.connect().await.unwrap();
     let client = reqwest::Client::new();
     let challenge = client
