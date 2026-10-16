@@ -2641,13 +2641,26 @@ async fn restart_required_managed_edit_never_loads_another_provider() {
 }
 
 #[tokio::test]
-async fn reload_uses_active_managed_registry_without_old_lock_or_blob() {
+async fn reload_uses_active_managed_registry_without_the_lock_file() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
     let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("managed boot candidate");
     fs::remove_file(broker.lock()).unwrap();
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(next.is_some());
+}
+
+#[tokio::test]
+async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed boot candidate");
     fs::remove_file(
         broker
             .directory
@@ -2659,7 +2672,7 @@ async fn reload_uses_active_managed_registry_without_old_lock_or_blob() {
     let (next, report) =
         super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
-    assert!(next.is_some(), "reload must not reopen pruned boot sources");
+    assert!(next.is_some());
 }
 
 #[tokio::test]
