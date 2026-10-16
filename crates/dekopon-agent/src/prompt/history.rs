@@ -354,6 +354,7 @@ pub struct ConversationTurn {
     user: String,
     answer: Option<RawAnswer>,
     exchanges: Vec<Exchange>,
+    memory_id: Option<u64>,
 }
 
 impl ConversationTurn {
@@ -363,6 +364,7 @@ impl ConversationTurn {
             user: user.into(),
             answer: Some(answer.into()),
             exchanges: Vec::new(),
+            memory_id: None,
         }
     }
 
@@ -372,6 +374,7 @@ impl ConversationTurn {
             user: user.into(),
             answer: None,
             exchanges: Vec::new(),
+            memory_id: None,
         }
     }
 
@@ -379,6 +382,17 @@ impl ConversationTurn {
     pub fn with_exchanges(mut self, exchanges: Vec<Exchange>) -> Self {
         self.exchanges = exchanges;
         self
+    }
+
+    #[must_use]
+    pub fn with_memory_id(mut self, id: u64) -> Self {
+        self.memory_id = Some(id);
+        self
+    }
+
+    #[must_use]
+    pub fn memory_id(&self) -> Option<u64> {
+        self.memory_id
     }
 
     #[must_use]

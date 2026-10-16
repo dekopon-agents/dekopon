@@ -1918,6 +1918,7 @@ async fn session(
                         sealed_at: selection_seal,
                         policy,
                     },
+                    &history,
                     |available, evidence| {
                         let capability = policy
                             .selection
@@ -1927,10 +1928,6 @@ async fn session(
                         journal::decide(&runtime, capability, available, evidence)
                     },
                 ) {
-                    Ok(projected)
-                        if projected.is_empty()
-                            && !history.is_empty()
-                            && selection_seal.is_none() => {}
                     Ok(projected) => history = projected,
                     Err(error) => tracing::warn!(
                         event = "gateway_recall_failed",
@@ -1983,7 +1980,11 @@ async fn session(
                 .map_err(SessionError::from);
             let turn = match &outcome {
                 Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
-                _ => history.turns().last().cloned(),
+                _ => history
+                    .turns()
+                    .last()
+                    .cloned()
+                    .map(|turn| turn.with_memory_id(journal::mint_turn_id())),
             };
             let images = if outcome.is_ok() {
                 session_attachments.take()

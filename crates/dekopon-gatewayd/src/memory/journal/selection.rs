@@ -13,7 +13,7 @@ use dekopon_shell::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     time::SystemTime,
 };
@@ -231,6 +231,29 @@ fn original_id(policy: &ResolvedPolicy) -> Option<&str> {
         .map(|routine| routine.id.as_str())
 }
 
+struct Fitted {
+    history: History,
+    records: VecDeque<Option<u64>>,
+    selections: HashMap<u64, Selection>,
+}
+
+impl Fitted {
+    fn push(&mut self, turn: ConversationTurn, record: Option<u64>) {
+        let before = self.history.len();
+        if self.history.record_projected(turn) {
+            for _ in 0..before + 1 - self.history.len() {
+                if let Some(Some(old)) = self.records.pop_front()
+                    && let Some(selection) = self.selections.get_mut(&old)
+                {
+                    selection.actual = None;
+                    selection.reason = Some("window-fit".into());
+                }
+            }
+            self.records.push_back(record);
+        }
+    }
+}
+
 fn default_choice(policy: &ResolvedPolicy) -> &str {
     match policy.selection.mode {
         SelectionMode::Fixed => policy.selection.routine.as_deref(),
@@ -243,18 +266,47 @@ fn default_choice(policy: &ResolvedPolicy) -> &str {
     .unwrap_or("original")
 }
 
+fn unpersisted(
+    resident: &History,
+    persisted: &HashSet<u64>,
+    horizon: u64,
+    sealed_at: Option<SystemTime>,
+) -> VecDeque<ConversationTurn> {
+    let floor = persisted.iter().min().copied();
+    resident
+        .turns()
+        .iter()
+        .filter(|turn| {
+            turn.memory_id().is_none_or(|id| {
+                let minted_ms = id / 1_000_000;
+                !persisted.contains(&id)
+                    && floor.is_none_or(|floor| id > floor)
+                    && minted_ms >= horizon
+                    && sealed_at.is_none_or(|at| minted_ms > millis(at))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 impl Journal {
+    fn horizon(&self, input: &Projection<'_>) -> u64 {
+        let now = millis(SystemTime::now());
+        now.saturating_sub(duration_millis(self.age_for(input.stem)))
+            .max(now.saturating_sub(duration_millis(input.window.forget_after)))
+    }
+
     fn eligible_lines(
         &self,
         input: &Projection<'_>,
+        persisted: &mut HashSet<u64>,
     ) -> Result<VecDeque<(u64, Evidence, Vec<String>)>, JournalError> {
         let _lock = self.lock.lock();
         let mut lines = VecDeque::new();
         let now = millis(SystemTime::now());
-        let horizon = now
-            .saturating_sub(duration_millis(self.age_for(input.stem)))
-            .max(now.saturating_sub(duration_millis(input.window.forget_after)));
+        let horizon = self.horizon(input);
         match validated_lines(&self.path(input.stem), |line| {
+            persisted.insert(line.turn_id);
             if line.grant != input.grant
                 || line.at_ms < horizon
                 || input.sealed_at.is_some_and(|at| line.at_ms <= millis(at))
@@ -346,20 +398,30 @@ impl Journal {
     pub(crate) fn project(
         &self,
         input: Projection<'_>,
+        resident: &History,
         mut decide: impl FnMut(&[String], &[Evidence]) -> Result<String, &'static str>,
     ) -> Result<History, JournalError> {
-        let lines = self.eligible_lines(&input)?;
-        let sealed_at = input.sealed_at;
+        let mut persisted = HashSet::new();
+        let lines = self.eligible_lines(&input, &mut persisted)?;
         let Projection {
             stem,
             grant,
             window,
             policy,
-            ..
+            sealed_at,
         } = input;
-        let mut history = History::new(window.limits);
+        let horizon = self.horizon(&input);
+        let mut unpersisted = unpersisted(resident, &persisted, horizon, sealed_at);
+        let mut fitted = Fitted {
+            history: History::new(window.limits),
+            records: VecDeque::new(),
+            selections: HashMap::new(),
+        };
         if lines.is_empty() {
-            return Ok(history);
+            unpersisted
+                .into_iter()
+                .for_each(|turn| fitted.push(turn, None));
+            return Ok(fitted.history);
         }
         let selection = &policy.selection;
         let original_id = original_id(policy);
@@ -382,12 +444,6 @@ impl Journal {
                 Err(reason) => (default.to_owned(), "fallback", Some(reason)),
             },
         };
-        let mut selections = HashMap::new();
-        let mut included_ids = VecDeque::new();
-        let now = millis(SystemTime::now());
-        let horizon = now
-            .saturating_sub(duration_millis(self.age_for(stem)))
-            .max(now.saturating_sub(duration_millis(window.forget_after)));
         let _lock = self.lock.lock();
         validated_lines(&self.path(stem), |line| {
             if line.record_id < first
@@ -397,6 +453,11 @@ impl Journal {
                 || sealed_at.is_some_and(|at| line.at_ms <= millis(at))
             {
                 return Ok(());
+            }
+            while let Some(turn) =
+                unpersisted.pop_front_if(|turn| turn.memory_id().unwrap_or(u64::MAX) < line.turn_id)
+            {
+                fitted.push(turn, None);
             }
             let pin = line
                 .pins
@@ -458,7 +519,7 @@ impl Journal {
             } else {
                 reason
             };
-            selections.insert(
+            fitted.selections.insert(
                 line.record_id,
                 Selection {
                     requested: Some(requested.to_owned()),
@@ -480,23 +541,15 @@ impl Journal {
                 } else {
                     ConversationTurn::unanswered(text)
                 };
-                let before = history.len();
-                if history.record_projected(turn) {
-                    for _ in 0..before + 1 - history.len() {
-                        if let Some(old) = included_ids.pop_front()
-                            && let Some(selection) = selections.get_mut(&old)
-                        {
-                            selection.actual = None;
-                            selection.reason = Some("window-fit".into());
-                        }
-                    }
-                    included_ids.push_back(line.record_id);
-                }
+                fitted.push(turn, Some(line.record_id));
             }
             Ok(())
         })?;
         drop(_lock);
-        self.persist_selections(&input, &selections, fallback_reason);
-        Ok(history)
+        unpersisted
+            .into_iter()
+            .for_each(|turn| fitted.push(turn, None));
+        self.persist_selections(&input, &fitted.selections, fallback_reason);
+        Ok(fitted.history)
     }
 }

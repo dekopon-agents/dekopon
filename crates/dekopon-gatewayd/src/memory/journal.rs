@@ -10,6 +10,7 @@ use std::{
     io::{self, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -69,6 +70,8 @@ struct Line {
     source_eligibility: bool,
     #[serde(default)]
     original_bytes: usize,
+    #[serde(default)]
+    turn_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +460,7 @@ impl Journal {
             next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
             source_eligibility: entry.prepared.is_none_or(|prepared| prepared.original),
             original_bytes: selection::original_envelope_bytes(entry.turn),
+            turn_id: entry.turn.memory_id().unwrap_or(0),
             representations: entry
                 .prepared
                 .map_or_else(Vec::new, |prepared| prepared.representations.clone()),
@@ -762,6 +766,16 @@ fn remove(path: &Path) {
     }
 }
 
+pub(crate) fn mint_turn_id() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = millis(SystemTime::now()).saturating_mul(1_000_000);
+    let next = |last: u64| now.max(last.saturating_add(1));
+    LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        Some(next(last))
+    })
+    .map_or(now, next)
+}
+
 pub(crate) fn grant_digest(granted: &[String]) -> String {
     let mut digest = Sha256::new();
     for capability in granted {
@@ -835,7 +849,7 @@ fn read_window(
                 Some(answer) => ConversationTurn::completed(user, answer),
                 None => ConversationTurn::unanswered(user),
             };
-            history.record(turn);
+            history.record(turn.with_memory_id(line.turn_id));
         }
         last = Some(line);
     }
