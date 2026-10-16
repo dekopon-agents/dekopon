@@ -1310,4 +1310,6 @@ pub enum PolicyBuildError {
 }
 
 #[cfg(test)]
+mod github_fixture_tests;
+#[cfg(test)]
 mod tests;

@@ -207,6 +207,15 @@ async fn broker_with(
 }
 
 async fn broker_over<A: AuditLog>(policies: &str, audit: Arc<A>) -> Arc<Broker<A>> {
+    broker_over_mapped(policies, audit, identities(), ["caller", "cpetersen"]).await
+}
+
+async fn broker_over_mapped<'a, A: AuditLog>(
+    policies: &str,
+    audit: Arc<A>,
+    mappings: IdentityDirectory,
+    principals: impl IntoIterator<Item = &'a str>,
+) -> Arc<Broker<A>> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -219,10 +228,10 @@ async fn broker_over<A: AuditLog>(policies: &str, audit: Arc<A>) -> Arc<Broker<A
             "broker-test"
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
-            probe_engine(policies, ["caller", "cpetersen"]),
+            probe_engine(policies, principals),
             probe_catalog(),
             CredentialStore::empty(),
-            identities(),
+            mappings,
             audit,
             BrokerLimits::default(),
         )
@@ -1236,6 +1245,99 @@ async fn attested_capabilities_over_the_socket() {
         .await
         .expect("server task exits")
         .expect("server shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn github_repo_prompt_grant_is_enforced_on_the_broker_socket() {
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("github.sock");
+    let listener = bind_fixture(&socket_path);
+    let mappings = IdentityDirectory::new([
+        (
+            ExternalSubject::github("owner", "repo").unwrap(),
+            "repo-principal".parse().unwrap(),
+        ),
+        (
+            ExternalSubject::github("owner", "other").unwrap(),
+            "other-principal".parse().unwrap(),
+        ),
+    ])
+    .unwrap();
+    let policy = r#"@id("repo-prompt")
+permit(principal == Dekopon::Principal::"repo-principal",
+       action == Dekopon::Action::"agent.prompt",
+       resource == Dekopon::Agent::"chat-agent")
+when { context.via == "caller" };
+@id("repo-read")
+permit(principal == Dekopon::Principal::"repo-principal",
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
+when { context.via == "caller" && context.agent == "chat-agent" };"#;
+    let audit = Arc::new(InMemoryAuditLog::new(8).unwrap());
+    let broker = broker_over_mapped(
+        policy,
+        audit,
+        mappings,
+        ["caller", "repo-principal", "other-principal"],
+    )
+    .await;
+    let mut peers = BTreeMap::new();
+    peers.insert(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: Some(AttestorGrant {
+                namespaces: Some(vec!["github.owner".into()]),
+            }),
+        },
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, peers, limits).unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).unwrap();
+    let github_claim = |repo: &str, guid: &str| {
+        Attestation::for_chat(
+            ExternalSubject::github("owner", repo).unwrap(),
+            agent("chat-agent"),
+            ChatScopeClaim {
+                transport: "github".parse().unwrap(),
+                kind: ChatTransportKind::Github,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("owner".into()),
+                    id: format!("owner.{repo}"),
+                    thread: Some(guid.into()),
+                },
+                trigger: Trigger::Message,
+            },
+        )
+    };
+    let granted = client
+        .session_surface(Some(github_claim("repo", "one")))
+        .await
+        .unwrap();
+    assert_eq!(
+        granted.principal.as_ref().map(PrincipalId::as_str),
+        Some("repo-principal")
+    );
+    assert_eq!(granted.capabilities.len(), 1);
+    assert_eq!(
+        granted.capabilities[0].capability.id.as_str(),
+        "cli-probe.upper"
+    );
+    for (repo, guid) in [("other", "one"), ("other", "two")] {
+        let denied = client
+            .session_surface(Some(github_claim(repo, guid)))
+            .await
+            .expect_err("the mapped second principal has no agent.prompt grant");
+        assert!(
+            matches!(denied, ClientError::Remote { code, .. } if code == ERROR_UNAUTHENTICATED)
+        );
+    }
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
