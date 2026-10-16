@@ -285,6 +285,8 @@ token. An omitted response `refresh_token` retains the predecessor; no in-memory
 `lazy` never refreshes an idle record. In `scheduled` mode the broker checks due records
 without provider traffic and refreshes at the earlier of `lastRefresh + 22 hours` or
 `expiresAt - 2 hours`, even when the access token has more than 60 seconds remaining.
+That has a cost: an endpoint whose `expires_in` is 2 hours or less saves records that are already
+due, so a `scheduled` source rotates its refresh token on every five-minute tick.
 A failed attempt retries after five minutes while the record stays Live; a restart recomputes
 due from the durable record. The scheduler reads the active broker generation on each tick,
 uses the same record lock as authorized use, and drains an in-flight attempt at shutdown. Two DRNs may share one record and lock only when their
