@@ -3,6 +3,8 @@ use std::{sync::atomic::AtomicU64, time::Duration};
 use super::*;
 use crate::{ShutdownDeadline, refresh_scheduler, secrets::ScheduledCatalog};
 
+mod integrate_tests;
+
 #[test]
 fn boot_inspection_reports_each_sealed_drn_and_malformed_record_without_values() {
     let dir = tempfile::tempdir().unwrap();
