@@ -312,7 +312,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an unreachable broker. `dekopon-gatewayd` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
 - an empty `transports:`, `models:`, or `routes:` list;
 - a model with `timeoutMs: 0`, or `shutdownGraceMs: 0`;
-- a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`;
+- a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`; two `whatsappCloudApi` transports on one `bind`, even with distinct callback paths, because each owns its own listener;
 - broker frame bounds the protocol rejects (`maxFrameBytes` zero or above its hard ceiling, `ioTimeoutMs` zero), a broker socket that neither `broker.socketPath` nor the discovery order starting at `DEKOPON_BROKER_SOCKET` resolves, or a `telemetry:` block `dekopon-telemetry` refuses.
 
 The `memory:` block adds three more:

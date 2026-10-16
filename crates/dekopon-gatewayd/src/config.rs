@@ -1824,7 +1824,7 @@ pub(crate) fn resolve(
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut webhook_mounts = BTreeSet::new();
-    let mut whatsapp_binds = BTreeSet::new();
+    let mut whatsapp_binds: BTreeMap<SocketAddr, Vec<String>> = BTreeMap::new();
     let mut github_binds = Vec::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
@@ -1844,7 +1844,7 @@ pub(crate) fn resolve(
                 callback_path,
                 ..
             } => {
-                whatsapp_binds.insert(*bind);
+                whatsapp_binds.entry(*bind).or_default().push(name.clone());
                 Some((*bind, callback_path.as_str()))
             }
             TransportConfig::GithubWebhook { bind, .. } => {
@@ -2012,10 +2012,18 @@ pub(crate) fn resolve(
             },
         });
     }
+    for (bind, transports) in &whatsapp_binds {
+        if transports.len() > 1 {
+            problems.push(ConfigProblem::SharedWhatsappBind {
+                bind: *bind,
+                transports: transports.clone(),
+            });
+        }
+    }
     if !whatsapp_binds.is_empty() {
         for (name, _) in github_binds
             .into_iter()
-            .filter(|(_, bind)| !whatsapp_binds.contains(bind))
+            .filter(|(_, bind)| !whatsapp_binds.contains_key(bind))
         {
             problems.push(ConfigProblem::GithubBindNotShared { name });
         }
@@ -2982,6 +2990,13 @@ pub enum ConfigProblem {
     GithubBindNotShared { name: String },
     #[error("webhook transport {name:?} conflicts with another listener bind or callback path")]
     ConflictingWebhookMount { name: String },
+    #[error(
+        "WhatsApp transports {transports:?} each own a listener on {bind}; give each WhatsApp transport its own bind"
+    )]
+    SharedWhatsappBind {
+        bind: SocketAddr,
+        transports: Vec<String>,
+    },
     #[error("routes[{route}]: githubEvents must be nonempty, unique and GitHub-only")]
     InvalidGithubEvents { route: usize },
     #[error("routes[{route}]: GitHub requires memory.mode: oneShot")]
