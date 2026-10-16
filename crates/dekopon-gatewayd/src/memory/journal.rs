@@ -511,6 +511,16 @@ impl Journal {
                 representation.source_record_id = next_record_id;
             }
         }
+        let encoded = encode_line(&line)?;
+        let agent = stem.split_once('/').map(|(agent, _)| agent);
+        if agent.is_some_and(|agent| encoded.len() as u64 > self.agent_cap(agent)) {
+            tracing::warn!(
+                event = "gateway_memory_retention_failed",
+                reason = "agent-byte-cap",
+                encoded_bytes = encoded.len()
+            );
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             DirBuilder::new()
                 .recursive(true)
@@ -522,7 +532,6 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(&path)?;
-        let encoded = encode_line(&line)?;
         file.write_all(&encoded)?;
         drop(file);
         let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
@@ -533,7 +542,7 @@ impl Journal {
             }
             result => result?,
         };
-        if let Some((agent, _)) = stem.split_once('/')
+        if let Some(agent) = agent
             && self.enforce_agent_cap(agent, Some(&path))?
         {
             tracing::warn!(
@@ -563,11 +572,7 @@ impl Journal {
         agent: &str,
         appended: Option<&Path>,
     ) -> Result<bool, JournalError> {
-        let limit = self
-            .agent_bytes
-            .get(agent)
-            .copied()
-            .unwrap_or(self.max_bytes_per_agent);
+        let limit = self.agent_cap(agent);
         let directory = self.dir.join(agent);
         if !directory.exists() {
             return Ok(false);
@@ -620,6 +625,13 @@ impl Journal {
                 .iter()
                 .any(|(path, size, cut, _)| path == appended && cut >= size)
         }))
+    }
+
+    fn agent_cap(&self, agent: &str) -> u64 {
+        self.agent_bytes
+            .get(agent)
+            .copied()
+            .unwrap_or(self.max_bytes_per_agent)
     }
 
     fn path(&self, stem: &str) -> PathBuf {
@@ -2455,6 +2467,47 @@ mod tests {
         );
         assert!(matches!(projected, Err(JournalError::Corrupt)));
         assert!(!journal.path(&stem).exists());
+    }
+
+    #[test]
+    fn a_turn_larger_than_the_agent_cap_is_refused_without_evicting_older_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let now = SystemTime::now();
+        let stem = key().journal_stem();
+        let other =
+            ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "other").journal_stem();
+        append(&journal, &stem, now - Duration::from_secs(2), GRANT, "kept");
+        append(
+            &journal,
+            &other,
+            now - Duration::from_secs(1),
+            GRANT,
+            "also kept",
+        );
+        let before = [
+            fs::read(journal.path(&stem)).unwrap(),
+            fs::read(journal.path(&other)).unwrap(),
+        ];
+        let cap = before.iter().map(|bytes| bytes.len() as u64).sum::<u64>() + 64;
+        journal.agent_bytes.insert("reviewer".into(), cap);
+        let (capture, _guard) = crate::tests::capture_spans();
+        append(&journal, &stem, now, GRANT, &"x".repeat(cap as usize));
+        let failures = capture.events_where(
+            "dekopon_gatewayd",
+            &[
+                ("event", "gateway_memory_retention_failed"),
+                ("reason", "agent-byte-cap"),
+            ],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            [
+                fs::read(journal.path(&stem)).unwrap(),
+                fs::read(journal.path(&other)).unwrap()
+            ],
+            before
+        );
     }
 
     #[test]

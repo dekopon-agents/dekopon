@@ -102,13 +102,7 @@ impl<'a> JournalMemoryTools<'a> {
                             total = total.saturating_add(fs::metadata(sibling)?.len());
                         }
                     }
-                    let cap = self
-                        .journal
-                        .agent_bytes
-                        .get(agent)
-                        .copied()
-                        .unwrap_or(self.journal.max_bytes_per_agent);
-                    if total > cap {
+                    if total > self.journal.agent_cap(agent) {
                         return Err(io::Error::other("memory update exceeds agent cap").into());
                     }
                 }
