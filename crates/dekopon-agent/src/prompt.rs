@@ -37,7 +37,9 @@ pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
 pub use history::{
-    ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits, RawAnswer,
+    ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_TURNS, Exchange, History, HistoryLimits, PackedArena, Pin, RawAnswer, ReadRef,
+    Representation, Selection,
 };
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";
@@ -232,6 +234,8 @@ pub struct SessionInputs<'a> {
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
+    capture_exchanges: Option<(Option<usize>, Option<usize>)>,
+    memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -255,7 +259,28 @@ impl<'a> SessionInputs<'a> {
             skills: &[],
             progress_notes: false,
             wakes: None,
+            capture_exchanges: None,
+            memory_tools: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_memory_tools(
+        mut self,
+        tools: &'a dyn crate::memory_tools::MemoryTools,
+    ) -> Self {
+        self.memory_tools = Some(tools);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_exchange_capture(
+        mut self,
+        request_max_bytes: Option<usize>,
+        result_max_bytes: Option<usize>,
+    ) -> Self {
+        self.capture_exchanges = Some((request_max_bytes, result_max_bytes));
+        self
     }
 
     #[must_use]
@@ -352,8 +377,8 @@ impl<'a> SessionInputs<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
 struct SessionExtensions<'a> {
+    exchanges: &'a mut Vec<Exchange>,
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
     reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
@@ -367,6 +392,8 @@ struct SessionExtensions<'a> {
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
+    capture_exchanges: Option<(Option<usize>, Option<usize>)>,
+    memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
 }
 
 pub fn run_prompt_session<M, R>(
@@ -397,6 +424,8 @@ where
         skills,
         progress_notes,
         wakes,
+        capture_exchanges,
+        memory_tools,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -422,12 +451,16 @@ where
     history.replay_into(&mut messages);
     messages.push(ModelMessage::user(prompt));
 
+    let mut exchanges = Vec::new();
     let (result, steers) = run_session(
         model,
         runtime,
         messages,
         limits,
         SessionExtensions {
+            exchanges: &mut exchanges,
+            capture_exchanges,
+            memory_tools,
             options,
             assets,
             reply_assets,
@@ -448,12 +481,15 @@ where
         user.push_str("\n\n");
         user.push_str(&steer);
     }
-    history.record(match &result {
-        Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
-            ConversationTurn::completed(user, outcome.answer.as_str())
+    history.record(
+        match &result {
+            Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+                ConversationTurn::completed(user, outcome.answer.as_str())
+            }
+            Ok(_) | Err(_) => ConversationTurn::unanswered(user),
         }
-        Ok(_) | Err(_) => ConversationTurn::unanswered(user),
-    });
+        .with_exchanges(exchanges),
+    );
     result
 }
 
@@ -469,9 +505,11 @@ where
     R: ScriptRuntime + ?Sized,
 {
     let mut steers = Vec::new();
+    let progress = extensions.progress;
+    let cancellation = extensions.cancellation;
     let result = run_turns(model, runtime, messages, limits, extensions, &mut steers);
     if let Err(error) = &result {
-        report_end(extensions.progress, extensions.cancellation, error);
+        report_end(progress, cancellation, error);
     }
     (result, steers)
 }
@@ -539,6 +577,7 @@ where
     R: ScriptRuntime + ?Sized,
 {
     let SessionExtensions {
+        exchanges,
         options,
         assets,
         reply_assets,
@@ -552,6 +591,8 @@ where
         skills,
         progress_notes,
         wakes,
+        capture_exchanges,
+        memory_tools,
     } = extensions;
     let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
@@ -569,6 +610,9 @@ where
     }
     if wakes.is_some() {
         model_tools.push(wake::wake_tool());
+    }
+    if memory_tools.is_some() {
+        model_tools.extend(crate::memory_tools::tools());
     }
 
     let session_span = tracing::info_span!(
@@ -914,6 +958,11 @@ where
                 )?;
                 continue;
             }
+            if let Some(memory) = memory_tools
+                && crate::memory_tools::dispatch(&mut messages, memory, &call)?
+            {
+                continue;
+            }
             if call.function.name == WAKE_TOOL_NAME
                 && let Some(registrar) = wakes
             {
@@ -1003,7 +1052,6 @@ where
                 );
                 check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script);
-                check_cancelled(cancellation)?;
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -1016,6 +1064,31 @@ where
                 );
                 outcome
             };
+            if let Some((request_max_bytes, result_max_bytes)) = capture_exchanges {
+                let request_cut = script.floor_char_boundary(
+                    request_max_bytes.unwrap_or(script.len()).min(script.len()),
+                );
+                let output = &outcome.output;
+                let cut = output.floor_char_boundary(
+                    result_max_bytes
+                        .unwrap_or(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
+                        .min(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
+                        .min(output.len()),
+                );
+                exchanges.push(Exchange {
+                    tool: SCRIPT_TOOL_NAME.into(),
+                    request: vec![Representation::original(&script[..request_cut], "")],
+                    result: vec![Representation::original(&output[..cut], "")],
+                    outcome: if outcome.exit_code == dekopon_shell::ExitCode::SUCCESS {
+                        "success"
+                    } else {
+                        "failure"
+                    }
+                    .into(),
+                    exit_status: Some(i32::from(outcome.exit_code.get())),
+                });
+            }
+            check_cancelled(cancellation)?;
             script_calls = script_calls.saturating_add(1);
             capability_invocations = runtime.capability_calls_used();
             messages.push(ModelMessage::tool(call.id, format_script_outcome(&outcome)));
@@ -2954,6 +3027,90 @@ mod tests {
             ]
         );
         assert!(next.tool_messages().is_empty());
+    }
+
+    #[test]
+    fn a_failed_script_is_captured_as_evidence_not_replayed_as_a_tool_call() {
+        struct FailedScript;
+        impl ScriptRuntime for FailedScript {
+            fn capability_calls_used(&self) -> u32 {
+                0
+            }
+
+            fn run_script(&self, _: &str) -> ScriptOutcome {
+                ScriptOutcome {
+                    output: "failure: 🦀".into(),
+                    exit_code: ExitCode::FAILURE,
+                    truncated: false,
+                    capability_calls: 0,
+                    steps: 1,
+                }
+            }
+        }
+        let model = ScriptedModel::new([script_call("call-1", "echo 🦀"), answer("noted")]);
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &FailedScript,
+            SessionInputs::new("try", limits(3, 2)).with_exchange_capture(None, None),
+            &mut history,
+        )
+        .expect("the failed script is an answerable outcome");
+        let exchange = &history.turns()[0].exchanges()[0];
+        assert_eq!(exchange.request[0].text.as_deref(), Some("echo 🦀"));
+        assert_eq!(exchange.result[0].text.as_deref(), Some("failure: 🦀"));
+        assert_eq!(exchange.exit_status, Some(1));
+        assert_eq!(exchange.outcome, "failure");
+        let next = ScriptedModel::new([answer("done")]);
+        run_prompt_with_history(
+            &next,
+            &RecordingRuntime::new(0),
+            "what happened?",
+            None,
+            limits(2, 2),
+            &mut history,
+        )
+        .expect("later turn answers");
+        assert_eq!(
+            next.first_roles(),
+            vec![
+                ("user", "try".into()),
+                ("assistant", "noted".into()),
+                ("user", "what happened?".into()),
+            ]
+        );
+        assert!(next.tool_messages().is_empty());
+        let retained = &history.turns()[0].exchanges()[0];
+        assert_eq!(retained.request[0].text.as_deref(), Some("echo 🦀"));
+        assert_eq!(retained.result[0].text.as_deref(), Some("failure: 🦀"));
+        assert_eq!(retained.exit_status, Some(1));
+    }
+
+    #[test]
+    fn capture_bounds_do_not_resurrect_a_script_result() {
+        let model = ScriptedModel::new([script_call("call-1", "abc🦀"), answer("done")]);
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("try", limits(3, 2)).with_exchange_capture(Some(4), Some(4)),
+            &mut history,
+        )
+        .expect("turn answers");
+        let exchange = &history.turns()[0].exchanges()[0];
+        assert_eq!(exchange.request[0].text.as_deref(), Some("abc"));
+        assert_eq!(exchange.result[0].text.as_deref(), Some("ran "));
+        assert_eq!(exchange.result[0].captured_bytes, 4);
+    }
+
+    #[test]
+    fn a_prefix_omits_whole_utf8_characters_and_counts_bytes() {
+        let original = super::Representation::original("ab🦀z", "v1");
+        let prefix = super::Representation::prefix("ab🦀z", 5, "short", "v1");
+        assert_eq!(original.text.as_deref(), Some("ab🦀z"));
+        assert_eq!(original.omitted_bytes(), 0);
+        assert_eq!(prefix.text.as_deref(), Some("ab"));
+        assert_eq!(prefix.omitted_bytes(), 5);
     }
 
     #[test]
@@ -5095,6 +5252,70 @@ mod tests {
         assert_eq!(roles.len(), 2, "no listing was added: {roles:?}");
         let tools = model.observed_tools.lock();
         assert!(tools[0].iter().all(|tool| tool.name != SKILL_TOOL_NAME));
+    }
+
+    #[test]
+    fn one_shot_offers_no_memory_tools_and_journal_session_dispatches_reads() {
+        struct LocalMemory;
+        impl crate::memory_tools::MemoryTools for LocalMemory {
+            fn read(&self, id: u64, representation: &str, range: Option<(u64, u64)>) -> String {
+                assert_eq!((id, representation, range), (7, "summary", Some((0, 4))));
+                "text".into()
+            }
+            fn set_pin(&self, _: u64, _: &str) -> String {
+                "pinned".into()
+            }
+            fn clear_pin(&self, _: Option<u64>) -> String {
+                "cleared".into()
+            }
+        }
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+        let one_shot = ScriptedModel::new([
+            tool_call(
+                "read-1",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+            tool_call(
+                "read-2",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+        ]);
+        let error = run_prompt_session(
+            &one_shot,
+            &runtime,
+            SessionInputs::new("hi", limits(2, 2)),
+            &mut history,
+        )
+        .expect_err("not offered");
+        assert!(matches!(error, PromptError::UnknownTool(name) if name == "read_memory_record"));
+        assert!(one_shot.observed_tools.lock()[0].iter().all(|tool| {
+            !tool.name.ends_with("memory_record") && !tool.name.ends_with("memory_pin")
+        }));
+
+        let model = ScriptedModel::new([
+            tool_call(
+                "read",
+                "read_memory_record",
+                json!({"recordId":7,"representationId":"summary","range":[0,4]}),
+            ),
+            answer("done"),
+        ]);
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("hi", limits(2, 2)).with_memory_tools(&LocalMemory),
+            &mut History::default(),
+        )
+        .expect("read");
+        assert_eq!(last_tool_results(&model), vec!["text"]);
+        assert!(
+            model.observed_tools.lock()[0]
+                .iter()
+                .any(|tool| tool.name == "read_memory_record")
+        );
     }
 
     #[test]

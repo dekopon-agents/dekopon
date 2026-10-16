@@ -21,7 +21,8 @@ mod conversation;
 mod follow;
 mod gateway;
 mod jobs;
-mod journal;
+mod memory;
+use memory::journal;
 mod meter_restore;
 mod metering;
 mod probe;
@@ -155,22 +156,16 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
-    let journal = match config.journal.clone() {
-        Some(journal) => Some(Arc::new(
-            tokio::task::spawn_blocking(move || {
-                journal::Journal::open(&journal.dir, journal.retention)
-            })
-            .await
-            .map_err(GatewaydError::TransportTask)?
-            .map_err(|error| GatewaydError::Journal {
-                kind: match error {
-                    journal::JournalError::Io { kind } => kind,
-                    journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
-                },
-            })?,
-        )),
-        None => None,
-    };
+    let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    if journal.is_some() {
+        for route in &config.routes {
+            if let (Some(window), Some(policy)) =
+                (route.memory.window(), route.memory_policy.as_ref())
+            {
+                memory::generation::report_policy(policy, window.recall);
+            }
+        }
+    }
     let wakes = match config.wakes.clone() {
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
@@ -193,7 +188,10 @@ where
         )),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
-        conversations: ConversationStore::new(config.sessions.max_conversations),
+        conversations: ConversationStore::with_arena_limit(
+            config.sessions.max_conversations,
+            config.memory.arena.max_transient_bytes.get() as usize,
+        ),
         follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
         journal,
         assets: Arc::new(AssetStore::with_retention(
@@ -269,6 +267,49 @@ where
     }
 }
 
+async fn open_journal(
+    config: Option<config::ResolvedJournal>,
+    memory: &config::ResolvedSettings,
+) -> Result<Option<Arc<journal::Journal>>, GatewaydError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let max_age = std::time::Duration::from_millis(memory.retention.max_age_ms.get());
+    let agent_ages = memory
+        .agents
+        .iter()
+        .map(|(id, agent)| (id.as_str().to_owned(), agent.max_age))
+        .collect();
+    let agent_bytes = memory
+        .agents
+        .iter()
+        .map(|(id, agent)| (id.as_str().to_owned(), agent.max_bytes.get()))
+        .collect();
+    let max_bytes_per_agent = memory.retention.max_bytes_per_agent.get();
+    let journal = tokio::task::spawn_blocking(move || {
+        let mut journal = journal::Journal::open_with_age(
+            &config.dir,
+            max_age,
+            config.retention,
+            config.seal_retention,
+        )?;
+        journal.agent_ages = agent_ages;
+        journal.agent_bytes = agent_bytes;
+        journal.max_bytes_per_agent = max_bytes_per_agent;
+        journal.enforce_caps()?;
+        Ok::<_, journal::JournalError>(journal)
+    })
+    .await
+    .map_err(GatewaydError::TransportTask)?
+    .map_err(|error| GatewaydError::Journal {
+        kind: match error {
+            journal::JournalError::Io { kind } => kind,
+            journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
+        },
+    })?;
+    Ok(Some(Arc::new(journal)))
+}
+
 async fn load_follow_table(
     journal: &Option<Arc<journal::Journal>>,
     enabled: bool,
@@ -334,6 +375,8 @@ pub enum CheckWarning {
     TransportCredential { transport: String, variable: String },
     #[error("model {model} reads {variable} from the environment at boot")]
     ModelCredential { model: String, variable: String },
+    #[error("persistent memory has no journal: window-only, memory tools unavailable")]
+    MemoryWithoutJournal,
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
     #[error("model {model} not probed: {reason}")]
@@ -441,7 +484,15 @@ pub(crate) async fn load_candidate_against(
         }
     };
     let transports = match (&config, &routes) {
-        (Some(config), Some(routes)) => credentials(config, routes, mode, &mut report),
+        (Some(config), Some(routes)) => {
+            if mode == config::LoadMode::Check
+                && config.journal.is_none()
+                && routes.has_persistent_memory()
+            {
+                report.warnings.push(CheckWarning::MemoryWithoutJournal);
+            }
+            credentials(config, routes, mode, &mut report)
+        }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
             Vec::new()

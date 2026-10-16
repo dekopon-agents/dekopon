@@ -57,6 +57,9 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Conversations** — `persistent` is the route default, with per-subject history under
   `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
   window. `memory: { mode: oneShot }` starts each session without prior history.
+  `sessions.memory` resolves retention/arena bounds and per-agent representation policies;
+  journal-backed routes may override the agent policy with `routes[].memory.policy`.
+  Without a journal, persistent routes remain window-only and config-check warns once.
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share

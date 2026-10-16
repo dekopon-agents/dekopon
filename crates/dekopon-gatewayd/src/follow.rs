@@ -566,7 +566,14 @@ mod tests {
     #[test]
     fn only_a_successful_same_leg_no_argument_stay_invites_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let key = "c".repeat(64);
         let ticket = Some((Arc::clone(&table), key.clone(), 0));
@@ -617,7 +624,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_racing_a_banish_cannot_reinsert_its_ticket() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let key = "c".repeat(64);
         table.stay(&key, SystemTime::now()).unwrap();
@@ -670,7 +684,14 @@ mod tests {
     #[test]
     fn a_banished_ticket_cannot_be_reinvited_before_marker_removal() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = FollowTable::load(journal).unwrap();
         let now = SystemTime::now();
         let key = "c".repeat(64);
@@ -690,7 +711,14 @@ mod tests {
     #[test]
     fn a_failed_refresh_removes_the_resident_ticket() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = FollowTable::load(journal).unwrap();
         let key = "d".repeat(64);
         let now = SystemTime::now();
@@ -707,7 +735,14 @@ mod tests {
     #[test]
     fn a_successful_leave_waits_for_delivery_before_expiring_its_ticket() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "a".repeat(64);
         let other = "b".repeat(64);
@@ -766,7 +801,14 @@ mod tests {
     #[test]
     fn a_failed_marker_write_never_activates_a_ticket() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "d".repeat(64);
         std::fs::create_dir(dir.path().join(format!("{key}.followed"))).unwrap();
@@ -818,7 +860,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let at = SystemTime::now();
         let key = "f".repeat(64);
-        let journal = Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap();
+        let journal = Journal::open(
+            dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap();
         journal
             .write_follow(
                 &key,
@@ -833,15 +880,27 @@ mod tests {
             .unwrap()
             .set_modified(at - Duration::from_secs(2 * 86400))
             .unwrap();
-        let restarted =
-            Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let restarted = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         assert!(matches!(
             FollowTable::load(restarted).unwrap().ticket(&key, at),
             FollowTicket::Active { .. }
         ));
         assert!(path.exists());
         let later = Arc::new(
-            Journal::open_at(dir.path(), Duration::from_secs(7 * 86400), at + LAPSE).unwrap(),
+            Journal::open_at(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+                at + LAPSE,
+            )
+            .unwrap(),
         );
         assert_eq!(
             FollowTable::load(later).unwrap().ticket(&key, at + LAPSE),
@@ -853,7 +912,14 @@ mod tests {
     #[test]
     fn elapsed_resident_tickets_release_capacity_for_a_new_invitation() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = FollowTable::load(Arc::clone(&journal)).unwrap();
         let now = SystemTime::now();
         for index in 0..MAX_TICKETS {
@@ -887,7 +953,14 @@ mod tests {
     #[test]
     fn corrupt_marker_is_removed_and_missing_marker_stays_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let key = "b".repeat(64);
         std::fs::write(dir.path().join(format!("{key}.followed")), b"{broken").unwrap();
         let (capture, _guard) = crate::tests::capture_spans();
@@ -899,7 +972,14 @@ mod tests {
         assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
         assert!(!dir.path().join(format!("{key}.followed")).exists());
         std::fs::write(dir.path().join(format!("{key}.followed")), vec![b'x'; 4097]).unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             FollowTable::load(journal)
                 .unwrap()
@@ -912,7 +992,14 @@ mod tests {
     #[test]
     fn boot_keeps_latest_deadlines_and_removes_one_excess_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let now = SystemTime::now();
         for index in 0..=MAX_TICKETS {
             let key = format!("{index:064x}");
@@ -955,7 +1042,14 @@ mod tests {
     #[test]
     fn unreadable_marker_refuses_boot_and_capacity_refuses_an_invite() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let key = "e".repeat(64);
         std::fs::create_dir(dir.path().join(format!("{key}.followed"))).unwrap();
         assert!(matches!(
@@ -986,7 +1080,14 @@ mod tests {
     #[test]
     fn persisted_ticket_lapses_on_injected_clock_and_leaves_without_history() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(Journal::open(dir.path(), Duration::from_secs(7 * 86400)).unwrap());
+        let journal = Arc::new(
+            Journal::open(
+                dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
+        );
         let table = FollowTable::load(Arc::clone(&journal)).unwrap();
         let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         assert_eq!(table.ticket("test", at), FollowTicket::Absent);

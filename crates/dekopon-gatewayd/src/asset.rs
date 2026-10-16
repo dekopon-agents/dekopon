@@ -195,6 +195,10 @@ impl AssetAccess {
         self.with_active(|_| ()).is_some()
     }
 
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.key.generation
+    }
+
     fn weak_fence(&self) -> Option<Weak<AssetFence>> {
         self.fence.as_ref().map(Arc::downgrade)
     }

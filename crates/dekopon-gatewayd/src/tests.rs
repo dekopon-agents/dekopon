@@ -766,6 +766,181 @@ async fn persistent_memory_defaults_and_explicit_scopes_survive_route_binding() 
 }
 
 #[tokio::test]
+async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    let second_route = input["routes"][0].clone();
+    input["routes"]
+        .as_array_mut()
+        .expect("routes fixture")
+        .push(second_route);
+    let resolved = load(directory.path(), &input)
+        .await
+        .expect("window-only configuration");
+    assert!(
+        resolved
+            .routes
+            .iter()
+            .all(|route| route.memory_policy.is_none())
+    );
+    let catalog_path = directory.path().join("dekopon.yaml");
+    fs::write(&catalog_path, catalog_text(true, Some("reasoning"))).expect("catalog fixture");
+    fs::set_permissions(&catalog_path, fs::Permissions::from_mode(0o600)).expect("private catalog");
+    let report = crate::check(write_config(directory.path(), &input), None, None).await;
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, crate::CheckWarning::MemoryWithoutJournal))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_binding() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"journal": {"path": "journal"}, "memory": {
+        "agents": {"reviewer": {"routine": "prefix", "policy": {
+            "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+            "routines": [{"id": "prefix", "kind": "prefix", "maxBytes": 1024}],
+            "retain": ["prefix"], "selection": {"mode": "agentPreference", "routine": "prefix"}
+        }}}
+    }});
+    let config = load(directory.path(), &input)
+        .await
+        .expect("agent policy resolves");
+    assert_eq!(
+        config.routes[0]
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .preferred_routine
+            .as_deref(),
+        Some("prefix")
+    );
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "original", "kind": "original"}], "retain": ["original"],
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original"}
+    }});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown agent preference is refused");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy { .. }
+    )));
+    input["sessions"]["memory"]["agents"]["reviewer"]["routine"] = json!("original");
+    let config = load(directory.path(), &input)
+        .await
+        .expect("route decider takes precedence");
+    assert!(matches!(
+        config.routes[0]
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .selection
+            .mode,
+        crate::config::memory::SelectionMode::Decider
+    ));
+    let routes =
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("bound policy");
+    assert!(matches!(
+        routes
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+            .expect("route")
+            .memory_policy
+            .as_ref()
+            .expect("policy")
+            .selection
+            .mode,
+        crate::config::memory::SelectionMode::Decider
+    ));
+}
+
+#[tokio::test]
+async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "summary", "kind": "progressiveOneShot", "model": "missing",
+            "parts": [{"id": "short", "maxBytes": 100}, {"id": "long", "maxBytes": 200}]}],
+        "retain": ["summary"], "selection": {"mode": "fixed", "routine": "summary"}
+    }});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown model");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::UnknownModel(_),
+            ..
+        }
+    )));
+    input["models"]
+        .as_array_mut()
+        .expect("models fixture")
+        .push(json!({
+            "name": "proxy-claude", "kind": "anthropic", "model": "claude-sonnet-4-5",
+            "apiKeyEnv": "ANTHROPIC_API_KEY"
+        }));
+    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("proxy-claude");
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("proxy-only model");
+    assert!(reports(
+        &error,
+        |problem| matches!(problem, ConfigProblem::MemoryPolicy {
+        problem: crate::config::memory::PolicyProblem::ProxyOnlyModel(model), ..
+    } if model == "proxy-claude")
+    ));
+    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("local-qwen");
+    assert!(
+        load(directory.path(), &input).await.is_ok(),
+        "known direct model resolves"
+    );
+    input["routes"][0]["memory"]["policy"]["routines"][0]["parts"][1]["maxBytes"] = json!(100);
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("non-increasing cumulative budgets");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("progressive parts"),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"memory": {"agents": {"nobody": {}}}});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("unknown agent");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy { .. }
+    )));
+    input["sessions"] = json!({"memory": {"retention": {"maxAgeMs": 0}}});
+    assert!(matches!(
+        load(directory.path(), &input).await,
+        Err(ConfigError::Decode { .. })
+    ));
+    input["sessions"] = json!({"memory": {"arena": {"sweepIntervalMs": 1000}}});
+    assert!(matches!(
+        load(directory.path(), &input).await,
+        Err(ConfigError::Decode { .. })
+    ));
+}
+
+#[tokio::test]
 async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
     let directory = temporary();
     for (key, value, replacement) in [
@@ -1084,8 +1259,18 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
     let window = resolved.routes[0].memory.window().expect("persistent");
     assert_eq!(window.recall, RecallSource::Journal);
     let journal = resolved.journal.expect("journal");
-    assert_eq!(journal.retention, Duration::from_secs(86_400));
+    assert_eq!(journal.retention, Duration::from_secs(7 * 86_400));
+    assert_eq!(journal.seal_retention, Duration::from_secs(86_400));
     assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
+    let policy = resolved.routes[0]
+        .memory_policy
+        .as_ref()
+        .expect("original-only default");
+    assert_eq!(policy.retain, ["original"]);
+    assert!(matches!(
+        policy.selection.mode,
+        crate::config::memory::SelectionMode::Fixed
+    ));
 }
 
 #[tokio::test]
@@ -3086,6 +3271,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         steering: crate::config::Steering::Abort,
         progress_notes: false,
         memory: MemoryPolicy::OneShot,
+        memory_policy: None,
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
@@ -7583,6 +7769,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         crate::journal::Journal::open(
             &directory.path().join("journal"),
             Duration::from_secs(604800),
+            Duration::from_secs(604800),
         )
         .unwrap(),
     );
@@ -7733,6 +7920,7 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     let journal = Arc::new(
         crate::journal::Journal::open(
             &directory.path().join("journal"),
+            Duration::from_secs(604800),
             Duration::from_secs(604800),
         )
         .unwrap(),
@@ -14130,6 +14318,7 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
         crate::journal::Journal::open(
             &directory.path().join("journal"),
             Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
         )
         .unwrap(),
     );
@@ -15948,8 +16137,12 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/generation.rs"]
+mod generation;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/selection.rs"]
+mod selection;
 #[path = "tests/steering.rs"]
 mod steering;
 #[path = "tests/steering_e2e.rs"]
@@ -15975,7 +16168,12 @@ fn journaled_runner(
         reply_on_busy: true,
         conversations: ConversationStore::new(1024),
         journal: Some(Arc::new(
-            crate::journal::Journal::open(journal, Duration::from_secs(3600)).expect("journal"),
+            crate::journal::Journal::open(
+                journal,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            )
+            .expect("journal"),
         )),
         follow: None,
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
@@ -16027,7 +16225,12 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         .await
         .unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
     let key = crate::follow::follow_key(
@@ -16136,7 +16339,12 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     ))
     .unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
     let mut route = route(model_config());
@@ -16282,8 +16490,12 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         let models = ModelScript::forbidden();
         let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
         let journal = Arc::new(
-            crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400))
-                .unwrap(),
+            crate::journal::Journal::open(
+                journal_dir.path(),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
+            )
+            .unwrap(),
         );
         let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
         let mut route = route(model_config());
@@ -16340,7 +16552,12 @@ async fn an_inactive_follow_turn_records_only_category_metadata() {
     let models = ModelScript::forbidden();
     let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     runner.follow = Some(Arc::new(crate::follow::FollowTable::load(journal).unwrap()));
     let mut route = route(model_config());
@@ -16412,7 +16629,12 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
     ]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
     let mut route = route(model_config());
@@ -16544,7 +16766,12 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
     let models = ModelScript::new([script_call("follow leave"), answer("Farewell.")]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
     let journal = Arc::new(
-        crate::journal::Journal::open(journal_dir.path(), Duration::from_secs(7 * 86400)).unwrap(),
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
     );
     let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
     let mut route = route(model_config());
@@ -16692,7 +16919,10 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            (
+                "user",
+                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nwhat broke?"
+            ),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
         ]),
@@ -16749,7 +16979,8 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
         );
     }
     assert_eq!(prompt[1], ("user".to_owned(), prompt[1].1.clone()));
-    assert!(prompt[1].1.starts_with("four photos"));
+    assert!(prompt[1].1.starts_with("[memory: {\"recordId\":1,"));
+    assert!(prompt[1].1.contains("four photos"));
 }
 
 type Asked = (Option<String>, Option<String>, usize);
@@ -17198,6 +17429,137 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
     assert_eq!(
         store.resident(&key, &allowed, window(), now + window().idle_timeout),
         Residency::Cold
+    );
+}
+
+#[test]
+fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 300);
+    let allowed = granted(&["cli-probe.upper"]);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let commit = |text: &str| {
+        let seed = store.begin(&key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed(text, "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    };
+    commit("one");
+    let old = store.snapshot(&key, &allowed).unwrap();
+    assert!(store.snapshot(&key, &granted(&["different"])).is_none());
+    commit("two");
+    let new = store.snapshot(&key, &allowed).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(old.read(1).unwrap()).unwrap()["user"],
+        "one"
+    );
+    assert_eq!(new.read(1), old.read(1));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["user"],
+        "two"
+    );
+    commit("three");
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
+    );
+    assert_eq!(store.snapshot(&key, &allowed).unwrap().read(3), None);
+    assert_eq!(old.read(1), new.read(1));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["answer"],
+        "ok"
+    );
+}
+
+#[test]
+fn two_conversations_share_the_arena_transient_ceiling() {
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 100);
+    let allowed = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    let a = private_conversation_key("dev", "first", SUBJECT);
+    let b = private_conversation_key("dev", "second", SUBJECT);
+    for key in [&a, &b] {
+        let seed = store.begin(key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed("one", "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    }
+    assert!(store.snapshot(&a, &allowed).unwrap().read(1).is_some());
+    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
+    );
+}
+
+#[test]
+fn an_evicted_conversations_held_reader_keeps_its_headroom_charge() {
+    let (capture, _guard) = capture_spans();
+    let store = ConversationStore::with_arena_limit(4, 100);
+    let allowed = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    let a = private_conversation_key("dev", "first", SUBJECT);
+    let b = private_conversation_key("dev", "second", SUBJECT);
+    let c = private_conversation_key("dev", "third", SUBJECT);
+    let commit = |key: &_| {
+        let seed = store.begin(key, &allowed, window(), None, now);
+        assert!(seed.lease.commit(
+            window(),
+            ConversationTurn::completed("one", "ok"),
+            TakenIn::default(),
+            &seed.cache_key,
+            now,
+        ));
+    };
+    commit(&a);
+    let held = store.snapshot(&a, &allowed).unwrap();
+    assert!(store.remove(&a, EvictionReason::Capacity));
+    commit(&b);
+    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(held.read(1).unwrap()).unwrap()["user"],
+        "one"
+    );
+    drop(held);
+    commit(&c);
+    assert!(store.snapshot(&c, &allowed).unwrap().read(1).is_some());
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_retention_failed"),
+                    ("reason", "arena-headroom"),
+                ]
+            )
+            .len(),
+        1,
     );
 }
 
@@ -18742,7 +19104,10 @@ async fn a_failed_seal_leaves_the_stop_notice_for_the_next_turn() {
     inbound.conversation.kind = ConversationKind::Thread;
     let stem = ConversationKey::shared(&route.agent, &route.transport, &inbound.conversation.key())
         .journal_stem();
-    let marker = journal.path().join(format!("{stem}.sealed"));
+    let marker = journal.path().join(format!(
+        "{}.sealed",
+        stem.split_once('/').expect("agent stem").1
+    ));
     let driver = Arc::new(RecordingDriver::default());
     let (model, session) = begin_parked_turn(
         &mut runner,
@@ -18832,6 +19197,182 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
             ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
         }
     }
+}
+
+#[tokio::test]
+async fn a_journal_less_session_offers_no_memory_tools() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("still works")]);
+    let runner = runner(broker, Arc::clone(&model), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::None));
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["still works"]);
+    let tools = model.tool_names(0);
+    for name in ["read_memory_record", "set_memory_pin", "clear_memory_pin"] {
+        assert!(
+            !tools.iter().any(|tool| tool == name),
+            "{name} must not be offered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn append_failure_preserves_the_delivered_reply_without_a_journal_record() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("delivered")]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let inbound = message("question");
+    let stem = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    )
+    .journal_stem();
+    fs::write(
+        journal_dir.path().join(route.agent.as_str()),
+        b"not a directory",
+    )
+    .expect("block append directory");
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["delivered"]);
+    assert_eq!(model.requests(), 1);
+    assert!(!journal_dir.path().join(format!("{stem}.jsonl")).exists());
+    let failed = capture.events_where(
+        "dekopon_gatewayd",
+        &[("event", "gateway_journal_append_failed")],
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].field("reason"), Some("io"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_chat() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
+    let models = ModelScript::new([
+        script_call("printf result-sentinel"),
+        answer("done"),
+        answer("done again"),
+    ]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    route.memory_policy = Some(crate::config::ResolvedPolicy::default());
+    crate::memory::generation::report_policy(
+        route.memory_policy.as_ref().unwrap(),
+        RecallSource::Platform,
+    );
+    let inbound = message("do the work");
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    );
+    let driver = HistoryDriver::new(Ok(Vec::new()));
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let remembered = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        route.memory.window().expect("persistent window"),
+        None,
+        Instant::now(),
+    );
+    let turn = remembered.history.turns().first().expect("committed turn");
+    assert!(
+        turn.exchanges().is_empty(),
+        "the resident window excludes durable tool bytes"
+    );
+    assert_eq!(turn.user(), "do the work");
+    assert_eq!(turn.answer(), Some("done"));
+    let bytes = fs::read_to_string(
+        journal_dir
+            .path()
+            .join(key.journal_stem())
+            .with_extension("jsonl"),
+    )
+    .expect("platform exchanges persist");
+    let line: Value = serde_json::from_str(bytes.trim()).expect("versioned turn");
+    assert_eq!(
+        line["exchanges"][0]["request"][0]["text"],
+        "printf result-sentinel"
+    );
+    let version =
+        crate::memory::generation::version(&route.memory_policy.as_ref().unwrap().routines[0]);
+    let tools = crate::journal::JournalMemoryTools {
+        journal: runner.journal.as_ref().unwrap(),
+        stem: key.journal_stem(),
+        grant: crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+        versions: [("original".to_owned(), version)].into(),
+    };
+    let read = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        line["recordId"].as_u64().unwrap(),
+        "original",
+        None,
+    );
+    assert!(read.contains("[request] printf result-sentinel"), "{read}");
+    assert!(read.contains("[result]"), "{read}");
+    assert!(read.contains("result-sentinel"), "{read}");
+    assert!(read.contains("outcome: success, exit: Some(0)"), "{read}");
+    assert!(!read.contains("do the work"));
+    assert!(!read.contains("done"));
+    let refused = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        line["recordId"].as_u64().unwrap(),
+        "missing",
+        None,
+    );
+    assert!(
+        refused.contains("eligible representation IDs: original"),
+        "{refused}"
+    );
+    assert!(line["user"].is_null());
+    assert!(line["answer"].is_null());
+    assert!(!bytes.contains("do the work"));
+    assert!(!bytes.contains("done"));
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("follow-up"),
+        driver as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let policy = capture.events_where(
+        "dekopon_gatewayd",
+        &[("event", "gateway_memory_policy"), ("recall", "platform")],
+    );
+    assert_eq!(policy.len(), 1);
+    assert_eq!(policy[0].field("mode"), Some("fixed"));
+    assert!(!format!("{policy:?}").contains("do the work"));
 }
 
 #[tokio::test(start_paused = true)]
