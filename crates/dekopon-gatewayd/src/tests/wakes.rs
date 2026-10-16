@@ -630,7 +630,7 @@ async fn a_fired_wake_with_no_route_sends_only_the_orphan_notice() {
         Arc::new(Vec::new()),
         receiver,
         async move {
-            let _ = shutdown_rx.await;
+            shutdown_rx.await.expect("shutdown signal");
         },
         Duration::from_secs(1),
         crate::collection::Collector::new(&[], 4),
