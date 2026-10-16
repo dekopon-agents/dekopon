@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::Body,
@@ -308,12 +307,6 @@ pub trait CurrentProxy: Clone + Send + Sync + 'static {
 impl CurrentProxy for Arc<ModelProxy> {
     fn current(&self) -> Option<Arc<ModelProxy>> {
         Some(Arc::clone(self))
-    }
-}
-
-impl CurrentProxy for Arc<ArcSwap<ModelProxy>> {
-    fn current(&self) -> Option<Arc<ModelProxy>> {
-        Some(self.load_full())
     }
 }
 

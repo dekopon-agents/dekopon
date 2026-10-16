@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use crate::{
-    Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER, Upstream,
+    CurrentProxy, Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER,
+    Upstream,
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
@@ -1045,4 +1046,10 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
 
 async fn json_body(response: reqwest::Response) -> serde_json::Value {
     serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+}
+
+impl CurrentProxy for Arc<arc_swap::ArcSwap<ModelProxy>> {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        Some(self.load_full())
+    }
 }
