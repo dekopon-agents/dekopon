@@ -304,7 +304,11 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     tracing::info!(
         event = "gateway_memory_policy",
         mode,
-        recall = if window.recall == crate::config::RecallSource::Journal { "journal" } else { "platform" },
+        recall = match window.recall {
+            crate::config::RecallSource::None => "none",
+            crate::config::RecallSource::Journal => "journal",
+            crate::config::RecallSource::Platform => "platform",
+        },
         retained_routines = policy.retain.len(),
         capture_user_bytes = ?policy.capture.user,
         capture_assistant_bytes = ?policy.capture.assistant,
