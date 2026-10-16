@@ -2111,7 +2111,11 @@ mod tests {
                         } => (attestation, invocation),
                         other @ (BrokerRequest::Capabilities { .. }
                         | BrokerRequest::RecordDeliveredTurn { .. }
-                        | BrokerRequest::UpcallResult { .. }) => {
+                        | BrokerRequest::UpcallResult { .. }
+                        | BrokerRequest::PrepareGeneration { .. }
+                        | BrokerRequest::CommitGeneration { .. }
+                        | BrokerRequest::AbortGeneration { .. }
+                        | BrokerRequest::ObserveGeneration) => {
                             panic!("unexpected request {other:?}")
                         }
                     };

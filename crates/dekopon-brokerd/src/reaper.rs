@@ -7,14 +7,15 @@ use crate::{BrokerdError, ServerError, ShutdownDeadline};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
-pub(crate) async fn serve<F>(
+pub(crate) async fn serve<F, P>(
     server: F,
     storage: Option<StorageHost>,
-    policies: RetentionPolicies,
+    policies: P,
     deadline: ShutdownDeadline,
 ) -> Result<(), BrokerdError>
 where
     F: Future<Output = Result<(), ServerError>>,
+    P: Fn() -> RetentionPolicies,
 {
     let Some(storage) = storage else {
         return server.await.map_err(BrokerdError::from);
@@ -28,7 +29,7 @@ where
             _ = interval.tick() => {}
         }
         let host = storage.clone();
-        let policies = policies.clone();
+        let policies = policies();
         let mut sweep = tokio::task::spawn_blocking(move || host.sweep(&policies));
         tokio::select! {
             result = &mut server => {
@@ -146,7 +147,7 @@ mod tests {
                 Ok(())
             },
             Some(host),
-            policies,
+            move || policies.clone(),
             ShutdownDeadline::default(),
         ));
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -168,7 +169,7 @@ mod tests {
         serve(
             async { Ok(()) },
             Some(host),
-            policies,
+            || policies.clone(),
             ShutdownDeadline::default(),
         )
         .await
@@ -242,7 +243,7 @@ mod tests {
         let result = serve(
             async { Err(ServerError::ShutdownTimeout) },
             None,
-            RetentionPolicies::new(),
+            RetentionPolicies::new,
             ShutdownDeadline::default(),
         )
         .await;

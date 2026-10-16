@@ -16,6 +16,7 @@ mod assets;
 pub mod capabilities;
 
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
+const RECONCILIATION_OWNER: &str = "dekopon-gatewayd";
 mod config;
 mod credentials;
 mod github_app;
@@ -103,22 +104,22 @@ where
     for warning in &report.warnings {
         warning.log();
     }
-    let Some(Candidate {
-        ready: Ready {
-            broker, identities, ..
-        },
-        socket_path,
-        provider_lock,
-        limits,
-        storage,
-        ..
-    }) = candidate
-    else {
+    let Some(candidate) = candidate else {
         return Err(BrokerdError::from_problems(report.problems));
     };
     let uid = current_uid();
-    let retention = broker.storage_retention_policies();
-    let server = BrokerServer::new(Arc::new(broker), identities, limits)?
+    let limits = candidate.limits;
+    let socket_path = candidate.socket_path.clone();
+    let provider_lock = candidate.provider_lock.clone();
+    let storage = candidate.storage.clone();
+    let broker = Arc::clone(&candidate.ready.broker);
+    let identities = candidate.ready.identities.clone();
+    let coordination = Arc::new(Coordination::new(
+        config_path.as_ref().to_path_buf(),
+        candidate,
+    ));
+    let server = BrokerServer::new(broker, identities, limits)?
+        .with_coordination(Arc::clone(&coordination))
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
@@ -139,7 +140,19 @@ where
         deadline.start(limits.shutdown_grace);
         result
     };
-    let result = reaper::serve(serving, storage, retention, deadline.clone()).await;
+    let result = reaper::serve(
+        serving,
+        storage,
+        || {
+            coordination
+                .active()
+                .ready
+                .broker
+                .storage_retention_policies()
+        },
+        deadline.clone(),
+    )
+    .await;
 
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
@@ -225,13 +238,6 @@ impl std::fmt::Display for Stage {
 
 enum Mode<'a> {
     Boot,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "step 4's generation swap constructs it; until then only the reload tests do"
-        )
-    )]
     Reload(&'a Candidate),
     Check(Option<CheckProviders>),
 }
@@ -245,6 +251,7 @@ enum Residents<'a> {
 }
 
 struct Candidate {
+    digest: String,
     ready: Ready,
     socket_path: PathBuf,
     provider_lock: Option<lock_watch::LoadedLock>,
@@ -253,6 +260,128 @@ struct Candidate {
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
     locked_providers: Option<Vec<dekopon_broker_host::LockedProviderSource>>,
     snapshot: config::ConfigSnapshot,
+}
+
+struct Coordination {
+    config_path: PathBuf,
+    loading: tokio::sync::Semaphore,
+    state: parking_lot::Mutex<GenerationState>,
+}
+
+struct GenerationState {
+    active: Arc<Candidate>,
+    prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
+}
+
+impl GenerationState {
+    fn owned_by(&self, uid: u32) -> bool {
+        self.active
+            .ready
+            .identities
+            .get(&uid)
+            .is_some_and(MappedPeer::is_reconciliation_owner)
+    }
+}
+
+impl Coordination {
+    fn new(config_path: PathBuf, active: Candidate) -> Self {
+        Self {
+            config_path,
+            loading: tokio::sync::Semaphore::new(1),
+            state: parking_lot::Mutex::new(GenerationState {
+                active: Arc::new(active),
+                prepared: None,
+            }),
+        }
+    }
+
+    fn active(&self) -> Arc<Candidate> {
+        Arc::clone(&self.state.lock().active)
+    }
+
+    fn owns(&self, uid: u32) -> bool {
+        self.state.lock().owned_by(uid)
+    }
+
+    async fn prepare(
+        &self,
+        expected_active: &str,
+        uid: u32,
+    ) -> (String, dekopon_broker_protocol::GenerationOutcome) {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let Ok(_permit) = self.loading.acquire().await else {
+            return (self.active().digest.clone(), GenerationOutcome::Refused);
+        };
+        let active = {
+            let state = self.state.lock();
+            if state.active.digest != expected_active
+                || !state.owned_by(uid)
+                || state
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(owner, _, _)| *owner != uid)
+            {
+                return (state.active.digest.clone(), GenerationOutcome::Refused);
+            }
+            Arc::clone(&state.active)
+        };
+        let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
+        let Some(next) = next else {
+            tracing::warn!(
+                event = "broker_reload_refused",
+                applied = false,
+                problems = report.problems.len()
+            );
+            return (active.digest.clone(), GenerationOutcome::Refused);
+        };
+        let mut state = self.state.lock();
+        if !Arc::ptr_eq(&state.active, &active)
+            || !state.owned_by(uid)
+            || state
+                .prepared
+                .as_ref()
+                .is_some_and(|(owner, _, _)| *owner != uid)
+        {
+            return (state.active.digest.clone(), GenerationOutcome::Refused);
+        }
+        let digest = next.digest.clone();
+        state.prepared = Some((uid, active, Arc::new(next)));
+        (digest, GenerationOutcome::Prepared)
+    }
+
+    fn commit(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let mut state = self.state.lock();
+        if !state.owned_by(uid) {
+            return GenerationOutcome::Refused;
+        }
+        let Some((owner, base, next)) = state.prepared.take() else {
+            return GenerationOutcome::Refused;
+        };
+        if owner != uid || next.digest != digest || !Arc::ptr_eq(&base, &state.active) {
+            state.prepared = Some((owner, base, next));
+            return GenerationOutcome::Refused;
+        }
+        state.active = next;
+        tracing::info!(event = "broker_reload_applied", generation.digest = digest);
+        GenerationOutcome::Applied
+    }
+
+    fn abort(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let mut state = self.state.lock();
+        if state.owned_by(uid)
+            && state
+                .prepared
+                .as_ref()
+                .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
+        {
+            state.prepared = None;
+            GenerationOutcome::Aborted
+        } else {
+            GenerationOutcome::Refused
+        }
+    }
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
@@ -378,15 +507,12 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
     let locked_providers = config.locked_providers.clone();
+    let reuse_registry = provider_lock.is_some() || restart_categories.is_empty();
     let storage = runtime.storage.clone();
     let assets = runtime.assets.clone();
     let snapshot = config.snapshot.clone();
     let resident_registry = match residents {
-        Residents::Borrow(active)
-            if restart_categories.is_empty() || active.locked_providers.is_some() =>
-        {
-            Some(active.ready.registry.clone())
-        }
+        Residents::Borrow(active) if reuse_registry => Some(active.ready.registry.clone()),
         Residents::Open | Residents::Borrow(_) | Residents::Scratch => None,
     };
     let prepared = prepare(
@@ -399,19 +525,29 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     .await;
     drop(scratch);
     match prepared {
-        Ok(ready) if report.problems.is_empty() => (
-            Some(Candidate {
-                ready,
-                socket_path,
-                provider_lock,
-                limits,
-                storage,
-                assets,
-                locked_providers,
-                snapshot,
-            }),
-            report,
-        ),
+        Ok(ready) if report.problems.is_empty() => {
+            let digest = match snapshot.digest() {
+                Ok(digest) => digest,
+                Err(source) => {
+                    report.problems.push(BrokerdError::Snapshot { source });
+                    return (None, report);
+                }
+            };
+            (
+                Some(Candidate {
+                    digest,
+                    ready,
+                    socket_path,
+                    provider_lock,
+                    limits,
+                    storage,
+                    assets,
+                    locked_providers,
+                    snapshot,
+                }),
+                report,
+            )
+        }
         Ok(_) => (None, report),
         Err(problems) => {
             report.problems.extend(problems);
@@ -645,7 +781,7 @@ struct Runtime {
 }
 
 struct Ready {
-    broker: Broker<TraceOnlyAuditLog>,
+    broker: Arc<Broker<TraceOnlyAuditLog>>,
     identities: BTreeMap<u32, MappedPeer>,
     registry: BrokerProviderRegistry,
 }
@@ -664,7 +800,16 @@ async fn prepare(
     resident_registry: Option<BrokerProviderRegistry>,
 ) -> Result<Ready, Vec<BrokerdError>> {
     let uid = current_uid();
-    for provider in &config.providers {
+    // Locked artifacts were checked at boot; a pruned old blob is not a new authority source.
+    for provider in config
+        .providers
+        .iter()
+        .skip(if resident_registry.is_some() {
+            config.locked_providers.as_ref().map_or(0, Vec::len)
+        } else {
+            0
+        })
+    {
         socket::validate_owned_file(provider, uid).map_err(|error| vec![error.into()])?;
     }
     let mut registry = if let Some(registry) = resident_registry {
@@ -853,7 +998,7 @@ async fn prepare(
     validate_capability_responses(&broker, &identities, max_frame_bytes)
         .map_err(|error| vec![error])?;
     Ok(Ready {
-        broker,
+        broker: Arc::new(broker),
         identities,
         registry: shared_registry,
     })
@@ -1108,6 +1253,11 @@ pub enum BrokerdError {
     Assets(#[source] assets::AssetsStartupError),
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),
+    #[error("broker generation snapshot could not be encoded")]
+    Snapshot {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("broker provider metadata could not be encoded")]
     ManifestMetadata {
         #[source]

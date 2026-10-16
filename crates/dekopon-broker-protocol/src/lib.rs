@@ -86,6 +86,8 @@ pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 pub enum ProtocolVersion {
     #[serde(rename = "dekopon.dev/broker/v1alpha2")]
     V1Alpha2,
+    #[serde(rename = "dekopon.dev/broker/v1alpha3")]
+    V1Alpha3,
 }
 
 /// This field is untrusted and reaches only telemetry and audit correlation; it is never an
@@ -862,15 +864,50 @@ pub enum BrokerRequest {
         status: u8,
         stderr: String,
     },
+    // Prepare compares the active digest; its response names the newly prepared digest.
+    PrepareGeneration {
+        digest: String,
+    },
+    CommitGeneration {
+        digest: String,
+    },
+    AbortGeneration {
+        digest: String,
+    },
+    ObserveGeneration,
 }
 
 impl BrokerRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if matches!(self, Self::Invoke { assets, .. } if assets.len() > MAX_ASSET_ROWS) {
-            return Err(ProtocolError::TooManyAssetRows);
+        match self {
+            Self::Invoke { assets, .. } if assets.len() > MAX_ASSET_ROWS => {
+                Err(ProtocolError::TooManyAssetRows)
+            }
+            Self::PrepareGeneration { digest }
+            | Self::CommitGeneration { digest }
+            | Self::AbortGeneration { digest }
+                if !valid_generation_digest(digest) =>
+            {
+                Err(ProtocolError::InvalidGenerationDigest)
+            }
+            Self::Invoke { .. }
+            | Self::Capabilities { .. }
+            | Self::RunCommand { .. }
+            | Self::RecordDeliveredTurn { .. }
+            | Self::UpcallResult { .. }
+            | Self::PrepareGeneration { .. }
+            | Self::CommitGeneration { .. }
+            | Self::AbortGeneration { .. }
+            | Self::ObserveGeneration => Ok(()),
         }
-        Ok(())
     }
+}
+
+fn valid_generation_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub const MAX_ASSET_ROWS: usize = 32;
@@ -1198,6 +1235,20 @@ pub enum BrokerResponse {
         code: String,
         message: String,
     },
+    Generation {
+        digest: String,
+        outcome: GenerationOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GenerationOutcome {
+    Prepared,
+    Applied,
+    Aborted,
+    Active,
+    Refused,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1467,6 +1518,8 @@ pub enum ProtocolError {
     MissingStreamDescriptors,
     #[error("broker frame has invalid descriptor indexes")]
     DescriptorIndex,
+    #[error("broker generation digest must be lowercase SHA-256")]
+    InvalidGenerationDigest,
     #[error("broker frame has too many asset rows")]
     TooManyAssetRows,
     #[error("frame maximum must be between 1 and {maximum} bytes")]
@@ -1559,7 +1612,8 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1591,7 +1645,8 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Invocation { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1683,7 +1738,8 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1700,6 +1756,90 @@ impl BrokerClient {
             BrokerResponse::Invocation { result, .. } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// The request digest is the observed active generation; the reply names the prepared candidate.
+    pub async fn prepare_generation(
+        &self,
+        expected_active: String,
+    ) -> Result<(String, GenerationOutcome), ClientError> {
+        match self
+            .exchange(RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                request: BrokerRequest::PrepareGeneration {
+                    digest: expected_active,
+                },
+            })
+            .await?
+        {
+            BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn commit_generation(
+        &self,
+        digest: String,
+    ) -> Result<GenerationOutcome, ClientError> {
+        self.generation(BrokerRequest::CommitGeneration { digest })
+            .await
+    }
+
+    pub async fn abort_generation(&self, digest: String) -> Result<GenerationOutcome, ClientError> {
+        self.generation(BrokerRequest::AbortGeneration { digest })
+            .await
+    }
+
+    pub async fn observe_generation(&self) -> Result<(String, GenerationOutcome), ClientError> {
+        match self
+            .exchange(RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                request: BrokerRequest::ObserveGeneration,
+            })
+            .await?
+        {
+            BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    async fn generation(&self, request: BrokerRequest) -> Result<GenerationOutcome, ClientError> {
+        let digest = match &request {
+            BrokerRequest::CommitGeneration { digest }
+            | BrokerRequest::AbortGeneration { digest } => digest,
+            BrokerRequest::Capabilities { .. }
+            | BrokerRequest::RunCommand { .. }
+            | BrokerRequest::Invoke { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::ObserveGeneration => return Err(ClientError::UnexpectedResponse),
+        };
+        let expected = digest.clone();
+        match self
+            .exchange(RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                request,
+            })
+            .await?
+        {
+            BrokerResponse::Generation { digest, outcome } if digest == expected => Ok(outcome),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Generation { .. }
+            | BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
         }
@@ -2001,6 +2141,7 @@ impl fmt::Display for ProtocolVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::V1Alpha2 => PROTOCOL_VERSION,
+            Self::V1Alpha3 => "dekopon.dev/broker/v1alpha3",
         })
     }
 }
