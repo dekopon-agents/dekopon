@@ -1722,17 +1722,22 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
 )]
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
-        .await
-        .map_err(|join| classified(SourceError::Internal, &join))?
-        .map_err(|error| {
-            let mapped = match error {
-                FileHygieneError::Io { .. } => SourceError::Io,
-                FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
-                _ => SourceError::Insecure,
-            };
-            classified(mapped, &error)
-        })
+    tokio::task::spawn_blocking(move || {
+        let result = read_trusted_file(&owned, uid, FileTier::Private, maximum);
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
+    })
+    .await
+    .map_err(|join| classified(SourceError::Internal, &join))?
+    .map_err(|error| {
+        let mapped = match error {
+            FileHygieneError::Io { .. } => SourceError::Io,
+            FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
+            _ => SourceError::Insecure,
+        };
+        classified(mapped, &error)
+    })
 }
 
 async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, SourceError> {

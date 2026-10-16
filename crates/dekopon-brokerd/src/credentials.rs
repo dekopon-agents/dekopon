@@ -129,12 +129,15 @@ pub(crate) async fn load_with_bytes(
 ) -> Result<(CredentialStore, Vec<u8>), CredentialsError> {
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
-        read_trusted_file(
+        let result = read_trusted_file(
             &owned,
             expected_uid,
             FileTier::Private,
             HARD_MAX_CREDENTIALS_BYTES,
-        )
+        );
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
     })
     .await
     .map_err(|join| CredentialsError::Read {

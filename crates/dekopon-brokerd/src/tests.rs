@@ -2106,15 +2106,56 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
     write_config(&broker.config(), &document);
     write_owner_only(&credentials, credential("a.example.test").as_bytes());
     write_owner_only(&bindings, map("a.example.test").as_bytes());
+    let credential_reads = super::private_read_witness::TrackedRead::new(&credentials);
+    let binding_reads = super::private_read_witness::TrackedRead::new(&bindings);
     let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
-    let owner = super::Coordination::new(broker.config(), active.unwrap());
+    assert_eq!(credential_reads.count(), 1, "boot credentials read once");
+    assert_eq!(binding_reads.count(), 1, "boot secret map read once");
+    let active = active.unwrap();
+    let mut observed = active.snapshot.clone();
+    observed
+        .record_authority_references(
+            Some(&credential_reads.last_bytes()),
+            Some(&binding_reads.last_bytes()),
+        )
+        .unwrap();
+    assert_eq!(
+        active.digest,
+        observed.digest().unwrap(),
+        "boot reference digest comes from runtime input"
+    );
+    credential_reads.reset();
+    binding_reads.reset();
+    let owner = super::Coordination::new(broker.config(), active);
     let old = owner.active().digest.clone();
     write_owner_only(&credentials, credential("b.example.test").as_bytes());
     write_owner_only(&bindings, map("b.example.test").as_bytes());
     let uid = current_uid();
     let (digest, outcome) = owner.prepare(&old, uid).await;
     assert_eq!(outcome, GenerationOutcome::Prepared);
+    assert_eq!(credential_reads.count(), 1, "prepare credentials read once");
+    assert_eq!(binding_reads.count(), 1, "prepare secret map read once");
+    let mut observed = owner
+        .state
+        .lock()
+        .prepared
+        .as_ref()
+        .unwrap()
+        .2
+        .snapshot
+        .clone();
+    observed
+        .record_authority_references(
+            Some(&credential_reads.last_bytes()),
+            Some(&binding_reads.last_bytes()),
+        )
+        .unwrap();
+    assert_eq!(
+        digest,
+        observed.digest().unwrap(),
+        "prepared digest comes from runtime input"
+    );
     assert_ne!(digest, old);
     assert_eq!(owner.abort(&digest, uid), GenerationOutcome::Aborted);
     let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
@@ -2199,12 +2240,19 @@ async fn a_second_serve_observes_edited_configuration_without_claiming_preparati
         &broker.directory.path().join("policies.cedar"),
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
+    let (expected, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let expected = expected.unwrap().digest;
     let second = broker.serve(std::future::pending());
     broker.ready(&second).await;
     let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
     let (prepared, outcome) = client.observe_generation().await.unwrap();
     assert_eq!(outcome, GenerationOutcome::Active);
     assert_ne!(prepared, old);
+    assert_eq!(
+        prepared, expected,
+        "second serve activates the edited candidate"
+    );
     assert_eq!(
         client.commit_generation(prepared).await.unwrap(),
         GenerationOutcome::Refused

@@ -21,6 +21,8 @@ mod config;
 mod credentials;
 mod github_app;
 mod lock_watch;
+#[cfg(test)]
+mod private_read_witness;
 mod provider_manager;
 mod reaper;
 mod secrets;
