@@ -229,8 +229,42 @@ struct Choice<'a> {
     fallback_reason: Option<&'static str>,
 }
 
+fn envelope(
+    line: &Line,
+    id: &str,
+    text: &str,
+    original_id: Option<&str>,
+    eligible: &[String],
+) -> ConversationTurn {
+    let label = format!(
+        "[memory: {}]\n",
+        json!({
+            "recordId": line.record_id,
+            "representationId": id,
+            "eligibleRepresentationIds": eligible,
+            "omittedBytes": line
+                .representations
+                .iter()
+                .find(|rep| rep.routine_id == id && rep.text.is_some())
+                .map_or(0, Representation::omitted_bytes),
+        })
+    );
+    if Some(id) == original_id
+        && line.exchanges.is_empty()
+        && let Some(user) = &line.user
+    {
+        let user = format!("{label}{user}");
+        match &line.answer {
+            Some(answer) => ConversationTurn::completed(user, answer.clone()),
+            None => ConversationTurn::unanswered(user),
+        }
+    } else {
+        ConversationTurn::unanswered(format!("{label}{text}"))
+    }
+}
+
 fn choose(
-    mut line: Line,
+    line: Line,
     choice: &Choice<'_>,
     policy: &ResolvedPolicy,
     max_bytes: usize,
@@ -251,29 +285,22 @@ fn choose(
     } else {
         pin.as_deref().unwrap_or(choice)
     };
-    let original = original_id.and_then(|id| text(&line, id, policy));
+    let eligible = eligible_ids(&line, policy);
+    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible);
+    let original = original_id.and_then(|id| text(&line, id, policy).map(|text| wrap(id, text)));
     let mut target = requested;
-    let mut replacement = text(&line, requested, policy);
+    let mut replacement = text(&line, requested, policy).map(|text| wrap(requested, text));
     if replacement.is_none()
         && authority == "decider"
         && let Some(fallback) = policy.selection.fallback.as_deref()
     {
         target = fallback;
-        replacement = text(&line, fallback, policy);
+        replacement = text(&line, fallback, policy).map(|text| wrap(fallback, text));
     }
-    let original_bytes = if original.is_some() && line.exchanges.is_empty() {
-        (line.user.as_ref().map_or(0, String::len) + line.answer.as_ref().map_or(0, String::len))
-            as u64
-    } else {
-        original
-            .as_ref()
-            .map_or(line.original_bytes, |text| text.len() as u64)
-    };
-    let replacement_bytes = if Some(target) == original_id && line.exchanges.is_empty() {
-        original_bytes
-    } else {
-        replacement.as_ref().map_or(0, |text| text.len() as u64)
-    };
+    let original_bytes = original
+        .as_ref()
+        .map_or(line.original_bytes, |turn| turn.bytes() as u64);
+    let replacement_bytes = replacement.as_ref().map_or(0, |turn| turn.bytes() as u64);
     let savings = i128::from(original_bytes) - i128::from(replacement_bytes);
     let automatic = authority == "fixed" || authority == "fallback";
     let (actual, reason) = if replacement.is_none() {
@@ -290,42 +317,15 @@ fn choose(
     } else {
         (target, fallback_reason.unwrap_or("selected"))
     };
-    let sent = if Some(actual) == original_id {
+    let pin_bytes = pin
+        .as_deref()
+        .and_then(|id| text(&line, id, policy).map(|text| wrap(id, text).bytes()))
+        .unwrap_or(0);
+    let turn = if Some(actual) == original_id {
         original
     } else {
         replacement
     };
-    let label = format!(
-        "[memory: {}]\n",
-        json!({
-            "recordId": line.record_id,
-            "representationId": actual,
-            "eligibleRepresentationIds": eligible_ids(&line, policy),
-            "omittedBytes": line
-                .representations
-                .iter()
-                .find(|rep| rep.routine_id == actual && rep.text.is_some())
-                .map_or(0, Representation::omitted_bytes),
-        })
-    );
-    let pin_bytes = pin
-        .as_deref()
-        .and_then(|id| text(&line, id, policy))
-        .map_or(0, |text| text.len());
-    let turn = sent.map(|sent| {
-        if Some(actual) == original_id
-            && line.exchanges.is_empty()
-            && let Some(user) = line.user.take()
-        {
-            let user = format!("{label}{user}");
-            match line.answer.take() {
-                Some(answer) => ConversationTurn::completed(user, answer),
-                None => ConversationTurn::unanswered(user),
-            }
-        } else {
-            ConversationTurn::unanswered(format!("{label}{sent}"))
-        }
-    });
     let included = turn.as_ref().is_some_and(|turn| turn.bytes() <= max_bytes);
     let reason = if turn.is_none() {
         "representation-unavailable"
