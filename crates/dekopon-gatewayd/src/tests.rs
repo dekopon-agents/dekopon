@@ -1515,7 +1515,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
     }));
     assert!(reports(
         &load(directory.path(), &bad).await.unwrap_err(),
-        |p| matches!(p, ConfigProblem::ConflictingWebhookMount { .. })
+        |p| matches!(p, ConfigProblem::GithubBindNotShared { name } if name == "github")
     ));
     let mut bad = doc.clone();
     bad["routes"][0]["transport"] = json!("dev");
