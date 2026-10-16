@@ -6563,6 +6563,67 @@ async fn a_leftover_improvement_suggestions_key_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_no_assets_keeps_the_fetch_tool_on_every_turn_and_refuses_the_call() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "fetch-call".into(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".to_owned(),
+                    arguments: json!({"id": 1}).to_string(),
+                },
+            }],
+            None,
+        ),
+        answer("There is nothing to look at."),
+    ]);
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("look at my photo"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(models.requests(), 2);
+    assert!(
+        models
+            .tool_names(0)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert_eq!(models.tool_names(0), models.tool_names(1));
+    assert_eq!(
+        tool_message(&models, 1),
+        "There is no chat-asset:1 in this conversation. The reference lines in the messages above name the ones there are."
+    );
+    assert!(
+        !models
+            .prompts
+            .lock()
+            .iter()
+            .flatten()
+            .filter_map(ModelMessage::parts)
+            .flatten()
+            .any(|part| !matches!(part, dekopon_model::model::ContentPart::Text(_)))
+    );
+    assert_eq!(driver.replies(), ["There is nothing to look at."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -6598,7 +6659,8 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
         vec![
             "bash".to_owned(),
             IMPROVEMENT_TOOL_NAME.to_owned(),
-            AGENT_CONFIG_TOOL_NAME.to_owned()
+            AGENT_CONFIG_TOOL_NAME.to_owned(),
+            "fetch_chat_asset".to_owned()
         ]
     );
 
@@ -11668,13 +11730,11 @@ fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
     let first = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("a.png", "image/png", 10)],
-        true,
         now,
     );
     let second = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("b.png", "image/png", 20)],
-        true,
         now,
     );
     assert_eq!(first.inventory[0].id, 1);
@@ -11683,7 +11743,6 @@ fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
     let other = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         vec![pending("c.png", "image/png", 30)],
-        true,
         now,
     );
     assert_eq!(other.inventory[0].id, 3);
@@ -11712,10 +11771,9 @@ fn attachment_inventory_obeys_the_same_private_and_shared_audience_keys_as_histo
     store.assets_for(
         &first_private,
         vec![pending("private.png", "image/png", 10)],
-        true,
         now,
     );
-    let isolated = store.assets_for(&second_private, Vec::new(), true, now);
+    let isolated = store.assets_for(&second_private, Vec::new(), now);
     assert!(
         isolated.inventory.is_empty(),
         "private participants cannot enumerate each other's attachments"
@@ -11724,14 +11782,9 @@ fn attachment_inventory_obeys_the_same_private_and_shared_audience_keys_as_histo
 
     let agent = "reviewer".parse().expect("valid agent fixture");
     let shared = ConversationKey::shared(&agent, "dev", "c2");
-    store.assets_for(
-        &shared,
-        vec![pending("shared.png", "image/png", 10)],
-        true,
-        now,
-    );
+    store.assets_for(&shared, vec![pending("shared.png", "image/png", 10)], now);
     assert_eq!(
-        store.assets_for(&shared, Vec::new(), true, now).inventory[0].name,
+        store.assets_for(&shared, Vec::new(), now).inventory[0].name,
         "shared.png",
         "participants on an explicitly shared route address one attachment inventory"
     );
@@ -11752,7 +11805,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let registered = store.assets_for_access(
         &old_access,
         vec![pending("old-secret.png", "image/png", 10)],
-        true,
         now,
     );
     assert_eq!(registered.arrived, vec![1]);
@@ -11772,12 +11824,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     );
     assert_eq!(
         store
-            .assets_for_access(
-                &stale.assets,
-                Vec::new(),
-                true,
-                now + Duration::from_secs(1),
-            )
+            .assets_for_access(&stale.assets, Vec::new(), now + Duration::from_secs(1),)
             .inventory[0]
             .name,
         "old-secret.png",
@@ -11793,7 +11840,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         racing_store.assets_for_access(
             &racing_access,
             vec![pending("racing-old.png", "image/png", 20)],
-            true,
             now + Duration::from_secs(2),
         )
     });
@@ -11812,7 +11858,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
             .assets_for_access(
                 &stale_access,
                 vec![pending("definitely-late.png", "image/png", 30)],
-                true,
                 now + Duration::from_secs(3),
             )
             .inventory
@@ -11823,7 +11868,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let replacement = store.assets_for_access(
         &fresh.assets,
         vec![pending("fresh.png", "image/png", 40)],
-        true,
         now + Duration::from_secs(3),
     );
     assert_eq!(replacement.arrived, vec![1]);
@@ -11853,12 +11897,7 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let now = Instant::now();
     let first = conversations.begin(&key, &allowed, window(), None, now);
     let old_access = first.assets.clone();
-    store.assets_for_access(
-        &old_access,
-        vec![pending("old.png", "image/png", 10)],
-        true,
-        now,
-    );
+    store.assets_for_access(&old_access, vec![pending("old.png", "image/png", 10)], now);
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
@@ -11884,7 +11923,6 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let registered = store.assets_for_access(
         &fresh.assets,
         vec![pending("fresh.png", "image/png", 10)],
-        true,
         now + Duration::from_secs(900),
     );
     assert_eq!(registered.arrived, vec![1]);
@@ -11905,7 +11943,6 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     store.assets_for_access(
         &old_access,
         vec![pending("displaced.png", "image/png", 10)],
-        true,
         now,
     );
     let first_cache_key = first.cache_key.clone();
@@ -11944,7 +11981,6 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
             .assets_for_access(
                 &in_flight_access,
                 vec![pending("late.png", "image/png", 20)],
-                true,
                 now + Duration::from_secs(3),
             )
             .inventory
@@ -11962,7 +11998,6 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let registered = store.assets_for_access(
         &replacement.assets,
         vec![pending("returned.png", "image/png", 30)],
-        true,
         now + Duration::from_secs(4),
     );
     assert_eq!(registered.arrived, vec![1]);
@@ -11984,7 +12019,6 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
             .assets_for_access(
                 &first.assets,
                 vec![pending("original.png", "image/png", 10)],
-                true,
                 now,
             )
             .arrived,
@@ -12009,7 +12043,6 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     store.assets_for_access(
         &second.assets,
         vec![pending("displacing.png", "image/png", 20)],
-        true,
         now + Duration::from_secs(1),
     );
     let resumed = conversations.begin(
@@ -12022,7 +12055,6 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     let replacement = store.assets_for_access(
         &resumed.assets,
         vec![pending("later.png", "image/png", 30)],
-        true,
         now + Duration::from_secs(2),
     );
     assert_eq!(
@@ -12064,10 +12096,9 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let registered = store.assets_for_access(
         &old_access,
         vec![pending("secret.png", "image/png", 10)],
-        true,
         now,
     );
-    assert!(registered.fetchable);
+    assert!(fetchable(&registered, true));
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
@@ -12084,12 +12115,11 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
         Some(Arc::new(CountingFetcher(Arc::clone(&fetch_calls))) as Arc<dyn AssetFetcher>),
         tokio::runtime::Handle::current(),
         true,
-        true,
     );
     assert!(conversations.remove(&key, EvictionReason::GrantChanged));
     assert!(
-        stale_session_assets.is_empty(),
-        "a retired generation withdraws the model-facing asset tool"
+        !stale_session_assets.offers_fetch(),
+        "a session that starts after its generation retired offers no asset tool"
     );
     let refusal = tokio::task::spawn_blocking(move || {
         stale_session_assets
@@ -12117,7 +12147,6 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let replacement = store.assets_for_access(
         &fresh.assets,
         vec![pending("new.png", "image/png", 10)],
-        true,
         now + Duration::from_secs(1),
     );
     assert_eq!(replacement.arrived, vec![1]);
@@ -12164,12 +12193,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     let now = Instant::now();
     let seed = conversations.begin(&key, &allowed, window(), None, now);
     let access = seed.assets.clone();
-    let registered = store.assets_for_access(
-        &access,
-        vec![pending("retired.png", "image/png", 10)],
-        true,
-        now,
-    );
+    store.assets_for_access(&access, vec![pending("retired.png", "image/png", 10)], now);
     let cache_key = seed.cache_key.clone();
     seed.lease.commit(
         window(),
@@ -12190,7 +12214,6 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
         }) as Arc<dyn AssetFetcher>),
         tokio::runtime::Handle::current(),
         true,
-        registered.fetchable,
     );
     let fetch = tokio::task::spawn_blocking(move || session_assets.fetch(1));
     entered_receive.await.expect("transport fetch starts");
@@ -12211,7 +12234,6 @@ fn the_asset_store_debug_view_exposes_only_counts() {
     store.assets_for(
         &private_conversation_key("dev", "private-channel-8675309", DISTINCTIVE),
         vec![pending("secret-plan.png", "image/png", 10)],
-        true,
         Instant::now(),
     );
 
@@ -12242,7 +12264,6 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
                 source: None,
             },
         ],
-        true,
         now,
     );
     let note = asset::reference_note(&registered, true).expect("a note for three files");
@@ -12258,7 +12279,7 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
         "{note}"
     );
     assert!(note.contains("fetch_chat_asset"), "{note}");
-    assert!(registered.fetchable);
+    assert!(fetchable(&registered, true));
 }
 
 #[test]
@@ -12267,15 +12288,21 @@ fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 2048)],
-        false,
         Instant::now(),
     );
     let note = asset::reference_note(&registered, false).expect("a note");
 
-    assert!(!registered.fetchable);
+    assert!(!fetchable(&registered, false));
     assert!(!note.contains("chat-asset:"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
+}
+
+fn fetchable(registered: &asset::Registered, images_supported: bool) -> bool {
+    registered
+        .inventory
+        .iter()
+        .any(|asset| asset.is_fetchable(images_supported))
 }
 
 #[test]
@@ -12285,15 +12312,13 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
     let first = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 2048)],
-        true,
         now,
     );
-    assert!(first.fetchable);
+    assert!(fetchable(&first, true));
 
     let second = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         Vec::new(),
-        true,
         now,
     );
     assert!(
@@ -12301,7 +12326,7 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
         "a message that carried nothing brought nothing"
     );
     assert!(
-        second.fetchable,
+        fetchable(&second, true),
         "but the conversation's screenshot is still there to be looked at"
     );
     assert_eq!(
@@ -12314,10 +12339,9 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
     let elsewhere = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         Vec::new(),
-        true,
         now,
     );
-    assert!(!elsewhere.fetchable);
+    assert!(!fetchable(&elsewhere, true));
 }
 
 #[test]
@@ -12335,7 +12359,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
                 url: "https://files.slack.com/f/recipe".to_owned(),
             }),
         }],
-        true,
         now,
     );
 
@@ -12343,7 +12366,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
         store.assets_for(
             &private_conversation_key("dev", "c1", SUBJECT),
             Vec::new(),
-            true,
             now,
         );
     }
@@ -12351,7 +12373,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 2048)],
-        true,
         now,
     );
     let note = asset::reference_note(&registered, true).expect("a note");
@@ -12374,7 +12395,6 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
     store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 10)],
-        true,
         Instant::now(),
     );
     let assets = SessionAssets::new(
@@ -12382,7 +12402,6 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
         AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
         None,
         tokio::runtime::Handle::current(),
-        true,
         true,
     );
 
@@ -12411,7 +12430,6 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
     store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 10)],
-        true,
         Instant::now(),
     );
     let assets = Arc::new(SessionAssets::new(
@@ -12419,7 +12437,6 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
         AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
         Some(Arc::new(FixedFetcher(b"\x89PNG\r\n\x1a\nshot".to_vec())) as Arc<dyn AssetFetcher>),
         tokio::runtime::Handle::current(),
-        true,
         true,
     ));
     let inputs = dekopon_agent::attachment::ChatAssetInputs::new(
@@ -13676,12 +13693,14 @@ fn a_document_does_not_need_the_image_modality() {
             },
             pending("shot.png", "image/png", 2048),
         ],
-        false,
         Instant::now(),
     );
     let note = asset::reference_note(&registered, false).expect("a note");
 
-    assert!(registered.fetchable, "the document is still fetchable");
+    assert!(
+        fetchable(&registered, false),
+        "the document is still fetchable"
+    );
     assert!(note.contains("chat-asset:1 — spec.pdf"), "{note}");
     assert!(!note.contains("chat-asset:2"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
@@ -13693,12 +13712,11 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("clip.mp4", "video/mp4", 1024)],
-        true,
         Instant::now(),
     );
     let note = asset::reference_note(&registered, true).expect("a note");
 
-    assert!(!registered.fetchable);
+    assert!(!fetchable(&registered, true));
     assert!(note.contains("clip.mp4"), "{note}");
     assert!(!note.contains("chat-asset:"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
@@ -16350,7 +16368,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
         None,
         Instant::now(),
     );
-    let registered = store.assets_for_access(&seed.assets, inbound.assets, true, Instant::now());
+    let registered = store.assets_for_access(&seed.assets, inbound.assets, Instant::now());
     assert_eq!(registered.arrived, vec![1]);
     let accesses = [
         AssetAccess::one_shot(private_conversation_key(
@@ -16370,7 +16388,6 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
             access,
             transport.asset_fetcher(),
             tokio::runtime::Handle::current(),
-            true,
             true,
         );
         tokio::task::spawn_blocking(move || assert!(assets.fetch_for_capability(1).is_err()))
@@ -17033,15 +17050,11 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     .await;
     assert_eq!(models.requests(), 4);
     assert!(
-        !models
+        models
             .tool_names(0)
             .contains(&"fetch_chat_asset".to_owned())
     );
-    assert!(
-        models
-            .tool_names(1)
-            .contains(&"fetch_chat_asset".to_owned())
-    );
+    assert_eq!(models.tool_names(0), models.tool_names(1));
     assert!(tool_message(&models, 1).contains("chat-asset:1"));
     for _ in 0..4 {
         observed.recv().await.unwrap();
@@ -19807,12 +19820,10 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         .conversations
         .begin(&private, &grant, window(), None, now);
     let access = asset_seed.assets.clone();
-    let arriving = runner.assets.assets_for_access(
-        &access,
-        vec![pending("kept.png", "image/png", 10)],
-        true,
-        now,
-    );
+    let arriving =
+        runner
+            .assets
+            .assets_for_access(&access, vec![pending("kept.png", "image/png", 10)], now);
     assert_eq!(arriving.arrived, [1]);
     drop(asset_seed);
     let old_generation = gateway.generation_for_test();
@@ -19869,7 +19880,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         assert_eq!(
             runner
                 .assets
-                .assets_for_access(&access, Vec::new(), true, now)
+                .assets_for_access(&access, Vec::new(), now)
                 .inventory[0]
                 .name,
             "kept.png"

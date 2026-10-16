@@ -101,7 +101,8 @@ impl fmt::Debug for FetchedAsset {
 pub trait AssetSource {
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
 
-    fn is_empty(&self) -> bool;
+    /// Asked once per session; the answer fixes whether the session offers the fetch tool.
+    fn offers_fetch(&self) -> bool;
 }
 
 pub trait ModelUsageObserver: Send + Sync {
@@ -614,6 +615,10 @@ where
     if memory_tools.is_some() {
         model_tools.extend(crate::memory_tools::tools());
     }
+    let assets = assets.filter(|source| source.offers_fetch());
+    if assets.is_some() {
+        model_tools.push(asset_tool());
+    }
 
     let session_span = tracing::info_span!(
         "prompt.session",
@@ -642,10 +647,6 @@ where
         let model_turns = completed_turns + 1;
         check_cancelled(cancellation)?;
         drain_steers(steering, &mut messages, steers);
-        model_tools.retain(|tool| tool.name != ASSET_TOOL_NAME);
-        if assets.is_some_and(|source| !source.is_empty()) {
-            model_tools.push(asset_tool());
-        }
         let model_span = tracing::info_span!(
             "prompt.model_turn",
             model.turn = model_turns,
@@ -4135,8 +4136,8 @@ mod tests {
                 .ok_or_else(|| format!("chat-asset:{id} is not part of this conversation."))
         }
 
-        fn is_empty(&self) -> bool {
-            self.0.is_empty()
+        fn offers_fetch(&self) -> bool {
+            !self.0.is_empty()
         }
     }
 
@@ -4166,7 +4167,7 @@ mod tests {
     }
 
     #[test]
-    fn each_prompt_records_the_tools_offered_to_that_turn() {
+    fn the_offered_tool_set_is_fixed_for_the_whole_session_while_assets_change() {
         use dekopon_test_support::CaptureLayer;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tracing_subscriber::prelude::*;
@@ -4176,8 +4177,8 @@ mod tests {
             fn fetch(&self, _: u64) -> Result<FetchedAsset, String> {
                 Err("not found".into())
             }
-            fn is_empty(&self) -> bool {
-                !self.0.load(Ordering::Relaxed)
+            fn offers_fetch(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
             }
         }
         struct ChangingModel<'a> {
@@ -4193,42 +4194,43 @@ mod tests {
                 on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
             ) -> Result<AssistantTurn, InferenceError> {
                 let turn = self.scripted.complete(messages, tools, options, on_event);
-                self.assets.0.store(true, Ordering::Relaxed);
+                self.assets.0.fetch_xor(true, Ordering::Relaxed);
                 turn
             }
         }
-        let capture = CaptureLayer::workspace();
-        let _guard = tracing_subscriber::registry()
-            .with(capture.clone())
-            .set_default();
-        let assets = ChangingAssets(AtomicBool::new(false));
-        let model = ChangingModel {
-            scripted: ScriptedModel::new([asset_call(1), answer("done")]),
-            assets: &assets,
-        };
-        let mut history = History::default();
-        run_prompt_session(
-            &model,
-            &RecordingRuntime::new(0),
-            SessionInputs::new("check", limits(2, 2)).with_assets(&assets),
-            &mut history,
-        )
-        .unwrap();
-        let first = capture.events_where(
-            "dekopon_agent::audit",
-            &[("audit.event", "agent.model.prompt"), ("model.turn", "1")],
-        );
-        let second = capture.events_where(
-            "dekopon_agent::audit",
-            &[("audit.event", "agent.model.prompt"), ("model.turn", "2")],
-        );
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_eq!(first[0].field("tools"), Some("bash,suggest_improvement"));
-        assert_eq!(
-            second[0].field("tools"),
-            Some("bash,suggest_improvement,fetch_chat_asset")
-        );
+        for (offered_at_start, tools) in [
+            (false, "bash,suggest_improvement"),
+            (true, "bash,suggest_improvement,fetch_chat_asset"),
+        ] {
+            let capture = CaptureLayer::workspace();
+            let _guard = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let assets = ChangingAssets(AtomicBool::new(offered_at_start));
+            let model = ChangingModel {
+                scripted: ScriptedModel::new([asset_call(1), answer("done")]),
+                assets: &assets,
+            };
+            let mut history = History::default();
+            run_prompt_session(
+                &model,
+                &RecordingRuntime::new(0),
+                SessionInputs::new("check", limits(2, 2)).with_assets(&assets),
+                &mut history,
+            )
+            .unwrap();
+            for turn in ["1", "2"] {
+                let prompts = capture.events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.model.prompt"), ("model.turn", turn)],
+                );
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0].field("tools"), Some(tools), "turn {turn}");
+            }
+            let observed = model.scripted.observed_tools.lock();
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0], observed[1]);
+        }
     }
 
     #[test]
