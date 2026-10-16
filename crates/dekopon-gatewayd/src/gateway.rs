@@ -832,7 +832,8 @@ fn reload_problem(problem: &GatewaydError) -> String {
         ) => format!("{problem}: {error}"),
         GatewaydError::Catalog(_) => problem.to_string(),
         GatewaydError::Probe(probe) => format!(
-            "{probe} ({})",
+            "model {} probe failed ({})",
+            probe.model,
             match &probe.source {
                 crate::probe::ProbeError::Credential(_) => "credential",
                 crate::probe::ProbeError::Vendor(error) => error.kind().as_str(),
@@ -1048,6 +1049,36 @@ mod snapshot_tests {
     use dekopon_model_token_governor::Tokens;
     use dekopon_test_support::LoopbackServer;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn probe_reload_record_omits_vendor_model_but_boot_retains_its_diagnostic() {
+        use crate::{ProbeError, ProbeProblem};
+        use dekopon_model::error::{InferenceError, ProtocolFailure};
+
+        const SENTINEL: &str = "configured-vendor-model-secret-sentinel";
+        let problem = GatewaydError::Probe(Box::new(ProbeProblem {
+            model: "router".to_owned(),
+            vendor_model: SENTINEL.to_owned(),
+            file: "gateway.yaml".into(),
+            routes: Vec::new(),
+            source: ProbeError::Vendor(InferenceError::Protocol(ProtocolFailure::NoChoices)),
+        }));
+        assert!(
+            error_chain(&problem).contains(SENTINEL),
+            "boot output is unchanged"
+        );
+        let (capture, _guard) = crate::tests::capture_spans();
+        let reason = reload_problem(&problem);
+        tracing::warn!(event = "gateway_reload_refused", applied = false, error = %reason);
+        let refused =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+        assert_eq!(refused.len(), 1);
+        let error = refused[0].field("error").unwrap();
+        assert!(error.contains("router"), "{error}");
+        assert!(error.contains("probe failed"), "{error}");
+        assert!(error.contains("protocol"), "{error}");
+        assert!(!error.contains(SENTINEL), "{error}");
+    }
 
     #[tokio::test]
     async fn one_published_snapshot_selects_the_proxy_for_each_request() {
