@@ -29,6 +29,15 @@ def render(*args):
     return docs, deployment, pod, volumes, gateway, broker, init
 
 
+def notes(*args):
+    result = subprocess.run(
+        ["helm", "install", "dekopon", str(CHART), "--dry-run=client", "--debug", *args],
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.split("\nNOTES:\n", 1)[1]
+
+
 def mounts(container):
     return {m["name"]: m for m in container["volumeMounts"]}
 
@@ -60,6 +69,7 @@ def test_live_gateway_directory_and_nested_skills():
     for name in ("gateway-config", "skills"):
         projection = volumes[name]["configMap"]
         assert projection["defaultMode"] & 0o022 == 0
+        assert projection["defaultMode"] & 0o004 == 0o004
     assert "fsGroup" not in pod["spec"]["securityContext"]
     assert "reloader.stakater.com/search" not in (pod["metadata"].get("annotations") or {})
     assert (deployment["metadata"].get("annotations") or {}) == {}
@@ -77,6 +87,7 @@ def test_inline_gateway_source_changes_without_broker_roll():
             {"key": "gatewayd.yaml", "path": "gatewayd.yaml"},
         ]
         assert volumes["gateway-config"]["secret"]["defaultMode"] & 0o022 == 0
+        assert volumes["gateway-config"]["secret"]["defaultMode"] & 0o004 == 0o004
         assert mounts(gateway)["gateway-config"]["readOnly"] is True
         assert "subPath" not in mounts(gateway)["gateway-config"]
         assert "gateway-config" not in mounts(broker) and "gateway-config" not in mounts(init)
@@ -92,6 +103,17 @@ def test_inline_gateway_source_changes_without_broker_roll():
     catalog_changed = render("--set", "gateway.enabled=true", "--set", "gateway.catalog.inline=agent-b", "--set", "gateway.config.inline=broker: {serverUid: 65532}")
     assert "checksum/catalog" not in (catalog_changed[2]["metadata"].get("annotations") or {})
     assert catalog_changed[2]["metadata"].get("annotations") == first[2]["metadata"].get("annotations")
+
+
+def test_restart_notice_names_only_broker_secret_sources():
+    gateway_args = (
+        "--set", "gateway.enabled=true", "--set", "gateway.config.existingSecret=gateway-authored",
+        "--set", "gateway.catalog.existingConfigMap=agents",
+    )
+    assert "rollout restart" not in notes(*gateway_args)
+    broker_args = ("--set", "broker.config.inline=", "--set", "broker.config.existingSecret=broker-authored")
+    assert "rollout restart" in notes(*broker_args)
+    assert "rollout restart" in notes(*gateway_args, *broker_args)
 
 
 def test_existing_gateway_secret_and_broker_restart_sources():
@@ -128,4 +150,5 @@ def test_existing_gateway_secret_and_broker_restart_sources():
 if __name__ == "__main__":
     test_live_gateway_directory_and_nested_skills()
     test_inline_gateway_source_changes_without_broker_roll()
+    test_restart_notice_names_only_broker_secret_sources()
     test_existing_gateway_secret_and_broker_restart_sources()
