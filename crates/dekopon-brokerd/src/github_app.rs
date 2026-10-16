@@ -352,10 +352,11 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use dekopon_broker::{CredentialRefreshError, RefreshingCredential as _};
-    use dekopon_test_support::LoopbackServer;
+    use dekopon_test_support::{CaptureLayer, LoopbackServer};
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tracing_subscriber::prelude::*;
 
     use super::{Downscope, GithubAppCredential, GithubAppKey, Installation};
 
@@ -668,10 +669,6 @@ mod tests {
                 "token-endpoint-unavailable",
             ),
             (
-                status_response("404 Not Found", r#"{"message":"Not Found"}"#),
-                "token-endpoint-rejected",
-            ),
-            (
                 status_response("201 Created", r#"{"token":"#),
                 "token-endpoint-protocol",
             ),
@@ -689,6 +686,41 @@ mod tests {
                 .await
                 .expect_err("the mint fails");
             assert_eq!(error, CredentialRefreshError::Unavailable { category });
+            server.join();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_mint_403_and_404_do_not_diagnose_repository_or_permission() {
+        for status in ["403 Forbidden", "404 Not Found"] {
+            let capture = CaptureLayer::new();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            let server = LoopbackServer::once(&status_response(
+                status,
+                r#"{"message":"ambiguous upstream refusal"}"#,
+            ));
+            let error = credential(&server, None)
+                .resolve()
+                .await
+                .expect_err("upstream refusal must not mint");
+            assert!(matches!(
+                error,
+                CredentialRefreshError::Unavailable {
+                    category: "token-endpoint-rejected"
+                }
+            ));
+            let events = capture.events_where(
+                "dekopon_brokerd::github_app",
+                &[("event", "broker_github_app_credential_refresh_failed")],
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].field("category"), Some("token-endpoint-rejected"));
+            assert_eq!(
+                events[0].field("message"),
+                Some("a GitHub App installation token could not be minted")
+            );
             server.join();
         }
     }
