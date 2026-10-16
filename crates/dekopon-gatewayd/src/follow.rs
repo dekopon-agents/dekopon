@@ -667,13 +667,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // The disk lock is taken one statement before the writer check, so the banish can land
+        // on either side of it: NotFound before, PermissionDenied after the marker write.
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(3), refresh)
                 .await
                 .unwrap()
                 .unwrap(),
             Err(JournalError::Io {
-                kind: io::ErrorKind::PermissionDenied
+                kind: io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
             })
         ));
         assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
