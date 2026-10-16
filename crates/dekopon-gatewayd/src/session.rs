@@ -1120,44 +1120,6 @@ impl Delta {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-async fn append_journal(
-    journal: &Arc<Journal>,
-    key: &ConversationKey,
-    granted: &[String],
-    window: MemoryWindow,
-    turn: ConversationTurn,
-    inventory: Vec<asset::AssetRef>,
-    next_asset_id: u64,
-) {
-    let journal = Arc::clone(journal);
-    let stem = key.journal_stem();
-    let grant = journal::grant_digest(granted);
-    let appended = tokio::task::spawn_blocking(move || {
-        journal.append(
-            &stem,
-            &journal::Entry {
-                at: SystemTime::now(),
-                grant: &grant,
-                turn: &turn,
-                inventory: &inventory,
-                next_asset_id,
-            },
-            window,
-        )
-    })
-    .await;
-    let reason = match appended {
-        Ok(Ok(())) => return,
-        Ok(Err(error)) => error.label(),
-        Err(_) => "task",
-    };
-    tracing::warn!(event = "gateway_journal_append_failed", reason);
-}
-
 fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
     let conversation = message.conversation.key();
     match route.memory {
@@ -1994,6 +1956,7 @@ async fn session(
     }
 
     progress.seal();
+    let mut pending_journal = None;
 
     if let Some(window) = window
         && let Some(turn) = turn
@@ -2007,28 +1970,28 @@ async fn session(
         };
         if lease.commit(window, turn, taken, &cache_key, Instant::now())
             && let Some(turn) = journaled
-            && let Some(journal) = runner.journal.as_ref()
+            && runner.journal.is_some()
         {
-            let inventory = runner.assets.inventory(&journal_access);
-            let next_asset_id = journal_access.next_asset_id();
-            append_journal(
-                journal,
-                &key,
-                &granted,
-                window,
-                turn,
-                inventory,
-                next_asset_id,
-            )
-            .await;
+            pending_journal = Some((turn, window));
         }
     }
 
+    let post_reply = || crate::memory::generation::PostReply {
+        runner,
+        route,
+        key: &key,
+        granted: &granted,
+        access: &journal_access,
+        cancellation: &cancellation,
+    };
     if matches!(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
         progress.terminal(Terminal::Silent).await;
+        if let Some((turn, window)) = pending_journal.take() {
+            crate::memory::generation::persist(post_reply(), window, turn).await;
+        }
         return "declined";
     }
 
@@ -2128,6 +2091,9 @@ async fn session(
         }
     };
     let delivered = progress.terminal(terminal).await;
+    if let Some((turn, window)) = pending_journal.take() {
+        crate::memory::generation::persist(post_reply(), window, turn).await;
+    }
     attachments.finish(match (&outcome, delivered) {
         (Ok(_), true) => AssetDeliveryDisposition::Delivered,
         (Ok(_), false) => AssetDeliveryDisposition::Failed,

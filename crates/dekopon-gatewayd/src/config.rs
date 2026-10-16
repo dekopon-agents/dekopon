@@ -1635,7 +1635,21 @@ pub(crate) fn resolve(
             &model_names,
             &proxy_only,
         ) {
-            Ok(policy) => Some(policy),
+            Ok(mut policy) => {
+                policy.models = policy
+                    .routines
+                    .iter()
+                    .filter_map(|routine| {
+                        let name = routine.model.as_ref()?;
+                        config
+                            .models
+                            .iter()
+                            .find(|model| model.name() == name)
+                            .map(|model| (name.clone(), model.clone()))
+                    })
+                    .collect();
+                Some(policy)
+            }
             Err(problem) => {
                 problems.push(ConfigProblem::MemoryPolicy {
                     route: Some(index),

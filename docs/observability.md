@@ -682,6 +682,7 @@ Every successful recall that seeds a window logs `gateway_recalled` at info with
 (messages a resident window's watermark read added; 0 on a cold recall). A watermark read that
 finds nothing new logs nothing. A failed one logs `gateway_recall_failed` at warn with
 `source` and `reason`; the message runs without what it would have added.
+A failed progressive part emits `gateway_memory_deviation` with a bounded configured routine ID and `reason="generation-failed"`; it does not change a reply already delivered. A stale conversation generation cannot publish its result and emits `gateway_memory_retention_failed` with `reason="stale-generation"`. Neither event carries source text or a conversation coordinate.
 `gateway_conversation_unresolved` is the debug-level record of why a conversation could not be
 placed, and the cause behind `drop.reason = conversation-unresolved`. On Discord, where the
 conversation is a guild channel, `cause` is `rest-cooldown`, `request`, `status`, `timeout`, `body`,

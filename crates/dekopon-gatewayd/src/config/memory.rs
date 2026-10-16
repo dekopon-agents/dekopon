@@ -4,8 +4,9 @@ use std::{
     time::Duration,
 };
 
+use crate::config::ModelConfig;
 use dekopon_core::AgentId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -113,7 +114,7 @@ pub enum Uncapped {
     Uncapped,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Routine {
     pub id: String,
@@ -123,7 +124,7 @@ pub struct Routine {
     pub parts: Option<Vec<Part>>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum RoutineKind {
     Original,
@@ -132,7 +133,7 @@ pub enum RoutineKind {
     ProgressiveTurducken,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Part {
     pub id: String,
@@ -158,6 +159,7 @@ pub enum SelectionMode {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedPolicy {
+    pub models: BTreeMap<String, ModelConfig>,
     pub capture: Capture,
     pub routines: Vec<Routine>,
     pub retain: Vec<String>,
@@ -168,6 +170,7 @@ pub struct ResolvedPolicy {
 impl Default for ResolvedPolicy {
     fn default() -> Self {
         Self {
+            models: BTreeMap::new(),
             capture: Capture {
                 user: CaptureBound::Word(Uncapped::Uncapped),
                 assistant: CaptureBound::Word(Uncapped::Uncapped),
@@ -409,6 +412,7 @@ pub fn resolve_policy(
         }
     };
     Ok(ResolvedPolicy {
+        models: BTreeMap::new(),
         capture: policy.capture.clone(),
         routines: policy.routines.clone(),
         retain: policy.retain.clone(),

@@ -191,7 +191,7 @@ impl AssetAccess {
         fence.is_active().then(|| operation(&self.key))
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.with_active(|_| ()).is_some()
     }
 

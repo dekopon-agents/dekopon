@@ -121,6 +121,7 @@ pub(crate) struct Entry<'a> {
     pub turn: &'a ConversationTurn,
     pub inventory: &'a [AssetRef],
     pub next_asset_id: u64,
+    pub prepared: Option<&'a super::generation::Prepared>,
 }
 
 // Every method does blocking file I/O under `lock`; callers run it on a blocking thread, and the
@@ -442,21 +443,35 @@ impl Journal {
             }) => 1,
             Err(error) => return Err(error),
         };
-        let line = Line {
+        let mut line = Line {
             version: 2,
             at_ms: millis(entry.at),
             record_id: next_record_id,
             next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
-            source_eligibility: true,
-            representations: Vec::new(),
-            exchanges: Vec::new(),
+            source_eligibility: entry.prepared.is_none_or(|prepared| prepared.original),
+            representations: entry
+                .prepared
+                .map_or_else(Vec::new, |prepared| prepared.representations.clone()),
+            exchanges: entry.prepared.map_or_else(
+                || entry.turn.exchanges().to_vec(),
+                |prepared| prepared.exchanges.clone(),
+            ),
             pins: Vec::new(),
             reads: Vec::new(),
             selections: Vec::new(),
-            availability: vec!["original".to_owned()],
+            availability: entry.prepared.map_or_else(
+                || vec!["original".to_owned()],
+                |prepared| prepared.availability.clone(),
+            ),
             grant: entry.grant.to_owned(),
-            user: Some(entry.turn.user().to_owned()),
-            answer: entry.turn.answer().map(str::to_owned),
+            user: entry
+                .prepared
+                .filter(|prepared| !prepared.original)
+                .map_or_else(|| Some(entry.turn.user().to_owned()), |_| None),
+            answer: entry
+                .prepared
+                .filter(|prepared| !prepared.original)
+                .map_or_else(|| entry.turn.answer().map(str::to_owned), |_| None),
             assets: entry
                 .inventory
                 .iter()
@@ -478,6 +493,14 @@ impl Journal {
                 .collect(),
             next_asset_id: entry.next_asset_id,
         };
+        for representation in &mut line.representations {
+            representation.source_record_id = next_record_id;
+        }
+        for exchange in &mut line.exchanges {
+            for representation in exchange.request.iter_mut().chain(&mut exchange.result) {
+                representation.source_record_id = next_record_id;
+            }
+        }
         if let Some(parent) = path.parent() {
             DirBuilder::new()
                 .recursive(true)
@@ -955,6 +978,7 @@ mod tests {
             .append(
                 stem,
                 &Entry {
+                    prepared: None,
                     at,
                     grant,
                     turn,
