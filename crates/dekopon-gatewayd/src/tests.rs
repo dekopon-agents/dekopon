@@ -18645,6 +18645,88 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
 }
 
 #[tokio::test]
+async fn yaml_mapping_key_order_does_not_publish_a_new_gateway_generation() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    let catalog = root.path().join("dekopon.yaml");
+    fs::write(&catalog, catalog_text(true, Some("reasoning"))).unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = root.path().join("gateway.yaml");
+    fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let broker_digest = "b".repeat(64);
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: broker_digest.clone(),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, broker_digest)
+    .unwrap();
+    let before = gateway.digest_for_test();
+
+    let mut config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let root_mapping = config.as_mapping_mut().unwrap();
+    let version = root_mapping.remove("apiVersion").unwrap();
+    root_mapping.insert("apiVersion".into(), version);
+    let route = config["routes"][0].as_mapping_mut().unwrap();
+    let agent = route.remove("agent").unwrap();
+    route.insert("agent".into(), agent);
+    fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let mut agent: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+    let metadata = agent.as_mapping_mut().unwrap().remove("metadata").unwrap();
+    agent
+        .as_mapping_mut()
+        .unwrap()
+        .insert("metadata".into(), metadata);
+    let spec = agent["spec"].as_mapping_mut().unwrap();
+    let description = spec.remove("description").unwrap();
+    spec.insert("description".into(), description);
+    fs::write(&catalog, serde_yaml::to_string(&agent).unwrap()).unwrap();
+
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    assert_eq!(
+        gateway.digest_for_test(),
+        before,
+        "mapping order is not effective config"
+    );
+    assert!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .is_empty()
+    );
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(
+        broker.recorded().is_empty(),
+        "unchanged broker response needs no commit"
+    );
+}
+
+#[tokio::test]
 async fn a_lost_commit_confirmation_requires_observation_before_gateway_publication() {
     use dekopon_broker_protocol::{
         BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,

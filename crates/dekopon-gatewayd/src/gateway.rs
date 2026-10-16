@@ -49,6 +49,43 @@ struct ReloadState {
     pending: Option<(String, String)>,
 }
 
+fn canonical_yaml(value: &serde_yaml::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn canonical_value(value: &serde_yaml::Value) -> Result<serde_json::Value, serde_json::Error> {
+        match value {
+            serde_yaml::Value::Mapping(mapping) => {
+                let fields = mapping
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            match key.as_str() {
+                                Some(key) => key.to_owned(),
+                                None => serde_json::to_string(key)?,
+                            },
+                            canonical_value(value)?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+                serde_json::to_value(fields)
+            }
+            serde_yaml::Value::Sequence(items) => {
+                let items = items
+                    .iter()
+                    .map(canonical_value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                serde_json::to_value(items)
+            }
+            serde_yaml::Value::Tagged(tagged) => {
+                serde_json::to_value((tagged.tag.to_string(), canonical_value(&tagged.value)?))
+            }
+            serde_yaml::Value::Null
+            | serde_yaml::Value::Bool(_)
+            | serde_yaml::Value::Number(_)
+            | serde_yaml::Value::String(_) => serde_json::to_value(value),
+        }
+    }
+    serde_json::to_vec(&canonical_value(value)?)
+}
+
 fn serving_digest(
     candidate: &Candidate,
     broker_digest: &str,
@@ -57,8 +94,8 @@ fn serving_digest(
     hasher.update((broker_digest.len() as u64).to_be_bytes());
     hasher.update(broker_digest.as_bytes());
     let mapping = config::merged_mapping(&candidate.sources.config)?;
-    let encoded =
-        serde_json::to_vec(&mapping).map_err(|_error| config::ConfigError::UnclassifiedSource)?;
+    let encoded = canonical_yaml(&serde_yaml::Value::Mapping(mapping))
+        .map_err(|_error| config::ConfigError::UnclassifiedSource)?;
     hasher.update((encoded.len() as u64).to_be_bytes());
     hasher.update(encoded);
     for (path, bytes) in &candidate.sources.catalog.0 {
@@ -69,8 +106,7 @@ fn serving_digest(
             (true, Some("yaml" | "yml" | "json")) => {
                 let value: serde_yaml::Value = serde_yaml::from_slice(bytes)
                     .map_err(|_error| config::ConfigError::UnclassifiedSource)?;
-                serde_json::to_vec(&value)
-                    .map_err(|_error| config::ConfigError::UnclassifiedSource)?
+                canonical_yaml(&value).map_err(|_error| config::ConfigError::UnclassifiedSource)?
             }
             _ => bytes.clone(),
         };
