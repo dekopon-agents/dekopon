@@ -1960,6 +1960,212 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
         applied[0].field("generation.digest"),
         Some(next_digest.as_str())
     );
+    assert_eq!(applied[0].field("category.count"), Some("1"));
+    assert_eq!(applied[0].field("categories"), Some("policies"));
+    assert!(
+        capture
+            .events_where(
+                "dekopon_broker::audit",
+                &[("audit.event", "broker_reload_applied")]
+            )
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unreadable_reload_source_reports_monitor_failure_not_activation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old_digest = fixture.active.digest.clone();
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    fs::remove_file(&fixture.path).unwrap();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old_digest, current_uid()).await,
+            (old_digest.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, old_digest);
+    let failed = capture.events_where(
+        "dekopon_brokerd",
+        &[("event", "broker_reload_monitor_failed")],
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].field("applied"), Some("false"));
+    let reason = failed[0]
+        .field("error")
+        .expect("sanitized monitor diagnostic");
+    assert!(reason.contains("broker configuration"), "{reason}");
+    assert!(
+        reason.contains(&fixture.path.display().to_string()),
+        "{reason}"
+    );
+    assert!(
+        capture
+            .events_where("dekopon_brokerd", &[("event", "broker_reload_applied")])
+            .is_empty()
+    );
+}
+
+#[test]
+fn broker_reload_diagnostics_do_not_walk_untrusted_source_errors() {
+    let problem = super::BrokerdError::Config(config::ConfigError::Read {
+        path: "broker.yaml".into(),
+        source: std::io::Error::other("private-source-sentinel"),
+    });
+    let entries = super::reload_entries(&problem);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0],
+        "broker configuration is invalid: could not read broker configuration at broker.yaml"
+    );
+    assert!(!entries[0].contains("private-source-sentinel"));
+}
+
+#[test]
+fn private_map_and_capability_aggregates_flatten_before_the_record_bound() {
+    let secrets = super::BrokerdError::Secrets(super::SecretMapError::Validation {
+        problems: (0..12).map(|index| format!("conflict #{index}")).collect(),
+    });
+    let entries = super::reload_entries(&secrets);
+    assert_eq!(entries.len(), 12);
+    assert!(dekopon_core::bounded_problems(entries.into_iter()).ends_with("and 4 more"));
+
+    let capabilities = super::BrokerdError::Capabilities {
+        problems: (0..12)
+            .map(|_| super::capabilities::CapabilityProblem::MissingField {
+                capability: "test-capability".parse().unwrap(),
+                field: "scope",
+            })
+            .collect(),
+    };
+    let entries = super::reload_entries(&capabilities);
+    assert_eq!(entries.len(), 12);
+    assert!(dekopon_core::bounded_problems(entries.into_iter()).ends_with("and 4 more"));
+}
+
+#[tokio::test]
+async fn twelve_invalid_credentials_render_eight_individual_refusal_reasons() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let source = (0..12).map(|index| format!(
+        "  - name: 'invalid name {index}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-secret-value\n"
+    )).collect::<String>();
+    write_owner_only(
+        &credential,
+        format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n{source}")
+            .as_bytes(),
+    );
+    let old = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("problems"), Some("12"));
+    let reason = refused[0].field("error").unwrap();
+    assert_eq!(reason.matches("credential #").count(), 8, "{reason}");
+    assert!(reason.ends_with("and 4 more"), "{reason}");
+    assert!(!reason.contains("invalid name"));
+}
+
+#[tokio::test]
+async fn broker_refusal_repeats_only_after_a_distinct_edit_or_repair() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old = fixture.active.digest.clone();
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let invalid = format!("{POLICIES}\n@id(\"broken\") permit(principal, action, resource\n");
+    write_owner_only(&fixture.cedar, invalid.as_bytes());
+    async {
+        for _ in 0..3 {
+            assert_eq!(
+                owner.prepare(&old, current_uid()).await,
+                (old.clone(), GenerationOutcome::Refused)
+            );
+        }
+        let refused =
+            || capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+        assert_eq!(refused().len(), 1);
+        write_owner_only(&fixture.cedar, format!("{invalid}\n").as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+        assert_eq!(refused().len(), 2);
+        write_owner_only(&fixture.cedar, POLICIES.as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Active)
+        );
+        write_owner_only(&fixture.cedar, format!("{invalid}\n").as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+        assert_eq!(refused().len(), 3);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, old);
+}
+
+#[tokio::test]
+async fn invalid_credential_name_never_enters_reload_or_boot_diagnostics() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const SENTINEL: &str = "sentinel invalid secret name";
+    let (broker, credential, owner) = generation_with_private_credential().await;
+    let old = owner.active().digest.clone();
+    let invalid = format!(
+        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: '{SENTINEL}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-second-long-enough\n"
+    );
+    write_owner_only(&credential, invalid.as_bytes());
+    let (candidate, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&owner.active())).await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        super::BrokerdError::Credentials(super::credentials::CredentialsError::Invalid { .. })
+    )));
+    let error = dekopon_core::error_chain(&super::BrokerdError::from_problems(report.problems));
+    assert!(error.contains("credential #1"), "{error}");
+    assert!(!error.contains(SENTINEL));
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let reason = refused[0].field("error").unwrap();
+    assert!(reason.contains("credential #1"), "{reason}");
+    assert!(!reason.contains(SENTINEL));
 }
 
 async fn generation_with_private_credential()

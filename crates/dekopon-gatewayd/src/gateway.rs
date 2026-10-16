@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
-use dekopon_core::ExternalSubject;
+use dekopon_core::{ExternalSubject, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tracing::Instrument as _;
 
 use crate::{
-    Candidate, ServeOutcome, cancel_session,
+    Candidate, GatewaydError, ServeOutcome, cancel_session,
     collection::{self, CollectionRoute as _},
     config::{self, GithubEvent},
     follow, jobs, observe_session,
@@ -99,6 +99,12 @@ struct ReloadState {
     credentials: Arc<session::ConfiguredModels>,
     metering: Arc<Metering>,
     pending: Option<(String, String)>,
+    unsettled: Option<config::RawCandidate>,
+}
+
+enum Unsettled {
+    Monitor,
+    Refused(&'static str),
 }
 
 fn canonical_yaml(value: &serde_yaml::Value) -> Result<Vec<u8>, serde_json::Error> {
@@ -262,6 +268,7 @@ impl Gateway {
             credentials: owners.credentials,
             metering: owners.metering,
             pending: None,
+            unsettled: None,
         });
         Ok(self)
     }
@@ -754,12 +761,13 @@ impl Gateway {
             route.clone(),
             message,
             driver,
+            generation._digest.clone(),
             move |message, queued| {
                 let generation = active.load();
                 let route = generation.routes.route(message)?;
                 (message.constituents.is_empty()
                     || route.identity(message) == queued.identity(message))
-                .then(|| route.clone())
+                .then(|| (route.clone(), generation._digest.clone()))
             },
         ));
     }
@@ -796,6 +804,82 @@ impl Gateway {
     }
 }
 
+fn reload_reason(problem: &GatewaydError) -> &'static str {
+    match problem {
+        GatewaydError::Config(config::ConfigError::RestartRequired { .. }) => "restart-required",
+        GatewaydError::Config(_) => "configuration",
+        GatewaydError::Catalog(_) => "catalog",
+        GatewaydError::Route(_) => "route",
+        GatewaydError::Probe(_) => "vendor-probe",
+        GatewaydError::Startup { .. } => "credential-or-transport",
+        GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Problems { .. } => "preparation",
+    }
+}
+
+fn reload_problem(problem: &GatewaydError) -> String {
+    match problem {
+        GatewaydError::Config(
+            error @ (config::ConfigError::Decode { .. }
+            | config::ConfigError::DecodeFragment { .. }),
+        ) => format!("{problem}: {error}"),
+        GatewaydError::Catalog(_) => problem.to_string(),
+        GatewaydError::Probe(probe) => format!(
+            "model {} probe failed ({})",
+            probe.model,
+            match &probe.source {
+                crate::probe::ProbeError::Credential(_) => "credential",
+                crate::probe::ProbeError::Vendor(error) => error.kind().as_str(),
+            }
+        ),
+        GatewaydError::Config(_)
+        | GatewaydError::Route(_)
+        | GatewaydError::Startup { .. }
+        | GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Problems { .. } => error_chain(problem),
+    }
+}
+
+fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
+    match problem {
+        GatewaydError::Config(config::ConfigError::Invalid { path, problems }) => problems
+            .iter()
+            .map(|item| ("configuration", format!("{}: {}", path.display(), item)))
+            .collect(),
+        GatewaydError::Route(crate::routes::RouteError { problems }) => problems
+            .iter()
+            .map(|item| ("route", item.to_string()))
+            .collect(),
+        GatewaydError::Config(_)
+        | GatewaydError::Catalog(_)
+        | GatewaydError::Startup { .. }
+        | GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Probe(_)
+        | GatewaydError::Problems { .. } => vec![(reload_reason(problem), reload_problem(problem))],
+    }
+}
+
 impl ReloadState {
     async fn run(mut self) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -817,13 +901,51 @@ impl ReloadState {
         )
         .await;
         let Some(candidate) = candidate else {
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                problems = report.problems.len()
-            );
+            let entries = report
+                .problems
+                .iter()
+                .flat_map(reload_entries)
+                .collect::<Vec<_>>();
+            let error = bounded_problems(entries.iter().map(|(_, reason)| reason.clone()));
+            if self.unreported(report.raw.refusing(&error)) {
+                let categories = entries
+                    .iter()
+                    .take(MAX_RENDERED_PROBLEMS)
+                    .map(|(category, _)| *category)
+                    .collect::<Vec<_>>();
+                tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    problems = entries.len(),
+                    categories = %categories.join(","),
+                    error = %error
+                );
+            }
             return;
         };
+        let raw = report.raw;
+        if let Err(unsettled) = self.activate(candidate).await {
+            let identity = match &unsettled {
+                Unsettled::Monitor => "monitor",
+                Unsettled::Refused(reason) => reason,
+            };
+            if !self.unreported(raw.refusing(identity)) {
+                return;
+            }
+            match unsettled {
+                Unsettled::Monitor => tracing::warn!(event = "gateway_reload_monitor_failed"),
+                Unsettled::Refused(reason) => {
+                    tracing::warn!(event = "gateway_reload_refused", applied = false, reason);
+                }
+            }
+        }
+    }
+
+    fn unreported(&mut self, raw: config::RawCandidate) -> bool {
+        self.unsettled.replace(raw) != Some(raw)
+    }
+
+    async fn activate(&mut self, candidate: Candidate) -> Result<(), Unsettled> {
         let refreshed_proxy = if candidate.config.models != self.config.models {
             match (
                 self.active.load().proxy.is_some(),
@@ -836,14 +958,7 @@ impl ReloadState {
                     &self.metering,
                 ) {
                     Ok(proxy) => Some(proxy),
-                    Err(_) => {
-                        tracing::warn!(
-                            event = "gateway_reload_refused",
-                            applied = false,
-                            reason = "proxy-model"
-                        );
-                        return;
-                    }
+                    Err(_) => return Err(Unsettled::Refused("proxy-model")),
                 },
                 _ => None,
             }
@@ -853,27 +968,22 @@ impl ReloadState {
         let broker = &candidate.config.broker;
         let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
         else {
-            tracing::warn!(event = "gateway_reload_monitor_failed");
-            return;
+            return Err(Unsettled::Monitor);
         };
         if let Some((pending_broker, pending_gateway)) = self.pending.clone() {
             let (observed, outcome) = match client.observe_generation().await {
                 Ok(observation) => observation,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
+                Err(_) => return Err(Unsettled::Monitor),
             };
             if outcome != GenerationOutcome::Active {
-                tracing::warn!(event = "gateway_reload_monitor_failed");
-                return;
+                return Err(Unsettled::Monitor);
             }
             let Ok(digest) = serving_digest(&candidate, &pending_broker) else {
-                return;
+                return Ok(());
             };
             if observed == pending_broker && digest == pending_gateway {
                 self.settle(candidate, observed, digest, refreshed_proxy);
-                return;
+                return Ok(());
             }
             self.broker_digest = observed;
             self.pending = None;
@@ -882,36 +992,23 @@ impl ReloadState {
         let (broker_digest, outcome) =
             match client.prepare_generation(expected_broker.clone()).await {
                 Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
+                Err(_) => return Err(Unsettled::Monitor),
             };
         let Ok(digest) = serving_digest(&candidate, &broker_digest) else {
-            return;
+            return Ok(());
         };
         match outcome {
             GenerationOutcome::Active if broker_digest == expected_broker => {
                 self.settle(candidate, broker_digest, digest, refreshed_proxy);
-                return;
+                return Ok(());
             }
             GenerationOutcome::Prepared => {}
             GenerationOutcome::Refused => {
                 self.broker_digest = broker_digest;
-                tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "broker-prepare"
-                );
-                return;
+                return Err(Unsettled::Refused("broker-prepare"));
             }
             GenerationOutcome::Active | GenerationOutcome::Applied | GenerationOutcome::Aborted => {
-                tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "broker-prepare"
-                );
-                return;
+                return Err(Unsettled::Refused("broker-prepare"));
             }
         }
         let confirmed = match client.commit_generation(broker_digest.clone()).await {
@@ -922,14 +1019,10 @@ impl ReloadState {
         };
         if !confirmed {
             self.pending = Some((broker_digest, digest));
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                reason = "broker-confirmation"
-            );
-            return;
+            return Err(Unsettled::Refused("broker-confirmation"));
         }
         self.settle(candidate, broker_digest, digest, refreshed_proxy);
+        Ok(())
     }
 
     fn settle(
@@ -940,10 +1033,24 @@ impl ReloadState {
         refreshed_proxy: Option<Arc<ModelProxy>>,
     ) {
         self.pending = None;
+        let repaired = self.unsettled.take().is_some();
         if digest == self.gateway_digest {
             self.broker_digest = broker_digest;
+            if repaired {
+                tracing::info!(
+                    event = "gateway_reload_applied",
+                    generation.digest = %digest,
+                    category.count = 0,
+                    categories = ""
+                );
+            }
             return;
         }
+        let categories = self
+            .sources
+            .changes(&candidate.sources)
+            .map(|changes| changes.swap)
+            .unwrap_or_default();
         let sources = Arc::new(candidate.sources);
         let proxy = refreshed_proxy.or_else(|| self.active.load().proxy.clone());
         self.active.store(Arc::new(ServingGeneration {
@@ -958,7 +1065,12 @@ impl ReloadState {
         self.config = candidate.config;
         self.sources = sources;
         self.broker_digest = broker_digest;
-        tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
+        tracing::info!(
+            event = "gateway_reload_applied",
+            generation.digest = %digest,
+            category.count = categories.len(),
+            categories = %categories.join(",")
+        );
         self.gateway_digest = digest;
         self.credentials.retire();
     }
@@ -972,6 +1084,75 @@ mod snapshot_tests {
     use dekopon_model_token_governor::Tokens;
     use dekopon_test_support::LoopbackServer;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn proxy_tls_source_bytes_never_enter_a_flattened_reload_record() {
+        const SENTINEL: &str = "SENTINEL";
+        let path = PathBuf::from("gateway.yaml");
+        let (capture, _guard) = crate::tests::capture_spans();
+        for (index, source) in [
+            rustls::pki_types::pem::Error::MissingSectionEnd {
+                end_marker: b"PRIVATE KEY----- SENTINEL".to_vec(),
+            },
+            rustls::pki_types::pem::Error::Base64Decode(SENTINEL.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let problem = GatewaydError::Config(config::ConfigError::Invalid {
+                path: path.clone(),
+                problems: vec![config::ConfigProblem::Proxy(
+                    crate::proxy::ProxyProblem::Tls(dekopon_model_proxy::tls::TlsError::Read {
+                        path: path.clone(),
+                        source,
+                    }),
+                )],
+            });
+            let entries = reload_entries(&problem);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "configuration");
+            let expected = format!("{}: proxy TLS files are unusable", path.display());
+            assert_eq!(entries[0].1, expected);
+            tracing::warn!(event = "gateway_reload_refused", applied = false, error = %entries[0].1);
+            let refused =
+                capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+            assert_eq!(refused.len(), index + 1);
+            let reason = refused[index].field("error").unwrap();
+            assert_eq!(reason, expected);
+            assert!(!reason.contains(SENTINEL));
+            assert!(!reason.contains("83, 69, 78"));
+        }
+    }
+
+    #[test]
+    fn probe_reload_record_omits_vendor_model_but_boot_retains_its_diagnostic() {
+        use crate::{ProbeError, ProbeProblem};
+        use dekopon_model::error::{InferenceError, ProtocolFailure};
+
+        const SENTINEL: &str = "configured-vendor-model-secret-sentinel";
+        let problem = GatewaydError::Probe(Box::new(ProbeProblem {
+            model: "router".to_owned(),
+            vendor_model: SENTINEL.to_owned(),
+            file: "gateway.yaml".into(),
+            routes: Vec::new(),
+            source: ProbeError::Vendor(InferenceError::Protocol(ProtocolFailure::NoChoices)),
+        }));
+        assert!(
+            error_chain(&problem).contains(SENTINEL),
+            "boot output is unchanged"
+        );
+        let (capture, _guard) = crate::tests::capture_spans();
+        let reason = reload_problem(&problem);
+        tracing::warn!(event = "gateway_reload_refused", applied = false, error = %reason);
+        let refused =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+        assert_eq!(refused.len(), 1);
+        let error = refused[0].field("error").unwrap();
+        assert!(error.contains("router"), "{error}");
+        assert!(error.contains("probe failed"), "{error}");
+        assert!(error.contains("protocol"), "{error}");
+        assert!(!error.contains(SENTINEL), "{error}");
+    }
 
     #[tokio::test]
     async fn one_published_snapshot_selects_the_proxy_for_each_request() {

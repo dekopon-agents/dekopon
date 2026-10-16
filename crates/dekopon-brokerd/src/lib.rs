@@ -46,7 +46,7 @@ use dekopon_broker::{
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, error_chain};
+use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, bounded_problems, error_chain};
 use dekopon_http_host::BoundCredential;
 use thiserror::Error;
 
@@ -208,6 +208,7 @@ pub struct CheckProviders {
 pub struct CheckReport {
     pub problems: Vec<BrokerdError>,
     pub warnings: Vec<StartupWarning>,
+    private_sources: Vec<PathBuf>,
 }
 
 /// Runs the startup validation `run` runs, then stops: no socket, no credentials file, no secret
@@ -276,9 +277,14 @@ struct Coordination {
 struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
+    reported: Option<RawCandidate>,
 }
 
 impl GenerationState {
+    fn unreported(&mut self, raw: RawCandidate) -> bool {
+        self.reported.replace(raw) != Some(raw)
+    }
+
     fn owned_by(&self, uid: u32) -> bool {
         self.active
             .ready
@@ -296,6 +302,7 @@ impl Coordination {
             state: parking_lot::Mutex::new(GenerationState {
                 active: Arc::new(active),
                 prepared: None,
+                reported: None,
             }),
         }
     }
@@ -332,12 +339,38 @@ impl Coordination {
         };
         let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
         let Some(next) = next else {
-            tracing::warn!(
-                event = "broker_reload_refused",
-                applied = false,
-                problems = report.problems.len(),
-                error = %error_chain(&BrokerdError::from_problems(report.problems))
-            );
+            let entries = report
+                .problems
+                .iter()
+                .flat_map(reload_entries)
+                .collect::<Vec<_>>();
+            let count = entries.len();
+            let error = bounded_problems(entries.into_iter());
+            let raw = RawCandidate::of(
+                self.config_path.clone(),
+                report.private_sources,
+                error.clone(),
+            )
+            .await;
+            let unreported = self.state.lock().unreported(raw);
+            let unreadable = report.problems.iter().any(|problem| {
+                matches!(
+                    problem,
+                    BrokerdError::Config(config::ConfigError::Read { .. })
+                )
+            });
+            match (unreported, unreadable) {
+                (false, _) => {}
+                (true, true) => {
+                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error);
+                }
+                (true, false) => tracing::warn!(
+                    event = "broker_reload_refused",
+                    applied = false,
+                    problems = count,
+                    error = %error
+                ),
+            }
             return (active.digest.clone(), GenerationOutcome::Refused);
         };
         let next = {
@@ -351,6 +384,7 @@ impl Coordination {
             {
                 return (state.active.digest.clone(), GenerationOutcome::Refused);
             }
+            state.reported = None;
             if next.digest == state.active.digest
                 && next.fingerprint.is_some()
                 && next.fingerprint == state.active.fingerprint
@@ -379,8 +413,14 @@ impl Coordination {
             state.prepared = Some((owner, base, next));
             return GenerationOutcome::Refused;
         }
+        let categories = state.active.snapshot.changed_categories(&next.snapshot);
         state.active = next;
-        tracing::info!(event = "broker_reload_applied", generation.digest = digest);
+        tracing::info!(
+            event = "broker_reload_applied",
+            generation.digest = digest,
+            category.count = categories.len(),
+            categories = %categories.join(",")
+        );
         GenerationOutcome::Applied
     }
 
@@ -421,6 +461,16 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
         Ok((config, refusal)) => {
             report.problems.extend(refusal.map(BrokerdError::from));
+            report.private_sources.extend(
+                [
+                    &config.credentials_path,
+                    &config.secret_map_path,
+                    &config.policies_path,
+                ]
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
             Some(config)
         }
         Err(error) => {
@@ -794,6 +844,56 @@ impl PrivateFingerprint {
             None => hasher.update([0]),
         }
         Self(hasher.finalize().into())
+    }
+}
+
+const MAX_RAW_SOURCE_BYTES: u64 = 16 << 20;
+
+/// In memory only, never logged or sent: it covers private bytes and exists to tell one refused
+/// candidate from another.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawCandidate([u8; 32]);
+
+impl RawCandidate {
+    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> Self {
+        use std::io::Read as _;
+
+        use sha2::{Digest as _, Sha256};
+        let digest = tokio::task::spawn_blocking(move || {
+            let mut paths = std::fs::read_dir(&config).map_or_else(
+                |_| vec![config.clone()],
+                |entries| {
+                    entries
+                        .filter_map(|entry| Some(entry.ok()?.path()))
+                        .collect()
+                },
+            );
+            paths.sort();
+            paths.extend(private);
+            let mut hasher = Sha256::new();
+            for path in paths {
+                let bytes = std::fs::metadata(&path)
+                    .and_then(|metadata| {
+                        if !metadata.is_file() {
+                            return Err(std::io::ErrorKind::InvalidInput.into());
+                        }
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(&path)?
+                            .take(MAX_RAW_SOURCE_BYTES)
+                            .read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    })
+                    .unwrap_or_else(|error| error.to_string().into_bytes());
+                for part in [path.as_os_str().as_encoded_bytes(), &bytes] {
+                    hasher.update(part.len().to_le_bytes());
+                    hasher.update(part);
+                }
+            }
+            hasher.update(refusal.as_bytes());
+            hasher.finalize().into()
+        })
+        .await;
+        Self(digest.unwrap_or_default())
     }
 }
 
@@ -1428,6 +1528,33 @@ impl BrokerdError {
             }
             (None, _) => Self::Startup { problems },
         }
+    }
+}
+
+fn reload_entries(problem: &BrokerdError) -> Vec<String> {
+    if let BrokerdError::Credentials(CredentialsError::Invalid { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("broker credentials are invalid: {item}"))
+            .collect()
+    } else if let BrokerdError::Secrets(SecretMapError::Validation { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("private secret map has conflicts: {item}"))
+            .collect()
+    } else if let BrokerdError::Capabilities { problems } = problem {
+        problems
+            .iter()
+            .map(|item| format!("capability configuration is invalid: {item}"))
+            .collect()
+    } else if let BrokerdError::Config(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Credentials(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Secrets(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else {
+        vec![problem.to_string()]
     }
 }
 

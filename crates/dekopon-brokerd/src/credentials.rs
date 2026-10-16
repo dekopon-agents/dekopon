@@ -232,7 +232,7 @@ fn resolve(
     let mut problems = Vec::new();
     let mut entries = Vec::with_capacity(file.credentials.len());
     let mut seen = std::collections::BTreeSet::new();
-    for entry in file.credentials {
+    for (position, entry) in file.credentials.into_iter().enumerate() {
         let name = entry.name.clone();
         if name.is_empty()
             || name.len() > MAX_CREDENTIAL_NAME_BYTES
@@ -242,7 +242,8 @@ fn resolve(
                 .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
         {
             problems.push(format!(
-                "credential name {name:?} is empty, oversized, or contains whitespace"
+                "credential #{} name is empty, oversized, or contains whitespace",
+                position + 1
             ));
             continue;
         }

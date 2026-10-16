@@ -78,13 +78,12 @@ impl RoutingTable {
         let mut problems = Vec::new();
         for (route_index, route) in config.routes.iter().enumerate() {
             let Some(agent) = catalog.agent(&route.agent) else {
-                problems.push(RouteProblem::UnknownAgent {
-                    agent: route.agent.to_string(),
-                });
+                problems.push(RouteProblem::UnknownAgent { route: route_index });
                 continue;
             };
             if !agent.spec.enabled {
                 problems.push(RouteProblem::DisabledAgent {
+                    route: route_index,
                     agent: route.agent.to_string(),
                 });
                 continue;
@@ -93,17 +92,17 @@ impl RoutingTable {
                 Some(name) => models
                     .iter()
                     .find(|model| model.name() == name)
-                    .ok_or_else(|| RouteProblem::UnknownModel {
-                        model: name.clone(),
-                    }),
+                    .ok_or(RouteProblem::UnknownModel { route: route_index }),
                 None => match agent.spec.model_class.as_deref() {
                     None => Err(RouteProblem::NoModelClass {
+                        route: route_index,
                         agent: route.agent.to_string(),
                     }),
                     Some(class) => models
                         .iter()
                         .find(|model| model.classes().iter().any(|offered| offered == class))
                         .ok_or_else(|| RouteProblem::NoModelForClass {
+                            route: route_index,
                             agent: route.agent.to_string(),
                             class: class.to_owned(),
                         }),
@@ -238,16 +237,22 @@ pub struct RouteError {
 
 #[derive(Debug, Error)]
 pub enum RouteProblem {
-    #[error("route names agent {agent:?}, which is not in the catalog")]
-    UnknownAgent { agent: String },
-    #[error("route names agent {agent:?}, which the catalog disables")]
-    DisabledAgent { agent: String },
-    #[error("route names model {model:?}, which is not configured")]
-    UnknownModel { model: String },
+    #[error("routes[{route}] names an agent which is not in the catalog")]
+    UnknownAgent { route: usize },
+    #[error("routes[{route}] names agent {agent:?}, which the catalog disables")]
+    DisabledAgent { route: usize, agent: String },
+    #[error("routes[{route}] names a model which is not configured")]
+    UnknownModel { route: usize },
     #[error(
-        "agent {agent:?} declares no modelClass and its route names no model, so no model can serve it"
+        "routes[{route}]: agent {agent:?} declares no modelClass and its route names no model, so no model can serve it"
     )]
-    NoModelClass { agent: String },
-    #[error("agent {agent:?} needs model class {class:?}, which no configured model offers")]
-    NoModelForClass { agent: String, class: String },
+    NoModelClass { route: usize, agent: String },
+    #[error(
+        "routes[{route}]: agent {agent:?} needs model class {class:?}, which no configured model offers"
+    )]
+    NoModelForClass {
+        route: usize,
+        agent: String,
+        class: String,
+    },
 }

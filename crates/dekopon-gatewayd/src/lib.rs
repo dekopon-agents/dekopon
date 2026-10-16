@@ -390,6 +390,7 @@ fn start_metering_tasks(
 pub struct CheckReport {
     pub problems: Vec<GatewaydError>,
     pub warnings: Vec<CheckWarning>,
+    pub(crate) raw: config::RawCandidate,
 }
 
 #[derive(Debug, Error)]
@@ -493,6 +494,17 @@ pub(crate) async fn load_candidate_against(
             None
         }
     };
+    let raw_catalog = match (&catalog, catalog_path) {
+        (Some(catalog), _) => {
+            Some(config::source_snapshot(catalog.source(), Some(catalog), current_uid()).await)
+        }
+        (None, Some(path)) => Some(config::source_snapshot(path, None, current_uid()).await),
+        (None, None) => None,
+    };
+    report.raw = config::RawCandidate::of(
+        before_config.as_ref(),
+        raw_catalog.as_ref().map(Result::as_ref),
+    );
     let routes = match (&config, &catalog) {
         (Some(config), Some(catalog)) => match RoutingTable::bind(config, catalog) {
             Ok(routes) => Some(routes),

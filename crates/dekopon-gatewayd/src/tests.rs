@@ -984,7 +984,7 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
     assert!(reports(&error, |problem| matches!(
         problem,
         ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::UnknownModel(_),
+            problem: crate::config::memory::PolicyProblem::UnknownModel,
             ..
         }
     )));
@@ -1344,7 +1344,7 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 
     let invalid: [RefusalCase; 6] = [
         ("appSecretEnv", &["pasted secret"], |problem| {
-            matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+            matches!(problem, ConfigProblem::InvalidEnvironmentName)
         }),
         ("bind", &["127.0.0.1:0"], |problem| {
             matches!(problem, ConfigProblem::InvalidWhatsappBind { .. })
@@ -2542,11 +2542,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             json!({"/transports": [{"name": "dev", "kind": "telegramLongPoll",
             "botTokenEnv": "12345:AAH-actual-secret-value"}]}),
-            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName),
         ),
         (
             json!({"/models/0/apiKeyEnv": "sk-live-not-a-variable"}),
-            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName),
         ),
         (
             json!({"/routes/0/indicators": {"mode": "native", "statusText": true}}),
@@ -17286,6 +17286,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 mod generation;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/reload_evidence.rs"]
+mod reload_evidence;
 #[path = "tests/selection.rs"]
 mod selection;
 #[path = "tests/steering.rs"]
@@ -19231,7 +19233,7 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
         crate::GatewaydError::Route(RouteError { problems })
             if problems.iter().any(|problem| matches!(
                 problem,
-                RouteProblem::UnknownAgent { agent } if agent == "nobody"
+                RouteProblem::UnknownAgent { .. }
             ))
     )));
 }
@@ -19381,7 +19383,7 @@ async fn check_reports_a_collision_an_unknown_agent_and_a_refused_model_together
     assert!(matches!(
         &report.problems[1],
         crate::GatewaydError::Route(RouteError { problems })
-            if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { agent }] if agent == "nobody")
+            if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { .. }])
     ));
     let crate::GatewaydError::Probe(problem) = &report.problems[2] else {
         panic!("the third problem is the probe: {:?}", report.problems[2]);
@@ -19536,7 +19538,8 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         message("first"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        move |_, _queued| Some((*selected.load_full()).clone()),
+        String::new(),
+        move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
     ));
     model.wait_until_entered().await;
     let queued = message_from("tel.999", "next");
@@ -19545,6 +19548,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         queued,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        String::new(),
         move |_, _queued| None,
     );
     second.await;
@@ -19705,6 +19709,10 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
                 capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
             assert_eq!(applied.len(), 1);
             assert_eq!(applied[0].field("generation.digest").unwrap().len(), 64);
+            if gateway_edit {
+                assert_eq!(applied[0].field("category.count"), Some("2"));
+                assert_eq!(applied[0].field("categories"), Some("routes,stopWords"));
+            }
         }
         assert!(matches!(
             broker.request().await.request,
