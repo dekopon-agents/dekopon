@@ -8,7 +8,19 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Broker audit and receipt consumers (next core release)
+## Policy digests, gateway file ownership and journal v2 (0.48.0)
+
+Upgrade the broker and gateway together; no provider WIT or SDK re-pin is needed. Before
+starting the new gateway, check that every catalog, instruction and skill file is owned by the
+gateway user, or by root on a read-only mount, and is not group- or world-writable. A symlinked
+file loads only as a read-only Kubernetes projection (a ConfigMap or Secret volume), and a
+non-projected catalog directory must be owned by the gateway user; anything else refuses boot.
+Incompatible journal files from an older gateway are reset on open, so journal-backed routes lose their
+recalled chat window once. `refresh: scheduled` on an `oauth2Refresh` source now rotates idle
+records. Gateway route, instruction, model and skill edits apply on the next reload without a
+restart.
+
+### Broker audit and receipt consumers
 
 Upgrade core before updating consumers of broker invocation results. The required decision
 reference and authorization receipt field `policyRevision` is now `policyDigest`, carrying the
