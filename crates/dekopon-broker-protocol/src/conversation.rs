@@ -1,6 +1,6 @@
 use std::fmt;
 
-use dekopon_core::{ExternalSubject, SubjectService};
+use dekopon_core::{ExternalSubject, SubjectSegment, SubjectService};
 use serde::{Deserialize, Serialize};
 
 use crate::ChatTransportKind;
@@ -415,24 +415,19 @@ fn canonical_container_for(transport: ChatTransportKind, value: &str) -> bool {
             ChatTransportKind::Slack => lowercase_token(value),
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Whatsapp => canonical_whatsapp_container(value),
-            ChatTransportKind::Github => github_segment(value, 39),
+            ChatTransportKind::Github => {
+                SubjectService::Github.admits_segment(SubjectSegment::Tenant, value)
+            }
             ChatTransportKind::Local => lowercase_scope_value(value),
             ChatTransportKind::Telegram => false,
         }
 }
 
-fn github_segment(value: &str, maximum: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-}
-
 fn canonical_github_id(value: &str) -> bool {
-    value
-        .split_once('.')
-        .is_some_and(|(owner, repo)| github_segment(owner, 39) && github_segment(repo, 100))
+    value.split_once('.').is_some_and(|(owner, repo)| {
+        SubjectService::Github.admits_segment(SubjectSegment::Tenant, owner)
+            && SubjectService::Github.admits_segment(SubjectSegment::Subject, repo)
+    })
 }
 
 /// `waba:phoneNumberId`, the pair Meta authenticates a Cloud API delivery under.

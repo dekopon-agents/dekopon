@@ -1823,8 +1823,9 @@ pub(crate) fn resolve(
     let mut transport_names = BTreeSet::new();
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
-    let mut webhook_bind = None;
-    let mut webhook_paths = BTreeSet::new();
+    let mut webhook_mounts = BTreeSet::new();
+    let mut whatsapp_binds = BTreeSet::new();
+    let mut github_binds = Vec::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
@@ -1842,17 +1843,23 @@ pub(crate) fn resolve(
                 bind,
                 callback_path,
                 ..
-            } => Some((*bind, callback_path.as_str())),
-            TransportConfig::GithubWebhook { bind, .. } => Some((*bind, "/webhooks/github")),
-            _ => None,
-        };
-        if let Some((bind, path)) = mount {
-            if webhook_bind.is_some_and(|existing| existing != bind)
-                || !webhook_paths.insert(path.to_owned())
-            {
-                problems.push(ConfigProblem::ConflictingWebhookMount { name: name.clone() });
+            } => {
+                whatsapp_binds.insert(*bind);
+                Some((*bind, callback_path.as_str()))
             }
-            webhook_bind = Some(bind);
+            TransportConfig::GithubWebhook { bind, .. } => {
+                github_binds.push((name.clone(), *bind));
+                Some((*bind, "/webhooks/github"))
+            }
+            TransportConfig::SlackSocketMode { .. }
+            | TransportConfig::DiscordGateway { .. }
+            | TransportConfig::TelegramLongPoll { .. }
+            | TransportConfig::Local { .. } => None,
+        };
+        if let Some((bind, path)) = mount
+            && !webhook_mounts.insert((bind, path.to_owned()))
+        {
+            problems.push(ConfigProblem::ConflictingWebhookMount { name: name.clone() });
         }
         let indicators = match &transport {
             TransportConfig::SlackSocketMode { liveness, .. }
@@ -2004,6 +2011,14 @@ pub(crate) fn resolve(
                 liveness,
             },
         });
+    }
+    if !whatsapp_binds.is_empty() {
+        for (name, _) in github_binds
+            .into_iter()
+            .filter(|(_, bind)| !whatsapp_binds.contains(bind))
+        {
+            problems.push(ConfigProblem::ConflictingWebhookMount { name });
+        }
     }
 
     let mut models_incomplete = config.models.is_empty();

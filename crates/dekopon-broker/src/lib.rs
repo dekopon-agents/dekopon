@@ -64,7 +64,7 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
     ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
-    SecretUseProposal, SubjectService, TraceId, error_chain,
+    SecretUseProposal, SubjectSegment, SubjectService, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
@@ -1169,15 +1169,22 @@ impl AttestorGrant {
         }
         for scope in namespaces {
             let mut segments = scope.split('.');
-            let service = segments.next().unwrap_or_default();
-            let service_valid = service.parse::<SubjectService>().is_ok();
-            let segments_valid = segments.clone().all(|segment| {
-                !segment.is_empty()
-                    && segment
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            });
-            if !service_valid || !segments_valid || segments.count() > 2 {
+            let valid = segments
+                .next()
+                .unwrap_or_default()
+                .parse::<SubjectService>()
+                .is_ok_and(|service| {
+                    segments.clone().count() <= 2
+                        && segments.enumerate().all(|(index, segment)| {
+                            let position = if index == 0 && service.requires_tenant() {
+                                SubjectSegment::Tenant
+                            } else {
+                                SubjectSegment::Subject
+                            };
+                            service.admits_segment(position, segment)
+                        })
+                });
+            if !valid {
                 return Err(BrokerBuildError::InvalidAttestorScope {
                     scope: scope.clone(),
                 });

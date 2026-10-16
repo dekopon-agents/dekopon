@@ -32,8 +32,49 @@ impl SubjectService {
         }
     }
 
-    const fn requires_tenant(self) -> bool {
+    #[must_use]
+    pub const fn requires_tenant(self) -> bool {
         matches!(self, Self::Slack | Self::Github)
+    }
+
+    #[must_use]
+    pub fn admits_segment(self, segment: SubjectSegment, value: &str) -> bool {
+        match self {
+            Self::Github => {
+                let maximum = match segment {
+                    SubjectSegment::Tenant => 39,
+                    SubjectSegment::Subject => 100,
+                };
+                !value.is_empty()
+                    && value.len() <= maximum
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-')
+                    })
+            }
+            Self::Slack | Self::Discord | Self::Telegram | Self::Whatsapp | Self::Tel => {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubjectSegment {
+    Tenant,
+    Subject,
+}
+
+impl SubjectSegment {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Subject => "subject",
+        }
     }
 }
 
@@ -64,8 +105,8 @@ pub struct ExternalSubject {
 
 impl ExternalSubject {
     pub fn slack(team: &str, user: &str) -> Result<Self, SubjectError> {
-        let tenant = normalize_segment(team, "tenant")?;
-        let subject = normalize_segment(user, "subject")?;
+        let tenant = normalize_segment(SubjectService::Slack, SubjectSegment::Tenant, team)?;
+        let subject = normalize_segment(SubjectService::Slack, SubjectSegment::Subject, user)?;
         Self::build(SubjectService::Slack, Some(tenant), subject)
     }
 
@@ -95,8 +136,8 @@ impl ExternalSubject {
     }
 
     pub fn github(owner: &str, repo: &str) -> Result<Self, SubjectError> {
-        let tenant = github_segment(&owner.to_ascii_lowercase(), "tenant", 39)?;
-        let subject = github_segment(&repo.to_ascii_lowercase(), "subject", 100)?;
+        let tenant = normalize_segment(SubjectService::Github, SubjectSegment::Tenant, owner)?;
+        let subject = normalize_segment(SubjectService::Github, SubjectSegment::Subject, repo)?;
         Self::build(SubjectService::Github, Some(tenant), subject)
     }
 
@@ -206,23 +247,9 @@ impl FromStr for ExternalSubject {
             (None, second)
         };
         let tenant = tenant
-            .map(|tenant| match service {
-                SubjectService::Github => github_segment(tenant, "tenant", 39),
-                SubjectService::Slack
-                | SubjectService::Discord
-                | SubjectService::Telegram
-                | SubjectService::Whatsapp
-                | SubjectService::Tel => require_canonical_segment(tenant, "tenant"),
-            })
+            .map(|tenant| require_canonical_segment(service, SubjectSegment::Tenant, tenant))
             .transpose()?;
-        let subject = match service {
-            SubjectService::Github => github_segment(subject, "subject", 100)?,
-            SubjectService::Slack
-            | SubjectService::Discord
-            | SubjectService::Telegram
-            | SubjectService::Whatsapp
-            | SubjectService::Tel => require_canonical_segment(subject, "subject")?,
-        };
+        let subject = require_canonical_segment(service, SubjectSegment::Subject, subject)?;
         let numeric = match service {
             SubjectService::Discord => is_discord_snowflake(&subject),
             SubjectService::Whatsapp => {
@@ -257,28 +284,12 @@ impl<'de> Deserialize<'de> for ExternalSubject {
     }
 }
 
-fn github_segment(
+fn normalize_segment(
+    service: SubjectService,
+    segment: SubjectSegment,
     value: &str,
-    segment: &'static str,
-    maximum: usize,
 ) -> Result<String, SubjectError> {
-    if value.is_empty()
-        || value.len() > maximum
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
-    {
-        return Err(SubjectError::InvalidSegment {
-            segment,
-            value: value.to_owned(),
-        });
-    }
-    Ok(value.to_owned())
-}
-
-fn normalize_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
-    let normalized = value.to_ascii_lowercase();
-    require_canonical_segment(&normalized, segment)
+    require_canonical_segment(service, segment, value.to_ascii_lowercase())
 }
 
 fn digits_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
@@ -308,16 +319,16 @@ fn is_discord_snowflake(value: &str) -> bool {
 }
 
 fn require_canonical_segment(
+    service: SubjectService,
+    segment: SubjectSegment,
     value: impl Into<String>,
-    segment: &'static str,
 ) -> Result<String, SubjectError> {
     let value = value.into();
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    {
-        return Err(SubjectError::InvalidSegment { segment, value });
+    if !service.admits_segment(segment, &value) {
+        return Err(SubjectError::InvalidSegment {
+            segment: segment.as_str(),
+            value,
+        });
     }
     Ok(value)
 }
