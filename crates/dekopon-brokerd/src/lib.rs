@@ -16,6 +16,7 @@ mod assets;
 pub mod capabilities;
 
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
+const RECONCILIATION_OWNER: &str = "dekopon-gatewayd";
 mod config;
 mod credentials;
 mod github_app;

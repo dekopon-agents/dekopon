@@ -29,12 +29,18 @@ use tokio::{
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::{Coordination, config::HARD_MAX_CONNECTIONS};
+use crate::{Coordination, RECONCILIATION_OWNER, config::HARD_MAX_CONNECTIONS};
 
 #[derive(Clone, Debug)]
 pub struct MappedPeer {
     pub context: AuthenticatedContext,
     pub attestor: Option<AttestorGrant>,
+}
+
+impl MappedPeer {
+    fn is_reconciliation_owner(&self) -> bool {
+        self.attestor.is_some() && self.context.principal().as_str() == RECONCILIATION_OWNER
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -492,6 +498,24 @@ where
     );
     if generation_request != (request.api_version == ProtocolVersion::V1Alpha3) {
         return refuse_invalid_claim(&mut stream, limits).await;
+    }
+    if generation_request && !peer.is_reconciliation_owner() {
+        tracing::warn!(
+            event = "broker_generation_refused",
+            peer.uid = uid,
+            reason = "not-reconciliation-owner",
+        );
+        return stream
+            .write_frame(
+                &ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "peer is not the reconciliation owner",
+                ),
+                &[],
+                limits,
+            )
+            .await
+            .map_err(ConnectionError::Write);
     }
     let context = &peer.context;
     let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();

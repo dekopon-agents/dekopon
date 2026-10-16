@@ -2705,6 +2705,15 @@ async fn managed_to_direct_provider_checks_candidate_manifest() {
 async fn socket_generation_handshake_observes_only_confirmed_activation() {
     use dekopon_broker_protocol::{BrokerClient, FrameLimits, GenerationOutcome};
     let broker = ManagedBroker::new();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["identities"] = json!([{
+        "uid": current_uid(),
+        "principal": "dekopon-gatewayd",
+        "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+        "attestor": {}
+    }]);
+    write_config(&broker.config(), &document);
     broker.publish_lock('1');
     let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
