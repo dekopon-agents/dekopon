@@ -1,4 +1,4 @@
-use super::{Backward, Journal, JournalError, Line, body, duration_millis, millis};
+use super::{Backward, Journal, JournalError, Line, body, duration_millis, millis, remove};
 use crate::config::{
     MemoryWindow,
     memory::{ResolvedPolicy, RoutineKind, SelectionMode},
@@ -365,22 +365,31 @@ impl Journal {
     ) -> Result<(), JournalError> {
         let horizon = self.horizon(input);
         let _lock = self.lock.lock();
-        let mut lines = match Backward::open(&self.path(input.stem)) {
+        let path = self.path(input.stem);
+        let mut lines = match Backward::open(&path) {
             Ok(lines) => lines,
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
             }) => return Ok(()),
             Err(error) => return Err(error),
         };
-        while let Some(line) = lines.next_line()? {
+        loop {
+            let line = match lines.next_line() {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(()),
+                Err(JournalError::Corrupt) => {
+                    remove(&path);
+                    return Err(JournalError::Corrupt);
+                }
+                Err(error) => return Err(error),
+            };
             let eligible = line.grant == input.grant
                 && line.at_ms >= horizon
                 && input.sealed_at.is_none_or(|at| line.at_ms > millis(at));
             if !visit(line, eligible) || !eligible {
-                break;
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     pub(crate) fn project(

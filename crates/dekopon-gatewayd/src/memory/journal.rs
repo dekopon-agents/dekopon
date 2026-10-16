@@ -446,6 +446,10 @@ impl Journal {
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
             }) => 1,
+            Err(JournalError::Corrupt) => {
+                remove(&path);
+                return Err(JournalError::Corrupt);
+            }
             Err(error) => return Err(error),
         };
         let default;
@@ -2393,6 +2397,64 @@ mod tests {
         assert!(journal.sealed(&stem, RETENTION).unwrap().is_none());
         journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
+    }
+
+    fn tear_last_line(path: &Path) {
+        let mut file = OpenOptions::new().append(true).open(path).expect("journal");
+        file.write_all(br#"{"version":2,"atMs":1"#)
+            .expect("torn line");
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_append_so_the_next_append_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let turn = ConversationTurn::completed("lost", "re: lost");
+        let entry = Entry {
+            prepared: None,
+            at: now,
+            grant: GRANT,
+            turn: &turn,
+            inventory: &[],
+            next_asset_id: 1,
+        };
+        assert!(matches!(
+            journal.append(&stem, &entry, window()),
+            Err(JournalError::Corrupt)
+        ));
+        assert!(!journal.path(&stem).exists());
+        append(&journal, &stem, now, GRANT, "after");
+        assert_eq!(
+            users(&journal.recall(&stem, GRANT, window(), now).expect("recall")),
+            ["after"]
+        );
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = ResolvedPolicy::default();
+        append(&journal, &stem, SystemTime::now(), GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let projected = journal.project(
+            Projection {
+                stem: &stem,
+                grant: GRANT,
+                window: window(),
+                sealed_at: None,
+                policy: &policy,
+            },
+            &History::new(window().limits),
+            |_available, _evidence| Err("unused"),
+        );
+        assert!(matches!(projected, Err(JournalError::Corrupt)));
+        assert!(!journal.path(&stem).exists());
     }
 
     fn decider_policy() -> ResolvedPolicy {
