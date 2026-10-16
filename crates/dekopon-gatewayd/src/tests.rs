@@ -308,7 +308,7 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
     .await;
     let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
     assert!(
-        candidate.transports.is_empty(),
+        candidate.prepared.is_none(),
         "reload must not build transports"
     );
     assert!(
@@ -1568,7 +1568,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::routes::RoutingTable::default()
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
         ),
         Err(crate::transport::TransportError::MissingCredential { .. })
     ));
@@ -1579,7 +1579,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::routes::RoutingTable::default()
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
         )
         .is_ok()
     );
@@ -1846,7 +1846,7 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         "github".into(),
         address,
         "secret".into(),
-        std::sync::Arc::clone(&routes),
+        crate::gateway::CurrentGeneration::boot(std::sync::Arc::clone(&routes), Arc::default()),
         None,
     );
     transport.connect().await.unwrap();
@@ -2037,8 +2037,13 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
     assert_eq!(evicted.message_id.to_string(), "first");
     drop(transport);
     tokio::task::yield_now().await;
-    let mut restarted =
-        GithubTransport::new("github".into(), address, "secret".into(), routes, None);
+    let mut restarted = GithubTransport::new(
+        "github".into(),
+        address,
+        "secret".into(),
+        crate::gateway::CurrentGeneration::boot(routes, Arc::default()),
+        None,
+    );
     restarted.connect().await.unwrap();
     assert_eq!(
         signed_github_request(&client, address, &body, &signature, "first").await,
@@ -2078,7 +2083,7 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
         "github".into(),
         address,
         "gh-secret".into(),
-        std::sync::Arc::new(crate::routes::RoutingTable::default()),
+        crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
         Some(wa),
     );
     let mut drivers = BTreeMap::new();
@@ -19474,7 +19479,7 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
         let mut document = document(root.path());
         document["broker"]["serverUid"] = json!(crate::current_uid());
         let path = write_config(root.path(), &document);
-        let candidate = crate::boot_candidate(&path).await.unwrap();
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
         let initial = candidate.routes.route(&message("before")).unwrap().steering;
         let next_broker = if same_broker_digest { "b" } else { "a" }.repeat(64);
         let response = |outcome| ResponseEnvelope {
@@ -19581,7 +19586,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         .unwrap()
         .insert(0, other_route);
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let response = || ResponseEnvelope {
         api_version: ProtocolVersion::V1Alpha2,
         response: BrokerResponse::Generation {
@@ -19746,7 +19751,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
     document["broker"]["serverUid"] = json!(crate::current_uid());
     document["models"][0] = json!({"name":"codex","kind":"chatgptSubscription","model":"first","authFile":first_path,"timeoutMs":2000,"classes":["reasoning"]});
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let response = || ResponseEnvelope {
         api_version: ProtocolVersion::V1Alpha2,
         response: BrokerResponse::Generation {
@@ -19853,7 +19858,7 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
         document["catalogPath"] = json!(catalog);
         document["broker"]["serverUid"] = json!(crate::current_uid());
         let path = write_config(root.path(), &document);
-        let candidate = crate::boot_candidate(&path).await.unwrap();
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
         let mut responses = vec![ResponseEnvelope {
             api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Generation {
@@ -19987,7 +19992,7 @@ async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let listener = UnixListener::bind(root.path().join("broker.sock")).unwrap();
     fs::set_permissions(
         root.path().join("broker.sock"),
@@ -20075,7 +20080,7 @@ async fn dispatched_message_starts_on_its_captured_generation_after_route_remova
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let mut broker = BrokerFixture::answering(
         root.path(),
         [ResponseEnvelope {
@@ -20140,7 +20145,7 @@ async fn refused_broker_digest_is_adopted_for_next_prepare_and_publication() {
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let old = "b".repeat(64);
     let current = "c".repeat(64);
     let response = |outcome| ResponseEnvelope {
@@ -20214,7 +20219,7 @@ async fn yaml_mapping_key_order_does_not_publish_a_new_gateway_generation() {
     let path = root.path().join("gateway.yaml");
     fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let broker_digest = "b".repeat(64);
     let mut broker = BrokerFixture::answering(
         root.path(),
@@ -20297,7 +20302,7 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let mut sequence = 0;
     let mut broker = BrokerFixture::scripted(root.path(), move |_, _| {
         sequence += 1;

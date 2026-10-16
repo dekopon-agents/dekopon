@@ -26,7 +26,7 @@ use super::{
     webhook::{self, VerifyFailure},
     whatsapp::WhatsappTransport,
 };
-use crate::{config::GithubEvent, routes::RoutingTable};
+use crate::{config::GithubEvent, gateway::CurrentGeneration};
 
 const CALLBACK: &str = "/webhooks/github";
 const RECENT_DELIVERIES: usize = 1024;
@@ -95,7 +95,7 @@ impl RefusalLog {
 struct StateData {
     name: String,
     secret: Arc<Redacted<Vec<u8>>>,
-    routes: Arc<RoutingTable>,
+    generation: CurrentGeneration,
     sender: mpsc::Sender<InboundMessage>,
     // Serializes the acceptance decision with the only in-process dedupe owner.
     accepted: Arc<Mutex<SeenIds>>,
@@ -177,10 +177,9 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     let Some((subject, conversation, event_kind, text)) = parse(&root, &event, &delivery) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
-    if state
-        .routes
-        .github_route(&state.name, &conversation, &subject, event_kind)
-        .is_none()
+    if !state
+        .generation
+        .admits_github(&state.name, &conversation, &subject, event_kind)
     {
         tracing::debug!(event = "gateway_github_ignored");
         return webhook::content_free(StatusCode::OK);
@@ -308,7 +307,7 @@ impl GithubTransport {
         name: String,
         bind: std::net::SocketAddr,
         secret: String,
-        routes: Arc<RoutingTable>,
+        generation: CurrentGeneration,
         whatsapp: Option<WhatsappTransport>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(QUEUE);
@@ -319,7 +318,7 @@ impl GithubTransport {
             state: StateData {
                 name,
                 secret: Arc::new(Redacted::new(secret.into_bytes())),
-                routes,
+                generation,
                 sender,
                 accepted: Arc::new(Mutex::new(SeenIds::new(RECENT_DELIVERIES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
@@ -423,7 +422,7 @@ mod tests {
             StateData {
                 name: "github".into(),
                 secret: Arc::new(Redacted::new(b"secret".to_vec())),
-                routes: Arc::new(RoutingTable::default()),
+                generation: CurrentGeneration::boot(Arc::default(), Arc::default()),
                 sender,
                 accepted: Arc::new(Mutex::new(SeenIds::new(RECENT_DELIVERIES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
@@ -646,9 +645,9 @@ mod tests {
             .expect("config");
         let catalog = dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml"))
             .expect("catalog");
-        let routes = RoutingTable::bind(&resolved, &catalog).expect("route");
+        let routes = crate::routes::RoutingTable::bind(&resolved, &catalog).expect("route");
         let (mut state, _unused) = state();
-        state.routes = Arc::new(routes);
+        state.generation = CurrentGeneration::boot(Arc::new(routes), Arc::default());
         let (sender, mut receiver) = mpsc::channel(1);
         state.sender = sender;
         let (capture, _guard) = crate::tests::capture_spans();

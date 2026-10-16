@@ -100,9 +100,16 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
-async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> {
+async fn boot_candidate(config_path: &Path) -> Result<(Candidate, Prepared), GatewaydError> {
     let (candidate, report) = load_candidate(config_path, None, config::LoadMode::Boot, None).await;
-    let candidate = candidate.ok_or_else(|| GatewaydError::from_problems(report.problems))?;
+    let Some((candidate, prepared)) = candidate.and_then(|mut candidate| {
+        candidate
+            .prepared
+            .take()
+            .map(|prepared| (candidate, prepared))
+    }) else {
+        return Err(GatewaydError::from_problems(report.problems));
+    };
     if !candidate
         .sources
         .still_current(config_path, &candidate.config.catalog_path, current_uid())
@@ -110,7 +117,7 @@ async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> 
     {
         return Err(config::ConfigError::ChangedDuringLoad.into());
     }
-    Ok(candidate)
+    Ok((candidate, prepared))
 }
 
 #[expect(
@@ -121,9 +128,13 @@ pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), Ga
 where
     F: Future<Output = ()> + Send,
 {
-    let mut candidate = boot_candidate(config_path.as_ref()).await?;
-    let built_transports = std::mem::take(&mut candidate.transports);
-    let routes = Arc::new(candidate.routes.clone());
+    let (
+        candidate,
+        Prepared {
+            transports: built_transports,
+            generation,
+        },
+    ) = boot_candidate(config_path.as_ref()).await?;
     let config = &candidate.config;
 
     let broker_client = BrokerClient::new(
@@ -216,7 +227,7 @@ where
     tracing::info!(
         event = "gateway_started",
         transport.count = config.transports.len(),
-        route.count = routes.len()
+        route.count = candidate.routes.len()
     );
 
     let mut terminal = Ok(());
@@ -227,12 +238,11 @@ where
     let shutdown_grace = config.shutdown_grace;
     let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
     let proxy_listener = config.proxy.clone();
-    let gateway = gateway::Gateway::new(
+    let gateway = gateway::Gateway::serving(
         runner,
-        routes,
+        generation,
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
-        Arc::new(config.stop_words.clone()),
     )
     .with_reload_owners(
         config_path.as_ref().to_path_buf(),
@@ -442,7 +452,7 @@ pub(crate) struct Candidate {
     pub(crate) sources: config::GatewaySources,
     pub(crate) config: ResolvedConfig,
     pub(crate) routes: RoutingTable,
-    pub(crate) transports: Vec<Box<dyn ChatTransport>>,
+    pub(crate) prepared: Option<Prepared>,
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
@@ -496,7 +506,7 @@ pub(crate) async fn load_candidate_against(
             None
         }
     };
-    let transports = match (&config, &routes) {
+    let prepared = match (&config, &routes) {
         (Some(config), Some(routes)) => {
             if mode == config::LoadMode::Check
                 && config.journal.is_none()
@@ -511,12 +521,12 @@ pub(crate) async fn load_candidate_against(
                 if !problems.is_empty() {
                     report.problems.push(GatewaydError::Startup { problems });
                 }
-                Vec::new()
+                None
             }
         }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
-            Vec::new()
+            None
         }
     };
     let reload_scope = ProbeScope::Every;
@@ -562,7 +572,7 @@ pub(crate) async fn load_candidate_against(
                             sources,
                             config,
                             routes,
-                            transports,
+                            prepared,
                         }),
                         Err(error) => {
                             report.problems.push(error.into());
@@ -598,10 +608,10 @@ fn credentials(
     routes: &RoutingTable,
     mode: config::LoadMode,
     report: &mut CheckReport,
-) -> Vec<Box<dyn ChatTransport>> {
+) -> Option<Prepared> {
     match mode {
         config::LoadMode::Boot => match prepare(config, routes) {
-            Ok(Prepared { transports }) => return transports,
+            Ok(prepared) => return Some(prepared),
             Err(error) => report.problems.push(error),
         },
         config::LoadMode::Check => {
@@ -633,7 +643,7 @@ fn credentials(
             }
         }
     }
-    Vec::new()
+    None
 }
 
 fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
@@ -867,6 +877,10 @@ mod openrouter_startup_tests {
 
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, GatewaydError> {
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
+    let generation = gateway::CurrentGeneration::boot(
+        Arc::new(routes.clone()),
+        Arc::new(config.stop_words.clone()),
+    );
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
         if let TransportConfig::GithubWebhook { name, bind, secret_env } = spec
@@ -879,7 +893,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
             }
             continue;
         }
-        match build_transport(spec, config, routes) {
+        match build_transport(spec, config, &generation) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -888,20 +902,24 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
         }
     }
     if problems.is_empty() {
-        Ok(Prepared { transports })
+        Ok(Prepared {
+            transports,
+            generation,
+        })
     } else {
         Err(GatewaydError::Startup { problems })
     }
 }
 
-struct Prepared {
+pub(crate) struct Prepared {
     transports: Vec<Box<dyn ChatTransport>>,
+    generation: gateway::CurrentGeneration,
 }
 
 fn build_transport(
     spec: &TransportConfig,
     config: &ResolvedConfig,
-    routes: &RoutingTable,
+    generation: &gateway::CurrentGeneration,
 ) -> Result<Box<dyn ChatTransport>, TransportError> {
     let surface = |liveness: &LivenessConfig| {
         let mut settings = liveness.settings();
@@ -925,7 +943,7 @@ fn build_transport(
             name.clone(),
             *bind,
             transport::read_credential(secret_env)?,
-            Arc::new(routes.clone()),
+            generation.clone(),
             None,
         )),
         TransportConfig::SlackSocketMode {
@@ -1005,7 +1023,7 @@ fn build_transport(
                     name.clone(),
                     *bind,
                     transport::read_credential(secret_env)?,
-                    Arc::new(routes.clone()),
+                    generation.clone(),
                     Some(whatsapp),
                 ))
             } else {

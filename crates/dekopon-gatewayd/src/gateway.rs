@@ -6,7 +6,8 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dekopon_broker_protocol::{BrokerClient, ConversationKind, GenerationOutcome};
+use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
+use dekopon_core::ExternalSubject;
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -17,7 +18,8 @@ use tracing::Instrument as _;
 use crate::{
     Candidate, ServeOutcome, cancel_session,
     collection::{self, CollectionRoute as _},
-    config, follow, jobs, observe_session,
+    config::{self, GithubEvent},
+    follow, jobs, observe_session,
     routes::RoutingTable,
     session::{self, CancelOutcome, SessionRunner},
     spawn_tick,
@@ -46,7 +48,34 @@ pub(crate) struct ServingGeneration {
 }
 
 #[derive(Clone)]
-struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
+pub(crate) struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
+
+impl CurrentGeneration {
+    pub(crate) fn boot(routes: Arc<RoutingTable>, stop_words: Arc<Vec<String>>) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(ServingGeneration {
+            routes,
+            stop_words,
+            proxy: None,
+            _sources: None,
+            _digest: String::new(),
+            _broker_digest: String::new(),
+        })))
+    }
+
+    pub(crate) fn admits_github(
+        &self,
+        transport: &str,
+        conversation: &Conversation,
+        subject: &ExternalSubject,
+        event: GithubEvent,
+    ) -> bool {
+        self.0
+            .load()
+            .routes
+            .github_route(transport, conversation, subject, event)
+            .is_some()
+    }
+}
 
 impl CurrentProxy for CurrentGeneration {
     fn current(&self) -> Option<Arc<ModelProxy>> {
@@ -153,6 +182,7 @@ impl ServingGeneration {
 }
 
 impl Gateway {
+    #[cfg(test)]
     pub(crate) fn new(
         runner: Arc<SessionRunner>,
         routes: Arc<RoutingTable>,
@@ -160,16 +190,23 @@ impl Gateway {
         drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
         stop_words: Arc<Vec<String>>,
     ) -> Self {
+        Self::serving(
+            runner,
+            CurrentGeneration::boot(routes, stop_words),
+            identities,
+            drivers,
+        )
+    }
+
+    pub(crate) fn serving(
+        runner: Arc<SessionRunner>,
+        generation: CurrentGeneration,
+        identities: Arc<BTreeMap<String, TransportIdentity>>,
+        drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    ) -> Self {
         Self {
             runner,
-            active: Arc::new(ArcSwap::from_pointee(ServingGeneration {
-                routes,
-                stop_words,
-                proxy: None,
-                _sources: None,
-                _digest: String::new(),
-                _broker_digest: String::new(),
-            })),
+            active: generation.0,
             reload: None,
             identities,
             drivers,
