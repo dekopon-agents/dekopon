@@ -7,6 +7,53 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-10-16
+
+### Added
+
+- Gateway route, instruction and model edits, including same-name model edits, reach subsequent turns and guest-proxy calls without restarting; queued follow-ups use current routes and grants, and the credential owner and collected conversations are kept.
+- Skills mounted from a read-only Kubernetes ConfigMap projection load directly and pick up ConfigMap edits on the next reload.
+- A refused broker reload records each problem's reason, naming the file and hygiene check, alongside the problem count.
+- Session spans identify their activated generation, and reload records report safe outcomes and changed categories.
+- Verified GitHub webhooks can start silent, broker-authorized repository turns on the shared webhook listener; GitHub webhook identity and route configuration is checked at load.
+- `refresh: scheduled` `oauth2Refresh` sources are rotated by the broker during idle periods, keeping credentials live without provider traffic.
+- Gateway configuration load validates memory retention and representation policies and warns when persistent memory has no journal.
+- Memory decider selection names its provider profile (backend, model and whether probabilities are required) and sends only typed metadata evidence.
+- Bounded script request and result evidence is preserved in memory for later turns.
+- Conversation windows publish stable packed snapshots without invalidating active readers.
+- Journal-backed conversations can generate bounded progressive memory parts after replying, without saving unretained originals.
+- Journal-backed persistent conversations can pin eligible representations and read retained records on demand.
+- Journal-backed chat replay can choose retained historical detail and reports the actual prompt representation and signed byte savings.
+- Discord channel/thread routes with `follow: true` can receive unmentioned follow-up replies after a quiet pause once a `dekopon-provider-follow.stay` invitation succeeds, and participants can end follow with the stop word or an agent-initiated leave.
+- A Discord follow turn that ran capability work and declines on its final step posts the fixed unreported-work warning, stays failed, and neither leaves nor refreshes its ticket; every other failed, refused, sealed or cancelled follow turn posts nothing.
+- Prompt and execution records show offered tools and the loaded provider artifact digest.
+- Model charge records identify returned failure kinds for accounting.
+
+### Changed
+
+- Decision references and authorization receipts carry a validated `policyDigest` instead of `policyRevision`; broker decision and execution audit records omit `policy.revision`, and the audit documentation names policy digests and identifiers without a revision.
+- `Broker::new` and `Broker::start` no longer take a policy revision; drop the argument.
+- Journal-backed conversations retain eligible turns beyond prompt-window eviction and reset incompatible journal files on upgrade.
+- Journal retention caps each agent's stored history and evicts the oldest whole turns across conversations.
+- Cold journal recall keeps only eligible recent turns resident while older records stay on disk.
+- Journal-backed platform chats retain tool evidence without duplicating platform chat text.
+- Unaddressed Slack Agent owned-thread continuations, like Discord follow turns, are told to give a specific, useful reply, to call `decline_chat_reply` for thanks, side talk or requests they cannot help with only before any capability work, and after work to report what happened instead of declining, even when leaving was requested.
+- Gateway checks report independent parsed-stage failures and name malformed configuration files.
+- Boot and check diagnostics refer to a rejected credential name, binding, route reference, budget entry or model by its position instead of repeating the rejected value.
+- A writable target of a projected gateway configuration key is refused as an insecure projection instead of an insecure file.
+
+### Fixed
+
+- Malformed broker credentials files no longer echo file values in their decode error.
+- Credential parse failures no longer include untrusted authentication values.
+- Short-lived routes no longer clear conversation seals needed by longer-lived routes.
+- Conversation seals expire at the route forget interval even when journal memory is retained longer.
+
+### Security
+
+- Gateway boot refuses untrusted projected sources and candidates changed during preparation, including a catalog whose skill files change during preparation.
+- Gateway catalog, instruction and skill files must be owned by the gateway user, or by root on a read-only mount, and not be group- or world-writable; a symlinked file loads only as a read-only Kubernetes projection, and a non-projected catalog directory must be owned by the gateway user.
+
 ## [dekopon-chart-0.34.0] - 2026-10-15
 
 ### Changed
