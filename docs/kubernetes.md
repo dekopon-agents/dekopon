@@ -82,7 +82,7 @@ routing; it is disabled by default. The broker never receives a TCP surface.
 |---|---|---|
 | `prepare-files` | init, runs to completion, **root** | `busybox`, copies configuration into an `emptyDir` with the right owner and mode |
 | `broker` | native sidecar (`restartPolicy: Always`) when the gateway is enabled, otherwise the pod's only regular container | `dekopon-brokerd --config /etc/dekopon/broker.yaml` |
-| `gateway` | regular container, only when `gateway.enabled` | `dekopon-gatewayd --config /etc/dekopon/gatewayd.yaml` |
+| `gateway` | regular container, only when `gateway.enabled` | `dekopon-gatewayd --config /etc/dekopon-gateway/gatewayd.yaml` (the directory `/etc/dekopon-gateway` with `gateway.configDirectory.configMap`) |
 
 `broker.providerSync.enabled` adds a hook `Job` that runs `dekopon-brokerd provider sync`; see
 [Syncing the set with the chart's hook Job](#syncing-the-set-with-the-charts-hook-job).
@@ -148,7 +148,12 @@ when inline broker configuration changes. An external broker Secret or a broker 
 fragment still needs an operator-managed restart (for example, Reloader) when edited. Gateway
 configuration instead mounts a distinct read-only Secret or ConfigMap directory directly at
 `paths.gatewayConfigDir`, with no `subPath`: the gateway trusts only a root- or daemon-owned,
-non-group/world-writable projection on a read-only mount and reconciles its updated contents.
+non-group/world-writable projection on a read-only mount. It re-reads that projection every two
+seconds and swaps in only `models`, `routes`, `stopWords`, transport and session `indicators`, and
+the catalog (agents and skills). An edit to `broker`, `transports`, `sessions`, `shutdownGraceMs`,
+`telemetry`, `metering` or `proxy` is refused as restart-required (`gateway_reload_refused`) and
+the gateway keeps running the configuration it has. Nothing rolls the pod for those edits: the
+operator must roll it.
 Neither broker policy nor credential projections are visible in the gateway container.
 
 The init container is the only thing in the chart that runs as root, and it holds `CHOWN` and
@@ -867,9 +872,12 @@ the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespac
 
 `gateway.configDirectory.configMap` mounts the ConfigMap directly at `paths.gatewayConfigDir`;
 `--config` points to that directory, and `gateway.config` must be empty. A projected key is
-root-owned and non-group/world-writable. No `subPath` or init copy pins its contents. Gateway
-catalog, config and skills updates are reconciled, not rolled. The chart cannot hash an external
-broker ConfigMap: keep broker fragments (including `host.yaml`) on the operator's restart path.
+root-owned and non-group/world-writable. No `subPath` or init copy pins its contents, and no
+gateway edit rolls the pod: the gateway swaps in only the live set named in
+[Why the broker still needs an init container](#why-the-broker-still-needs-an-init-container),
+refuses every other edit as restart-required, and the operator rolls the pod for those. The chart
+cannot hash an external broker ConfigMap: keep broker fragments (including `host.yaml`) on the
+operator's restart path.
 For Reloader, annotate that broker ConfigMap `reloader.stakater.com/match: "true"` and set
 `reloader.stakater.com/search: "true"` in `deploymentAnnotations`; do not include gateway-only
 ConfigMaps on the shared-pod Reloader list. Secret material still requires its established
