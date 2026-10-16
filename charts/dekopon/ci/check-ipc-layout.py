@@ -17,7 +17,7 @@ def denied(operation, label):
     try:
         operation()
     except OSError as error:
-        assert error.errno in (errno.EACCES, errno.EPERM), (label, error)
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), (label, error)
         print("PASS denied " + label, flush=True)
     else:
         raise AssertionError("unexpected access: " + label)
@@ -82,7 +82,7 @@ def broker():
     write("/var/lib/dekopon-provider-storage/private")
     write("/var/lib/dekopon-assets/private")
     owned_file("/var/lib/dekopon-assets/private", 0o022)
-    for file in ("/etc/dekopon-gateway/gatewayd.yaml", "/gateway-state/chatgpt-auth.json"):
+    for file in ("/gateway-state/chatgpt-auth.json",):
         denied(lambda: read(file), "broker reading " + file)
         denied(lambda: write(file), "broker writing " + file)
         denied(lambda: os.unlink(file), "broker replacing " + file)
@@ -104,7 +104,11 @@ def broker():
 
 
 def gateway():
-    owned_file("/etc/dekopon-gateway/gatewayd.yaml", 0o022)
+    assert os.path.islink("/etc/dekopon-gateway/gatewayd.yaml")
+    assert os.path.islink("/etc/dekopon-gateway/..data")
+    assert os.stat("/etc/dekopon-gateway/gatewayd.yaml").st_uid == 0
+    read("/etc/dekopon-gateway/gatewayd.yaml")
+    denied(lambda: write("/etc/dekopon-gateway/gatewayd.yaml"), "gateway writing projection")
     owned_file("/gateway-state/chatgpt-auth.json", 0o077)
     for file in ("/etc/dekopon/broker.yaml", "/etc/dekopon/policies.cedar",
                  "/etc/dekopon/broker-credentials.yaml",

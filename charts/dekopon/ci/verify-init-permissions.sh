@@ -51,7 +51,6 @@ docker() {
 platform=${PLATFORM:-linux/arm64}
 busybox=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 python_image=python:3.13-alpine
-skills_mounts=()
 
 # --------------------------------------------------------------------------------------------
 # Helpers
@@ -109,21 +108,24 @@ assert "broker-assets" not in gm
 assert bm["broker-assets"]["mountPath"]=="/var/lib/dekopon-assets"
 assert "config-source" not in gm and "config-source" not in bm
 expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
-          "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",
+          "runtime":"/run/dekopon",
           "state":"/var/lib/dekopon"}
 expected.update({"broker-assets": "/var/lib/dekopon-assets"})
 if "skills" in volumes:
-    expected.update({"skills-source":"/dekopon-skills-source", "skills":"/etc/dekopon-skills"})
+    assert volumes["skills"]["configMap"]["defaultMode"] & 0o022 == 0
+    assert "skills" not in {m["name"] for m in ic["volumeMounts"]}
     assert gm["skills"] == {"name":"skills", "mountPath":"/etc/dekopon-skills", "readOnly":True}
-    assert "skills" not in bm and "skills-source" not in gm and "skills-source" not in bm
+    assert "skills" not in bm
 if "provider-storage" in bm:
     expected.update({"provider-storage":"/var/lib/dekopon-provider-storage"})
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
-assert gm["gateway-config"]["mountPath"]==bm["config"]["mountPath"]=="/etc/dekopon"
+assert gm["gateway-config"]=={"name":"gateway-config","mountPath":"/etc/dekopon-gateway","readOnly":True}
+assert bm["config"]["mountPath"]=="/etc/dekopon"
 assert gm["runtime"]["mountPath"]==bm["runtime"]["mountPath"]=="/run/dekopon"
 config=next(d["stringData"] for d in docs if d["kind"]=="Secret" and "broker.yaml" in d.get("stringData",{}))
 broker_config=yaml.safe_load(config["broker.yaml"])
-gateway_config=yaml.safe_load(config["gatewayd.yaml"])
+gateway_source=next(d["stringData"] for d in docs if d["kind"]=="Secret" and "gatewayd.yaml" in d.get("stringData",{}))
+gateway_config=yaml.safe_load(gateway_source["gatewayd.yaml"])
 assert gateway_config["broker"]["serverUid"]==broker["securityContext"]["runAsUser"]
 peers={p["uid"]:p for p in broker_config["identities"]}
 assert "attestor" in peers[gateway["securityContext"]["runAsUser"]]
@@ -156,7 +158,6 @@ run_init() {
     -v "${resource}-run":/run/dekopon -v "${resource}-state":/var/lib/dekopon \
     -v "${resource}-storage":/var/lib/dekopon-provider-storage \
     -v "${resource}-assets":/var/lib/dekopon-assets \
-    ${skills_mounts[@]+"${skills_mounts[@]}"} \
     "$busybox" /bin/sh -c "$(cat "$1")"
 }
 
@@ -242,12 +243,11 @@ mkdir -p "$stamp"
 printf 'apiVersion: dekopon.dev/brokerd/v1alpha1\n' > "$stamp/broker.yaml"
 printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.cedar"
 printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
-printf 'apiVersion: dekopon.dev/gatewayd/v1alpha1\n' > "$stamp/gatewayd.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml gatewayd.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
+for k in broker.yaml policies.cedar broker-credentials.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -526,10 +526,16 @@ claim_perms=$(docker run --rm --platform "$platform" -v "${resource}-state":/s "
 assert_eq "neither daemon owns or traverses the claim root" "$claim_perms" "0:0:700:directory"
 
 echo "==> distinct-UID processes against the rendered permission layout"
+docker run --rm --platform "$platform" -v "${resource}-gateway-etc":/s "$busybox" sh -c '
+  mkdir -p /s/..generation
+  printf "gateway fixture\n" > /s/..generation/gatewayd.yaml
+  chmod 0444 /s/..generation/gatewayd.yaml
+  ln -s ..generation /s/..data
+  ln -s ..data/gatewayd.yaml /s/gatewayd.yaml'
 docker run --rm -i --platform "$platform" --user 0:0 \
   --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID \
   --security-opt=no-new-privileges --read-only \
-  -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway \
+  -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway:ro \
   -v "${resource}-run":/run/dekopon \
   --mount "type=volume,src=${resource}-state,dst=/gateway-state,volume-subpath=chatgpt" \
   -v "${resource}-storage":/var/lib/dekopon-provider-storage \
@@ -998,39 +1004,9 @@ docker run --rm -i --platform "$platform" --user 65532:65532 --cap-drop=ALL \
   -v "${resource}-check":/check:ro \
   "$python_image" python3 - < "$work/config-check-set.py"
 
-echo "==> materializing nested skills from a projected ConfigMap"
-for suffix in skills-src skills; do
-  v="${resource}-${suffix}"
-  if docker volume inspect "$v" >/dev/null 2>&1; then
-    echo "refusing preexisting test volume: $v" >&2
-    exit 1
-  fi
-  echo "$v" >> "$work/volumes"
-  docker volume create "$v" >/dev/null
-done
-skills_mounts=(-v "${resource}-skills-src:/dekopon-skills-source:ro" -v "${resource}-skills:/etc/dekopon-skills")
-docker run --rm -v "${resource}-skills-src:/s" "$busybox" sh -c '
-  mkdir -p /s/..fixture/review/references
-  printf "%s\n" "review body" > /s/..fixture/review/SKILL.md
-  printf "%s\n" "module.exports = 42;" > /s/..fixture/review/references/review.cjs
-  chmod 0400 /s/..fixture/review/SKILL.md /s/..fixture/review/references/review.cjs
-  ln -s ..fixture /s/..data
-  ln -s ..data/review /s/review'
-render_init "$work/skills-init.sh" --set gateway.skills.configMap=dekopon-skills \
-  --set 'gateway.skills.items[0].key=review-skill,gateway.skills.items[0].path=review/SKILL.md' \
-  --set 'gateway.skills.items[1].key=review-reference,gateway.skills.items[1].path=review/references/review.cjs'
-run_init "$work/skills-init.sh"
-run_init "$work/skills-init.sh"
-docker run --rm --user 65533:65533 --cap-drop=ALL --read-only \
-  -v "${resource}-skills:/etc/dekopon-skills:ro" "$busybox" sh -c '
-  set -eu
-  test -z "$(find /etc/dekopon-skills -type l)"
-  test ! -e /etc/dekopon-skills/..data
-  test "$(cat /etc/dekopon-skills/review/SKILL.md)" = "review body"
-  test "$(cat /etc/dekopon-skills/review/references/review.cjs)" = "module.exports = 42;"
-  test "$(stat -c "%u:%g:%a:%h" /etc/dekopon-skills/review/SKILL.md)" = "0:0:644:1"
-  if touch /etc/dekopon-skills/review/new 2>/dev/null; then exit 1; fi'
-echo "PASS nested skills are regular, gateway-readable, read-only, and survive init reruns"
+echo "==> render live gateway projections"
+python3 "$chart_dir/ci/test-live-sources.py"
+echo "PASS gateway source mounts are live, read-only and isolated"
 
 echo
 echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only; the managed provider set is broker-only, owned by 65532, and survives a restart."

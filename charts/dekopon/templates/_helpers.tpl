@@ -80,6 +80,10 @@ Object names.
 {{- printf "%s-config" (include "dekopon.fullname" .) -}}
 {{- end -}}
 
+{{- define "dekopon.gatewayConfigSecretName" -}}
+{{- printf "%s-gateway-config" (include "dekopon.fullname" .) -}}
+{{- end -}}
+
 {{- define "dekopon.credentialsSecretName" -}}
 {{- printf "%s-credentials" (include "dekopon.fullname" .) -}}
 {{- end -}}
@@ -120,7 +124,7 @@ Whether each optional file has a source at all.
 {{- end -}}
 
 {{- define "dekopon.hasInlineConfig" -}}
-{{- if or .Values.broker.config.inline .Values.broker.policies.inline .Values.broker.secretMap.inline (and .Values.gateway.enabled .Values.gateway.config.inline) -}}true{{- end -}}
+{{- if or .Values.broker.config.inline .Values.broker.policies.inline .Values.broker.secretMap.inline -}}true{{- end -}}
 {{- end -}}
 
 {{- define "dekopon.chatgptSecretName" -}}
@@ -258,11 +262,6 @@ cannot drift apart.
 - file: {{ .file }}
   secret: {{ .existingSecret }}
   key: {{ .existingSecretKey }}
-{{- end }}
-{{- if and .Values.gateway.enabled (not .Values.gateway.configDirectory.configMap) }}
-- file: gatewayd.yaml
-  secret: {{ default (include "dekopon.configSecretName" .) .Values.gateway.config.existingSecret }}
-  key: {{ if .Values.gateway.config.existingSecret }}{{ .Values.gateway.config.existingSecretKey }}{{ else }}gatewayd.yaml{{ end }}
 {{- end }}
 {{- end -}}
 
